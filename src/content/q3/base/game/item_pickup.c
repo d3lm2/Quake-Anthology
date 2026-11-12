@@ -10,13 +10,13 @@ enum { RESPAWN_ARMOR = 25, RESPAWN_HEALTH = 35, RESPAWN_HOLDABLE = 60, RESPAWN_M
 enum { IT_BAD = 0, IT_WEAPON = 1, IT_AMMO = 2, IT_ARMOR = 3, IT_HEALTH = 4, IT_POWERUP = 5, IT_HOLDABLE = 6, IT_PERSISTANT_POWERUP = 7, IT_TEAM = 8 };
 enum { GT_TEAM = 3 };
 typedef struct { qa_q3_game_client *client; const qa_q3_base_item_definition *item; double item_index; } pickup_input;
-static qa_q3_game_client *client_of(qa_q3_game_entity *e) { if (!e->client) qa_range_error("Item pickup requires a client entity"); return e->client; }
+static qa_q3_game_client *client_of(qa_q3_game_entity *e) { if (!e->client) qa_raise("Error", 0, 0, "Item pickup requires a client entity"); return e->client; }
 static pickup_input get_input(qa_q3_game_entity *item_entity, qa_q3_game_entity *other) {
   pickup_input in; in.client = client_of(other); in.item = item_entity->item;
-  if (!in.item) qa_range_error("Item pickup requires an item definition");
+  if (!in.item) qa_raise("Error", 0, 0, "Item pickup requires an item definition");
   in.item_index = -1; size_t n = 0; const qa_q3_base_item_definition *list = qa_q3_base_item_list(in.client->ps.state_product, &n);
   for (size_t i = 0; i < n; i++) if (&list[i] == in.item) { in.item_index = (double)i; break; }
-  if (in.item_index < 0) qa_range_error("Item does not belong to %s", qa_q3_base_product_name(in.client->ps.state_product));
+  if (in.item_index < 0) qa_raise("Error", 0, 0, "Item does not belong to %s", qa_q3_base_product_name(in.client->ps.state_product));
   return in;
 }
 static const qa_q3_base_stat_schema *schema_of(qa_q3_game_client *c) { return qa_q3_base_stat_schema_for(c->ps.state_product); }
@@ -30,7 +30,7 @@ static void add_ammo_to(qa_q3_game_client *c, double weapon, double count) {
   qa_q3_base_player_state_slots_set(&c->ps.ammo, (size_t)weapon, total > 200 ? 200 : total);
 }
 static double pickup_ammo_from(qa_q3_game_entity *ie, qa_q3_game_client *c, const qa_q3_base_item_definition *item) {
-  if (item->type != IT_AMMO) qa_range_error("Pickup_Ammo requires an ammo item");
+  if (item->type != IT_AMMO) qa_raise("Error", 0, 0, "Pickup_Ammo requires an ammo item");
   add_ammo_to(c, item->tag, ie->count != 0 ? ie->count : item->quantity); return QA_Q3_RESPAWN_AMMO;
 }
 double qa_q3_pickup_ammo(qa_q3_game_entity *ie, qa_q3_game_entity *other) { pickup_input in = get_input(ie, other); return pickup_ammo_from(ie, in.client, in.item); }
@@ -48,11 +48,11 @@ double qa_q3_item_respawn_seconds(const qa_q3_base_item_definition *item, qa_q3_
   if (item->type == IT_HOLDABLE) return RESPAWN_HOLDABLE;
   if (item->type == IT_POWERUP) return RESPAWN_POWERUP;
   if (item->type == IT_PERSISTANT_POWERUP) return -1;
-  if (item->type == IT_TEAM) qa_range_error("Team objective lifecycle requires its original pickup handler");
-  qa_range_error("Invalid item has no pickup lifecycle");
+  if (item->type == IT_TEAM) qa_raise("Error", 0, 0, "Team objective lifecycle requires its original pickup handler");
+  qa_raise("Error", 0, 0, "Invalid item has no pickup lifecycle");
 }
 static double pickup_weapon_from(qa_q3_game_entity *ie, qa_q3_game_client *c, const qa_q3_base_item_definition *item, qa_q3_weapon_pickup_context ctx) {
-  if (item->type != IT_WEAPON) qa_range_error("Pickup_Weapon requires a weapon item");
+  if (item->type != IT_WEAPON) qa_raise("Error", 0, 0, "Pickup_Weapon requires a weapon item");
   qa_q3_weapon_pickup_quantity_input qi = {ie->count, item->quantity, (qa_js_to_int32(ie->flags) & QA_Q3_GAME_FLAG_DROPPED_ITEM) != 0, ctx.game_type, qa_q3_base_player_state_slots_get(&c->ps.ammo, (size_t)item->tag)};
   double q = qa_q3_weapon_pickup_quantity(qi); size_t w = schema_of(c)->weapons;
   qa_q3_base_player_state_slots_set(&c->ps.stats, w, qa_js_to_int32(qa_q3_base_player_state_slots_get(&c->ps.stats, w)) | (1 << qa_js_to_int32(item->tag)));
@@ -61,17 +61,19 @@ static double pickup_weapon_from(qa_q3_game_entity *ie, qa_q3_game_client *c, co
 }
 double qa_q3_pickup_weapon(qa_q3_game_entity *ie, qa_q3_game_entity *other, qa_q3_weapon_pickup_context ctx) { pickup_input in = get_input(ie, other); return pickup_weapon_from(ie, in.client, in.item, ctx); }
 static double pickup_health_from(qa_q3_game_entity *ie, qa_q3_game_client *c, const qa_q3_base_item_definition *item, qa_q3_game_entity *other) {
-  if (item->type != IT_HEALTH) qa_range_error("Pickup_Health requires a health item");
+  if (item->type != IT_HEALTH) qa_raise("Error", 0, 0, "Pickup_Health requires a health item");
   double max_h = qa_q3_base_player_state_slots_get(&c->ps.stats, schema_of(c)->max_health);
   double limit = has_guard(c) || (item->quantity != 5 && item->quantity != 100) ? max_h : max_h * 2;
   double q = ie->count != 0 ? ie->count : item->quantity;
-  double h = qa_int32(qa_q3_game_entity_health(other) + q); if (h > limit) h = limit;
-  qa_q3_game_entity_set_health(other, h); qa_q3_base_player_state_slots_set(&c->ps.stats, schema_of(c)->health, h);
+  /* TS stores the sum through the health binding, then the limit, and mirrors what the binding reads back. */
+  qa_q3_game_entity_set_health(other, qa_int32(qa_q3_game_entity_health(other) + q));
+  if (qa_q3_game_entity_health(other) > limit) qa_q3_game_entity_set_health(other, limit);
+  qa_q3_base_player_state_slots_set(&c->ps.stats, schema_of(c)->health, qa_q3_game_entity_health(other));
   return item->quantity == 100 ? RESPAWN_MEGAHEALTH : RESPAWN_HEALTH;
 }
 double qa_q3_pickup_health(qa_q3_game_entity *ie, qa_q3_game_entity *other) { pickup_input in = get_input(ie, other); return pickup_health_from(ie, in.client, in.item, other); }
 static double pickup_armor_from(qa_q3_game_client *c, const qa_q3_base_item_definition *item) {
-  if (item->type != IT_ARMOR) qa_range_error("Pickup_Armor requires an armor item");
+  if (item->type != IT_ARMOR) qa_raise("Error", 0, 0, "Pickup_Armor requires an armor item");
   double armor = qa_int32(qa_q3_base_player_state_slots_get(&c->ps.stats, schema_of(c)->armor) + item->quantity);
   double max_h = qa_q3_base_player_state_slots_get(&c->ps.stats, schema_of(c)->max_health);
   double limit = has_guard(c) ? max_h : max_h * 2;
@@ -79,18 +81,22 @@ static double pickup_armor_from(qa_q3_game_client *c, const qa_q3_base_item_defi
 }
 double qa_q3_pickup_armor(qa_q3_game_entity *ie, qa_q3_game_entity *other) { pickup_input in = get_input(ie, other); return pickup_armor_from(in.client, in.item); }
 static double pickup_holdable_from(qa_q3_game_client *c, const qa_q3_base_item_definition *item, double idx) {
-  if (item->type != IT_HOLDABLE) qa_range_error("Pickup_Holdable requires a holdable item");
+  if (item->type != IT_HOLDABLE) qa_raise("Error", 0, 0, "Pickup_Holdable requires a holdable item");
   qa_q3_base_player_state_slots_set(&c->ps.stats, schema_of(c)->holdable_item, idx);
   if (item->tag == 3) c->ps.e_flags = qa_js_to_int32(c->ps.e_flags) | 0x200;
   return RESPAWN_HOLDABLE;
 }
 double qa_q3_pickup_holdable(qa_q3_game_entity *ie, qa_q3_game_entity *other) { pickup_input in = get_input(ie, other); return pickup_holdable_from(in.client, in.item, in.item_index); }
 static double source_handicap(const char *raw) { double p = qa_game_atof(raw); return p <= 0 || p > 100 ? 100 : p; }
-static double pickup_persistent_from(qa_q3_game_entity *ie, qa_q3_game_client *c, const qa_q3_base_item_definition *item, double idx, const char *raw, qa_q3_game_entity *other) {
-  if (c->ps.state_product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("Persistent powerups require missionpack player state");
-  if (item->type != IT_PERSISTANT_POWERUP) qa_range_error("Pickup_PersistantPowerup requires a persistent powerup item");
+/* TS readHandicap: () => string. pickupItem reads the client's handicap only here, after the product and
+   type checks and after the persistent-powerup stat and owner are written. */
+typedef struct handicap_reader { const char *raw; void *ctx; const char *(*for_client)(void *ctx, double client_num); const qa_q3_game_client *client; } handicap_reader;
+static const char *read_handicap(handicap_reader r) { return r.for_client ? r.for_client(r.ctx, r.client->ps.client_num) : r.raw; }
+static double pickup_persistent_from(qa_q3_game_entity *ie, qa_q3_game_client *c, const qa_q3_base_item_definition *item, double idx, handicap_reader reader, qa_q3_game_entity *other) {
+  if (c->ps.state_product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "Persistent powerups require missionpack player state");
+  if (item->type != IT_PERSISTANT_POWERUP) qa_raise("Error", 0, 0, "Pickup_PersistantPowerup requires a persistent powerup item");
   qa_q3_base_player_state_slots_set(&c->ps.stats, 2, idx); c->persistant_powerup = ie;
-  double handicap = source_handicap(raw), player_max = trunc(handicap);
+  double handicap = source_handicap(read_handicap(reader)), player_max = trunc(handicap);
   if (item->tag == 11) {
     double maximum = trunc(2 * handicap); qa_q3_game_entity_set_health(other, maximum);
     qa_q3_base_player_state_slots_set(&c->ps.stats, 0, maximum); qa_q3_base_player_state_slots_set(&c->ps.stats, 7, maximum);
@@ -100,9 +106,9 @@ static double pickup_persistent_from(qa_q3_game_entity *ie, qa_q3_game_client *c
   else c->pers.max_health = player_max;
   return -1;
 }
-double qa_q3_pickup_persistent_powerup(qa_q3_game_entity *ie, qa_q3_game_entity *other, const char *raw) { pickup_input in = get_input(ie, other); return pickup_persistent_from(ie, in.client, in.item, in.item_index, raw, other); }
+double qa_q3_pickup_persistent_powerup(qa_q3_game_entity *ie, qa_q3_game_entity *other, const char *raw) { pickup_input in = get_input(ie, other); handicap_reader reader = {raw, NULL, NULL, NULL}; return pickup_persistent_from(ie, in.client, in.item, in.item_index, reader, other); }
 static double pickup_powerup_from(qa_q3_game_entity *ie, qa_q3_game_client *c, const qa_q3_base_item_definition *item, qa_q3_powerup_pickup_context ctx) {
-  if (item->type != IT_POWERUP) qa_range_error("Pickup_Powerup requires a powerup item");
+  if (item->type != IT_POWERUP) qa_raise("Error", 0, 0, "Pickup_Powerup requires a powerup item");
   if (ctx.time != trunc(ctx.time) || ctx.time < -2147483648 || ctx.time > 2147483647) qa_range_error("Powerup pickup time must be a signed 32-bit millisecond value");
   double expiration = qa_q3_base_player_state_slots_get(&c->ps.powerups, (size_t)item->tag);
   if (expiration == 0) expiration = ctx.time - fmod(ctx.time, 1000);
@@ -129,8 +135,11 @@ double qa_q3_pickup_item(qa_q3_game_entity *ie, qa_q3_game_entity *other, qa_q3_
   if (in.item->type == IT_HEALTH) return pickup_health_from(ie, in.client, in.item, other);
   if (in.item->type == IT_POWERUP) return pickup_powerup_from(ie, in.client, in.item, ctx.powerup);
   if (in.item->type == IT_HOLDABLE) return pickup_holdable_from(in.client, in.item, in.item_index);
-  if (in.item->type == IT_PERSISTANT_POWERUP) return pickup_persistent_from(ie, in.client, in.item, in.item_index, ctx.handicap_for_client(ctx.handicap_ctx, in.client->ps.client_num), other);
-  if (in.item->type == IT_TEAM) qa_range_error("Pickup_Item: IT_TEAM requires the team objective pickup handler");
-  if (in.item->type == IT_BAD) qa_range_error("Pickup_Item: IT_BAD cannot be picked up");
-  qa_range_error("Pickup_Item: unknown item");
+  if (in.item->type == IT_PERSISTANT_POWERUP) {
+    handicap_reader reader = {NULL, ctx.handicap_ctx, ctx.handicap_for_client, in.client};
+    return pickup_persistent_from(ie, in.client, in.item, in.item_index, reader, other);
+  }
+  if (in.item->type == IT_TEAM) qa_raise("Error", 0, 0, "Pickup_Item: IT_TEAM requires the team objective pickup handler");
+  if (in.item->type == IT_BAD) qa_raise("Error", 0, 0, "Pickup_Item: IT_BAD cannot be picked up");
+  qa_raise("Error", 0, 0, "Pickup_Item: unknown item [object Object]"); /* TS String(item) */
 }

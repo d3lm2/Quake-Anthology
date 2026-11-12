@@ -13,9 +13,10 @@
 static noreturn void qa_error(const char *message) {
   qa_raise("Error", 0, 0, "%s", message);
 }
+/* TS throw new SourceItemRetired(lease, actor, owner): a raise by that name, which the source
+ * item runtimes catch to cancel the retired weapon input (compat/qvm/mod_items.c). */
 static noreturn void qa_retired(void) {
-  fprintf(stderr, "Error: %s\n", QA_SOURCE_ITEM_RETIRED_MESSAGE);
-  abort();
+  qa_raise("SourceItemRetired", 0, 0, "%s", QA_SOURCE_ITEM_RETIRED_MESSAGE);
 }
 static bool str_eq(const char *a, const char *b) {
   if (a == NULL || b == NULL) return a == b;
@@ -101,7 +102,10 @@ struct bound_items {
   void (*invoke)(void *ctx, qa_item_id item, qa_source_item_action action);
   bool active;
 };
+/* TS: the binding object lives while its store maps items to it or a resolved match's current() closure holds it.
+ * refs counts both; the last release frees it. */
 struct bound_pickups {
+  size_t refs;
   int64_t id;
   qa_provider_id owner;
   qa_captured_original_pickup_rule *rules;
@@ -110,6 +114,7 @@ struct bound_pickups {
   size_t item_count;
 };
 struct inv_store {
+  uint64_t serial; /* identity for current(): a freed store's address can be reused */
   qa_owned_actor actor;
   qa_inventory_state_binding primary;
   bound_items **groups;
@@ -128,6 +133,7 @@ struct qa_shared_inventory_table {
   inv_store **stores;
   size_t store_count, store_capacity;
   int64_t next_pickup_id;
+  uint64_t next_store_serial;
   int64_t release_subscription;
   /* scratch */
   qa_inventory_entry *scratch;
@@ -190,13 +196,16 @@ static void free_pickups(bound_pickups *binding) {
   free(binding->items);
   free(binding);
 }
-/* Groups and pickup bindings are table-owned (released at table destroy): a
- * lease, item action or pickup `current` closure keeps reading them after a
- * close, unbind or actor release, as TS closures keep their objects. */
+static void free_pickups_cleanup(void *binding) { free_pickups(binding); }
+/* Groups are table-owned (released at table destroy): a lease or item action closure keeps reading them after a
+ * close or actor release, as TS closures keep their objects. */
 static void free_group_owned(void *ptr) { free_group(ptr); }
-static void free_pickups_owned(void *ptr) { free_pickups(ptr); }
+static void unref_pickups(bound_pickups *binding) {
+  if (binding != NULL && --binding->refs == 0) free_pickups(binding);
+}
 static void free_store(inv_store *store) {
   if (store == NULL) return;
+  for (size_t i = 0; i < store->pickup_count; i++) unref_pickups(store->pickups[i]);
   free(store->groups);
   free(store->item_keys);
   free(store->item_groups);
@@ -318,6 +327,7 @@ void qa_shared_inventory_table_bind(qa_shared_inventory_table *table, qa_owned_a
   qa_session_actor_registry_assert_owned(table->actors, actor);
   if (find_store(table, actor) != NULL) qa_error("Actor already has an inventory binding");
   inv_store *store = xcalloc(sizeof *store);
+  store->serial = ++table->next_store_serial;
   store->actor = actor;
   store->primary = binding;
   if (table->store_count == table->store_capacity) {
@@ -492,7 +502,6 @@ qa_source_item_lease qa_shared_inventory_table_bind_items(qa_shared_inventory_ta
     qa_error("Source items require an existing primary inventory and a nonempty group");
   size_t primary_count = 0;
   const qa_inventory_entry *primary = store->primary.read(store->primary.ctx, &primary_count);
-  char message[2048];
   bound_items *group = xcalloc(sizeof *group);
   own_state_with(table, group, free_group_owned);
   group->count = requested.item_count;
@@ -519,10 +528,7 @@ qa_source_item_lease qa_shared_inventory_table_bind_items(qa_shared_inventory_ta
         definition->label == NULL || definition->label[0] == '\0' ||
         group_for_item(store, definition->item) != NULL ||
         (str_eq(admission, "add") ? in_primary : !in_primary)) {
-      (void)snprintf(message, sizeof message,
-                     "Source item %s conflicts with its current owner or admission",
-                     definition->item);
-      qa_error(message);
+      qa_raise("Error", 0, 0, "Source item %s conflicts with its current owner or admission", definition->item);
     }
     if (definition->actions != NULL) {
       bool bad = definition->action_count == 0 || requested.invoke == NULL;
@@ -554,8 +560,7 @@ qa_source_item_lease qa_shared_inventory_table_bind_items(qa_shared_inventory_ta
   for (size_t i = 0; i < group->count; i++) {
     qa_item_id item = group->admissions[i].definition.item;
     if (pickup_for_item(store, item) != NULL) {
-      (void)snprintf(message, sizeof message, "Source item %s already has a pickup delegate", item);
-      qa_error(message);
+      qa_raise("Error", 0, 0, "Source item %s already has a pickup delegate", item);
     }
   }
   for (size_t i = 0; i < group->count; i++) {
@@ -714,31 +719,34 @@ int64_t qa_shared_inventory_table_bind_pickup(qa_shared_inventory_table *table,
                                               qa_inventory_pickup_binding requested) {
   qa_session_actor_registry_assert_owned(table->actors, actor);
   inv_store *store = find_store(table, actor);
-  size_t rule_count = 0;
-  qa_captured_original_pickup_rule *rules =
-      qa_capture_original_pickup_rules(requested.rules, requested.rule_count, &rule_count);
+  /* The captured rules and item list are released if a check below raises (TS: garbage). */
+  bound_pickups *binding = xcalloc(sizeof *binding);
+  binding->refs = 1;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_pickups_cleanup, binding);
+  binding->rules = qa_capture_original_pickup_rules(requested.rules, requested.rule_count, &binding->rule_count);
+  qa_captured_original_pickup_rule *rules = binding->rules;
+  size_t rule_count = binding->rule_count;
   /* Distinct inventory-write items, in first-appearance order. */
-  qa_item_id *items = NULL;
-  size_t item_count = 0, item_capacity = 0;
-  char message[2048];
+  size_t item_capacity = 0;
   for (size_t r = 0; r < rule_count; r++) {
     for (size_t w = 0; w < rules[r].writes.count; w++) {
       qa_pickup_write write = rules[r].writes.values[w];
       if (write.kind != QA_PICKUP_RESOURCE_INVENTORY) continue;
       bool seen = false;
-      for (size_t i = 0; i < item_count; i++) {
-        if (str_eq(items[i], write.item)) seen = true;
+      for (size_t i = 0; i < binding->item_count; i++) {
+        if (str_eq(binding->items[i], write.item)) seen = true;
       }
       if (!seen) {
-        if (item_count == item_capacity) {
+        if (binding->item_count == item_capacity) {
           item_capacity = item_capacity != 0 ? item_capacity * 2 : 8;
-          items = xrealloc(items, item_capacity * sizeof *items);
+          binding->items = xrealloc(binding->items, item_capacity * sizeof *binding->items);
         }
-        items[item_count++] = write.item;
+        binding->items[binding->item_count++] = write.item;
       }
     }
   }
-  if (item_count == 0) qa_error("Original inventory pickup delegate has no inventory writes");
+  if (binding->item_count == 0) qa_error("Original inventory pickup delegate has no inventory writes");
   for (size_t r = 0; r < rule_count; r++) {
     for (size_t w = 0; w < rules[r].writes.count; w++) {
       qa_pickup_write write = rules[r].writes.values[w];
@@ -753,24 +761,17 @@ int64_t qa_shared_inventory_table_bind_pickup(qa_shared_inventory_table *table,
         }
       }
       if (!admitted) {
-        (void)snprintf(message, sizeof message, "Original pickup destination %s was not admitted", write.item);
-        qa_error(message);
+        qa_raise("Error", 0, 0, "Original pickup destination %s was not admitted", write.item);
       }
       bound_items *source = group_for_item(store, write.item);
       if (source != NULL && !str_eq(source->owner, requested.owner)) {
-        (void)snprintf(message, sizeof message,
-                       "Original pickup destination %s belongs to another source", write.item);
-        qa_error(message);
+        qa_raise("Error", 0, 0, "Original pickup destination %s belongs to another source", write.item);
       }
       if (pickup_for_item(store, write.item) != NULL) {
-        (void)snprintf(message, sizeof message,
-                       "Original pickup destination %s already has a grant owner", write.item);
-        qa_error(message);
+        qa_raise("Error", 0, 0, "Original pickup destination %s already has a grant owner", write.item);
       }
       if (!str_eq(write.fields, "count") && !store_mutable_capacity(table, actor, store, write.item)) {
-        (void)snprintf(message, sizeof message,
-                       "Original pickup destination %s has no mutable capacity", write.item);
-        qa_error(message);
+        qa_raise("Error", 0, 0, "Original pickup destination %s has no mutable capacity", write.item);
       }
     }
   }
@@ -782,28 +783,21 @@ int64_t qa_shared_inventory_table_bind_pickup(qa_shared_inventory_table *table,
         for (size_t n = 0; n < rule_count; n++) {
           for (size_t m = 0; m < rules[n].offered_count; m++) {
             if (str_eq(rules[n].offered[m], offered)) {
-              (void)snprintf(message, sizeof message,
-                             "Ambiguous original inventory pickup for %s", offered);
-              qa_error(message);
+              qa_raise("Error", 0, 0, "Ambiguous original inventory pickup for %s", offered);
             }
           }
         }
       }
     }
   }
-  bound_pickups *binding = xcalloc(sizeof *binding);
-  own_state_with(table, binding, free_pickups_owned);
-  binding->id = ++table->next_pickup_id;
-  binding->owner = requested.owner;
-  binding->rules = rules;
-  binding->rule_count = rule_count;
-  binding->items = items;
-  binding->item_count = item_count;
   if (store->pickup_count == store->pickup_capacity) {
     store->pickup_capacity = store->pickup_capacity != 0 ? store->pickup_capacity * 2 : 4;
     store->pickups = xrealloc(store->pickups, store->pickup_capacity * sizeof *store->pickups);
   }
-  store->pickups[store->pickup_count++] = binding;
+  qa_cleanup_pop(&guard);
+  binding->id = ++table->next_pickup_id;
+  binding->owner = requested.owner;
+  store->pickups[store->pickup_count++] = binding; /* the store's reference */
   return binding->id;
 }
 
@@ -813,9 +807,11 @@ void qa_shared_inventory_table_unbind_pickup(qa_shared_inventory_table *table,
   if (store == NULL) return;
   for (size_t i = 0; i < store->pickup_count; i++) {
     if (store->pickups[i]->id == binding_id) {
+      bound_pickups *binding = store->pickups[i];
       memmove(&store->pickups[i], &store->pickups[i + 1],
               (store->pickup_count - i - 1) * sizeof *store->pickups);
       store->pickup_count--;
+      unref_pickups(binding); /* resolved matches may still hold it */
       return;
     }
   }
@@ -825,15 +821,22 @@ typedef struct pickup_current_state {
   qa_shared_inventory_table *table;
   qa_owned_actor actor;
   inv_store *store;
-  bound_pickups *binding;
+  uint64_t store_serial;
+  bound_pickups *binding; /* a counted reference */
   qa_pickup_write write;
 } pickup_current_state;
+static void pickup_current_release(void *ctx) {
+  pickup_current_state *state = ctx;
+  unref_pickups(state->binding);
+  free(state);
+}
 static bool pickup_current(void *ctx) {
   pickup_current_state *state = ctx;
   qa_owned_actor resolved;
+  inv_store *current = find_store(state->table, state->actor);
   if (!qa_session_actor_registry_resolve_owned(state->table->actors, state->actor.id, &resolved) ||
       !qa_same_owned_actor(resolved, state->actor) ||
-      find_store(state->table, state->actor) != state->store) return false;
+      current == NULL || current->serial != state->store_serial) return false;
   for (size_t i = 0; i < state->binding->item_count; i++) {
     qa_item_id item = state->binding->items[i];
     if (pickup_for_item(state->store, item) != state->binding) return false;
@@ -886,10 +889,13 @@ qa_original_pickup_resolution qa_shared_inventory_table_resolve_pickup(
         state->table = table;
         state->actor = actor;
         state->store = store;
+        state->store_serial = store->serial;
         state->binding = binding;
+        binding->refs++;
         state->write = write;
-        own_state(table, state);
         qa_current_original_pickup *match = &table->scratch_matches[at++];
+        memset(match, 0, sizeof *match);
+        match->release = pickup_current_release;
         match->ctx = state;
         match->owner = binding->owner;
         match->operation = rule->operation;

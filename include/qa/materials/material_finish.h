@@ -5,8 +5,8 @@
  * chosen by slice-a). Results own their stage/pass/diagnostic storage;
  * input definitions and images are borrowed and must outlive a result
  * only where the TS shares the object (stage maps, bindings, strings).
- * The CollapseMultitexture iterator (TS owner material-iterator.ts,
- * not yet ported) is implemented privately in material_finish.c.
+ * The CollapseMultitexture iterator (TS owner material-iterator.ts)
+ * has a private copy in material_finish.c.
  * GPL-2.0-or-later.
  */
 #ifndef QA_MATERIALS_MATERIAL_FINISH_H

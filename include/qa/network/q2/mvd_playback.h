@@ -57,6 +57,7 @@ typedef struct qa_q2_mvd_playback {
   double frame_number, max_clients, selected, dummy;
   uint8_t *portal_bits; /* owned */
   size_t portal_bits_length;
+  bool stopped; /* qa_q2_mvd_playback_stop during read_records */
 } qa_q2_mvd_playback;
 
 /* False only on OOM. */
@@ -85,6 +86,10 @@ const char *qa_q2_mvd_playback_config_string(
  * generator consumer can. Malformed input raises the TS errors; records not yet handed to
  * the sink are released then. False only on OOM. */
 typedef void (*qa_q2_mvd_record_sink)(void *ctx, qa_q2_server_record *record);
+/* Called from a sink: the consumer leaves its for-of over the generator (TS return()), so
+ * read_records releases the records not yet handed over and decodes nothing more of this
+ * message (no further state change, error or wire finish). */
+void qa_q2_mvd_playback_stop(qa_q2_mvd_playback *playback);
 bool qa_q2_mvd_playback_read_records(qa_q2_mvd_playback *playback,
                                      const uint8_t *bytes, size_t length,
                                      qa_q2_mvd_record_sink sink, void *ctx);

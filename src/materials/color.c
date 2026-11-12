@@ -4,6 +4,7 @@
 
 #include "qa/core/math.h"
 #include "qa/core/renderer_math.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/materials/color.h"
 
@@ -39,8 +40,9 @@ qa_vec3 qa_diffuse_color(qa_vec3 normal, qa_entity_lighting lighting) {
                         lighting.directed_light.z};
   double out_parts[3];
   for (int i = 0; i < 3; i++) {
-    double v = trunc(fr(parts[i] + fr(incoming * directed[i])));
-    out_parts[i] = (double)(qa_mat_to_int32(v < 255 ? v : 255) & 255);
+    /* Math.min(255, Math.trunc(...)) & 255: Math.min keeps a NaN, and NaN & 255 is 0. */
+    double v = qa_js_min(255, trunc(fr(parts[i] + fr(incoming * directed[i]))));
+    out_parts[i] = (double)(qa_mat_to_int32(v) & 255);
   }
   qa_vec3 out = {out_parts[0], out_parts[1], out_parts[2]};
   return out;
@@ -62,8 +64,8 @@ double qa_specular_alpha(qa_vec3 position, qa_vec3 normal,
   if (l < 0) return 0;
   l = fr(l * l);
   l = fr(l * l);
-  double value = trunc(fr(l * 255));
-  return value < 255 ? value : 255;
+  /* Math.min keeps a NaN (a zero viewer distance), which the byte store then rejects. */
+  return qa_js_min(255, trunc(fr(l * 255)));
 }
 
 static qa_vec4 waveform_color(qa_waveform wave, double time,
@@ -125,7 +127,7 @@ static qa_vec4 evaluate_rgb(qa_mat_shader_stage stage,
                           context.noise);
   } else if (eq(kind, "lightingdiffuse")) {
     if (context.lighting == NULL)
-      qa_range_error("lightingDiffuse requires entity lighting");
+      qa_raise("Error", 0, 0, "lightingDiffuse requires entity lighting");
     qa_vec3 color = qa_diffuse_color(vertex.normal, *context.lighting);
     red = color.x; green = color.y; blue = color.z;
     alpha = qa_dot3(vertex.normal, context.lighting->light_dir) <= 0

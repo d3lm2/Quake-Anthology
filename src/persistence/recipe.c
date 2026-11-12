@@ -328,6 +328,12 @@ static qa_grapple_selection read_grapple(const qa_save_reader *reader) {
     grapple.profile = qa_read_qvm_grapple_definition(&profile);
     qa_save_reader_destroy(&profile);
     if (grapple.profile == NULL) qa_save_reader_fail(reader, "out of memory");
+    /* The definition's arrays are the caller's to free too (qvm_grapple.h): a later raise
+     * releases them here, and qa_executable_recipe_free after a read. */
+    arena_track(reader, (void *)grapple.profile->fire_arguments.values);
+    arena_track(reader, (void *)grapple.profile->movement.words);
+    arena_track(reader, (void *)grapple.profile->initial_cvars);
+    arena_track(reader, (void *)grapple.profile->presentation.view_attachments);
     arena_track(reader, (void *)grapple.profile);
   }
   return grapple;
@@ -723,13 +729,12 @@ static qa_weapon_behavior_callback read_behavior_callback(
     callback.abi = qa_read_native_call_abi(&abi);
     qa_save_reader_destroy(&abi);
     qa_save_reader offset = field(reader, "imageOffset");
-    callback.image_offset = qa_save_reader_bigint(&offset);
+    /* TS compares the whole bigint against the unsigned ABI width: a negative
+     * value, one above 2^64 - 1, or one above UINT32_MAX under a 4-byte ABI fails. */
+    bool in_range = qa_save_reader_bigint_u64(&offset, &callback.image_offset);
     qa_save_reader_destroy(&offset);
-    /* TS compares against the unsigned ABI width; a negative int64
-     * or a value above UINT32_MAX under a 4-byte ABI fails. Values
-     * above INT64_MAX cannot be represented in the C bigint field. */
-    if (callback.image_offset < 0 ||
-        (callback.abi.pointer_bytes == 4 && callback.image_offset > 4294967295LL))
+    if (!in_range ||
+        (callback.abi.pointer_bytes == 4 && callback.image_offset > 4294967295ULL))
       qa_save_reader_fail(
           reader,
           "native behavior image offset is outside its ABI address width");
@@ -752,15 +757,7 @@ static qa_resolved_weapon_behavior_selection read_weapon_behavior(
       xmalloc(reader, sizeof *definition);
   memset(definition, 0, sizeof *definition);
   definition->module = module;
-  qa_save_reader fire_reader = field(&value, "fire");
-  definition->fire = read_behavior_callback(&fire_reader, module);
-  qa_save_reader_destroy(&fire_reader);
-  qa_save_reader activate = field(&value, "activate");
-  if (!qa_save_reader_is_null(&activate)) {
-    definition->has_activate = true;
-    definition->activate = read_behavior_callback(&activate, module);
-  }
-  qa_save_reader_destroy(&activate);
+  /* TS order: module, source, artifact and their check, then fire and activate. */
   behavior.source = field_provider(reader, "source");
   qa_save_reader artifact_reader = field(reader, "artifact");
   behavior.artifact = read_resource(&artifact_reader);
@@ -770,6 +767,15 @@ static qa_resolved_weapon_behavior_selection read_weapon_behavior(
       strcmp(behavior.artifact.requested_path, module.artifact_path) != 0)
     qa_save_reader_fail(reader,
                         "weapon behavior source differs from selected artifact");
+  qa_save_reader fire_reader = field(&value, "fire");
+  definition->fire = read_behavior_callback(&fire_reader, module);
+  qa_save_reader_destroy(&fire_reader);
+  qa_save_reader activate = field(&value, "activate");
+  if (!qa_save_reader_is_null(&activate)) {
+    definition->has_activate = true;
+    definition->activate = read_behavior_callback(&activate, module);
+  }
+  qa_save_reader_destroy(&activate);
   qa_save_reader id = field(&value, "id");
   definition->id = qa_namespaced(&id);
   qa_save_reader_destroy(&id);
@@ -810,6 +816,12 @@ static qa_resolved_weapon_behavior_selection read_weapon_behavior(
     if ((int64_t)layout->entity_stride % 4 != 0 ||
         (int64_t)layout->level_time % 4 != 0)
       qa_save_reader_fail(&layout_reader, "unaligned QVM behavior layout");
+    /* TS object literal order: abiProfile, then the layout's allocate, free, the four field
+     * offsets, fireAbi. */
+    behavior.component_abi_profile =
+        field_choice(&saved_component, "abiProfile", abi_profiles, 2);
+    layout->allocate = field_integer(&layout_reader, "allocate", 1);
+    layout->free = field_integer(&layout_reader, "free", 1);
     double occupied[4];
     size_t occupied_count = 0;
     const char *const names[4] = {"inuse", "nextthink", "think", "health"};
@@ -832,15 +844,11 @@ static qa_resolved_weapon_behavior_selection read_weapon_behavior(
     layout->field_nextthink = offsets[1];
     layout->field_think = offsets[2];
     layout->field_health = offsets[3];
-    layout->allocate = field_integer(&layout_reader, "allocate", 1);
-    layout->free = field_integer(&layout_reader, "free", 1);
     layout->fire_abi =
         field_literal(&layout_reader, "fireAbi", "entity-pointer-start-direction");
     qa_save_reader_destroy(&layout_reader);
     behavior.has_component = true;
     behavior.component_is_qvm = true;
-    behavior.component_abi_profile =
-        field_choice(&saved_component, "abiProfile", abi_profiles, 2);
     behavior.component_layout = layout;
   }
   qa_save_reader_destroy(&saved_component);
@@ -863,23 +871,39 @@ static qa_resolved_weapon_behavior_selection read_weapon_behavior(
         "weapon behavior callbacks and component declaration do not match");
   return behavior;
 }
+typedef struct gameplay_mods {
+  const qa_resolved_gameplay_mod **values;
+  size_t count;
+} gameplay_mods;
+static void gameplay_mods_unwind(void *arg) {
+  gameplay_mods *mods = (gameplay_mods *)arg;
+  for (size_t i = 0; i < mods->count; i++) qa_resolved_gameplay_mod_release((qa_resolved_gameplay_mod *)mods->values[i]);
+}
 static qa_executable_recipe read_recipe(const qa_save_reader *reader) {
   qa_executable_recipe recipe;
   memset(&recipe, 0, sizeof recipe);
+  /* The arena frees the mod structs on a raise anywhere below; this node first releases what
+   * each mod read so far owns (dependency selections, declaration). */
+  gameplay_mods built = {NULL, 0};
+  qa_cleanup mods_node;
+  qa_cleanup_push(&mods_node, gameplay_mods_unwind, &built);
   qa_save_reader mods = field(reader, "mods");
   if (!qa_save_reader_is_undefined(&mods)) {
     size_t count = qa_save_reader_list_count(&mods);
     const qa_resolved_gameplay_mod **values =
         count > 0 ? xmalloc(&mods, count * sizeof *values) : NULL;
+    built.values = values;
     for (size_t i = 0; i < count; i++) {
       qa_resolved_gameplay_mod *mod = xmalloc(&mods, sizeof *mod);
       qa_save_reader entry = item(&mods, i);
       *mod = qa_read_gameplay_mod(&entry);
       qa_save_reader_destroy(&entry);
       values[i] = mod;
+      built.count = i + 1;
     }
     recipe.mods = values;
     recipe.mod_count = count;
+    recipe.mods_key = QA_RECIPE_KEY_FIRST; /* readRecipe keeps a saved (even empty) list */
   }
   qa_save_reader_destroy(&mods);
   qa_save_reader behaviors = field(reader, "weaponBehaviors");
@@ -894,6 +918,7 @@ static qa_executable_recipe read_recipe(const qa_save_reader *reader) {
     }
     recipe.weapon_behaviors = values;
     recipe.weapon_behavior_count = count;
+    recipe.weapon_behaviors_key = QA_RECIPE_KEY_FIRST;
   }
   qa_save_reader_destroy(&behaviors);
   qa_save_reader version = field(reader, "schemaVersion");
@@ -1020,6 +1045,7 @@ static qa_executable_recipe read_recipe(const qa_save_reader *reader) {
     arena_track(&ordering, (void *)recipe.ordering.providers);
     qa_save_reader_destroy(&ordering);
   }
+  qa_cleanup_pop(&mods_node);
   return recipe;
 }
 qa_executable_recipe qa_read_recipe(const qa_save_reader *reader) {
@@ -1033,7 +1059,10 @@ static void mount_release(const qa_content_mount *mount) {
   free((void *)(mount->kind == QA_CONTENT_MOUNT_ARCHIVE ? mount->as.archive.identity.id : mount->as.loose.identity.id));
 }
 void qa_executable_recipe_free(qa_executable_recipe *recipe) {
-  for (size_t i = 0; i < recipe->mod_count; i++) free((void *)recipe->mods[i]);
+  for (size_t i = 0; i < recipe->mod_count; i++) {
+    if (recipe->mods[i] != NULL) qa_resolved_gameplay_mod_release((qa_resolved_gameplay_mod *)recipe->mods[i]);
+    free((void *)recipe->mods[i]);
+  }
   free((void *)recipe->mods);
   for (size_t i = 0; i < recipe->weapon_behavior_count; i++) {
     qa_resolved_weapon_behavior_selection *behavior = (qa_resolved_weapon_behavior_selection *)&recipe->weapon_behaviors[i];
@@ -1047,6 +1076,13 @@ void qa_executable_recipe_free(qa_executable_recipe *recipe) {
   free((void *)recipe->preset);
   qa_resolved_resource_release((qa_resolved_resource_reference *)&recipe->map.geometry);
   free((void *)recipe->weapons.values);
+  if (recipe->equipment.grapple.profile != NULL) {
+    const qa_qvm_grapple_definition *profile = recipe->equipment.grapple.profile;
+    free((void *)profile->fire_arguments.values);
+    free((void *)profile->movement.words);
+    free((void *)profile->initial_cvars);
+    free((void *)profile->presentation.view_attachments);
+  }
   free((void *)recipe->equipment.grapple.profile);
   free((void *)recipe->enemies.by_classname);
   for (size_t i = 0; i < recipe->execution_count; i++) {

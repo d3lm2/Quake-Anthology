@@ -9,8 +9,14 @@
 #include "qa/materials/legacy_fog.h"
 #include "qa/foundation/js.h"
 
+/* Math.min(1, Math.max(0, value)): NaN stays NaN, -0 becomes 0. */
 static double clamp01(double value) {
-  return value < 0 ? 0 : value > 1 ? 1 : value;
+  return qa_js_min(1, qa_js_max(0, value));
+}
+/* JS trim/\s white space of a byte string (fixedByteString text: each byte
+ * one Latin-1 code point, so 0xA0 is NO-BREAK SPACE). */
+static bool byte_space(unsigned char c) {
+  return (c >= 9 && c <= 13) || c == 32 || c == 0xa0;
 }
 static qa_vec3 mix3(qa_vec3 a, qa_vec3 b, double fraction) {
   qa_vec3 out = {a.x + (b.x - a.x) * fraction, a.y + (b.y - a.y) * fraction,
@@ -27,10 +33,11 @@ void qa_q1_fog_state_init(qa_q1_fog_state *state) {
 void qa_q1_fog_state_update(qa_q1_fog_state *state, qa_q1_fog value,
                             double time, double duration) {
   state->previous = qa_q1_fog_state_sample(state, time);
-  state->target = (qa_q1_fog){value.density > 0 ? value.density : 0,
+  /* Math.max(0, ...): a NaN density or duration (wire input) stays NaN. */
+  state->target = (qa_q1_fog){qa_js_max(0, value.density),
       {clamp01(value.color.x), clamp01(value.color.y), clamp01(value.color.z)}};
   state->start = time;
-  state->duration = duration > 0 ? duration : 0;
+  state->duration = qa_js_max(0, duration);
 }
 qa_q1_fog_transition qa_q1_fog_state_capture(const qa_q1_fog_state *state) {
   qa_q1_fog_transition out = {state->previous, state->target, state->start,
@@ -77,16 +84,16 @@ qa_q1_fog_transition qa_q1_world_fog(const char *entities) {
       if (key[0] == '_') key++;
       /* trimEnd then compare to "fog" */
       size_t length = strlen(key);
-      while (length > 0 && isspace((unsigned char)key[length - 1])) length--;
+      while (length > 0 && byte_space((unsigned char)key[length - 1])) length--;
       if (length != 3 || strncmp(key, "fog", 3) != 0) continue;
       double defaults[4] = {0, 0.3, 0.3, 0.3};
       const char *p = world->properties[i].value;
       int index = 0;
       while (index < 4) {
-        while (isspace((unsigned char)*p)) p++;
+        while (byte_space((unsigned char)*p)) p++;
         if (*p == '\0') break;
         const char *start = p;
-        while (*p != '\0' && !isspace((unsigned char)*p)) p++;
+        while (*p != '\0' && !byte_space((unsigned char)*p)) p++;
         double value = js_number(start, (size_t)(p - start));
         if (!isfinite(value)) break;
         defaults[index++] = value;

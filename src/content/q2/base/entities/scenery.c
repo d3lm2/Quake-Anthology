@@ -11,23 +11,31 @@
 
 #include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/fields.h"
+#include "../diagnostic.h"
 #include "qa/content/q2/foundation/scenery.h"
 #include "qa/core/math.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 
-typedef struct anim_entry { qa_q2_entity *e; double first, end; } anim_entry;
-typedef struct clock_entry { qa_q2_entity *e; double value; } clock_entry;
+/* TS WeakMap<Q2Entity, ...>: an entry dies with its entity. C keys by pointer, and a
+ * freed entity's address can be given to a later entity, so an entry counts only while
+ * the actor recorded with it is still that entity's. */
+typedef struct anim_entry { qa_q2_entity *e; qa_actor_id actor; double first, end; } anim_entry;
+typedef struct clock_entry { qa_q2_entity *e; qa_actor_id actor; double value; } clock_entry;
 /* TS clock messages are immutable strings held by both the clock and its
  * display. Each entity gets its own heap text so a pointer stays valid when
  * the clock table grows or is restored, and a former display keeps its text. */
-typedef struct message_slot { qa_q2_entity *e; char text[16]; } message_slot;
+typedef struct message_slot { qa_q2_entity *e; qa_actor_id actor; char text[16]; } message_slot;
 
 struct qa_q2_base_scenery {
   qa_q2_base_entity_hooks hooks;
   anim_entry *animations; size_t animation_count, animation_cap;
   clock_entry *clocks; size_t clock_count, clock_cap;
   message_slot **messages; size_t message_count, message_cap;
+  /* TS WeakMap entries end with their entity: C drops them when the actor is released. */
+  bool connected;
+  qa_session_actor_registry *registry;
+  int64_t subscription;
   qa_q2_named_think thinks[6];
   qa_q2_named_use uses[5];
   qa_q2_named_touch touches[2];
@@ -93,33 +101,41 @@ void qa_q2_clock_text(double seconds, double style, char *out, size_t out_size) 
   (void)snprintf(out, out_size, "%s:%s:%s", hour_text, minute_text, sec);
 }
 
-static anim_entry *find_animation(qa_q2_base_scenery *s, qa_q2_entity *e) {
+static anim_entry *animation_slot(qa_q2_base_scenery *s, qa_q2_entity *e) {
   for (size_t i = 0; i < s->animation_count; i++) if (s->animations[i].e == e) return &s->animations[i];
   return NULL;
 }
-static clock_entry *find_clock(qa_q2_base_scenery *s, qa_q2_entity *e) {
+static clock_entry *clock_slot(qa_q2_base_scenery *s, qa_q2_entity *e) {
   for (size_t i = 0; i < s->clock_count; i++) if (s->clocks[i].e == e) return &s->clocks[i];
   return NULL;
 }
+static anim_entry *find_animation(qa_q2_base_scenery *s, qa_q2_entity *e) {
+  anim_entry *slot = animation_slot(s, e);
+  return slot && qa_same_actor(slot->actor, e->actor.id) ? slot : NULL;
+}
+static clock_entry *find_clock(qa_q2_base_scenery *s, qa_q2_entity *e) {
+  clock_entry *slot = clock_slot(s, e);
+  return slot && qa_same_actor(slot->actor, e->actor.id) ? slot : NULL;
+}
 static clock_entry *clock_of(qa_q2_base_scenery *s, qa_q2_entity *e) {
   clock_entry *entry = find_clock(s, e);
-  if (!entry) qa_range_error("Missing saved Q2 clock state");
+  if (!entry) qa_raise("Error", 0, 0, "Missing saved Q2 clock state");
   return entry;
 }
 static void set_animation(qa_q2_base_scenery *s, qa_q2_entity *e, double first, double end) {
-  anim_entry *existing = find_animation(s, e);
-  if (existing) { existing->first = first; existing->end = end; return; }
+  anim_entry *existing = animation_slot(s, e);
+  if (existing) { existing->actor = e->actor.id; existing->first = first; existing->end = end; return; }
   if (s->animation_count == s->animation_cap) {
     size_t cap = s->animation_cap ? s->animation_cap * 2 : 8;
     anim_entry *grown = realloc(s->animations, cap * sizeof *grown);
     if (!grown) qa_range_error("Out of memory");
     s->animations = grown; s->animation_cap = cap;
   }
-  s->animations[s->animation_count++] = (anim_entry){e, first, end};
+  s->animations[s->animation_count++] = (anim_entry){e, e->actor.id, first, end};
 }
 static clock_entry *set_clock(qa_q2_base_scenery *s, qa_q2_entity *e, double value) {
-  clock_entry *existing = find_clock(s, e);
-  if (existing) { existing->value = value; return existing; }
+  clock_entry *existing = clock_slot(s, e);
+  if (existing) { existing->actor = e->actor.id; existing->value = value; return existing; }
   if (s->clock_count == s->clock_cap) {
     size_t cap = s->clock_cap ? s->clock_cap * 2 : 8;
     clock_entry *grown = realloc(s->clocks, cap * sizeof *grown);
@@ -128,12 +144,13 @@ static clock_entry *set_clock(qa_q2_base_scenery *s, qa_q2_entity *e, double val
   }
   clock_entry *entry = &s->clocks[s->clock_count++];
   *entry = (clock_entry){0};
-  entry->e = e; entry->value = value;
+  entry->e = e; entry->actor = e->actor.id; entry->value = value;
   return entry;
 }
 
 static char *message_of(qa_q2_base_scenery *s, qa_q2_entity *e) {
-  for (size_t i = 0; i < s->message_count; i++) if (s->messages[i]->e == e) return s->messages[i]->text;
+  for (size_t i = 0; i < s->message_count; i++)
+    if (s->messages[i]->e == e && qa_same_actor(s->messages[i]->actor, e->actor.id)) return s->messages[i]->text;
   if (s->message_count == s->message_cap) {
     size_t cap = s->message_cap ? s->message_cap * 2 : 8;
     message_slot **grown = realloc(s->messages, cap * sizeof *grown);
@@ -142,9 +159,33 @@ static char *message_of(qa_q2_base_scenery *s, qa_q2_entity *e) {
   }
   message_slot *slot = calloc(1, sizeof *slot);
   if (!slot) qa_range_error("Out of memory");
-  slot->e = e;
+  slot->e = e; slot->actor = e->actor.id;
   s->messages[s->message_count++] = slot;
   return slot->text;
+}
+
+static void scenery_release(void *ctx, qa_owned_actor actor) {
+  qa_q2_base_scenery *s = ctx;
+  for (size_t i = 0; i < s->animation_count; i++)
+    if (qa_same_actor(s->animations[i].actor, actor.id)) {
+      memmove(&s->animations[i], &s->animations[i + 1], (s->animation_count - i - 1) * sizeof *s->animations);
+      s->animation_count--; i--;
+    }
+  for (size_t i = 0; i < s->clock_count; i++)
+    if (qa_same_actor(s->clocks[i].actor, actor.id)) {
+      memmove(&s->clocks[i], &s->clocks[i + 1], (s->clock_count - i - 1) * sizeof *s->clocks);
+      s->clock_count--; i--;
+    }
+  /* A released entity is still readable until the source clock moves on, so its
+   * message text stays; the slot only stops answering for that address. */
+  for (size_t i = 0; i < s->message_count; i++)
+    if (qa_same_actor(s->messages[i]->actor, actor.id)) s->messages[i]->e = NULL;
+}
+static void scenery_connect(qa_q2_base_scenery *s, qa_q2_game_services *game) {
+  if (s->connected) return;
+  s->registry = game->host->actors;
+  s->subscription = qa_session_actor_registry_on_release(game->host->actors, scenery_release, s);
+  s->connected = true;
 }
 
 static void set_model(qa_q2_entity *entity, qa_q2_game_services *game, const char *path, qa_bounds bounds, const char *solid) {
@@ -165,7 +206,7 @@ static void animate(qa_q2_base_scenery *s, qa_q2_entity *entity, qa_q2_game_serv
 static void animate_step_fn(void *c, qa_q2_entity *self, qa_q2_game_services *game) {
   qa_q2_base_scenery *s = c;
   anim_entry *state = find_animation(s, self);
-  if (!state) qa_range_error("Missing saved scenery animation");
+  if (!state) qa_raise("Error", 0, 0, "Missing saved scenery animation");
   self->frame++;
   if (self->frame >= state->end) self->frame = state->first;
   game->show(game->ctx, self);
@@ -177,6 +218,13 @@ static void reset_clock(qa_q2_base_scenery *s, qa_q2_entity *entity) {
   entity->has_activator = false;
   if ((sf(entity) & 1) != 0) { state->value = 0; entity->wait = entity->count; }
   else if ((sf(entity) & 2) != 0) { state->value = entity->count; entity->wait = 0; }
+}
+
+typedef struct clock_fire_scope { qa_q2_entity *self; const char *target, *message; } clock_fire_scope;
+static void clock_fire_finally(void *arg) {
+  clock_fire_scope *scope = arg;
+  scope->self->target = scope->target;
+  scope->self->message = scope->message;
 }
 
 static void clock_tick_fn(void *c, qa_q2_entity *self, qa_q2_game_services *services) {
@@ -211,18 +259,26 @@ static void clock_tick_fn(void *c, qa_q2_entity *self, qa_q2_game_services *serv
     memcpy(shown, own, sizeof ((message_slot *)0)->text);
     display->message = shown;
   }
+  double counted = state->value;
   qa_actor_id self_id = self->actor.id;
   (void)qa_actor_callback_table_use(services->host->callbacks, display->actor, &self_id, &self_id);
-  if (((sf(self) & 1) != 0 && state->value > self->wait) || ((sf(self) & 2) != 0 && state->value < self->wait)) {
+  /* The display's use callback may spawn or remove a clock and move the table; TS still
+   * holds this clock's state object when the clock itself was removed. */
+  state = find_clock(s, self);
+  double value = state ? state->value : counted;
+  if (((sf(self) & 1) != 0 && value > self->wait) || ((sf(self) & 2) != 0 && value < self->wait)) {
     const char *path_target = qa_q2_spawn_get(&self->spawn, "pathtarget");
     if (!path_target) path_target = "";
     if (path_target[0] != '\0') {
-      const char *previous_target = self->target, *previous_message = self->message;
+      /* TS try { useTargets } finally { restore target and message }. */
+      clock_fire_scope scope = {self, self->target, self->message};
+      qa_cleanup guard;
       self->target = path_target;
       self->message = "";
+      qa_cleanup_push(&guard, clock_fire_finally, &scope);
       qa_q2_game_use_targets_entity(services, self, self->has_activator ? &self->activator : NULL, false);
-      self->target = previous_target;
-      self->message = previous_message;
+      qa_cleanup_pop(&guard);
+      clock_fire_finally(&scope);
     }
     if ((sf(self) & 8) == 0 || !qa_session_actor_registry_is_live(services->host->actors, self->actor.id)) return;
     reset_clock(s, self);
@@ -251,9 +307,7 @@ static void teleporter_touch_fn(void *c, qa_q2_entity *self, qa_q2_game_services
   bool has_owned = qa_session_actor_registry_resolve_owned(services->host->actors, contact.other, &owned);
   qa_body_state_result body = qa_shared_body_table_read(services->host->bodies, contact.other);
   if (!destination) {
-    char message[512];
-    (void)snprintf(message, sizeof message, "Teleporter destination missing: %s", self->target);
-    services->host->diagnostic(services->host->ctx, message);
+    q2b_diagnosticf(services, "Teleporter destination missing: %s", self->target);
     return;
   }
   if (!has_owned || !body.has_value) return;
@@ -404,8 +458,9 @@ static void string_use_fn(void *c, qa_q2_entity *self, qa_q2_game_services *serv
       const char *member_team = qa_q2_spawn_get(&member->spawn, "team");
       if (!member_team || strcmp(member_team, team) != 0) continue;
     }
+    /* TS self.message[member.count - 1] ?? "": only an integer index names a character. */
     double index = member->count - 1;
-    char character = index >= 0 && index < (double)length ? self->message[(size_t)index] : '\0';
+    char character = index >= 0 && index < (double)length && index == trunc(index) ? self->message[(size_t)index] : '\0';
     member->frame = character >= '0' && character <= '9' ? character - '0' : character == '-' ? 10 : character == ':' ? 11 : 12;
     services->show(services->ctx, member);
   }
@@ -435,6 +490,7 @@ qa_q2_base_scenery *qa_q2_base_scenery_create(qa_q2_base_entity_hooks hooks) {
 }
 void qa_q2_base_scenery_destroy(qa_q2_base_scenery *s) {
   if (!s) return;
+  if (s->connected) qa_session_actor_registry_off_release(s->registry, s->subscription);
   for (size_t i = 0; i < s->message_count; i++) free(s->messages[i]);
   free(s->messages); free(s->animations); free(s->clocks); free(s);
 }
@@ -463,10 +519,11 @@ qa_q2_base_scenery_checkpoint qa_q2_base_scenery_capture(qa_q2_base_scenery *s, 
 static qa_q2_entity *saved_scenery(qa_q2_game_services *game, qa_saved_actor_id actor) {
   qa_owned_actor owner = qa_q2_restore_actor(game, actor);
   qa_q2_entity *entity = game->entity(game->ctx, &owner.id);
-  if (!entity) qa_range_error("Missing saved Q2 scenery");
+  if (!entity) qa_raise("Error", 0, 0, "Missing saved Q2 scenery");
   return entity;
 }
 void qa_q2_base_scenery_restore(qa_q2_base_scenery *s, qa_q2_game_services *game, qa_q2_base_scenery_checkpoint checkpoint) {
+  scenery_connect(s, game);
   s->animation_count = 0; s->clock_count = 0;
   for (size_t i = 0; i < checkpoint.animation_count; i++)
     set_animation(s, saved_scenery(game, checkpoint.animations[i].actor), checkpoint.animations[i].first, checkpoint.animations[i].end);
@@ -476,9 +533,7 @@ void qa_q2_base_scenery_restore(qa_q2_base_scenery *s, qa_q2_game_services *game
 
 static void spawn_clock(qa_q2_base_scenery *s, qa_q2_entity *entity, qa_q2_game_services *game) {
   if (entity->target[0] == '\0' || ((sf(entity) & 2) != 0 && entity->count == 0)) {
-    char message[128];
-    (void)snprintf(message, sizeof message, "func_clock without %s", (sf(entity) & 2) != 0 ? "count or target" : "target");
-    game->host->diagnostic(game->host->ctx, message);
+    q2b_diagnosticf(game, "func_clock without %s", (sf(entity) & 2) != 0 ? "count or target" : "target");
     game->remove(game->ctx, entity);
     return;
   }
@@ -506,7 +561,9 @@ static void spawn_teleporter(qa_q2_base_scenery *s, qa_q2_entity *entity, qa_q2_
   ev.reliable = false; ev.loop = "start";
   game->host->emit(game->host->ctx, ev);
   qa_q2_entity *trigger = game->create(game->ctx, "teleporter_trigger", NULL, 0);
-  trigger->target = entity->target;
+  /* TS strings are values; the teleporter's text is owned by its spawn fields and
+   * the trigger can outlive it, so the trigger keeps an interned copy. */
+  trigger->target = qa_q2_intern(entity->target);
   trigger->has_owner = true; trigger->owner = entity->actor.id;
   trigger->visible = false;
   qa_q2_body_changes changes = {0};
@@ -527,6 +584,7 @@ static void combat_create(qa_q2_game_services *game, qa_q2_entity *entity, doubl
 }
 
 bool qa_q2_base_scenery_spawn(qa_q2_base_scenery *s, qa_q2_entity *entity, qa_q2_game_services *game) {
+  scenery_connect(s, game);
   const char *classname = entity->classname;
   if (strcmp(classname, "viewthing") == 0) {
     entity->render_flags = 64;

@@ -30,7 +30,7 @@ static int signed_byte(const char *buffer, size_t offset) {
 typedef struct integer_scan { double value; size_t next_offset; } integer_scan;
 static integer_scan scan_integer(const char *buffer, size_t offset) {
   size_t length = strlen(buffer);
-  if (offset > length) qa_range_error("truncated session data scans beyond its terminating NUL");
+  if (offset > length) qa_raise("SessionDataError", 0, 0, "truncated session data scans beyond its terminating NUL");
   double value = qa_game_atoi(buffer + offset);
   size_t cursor = offset;
   while (cursor < length && signed_byte(buffer, cursor) <= 32) cursor++;

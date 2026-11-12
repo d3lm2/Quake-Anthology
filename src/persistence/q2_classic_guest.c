@@ -1,5 +1,6 @@
 /* Port of src/persistence/q2-classic-guest.ts. GPL-2.0-or-later. */
 #include "qa/persistence/q2_classic_guest.h"
+#include "qa/persistence/provider_ownership.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -62,6 +63,50 @@ static bool push_own(qa_save_value *array, qa_save_value *child) {
   return true;
 }
 
+/* --- configstring text ---
+ * TS keeps a configstring as a byte string (one character per byte, as the guest and the .sv2
+ * container read it), and the checkpoint JSON holds those characters, so a byte >= 0x80 is
+ * written as the two-byte UTF-8 of U+0080..U+00FF. The C level state keeps the raw bytes; these
+ * convert at the JSON boundary. */
+static char *bytes_to_json_text(const char *bytes) {
+  size_t length = strlen(bytes), extra = 0;
+  for (size_t i = 0; i < length; i++) extra += (unsigned char)bytes[i] >= 0x80;
+  char *out = (char *)malloc(length + extra + 1);
+  if (out == NULL) return NULL;
+  size_t o = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)bytes[i];
+    if (c < 0x80) out[o++] = (char)c;
+    else {
+      out[o++] = (char)(0xc0 | (c >> 6));
+      out[o++] = (char)(0x80 | (c & 0x3f));
+    }
+  }
+  out[o] = '\0';
+  return out;
+}
+/* Rewrites a decoded string node in place as its byte string: every character is at most
+ * U+00FF. A character above U+00FF has no byte form; such text stays as read (TS refuses it
+ * where it writes the bytes, textBytes' "source save requires byte characters"). */
+static void json_text_to_bytes(const qa_save_reader *reader) {
+  qa_save_value *node = (qa_save_value *)reader->value; /* the decoded tree is the save's own */
+  if (node == NULL || node->kind != QA_SAVE_STRING) return;
+  size_t length = node->text_length > strlen(node->text) ? node->text_length : strlen(node->text);
+  const unsigned char *in = (const unsigned char *)node->text;
+  for (size_t i = 0; i < length; i++)
+    if (in[i] >= 0xc4 || (in[i] >= 0x80 && in[i] < 0xc0 && (i == 0 || in[i - 1] < 0xc2))) return;
+  size_t o = 0;
+  for (size_t i = 0; i < length; i++) {
+    if (in[i] == 0xc2 || in[i] == 0xc3) {
+      node->text[o++] = (char)(((in[i] & 0x03) << 6) | (in[i + 1] & 0x3f));
+      i++;
+    } else
+      node->text[o++] = (char)in[i];
+  }
+  node->text[o] = '\0';
+  node->text_length = o > strlen(node->text) ? o : 0;
+}
+
 /* --- level-state read/write --- */
 static void read_level_state(const qa_save_reader *reader,
                              qa_q2_classic_level_state *out) {
@@ -79,6 +124,7 @@ static void read_level_state(const qa_save_reader *reader,
     qa_save_reader_destroy(&index);
     qa_save_reader value = field(&entry, "value");
     out->configstrings[i].value = qa_save_reader_string(&value);
+    json_text_to_bytes(&value);
     qa_save_reader_destroy(&value);
     qa_save_reader_destroy(&entry);
   }
@@ -106,12 +152,23 @@ static bool build_level_state_into(qa_save_value *obj,
   if (configstrings == NULL) return false;
   for (size_t i = 0; i < state->configstring_count; i++) {
     qa_save_value *entry = qa_save_value_object();
-    if (entry == NULL ||
-        !set_own(entry, "index", qa_save_value_number(state->configstrings[i].index)) ||
-        !set_own(entry, "value", qa_save_value_string(
-            state->configstrings[i].value != NULL ? state->configstrings[i].value : "")) ||
-        !push_own(configstrings, entry)) {
+    char *text = bytes_to_json_text(state->configstrings[i].value != NULL ? state->configstrings[i].value : "");
+    qa_save_value *value = text != NULL ? qa_save_value_string(text) : NULL;
+    free(text);
+    bool ok = entry != NULL && value != NULL;
+    if (!ok) {
       qa_save_value_free(entry);
+      qa_save_value_free(value);
+    } else if (!set_own(entry, "index", qa_save_value_number(state->configstrings[i].index))) {
+      qa_save_value_free(value);
+      qa_save_value_free(entry);
+      ok = false;
+    } else if (!set_own(entry, "value", value)) { /* set_own releases the child it could not store */
+      qa_save_value_free(entry);
+      ok = false;
+    } else
+      ok = push_own(configstrings, entry); /* push_own releases the entry it could not store */
+    if (!ok) {
       qa_save_value_free(configstrings);
       return false;
     }
@@ -123,9 +180,12 @@ static bool build_level_state_into(qa_save_value *obj,
     qa_save_value *entry = qa_save_value_object();
     if (entry == NULL ||
         !set_own(entry, "portal", qa_save_value_number(state->portals[i].portal)) ||
-        !set_own(entry, "open", qa_save_value_boolean(state->portals[i].open)) ||
-        !push_own(portals, entry)) {
+        !set_own(entry, "open", qa_save_value_boolean(state->portals[i].open))) {
       qa_save_value_free(entry);
+      qa_save_value_free(portals);
+      return false;
+    }
+    if (!push_own(portals, entry)) { /* push_own releases the entry */
       qa_save_value_free(portals);
       return false;
     }
@@ -134,24 +194,46 @@ static bool build_level_state_into(qa_save_value *obj,
 }
 
 /* --- validation --- */
+/* TS checks duplicates through Sets, then the ranges; every failure is the same Error, so one
+ * pass over each list with a seen-table over the valid range is the same test in linear time
+ * (a list from a save can be long). */
 static void validate_level_state(const qa_q2_classic_level_state *state) {
+  bool configstrings[2080] = {false};
   for (size_t i = 0; i < state->configstring_count; i++) {
     double index = state->configstrings[i].index;
-    if (!safe_integer(index) || index < 0 || index >= 2080)
+    if (!safe_integer(index) || index < 0 || index >= 2080 || configstrings[(size_t)index])
       qa_error("Invalid classic native level metadata");
-    for (size_t j = i + 1; j < state->configstring_count; j++)
-      if (state->configstrings[j].index == index)
-        qa_error("Invalid classic native level metadata");
+    configstrings[(size_t)index] = true;
   }
+  bool portals[1024] = {false};
   for (size_t i = 0; i < state->portal_count; i++) {
     double portal = state->portals[i].portal;
-    if (!safe_integer(portal) || portal < 0 || portal >= 1024)
+    if (!safe_integer(portal) || portal < 0 || portal >= 1024 || portals[(size_t)portal])
       qa_error("Invalid classic native level metadata");
-    for (size_t j = i + 1; j < state->portal_count; j++)
-      if (state->portals[j].portal == portal)
-        qa_error("Invalid classic native level metadata");
+    portals[(size_t)portal] = true;
   }
 }
+/* TS `visited` Set of the maps validated so far: open addressing over FNV-1a. */
+typedef struct visited_set {
+  const char **slots;
+  size_t capacity;
+} visited_set;
+static size_t text_hash(const char *text) {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++) hash = (hash ^ *p) * 0x100000001b3ull;
+  return (size_t)hash;
+}
+static bool visited_add(visited_set *set, const char *map) {
+  size_t mask = set->capacity - 1;
+  for (size_t at = text_hash(map) & mask;; at = (at + 1) & mask) {
+    if (set->slots[at] == NULL) {
+      set->slots[at] = map;
+      return true;
+    }
+    if (strcmp(set->slots[at], map) == 0) return false;
+  }
+}
+static void free_slots(void *arg) { free(arg); }
 static bool valid_visited_map(const char *map, const char *save_map) {
   if (map == NULL) return false;
   /* TS length counts UTF-16 units; C counts bytes. Map paths are
@@ -188,22 +270,28 @@ static void validate(const qa_q2_classic_original_save *save,
   validate_level_state(&save->server.state);
   if (save->server.cvars.length == 0)
     qa_error("Invalid classic native server state");
+  visited_set visited = {NULL, 16};
+  while (visited.capacity < save->visited_level_count * 2) visited.capacity *= 2;
+  visited.slots = (const char **)calloc(visited.capacity, sizeof *visited.slots);
+  if (visited.slots == NULL) qa_error("out of memory");
+  qa_cleanup visited_guard;
+  qa_cleanup_push(&visited_guard, free_slots, (void *)visited.slots);
   for (size_t i = 0; i < save->visited_level_count; i++) {
     const qa_q2_classic_visited_level *level = &save->visited_levels[i];
-    bool duplicate = false;
-    for (size_t j = 0; j < i; j++)
-      if (same_text(save->visited_levels[j].map, level->map)) duplicate = true;
+    /* TS tests visited.has(map) before the map is added, after the path checks. */
     if (level->version != 1 || !valid_visited_map(level->map, save->map) ||
-        duplicate || level->level.length == 0)
+        !visited_add(&visited, level->map) || level->level.length == 0)
       qa_error("Invalid classic native visited level");
     validate_level_state(&level->state);
   }
+  qa_cleanup_pop(&visited_guard);
+  free((void *)visited.slots);
   /* TS calls decodeCheckpointValue(save.server.cvars) for its throw. */
   qa_save_value *cvars = qa_decode_checkpoint_value(save->server.cvars.bytes,
                                                     save->server.cvars.length);
   qa_save_value_free(cvars);
-  if (save->game.length == 0 || save->level.length == 0)
-    qa_error("Classic native save requires both original files");
+  if (save->game.length == 0 || (!save->level_absent && save->level.length == 0))
+    qa_error("Classic native save requires its original game file");
 }
 
 /* --- provider checkpoint encode/decode --- */
@@ -245,7 +333,8 @@ static qa_save_value *build_save(const qa_q2_classic_original_save *save) {
       !set_own(obj, "server", server))
     goto fail;
   if (!set_own(obj, "game", qa_save_value_bytes(save->game.bytes, save->game.length)) ||
-      !set_own(obj, "level", qa_save_value_bytes(save->level.bytes, save->level.length)))
+      !set_own(obj, "level", save->level_absent ? qa_save_value_null()
+                                                : qa_save_value_bytes(save->level.bytes, save->level.length)))
     goto fail;
   qa_save_value *visited = qa_save_value_array();
   if (visited == NULL) goto fail;
@@ -282,17 +371,24 @@ bool qa_encode_q2_classic_original_save(const qa_q2_classic_original_save *save,
   if (bytes == NULL) return false;
   out->provider = save->module.id;
   out->schema = "q2:classic-native-original";
-  out->version = 1;
+  out->version = QA_NATIVE_Q2_ORIGINAL_VERSION;
   out->bytes.bytes = bytes;
   out->bytes.length = length;
   return true;
 }
-bool qa_decode_q2_classic_original_save(const qa_provider_checkpoint *record,
-                                        qa_q2_classic_original_identity expected,
-                                        qa_q2_classic_original_save *out) {
-  memset(out, 0, sizeof *out);
+/* A map read from the save. TS validate() refuses a map holding a NUL (the visited-level pattern) or
+ * compares it whole (the current map); the C text would end at the NUL, so such a map reads as a text
+ * no check accepts ("\x7f"), and validation fails where TS fails. */
+static const char *map_text(const qa_save_reader *reader) {
+  size_t length = 0;
+  const char *text = qa_save_reader_string_length(reader, &length);
+  return length == strlen(text) ? text : "\x7f";
+}
+static bool decode_original_save(const qa_provider_checkpoint *record,
+                                 qa_q2_classic_original_identity expected,
+                                 qa_q2_classic_original_save *out) {
   if (!same_text(record->schema, "q2:classic-native-original") ||
-      record->version != 1 || !same_text(record->provider, expected.module.id))
+      (record->version != 1 && record->version != 2) || !same_text(record->provider, expected.module.id))
     qa_error("Unsupported classic native source save provider");
   qa_save_value *root = qa_decode_checkpoint_value(record->bytes.bytes,
                                                    record->bytes.length);
@@ -322,11 +418,11 @@ bool qa_decode_q2_classic_original_save(const qa_provider_checkpoint *record,
   qa_save_reader_destroy(&server);
   qa_save_reader visits = field(&reader, "visitedLevels");
   if (!qa_save_reader_is_undefined(&visits)) {
-    out->visited_level_count = qa_save_reader_list_count(&visits);
+    size_t visited_count = qa_save_reader_list_count(&visits);
     out->visited_levels = (qa_q2_classic_visited_level *)calloc(
-        out->visited_level_count != 0 ? out->visited_level_count : 1,
-        sizeof *out->visited_levels);
+        visited_count != 0 ? visited_count : 1, sizeof *out->visited_levels);
     if (out->visited_levels == NULL) qa_save_reader_fail(&visits, "out of memory");
+    out->visited_level_count = visited_count;
     for (size_t i = 0; i < out->visited_level_count; i++) {
       qa_save_reader entry = item(&visits, i);
       qa_save_reader entry_version = field(&entry, "version");
@@ -335,7 +431,7 @@ bool qa_decode_q2_classic_original_save(const qa_provider_checkpoint *record,
       out->visited_levels[i].version = 1;
       read_level_state(&entry, &out->visited_levels[i].state);
       qa_save_reader map = field(&entry, "map");
-      out->visited_levels[i].map = qa_save_reader_string(&map);
+      out->visited_levels[i].map = map_text(&map);
       qa_save_reader_destroy(&map);
       qa_save_reader level = field(&entry, "level");
       out->visited_levels[i].level.bytes =
@@ -349,7 +445,7 @@ bool qa_decode_q2_classic_original_save(const qa_provider_checkpoint *record,
   out->module = qa_read_module(&module);
   qa_save_reader_destroy(&module);
   qa_save_reader map = field(&reader, "map");
-  out->map = qa_save_reader_string(&map);
+  out->map = map_text(&map);
   qa_save_reader_destroy(&map);
   qa_save_reader autosave = field(&reader, "autosave");
   out->autosave = qa_save_reader_boolean(&autosave);
@@ -357,8 +453,10 @@ bool qa_decode_q2_classic_original_save(const qa_provider_checkpoint *record,
   qa_save_reader game = field(&reader, "game");
   out->game.bytes = qa_save_reader_bytes(&game, &out->game.length);
   qa_save_reader_destroy(&game);
+  /* Version 2 allows the current level to be absent; a version 1 record always carries it. */
   qa_save_reader level = field(&reader, "level");
-  out->level.bytes = qa_save_reader_bytes(&level, &out->level.length);
+  if (record->version != 1 && qa_save_reader_is_null(&level)) out->level_absent = true;
+  else out->level.bytes = qa_save_reader_bytes(&level, &out->level.length);
   qa_save_reader_destroy(&level);
   qa_save_reader_destroy(&reader);
   validate(out, expected);
@@ -385,6 +483,53 @@ void qa_q2_classic_original_save_free(qa_q2_classic_original_save *save) {
   }
   qa_save_value_free(save->root);
   memset(save, 0, sizeof *save);
+}
+typedef struct decode_scope {
+  const qa_provider_checkpoint *record;
+  qa_q2_classic_original_identity expected;
+  qa_q2_classic_original_save *out;
+  bool ok;
+} decode_scope;
+static void decode_scope_run(void *raw) {
+  decode_scope *scope = (decode_scope *)raw;
+  scope->ok = decode_original_save(scope->record, scope->expected, scope->out);
+}
+/* A record that fails validation raises; the partly decoded save is released first, as the TS discards it. */
+bool qa_decode_q2_classic_original_save(const qa_provider_checkpoint *record,
+                                        qa_q2_classic_original_identity expected,
+                                        qa_q2_classic_original_save *out) {
+  memset(out, 0, sizeof *out);
+  decode_scope scope = {record, expected, out, false};
+  qa_caught_error caught;
+  if (!qa_try(decode_scope_run, &scope, &caught)) {
+    qa_q2_classic_original_save_free(out);
+    qa_rethrow(&caught);
+  }
+  return scope.ok;
+}
+static void owned_level_state_free(qa_q2_classic_level_state *state) {
+  for (size_t i = 0; i < state->configstring_count; i++) free((char *)state->configstrings[i].value);
+  level_state_free(state);
+}
+void qa_q2_classic_original_import_free(qa_q2_classic_original_import *import) {
+  if (import == NULL) return;
+  free(import->map);
+  free(import->spawn_point);
+  owned_level_state_free(&import->server);
+  for (size_t i = 0; i < import->latched_count; i++) {
+    free(import->latched[i].name);
+    free(import->latched[i].value);
+  }
+  free(import->latched);
+  free(import->game);
+  free(import->level);
+  for (size_t i = 0; i < import->visited_level_count; i++) {
+    owned_level_state_free(&import->visited_levels[i].state);
+    free((char *)import->visited_levels[i].map);
+    free((void *)import->visited_levels[i].level.bytes);
+  }
+  free(import->visited_levels);
+  memset(import, 0, sizeof *import);
 }
 
 /* --- ClassicOriginalSaveFiles overlay --- */
@@ -676,6 +821,7 @@ static void operation_end(qa_classic_original_save_files *files) {
   entries_clear(files);
   files->active = false;
 }
+static void operation_end_cleanup(void *arg) { operation_end(arg); }
 static void assert_closed(qa_classic_original_save_files *files) {
   for (size_t i = 0; i < files->entry_count; i++)
     if (files->entries[i].open_handles != 0)
@@ -707,6 +853,8 @@ bool qa_classic_original_save_files_capture(
     qa_q2_classic_original_save *out) {
   memset(out, 0, sizeof *out);
   if (!operation_begin(files, OP_CAPTURE, NULL, 0)) return false;
+  qa_cleanup operation; /* TS run(): finally closes the handles and ends the operation */
+  qa_cleanup_push(&operation, operation_end_cleanup, files);
   write(write_ctx, k_game_path, k_level_path, autosave);
   assert_closed(files);
   file_entry *game = find_entry(files, k_game_path, NULL);
@@ -720,6 +868,7 @@ bool qa_classic_original_save_files_capture(
   size_t game_length = game->length;
   uint8_t *level_copy = dup_bytes(level->bytes, level->length);
   size_t level_length = level->length;
+  qa_cleanup_pop(&operation);
   operation_end(files);
   if (game_copy == NULL || level_copy == NULL ||
       !copy_level_state(&server.state, &out->server.state)) {
@@ -742,33 +891,36 @@ bool qa_classic_original_save_files_capture(
 }
 void qa_classic_original_save_files_restore(
     qa_classic_original_save_files *files, const qa_q2_classic_original_save *save,
-    qa_q2_classic_original_identity expected, qa_q2_classic_read_fn read,
-    void *read_ctx) {
-  validate(save, expected);
+    qa_q2_classic_read_fn read, void *read_ctx) {
+  /* TS restoreFiles: a save whose current level was never written has only the game file to hand to the module. */
   const initial_bytes initial[] = {
       {true, save->game.bytes, save->game.length},
       {false, save->level.bytes, save->level.length}};
-  if (!operation_begin(files, OP_RESTORE, initial, 2))
+  if (!operation_begin(files, OP_RESTORE, initial, save->level_absent ? 1 : 2))
     qa_error("out of memory");
-  read(read_ctx, k_game_path, k_level_path);
+  qa_cleanup operation;
+  qa_cleanup_push(&operation, operation_end_cleanup, files);
+  read(read_ctx, k_game_path, save->level_absent ? NULL : k_level_path);
   assert_closed(files);
   bool consumed = true;
   for (size_t i = 0; i < files->entry_count; i++)
     if (!files->entries[i].read) consumed = false;
+  qa_cleanup_pop(&operation);
   operation_end(files);
   if (!consumed)
-    qa_error("Native restore callbacks did not consume both original files");
+    qa_error("Native restore callbacks did not consume the original files");
 }
 void qa_classic_original_save_files_restore_loading(
     qa_classic_original_save_files *files, const qa_q2_classic_original_save *save,
-    qa_q2_classic_original_identity expected, qa_q2_classic_read_fn read,
-    void *read_ctx) {
-  qa_classic_original_save_files_restore(files, save, expected, read, read_ctx);
+    qa_q2_classic_read_fn read, void *read_ctx) {
+  qa_classic_original_save_files_restore(files, save, read, read_ctx);
 }
 bool qa_classic_original_save_files_capture_travel_level(
     qa_classic_original_save_files *files, qa_q2_classic_level_write_fn write,
     void *write_ctx, uint8_t **out_bytes, size_t *out_length) {
   if (!operation_begin(files, OP_CAPTURE_LEVEL, NULL, 0)) return false;
+  qa_cleanup operation;
+  qa_cleanup_push(&operation, operation_end_cleanup, files);
   write(write_ctx, k_level_path);
   assert_closed(files);
   file_entry *level = find_entry(files, k_level_path, NULL);
@@ -776,6 +928,7 @@ bool qa_classic_original_save_files_capture_travel_level(
     qa_error("Native travel callback did not write a level file");
   *out_bytes = dup_bytes(level->bytes, level->length);
   *out_length = level->length;
+  qa_cleanup_pop(&operation);
   operation_end(files);
   return *out_bytes != NULL;
 }
@@ -792,10 +945,13 @@ void *qa_classic_original_save_files_with_travel_level(
   const initial_bytes initial[] = {{false, bytes, length}};
   if (!operation_begin(files, OP_RESTORE_LEVEL, initial, 1))
     qa_error("out of memory");
+  qa_cleanup operation;
+  qa_cleanup_push(&operation, operation_end_cleanup, files);
   void *result = read(read_ctx, k_level_path);
   assert_closed(files);
   file_entry *level = find_entry(files, k_level_path, NULL);
   bool consumed = level != NULL && level->read;
+  qa_cleanup_pop(&operation);
   operation_end(files);
   if (!consumed)
     qa_error("Native travel callback did not consume the level file");

@@ -31,7 +31,22 @@ char *qa_physical_input_name(const qa_physical_input *input);
 qa_input_binding *qa_default_bindings(double device, qa_command_dialect dialect,
                                       const qa_weapon_binding_item *items,
                                       size_t item_count, size_t *out_count);
-/* Malloc'd command strings; caller frees each and the array. */
+/* TS nativeConfigCarries: whether a game's own config file carries this binding: a console command on a key
+ * or mouse button. Controller bindings and engine action targets live only in the seat settings, so they are
+ * restored from there even when a stock game's file holds the rest of the bindings. */
+bool qa_native_config_carries(const qa_input_binding *binding);
+/* One `[key, command]` pair of TS archivedBindingPairs; both strings are owned. */
+typedef struct qa_binding_pair {
+  char *key;
+  char *command;
+} qa_binding_pair;
+/* TS archivedBindingPairs: dedicated profiles include named device-zero controls; graphical profiles retain
+ * controllers in seat settings. Malloc'd; free with qa_binding_pairs_free. NULL only on OOM. */
+qa_binding_pair *qa_archived_binding_pairs(const qa_input_binding *bindings, size_t count,
+                                           bool include_controller_bindings, size_t *out_count);
+void qa_binding_pairs_free(qa_binding_pair *pairs, size_t count);
+/* TS archivedBindings: "unbindall", then one `bind "KEY" "command"` per pair. Malloc'd command strings; caller
+ * frees each and the array. */
 char **qa_archived_bindings(const qa_input_binding *bindings, size_t count,
                             bool include_controller_bindings, size_t *out_count);
 

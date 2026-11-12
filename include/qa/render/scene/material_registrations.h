@@ -120,6 +120,8 @@ typedef struct qa_prepared_remap_refresh { void *_impl; qa_scene_material_regist
 void qa_scene_material_registrations_prepare_remap_refresh(qa_scene_material_registrations *r, const qa_remap_refresh_source *sources, size_t count, qa_prepared_remap_refresh *out);
 void qa_prepared_remap_refresh_validate(qa_prepared_remap_refresh *p);
 void qa_prepared_remap_refresh_commit(qa_prepared_remap_refresh *p);
+/* Releases a prepared refresh that will not be committed (commit releases its own). */
+void qa_prepared_remap_refresh_destroy(qa_prepared_remap_refresh *p);
 qa_provider_shader_registrations *qa_scene_material_registrations_provider(qa_scene_material_registrations *r, qa_content_id content);
 qa_shader_world_identity *qa_scene_material_registrations_world(qa_scene_material_registrations *r, qa_decoded_world map);
 void qa_scene_material_registrations_admit(qa_scene_material_registrations *r, qa_shader_registration *registration);

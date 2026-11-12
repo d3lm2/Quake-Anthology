@@ -57,9 +57,9 @@ static noreturn void slot_outside(const qa_q3_base_player_state_slots *slots, do
 }
 double qa_q3_base_player_state_slots_get(const qa_q3_base_player_state_slots *slots, double index) {
   if (slots->has_binding) {
-    int32_t value;
+    double value;
     if (!slots->binding.read(slots->binding.ctx, index, &value)) slot_outside(slots, index);
-    return (double)value;
+    return value;
   }
   /* Int32Array load: non-integer or out-of-range index is undefined. */
   if (!(index == trunc(index)) || index < 0 || index >= slots->length) slot_outside(slots, index);

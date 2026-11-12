@@ -34,7 +34,7 @@ bool qa_app_sim_source_pickup_cargo_get(qa_app_sim_source_pickup_cargo *c, qa_ac
 }
 void qa_app_sim_source_pickup_cargo_set(qa_app_sim_source_pickup_cargo *c, qa_actor_id actor, qa_app_sim_dropped_pickup_cargo cargo) {
   bool safe = cargo.count == trunc(cargo.count) && fabs(cargo.count) <= 9007199254740991.0;
-  if (!c->reg.is_live(c->reg.ctx, actor) || !safe || cargo.count <= 0) qa_range_error("Invalid original dropped pickup cargo");
+  if (!c->reg.is_live(c->reg.ctx, actor) || !safe || cargo.count <= 0) qa_raise("Error", 0, 0, "Invalid original dropped pickup cargo");
   bool f; size_t i = idx_of(c, actor, &f);
   if (f) { c->current[i].cargo = cargo; return; }
   if (c->count == c->cap) { c->cap = c->cap != 0 ? c->cap * 2 : 8; c->current = realloc(c->current, c->cap * sizeof *c->current); if (c->current == NULL) qa_range_error("Out of memory"); }
@@ -63,17 +63,24 @@ static qa_app_sim_dropped_pickup_level *copy_levels(const qa_app_sim_dropped_pic
 }
 qa_app_sim_dropped_pickup_level *qa_app_sim_source_pickup_cargo_travel(qa_app_sim_source_pickup_cargo *c, const char *map, bool new_unit, size_t *out_count) {
   size_t n = new_unit ? 0 : c->level_count;
-  qa_app_sim_dropped_pickup_level *levels = new_unit ? calloc(1, sizeof *levels) : copy_levels(c->levels, c->level_count);
-  if (levels == NULL) qa_range_error("Out of memory");
+  /* The current level's slots first (their throw leaves nothing allocated); copying the retained levels before
+   * them, as TS does, has no effect the order could show. */
+  qa_app_sim_dropped_pickup_slot *items = NULL;
   if (!new_unit) {
-    qa_app_sim_dropped_pickup_slot *items = calloc(c->count != 0 ? c->count : 1, sizeof *items);
+    items = calloc(c->count != 0 ? c->count : 1, sizeof *items);
     if (items == NULL) qa_range_error("Out of memory");
     for (size_t i = 0; i < c->count; i++) {
       qa_provider_id prov = NULL; double slot = 0;
-      if (!c->reg.source_of(c->reg.ctx, c->current[i].actor, &prov, &slot) || prov == NULL || c->provider == NULL || strcmp(prov, c->provider) != 0)
-        qa_range_error("Dropped pickup has no original level allocation");
+      if (!c->reg.source_of(c->reg.ctx, c->current[i].actor, &prov, &slot) || prov == NULL || c->provider == NULL || strcmp(prov, c->provider) != 0) {
+        free(items);
+        qa_raise("Error", 0, 0, "Dropped pickup has no original level allocation");
+      }
       items[i].item = c->current[i].cargo.item; items[i].count = c->current[i].cargo.count; items[i].slot = slot;
     }
+  }
+  qa_app_sim_dropped_pickup_level *levels = new_unit ? calloc(1, sizeof *levels) : copy_levels(c->levels, c->level_count);
+  if (levels == NULL) qa_range_error("Out of memory");
+  if (!new_unit) {
     size_t found = n; bool has = false;
     for (size_t i = 0; i < n; i++) if (strcmp(levels[i].map, map) == 0) { found = i; has = true; }
     if (has) { free(levels[found].items); levels[found].items = items; levels[found].item_count = c->count; }
@@ -91,7 +98,7 @@ void qa_app_sim_source_pickup_cargo_revisit(qa_app_sim_source_pickup_cargo *c, c
     for (size_t j = 0; j < levels[i].item_count; j++) {
       qa_actor_id actor;
       if (!c->reg.at_source(c->reg.ctx, c->provider, levels[i].items[j].slot, &actor))
-        qa_range_error("Retained dropped pickup has no restored source allocation");
+        qa_raise("Error", 0, 0, "Retained dropped pickup has no restored source allocation");
       qa_app_sim_dropped_pickup_cargo cargo = {levels[i].items[j].item, levels[i].items[j].count};
       qa_app_sim_source_pickup_cargo_set(c, actor, cargo);
     }

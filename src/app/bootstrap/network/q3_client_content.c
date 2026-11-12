@@ -83,17 +83,20 @@ static bool collect_is_q3(void *ctx, const qa_resolved_resource_reference *refer
   (void)reference;
   return *flag;
 }
-typedef struct packages_scope { const qa_app_q3_package_mount *mounts; size_t count; double checksum_feed; qa_app_q3_packages *packages; } packages_scope;
-static void packages_body(void *ctx) {
-  packages_scope *scope = ctx;
-  scope->packages = qa_app_q3_packages_open(scope->mounts, scope->count, scope->checksum_feed);
+typedef struct open_held { qa_app_q3_client_content *content; qa_app_q3_packages *catalog; qa_content_digest *storage; } open_held;
+static void open_unwind(void *arg) {
+  open_held *held = arg;
+  qa_app_q3_packages_destroy(held->catalog);
+  free(held->storage);
+  /* Closes the loaded content when there is one; settings are the content's. */
+  qa_app_q3_client_content_destroy(held->content);
 }
 qa_app_q3_client_content *qa_app_q3_client_content_open(qa_app_q3_content_host host,
     const char *info, double checksum_feed) {
   pure_system_info settings = system_info(info, checksum_feed);
   if (strcmp(host.product_family, "q3") != 0) {
     system_info_free(&settings);
-    qa_range_error("Q3 client content requires a Q3 product");
+    qa_raise("Error", 0, 0, "Q3 client content requires a Q3 product");
   }
   const char *slash = strrchr(host.product_content_directory, '/');
   const char *tail = slash ? slash + 1 : host.product_content_directory;
@@ -108,45 +111,30 @@ qa_app_q3_client_content *qa_app_q3_client_content_open(qa_app_q3_content_host h
   qa_app_q3_client_content *content = calloc(1, sizeof *content);
   if (!content) { system_info_free(&settings); return NULL; }
   content->host = host; content->settings = settings;
-  qa_app_q3_packages *catalog = qa_app_q3_packages_open(
-      host.catalog_mounts, host.catalog_mount_count, checksum_feed);
-  if (!catalog) { qa_app_q3_client_content_destroy(content); return NULL; }
-  qa_pure_mount_policy policy; qa_content_digest *storage = NULL;
+  /* A raise from the catalog packages, the content load or the loaded packages (TS: catch {
+   * await content.close(); throw }) releases what this call built. */
+  open_held held = {content, NULL, NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, open_unwind, &held);
+  held.catalog = qa_app_q3_packages_open(host.catalog_mounts, host.catalog_mount_count, checksum_feed);
+  if (!held.catalog) { qa_cleanup_pop(&guard); open_unwind(&held); return NULL; }
+  qa_pure_mount_policy policy;
   bool has_policy = settings.checksum_count != 0;
   if (has_policy) {
     if (!qa_q3_content_references_pure_mount_policy(
-            qa_app_q3_packages_references(catalog), settings.checksums,
-            settings.checksum_count, &policy, &storage))
+            qa_app_q3_packages_references(held.catalog), settings.checksums,
+            settings.checksum_count, &policy, &held.storage))
       qa_range_error("out of memory");
   }
-  void *loaded = host.load_content(host.ctx, has_policy ? &policy : NULL);
-  content->loaded = loaded;
+  content->loaded = host.load_content(host.ctx, has_policy ? &policy : NULL);
   size_t mount_count = 0;
-  const qa_app_q3_package_mount *mounts = host.loaded_mounts(host.ctx, loaded, &mount_count);
-  /* TS: try { Q3ApplicationPackages.open(content) } catch (error) { await content.close(); throw error; } */
-  packages_scope scope = { mounts, mount_count, checksum_feed, NULL };
-  qa_caught_error caught;
-  if (!qa_try(packages_body, &scope, &caught)) {
-    host.close_content(host.ctx, loaded);
-    content->loaded = NULL;
-    qa_app_q3_packages_destroy(catalog);
-    free(storage);
-    content->settings.checksums = NULL; content->settings.checksum_count = 0;
-    system_info_free(&settings);
-    free(content);
-    qa_rethrow(&caught);
-  }
-  content->packages = scope.packages;
-  if (!content->packages) {
-    host.close_content(host.ctx, loaded);
-    content->loaded = NULL;
-    qa_app_q3_packages_destroy(catalog);
-    qa_app_q3_client_content_destroy(content);
-    return NULL;
-  }
+  const qa_app_q3_package_mount *mounts = host.loaded_mounts(host.ctx, content->loaded, &mount_count);
+  content->packages = qa_app_q3_packages_open(mounts, mount_count, checksum_feed);
+  if (!content->packages) { qa_cleanup_pop(&guard); open_unwind(&held); return NULL; }
   content->has_policy = has_policy;
-  if (has_policy) { content->policy = policy; content->policy_storage = storage; }
-  qa_app_q3_packages_destroy(catalog);
+  if (has_policy) { content->policy = policy; content->policy_storage = held.storage; held.storage = NULL; }
+  qa_cleanup_pop(&guard);
+  qa_app_q3_packages_destroy(held.catalog);
   return content;
 }
 void qa_app_q3_client_content_destroy(qa_app_q3_client_content *content) {
@@ -205,7 +193,7 @@ char *qa_app_q3_client_content_referenced_pure_command(
         if (snapshot[i].flags & required[r].flag) found = true;
       if (!found) {
         free(snapshot);
-        qa_range_error("Pure Q3 admission requires an actually loaded %s module", required[r].name);
+        qa_raise("Error", 0, 0, "Pure Q3 admission requires an actually loaded %s module", required[r].name);
       }
     }
     free(snapshot);

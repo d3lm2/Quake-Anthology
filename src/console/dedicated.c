@@ -2,10 +2,14 @@
 #include "qa/console/dedicated.h"
 
 #include "qa/foundation/support.h"
+#include <errno.h>
+#include <poll.h>
 #include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 static noreturn void qa_error(const char *message) {
   qa_raise("Error", 0, 0, "%s", message);
@@ -73,11 +77,23 @@ static void split_pending(qa_dedicated_console *console) {
   }
 }
 
+/* TS this.pending.length: UTF-16 units of the decoded text. A 4-byte UTF-8
+ * sequence is two units, other sequences one; continuation bytes add none. */
+static size_t pending_units(const qa_dedicated_console *console) {
+  size_t units = 0;
+  for (size_t i = 0; i < console->pending_length; i++) {
+    uint8_t byte = (uint8_t)console->pending[i];
+    if ((byte & 0xc0) == 0x80) continue;
+    units += byte >= 0xf0 ? 2 : 1;
+  }
+  return units;
+}
+
 /* TS split(): lines first, then an over-long unterminated remainder is
  * dropped. */
 static void split(qa_dedicated_console *console) {
   split_pending(console);
-  if (console->pending_length > MAXIMUM_PENDING) {
+  if (console->pending_length > MAXIMUM_PENDING && pending_units(console) > MAXIMUM_PENDING) {
     console->pending_length = 0;
     console->dropped++;
   }
@@ -121,6 +137,33 @@ void qa_dedicated_console_fail(qa_dedicated_console *console,
   if (console->closed) return;
   free(console->error_message);
   console->error_message = dup_range(message, strlen(message));
+}
+
+void qa_dedicated_console_pump_stdin(qa_dedicated_console *console) {
+  if (console->closed || console->ended || console->error_message != NULL) return;
+  for (;;) {
+    struct pollfd descriptor = {.fd = STDIN_FILENO, .events = POLLIN};
+    int ready = poll(&descriptor, 1, 0);
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready <= 0) return;
+    if ((descriptor.revents & POLLNVAL) != 0) { /* no standard input: an ended stream */
+      qa_dedicated_console_end(console);
+      return;
+    }
+    char buffer[4096];
+    ssize_t count = read(STDIN_FILENO, buffer, sizeof buffer);
+    if (count < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+      qa_dedicated_console_fail(console, strerror(errno));
+      return;
+    }
+    if (count == 0) {
+      qa_dedicated_console_end(console);
+      return;
+    }
+    qa_dedicated_console_feed(console, buffer, (size_t)count);
+  }
 }
 
 bool qa_dedicated_console_eof(const qa_dedicated_console *console) {

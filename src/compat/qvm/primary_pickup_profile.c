@@ -142,9 +142,15 @@ bool qa_qvm_primary_pickup_grant_eligible(void *ctx, qa_qvm_pickup_eligibility c
     bindings[i].ctx = &decisions[i];
     bindings[i].decide = decide_branch;
   }
+  /* The gate is guest code: its raise must not strand the per-call decisions. */
+  qa_cleanup binding_cleanup, decision_cleanup;
+  qa_cleanup_push(&binding_cleanup, free, bindings);
+  qa_cleanup_push(&decision_cleanup, free, decisions);
   call->branches(call->call_ctx, bindings, branch_count);
   int32_t result = strcmp(call->execution, "asynchronous") == 0 ? call->proceed_async(call->call_ctx)
                                                                 : call->proceed(call->call_ctx);
+  qa_cleanup_pop(&decision_cleanup);
+  qa_cleanup_pop(&binding_cleanup);
   free(bindings);
   free(decisions);
   return result != 0;
@@ -170,6 +176,7 @@ void qa_qvm_read_primary_pickup_profile(const qa_save_reader *reader, const qa_r
   qa_save_reader grants_reader = field(reader, "grants");
   size_t grant_count = qa_save_reader_list_count(&grants_reader);
   qa_qvm_pickup_grant *grants = xmalloc(grant_count * sizeof *grants);
+  memset(grants, 0, grant_count * sizeof *grants); /* a refused grant leaves the rest freeable */
   out->grants = grants;
   out->grant_count = grant_count;
   for (size_t g = 0; g < grant_count; g++) {

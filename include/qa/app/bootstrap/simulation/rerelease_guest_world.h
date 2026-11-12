@@ -19,7 +19,8 @@ typedef struct qa_app_sim_rerelease_guest_world_options {
   qa_windows_capabilities capabilities; /* nowMilliseconds, performanceCounter and performanceFrequency are required */
   bool has_instruction_budget; double instruction_budget;
 } qa_app_sim_rerelease_guest_world_options;
-typedef struct qa_app_sim_rerelease_guest_save { qa_compat_q2_rerelease_source_save game, level; } qa_app_sim_rerelease_guest_save;
+/* level_absent is the TS `level: null`: the save never wrote the current level, which then spawns fresh. */
+typedef struct qa_app_sim_rerelease_guest_save { qa_compat_q2_rerelease_source_save game, level; bool level_absent; } qa_app_sim_rerelease_guest_save;
 typedef struct qa_app_sim_rerelease_guest_revisit {
   qa_compat_q2_rerelease_source_save level;
   void *ctx; void (*restore_server_state)(void *ctx, qa_app_sim_rerelease_guest_world *world);
@@ -56,6 +57,8 @@ qa_app_sim_rerelease_entity_info qa_app_sim_rerelease_guest_world_entity_info(qa
 const qa_q2_rerelease_entity_state *qa_app_sim_rerelease_guest_world_entity_states(qa_app_sim_rerelease_guest_world *world, size_t *out_count);
 qa_q2_rerelease_entity_state qa_app_sim_rerelease_guest_world_entity_state(qa_app_sim_rerelease_guest_world *world, double slot);
 qa_q2_rerelease_player_state qa_app_sim_rerelease_guest_world_player_state(qa_app_sim_rerelease_guest_world *world, double slot);
+/* The same state with its stats in the caller's own 64 numbers (see rerelease_guest_services.h). */
+qa_q2_rerelease_player_state qa_app_sim_rerelease_guest_world_player_state_into(qa_app_sim_rerelease_guest_world *world, double slot, double *stats);
 double qa_app_sim_rerelease_guest_world_player_ping(qa_app_sim_rerelease_guest_world *world, double slot);
 void qa_app_sim_rerelease_guest_world_set_player_ping(qa_app_sim_rerelease_guest_world *world, double slot, double ping);
 qa_app_sim_model_appearance qa_app_sim_rerelease_guest_world_model_appearance(qa_app_sim_rerelease_guest_world *world, double slot);

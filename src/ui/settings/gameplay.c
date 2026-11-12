@@ -38,7 +38,7 @@ static void color_write(void *v, const char *value) {
   bool known = false;
   for (int i = 0; i < 14; i++)
     if (strcmp(c->colors[i].id, value) == 0) known = true;
-  if (!known) qa_range_error("Unknown Quake color");
+  if (!known) qa_raise("Error", 0, 0, "Unknown Quake color");
   char *text = qa_cvar_registry_variable_string(c->client, c->name);
   if (text == NULL) qa_range_error("Out of memory");
   int32_t previous = qa_native_atoi(text);

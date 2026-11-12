@@ -5,6 +5,7 @@
 #include "qa/audio/wav.h"
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,9 @@
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
+#include "qa/platform/files/writable.h"
+#include "qa/platform/files/contained.h"
+#include "qa/formats/text_decoder.h"
 typedef struct retained_entry { char *key; uint8_t *bytes; size_t length; qa_resource_id resource; } retained_entry;
 typedef struct sound_entry { char *path; qa_sound_asset sound; } sound_entry;
 typedef struct model_entry {
@@ -126,31 +130,86 @@ static void names_add(qa_app_application_q3_assets *a, const char *lowered) {
   }
   a->names[a->name_count++] = xstrdup(lowered);
 }
-static void walk_loose(qa_app_application_q3_assets *a, const char *root, const char *dir) {
+/* One mount's files, gathered before any is added: Bun's recursive readdir rejects as a whole. */
+typedef struct loose_walk {
+  char **names; size_t count, capacity;
+  int error;   /* errno of the directory that could not be opened; 0 when none */
+  char *failed; /* that directory's path */
+} loose_walk;
+static void loose_walk_release(void *arg) {
+  loose_walk *walk = arg;
+  for (size_t i = 0; i < walk->count; i++) free(walk->names[i]);
+  free(walk->names);
+  free(walk->failed);
+  memset(walk, 0, sizeof *walk);
+}
+static void loose_walk_add(loose_walk *walk, char *lowered) {
+  if (walk->count == walk->capacity) {
+    size_t cap = walk->capacity == 0 ? 64 : walk->capacity * 2;
+    char **next = realloc(walk->names, cap * sizeof *next);
+    if (next == NULL) { free(lowered); qa_range_error("Out of memory"); }
+    walk->names = next; walk->capacity = cap;
+  }
+  walk->names[walk->count++] = lowered;
+}
+/* readdir(rootPath, { recursive: true, withFileTypes: true }): false with walk->error set when a directory cannot be
+ * opened (Bun reports it as syscall "open" on that directory). */
+static bool walk_loose(loose_walk *walk, const char *root, const char *dir) {
   DIR *stream = opendir(dir);
-  if (stream == NULL) return; /* TS ENOENT -> [] (other errors rethrow; opendir cannot split them portably) */
+  if (stream == NULL) {
+    walk->error = errno;
+    walk->failed = xstrdup(dir);
+    return false;
+  }
   struct dirent *entry;
-  while ((entry = readdir(stream)) != NULL) {
+  bool ok = true;
+  while (ok && (entry = readdir(stream)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
     size_t len = strlen(dir) + 1 + strlen(entry->d_name) + 1;
     char *full = malloc(len);
-    if (full == NULL) qa_range_error("Out of memory");
+    if (full == NULL) { closedir(stream); qa_range_error("Out of memory"); }
     snprintf(full, len, "%s/%s", dir, entry->d_name);
+    /* Dirent types (lstat): a recursive readdir neither follows a symbolic link nor reports one as a file. */
     struct stat st;
-    if (stat(full, &st) == 0) {
-      if (S_ISDIR(st.st_mode)) walk_loose(a, root, full);
+    if (lstat(full, &st) == 0) {
+      if (S_ISDIR(st.st_mode)) ok = walk_loose(walk, root, full);
       else if (S_ISREG(st.st_mode)) {
         size_t root_len = strlen(root);
-        const char *rel = full + root_len;
-        if (*rel == '/') rel++;
-        char *lowered = lowered_copy(rel);
-        names_add(a, lowered);
-        free(lowered);
+        char *rel = strdup(full + root_len + (full[root_len] == '/' ? 1 : 0));
+        if (rel == NULL) { free(full); closedir(stream); qa_range_error("Out of memory"); }
+        for (char *p = rel; *p != '\0'; p++) if (*p == '\\') *p = '/'; /* .replaceAll("\\", "/") */
+        char *lowered = qa_js_to_lower_case(rel);
+        free(rel);
+        if (lowered == NULL) { free(full); closedir(stream); qa_range_error("Out of memory"); }
+        loose_walk_add(walk, lowered);
       }
     }
     free(full);
   }
   closedir(stream);
+  return ok;
+}
+/* TS: readdir(...).catch(error => ENOENT ? [] : throw), then every file's lowered relative path joins the names. */
+static void add_loose_mount(qa_app_application_q3_assets *a, const char *root) {
+  loose_walk walk;
+  memset(&walk, 0, sizeof walk);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, loose_walk_release, &walk);
+  if (!walk_loose(&walk, root, root)) {
+    if (walk.error != ENOENT) {
+      char *failed = walk.failed;
+      walk.failed = NULL;
+      qa_cleanup_pop(&guard);
+      loose_walk_release(&walk);
+      qa_cleanup path_guard;
+      qa_cleanup_push(&path_guard, free, failed);
+      qa_node_fs_error_paths(walk.error, "open", failed, NULL);
+    }
+  } else {
+    for (size_t i = 0; i < walk.count; i++) names_add(a, walk.names[i]);
+  }
+  qa_cleanup_pop(&guard);
+  loose_walk_release(&walk);
 }
 static bool font_open_bridge(void *ctx, const char *path, qa_opened_resource *out) {
   qa_content_mounted *mounts = ctx;
@@ -196,19 +255,32 @@ static bool font_save_bridge(void *ctx) {
   font_write_ctx *w = ctx;
   return w->save_font_data(w->save_ctx);
 }
+static void writable_print_bridge(const char *text, void *ctx) {
+  qa_app_application_q3_assets *a = ctx;
+  a->print(a->print_ctx, text);
+}
+static void close_writable(void *file) { qa_writable_binary_file_close(file); }
+static void destroy_store(void *store) { qa_user_file_store_destroy(store); }
+/* writeFile: new UserFileStore(user.root).open(name, "write", print) (which creates the contained parent directories),
+ * then file.write(bytes) inside try/finally file.close(). */
 static void font_write_file(void *ctx, const char *name, qa_byte_view bytes) {
   font_write_ctx *w = ctx;
-  if (w->root == NULL) qa_range_error("Font export requires a content user directory");
-  size_t len = strlen(w->root) + 1 + strlen(name) + 1;
-  char *path = malloc(len);
-  if (path == NULL) qa_range_error("Out of memory");
-  snprintf(path, len, "%s/%s", w->root, name);
-  FILE *file = fopen(path, "wb");
-  free(path);
-  if (file == NULL) qa_range_error("Cannot export generated font %s", name);
-  size_t wrote = fwrite(bytes.bytes, 1, bytes.length, file);
-  fclose(file);
-  if (wrote != bytes.length) qa_range_error("Incomplete generated font export %s", name);
+  if (w->root == NULL) qa_raise("Error", 0, 0, "Font export requires a content user directory");
+  qa_user_file_store store;
+  if (!qa_user_file_store_init(&store, w->root)) qa_range_error("Out of memory");
+  qa_writable_binary_file file;
+  qa_cleanup store_guard;
+  qa_cleanup_push(&store_guard, destroy_store, &store);
+  bool opened = qa_user_file_store_open(&store, name, QA_WRITABLE_WRITE, writable_print_bridge, w->assets, &file);
+  qa_cleanup_pop(&store_guard);
+  qa_user_file_store_destroy(&store);
+  if (!opened) qa_raise("Error", 0, 0, "Cannot export generated font %s", name);
+  qa_cleanup file_guard;
+  qa_cleanup_push(&file_guard, close_writable, &file);
+  int64_t wrote = qa_writable_binary_file_write(&file, bytes.bytes, bytes.length);
+  if (wrote != (int64_t)bytes.length) qa_raise("Error", 0, 0, "Incomplete generated font export %s", name);
+  qa_cleanup_pop(&file_guard);
+  qa_writable_binary_file_close(&file);
 }
 static void sync_noop(void *ctx) { (void)ctx; }
 static const qa_sound_asset *bank_load_sync(void *ctx, const char *path, bool compressed) {
@@ -263,7 +335,7 @@ qa_app_application_q3_assets *qa_app_application_q3_assets_create(
     char *root = xstrdup(a->provider.loose_roots[i]);
     size_t len = strlen(root);
     while (len > 1 && root[len - 1] == '/') root[--len] = '\0';
-    walk_loose(a, root, root);
+    add_loose_mount(a, root);
     free(root);
   }
   bool guest_async = mode != NULL && strcmp(mode, "guest-async") == 0;
@@ -408,16 +480,18 @@ const uint8_t *qa_app_application_q3_assets_read_sync(qa_app_application_q3_asse
   for (size_t i = 0; i < assets->retained_count; i++)
     if (strcmp(assets->retained[i].key, key) == 0) found = &assets->retained[i];
   free(key);
-  if (found == NULL) qa_range_error("Q3 source requested an unretained synchronous asset: %s", path);
+  if (found == NULL) qa_raise("Error", 0, 0, "Q3 source requested an unretained synchronous asset: %s", path);
   *out_length = found->length;
   return found->bytes;
 }
 const qa_sound_asset *qa_app_application_q3_assets_sound(qa_app_application_q3_assets *assets, const char *name) {
   const char *rest = name[0] == '#' ? name + 1 : name;
-  char buffer[1024];
-  if (name[0] != '#' && strncmp(name, "sound/", 6) != 0) snprintf(buffer, sizeof buffer, "sound/%s", name);
-  else snprintf(buffer, sizeof buffer, "%s", rest);
+  bool prefixed = name[0] != '#' && strncmp(name, "sound/", 6) != 0;
+  char *buffer = malloc(strlen(rest) + 7);
+  if (buffer == NULL) qa_range_error("Out of memory");
+  snprintf(buffer, strlen(rest) + 7, "%s%s", prefixed ? "sound/" : "", rest);
   char *path = lowered_copy(buffer);
+  free(buffer);
   for (size_t i = 0; i < assets->sound_count; i++)
     if (strcmp(assets->sounds[i].path, path) == 0) { free(path); return &assets->sounds[i].sound; }
   retained_entry *opened = NULL;
@@ -496,11 +570,10 @@ static bool host_skin(void *ctx, const char *path, const qa_q3_pres_scene_skin *
   a->host.provider(a->host.ctx, content, &provider);
   qa_content_opened_resource opened;
   if (!qa_content_mounted_open(provider.mounts, path, NULL, NULL, &opened)) { *out = NULL; return true; }
-  char *text = malloc(opened.byte_length + 1);
-  if (text == NULL) qa_range_error("Out of memory");
-  memcpy(text, opened.bytes, opened.byte_length);
-  text[opened.byte_length] = '\0';
+  /* parseSkin(new TextDecoder().decode(opened.bytes)): a leading BOM dropped, invalid UTF-8 as U+FFFD */
+  char *text = qa_text_decoder_decode(opened.bytes, opened.byte_length, NULL);
   free(opened.bytes);
+  if (text == NULL) qa_range_error("Out of memory");
   size_t surface_count = 0;
   qa_skin_surface *parsed = qa_parse_skin(text, &surface_count);
   free(text);
@@ -719,7 +792,8 @@ static void host_app_provider(void *ctx, qa_content_id content, qa_app_q3_provid
 }
 /* TS world.models[index]?.bounds over the decoded world. */
 static bool world_model_bounds(const qa_decoded_world *world, double index, qa_bounds *out) {
-  if (!(index >= 0) || index != floor(index)) return false;
+  /* An index past any array (1e30, Infinity) is the TS undefined, and must not reach the cast. */
+  if (!(index >= 0) || index != floor(index) || index >= 4294967296.0) return false;
   size_t i = (size_t)index;
   if (world->kind == QA_DECODED_WORLD_Q1 && i < world->as.q1->model_count) { *out = world->as.q1->models[i].bounds; return true; }
   if (world->kind == QA_DECODED_WORLD_Q2 && i < world->as.q2->model_count) { *out = world->as.q2->models[i].bounds; return true; }

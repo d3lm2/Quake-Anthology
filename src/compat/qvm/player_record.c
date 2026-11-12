@@ -223,9 +223,11 @@ void qa_qvm_write_player_state_unmapped(qa_qvm_writable_view *view, const qa_q3_
   qa_q3_player_state translated = *state;
   translated.persistent.values = persistent;
   translated.persistent.count = 16;
-  translated.events[0] = qa_qvm_legacy_event_ex((int32_t)state->events[0], profile, true, lenient);
-  translated.events[1] = qa_qvm_legacy_event_ex((int32_t)state->events[1], profile, true, lenient);
-  translated.external_event = qa_qvm_legacy_event_ex((int32_t)state->external_event, profile, true, lenient);
+  /* TS qvmEvent masks the number (ToInt32) and the store wraps it; a C cast of a
+   * value outside int32, or of NaN, is undefined. */
+  translated.events[0] = qa_qvm_legacy_event_ex(qa_int32(state->events[0]), profile, true, lenient);
+  translated.events[1] = qa_qvm_legacy_event_ex(qa_int32(state->events[1]), profile, true, lenient);
+  translated.external_event = qa_qvm_legacy_event_ex(qa_int32(state->external_event), profile, true, lenient);
   double powerups[16];
   if (lenient) {
     qa_qvm_legacy_powerups_lenient(state->powerups.values, state->powerups.count, profile, powerups);

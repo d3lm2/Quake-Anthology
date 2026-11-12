@@ -25,7 +25,8 @@ static void nuke_explode(qa_q2mp_nuke *n, qa_q2_entity *entity, qa_q2_game_servi
   qa_actor_id *blinded = NULL;
   size_t blinded_count = 0, blinded_cap = 0;
   size_t count = 0;
-  const qa_actor_id *actors = game->host->nearby(game->host->ctx, origin, entity->damage_radius * 2, &count);
+  /* Copied: the damage below can run another nearby() query, which reuses the host's result buffer. */
+  qa_actor_id *actors = qa_q2_game_nearby_copy(game, origin, entity->damage_radius * 2, &count);
   for (size_t i = 0; i < count; i++) {
     qa_actor_id actor = actors[i];
     if (qa_same_actor(actor, entity->actor.id) || !q2mp_live(game, actor) || !q2mp_can_hurt(game, actor)) continue;
@@ -58,6 +59,7 @@ static void nuke_explode(qa_q2mp_nuke *n, qa_q2_entity *entity, qa_q2_game_servi
                 trunc(points), trunc(points), q2mp_sub(body.value.origin, origin), origin, q2mp_zero(), QA_Q2MP_MOD_NUKE,
                 true, 1, "q2:ammo_nuke");
   }
+  free(actors);
   size_t players = 0;
   const qa_actor_id *list = game->host->players(game->host->ctx, &players);
   for (size_t i = 0; i < players; i++) {

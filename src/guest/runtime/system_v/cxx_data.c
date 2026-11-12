@@ -28,7 +28,7 @@ static char *concat2(const char *a, const char *b) {
   strcpy(out, a); strcat(out, b);
   return out;
 }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
 static void write_ptr(const qa_mapped_guest_memory *m, qa_guest_core_address a, qa_guest_core_address v) {
   qa_gmem_write_pointer(m, a, true, v);
 }
@@ -74,7 +74,7 @@ qa_guest_core_address qa_cxx_abi_function(qa_cxx_abi_data *abi, const char *name
                       result_is_void, result, invoke);
   qa_guest_core_address address = {0};
   if (!qa_system_v_resolve_address(abi->host, "libstdc++.so.6", name, actual_version, &address))
-    qa_range_error("Unbound C++ service %s", name);
+    qa_raise("Error", 0, 0, "Unbound C++ service %s", name);
   return address;
 }
 qa_guest_core_address qa_cxx_abi_unsupported(qa_cxx_abi_data *abi, const char *name) {
@@ -132,7 +132,7 @@ void qa_cxx_abi_data_init(qa_cxx_abi_data *abi, qa_system_v_service_host *host) 
         char buffer[96];
         (void)snprintf(buffer, sizeof buffer, "__guest_%s_type_info_virtual_%d",
                        form_name(form), index);
-        entry = qa_cxx_abi_unsupported(abi, xstrdup(buffer));
+        entry = qa_cxx_abi_unsupported(abi, buffer);
       }
       write_ptr(m, qa_cxx_abi_slot(abi, table, (index + 2) * p), entry);
     }

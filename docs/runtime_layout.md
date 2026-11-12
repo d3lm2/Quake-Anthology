@@ -12,12 +12,18 @@ Source: `../quake-anthology-ts/src/app/bootstrap/simulation/runtime.ts` (8,752 l
 | `src/app/bootstrap/simulation/shared_simulation_source.c` | createSource (six source kinds), q1ActorHost, q2ActorHost | A |
 | `src/app/bootstrap/simulation/shared_simulation_step.c` | step, stepAsync, native Q2 frames, selected-source frames, snapshot | A |
 | `src/app/bootstrap/simulation/shared_simulation_access.c` | access structs for the network adapters and bot shells | A |
-| `src/app/bootstrap/simulation/shared_simulation_worlds.c` | B1: monsters, foreign worlds, guest monsters, native Q2 guest bridge, match rules (tag, lmctf, deathball, horde), combat registration | done |
+| `src/app/bootstrap/simulation/shared_simulation_worlds.c` | B1: monsters, foreign worlds, guest monsters, native Q2 guest bridge, combat registration (the match rules and the creature-source half of monster admission moved to the files below, as TS moved them out of runtime.ts) | done |
 | `src/app/bootstrap/simulation/shared_simulation_arsenal.c` | B2: selected arsenals, weapons, pickups, equipment, grapple, hand grenades, inventory UI, presentation | B2 |
 | `src/app/bootstrap/simulation/shared_simulation_players.c` | B3: players, admission, characters, views, userinfo, commands, travel, checkpoint, restore, mods | B3 |
 | `src/app/bootstrap/simulation/shared_simulation_checkpoint.c` | B3: checkpoint, checkpointLoading, checkpointFromSource (the world:simulation record as a checkpoint-value tree in TS key order), the q2-native original provider, nativeRestorePrelude, restoreNativeLoading, restore, and the B1 Q1-checkpoint rows | B3 |
 | `src/app/bootstrap/simulation/shared_simulation_mods.c` | B3: load's `SessionMods.open({...})` (ModHostServices, engine fragment, owner-binding adapter) | B3 |
-| `src/app/bootstrap/simulation/source_strategy.{h,c}` | source-strategy.ts: `qa_app_source_strategy` tables per source class (`sim->strategy`, a pointer to the class table, set with the source); all 226 TS members ported (D1, D1b, D1c, D1d); typed-access sweep in "Typed access sweep" below; members that need a runtime file's static helpers are defined beside them as `qa_ss_<class>_<member>` | D1c |
+| `src/app/bootstrap/simulation/source_strategy.{h,c}` | source-strategy.ts: `qa_app_source_strategy` tables per source class (`sim->strategy`, a pointer to the class table, set with the source); all 228 TS members ported (D1, D1b, D1c, D1d; D9c added importLoading and importOriginal, TS e06fcfff); typed-access sweep in "Typed access sweep" below; members that need a runtime file's static helpers are defined beside them as `qa_ss_<class>_<member>` | D1c |
+| `src/app/bootstrap/simulation/foreign_match_host.{h,c}`, `foreign_{horde,tag,lmctf,deathball}_rules.c`, `foreign_match_rules.c` | foreign-match-host.ts (shared helpers `qa_fm_*`, ForeignMatchSpawns, balancedTeam, the damage-transform registration), foreign-{horde,tag,lmctf,deathball}-rules.ts (each rule's tick plus its ForeignMatchStrategy members `qa_app_foreign_<rule>_{blocks_checkpoint,release,register_combat}`), foreign-match-rules.ts (ForeignMatchRules: `qa_app_foreign_match_rules_{tick,release,blocks_checkpoint,register_combat}`, called by step, the actor release hook, the save and restart guards and registerCombat). The rules' state stays on the simulation, which is the TS ForeignMatchHost | D1d |
+| `src/app/bootstrap/simulation/monster_admission.c`, `include/qa/app/bootstrap/simulation/monster_admission.h` | monster-admission.ts: MonsterAdmissionServices and MonsterAdmission (strategy, probe, query, obstructed, resume, enemy, oldEnemy, setRoute), monsterSourceStrategy (`qa_app_sim_monster_source_*`). worlds.c builds it in `wl_monster_admission` (TS monsterAdmission) and keeps the placement search that uses it | D1d |
+| `src/app/bootstrap/simulation/diagnostics.c`, `include/qa/app/bootstrap/simulation/diagnostics.h` | diagnostics.ts (SimulationDiagnostics as `qa_app_simulation_diagnostics`) and SharedSimulation.diagnostics() (`qa_app_shared_sim_diagnostics`). Checked by `test_sim_verify --diagnostics` against tests/app/oracles/sim_diagnostics_<case>.txt (D9c) | D1d |
+| `src/app/bootstrap/simulation/native_q2_rerelease_pak.c`, `include/qa/app/bootstrap/simulation/native_q2_rerelease_pak.h` | native-q2-rerelease-pak.ts (TS e06fcfff): rereleaseAutosaveName, rereleaseSlotName, q2RereleasePakEntries, q2RereleasePak, readQ2RereleasePak (`qa_app_sim_q2_rerelease_native_import`, declared with NativeQ2Import in native_q2_rerelease_save.h). tests/app/test_q2_rerelease_pak.c | D9c |
+| `src/app/bootstrap/simulation/qvm_component_state.c`, `include/qa/app/bootstrap/simulation/qvm_component_state.h` | qvm-component-state.ts: qvmWeaponInitializationEntities, QvmComponentState (`qa_app_sim_qvm_component_state`: capture/restore with the TS `label` error texts), qvmComponentSpatial (`qa_app_sim_qvm_component_spatial`). qvm_weapon_behavior.c and qvm_grapple_source.c hold one each instead of their own copies | D9c |
+| `src/app/bootstrap/simulation/network_q2_guest_core.c`, `include/qa/app/bootstrap/simulation/network_q2_guest_core.h` | network-q2-guest-core.ts: createQ2GuestHostCore (`qa_app_sim_q2_guest_host_core`: player table, requirePlayer, headnodeVisible, audienceIncludes, freeSlot, registerServerVariables, disconnect, and the shared host members). network_q2_guest.c and network_q2_rerelease_native.c forward to it | D9c |
 | `src/app/bootstrap/simulation/q3/{engine.h,qvm_engine.c,native_guest_source.c,server_traps.c}` | q3/engine.ts (Q3GameEngine table), qvm-engine.ts (Q3QvmEngine), native-guest-source.ts (Q3NativeGuestSource, q3NativeProfile, prepareQ3Native), server-traps.ts (Q3ServerTraps); q3/guest_runtime.c (TS Q3ServerGame, C name qa_app_q3_qvm_server_game) drives either engine | D1b |
 | `src/app/bootstrap/simulation/checkpoint_values.c` | value trees of the live TS records checkpointFromSource encodes (no TS file: TS encodes the objects themselves) | B3 |
 
@@ -26,7 +32,7 @@ Naming: method `fooBar` is `qa_app_shared_sim_foo_bar(qa_app_shared_simulation *
 
 ## SourceStrategy members (source-strategy.ts -> source_strategy.{h,c}, D1c)
 
-Every member of the TS `SourceStrategy` interface (226), the classes that override it (LoadingStrategy implements all;
+Every member of the TS `SourceStrategy` interface (228 since TS e06fcfff added `importLoading` and `importOriginal`; 226 before), the classes that override it (LoadingStrategy implements all;
 LoadedStrategy overrides none), its C table member, and its status. "done" means the member is a `qa_app_source_strategy`
 field, each class table carries its TS override, and the runtime C calls `sim->strategy->member(...)` where TS calls
 `this.strategy.member(...)`. Since D1c, `sim->strategy` is a pointer to the class's shared table (built once; see
@@ -213,9 +219,11 @@ shared_simulation_internal.h; the rest are static in source_strategy.c. C signat
 | `grantQuad` | Q1, Q3 | `grant_quad` | done |
 | `admitsGuestMonsters` | QuakeC, Q2Native, Q3, Q3Qvm | `admits_guest_monsters` | done |
 | `assertSavable` | Q2Native | `assert_savable` | done (D1d) |
-| `captureGuestSave` | Q2Native | `capture_guest_save` | done (D1d) |
-| `originalSave` | Q2Native | `original_save` | done (D1d) |
+| `captureGuestSave` | Q2Native | `capture_guest_save` | done (D1d; D9c: `autosave` parameter) |
+| `originalSave` | Q2Native | `original_save` | done (D1d; D9c: `autosave` parameter, a level the unit has not left before is absent from an autosave) |
 | `restoreLoading` | Q2Native | `restore_loading` | done (D1d) |
+| `importLoading` | Q2Native | `import_loading` | done (D9c; `qa_ss_q2_native_import_loading`, shared_simulation_checkpoint.c) |
+| `importOriginal` | Q2Native | `import_original` | done (D9c; `qa_ss_q2_native_import_original`, shared_simulation_checkpoint.c) |
 | `restoreGuest` | Q2Native | `restore_guest` | done (D1d) |
 | `guestEdition` | Q2Native | `guest_edition` | done |
 | `monsterProxy` | Q2Native, Q3Qvm | `monster_proxy` | done (D1d) |
@@ -266,9 +274,9 @@ shared_simulation_internal.h; the rest are static in source_strategy.c. C signat
 
 ## Typed access sweep (D1d, 2026-11-03)
 
-Every remaining `sim->strategy->as_*()` call and `ss_source_is(sim, ...)` call in shared_simulation_*.c (168 sites:
-131 `as_*()` calls, of which 6 are inside the `ss_source_is` helper, and 34 `ss_source_is` calls in
-shared_simulation_arsenal.c), grouped by enclosing C function. Each is a typed access TypeScript also makes at the same
+Every remaining `sim->strategy->as_*()` call and `ss_source_is(sim, ...)` call in shared_simulation_*.c, foreign_*.c and
+diagnostics.c (recounted 2026-11-10: 132 `as_*()` calls, of which 6 are inside the `ss_source_is` helper, and 34
+`ss_source_is` calls in shared_simulation_arsenal.c), grouped by enclosing C function. Each is a typed access TypeScript also makes at the same
 place: either the TS method of the same name calls `strategy.asX()` (checked by
 build/agents/d1d-sim/tmp/sweep.py against runtime.ts), or the C function is a closure, host-object member or helper
 whose TS counterpart (named in the last column) makes it. Several TS counterparts reach `asX()` through a runtime
@@ -288,11 +296,15 @@ shared_simulation_core.c and shared_simulation_worlds.c.
 
 `source.kind` switches: `wl_source_identity` (shared_simulation_worlds.c) is kept. It is TS `this.source !== source`
 object identity (primaryMatchPlayer, runtime.ts 9811), not per-source behavior: C's SourceRuntime is a tagged struct,
-so identity is the kind plus that kind's owner pointer. The remaining `sim->source.kind = ...` writes are the TS
-`setSource` installations (core.c loading, worlds.c Q3 restart).
+so identity is the kind plus that kind's owner pointer. `ss_original_rule` (shared_simulation_arsenal.c,
+`rule->kind = sim->source.kind`) stores the same identity for nativeDropProtection's `this.source !== source`. The
+remaining `sim->source.kind = ...` writes are the TS `setSource` installations (core.c loading, worlds.c Q3 restart).
+Every other `source.kind` text in these files is a different object's kind (selected weapon source, command source,
+event source records).
 
 | C file | C function | typed access | sites | TS counterpart |
 |---|---|---|---|---|
+| diagnostics.c | `dg_source` | asQ1 | 1 | diagnostics source(): `const q1 = sim.strategy.asQ1()` (runtime.ts diagnostics()) |
 | access.c | `ss_q1_source` | asQ1 | 1 | TS `q1Source` (runtime.ts 10011) makes `strategy.asQ1()` |
 | access.c | `ss_q3_source` | asQ3 | 1 | TS `q3Source` (runtime.ts 10894) makes `strategy.asQ3()` |
 | access.c | `ss_q3_guest` | asQ3Qvm | 1 | TS `q3Guest` (runtime.ts 10684) makes `strategy.asQ3Qvm()` |
@@ -377,8 +389,8 @@ so identity is the kind plus that kind's owner pointer. The remaining `sim->sour
 | step.c | `qa_app_shared_sim_step_async` | asQ3Qvm | 1 | TS `stepAsync` (runtime.ts 8538) makes `strategy.asQ3Qvm()` |
 | step.c | `qa_app_shared_sim_begin_native_q2_step` | asQ2Native | 1 | TS `beginNativeQ2Step` (runtime.ts 10573) makes `strategy.asQ2Native()` |
 | step.c | `qa_app_shared_sim_native_q2_frames` | asQ2Native | 1 | stepNativeQ2Async: `const source = this.strategy.asQ2Native()` (10616) |
-| worlds.c | `qa_app_shared_sim_tick_horde_wave` | asQ3 | 1 | foreign-horde-rules.ts 32 `host.sourceKind === "q3"` (host.sourceKind = strategy.kind) |
-| worlds.c | `qa_app_shared_sim_foreign_ctf` | asQ1 | 1 | foreign-lmctf-rules.ts 65 `host.sourceKind !== "q1"` (host.sourceKind = strategy.kind) |
+| foreign_horde_rules.c | `qa_app_shared_sim_tick_horde_wave` | asQ3 | 1 | foreign-horde-rules.ts 32 `host.sourceKind === "q3"` (host.sourceKind = strategy.kind) |
+| foreign_lmctf_rules.c | `qa_app_shared_sim_foreign_ctf` | asQ1 | 1 | foreign-lmctf-rules.ts 65 `host.sourceKind !== "q1"` (host.sourceKind = strategy.kind) |
 | worlds.c | `qa_app_shared_sim_q1_weapon_source` | asQ1 | 1 | TS `q1WeaponSource` (runtime.ts 9949) makes `strategy.asQ1()` |
 | worlds.c | `qa_app_shared_sim_q2_weapon_source` | asQ2 | 1 | TS `q2WeaponSource` (runtime.ts 9957) makes `strategy.asQ2()` |
 | worlds.c | `qa_app_shared_sim_q2_item_weapon_source` | asQ2 | 1 | TS `q2ItemWeaponSource` (runtime.ts 9954) makes `strategy.asQ2()` |
@@ -429,7 +441,7 @@ so identity is the kind plus that kind's owner pointer. The remaining `sim->sour
 
 | TS lines | TS member | C function | C file | Group | Status |
 |---|---|---|---|---|---|
-| 271-271 | `add` | `qa_ss_add` | `shared_simulation_support.c` | A | done |
+| 271-271 | `add` | core `qa_add3` (TS ccef0925 removed vec.ts: runtime.ts imports core add3/zeroVec3; `qa_ss_add`/`qa_ss_zero` are gone) | `src/core/math.c` | A | done |
 | 272-272 | `subtract` | `qa_ss_subtract` | `shared_simulation_support.c` | A | done |
 | 273-273 | `seconds` | `qa_ss_seconds` | `shared_simulation_support.c` | A | done |
 | 274-277 | `replacedSupplyItems` | `qa_ss_replaced_supply_items` | `shared_simulation_arsenal.c` | B2 | done |
@@ -779,7 +791,7 @@ so identity is the kind plus that kind's owner pointer. The remaining `sim->sour
 | 8681-8704 | `close` | `qa_app_shared_sim_close` | `shared_simulation_core.c` | A | done |
 | 8705-8705 | `assertOpen` | `qa_app_shared_sim_assert_open` | `shared_simulation_core.c` | A | done |
 | 8708-8708 | `createSimulation` | `qa_app_shared_simulation_create` | `shared_simulation_core.c` | A | done |
-| 8714-8742 | `orderedActorTurns` | `qa_app_sim_ordered_actor_turns_next (existing, runtime.c)` | `shared_simulation_core.c` | A | done |
+| 8714-8742 | `orderedActorTurns` | `qa_app_sim_ordered_actor_turns_next` (declared in runtime.h) | `shared_simulation_turns.c` | A | done |
 | 8744-8744 | `loadSimulation` | `qa_app_shared_simulation_load` | `shared_simulation_core.c` | A | done |
 | 8747-8752 | `RevisionMap` | `qa_ss_map (revision counter)` | `shared_simulation_support.c` | A | done |
 

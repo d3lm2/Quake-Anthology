@@ -6,6 +6,20 @@
 #include <string.h>
 
 #include "qa/core/binary/index.h"
+#include "qa/foundation/support.h"
+
+/* A BinaryError caught by the caller must not leak the reader's name or the
+ * index and palette buffers. */
+typedef struct decode_guard {
+  qa_binary_reader *reader;
+  uint8_t **indices, **palette;
+} decode_guard;
+static void decode_guard_release(void *arg) {
+  decode_guard *guard = (decode_guard *)arg;
+  free(*guard->indices);
+  free(*guard->palette);
+  qa_binary_reader_destroy(guard->reader);
+}
 
 void qa_q3_pcx_indexed_destroy(qa_q3_pcx_indexed *image) {
   free(image->indices);
@@ -24,6 +38,10 @@ int qa_decode_q3_pcx_indexed(const uint8_t *bytes, size_t length,
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, name)) return 0;
   memset(out, 0, sizeof *out);
+  uint8_t *indices = NULL, *palette = NULL;
+  decode_guard guard_state = {&reader, &indices, &palette};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decode_guard_release, &guard_state);
   if (qa_binary_reader_length(&reader) < 12) {
     qa_binary_error(name, 0, "truncated PCX header");
   }
@@ -37,6 +55,7 @@ int qa_decode_q3_pcx_indexed(const uint8_t *bytes, size_t length,
   int64_t width = xmax + 1, height = ymax + 1;
   if (manufacturer != 0x0a || version != 5 || encoding != 1 ||
       bits_per_pixel != 8 || xmax >= 1024 || ymax >= 1024) {
+    qa_cleanup_pop(&guard);
     qa_binary_reader_destroy(&reader);
     if (rejection_message != NULL) {
       size_t capacity = strlen(name) + 96;
@@ -54,19 +73,21 @@ int qa_decode_q3_pcx_indexed(const uint8_t *bytes, size_t length,
                     "PCX palette precedes input");
   }
   size_t count = (size_t)(width * height);
-  uint8_t *indices = count == 0 ? NULL : (uint8_t *)calloc(count, 1);
-  if (count != 0 && indices == NULL) { qa_binary_reader_destroy(&reader); return 0; }
+  indices = count == 0 ? NULL : (uint8_t *)calloc(count, 1);
+  if (count != 0 && indices == NULL) { qa_cleanup_pop(&guard); qa_binary_reader_destroy(&reader); return 0; }
   qa_binary_reader palette_section;
   if (!qa_binary_reader_section(&reader,
                                 (int64_t)qa_binary_reader_length(&reader) - 768,
                                 768, &palette_section)) {
+    qa_cleanup_pop(&guard);
     free(indices);
     qa_binary_reader_destroy(&reader);
     return 0;
   }
-  uint8_t *palette = qa_binary_reader_bytes(&palette_section, 768);
+  palette = qa_binary_reader_bytes(&palette_section, 768);
   qa_binary_reader_destroy(&palette_section);
   if (palette == NULL) {
+    qa_cleanup_pop(&guard);
     free(indices);
     qa_binary_reader_destroy(&reader);
     return 0;
@@ -93,6 +114,7 @@ int qa_decode_q3_pcx_indexed(const uint8_t *bytes, size_t length,
       x += run_length;
     }
   }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   out->width = width;
   out->height = height;

@@ -31,8 +31,9 @@ void qa_app_unified_presentation_event_from_tree(const qa_save_value *tree, qa_a
 /* SimulationEvent: the client's view of a tree qa_app_unified_read_simulation_event returned. Strings
  * borrow the tree; actor/origin/counts point into *storage (release with
  * qa_app_unified_simulation_event_storage_release). A unified frame carries the sound and message
- * payloads only (network-unified.ts frame() filters with permitted(), which drops damage and transition),
- * so a damage or transition payload raises RangeError here. */
+ * payloads only (network-unified.ts frame() filters with permitted(), which drops damage and transition).
+ * A damage or transition payload from another server is kept with its kind only: TS passes it on and
+ * its client consumers never read outcome or decision. */
 typedef struct qa_app_unified_simulation_event_storage {
   qa_actor_id actor; qa_vec3 origin; double *counts;
 } qa_app_unified_simulation_event_storage;

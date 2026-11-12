@@ -50,7 +50,7 @@ static void private_field_check(void *ctx, const qa_qvm_item_field *field, const
     if (strcmp(state->key_records[i], field->record) == 0 && state->key_offsets[i] == field->offset)
       previous = state->usages[i];
   if (!isfinite(field->offset) || field->offset != trunc(field->offset) || field->offset < 0 ||
-      (int64_t)field->offset % 4 != 0 || field->offset + 4 > (double)bytes ||
+      fmod(field->offset, 4) != 0 || field->offset + 4 > (double)bytes ||
       (previous != NULL && !(strcmp(previous, "capacity") == 0 && strcmp(usage, "capacity") == 0)))
     qa_save_reader_fail(state->reader, "private inventory field is outside or overlaps its source record");
   if (state->count == state->capacity) {
@@ -379,6 +379,9 @@ static double capacity_of(void *ctx, qa_qvm_memory *memory, double weapon_value,
     return (double)qa_qvm_writable_view_get_int32(&view, 0, true);
   }
   int32_t *args = xmalloc(state->argument_count * sizeof *args);
+  /* The evaluation runs guest code: its raise must not strand the words. */
+  qa_cleanup args_cleanup;
+  qa_cleanup_push(&args_cleanup, free, args);
   for (size_t i = 0; i < state->argument_count; i++) {
     args[i] = strcmp(state->arguments[i].kind, "maximum-grant") == 0
         ? 0x7fffffff : word_value(state->arguments[i], weapon, context);
@@ -391,13 +394,17 @@ static double capacity_of(void *ctx, qa_qvm_memory *memory, double weapon_value,
         state->has_stack ? &state->stack : NULL);
   } else {
     int64_t *inputs = xmalloc(state->input_count * sizeof *inputs);
+    qa_cleanup inputs_cleanup;
+    qa_cleanup_push(&inputs_cleanup, free, inputs);
     for (size_t i = 0; i < state->input_count; i++)
       inputs[i] = word_value(state->inputs[i], weapon, context);
     result = qa_qvm_module_evaluate_region(context->module, args, state->argument_count,
         state->function, &state->region, inputs, state->input_count,
         state->has_stack ? &state->stack : NULL);
+    qa_cleanup_pop(&inputs_cleanup);
     free(inputs);
   }
+  qa_cleanup_pop(&args_cleanup);
   free(args);
   return (double)result;
 }

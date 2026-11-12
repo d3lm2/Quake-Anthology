@@ -378,6 +378,14 @@ typedef enum qa_guest_checkpoint_kind {
   QA_GUEST_CHECKPOINT_QUAKEC, QA_GUEST_CHECKPOINT_QVM,
   QA_GUEST_CHECKPOINT_NATIVE_GUEST, QA_GUEST_CHECKPOINT_TYPESCRIPT
 } qa_guest_checkpoint_kind;
+/* C-only: a bigint field of a read checkpoint whose saved value lies outside int64 (TS keeps
+ * any bigint). The field holds the saturated int64; `text` (borrowed from the read tree) is
+ * the saved decimal, which a re-encode writes back. */
+typedef struct qa_guest_wide_bigint {
+  const int64_t *field;
+  const char *text;
+} qa_guest_wide_bigint;
+
 struct qa_guest_checkpoint {
   qa_guest_checkpoint_kind kind;
   qa_module_identity module;
@@ -412,6 +420,8 @@ struct qa_guest_checkpoint {
   qa_guest_private_state runtime_state; /* native-guest */
   qa_guest_private_state state;         /* typescript */
   qa_game_api_identity game_api;        /* typescript */
+  const qa_guest_wide_bigint *wide_bigints; /* malloc'd by qa_read_guest; NULL elsewhere */
+  size_t wide_bigint_count;
 };
 
 #endif

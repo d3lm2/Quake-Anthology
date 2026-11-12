@@ -17,7 +17,7 @@ static qa_q1_trace q1_trace(void *ctx, qa_q1_trace_request request) {
   q.policy.has_hull = false; q.numeric = world->numeric;
   q.pass_actor = request.has_ignore ? &request.ignore : NULL;
   qa_trace_result trace = qa_shared_trace(world->scene, q);
-  if (!is(trace.kind, "q1")) qa_range_error("Q1 actor trace returned another source representation");
+  if (!is(trace.kind, "q1")) qa_raise("Error", 0, 0, "Q1 actor trace returned another source representation");
   qa_q1_trace out; memset(&out, 0, sizeof out);
   out.fraction = trace.fraction; out.end = trace.end; out.normal = trace.source_plane_q1.normal;
   if (trace.hit.kind == QA_TRACE_HIT_ACTOR) { out.has_actor = true; out.actor = trace.hit.actor; }
@@ -42,7 +42,7 @@ static qa_q1_contents q1_contents(void *ctx, qa_vec3 point) {
   q.point = point; q.target.is_model = false; q.pass_actor = NULL;
   q.policy.kind = "q1"; q.policy.move = "normal"; q.numeric = env->world.numeric;
   qa_point_contents_result result = qa_shared_point_contents(env->world.scene, q);
-  if (!is(result.kind, "q1")) qa_range_error("Q1 actor contents returned another source representation");
+  if (!is(result.kind, "q1")) qa_raise("Error", 0, 0, "Q1 actor contents returned another source representation");
   double v = result.contents;
   return v == -2 ? "solid" : v == -3 ? "water" : v == -4 ? "slime" : v == -5 ? "lava" : v == -6 ? "sky" : "empty";
 }
@@ -121,7 +121,7 @@ static double q2_contents(void *ctx, qa_vec3 point) {
   q.policy.kind = "q2"; q.policy.contents_mask = -1; q.policy.leaf_contents = env->world.leaf_contents ? env->world.leaf_contents : "merged";
   q.numeric = env->world.numeric;
   qa_point_contents_result result = qa_shared_point_contents(env->world.scene, q);
-  if (!is(result.kind, "q2")) qa_range_error("Q2 actor contents returned another source representation");
+  if (!is(result.kind, "q2")) qa_raise("Error", 0, 0, "Q2 actor contents returned another source representation");
   return is(env->world.leaf_contents, "stored") ? result.stored : result.merged;
 }
 static bool q2_in_pvs(void *ctx, qa_vec3 a, qa_vec3 b) { return visible(ctx, a, b, "pvs"); }
@@ -148,13 +148,23 @@ static const qa_actor_id *q2_nearby(void *ctx, qa_vec3 origin, double radius, si
     qa_body_state body;
     if (!env->world.body_read(env->world.ctx, all[i], &body)) continue;
     double dx = body.origin.x - origin.x, dy = body.origin.y - origin.y, dz = body.origin.z - origin.z;
-    if (qa_js_hypot3(dx, dy, dz) <= radius && env->nearby_count < 256)
-      env->nearby_storage[env->nearby_count++] = all[i];
+    if (!(qa_js_hypot3(dx, dy, dz) <= radius)) continue;
+    if (env->nearby_count == env->nearby_capacity) {
+      size_t capacity = env->nearby_capacity ? env->nearby_capacity * 2 : 64;
+      qa_actor_id *grown = realloc(env->nearby_storage, capacity * sizeof *grown);
+      if (grown == NULL) qa_range_error("Out of memory");
+      env->nearby_storage = grown; env->nearby_capacity = capacity;
+    }
+    env->nearby_storage[env->nearby_count++] = all[i];
   }
   sort_world = &env->world;
   qa_js_sort(env->nearby_storage, env->nearby_count, sizeof env->nearby_storage[0], env->world.source_order ? nearby_cmp : order_cmp);
   if (out_count) *out_count = env->nearby_count;
   return env->nearby_storage;
+}
+void qa_app_sim_q2_actor_host_env_release(qa_app_sim_q2_actor_host_env *env) {
+  free(env->nearby_storage);
+  env->nearby_storage = NULL; env->nearby_count = env->nearby_capacity = 0;
 }
 static qa_bounds q2_model_bounds(void *ctx, double model) {
   return qa_shared_model_bounds(((qa_app_sim_q2_actor_host_env *)ctx)->world.scene, model);

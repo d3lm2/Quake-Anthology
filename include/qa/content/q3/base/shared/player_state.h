@@ -17,10 +17,12 @@ typedef struct qa_q3_base_user_command {
   double server_time; qa_vec3 angles; double buttons, weapon, forwardmove, rightmove, upmove;
 } qa_q3_base_user_command;
 
-/* TS PlayerSlotBinding: read false is TS undefined. index is a TS number. */
+/* TS PlayerSlotBinding: read false is TS undefined. index is a TS number.
+ * read returns the bound number as it is (health and armor points are not
+ * int32 words); only write receives `value | 0`. */
 typedef struct qa_q3_base_player_slot_binding {
   void *ctx;
-  bool (*read)(void *ctx, double index, int32_t *out);
+  bool (*read)(void *ctx, double index, double *out);
   void (*write)(void *ctx, double index, int32_t value);
 } qa_q3_base_player_slot_binding;
 

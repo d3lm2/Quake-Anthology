@@ -17,6 +17,7 @@ typedef struct { const qa_q2_surface_info *surface; qa_guest_address address; } 
 typedef struct callback_wrap {
   qa_compat_q2_rerelease_q2_guest_host *host;
   qa_actor_callbacks inner;
+  qa_actor_id actor; /* the actor these closures were bound for */
   struct callback_wrap *next;
 } callback_wrap_t;
 struct qa_compat_q2_rerelease_q2_guest_host {
@@ -35,6 +36,8 @@ struct qa_compat_q2_rerelease_q2_guest_host {
   bot_entry_t *bots; size_t bot_count, bot_cap;
   qa_raw_entity_view *bot_scratch; size_t bot_scratch_cap;
   callback_wrap_t *wraps;
+  /* Closures of released actors (TS collects them): freed at the next frame entry, never under a running callback. */
+  callback_wrap_t *retired_wraps;
   int64_t filter_depth;
   int64_t unsubscribe_id; bool subscribed;
   bool initialized, closed, has_pickups;
@@ -94,30 +97,46 @@ void qa_compat_q2_rerelease_q2_guest_host_finish_input_retirement(qa_compat_q2_r
   set_remove(h->retired, &h->retired_count, slot);
   remove_lifetime(h, slot);
 }
+/* TS invoke(call): try { return call(); } finally { this.reconcile(); }. The wrap may be retired by the callback it
+ * runs (the actor frees itself), so the host is read first. */
+static void reconcile_finally(void *v) { qa_compat_q2_rerelease_q2_guest_host_reconcile(v); }
 static void wrap_think(void *v, qa_owned_actor self, qa_frame_context frame) {
-  callback_wrap_t *w = v;
+  callback_wrap_t *w = v; qa_compat_q2_rerelease_q2_guest_host *host = w->host;
+  qa_cleanup node; qa_cleanup_push(&node, reconcile_finally, host);
   if (w->inner.think) w->inner.think(w->inner.ctx, self, frame);
-  qa_compat_q2_rerelease_q2_guest_host_reconcile(w->host);
+  qa_cleanup_pop(&node);
+  qa_compat_q2_rerelease_q2_guest_host_reconcile(host);
 }
 static void wrap_touch(void *v, qa_touch_contact contact) {
-  callback_wrap_t *w = v;
+  callback_wrap_t *w = v; qa_compat_q2_rerelease_q2_guest_host *host = w->host;
+  qa_cleanup node; qa_cleanup_push(&node, reconcile_finally, host);
   if (w->inner.touch) w->inner.touch(w->inner.ctx, contact);
-  qa_compat_q2_rerelease_q2_guest_host_reconcile(w->host);
+  qa_cleanup_pop(&node);
+  qa_compat_q2_rerelease_q2_guest_host_reconcile(host);
 }
 static void wrap_use(void *v, qa_owned_actor self, const qa_actor_id *other, const qa_actor_id *activator) {
-  callback_wrap_t *w = v;
+  callback_wrap_t *w = v; qa_compat_q2_rerelease_q2_guest_host *host = w->host;
+  qa_cleanup node; qa_cleanup_push(&node, reconcile_finally, host);
   if (w->inner.use) w->inner.use(w->inner.ctx, self, other, activator);
-  qa_compat_q2_rerelease_q2_guest_host_reconcile(w->host);
+  qa_cleanup_pop(&node);
+  qa_compat_q2_rerelease_q2_guest_host_reconcile(host);
 }
 static void wrap_pain(void *v, qa_pain_reaction reaction) {
-  callback_wrap_t *w = v;
+  callback_wrap_t *w = v; qa_compat_q2_rerelease_q2_guest_host *host = w->host;
+  qa_cleanup node; qa_cleanup_push(&node, reconcile_finally, host);
   if (w->inner.pain) w->inner.pain(w->inner.ctx, reaction);
-  qa_compat_q2_rerelease_q2_guest_host_reconcile(w->host);
+  qa_cleanup_pop(&node);
+  qa_compat_q2_rerelease_q2_guest_host_reconcile(host);
 }
 static void wrap_die(void *v, qa_death_reaction reaction) {
-  callback_wrap_t *w = v;
+  callback_wrap_t *w = v; qa_compat_q2_rerelease_q2_guest_host *host = w->host;
+  qa_cleanup node; qa_cleanup_push(&node, reconcile_finally, host);
   if (w->inner.die) w->inner.die(w->inner.ctx, reaction);
-  qa_compat_q2_rerelease_q2_guest_host_reconcile(w->host);
+  qa_cleanup_pop(&node);
+  qa_compat_q2_rerelease_q2_guest_host_reconcile(host);
+}
+static void free_retired_wraps(qa_compat_q2_rerelease_q2_guest_host *h) {
+  while (h->retired_wraps) { callback_wrap_t *next = h->retired_wraps->next; free(h->retired_wraps); h->retired_wraps = next; }
 }
 bool qa_compat_q2_rerelease_q2_guest_host_actor(qa_compat_q2_rerelease_q2_guest_host *h, qa_raw_entity_view view, qa_owned_actor *out) {
   if (set_contains(h->retired, h->retired_count, view.slot)) return false;
@@ -159,7 +178,7 @@ bool qa_compat_q2_rerelease_q2_guest_host_actor(qa_compat_q2_rerelease_q2_guest_
   if (binding.has_power_armor_cells) qa_gameplay_authority_bind_power_armor_cells(engine->combat, actor, binding.power_armor_cells);
   if (binding.has_inventory) qa_shared_inventory_table_bind(engine->inventory, actor, binding.inventory);
   callback_wrap_t *wrap = xmalloc(sizeof *wrap);
-  wrap->host = h; wrap->inner = binding.callbacks;
+  wrap->host = h; wrap->inner = binding.callbacks; wrap->actor = actor.id;
   wrap->next = h->wraps; h->wraps = wrap;
   qa_actor_callbacks callbacks; memset(&callbacks, 0, sizeof callbacks);
   callbacks.ctx = wrap;
@@ -179,12 +198,12 @@ bool qa_compat_q2_rerelease_q2_guest_host_actor(qa_compat_q2_rerelease_q2_guest_
   return true;
 }
 qa_owned_actor qa_compat_q2_rerelease_q2_guest_host_reserve_client(qa_compat_q2_rerelease_q2_guest_host *h, double slot) {
-  if (h->closed || slot < 1 || trunc(slot) != slot) qa_range_error("Invalid Q2 client reservation");
+  if (h->closed || slot < 1 || trunc(slot) != slot) qa_raise("Error", 0, 0, "Invalid Q2 client reservation");
   set_add(&h->reserved, &h->reserved_count, &h->reserved_cap, slot);
   qa_raw_entity_table table = qa_compat_q2_rerelease_guest_module_entities(h->module);
   qa_owned_actor actor;
   if (!qa_compat_q2_rerelease_q2_guest_host_actor(h, table.at_slot(table.ctx, slot), &actor))
-    qa_range_error("Q2 reserved source client has no actor");
+    qa_raise("Error", 0, 0, "Q2 reserved source client has no actor");
   return actor;
 }
 bool qa_compat_q2_rerelease_q2_guest_host_is_client_reserved(qa_compat_q2_rerelease_q2_guest_host *h, double slot) {
@@ -216,15 +235,30 @@ static void release_actors(qa_compat_q2_rerelease_q2_guest_host *h) {
   }
   h->lifetime_count = 0;
 }
-static void on_released(void *v, qa_owned_actor actor) {
-  qa_compat_q2_rerelease_q2_guest_host *h = v;
-  if (h->foreign) qa_compat_q2_rerelease_foreign_actors_released(h->foreign, actor);
+typedef struct released_ctx { qa_compat_q2_rerelease_q2_guest_host *h; qa_actor_id actor; } released_ctx;
+static void released_finally(void *v) {
+  released_ctx *r = v; qa_compat_q2_rerelease_q2_guest_host *h = r->h;
   for (size_t i = 0; i < h->bot_count; i++)
-    if (qa_same_actor(h->bots[i].actor, actor.id)) {
+    if (qa_same_actor(h->bots[i].actor, r->actor)) {
       memmove(&h->bots[i], &h->bots[i + 1], (h->bot_count - i - 1) * sizeof *h->bots);
       h->bot_count--;
       break;
     }
+  /* The released actor's callback closures are unreachable now. */
+  for (callback_wrap_t **link = &h->wraps; *link != NULL;) {
+    callback_wrap_t *wrap = *link;
+    if (qa_same_actor(wrap->actor, r->actor)) { *link = wrap->next; wrap->next = h->retired_wraps; h->retired_wraps = wrap; }
+    else link = &wrap->next;
+  }
+}
+/* try { this.foreignActors?.released(actor); } finally { this.#botEntities.delete(actor.id); } */
+static void on_released(void *v, qa_owned_actor actor) {
+  qa_compat_q2_rerelease_q2_guest_host *h = v;
+  released_ctx r = {h, actor.id};
+  qa_cleanup node; qa_cleanup_push(&node, released_finally, &r);
+  if (h->foreign) qa_compat_q2_rerelease_foreign_actors_released(h->foreign, actor);
+  qa_cleanup_pop(&node);
+  released_finally(&r);
 }
 static void subscribe(qa_compat_q2_rerelease_q2_guest_host *h) {
   h->unsubscribe_id = qa_session_actor_registry_on_release(h->options.engine->actors, on_released, h);
@@ -238,7 +272,7 @@ static void unsubscribe(qa_compat_q2_rerelease_q2_guest_host *h) {
 void qa_compat_q2_rerelease_q2_guest_host_rebind_world(qa_compat_q2_rerelease_q2_guest_host *h, void *ctx, void (*commit)(void *ctx)) {
   if (h->has_pickups) qa_compat_q2_native_primary_pickups_assert_idle(&h->pickups);
   if (h->closed || !h->initialized || h->filter_depth != 0)
-    qa_range_error("Q2 world rebind requires an idle initialized host");
+    qa_raise("Error", 0, 0, "Q2 world rebind requires an idle initialized host");
   if (h->foreign) qa_compat_q2_rerelease_foreign_actors_clear(h->foreign);
   h->reserved_count = 0;
   release_actors(h);
@@ -291,28 +325,43 @@ void qa_compat_q2_rerelease_q2_guest_host_pre_init(qa_compat_q2_rerelease_q2_gue
   qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
   qa_compat_q2_rerelease_guest_module_pre_init(h->module);
 }
-void qa_compat_q2_rerelease_q2_guest_host_init(qa_compat_q2_rerelease_q2_guest_host *h) {
-  if (h->closed) qa_range_error("Q2 guest host is closed");
+static void init_body(void *v) {
+  qa_compat_q2_rerelease_q2_guest_host *h = v;
   qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
   qa_compat_q2_rerelease_guest_module_init(h->module);
   h->initialized = true;
   qa_compat_q2_rerelease_q2_guest_host_reconcile(h);
 }
+void qa_compat_q2_rerelease_q2_guest_host_init(qa_compat_q2_rerelease_q2_guest_host *h) {
+  if (h->closed) qa_raise("Error", 0, 0, "Q2 guest host is closed");
+  /* try { ... } catch (error) { this.shutdown(); throw error; } */
+  qa_caught_error caught;
+  if (!qa_try(init_body, h, &caught)) {
+    qa_compat_q2_rerelease_q2_guest_host_shutdown(h);
+    qa_rethrow(&caught);
+  }
+}
 qa_guest_call_result qa_compat_q2_rerelease_q2_guest_host_call_loading(qa_compat_q2_rerelease_q2_guest_host *h, const char *name,
                                                                        const qa_guest_call_value *arguments, size_t count,
                                                                        void (*next_frame)(void *), void *next_ctx) {
-  if (h->closed) qa_range_error("Q2 guest host is closed");
+  if (h->closed) qa_raise("Error", 0, 0, "Q2 guest host is closed");
   qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
   qa_guest_call_result result = qa_compat_q2_rerelease_guest_module_call_game_loading(h->module, name, arguments, count, next_frame, next_ctx);
   if (h->initialized) qa_compat_q2_rerelease_q2_guest_host_reconcile(h);
   return result;
 }
 void qa_compat_q2_rerelease_q2_guest_host_init_loading(qa_compat_q2_rerelease_q2_guest_host *h, void (*next_frame)(void *), void *next_ctx) {
-  if (h->initialized) qa_range_error("API 2023 Init already completed");
+  if (h->initialized) qa_raise("Error", 0, 0, "API 2023 Init already completed");
   (void)qa_compat_q2_rerelease_q2_guest_host_call_loading(h, "PreInit", NULL, 0, next_frame, next_ctx);
   (void)qa_compat_q2_rerelease_q2_guest_host_call_loading(h, "Init", NULL, 0, next_frame, next_ctx);
   h->initialized = true;
   qa_compat_q2_rerelease_q2_guest_host_reconcile(h);
+}
+typedef struct loading_call {
+  qa_compat_q2_rerelease_q2_guest_host *h; const char *name; const qa_guest_call_value *args; size_t count; void (*next)(void *); void *next_ctx;
+} loading_call;
+static void loading_call_fn(void *v) {
+  loading_call *c = v; (void)qa_compat_q2_rerelease_q2_guest_host_call_loading(c->h, c->name, c->args, c->count, c->next, c->next_ctx);
 }
 void qa_compat_q2_rerelease_q2_guest_host_spawn_entities_loading(qa_compat_q2_rerelease_q2_guest_host *h, const char *map, const char *entities,
                                                                  const char *spawnpoint, void (*next_frame)(void *), void *next_ctx) {
@@ -323,12 +372,16 @@ void qa_compat_q2_rerelease_q2_guest_host_spawn_entities_loading(qa_compat_q2_re
     addresses[i] = qa_compat_q2_rerelease_guest_module_string(h->module, texts[i]);
     args[i] = qa_compat_q2_rerelease_guest_pointer(true, addresses[i]);
   }
-  (void)qa_compat_q2_rerelease_q2_guest_host_call_loading(h, "SpawnEntities", args, 3, next_frame, next_ctx);
+  /* try { await this.callLoading(...) } finally { unmap each string } */
+  loading_call call = {h, "SpawnEntities", args, 3, next_frame, next_ctx};
+  qa_caught_error caught; const bool completed = qa_try(loading_call_fn, &call, &caught);
   qa_compat_q2_memory *memory = hmem(h);
   for (int i = 0; i < 3; i++) memory->unmap(memory->ctx, addresses[i], qa_compat_q2_native_allocation_bytes((double)strlen(texts[i]) + 1));
+  if (!completed) qa_rethrow(&caught);
 }
 void qa_compat_q2_rerelease_q2_guest_host_run_frame_loading(qa_compat_q2_rerelease_q2_guest_host *h, bool main_loop,
                                                             void (*next_frame)(void *), void *next_ctx) {
+  free_retired_wraps(h);
   (void)qa_compat_q2_rerelease_q2_guest_host_call_loading(h, "PrepFrame", NULL, 0, next_frame, next_ctx);
   if (h->foreign) qa_compat_q2_rerelease_foreign_actors_synchronize(h->foreign);
   qa_guest_call_value arg = qa_compat_q2_rerelease_guest_bool(main_loop);
@@ -336,57 +389,72 @@ void qa_compat_q2_rerelease_q2_guest_host_run_frame_loading(qa_compat_q2_rerelea
 }
 static void check_save(qa_compat_q2_rerelease_q2_guest_host *h, qa_compat_q2_rerelease_source_save saved) {
   if (saved.native_length && memchr(saved.native, 0, saved.native_length))
-    qa_range_error("Q2 JSON save contains an embedded terminator");
+    qa_raise("Error", 0, 0, "Q2 JSON save contains an embedded terminator");
   if (!h->foreign && (saved.deferred_damage_count != 0 || saved.projection_count != 0))
-    qa_range_error("Native save requires its foreign actor binding");
+    qa_raise("Error", 0, 0, "Native save requires its foreign actor binding");
+}
+typedef struct read_op {
+  qa_compat_q2_rerelease_q2_guest_host *h; const char *kind; qa_compat_q2_rerelease_source_save saved; const char *domain;
+  bool loading; void (*next)(void *); void *next_ctx; qa_guest_address address; bool restoring;
+} read_op;
+static void read_body(void *v) {
+  read_op *o = v; qa_compat_q2_rerelease_q2_guest_host *h = o->h; qa_compat_q2_memory *memory = hmem(h);
+  memory->write(memory->ctx, o->address, o->saved.native, o->saved.native_length);
+  if (h->foreign) qa_compat_q2_rerelease_foreign_actors_begin_restore(h->foreign, o->saved.projections, o->saved.projection_count, o->domain);
+  o->restoring = true;
+  qa_guest_call_value arg = qa_compat_q2_rerelease_guest_pointer(true, o->address);
+  const char *name = strcmp(o->kind, "game") == 0 ? "ReadGameJson" : "ReadLevelJson";
+  if (o->loading) (void)qa_compat_q2_rerelease_q2_guest_host_call_loading(h, name, &arg, 1, o->next, o->next_ctx);
+  else {
+    qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
+    (void)qa_compat_q2_rerelease_guest_module_call_game(h->module, name, &arg, 1, NULL, NULL);
+    qa_compat_q2_rerelease_q2_guest_host_reconcile(h);
+  }
+  if (h->foreign)
+    qa_compat_q2_rerelease_deferred_damage_restore(qa_compat_q2_rerelease_foreign_actors_get_deferred(h->foreign),
+                                                   o->saved.deferred_damage, o->saved.deferred_damage_count, o->domain);
+}
+/* TS readSave / readSaveLoading: the restore scope ends and the input is unmapped in a finally. */
+static void read_save_common(qa_compat_q2_rerelease_q2_guest_host *h, const char *kind, qa_compat_q2_rerelease_source_save saved,
+                             const char *domain, bool loading, void (*next_frame)(void *), void *next_ctx) {
+  if (h->has_pickups) qa_compat_q2_native_primary_pickups_assert_idle(&h->pickups);
+  check_save(h, saved);
+  qa_compat_q2_memory *memory = hmem(h);
+  read_op o; memset(&o, 0, sizeof o);
+  o.h = h; o.kind = kind; o.saved = saved; o.domain = domain ? domain : "current"; o.loading = loading; o.next = next_frame; o.next_ctx = next_ctx;
+  o.address = qa_compat_q2_allocate_native_memory(memory, (double)saved.native_length + 1, "Q2 source save input");
+  qa_caught_error caught; const bool completed = qa_try(read_body, &o, &caught);
+  if (o.restoring && h->foreign) qa_compat_q2_rerelease_foreign_actors_end_restore(h->foreign);
+  memory->unmap(memory->ctx, o.address, qa_compat_q2_native_allocation_bytes((double)saved.native_length + 1));
+  if (!completed) qa_rethrow(&caught);
 }
 void qa_compat_q2_rerelease_q2_guest_host_read_save_loading(qa_compat_q2_rerelease_q2_guest_host *h, const char *kind,
                                                             qa_compat_q2_rerelease_source_save saved, void (*next_frame)(void *), void *next_ctx,
                                                             const char *domain) {
-  if (h->has_pickups) qa_compat_q2_native_primary_pickups_assert_idle(&h->pickups);
-  check_save(h, saved);
-  const char *dom = domain ? domain : "current";
-  qa_compat_q2_memory *memory = hmem(h);
-  qa_guest_address address = qa_compat_q2_allocate_native_memory(memory, (double)saved.native_length + 1, "Q2 source save input");
-  memory->write(memory->ctx, address, saved.native, saved.native_length);
-  if (h->foreign) qa_compat_q2_rerelease_foreign_actors_begin_restore(h->foreign, saved.projections, saved.projection_count, dom);
-  qa_guest_call_value arg = qa_compat_q2_rerelease_guest_pointer(true, address);
-  (void)qa_compat_q2_rerelease_q2_guest_host_call_loading(h, strcmp(kind, "game") == 0 ? "ReadGameJson" : "ReadLevelJson", &arg, 1, next_frame, next_ctx);
-  if (h->foreign) {
-    qa_compat_q2_rerelease_deferred_damage_restore(qa_compat_q2_rerelease_foreign_actors_get_deferred(h->foreign),
-                                                   saved.deferred_damage, saved.deferred_damage_count, dom);
-    qa_compat_q2_rerelease_foreign_actors_end_restore(h->foreign);
-  }
-  memory->unmap(memory->ctx, address, qa_compat_q2_native_allocation_bytes((double)saved.native_length + 1));
+  read_save_common(h, kind, saved, domain, true, next_frame, next_ctx);
 }
 void qa_compat_q2_rerelease_q2_guest_host_read_save(qa_compat_q2_rerelease_q2_guest_host *h, const char *kind,
                                                     qa_compat_q2_rerelease_source_save saved, const char *domain) {
-  if (h->has_pickups) qa_compat_q2_native_primary_pickups_assert_idle(&h->pickups);
-  check_save(h, saved);
-  const char *dom = domain ? domain : "current";
-  qa_compat_q2_memory *memory = hmem(h);
-  qa_guest_address address = qa_compat_q2_allocate_native_memory(memory, (double)saved.native_length + 1, "Q2 source save input");
-  memory->write(memory->ctx, address, saved.native, saved.native_length);
-  if (h->foreign) qa_compat_q2_rerelease_foreign_actors_begin_restore(h->foreign, saved.projections, saved.projection_count, dom);
-  qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
-  qa_guest_call_value arg = qa_compat_q2_rerelease_guest_pointer(true, address);
-  (void)qa_compat_q2_rerelease_guest_module_call_game(h->module, strcmp(kind, "game") == 0 ? "ReadGameJson" : "ReadLevelJson", &arg, 1, NULL, NULL);
-  qa_compat_q2_rerelease_q2_guest_host_reconcile(h);
-  if (h->foreign) {
-    qa_compat_q2_rerelease_deferred_damage_restore(qa_compat_q2_rerelease_foreign_actors_get_deferred(h->foreign),
-                                                   saved.deferred_damage, saved.deferred_damage_count, dom);
-    qa_compat_q2_rerelease_foreign_actors_end_restore(h->foreign);
-  }
-  memory->unmap(memory->ctx, address, qa_compat_q2_native_allocation_bytes((double)saved.native_length + 1));
+  read_save_common(h, kind, saved, domain, false, NULL, NULL);
 }
+static void shutdown_foreign(void *v) { qa_compat_q2_rerelease_q2_guest_host *h = v; if (h->foreign) qa_compat_q2_rerelease_foreign_actors_close(h->foreign); }
+static void shutdown_game(void *v) {
+  qa_compat_q2_rerelease_q2_guest_host *h = v;
+  if (h->initialized) (void)qa_compat_q2_rerelease_guest_module_call_game(h->module, "Shutdown", NULL, 0, NULL, NULL);
+}
+static void shutdown_release(void *v) { release_actors(v); }
+static void shutdown_unsubscribe(void *v) { unsubscribe(v); }
 void qa_compat_q2_rerelease_q2_guest_host_shutdown(qa_compat_q2_rerelease_q2_guest_host *h) {
   if (h->closed) return;
   h->closed = true;
   if (h->has_pickups) qa_compat_q2_native_primary_pickups_close(&h->pickups);
-  if (h->foreign) qa_compat_q2_rerelease_foreign_actors_close(h->foreign);
-  if (h->initialized) (void)qa_compat_q2_rerelease_guest_module_call_game(h->module, "Shutdown", NULL, 0, NULL, NULL);
-  release_actors(h);
-  unsubscribe(h);
+  /* try { try { foreignActors.close() } finally { Shutdown } } finally { try { releaseActors } finally { unsubscribe } }:
+   * every step runs, and the last one that threw is the error reported. */
+  static void (*const steps[])(void *) = {shutdown_foreign, shutdown_game, shutdown_release, shutdown_unsubscribe};
+  qa_caught_error pending, step; bool failed = false;
+  for (size_t i = 0; i < sizeof steps / sizeof *steps; i++)
+    if (!qa_try(steps[i], h, &step)) { pending = step; failed = true; }
+  if (failed) qa_rethrow(&pending);
 }
 void qa_compat_q2_rerelease_q2_guest_host_spawn_entities(qa_compat_q2_rerelease_q2_guest_host *h, const char *map, const char *entities, const char *spawnpoint) {
   qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
@@ -394,11 +462,13 @@ void qa_compat_q2_rerelease_q2_guest_host_spawn_entities(qa_compat_q2_rerelease_
   qa_compat_q2_rerelease_q2_guest_host_reconcile(h);
 }
 void qa_compat_q2_rerelease_q2_guest_host_prep_frame(qa_compat_q2_rerelease_q2_guest_host *h) {
+  free_retired_wraps(h);
   qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
   qa_compat_q2_rerelease_guest_module_prep_frame(h->module);
   qa_compat_q2_rerelease_q2_guest_host_reconcile(h);
 }
 void qa_compat_q2_rerelease_q2_guest_host_run_frame(qa_compat_q2_rerelease_q2_guest_host *h, bool main_loop) {
+  free_retired_wraps(h);
   qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
   if (h->foreign) qa_compat_q2_rerelease_foreign_actors_synchronize(h->foreign);
   qa_compat_q2_rerelease_guest_module_run_frame(h->module, main_loop);
@@ -426,73 +496,72 @@ void qa_compat_q2_rerelease_q2_guest_host_client_disconnect(qa_compat_q2_rerelea
   qa_compat_q2_rerelease_guest_module_client_disconnect(h->module, slot);
   qa_compat_q2_rerelease_q2_guest_host_reconcile(h);
 }
-static qa_compat_q2_rerelease_source_save finish_save(qa_compat_q2_rerelease_q2_guest_host *h, const char *kind,
-                                                      qa_guest_call_result written, qa_guest_address size) {
-  qa_compat_q2_memory *memory = hmem(h);
-  qa_guest_address output;
-  bool has_output = qa_compat_q2_rerelease_result_pointer(written, &output);
-  qa_compat_q2_rerelease_source_save save; memset(&save, 0, sizeof save);
-  if (!has_output) {
-    memory->unmap(memory->ctx, size, 8);
-    qa_range_error("Q2 source save returned null");
-  }
-  uint64_t length = qa_compat_q2_mem_read_u64(memory, size);
-  if (length > 9007199254740991ull) {
-    qa_compat_q2_rerelease_core_imports_free(h->core, true, output);
-    memory->unmap(memory->ctx, size, 8);
-    qa_range_error("Q2 source save length exceeds host copy range");
-  }
-  save.native = xmalloc((size_t)length);
-  save.native_length = (size_t)length;
-  memory->copy(memory->ctx, output, save.native, (double)length);
-  if (strcmp(kind, "level") == 0 && h->foreign) {
+typedef struct write_op {
+  qa_compat_q2_rerelease_q2_guest_host *h; const char *kind; bool automatic, loading; void (*next)(void *); void *next_ctx;
+  qa_guest_address size, output; bool has_output; qa_compat_q2_rerelease_source_save save;
+} write_op;
+static void write_body(void *v) {
+  write_op *o = v; qa_compat_q2_rerelease_q2_guest_host *h = o->h; qa_compat_q2_memory *memory = hmem(h);
+  qa_guest_call_value args[2] = {qa_compat_q2_rerelease_guest_bool(o->automatic), qa_compat_q2_rerelease_guest_pointer(true, o->size)};
+  const char *name = strcmp(o->kind, "game") == 0 ? "WriteGameJson" : "WriteLevelJson";
+  qa_guest_call_result written = o->loading ? qa_compat_q2_rerelease_guest_module_call_game_loading(h->module, name, args, 2, o->next, o->next_ctx)
+                                            : qa_compat_q2_rerelease_guest_module_call_game(h->module, name, args, 2, NULL, NULL);
+  o->has_output = qa_compat_q2_rerelease_result_pointer(written, &o->output);
+  if (!o->has_output) qa_raise("Error", 0, 0, "Q2 source save returned null");
+  uint64_t length = qa_compat_q2_mem_read_u64(memory, o->size);
+  if (length > 9007199254740991ull) qa_range_error("Q2 source save length exceeds host copy range");
+  /* memory.copy(output, length) faults on an unmapped range before anything is allocated for it: the guest names the length. */
+  memory->check(memory->ctx, o->output, (double)length, "read");
+  o->save.native = xmalloc((size_t)length);
+  o->save.native_length = (size_t)length;
+  memory->copy(memory->ctx, o->output, o->save.native, (double)length);
+  if (strcmp(o->kind, "level") == 0 && h->foreign) {
     size_t count = 0;
     qa_compat_q2_rerelease_deferred_damage_save *entries = qa_compat_q2_rerelease_deferred_damage_save_entries(
         qa_compat_q2_rerelease_foreign_actors_get_deferred(h->foreign), &count);
-    save.deferred_damage = entries; save.deferred_damage_count = count;
-    save.projections = qa_compat_q2_rerelease_foreign_actors_save_projections(h->foreign, &save.projection_count);
+    o->save.deferred_damage = entries; o->save.deferred_damage_count = count;
+    o->save.projections = qa_compat_q2_rerelease_foreign_actors_save_projections(h->foreign, &o->save.projection_count);
   }
-  qa_compat_q2_rerelease_core_imports_free(h->core, true, output);
-  memory->unmap(memory->ctx, size, 8);
-  return save;
+}
+/* TS writeSave / writeSaveLoading: try { ... } finally { if (output !== null) this.core.free(output); memory.unmap(size, 8); } */
+static qa_compat_q2_rerelease_source_save write_save_common(qa_compat_q2_rerelease_q2_guest_host *h, const char *kind, bool automatic_or_transition,
+                                                            bool loading, void (*next_frame)(void *), void *next_ctx) {
+  qa_compat_q2_memory *memory = hmem(h);
+  write_op o; memset(&o, 0, sizeof o);
+  o.h = h; o.kind = kind; o.automatic = automatic_or_transition; o.loading = loading; o.next = next_frame; o.next_ctx = next_ctx;
+  o.size = memory->allocate(memory->ctx, 8, true, 8, "Q2 save size");
+  qa_caught_error caught; const bool completed = qa_try(write_body, &o, &caught);
+  if (!completed) { free(o.save.native); o.save.native = NULL; }
+  if (o.has_output) qa_compat_q2_rerelease_core_imports_free(h->core, true, o.output);
+  memory->unmap(memory->ctx, o.size, 8);
+  if (!completed) qa_rethrow(&caught);
+  return o.save;
 }
 qa_compat_q2_rerelease_source_save qa_compat_q2_rerelease_q2_guest_host_write_save(qa_compat_q2_rerelease_q2_guest_host *h, const char *kind,
                                                                                    bool automatic_or_transition) {
   if (h->has_pickups) qa_compat_q2_native_primary_pickups_assert_idle(&h->pickups);
-  qa_compat_q2_memory *memory = hmem(h);
-  qa_guest_address size = memory->allocate(memory->ctx, 8, true, 8, "Q2 save size");
-  qa_guest_call_value args[2] = {qa_compat_q2_rerelease_guest_bool(automatic_or_transition),
-                                 qa_compat_q2_rerelease_guest_pointer(true, size)};
-  qa_guest_call_result written = qa_compat_q2_rerelease_guest_module_call_game(
-      h->module, strcmp(kind, "game") == 0 ? "WriteGameJson" : "WriteLevelJson", args, 2, NULL, NULL);
-  return finish_save(h, kind, written, size);
+  return write_save_common(h, kind, automatic_or_transition, false, NULL, NULL);
 }
 qa_compat_q2_rerelease_source_save qa_compat_q2_rerelease_q2_guest_host_write_save_loading(
     qa_compat_q2_rerelease_q2_guest_host *h, const char *kind, bool automatic_or_transition, void (*next_frame)(void *), void *next_ctx) {
   if (h->has_pickups) qa_compat_q2_native_primary_pickups_assert_idle(&h->pickups);
-  if (h->closed) qa_range_error("Q2 guest host is closed");
+  if (h->closed) qa_raise("Error", 0, 0, "Q2 guest host is closed");
   qa_compat_q2_rerelease_core_imports_refresh_cvars(h->core);
-  qa_compat_q2_memory *memory = hmem(h);
-  qa_guest_address size = memory->allocate(memory->ctx, 8, true, 8, "Q2 save size");
-  qa_guest_call_value args[2] = {qa_compat_q2_rerelease_guest_bool(automatic_or_transition),
-                                 qa_compat_q2_rerelease_guest_pointer(true, size)};
-  qa_guest_call_result written = qa_compat_q2_rerelease_guest_module_call_game_loading(
-      h->module, strcmp(kind, "game") == 0 ? "WriteGameJson" : "WriteLevelJson", args, 2, next_frame, next_ctx);
-  return finish_save(h, kind, written, size);
+  return write_save_common(h, kind, automatic_or_transition, true, next_frame, next_ctx);
 }
 void qa_compat_q2_rerelease_q2_guest_host_bind_pickup_supply(qa_compat_q2_rerelease_q2_guest_host *h, qa_compat_q2_native_pickup_supply owner) {
-  if (!h->has_pickups) qa_range_error("This original game has no admitted pickup supply interface");
+  if (!h->has_pickups) qa_raise("Error", 0, 0, "This original game has no admitted pickup supply interface");
   qa_compat_q2_native_primary_pickups_bind_supply(&h->pickups, owner);
 }
 void qa_compat_q2_rerelease_q2_guest_host_unbind_pickup_supply(qa_compat_q2_rerelease_q2_guest_host *h, qa_compat_q2_native_pickup_supply owner) {
   qa_compat_q2_native_primary_pickups_unbind_supply(&h->pickups, owner);
 }
 qa_compat_q2_native_pickup_supply_evaluation qa_compat_q2_rerelease_q2_guest_host_pickup_supply(qa_compat_q2_rerelease_q2_guest_host *h, const qa_original_pickup_offer *offer) {
-  if (!h->has_pickups) qa_range_error("This original game has no admitted pickup supply interface");
+  if (!h->has_pickups) qa_raise("Error", 0, 0, "This original game has no admitted pickup supply interface");
   return qa_compat_q2_native_primary_pickups_evaluate_supply(&h->pickups, offer);
 }
 bool qa_compat_q2_rerelease_q2_guest_host_pickup_supply_owns(qa_compat_q2_rerelease_q2_guest_host *h, qa_actor_id actor, qa_item_id item, qa_actor_id pickup) {
-  if (!h->has_pickups) qa_range_error("This original game has no admitted pickup supply interface");
+  if (!h->has_pickups) qa_raise("Error", 0, 0, "This original game has no admitted pickup supply interface");
   return h->pickups.has_supply && h->pickups.supply.owns(h->pickups.supply.ctx, actor, item, pickup);
 }
 static bool surface_address(qa_compat_q2_rerelease_q2_guest_host *h, const qa_q2_surface_info *surface, qa_guest_address *out) {
@@ -535,7 +604,7 @@ static void put_plane(uint8_t *view, size_t offset, qa_bsp_plane value) {
 }
 qa_guest_call_result qa_compat_q2_rerelease_q2_guest_host_encode_trace(qa_compat_q2_rerelease_q2_guest_host *h, qa_trace_result trace,
                                                                        const qa_guest_address *clipped_entity) {
-  if (!trace.kind || strcmp(trace.kind, "q2") != 0) qa_range_error("Rerelease trace requires Q2 source collision fields");
+  if (!trace.kind || strcmp(trace.kind, "q2") != 0) qa_raise("Error", 0, 0, "Rerelease trace requires Q2 source collision fields");
   size_t length = (size_t)qa_compat_q2_rerelease_trace_layout.byte_length;
   if (length > h->trace_scratch_cap) { h->trace_scratch = xrealloc(h->trace_scratch, length); h->trace_scratch_cap = length; }
   uint8_t *view = h->trace_scratch;
@@ -592,6 +661,7 @@ static bool foreign_lookup_defined(qa_compat_q2_rerelease_q2_guest_host *h, qa_r
   qa_owned_actor found;
   return qa_compat_q2_rerelease_foreign_actors_lookup(h->foreign, view, &found) != QA_COMPAT_Q2_RR_LOOKUP_UNDEFINED;
 }
+static void filter_depth_finally(void *v) { qa_compat_q2_rerelease_q2_guest_host *h = v; h->filter_depth--; }
 static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host *h, qa_compat_q2_rerelease_import_call call) {
   if (h->options.intercept_import) {
     qa_guest_call_result intercepted;
@@ -620,7 +690,7 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
     qa_owned_actor actor;
     bool has_actor = qa_compat_q2_rerelease_q2_guest_host_actor(h, view, &actor);
     if (strcmp(name, "Bot_RegisterEdict") == 0) {
-      if (!has_actor) qa_range_error("Q2 bot registration requires a live source edict");
+      if (!has_actor) qa_raise("Error", 0, 0, "Q2 bot registration requires a live source edict");
       bool present = false;
       for (size_t i = 0; i < h->bot_count; i++) if (qa_same_actor(h->bots[i].actor, actor.id)) { h->bots[i].view = view; present = true; }
       if (!present) {
@@ -656,22 +726,30 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
     bool has_data = qa_compat_q2_guest_pointer(args, count, 6, &data);
     if (area != 1 && area != 2) qa_range_error("Q2 BoxEdicts requires AREA_SOLID or AREA_TRIGGERS");
     if (maximum < 0 || maximum > 9007199254740991ll) qa_range_error("Invalid Q2 BoxEdicts capacity");
-    if (maximum > 0 && !has_list) qa_range_error("Q2 BoxEdicts output is null with nonzero capacity");
+    if (maximum > 0 && !has_list) qa_raise("Error", 0, 0, "Q2 BoxEdicts output is null with nonzero capacity");
     size_t candidate_count = 0;
-    const qa_actor_id *candidates = h->options.spatial.box_edicts(h->options.spatial.ctx, min, max, area, &candidate_count);
+    const qa_actor_id *listed = h->options.spatial.box_edicts(h->options.spatial.ctx, min, max, area, &candidate_count);
+    /* The candidate list is a snapshot, so filters may link or unlink entities (M_CheckDodge reaches monsterinfo.dodge
+     * from here) and call BoxEdicts again: the service's own list may be rebuilt under the walk. */
+    qa_actor_id *candidates = xmalloc(candidate_count * sizeof *candidates);
+    if (candidate_count) memcpy(candidates, listed, candidate_count * sizeof *candidates);
+    qa_cleanup candidates_node; qa_cleanup_push(&candidates_node, free, candidates);
     uint64_t found = 0;
     for (size_t i = 0; i < candidate_count; i++) {
       qa_guest_address address = qa_compat_q2_rerelease_q2_guest_host_address_for_actor(h, candidates[i]);
       int64_t outcome = 0;
       if (has_filter) {
+        /* this.#filterDepth++; try { ... } finally { this.#filterDepth--; } */
         h->filter_depth++;
+        qa_cleanup depth_node; qa_cleanup_push(&depth_node, filter_depth_finally, h);
         qa_guest_call_value filter_args[2] = {qa_compat_q2_rerelease_guest_pointer(true, address),
                                               qa_compat_q2_rerelease_guest_pointer(has_data, data)};
         qa_guest_call_result result = qa_compat_q2_rerelease_guest_module_invoke(h->module, filter, h->box_filter_signature,
                                                                                 filter_args, 2, NULL, NULL);
-        h->filter_depth--;
-        if (result.kind != QA_GUEST_VALUE_INT32) qa_range_error("Q2 BoxEdicts filter must return its source enum");
+        if (result.kind != QA_GUEST_VALUE_INT32) qa_raise("TypeError", 0, 0, "Q2 BoxEdicts filter must return its source enum");
         outcome = (int64_t)result.number_value;
+        qa_cleanup_pop(&depth_node);
+        h->filter_depth--;
       }
       if ((outcome & ~65) != 0) qa_range_error("Invalid Q2 BoxEdicts filter result %lld", (long long)outcome);
       if ((outcome & 1) == 0) {
@@ -683,6 +761,7 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
       }
       if ((outcome & 64) != 0) break;
     }
+    qa_cleanup_pop(&candidates_node); free(candidates);
     qa_guest_call_result out; memset(&out, 0, sizeof out);
     out.kind = QA_GUEST_VALUE_UINT64; out.uint64_value = found;
     return out;
@@ -717,7 +796,7 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
     bool has_min = qa_compat_q2_guest_pointer(args, count, 1, &min_a);
     bool has_max = qa_compat_q2_guest_pointer(args, count, 2, &max_a);
     bool has_pass = qa_compat_q2_guest_pointer(args, count, 4, &pass);
-    if (has_min != has_max) qa_range_error("Q2 trace requires both bounds or neither");
+    if (has_min != has_max) qa_raise("Error", 0, 0, "Q2 trace requires both bounds or neither");
     qa_actor_id ignore;
     const qa_actor_id *ignore_ptr = NULL;
     if (has_pass) {
@@ -756,7 +835,7 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
       return void_result();
     }
     uint32_t solid = qa_compat_q2_mem_read_u8(memory, at_field(h, view, "solid"));
-    if (solid > 3) qa_range_error("Unsupported source Q2 solid %u", solid);
+    if (solid > 3) qa_raise("Error", 0, 0, "Unsupported source Q2 solid %u", solid);
     double model = 0;
     const double *model_ptr = NULL;
     if (solid == 3) {
@@ -769,7 +848,7 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
     qa_shared_body_table_link(engine->bodies, actor, NULL);
     qa_compat_q2_rerelease_link_metadata metadata = h->options.spatial.link_metadata(h->options.spatial.ctx, actor, view);
     qa_linked_body_result linked = qa_shared_body_table_linked(engine->bodies, actor.id);
-    if (!linked.has_value) qa_range_error("Shared body failed to retain source link");
+    if (!linked.has_value) qa_raise("Error", 0, 0, "Shared body failed to retain source link");
     write_vector(h, at_field(h, view, "absmin"), linked.value.absolute_bounds.min);
     write_vector(h, at_field(h, view, "absmax"), linked.value.absolute_bounds.max);
     qa_vec3 mins = read_vector(h, at_field(h, view, "mins"));
@@ -782,7 +861,8 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
         (qa_compat_q2_mem_read_u32(memory, at_field(h, view, "s.renderfx")) & 128) == 0)
       (address2 = at_field(h, view, "s.old_origin"), vector = read_vector(h, at_field(h, view, "s.origin")), write_vector(h, address2, vector));
     qa_guest_address a3 = at_field(h, view, "linkcount");
-    int v2 = qa_compat_q2_mem_read_i32(memory, at_field(h, view, "linkcount")) + 1;
+    /* writeInt32(linkcount + 1): the guest's word wraps instead of overflowing. */
+    int32_t v2 = (int32_t)(qa_compat_q2_mem_read_u32(memory, at_field(h, view, "linkcount")) + 1u);
     qa_compat_q2_mem_write_i32(memory, a3, v2);
     qa_compat_q2_mem_write_u8(memory, at_field(h, view, "linked"), solid == 0 ? 0 : 1);
     return void_result();
@@ -790,6 +870,7 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
   if (strcmp(name, "setmodel") == 0) {
     qa_raw_entity_view view = table.from_pointer(table.ctx, qa_compat_q2_guest_required_pointer(args, count, 0));
     char *model_name = qa_compat_q2_read_guest_string(memory, qa_compat_q2_guest_required_pointer(args, count, 1), -1);
+    qa_cleanup name_node; qa_cleanup_push(&name_node, free, model_name);
     qa_guest_address a2 = at_field(h, view, "s.modelindex");
     int32_t v = qa_js_to_int32(h->options.services.resource_index(h->options.services.ctx, "model", model_name));
     qa_compat_q2_mem_write_i32(memory, a2, v);
@@ -801,10 +882,8 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
         model = qa_js_string_to_number(text); /* Number(name.slice(1)); strtod missed "0b11" and " 5 " */
         valid = !isnan(model);
       }
-      if (!valid || trunc(model) != model || model < 0 || model > 9007199254740991.0) {
-        free(model_name);
-        qa_range_error("Invalid source inline model name");
-      }
+      if (!valid || trunc(model) != model || model < 0 || model > 9007199254740991.0)
+        qa_raise("Error", 0, 0, "Invalid source inline model name");
       qa_bounds bounds = engine->inline_model_bounds(engine->ctx, model);
       write_vector(h, at_field(h, view, "mins"), bounds.min);
       write_vector(h, at_field(h, view, "maxs"), bounds.max);
@@ -815,7 +894,7 @@ static qa_guest_call_result dispatch_import(qa_compat_q2_rerelease_q2_guest_host
       link.name = "linkentity"; link.arguments = link_args; link.argument_count = 1;
       (void)host_import(h, link);
     }
-    free(model_name);
+    qa_cleanup_pop(&name_node); free(model_name);
     return void_result();
   }
   return qa_compat_q2_rerelease_core_imports_invoke(h->core, call);
@@ -862,7 +941,7 @@ static bool pickup_current(void *ctx, qa_raw_entity_view record, qa_actor_id *ou
 }
 static const qa_original_pickup_admission *pickup_admission(void *ctx) {
   qa_compat_q2_rerelease_q2_guest_host *h = ctx;
-  if (!h->options.has_pickups) qa_range_error("API2023 primary pickup authority disappeared");
+  if (!h->options.has_pickups) qa_raise("Error", 0, 0, "API2023 primary pickup authority disappeared");
   return h->options.pickup_admission;
 }
 static void *pickup_with_protection(void *ctx, qa_raw_entity_view recipient, qa_protection_channel channel, void *operation_ctx, void (*current)(void *),
@@ -871,9 +950,9 @@ static void *pickup_with_protection(void *ctx, qa_raw_entity_view recipient, qa_
 }
 qa_compat_q2_rerelease_q2_guest_host *qa_compat_q2_rerelease_q2_guest_host_create(const qa_compat_q2_rerelease_q2_host_options *options) {
   if (options->has_pickups && options->semantics.project)
-    qa_range_error("Primary pickup callers cannot bind a component projection");
+    qa_raise("Error", 0, 0, "Primary pickup callers cannot bind a component projection");
   if (options->debug_drawing_headless && (options->debug_shapes || options->world_text))
-    qa_range_error("Headless Q2 debug drawing cannot bind renderer callbacks");
+    qa_raise("Error", 0, 0, "Headless Q2 debug drawing cannot bind renderer callbacks");
   qa_compat_q2_rerelease_q2_guest_host *h = calloc(1, sizeof *h);
   if (!h) return NULL;
   h->options = *options;
@@ -906,7 +985,7 @@ qa_compat_q2_rerelease_q2_guest_host *qa_compat_q2_rerelease_q2_guest_host_creat
     if (!h->messages) qa_range_error("Q2 rerelease host out of memory");
   }
   if (options->foreign_damage && !options->has_native_entries)
-    qa_range_error("Foreign native damage requires verified entry points");
+    qa_raise("Error", 0, 0, "Foreign native damage requires verified entry points");
   if (options->foreign_damage && options->has_native_entries) {
     h->foreign = qa_compat_q2_rerelease_foreign_actors_create(h, options->native_entries, *options->foreign_damage);
     if (!h->foreign) qa_range_error("Q2 rerelease host out of memory");
@@ -940,6 +1019,7 @@ void qa_compat_q2_rerelease_q2_guest_host_destroy(qa_compat_q2_rerelease_q2_gues
   free(h->lifetimes); free(h->retired); free(h->reserved); free(h->surfaces);
   free(h->bots); free(h->bot_scratch); free(h->trace_scratch);
   while (h->wraps) { callback_wrap_t *next = h->wraps->next; free(h->wraps); h->wraps = next; }
+  free_retired_wraps(h);
   free(h);
 }
 const qa_compat_q2_rerelease_q2_host_options *qa_compat_q2_rerelease_q2_guest_host_get_options(const qa_compat_q2_rerelease_q2_guest_host *h) {

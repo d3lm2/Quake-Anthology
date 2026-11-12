@@ -2,7 +2,6 @@
 #include "qa/formats/q3_model/text.h"
 #include "qa/network/common/js_number.h"
 
-#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +21,9 @@ noreturn void qa_model_text_error(const char *source, size_t offset, const char 
   qa_raise("ModelTextError", 0, (long long)offset, "%s:%zu: %s", source, offset, message);
 }
 
-/* JSON.stringify of a token for the expect/number messages. */
+/* JSON.stringify of a token for the expect/number messages. `out` holds at
+ * least 6 * strlen(text) + 10 bytes (json_quote_capacity). */
+static size_t json_quote_capacity(const char *text) { return strlen(text) * 6 + 10; }
 static void json_quote(const char *text, char *out, size_t capacity) {
   size_t w = 0;
   out[w++] = '"';
@@ -31,6 +32,9 @@ static void json_quote(const char *text, char *out, size_t capacity) {
                          : *p == '\n' ? "\\n" : *p == '\r' ? "\\r" : *p == '\t' ? "\\t" : NULL;
     if (escape != NULL) {
       w += (size_t)snprintf(out + w, capacity - w, "%s", escape);
+    } else if (*p == 0xc0 && p[1] == 0x80) { /* a decoded U+0000 (qa_text_decoder_decode) */
+      w += (size_t)snprintf(out + w, capacity - w, "\\u0000");
+      p++;
     } else if (*p < 0x20) {
       w += (size_t)snprintf(out + w, capacity - w, "\\u%04x", *p);
     } else {
@@ -48,8 +52,25 @@ void qa_model_tokens_init(qa_model_tokens *tokens, const char *text, const char 
   tokens->offset = 0;
 }
 
+/* TS counts the offset in UTF-16 code units of the decoded text: a UTF-8
+ * sequence of up to three bytes is one unit, a four-byte one is two. */
+static size_t utf16_offset(const qa_model_tokens *tokens) {
+  size_t units = 0;
+  for (size_t i = 0; i < tokens->offset && i < tokens->length; i++) {
+    unsigned char c = (unsigned char)tokens->text[i];
+    if ((c & 0xc0) == 0x80) continue;
+    units += c >= 0xf0 ? 2 : 1;
+  }
+  return units;
+}
+
 noreturn void qa_model_tokens_fail(const qa_model_tokens *tokens, const char *message) {
-  qa_model_text_error(tokens->source, tokens->offset, message);
+  qa_model_text_error(tokens->source, utf16_offset(tokens), message);
+}
+
+/* JS /\s/: ASCII whitespace plus the Unicode spaces and line separators. */
+static size_t space_length(const qa_model_tokens *tokens) {
+  return qa_js_white_space_length(tokens->text + tokens->offset);
 }
 
 static bool starts_with(const qa_model_tokens *tokens, const char *prefix) {
@@ -60,8 +81,8 @@ static bool starts_with(const qa_model_tokens *tokens, const char *prefix) {
 
 char *qa_model_tokens_next(qa_model_tokens *tokens) {
   while (tokens->offset < tokens->length) {
-    char character = tokens->text[tokens->offset];
-    if (isspace((unsigned char)character)) { tokens->offset++; continue; }
+    size_t space = space_length(tokens);
+    if (space != 0) { tokens->offset += space; continue; }
     if (starts_with(tokens, "//")) {
       size_t end = tokens->offset + 2;
       while (end < tokens->length && tokens->text[end] != '\n') end++;
@@ -103,7 +124,7 @@ char *qa_model_tokens_next(qa_model_tokens *tokens) {
   }
   while (tokens->offset < tokens->length) {
     char character = tokens->text[tokens->offset];
-    if (isspace((unsigned char)character) || character == '{' || character == '}' || character == '(' ||
+    if (space_length(tokens) != 0 || character == '{' || character == '}' || character == '(' ||
         character == ')')
       break;
     tokens->offset++;
@@ -124,11 +145,16 @@ char *qa_model_tokens_token(qa_model_tokens *tokens) {
 void qa_model_tokens_expect(qa_model_tokens *tokens, const char *expected) {
   char *actual = qa_model_tokens_token(tokens);
   if (strcmp(actual, expected) != 0) {
-    char want[512], got[512], message[1100];
-    json_quote(expected, want, sizeof want);
-    json_quote(actual, got, sizeof got);
-    snprintf(message, sizeof message, "expected %s, got %s", want, got);
+    /* Sized to the token: a long file token is not cut to a fixed buffer. */
+    size_t want_capacity = json_quote_capacity(expected), got_capacity = json_quote_capacity(actual);
+    char *want = xmalloc(want_capacity), *got = xmalloc(got_capacity);
+    json_quote(expected, want, want_capacity);
+    json_quote(actual, got, got_capacity);
     free(actual);
+    char message[QA_CAUGHT_MESSAGE_CAPACITY];
+    snprintf(message, sizeof message, "expected %s, got %s", want, got);
+    free(want);
+    free(got);
     qa_model_tokens_fail(tokens, message);
   }
   free(actual);
@@ -139,10 +165,13 @@ double qa_model_tokens_number(qa_model_tokens *tokens) {
   double value = qa_js_string_to_number(token); /* Number(token); strtod missed "0b1" and " 1" */
   bool valid = token[0] != '\0' && isfinite(value);
   if (!valid) {
-    char quoted[512], message[600];
-    json_quote(token, quoted, sizeof quoted);
-    snprintf(message, sizeof message, "invalid number %s", quoted);
+    size_t capacity = json_quote_capacity(token);
+    char *quoted = xmalloc(capacity);
+    json_quote(token, quoted, capacity);
     free(token);
+    char message[QA_CAUGHT_MESSAGE_CAPACITY];
+    snprintf(message, sizeof message, "invalid number %s", quoted);
+    free(quoted);
     qa_model_tokens_fail(tokens, message);
   }
   free(token);

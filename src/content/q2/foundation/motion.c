@@ -12,8 +12,11 @@
 #include "qa/foundation/js.h"
 
 typedef struct curve { float *positions; size_t count; double frame, subframe, subframes; } curve;
+/* TS WeakMap<Q2Entity, LinearMove>: the entry dies with its entity. A C entity
+ * is freed at release and its address reused, so an entry also records the
+ * actor id; a pointer match with another id is a dead entity's entry. */
 typedef struct move {
-  qa_q2_entity *e; qa_vec3 direction, destination, reference;
+  qa_q2_entity *e; qa_actor_id actor; qa_vec3 direction, destination, reference;
   double remaining, current_speed, move_speed, next_speed, decel_distance;
   qa_q2_think done; curve *cv;
 } move;
@@ -27,16 +30,38 @@ struct qa_q2_linear_motion {
   double **cp_positions;
 };
 
+static void free_curve(move *mv) { if (mv->cv) { free(mv->cv->positions); free(mv->cv); mv->cv = NULL; } }
 static move *find_move(qa_q2_linear_motion *m, qa_q2_entity *e) {
-  for (size_t i = 0; i < m->count; i++) if (m->moves[i].e == e) return &m->moves[i];
+  for (size_t i = 0; i < m->count; i++) {
+    if (m->moves[i].e != e) continue;
+    if (qa_same_actor(m->moves[i].actor, e->actor.id)) return &m->moves[i];
+    free_curve(&m->moves[i]);
+    memmove(&m->moves[i], &m->moves[i + 1], (m->count - i - 1) * sizeof *m->moves);
+    m->count--;
+    return NULL;
+  }
   return NULL;
+}
+/* Entries of released entities, dropped before the table grows. */
+static void drop_dead_moves(qa_q2_linear_motion *m, qa_q2_game_services *g) {
+  size_t kept = 0;
+  for (size_t i = 0; i < m->count; i++) {
+    if (qa_session_actor_registry_is_live(g->host->actors, m->moves[i].actor)) m->moves[kept++] = m->moves[i];
+    else free_curve(&m->moves[i]);
+  }
+  m->count = kept;
+}
+/* TS curve.positions[index]: undefined outside the array or at a non-integer index. */
+static bool curve_sample(const curve *cv, double index, double *out) {
+  if (!(index >= 0 && index < (double)cv->count) || index != floor(index)) return false;
+  *out = (double)cv->positions[(size_t)index];
+  return true;
 }
 static move *state_of(qa_q2_linear_motion *m, qa_q2_entity *e) {
   move *s = find_move(m, e);
-  if (!s) qa_range_error("Q2 mover callback has no active move");
+  if (!s) qa_raise("Error", 0, 0, "Q2 mover callback has no active move");
   return s;
 }
-static void free_curve(move *mv) { if (mv->cv) { free(mv->cv->positions); free(mv->cv); mv->cv = NULL; } }
 static void delete_move(qa_q2_linear_motion *m, qa_q2_entity *e) {
   for (size_t i = 0; i < m->count; i++)
     if (m->moves[i].e == e) { free_curve(&m->moves[i]); memmove(&m->moves[i], &m->moves[i + 1], (m->count - i - 1) * sizeof *m->moves); m->count--; return; }
@@ -132,20 +157,19 @@ static void curve_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_linear_motion *m = c;
   move *st = state_of(m, e);
   curve *cv = st->cv;
-  if (!cv) qa_range_error("Q2 rerelease accelerated move has no curve");
+  if (!cv) qa_raise("Error", 0, 0, "Q2 rerelease accelerated move has no curve");
   if (cv->subframes != 0 && cv->subframe == cv->subframes + 1) { cv->subframe = 0; cv->frame++; }
   if (cv->frame == (double)cv->count) { final_fn(m, e, g); return; }
   double distance;
   if (cv->subframes != 0) {
-    int64_t fi = (int64_t)cv->frame;
-    if (fi - 1 < 0 || fi >= (int64_t)cv->count) qa_range_error("Q2 accelerated move references a missing curve sample");
-    double from = cv->positions[fi - 1], to = cv->positions[fi];
+    double from, to;
+    if (!curve_sample(cv, cv->frame - 1, &from) || !curve_sample(cv, cv->frame, &to))
+      qa_raise("Error", 0, 0, "Q2 accelerated move references a missing curve sample");
     distance = from + (to - from) * (cv->subframe + 1) / (cv->subframes + 1);
     cv->subframe++;
   } else {
-    int64_t fi = (int64_t)cv->frame++;
-    if (fi < 0 || fi >= (int64_t)cv->count) qa_range_error("Q2 accelerated move references a missing curve sample");
-    distance = cv->positions[fi];
+    double frame_index = cv->frame++;
+    if (!curve_sample(cv, frame_index, &distance)) qa_raise("Error", 0, 0, "Q2 accelerated move references a missing curve sample");
   }
   qa_vec3 target = qa_q2_add(st->reference, qa_q2_scale(st->direction, distance));
   qa_vec3 value = qa_q2_subtract(target, qa_q2_game_body(g, e).origin);
@@ -201,7 +225,7 @@ qa_q2_linear_motion_checkpoint qa_q2_linear_motion_capture(qa_q2_linear_motion *
     move *st = find_move(m, entities[i]);
     if (!st) continue;
     const char *done = qa_q2_think_name(g->source_callbacks, st->done, st->done.fn != NULL);
-    if (!done) qa_range_error("Q2 linear move checkpoint has no end function");
+    if (!done) qa_raise("Error", 0, 0, "Q2 linear move checkpoint has no end function");
     qa_q2_linear_motion_entry *en = &m->cp[m->cp_count];
     *en = (qa_q2_linear_motion_entry){0};
     en->actor = (qa_saved_actor_id){(double)entities[i]->actor.id.slot, (double)entities[i]->actor.id.generation};
@@ -229,10 +253,15 @@ void qa_q2_linear_motion_restore(qa_q2_linear_motion *m, qa_q2_game_services *g,
     qa_q2_entity *e = g->entity(g->ctx, &owner.id);
     bool has = false;
     qa_q2_think done = qa_q2_think_resolve(g->source_callbacks, cp.entries[i].done, &has);
-    if (!e || !has) qa_range_error("Q2 linear move checkpoint has no actor or end function");
-    if (m->count == m->cap) { m->cap = m->cap ? m->cap * 2 : 8; m->moves = realloc(m->moves, m->cap * sizeof *m->moves); if (!m->moves) qa_range_error("out of memory"); }
-    move *st = &m->moves[m->count++];
-    *st = (move){e, cp.entries[i].direction, cp.entries[i].destination, cp.entries[i].reference,
+    if (!e || !has) qa_raise("Error", 0, 0, "Q2 linear move checkpoint has no actor or end function");
+    /* TS moves.set(entity, ...): a second entry for one entity replaces the first. */
+    move *st = find_move(m, e);
+    if (st) free_curve(st);
+    else {
+      if (m->count == m->cap) { m->cap = m->cap ? m->cap * 2 : 8; m->moves = realloc(m->moves, m->cap * sizeof *m->moves); if (!m->moves) qa_range_error("out of memory"); }
+      st = &m->moves[m->count++];
+    }
+    *st = (move){e, e->actor.id, cp.entries[i].direction, cp.entries[i].destination, cp.entries[i].reference,
         cp.entries[i].remaining, cp.entries[i].current_speed, cp.entries[i].move_speed,
         cp.entries[i].next_speed, cp.entries[i].decel_distance, done, NULL};
     if (cp.entries[i].has_curve) {
@@ -255,10 +284,11 @@ void qa_q2_linear_motion_move_to(qa_q2_linear_motion *m, qa_q2_entity *e, qa_q2_
   double distance = qa_q2_length(delta);
   move *st = find_move(m, e);
   if (!st) {
+    if (m->count == m->cap) drop_dead_moves(m, g);
     if (m->count == m->cap) { m->cap = m->cap ? m->cap * 2 : 8; m->moves = realloc(m->moves, m->cap * sizeof *m->moves); if (!m->moves) qa_range_error("out of memory"); }
     st = &m->moves[m->count++];
     *st = (move){0};
-    st->e = e;
+    st->e = e; st->actor = e->actor.id;
   } else free_curve(st);
   st->direction = distance == 0 ? QA_Q2_ZERO : qa_q2_scale(delta, 1 / distance);
   st->remaining = distance; st->destination = dest; st->reference = origin;

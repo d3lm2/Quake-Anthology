@@ -7,7 +7,6 @@
 #include "qa/core/math.h"
 #include "qa/input/support.h"
 #include <math.h>
-#include <setjmp.h>
 #define ITEM_CONFIG_BYTES 8
 #define ITEM_INFO_BYTES 236
 #define LEVEL_ITEM_BYTES 60
@@ -259,11 +258,32 @@ static qa_item_config_bots_a *throw_load_error(char **error, const char *path, i
                                                const char *message) {
   char *text = lib_format("%s:%lld:%lld: %s", path, (long long)line, (long long)column, message);
   if (error == NULL) {
-    fprintf(stderr, "ScriptLanguageError: %s\n", text);
-    abort();
+    /* Nothing takes the error by value: raise the TS class (uncaught, this prints and aborts). */
+    char shown[QA_CAUGHT_MESSAGE_CAPACITY];
+    snprintf(shown, sizeof shown, "%s", text);
+    free(text);
+    qa_raise("ScriptLanguageError", 0, 0, "%s", shown);
   }
   *error = text;
   return NULL;
+}
+/* What a raise out of a callback (a retired goal setup) leaves behind. The source reader is kept:
+ * TS abandons it undisposed, so its scripts stay live in the bot memory, and disposing it here
+ * would release them. */
+typedef struct item_load_scratch {
+  char *canonical;
+  qa_item_config_bots_a *config;
+  qa_structure_reader *reader;
+  item_tokens *tokens;
+  qa_ui_script_diagnostic *failure;
+} item_load_scratch;
+static void item_load_scratch_free(void *arg) {
+  item_load_scratch *scratch = arg;
+  if (scratch->tokens != NULL && scratch->tokens->unread != NULL) qa_ui_script_token_release(scratch->tokens->unread);
+  if (scratch->reader != NULL) qa_structure_reader_destroy(scratch->reader);
+  if (scratch->failure != NULL) qa_ui_script_diagnostic_destroy(scratch->failure);
+  if (scratch->config != NULL) qa_item_config_destroy(scratch->config); /* frees the path too */
+  else free(scratch->canonical);
 }
 qa_item_config_bots_a *qa_load_item_config(const qa_bot_script_reader *resolver, const char *path,
                                            const qa_item_config_options *options_argument, char **error) {
@@ -285,6 +305,9 @@ qa_item_config_bots_a *qa_load_item_config(const qa_bot_script_reader *resolver,
     return result;
   }
   char *canonical = lib_strdup(root.path);
+  item_load_scratch scratch = {canonical, NULL, NULL, NULL, NULL};
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, item_load_scratch_free, &scratch);
   item_load load = {options, options->preprocessor, resolver, 0};
   qa_ui_script_preprocessor_options preprocessor_options;
   memset(&preprocessor_options, 0, sizeof preprocessor_options);
@@ -300,7 +323,7 @@ qa_item_config_bots_a *qa_load_item_config(const qa_bot_script_reader *resolver,
       qa_ui_script_source_reader_open(&root, item_load_resolve, (void *)(uintptr_t)resolver, &preprocessor_options);
   if (source == NULL) qa_range_error("out of memory");
   flush_source_diagnostics(&load, source);
-  qa_item_config_bots_a *config = lib_alloc(sizeof *config);
+  qa_item_config_bots_a *config = scratch.config = lib_alloc(sizeof *config);
   if (options->memory != NULL) {
     config->memory = options->memory;
   } else {
@@ -318,12 +341,18 @@ qa_item_config_bots_a *qa_load_item_config(const qa_bot_script_reader *resolver,
   qa_structure_reader reader;
   qa_structure_reader_init(&reader, (qa_structure_token_source){&tokens, item_tokens_next, item_tokens_unread},
                            canonical, prior, prior_count, NULL, NULL);
+  scratch.reader = &reader;
+  scratch.tokens = &tokens;
   item_failure failure;
   memset(&failure, 0, sizeof failure);
   bool parsed = parse_item_config(&tokens, &reader, maximum, &config->allocation, &failure);
   if (tokens.unread != NULL) qa_ui_script_token_release(tokens.unread);
+  scratch.tokens = NULL;
   qa_structure_reader_destroy(&reader);
+  scratch.reader = NULL;
+  /* The reports below can raise too (a retired goal setup): the config struct goes with them. */
   if (!parsed) {
+    scratch.failure = &failure.diagnostic;
     flush_source_diagnostics(&load, source);
     report_script_diagnostic(&load, &failure.diagnostic);
     qa_bot_memory_free(config->memory, &config->allocation);
@@ -333,6 +362,7 @@ qa_item_config_bots_a *qa_load_item_config(const qa_bot_script_reader *resolver,
     qa_item_config_bots_a *result =
         throw_load_error(error, failure.diagnostic.location.path, failure.diagnostic.location.line,
                          failure.diagnostic.location.column, failure.diagnostic.message);
+    qa_cleanup_pop(&scratch_cleanup);
     qa_ui_script_diagnostic_destroy(&failure.diagnostic);
     if (!failure.classname) qa_ui_script_source_reader_destroy(source);
     qa_item_config_destroy(config);
@@ -351,6 +381,7 @@ qa_item_config_bots_a *qa_load_item_config(const qa_bot_script_reader *resolver,
   char *loaded = lib_format("loaded %s\n", path);
   emit_report(options->report, options->report_ctx, QA_GOAL_MESSAGE, loaded);
   free(loaded);
+  qa_cleanup_pop(&scratch_cleanup);
   return config;
 }
 /* ---- library helpers ---- */
@@ -592,15 +623,17 @@ static void release_weights(qa_bot_goal_library *l, qa_goal_state_cell *state) {
 }
 /* ---- setup ---- */
 typedef struct setup_frame {
-  jmp_buf buf;
   qa_bot_goal_library *library;
   int64_t generation, revision;
   qa_bot_script_reader wrapped;
 } setup_frame;
-/* TS checkCurrent: RetiredGoalSetup unwinds to the setup catch. */
+/* TS checkCurrent: RetiredGoalSetup unwinds to the setup catch. It is raised through the port's
+ * one unwinding channel, so the script reader's catch frames and cleanups between here and
+ * qa_bot_goal_setup are left properly. */
 static void check_current(setup_frame *frame) {
   qa_bot_goal_library *l = frame->library;
-  if (frame->generation != l->generation || frame->revision != l->setup_revision) longjmp(frame->buf, 1);
+  if (frame->generation != l->generation || frame->revision != l->setup_revision)
+    qa_raise("RetiredGoalSetup", 0, 0, "%s", "");
 }
 static bool setup_resolve_root(void *ctx, const char *filename, qa_ui_script_source *out) {
   setup_frame *frame = ctx;
@@ -675,13 +708,27 @@ static int64_t setup_body(setup_frame *frame, const char *path) {
   l->config = config;
   return QA_GOAL_ERROR_NONE;
 }
+typedef struct setup_call {
+  setup_frame *frame;
+  const char *path;
+  int64_t result;
+} setup_call;
+static void setup_run(void *ctx) {
+  setup_call *call = ctx;
+  call->result = setup_body(call->frame, call->path);
+}
 int64_t qa_bot_goal_setup(qa_bot_goal_library *l, const char *path) {
   setup_frame frame;
+  memset(&frame, 0, sizeof frame);
   frame.library = l;
   frame.generation = l->generation;
   frame.revision = ++l->setup_revision;
-  if (setjmp(frame.buf) != 0) return QA_GOAL_ERROR_CANNOT_LOAD_ITEM_CONFIG;
-  return setup_body(&frame, path != NULL ? path : "items.c");
+  setup_call call = {&frame, path != NULL ? path : "items.c", QA_GOAL_ERROR_CANNOT_LOAD_ITEM_CONFIG};
+  qa_caught_error caught;
+  if (qa_try(setup_run, &call, &caught)) return call.result;
+  /* TS catch: RetiredGoalSetup is the answer; every other class goes on up. */
+  if (strcmp(caught.name, "RetiredGoalSetup") == 0) return QA_GOAL_ERROR_CANNOT_LOAD_ITEM_CONFIG;
+  qa_rethrow(&caught);
 }
 int64_t qa_bot_goal_alloc_goal_state(qa_bot_goal_library *l, int64_t client) {
   for (int64_t handle = 1; handle <= QA_MAX_GOAL_STATES; handle++) {
@@ -886,9 +933,13 @@ static void add_avoid(qa_bot_goal_library *l, qa_goal_state_cell *state, int64_t
   lib_set_f32(AVOID_TIME(b, slot), (float)((double)now(l) + duration));
 }
 static uint8_t *level_item(qa_bot_goal_library *l, int64_t pointer) {
-  if (!l->has_level_item_heap || pointer <= 0 || (uint64_t)pointer * LEVEL_ITEM_BYTES > l->level_item_heap.length)
+  if (!l->has_level_item_heap || pointer <= 0) qa_range_error("Invalid level item pointer");
+  /* TS `heap.bytes.length`: a heap freed by an initLevelItems that then left early raises the
+   * freed-allocation Error here. */
+  uint8_t *bytes = qa_bot_memory_allocation_bytes(&l->level_item_heap);
+  if ((uint64_t)pointer * LEVEL_ITEM_BYTES > l->level_item_heap.length)
     qa_range_error("Invalid level item pointer");
-  return l->level_item_heap.bytes + (pointer - 1) * LEVEL_ITEM_BYTES;
+  return bytes + (pointer - 1) * LEVEL_ITEM_BYTES;
 }
 #define L_NUMBER(p) lib_i32((p) + 0)
 #define L_INFO(p) lib_i32((p) + 4)
@@ -907,7 +958,7 @@ static const uint8_t *item_info_cell(const qa_bot_goal_library *l, int32_t index
   return config_cell(l->config, (size_t)index);
 }
 static uint32_t level_item_pointer(const qa_bot_goal_library *l, const uint8_t *item) {
-  return (uint32_t)((size_t)(item - l->level_item_heap.bytes) / LEVEL_ITEM_BYTES) + 1;
+  return (uint32_t)((size_t)(item - qa_bot_memory_allocation_bytes(&l->level_item_heap)) / LEVEL_ITEM_BYTES) + 1;
 }
 static uint8_t *find_level_item_number(qa_bot_goal_library *l, int64_t number) {
   for (int64_t pointer = l->level_head; pointer != 0;) {
@@ -1152,8 +1203,9 @@ void qa_bot_goal_init_level_items(qa_bot_goal_library *l, const qa_goal_world *w
   int64_t revision = l->map_revision + 1;
   qa_bot_goal_init_info_entities(l, &world);
   if (revision != l->map_revision) return;
+  /* TS frees the old heap and keeps the reference until the new one is allocated: leaving early
+   * below (a retired revision, a non-finite or out-of-range max_levelitems) keeps a freed heap. */
   if (l->has_level_item_heap) qa_bot_memory_free(l->memory, &l->level_item_heap);
-  l->has_level_item_heap = false;
   double maximum_value = 256;
   if (l->options.max_level_items != NULL) maximum_value = l->options.max_level_items(l->options.max_level_items_ctx);
   maximum_value = trunc((double)finite_float(maximum_value, "max_levelitems"));
@@ -1646,7 +1698,7 @@ static bool consider_source_candidates(chooser *c) {
         l->source_goals = lib_realloc(l->source_goals, l->source_goal_capacity * sizeof *l->source_goals);
       }
       binding = &l->source_goals[l->source_goal_count++];
-      *binding = (qa_goal_source_binding){number, l->next_serial++, current.actor, NULL, blank_goal()};
+      *binding = (qa_goal_source_binding){number, l->next_serial++, current.actor, NULL, blank_goal(), false};
       binding->goal = (qa_bot_goal){position.origin, position.area, mins, maxs, current.entity, number,
                                     QA_GOAL_FLAG_ITEM, -1};
     } else {
@@ -1705,7 +1757,7 @@ static bool choose_item(qa_bot_goal_library *l, int64_t handle, qa_vec3 origin, 
   if (c.best.native) {
     /* TS keeps the LevelItem's allocation: reading it after a re-init raises the freed guard. */
     if (!l->has_level_item_heap || l->level_item_heap.record != c.best.heap_record)
-      qa_range_error("Bot memory allocation has been freed");
+      qa_raise("Error", 0, 0, "Bot memory allocation has been freed");
     uint8_t *item = level_item(l, c.best.pointer);
     add_avoid(l, state, L_NUMBER(item),
               L_TIMEOUT(item) != 0 ? 10 : default_avoid_time(item_info_cell(l, L_INFO(item))));
@@ -1756,20 +1808,26 @@ static const char *goal_severity_name(qa_goal_severity severity) {
   static const char *const names[] = {"message", "warning", "error", "fatal"};
   return names[severity];
 }
-static qa_save_value *goal_value(const qa_bot_goal *goal) {
+static qa_save_value *goal_value(const qa_bot_goal *goal, bool restored_order) {
   qa_save_value *object = lib_sv(qa_save_value_object());
   lib_set(object, "origin", lib_vec3_value(goal->origin));
-  lib_set_num(object, "area", (double)goal->area);
+  if (!restored_order) lib_set_num(object, "area", (double)goal->area);
   lib_set(object, "mins", lib_vec3_value(goal->mins));
   lib_set(object, "maxs", lib_vec3_value(goal->maxs));
+  if (restored_order) lib_set_num(object, "area", (double)goal->area);
   lib_set_num(object, "entity", (double)goal->entity);
   lib_set_num(object, "number", (double)goal->number);
   lib_set_num(object, "flags", (double)goal->flags);
   lib_set_num(object, "itemInfo", (double)goal->item_info);
   return object;
 }
+static void free_save_value(void *arg) { qa_save_value_free(*(qa_save_value **)arg); }
 qa_save_value *qa_bot_goal_checkpoint(qa_bot_goal_library *l, qa_bot_memory_capture *memory) {
   qa_save_value *object = lib_sv(qa_save_value_object());
+  /* A reference to a freed allocation raises midway (TS throws from memory.reference): the partial
+   * tree goes with it. */
+  qa_cleanup object_cleanup;
+  qa_cleanup_push(&object_cleanup, free_save_value, &object);
   lib_set_num(object, "generation", (double)l->generation);
   lib_set_num(object, "setupRevision", (double)l->setup_revision);
   lib_set_num(object, "mapRevision", (double)l->map_revision);
@@ -1837,7 +1895,7 @@ qa_save_value *qa_bot_goal_checkpoint(qa_bot_goal_library *l, qa_bot_memory_capt
     lib_set_num(actor, "generation", (double)binding->actor.generation);
     lib_set(entry, "actor", actor);
     lib_set(entry, "name", qa_save_value_string(binding->name));
-    lib_set(entry, "goal", goal_value(&binding->goal));
+    lib_set(entry, "goal", goal_value(&binding->goal, binding->restored_order));
     lib_push(source_goals, entry);
   }
   lib_set(object, "sourceGoals", source_goals);
@@ -1865,6 +1923,7 @@ qa_save_value *qa_bot_goal_checkpoint(qa_bot_goal_library *l, qa_bot_memory_capt
     lib_push(info, entry);
   }
   lib_set(object, "infoEntities", info);
+  qa_cleanup_pop(&object_cleanup);
   return object;
 }
 static qa_vec3 read_vector_field(const qa_save_reader *goal, const char *name) {
@@ -1880,10 +1939,13 @@ static qa_vec3 read_vector_field(const qa_save_reader *goal, const char *name) {
   qa_save_reader_destroy(&vector);
   return result;
 }
+static void free_slot(void *arg) { free(*(void **)arg); }
 static void visit_list(qa_bot_goal_library *l, int64_t start, int kind) {
   /* TS visit(): a seen-set walk over one saved link chain. */
   size_t capacity = 16, count = 0;
   int64_t *seen = lib_alloc(capacity * sizeof *seen);
+  qa_cleanup seen_cleanup; /* a cycle or bad link raises with the set held */
+  qa_cleanup_push(&seen_cleanup, free_slot, &seen);
   for (int64_t pointer = start; pointer != 0;) {
     for (size_t i = 0; i < count; i++)
       if (seen[i] == pointer) qa_ui_script_plain_error("Saved goal list has a cycle");
@@ -1894,7 +1956,127 @@ static void visit_list(qa_bot_goal_library *l, int64_t start, int kind) {
     seen[count++] = pointer;
     pointer = kind == 0 ? (int64_t)L_NEXT(level_item(l, pointer)) : (int64_t)info_next(info_entity(l, pointer));
   }
+  qa_cleanup_pop(&seen_cleanup);
   free(seen);
+}
+/* TS restore reads the whole image, cell by cell in this order, before it validates or changes
+ * anything: a malformed cell is a SaveFormatError naming the first one in this order. */
+static void read_pairs(const qa_save_reader *reader, const char *list_name, const char *first, double first_minimum,
+                       const char *second) {
+  qa_save_reader list;
+  lib_field(reader, list_name, &list);
+  size_t count = qa_save_reader_list_count(&list);
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader entry;
+    lib_item(&list, i, &entry);
+    (void)lib_int_min(&entry, first, first_minimum);
+    (void)lib_int_min(&entry, second, 0);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+}
+static void read_goal_image(const qa_save_reader *reader) {
+  static const char *const severities[] = {"message", "warning", "error", "fatal"};
+  static const char *const kinds[] = {"camp", "location"};
+  qa_save_reader list, cell;
+  (void)lib_int_min(reader, "generation", 0);
+  (void)lib_int_min(reader, "setupRevision", 0);
+  (void)lib_int_min(reader, "mapRevision", 0);
+  (void)lib_int(reader, "configuredGameType");
+  (void)lib_read_bool(reader, "hasWorld");
+  lib_field(reader, "reported", &list);
+  size_t count = qa_save_reader_list_count(&list);
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader entry;
+    lib_item(&list, i, &entry);
+    lib_field(&entry, "severity", &cell);
+    (void)qa_save_reader_choice_string(&cell, severities, 4);
+    qa_save_reader_destroy(&cell);
+    lib_field(&entry, "message", &cell);
+    (void)qa_save_reader_string(&cell);
+    qa_save_reader_destroy(&cell);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  (void)lib_int_min(reader, "nextId", 1);
+  read_pairs(reader, "configs", "pointer", 1, "config");
+  read_pairs(reader, "indexes", "pointer", 1, "allocation");
+  read_pairs(reader, "states", "handle", 1, "allocation");
+  lib_field(reader, "config", &cell);
+  if (!qa_save_reader_is_null(&cell)) {
+    (void)lib_int_min(&cell, "allocation", 0);
+    qa_save_reader path;
+    lib_field(&cell, "path", &path);
+    (void)qa_save_reader_string(&path);
+    qa_save_reader_destroy(&path);
+    lib_diagnostics diagnostics = {NULL, 0, 0};
+    lib_read_diagnostics(&cell, "diagnostics", &diagnostics);
+    lib_diagnostics_destroy(&diagnostics);
+  }
+  qa_save_reader_destroy(&cell);
+  (void)lib_int_min(reader, "nextSourceGoal", 0);
+  lib_field(reader, "sourceGoals", &list);
+  count = qa_save_reader_list_count(&list);
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader entry, goal, actor;
+    lib_item(&list, i, &entry);
+    lib_field(&entry, "goal", &goal);
+    (void)lib_int(&entry, "number");
+    lib_field(&entry, "actor", &actor);
+    (void)lib_int_min(&actor, "slot", 0);
+    qa_save_reader_destroy(&actor);
+    lib_field(&entry, "actor", &actor);
+    (void)lib_int_min(&actor, "generation", 0);
+    qa_save_reader_destroy(&actor);
+    lib_field(&entry, "name", &cell);
+    (void)qa_save_reader_string(&cell);
+    qa_save_reader_destroy(&cell);
+    static const char *const vectors[] = {"origin", "mins", "maxs"};
+    static const char *const axes[] = {"x", "y", "z"};
+    for (int v = 0; v < 3; v++) {
+      qa_save_reader vector;
+      lib_field(&goal, vectors[v], &vector);
+      for (int a = 0; a < 3; a++) {
+        lib_field(&vector, axes[a], &cell);
+        (void)qa_save_reader_number(&cell);
+        qa_save_reader_destroy(&cell);
+      }
+      qa_save_reader_destroy(&vector);
+    }
+    (void)lib_int(&goal, "area");
+    (void)lib_int(&goal, "entity");
+    (void)lib_int(&goal, "number");
+    (void)lib_int(&goal, "flags");
+    (void)lib_int(&goal, "itemInfo");
+    qa_save_reader_destroy(&goal);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  lib_field(reader, "levelItemHeap", &cell);
+  if (!qa_save_reader_is_null(&cell)) (void)qa_save_reader_integer_min(&cell, 0);
+  qa_save_reader_destroy(&cell);
+  lib_field(reader, "mapWords", &list);
+  count = qa_save_reader_list_count(&list);
+  for (size_t i = 0; i < count; i++) {
+    lib_item(&list, i, &cell);
+    (void)qa_save_reader_integer_min(&cell, 0);
+    qa_save_reader_destroy(&cell);
+  }
+  qa_save_reader_destroy(&list);
+  (void)lib_int_min(reader, "nextInfoPointer", 1);
+  lib_field(reader, "infoEntities", &list);
+  count = qa_save_reader_list_count(&list);
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader entry;
+    lib_item(&list, i, &entry);
+    (void)lib_int_min(&entry, "pointer", 1);
+    (void)lib_int_min(&entry, "allocation", 0);
+    lib_field(&entry, "kind", &cell);
+    (void)qa_save_reader_choice_string(&cell, kinds, 2);
+    qa_save_reader_destroy(&cell);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
 }
 void qa_bot_goal_restore(qa_bot_goal_library *l, const qa_save_value *value, qa_bot_memory_restored *memory,
                          const qa_goal_world *world, qa_goal_restore_actor_fn actor, void *actor_ctx) {
@@ -1902,6 +2084,7 @@ void qa_bot_goal_restore(qa_bot_goal_library *l, const qa_save_value *value, qa_
   static const char *const kinds[] = {"camp", "location"};
   qa_save_reader reader, reported, configs, indexes, states, config, source_goals, heap, words, info;
   if (!qa_save_reader_init(&reader, value, "bot.goals")) qa_range_error("out of memory");
+  read_goal_image(&reader);
   double generation = lib_int_min(&reader, "generation", 0), setup_revision = lib_int_min(&reader, "setupRevision", 0);
   double map_revision = lib_int_min(&reader, "mapRevision", 0), game_type = lib_int(&reader, "configuredGameType");
   bool has_world = lib_read_bool(&reader, "hasWorld");
@@ -1931,6 +2114,8 @@ void qa_bot_goal_restore(qa_bot_goal_library *l, const qa_save_value *value, qa_
     qa_ui_script_plain_error("Invalid goal library restoration");
   size_t config_count = qa_save_reader_list_count(&configs);
   int64_t *admitted = lib_alloc((config_count + qa_save_reader_list_count(&indexes) + 1) * sizeof *admitted);
+  qa_cleanup admitted_cleanup; /* a bad pointer raises with the list held */
+  qa_cleanup_push(&admitted_cleanup, free_slot, &admitted);
   size_t admitted_count = 0;
   for (size_t i = 0; i < config_count; i++) {
     qa_save_reader entry;
@@ -1968,6 +2153,7 @@ void qa_bot_goal_restore(qa_bot_goal_library *l, const qa_save_value *value, qa_
     l->index_references[l->index_reference_count++] =
         (qa_goal_index_reference){(int64_t)pointer, qa_bot_memory_restored_allocation(memory, (int64_t)reference)};
   }
+  qa_cleanup_pop(&admitted_cleanup);
   free(admitted);
   size_t state_count = qa_save_reader_list_count(&states);
   for (size_t i = 0; i < state_count; i++) {
@@ -1979,12 +2165,14 @@ void qa_bot_goal_restore(qa_bot_goal_library *l, const qa_save_value *value, qa_
       qa_ui_script_plain_error("Invalid saved goal state handle");
     qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
     if (allocation.length != GOAL_STATE_BYTES) qa_ui_script_plain_error("Saved goal state allocation size mismatch");
-    qa_goal_state_cell *state = &l->states[(size_t)handle];
-    *state = (qa_goal_state_cell){true, l->next_serial++, allocation};
-    (void)state_weight_config(l, state);
-    (void)state_indexes(l, state);
-    if (stack_top(state) < 0 || stack_top(state) > QA_MAX_GOAL_STACK)
+    /* TS admits the state (states.set) only once its pointers and stack have been checked. */
+    qa_goal_state_cell candidate_state = {true, 0, allocation};
+    (void)state_weight_config(l, &candidate_state);
+    (void)state_indexes(l, &candidate_state);
+    if (stack_top(&candidate_state) < 0 || stack_top(&candidate_state) > QA_MAX_GOAL_STACK)
       qa_ui_script_plain_error("Saved goal stack exceeds capacity");
+    candidate_state.serial = l->next_serial++;
+    l->states[(size_t)handle] = candidate_state;
   }
   if (!qa_save_reader_is_null(&config)) {
     double reference = lib_int_min(&config, "allocation", 0);
@@ -2009,22 +2197,24 @@ void qa_bot_goal_restore(qa_bot_goal_library *l, const qa_save_value *value, qa_
     lib_field(&entry, "actor", &saved_actor);
     qa_saved_actor_id saved = {lib_int_min(&saved_actor, "slot", 0), lib_int_min(&saved_actor, "generation", 0)};
     qa_save_reader_destroy(&saved_actor);
-    char *name = lib_read_string(&entry, "name");
     lib_field(&entry, "goal", &goal);
     qa_bot_goal restored = {read_vector_field(&goal, "origin"), (int64_t)lib_int(&goal, "area"),
                             read_vector_field(&goal, "mins"), read_vector_field(&goal, "maxs"),
                             (int64_t)lib_int(&goal, "entity"), (int64_t)lib_int(&goal, "number"),
                             (int64_t)lib_int(&goal, "flags"), (int64_t)lib_int(&goal, "itemInfo")};
     qa_save_reader_destroy(&goal);
-    qa_save_reader_destroy(&entry);
     if (!qa_is_source_goal_number(number) || find_source_goal(l, (int64_t)number) != NULL)
       qa_ui_script_plain_error("Invalid saved source pickup goal identity");
     if (l->source_goal_count == l->source_goal_capacity) {
       l->source_goal_capacity = lib_grow(l->source_goal_capacity, l->source_goal_count + 1);
       l->source_goals = lib_realloc(l->source_goals, l->source_goal_capacity * sizeof *l->source_goals);
     }
+    qa_actor_id resolved = actor(actor_ctx, saved);
+    /* Copied only once nothing before the store can raise. */
+    char *name = lib_read_string(&entry, "name");
+    qa_save_reader_destroy(&entry);
     l->source_goals[l->source_goal_count++] =
-        (qa_goal_source_binding){(int64_t)number, l->next_serial++, actor(actor_ctx, saved), name, restored};
+        (qa_goal_source_binding){(int64_t)number, l->next_serial++, resolved, name, restored, true};
   }
   if (!qa_save_reader_is_null(&heap)) {
     double reference = qa_save_reader_integer_min(&heap, 0);

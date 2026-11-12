@@ -4,8 +4,8 @@
  * contracts/execution.h in one TU; layout.h precedent). Also the guest value
  * codec (guest/abi/values.ts encodeValue/decodeValue/storageBytes) over those
  * types. CPU and callback-table access goes through the shared runner mirror.
- * Recoverable throws use qa/compat/q2/native_throw.h; every other TS throw
- * stays fatal (qa_range_error), as docs/PORTING.md. GPL-2.0-or-later. */
+ * Recoverable throws use qa/compat/q2/native_throw.h; every other TS throw is
+ * a qa_raise of the TS error class. GPL-2.0-or-later. */
 #ifndef QA_COMPAT_Q2_NATIVE_MOD_HOST_API_H
 #define QA_COMPAT_Q2_NATIVE_MOD_HOST_API_H
 #include <stdbool.h>
@@ -108,7 +108,10 @@ qa_guest_address qa_compat_q2_native_mod_image_rva(const qa_compat_q2_native_mod
 /* TS entry.kind === "export" ? host.entry(name) : image + rva. */
 qa_guest_address qa_compat_q2_native_mod_entry_address(const qa_compat_q2_native_mod_host *host, qa_native_mod_entry entry);
 uint64_t qa_compat_q2_native_mod_stack(const qa_compat_q2_native_mod_host *host);
-/* TS (address - table.base) / stride; aborts with message outside the table. */
+/* TS `difference >= 0n && difference % BigInt(stride) === 0n`: false before the table or between two rows; *out
+ * is the row. BigInt(stride) raises JavaScriptCore's RangeError for a stride that is zero or not an integer. */
+bool qa_compat_q2_native_mod_table_index(qa_compat_q2_native_mod_entities table, qa_guest_address address, double *out);
+/* TS (address - table.base) / stride; raises Error(message) outside the table. */
 double qa_compat_q2_native_mod_table_slot(const qa_compat_q2_native_mod_host *host, qa_guest_address address, const char *message);
 /* TS isDeepStrictEqual over armor states. */
 bool qa_compat_q2_regular_armor_equal(qa_regular_armor_state a, qa_regular_armor_state b);

@@ -125,7 +125,10 @@ static void graphical_release(void *record) {
   }
   /* The seat presentations closed their UIs when they closed (and were freed by their cleanup). */
   for (size_t i = 0; i < graphical->presentation_count; i++) qa_app_seat_ui_destroy(graphical->presentations[i].ui);
-  for (size_t i = 0; i < graphical->native_q2_count; i++) qa_app_application_effects_destroy(graphical->native_q2[i].effects);
+  for (size_t i = 0; i < graphical->native_q2_count; i++) {
+    qa_app_application_effects_destroy(graphical->native_q2[i].effects);
+    free(graphical->native_q2[i].userinfo);
+  }
   qa_app_application_effects_destroy(graphical->effects);
   qa_app_rerelease_presentation_destroy(graphical->rerelease);
   qa_app_application_input_destroy(graphical->input);
@@ -459,7 +462,7 @@ static void open_body(void *ctx) {
     rerelease_seats[i].actor = g->players[i].actor;
   }
   qa_app_rerelease_presentation *rerelease = qa_app_rerelease_presentation_create(g->assets, rerelease_seats, g->player_count,
-      qa_app_application_input_shared_settings(g->input));
+      qa_app_application_input_shared_settings_view(g->input));
   graphical_record *kept = checked(calloc(1, sizeof *kept));
   kept->owner = g->owner;
   g->owner->adopted = true;

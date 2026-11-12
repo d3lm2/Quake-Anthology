@@ -63,6 +63,7 @@ void qa_q2_mvd_header_free(qa_q2_mvd_header *header) {
   }
   header->config_strings = NULL;
   header->config_string_count = 0;
+  qa_q2_server_data_result_clear(&header->data);
 }
 
 /* Owned configstring list held across reads that can raise. */
@@ -147,9 +148,11 @@ bool qa_q2_read_mvd_header(const uint8_t *bytes, size_t length,
     held.items[held.count].value = owned;
     held.count++;
   }
-  out->config_strings = held.items;
-  out->config_string_count = held.count;
-  const char *max_str = qa_q2_mvd_header_config_string(out, out->profile.max_clients_index);
+  /* The list moves into *out only after the last check that can raise, so a caller that frees
+   * *out after a caught raise never sees the list the cleanup released. */
+  const char *max_str = NULL;
+  for (size_t i = 0; i < held.count; i++)
+    if (held.items[i].index == out->profile.max_clients_index) max_str = held.items[i].value;
   double max_clients = max_str != NULL ? js_number(max_str) : NAN;
   /* Number.isInteger rejects NaN and the infinities before the range test. */
   if (!isfinite(max_clients) || max_clients != trunc(max_clients) || max_clients < 1 ||
@@ -158,20 +161,13 @@ bool qa_q2_read_mvd_header(const uint8_t *bytes, size_t length,
   }
   qa_q2_message_check_read(&message);
   qa_cleanup_pop(&node);
+  out->config_strings = held.items;
+  out->config_string_count = held.count;
   memset(&out->data, 0, sizeof out->data);
   out->data.servercount = servercount;
-  memcpy(out->data.gamedir, gamedir, sizeof out->data.gamedir < sizeof gamedir
-                                         ? sizeof out->data.gamedir
-                                         : sizeof gamedir);
-  out->data.gamedir[sizeof out->data.gamedir - 1] = '\0';
   out->data.clientnum = 0;
-  const char *level = qa_q2_mvd_header_config_string(out, 0);
-  if (level != NULL) {
-    size_t llen = strlen(level);
-    if (llen >= sizeof out->data.levelname) llen = sizeof out->data.levelname - 1;
-    memcpy(out->data.levelname, level, llen);
-    out->data.levelname[llen] = '\0';
-  }
+  /* levelname: configStrings.get(0) ?? "" (owned copies; an OOM raise leaves both NULL). */
+  qa_q2_server_data_result_set_strings(&out->data, gamedir, qa_q2_mvd_header_config_string(out, 0));
   out->data.attractloop = true;
   out->data.server_state = 2;
   out->data.has_server_fps = true;

@@ -39,7 +39,7 @@ qa_app_recorded_source *qa_app_recorded_source_create(qa_app_recorded_demo_resou
     void (*complete)(void *ctx, const char *reason, const qa_app_demo_timing *timing),
     void *complete_ctx) {
   if (resource.kind != remote_family || playback.family != resource.kind)
-    qa_range_error("Recording and remote presentation families differ");
+    qa_raise("Error", 0, 0, "Recording and remote presentation families differ");
   qa_app_recorded_source *s = calloc(1, sizeof *s);
   if (!s) return NULL;
   s->resource = resource; s->playback = playback; s->timedemo = timedemo;
@@ -53,7 +53,7 @@ const qa_app_recorded_demo_resource *qa_app_recorded_source_resource(const qa_ap
 }
 void qa_app_recorded_source_select_player(qa_app_recorded_source *source, double clientnum) {
   if (source->playback.family != QA_APP_REC_Q2)
-    qa_range_error("View selection requires a multiview Q2 recording");
+    qa_raise("Error", 0, 0, "View selection requires a multiview Q2 recording");
   source->playback.select_player_q2(source->playback.ctx, clientnum);
 }
 const char *qa_app_recorded_source_phase(const qa_app_recorded_source *source) { return source->state; }

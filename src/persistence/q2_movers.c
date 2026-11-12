@@ -11,6 +11,8 @@
 /* ---- TS readQ2LinearMotionCheckpoint ---- */
 qa_q2_linear_motion_checkpoint qa_read_q2_linear_motion_checkpoint(const qa_save_reader *reader,
                                                                    qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2_linear_motion_checkpoint out;
   out.count = qa_save_reader_list_count(reader);
   qa_q2_linear_motion_entry *entries = qa_persist_decoded_array(owner, out.count, sizeof *entries);
@@ -50,6 +52,7 @@ qa_q2_linear_motion_checkpoint qa_read_q2_linear_motion_checkpoint(const qa_save
     qa_save_reader_destroy(&value);
   }
   out.entries = entries;
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 
@@ -95,6 +98,8 @@ qa_save_value *qa_q2_linear_motion_checkpoint_value(const qa_q2_linear_motion_ch
 /* ---- TS readQ2AngularMotionCheckpoint ---- */
 qa_q2_angular_motion_checkpoint qa_read_q2_angular_motion_checkpoint(const qa_save_reader *reader,
                                                                      qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2_angular_motion_checkpoint out;
   out.count = qa_save_reader_list_count(reader);
   qa_q2_angular_motion_entry *entries = qa_persist_decoded_array(owner, out.count, sizeof *entries);
@@ -107,6 +112,7 @@ qa_q2_angular_motion_checkpoint qa_read_q2_angular_motion_checkpoint(const qa_sa
     qa_save_reader_destroy(&value);
   }
   out.entries = entries;
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 /* TS angular-motion.ts capture: {actor, destination, speed, done}. */
@@ -126,6 +132,8 @@ qa_save_value *qa_q2_angular_motion_checkpoint_value(const qa_q2_angular_motion_
 
 /* ---- TS readQ2MoversCheckpoint ---- */
 qa_q2_movers_checkpoint qa_read_q2_movers_checkpoint(const qa_save_reader *reader, qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   static const char *const PHASES[] = {"bottom", "up", "top", "down"};
   qa_q2_movers_checkpoint out;
   memset(&out, 0, sizeof out);
@@ -189,6 +197,7 @@ qa_q2_movers_checkpoint qa_read_q2_movers_checkpoint(const qa_save_reader *reade
   qa_save_reader angular = q2c_field(reader, "angular");
   out.angular = qa_read_q2_angular_motion_checkpoint(&angular, owner);
   qa_save_reader_destroy(&angular);
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 
@@ -247,9 +256,12 @@ uint8_t *qa_encode_q2_movers_checkpoint(const qa_q2_movers_checkpoint *checkpoin
 
 bool qa_decode_q2_movers_checkpoint(const uint8_t *bytes, size_t length, qa_q2_movers_checkpoint *out,
                                     qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_save_reader reader;
-  if (!q2c_open(bytes, length, "q2-movers", owner, &reader)) return false;
+  if (!q2c_open(bytes, length, "q2-movers", owner, &reader)) { qa_persist_decoded_leave(&owner_scope); return false; }
   *out = qa_read_q2_movers_checkpoint(&reader, owner);
   qa_save_reader_destroy(&reader);
+  qa_persist_decoded_leave(&owner_scope);
   return true;
 }

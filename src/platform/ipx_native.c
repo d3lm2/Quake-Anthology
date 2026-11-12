@@ -87,6 +87,15 @@ static bool address_from(const uint8_t *bytes, size_t length,
   uint32_t network = ((uint32_t)bytes[4] << 24) | ((uint32_t)bytes[5] << 16) |
                      ((uint32_t)bytes[6] << 8) | (uint32_t)bytes[7];
   uint16_t port = (uint16_t)(((uint16_t)bytes[2] << 8) | bytes[3]);
+  /* TS ipxAddress(...) throws RangeError("Invalid network port") for 0; the
+   * callers turn the throw into this failure (the descriptor is closed). */
+  if (port == 0) {
+    if (error != NULL) {
+      error->unsupported = false;
+      snprintf(error->message, sizeof error->message, "Invalid network port");
+    }
+    return false;
+  }
   *out = qa_platform_ipx_address_make(network, bytes + 8, (double)port);
   return true;
 }

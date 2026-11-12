@@ -48,6 +48,12 @@ void qa_dedicated_console_end(qa_dedicated_console *console);
  * (aborted) by the next drain, as the TS throws the Error. */
 void qa_dedicated_console_fail(qa_dedicated_console *console,
                                const char *message);
+/* TS default constructor argument (input = process.stdin): the stream's
+ * data/end/error events for the process's standard input. Reads what is
+ * available without blocking and feeds it; end of input is the "end" event,
+ * a read failure the "error" event. Call before each drain (Node delivers
+ * the events between frames). Nothing is read once closed or ended. */
+void qa_dedicated_console_pump_stdin(qa_dedicated_console *console);
 bool qa_dedicated_console_eof(const qa_dedicated_console *console);
 /* Appends the dropped-line echo (when any were dropped), then every
  * queued line plus '\n'; returns the line count.

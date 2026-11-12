@@ -48,7 +48,7 @@ void qa_bot_lib_vars_init_memory(qa_bot_lib_vars *v, qa_bot_memory *memory) {
 }
 void qa_bot_lib_vars_init(qa_bot_lib_vars *v) { qa_bot_lib_vars_init_memory(v, NULL); }
 void qa_bot_lib_vars_destroy(qa_bot_lib_vars *v) {
-  for (size_t i = 0; i < v->record_capacity; i++) free(v->records[i]);
+  for (size_t i = 0; i < v->record_count; i++) free(v->records[i].record);
   for (size_t i = 0; i < v->retired_count; i++) free(v->retired[i]);
   free(v->records);
   free(v->strings);
@@ -57,35 +57,95 @@ void qa_bot_lib_vars_destroy(qa_bot_lib_vars *v) {
   v->strings = NULL;
   v->retired = NULL;
   v->record_capacity = v->string_capacity = v->retired_count = v->retired_capacity = 0;
+  v->record_count = v->string_count = 0;
   qa_bot_memory_destroy(&v->owned_memory);
 }
 static const uint8_t *view_bytes(const qa_bot_lib_var *variable) {
-  if (variable->retired) qa_range_error("Bot memory allocation has been freed");
+  if (variable->retired) qa_raise("Error", 0, 0, "Bot memory allocation has been freed");
   return variable->allocation.bytes;
 }
+/* Map lookups over the insertion-ordered entries: the index of `pointer`, or `count`. */
+#define ENTRY_INDEX(entries, count, unsorted, pointer)                        \
+  do {                                                                        \
+    if (unsorted) {                                                           \
+      for (index = 0; index < (count) && (entries)[index].pointer != (pointer); index++) {} \
+    } else {                                                                  \
+      size_t low = 0, high = (count);                                         \
+      while (low < high) {                                                    \
+        size_t middle = low + (high - low) / 2;                               \
+        if ((entries)[middle].pointer < (pointer)) low = middle + 1;          \
+        else high = middle;                                                   \
+      }                                                                       \
+      index = low < (count) && (entries)[low].pointer == (pointer) ? low : (count); \
+    }                                                                         \
+  } while (0)
+static size_t string_index(const qa_bot_lib_string_entry *entries, size_t count, bool unsorted, int64_t key) {
+  if (key < 1 || key > 0xffffffffLL) return count;
+  uint32_t pointer = (uint32_t)key;
+  size_t index;
+  ENTRY_INDEX(entries, count, unsorted, pointer);
+  return index;
+}
+static size_t record_index(const qa_bot_lib_record_entry *entries, size_t count, bool unsorted, int64_t key) {
+  if (key < 1 || key > 0xffffffffLL) return count;
+  uint32_t pointer = (uint32_t)key;
+  size_t index;
+  ENTRY_INDEX(entries, count, unsorted, pointer);
+  return index;
+}
+/* Map.set: replaces in place, or appends (insertion order). */
+static void string_put(qa_bot_lib_string_entry **entries, size_t *count, size_t *capacity, bool *unsorted,
+                       int64_t pointer, qa_bot_lib_string_pointer cell) {
+  size_t index = string_index(*entries, *count, *unsorted, pointer);
+  if (index < *count) {
+    (*entries)[index].cell = cell;
+    return;
+  }
+  if (*count == *capacity) {
+    *capacity = lib_grow(*capacity, *count + 1);
+    *entries = lib_realloc(*entries, *capacity * sizeof **entries);
+  }
+  if (*count > 0 && (*entries)[*count - 1].pointer > (uint32_t)pointer) *unsorted = true;
+  (*entries)[(*count)++] = (qa_bot_lib_string_entry){(uint32_t)pointer, cell};
+}
+static void record_put(qa_bot_lib_record_entry **entries, size_t *count, size_t *capacity, bool *unsorted,
+                       int64_t pointer, qa_bot_lib_var *record) {
+  size_t index = record_index(*entries, *count, *unsorted, pointer);
+  if (index < *count) {
+    (*entries)[index].record = record;
+    return;
+  }
+  if (*count == *capacity) {
+    *capacity = lib_grow(*capacity, *count + 1);
+    *entries = lib_realloc(*entries, *capacity * sizeof **entries);
+  }
+  if (*count > 0 && (*entries)[*count - 1].pointer > (uint32_t)pointer) *unsorted = true;
+  (*entries)[(*count)++] = (qa_bot_lib_record_entry){(uint32_t)pointer, record};
+}
 static qa_bot_lib_string_pointer *string_cell(qa_bot_lib_vars *v, int64_t pointer) {
-  if (pointer < 0 || (size_t)pointer >= v->string_capacity) return NULL;
-  qa_bot_lib_string_pointer *cell = &v->strings[pointer];
-  return cell->live ? cell : NULL;
+  size_t index = string_index(v->strings, v->string_count, v->strings_unsorted, pointer);
+  return index < v->string_count ? &v->strings[index].cell : NULL;
+}
+/* Map.delete. */
+static void string_delete(qa_bot_lib_vars *v, int64_t pointer) {
+  size_t index = string_index(v->strings, v->string_count, v->strings_unsorted, pointer);
+  if (index >= v->string_count) return;
+  memmove(&v->strings[index], &v->strings[index + 1], (v->string_count - index - 1) * sizeof *v->strings);
+  v->string_count--;
+}
+static void record_delete(qa_bot_lib_vars *v, int64_t pointer) {
+  size_t index = record_index(v->records, v->record_count, v->records_unsorted, pointer);
+  if (index >= v->record_count) return;
+  memmove(&v->records[index], &v->records[index + 1], (v->record_count - index - 1) * sizeof *v->records);
+  v->record_count--;
 }
 static void set_string_cell(qa_bot_lib_vars *v, int64_t pointer, qa_bot_memory_allocation allocation,
                             int64_t offset) {
-  if ((size_t)pointer >= v->string_capacity) {
-    size_t next = lib_grow(v->string_capacity, (size_t)pointer + 1);
-    v->strings = lib_realloc(v->strings, next * sizeof *v->strings);
-    memset(v->strings + v->string_capacity, 0, (next - v->string_capacity) * sizeof *v->strings);
-    v->string_capacity = next;
-  }
-  v->strings[pointer] = (qa_bot_lib_string_pointer){true, allocation, offset};
+  string_put(&v->strings, &v->string_count, &v->string_capacity, &v->strings_unsorted, pointer,
+             (qa_bot_lib_string_pointer){true, allocation, offset});
 }
 static void set_record_cell(qa_bot_lib_vars *v, int64_t pointer, qa_bot_lib_var *record) {
-  if ((size_t)pointer >= v->record_capacity) {
-    size_t next = lib_grow(v->record_capacity, (size_t)pointer + 1);
-    v->records = lib_realloc(v->records, next * sizeof *v->records);
-    memset(v->records + v->record_capacity, 0, (next - v->record_capacity) * sizeof *v->records);
-    v->record_capacity = next;
-  }
-  v->records[pointer] = record;
+  record_put(&v->records, &v->record_count, &v->record_capacity, &v->records_unsorted, pointer, record);
 }
 static const char *read_string(qa_bot_lib_vars *v, uint32_t pointer) {
   qa_bot_lib_string_pointer *reference = string_cell(v, pointer);
@@ -110,8 +170,8 @@ static int64_t next_pointer(qa_bot_lib_vars *v) {
   return v->next_pointer++;
 }
 static qa_bot_lib_var *record_at(qa_bot_lib_vars *v, int64_t pointer) {
-  qa_bot_lib_var *record =
-      pointer >= 0 && (size_t)pointer < v->record_capacity ? v->records[pointer] : NULL;
+  size_t index = record_index(v->records, v->record_count, v->records_unsorted, pointer);
+  qa_bot_lib_var *record = index < v->record_count ? v->records[index].record : NULL;
   if (record == NULL) qa_ui_script_plain_error("Bot library variable record pointer is not live");
   return record;
 }
@@ -143,8 +203,7 @@ static void assign(qa_bot_lib_vars *v, qa_bot_lib_var *record, const char *text,
       lib_mem_alloc(v->memory, (int64_t)length + 1, QA_BOT_MEMORY_HEAP, false);
   set_string_cell(v, pointer, allocation, 0);
   uint8_t *bytes = record->allocation.bytes;
-  qa_bot_lib_string_pointer *old = string_cell(v, lib_u32(bytes + 4));
-  if (old != NULL) old->live = false;
+  string_delete(v, lib_u32(bytes + 4));
   lib_set_u32(bytes + 4, (uint32_t)pointer);
   memcpy(allocation.bytes, text, length + 1);
   lib_set_f32(bytes + 16, numeric);
@@ -227,10 +286,13 @@ void qa_bot_lib_vars_set(qa_bot_lib_vars *v, const char *n, const char *val) {
   float numeric = parse_value(val);
   /* The new value may alias the freed string (a borrowed view of the old one). */
   char *text = lib_strdup(val);
+  qa_cleanup text_node; /* pointer exhaustion raises inside allocate/assign */
+  qa_cleanup_push(&text_node, free, text);
   qa_bot_lib_var *existing = get_text(v, n);
   if (existing != NULL) free_string(v, existing);
   qa_bot_lib_var *variable = existing != NULL ? existing : allocate(v, n);
   assign(v, variable, text, numeric);
+  qa_cleanup_pop(&text_node);
   free(text);
 }
 void qa_bot_lib_vars_set_by_name_bytes(qa_bot_lib_vars *v, qa_bot_lib_name_byte_fn read_byte,
@@ -257,13 +319,11 @@ void qa_bot_lib_vars_clear(qa_bot_lib_vars *v) {
     v->head = lib_u32(bytes + 20);
     uint32_t value_pointer = lib_u32(bytes + 4), name_pointer = lib_u32(bytes);
     if (value_pointer != 0) free_string(v, variable);
-    qa_bot_lib_string_pointer *cell = string_cell(v, value_pointer);
-    if (cell != NULL) cell->live = false;
-    cell = string_cell(v, name_pointer);
-    if (cell != NULL) cell->live = false;
+    string_delete(v, value_pointer);
+    string_delete(v, name_pointer);
     qa_bot_memory_free(v->memory, &variable->allocation);
     variable->retired = true;
-    v->records[pointer] = NULL;
+    record_delete(v, pointer);
     /* Retained handles belong to the old botlib lifetime and read as freed. */
     if (v->retired_count == v->retired_capacity) {
       v->retired_capacity = lib_grow(v->retired_capacity, v->retired_count + 1);
@@ -272,32 +332,53 @@ void qa_bot_lib_vars_clear(qa_bot_lib_vars *v) {
     v->retired[v->retired_count++] = variable;
   }
 }
+static void checkpoint_unwind(void *arg) { qa_save_value_free((qa_save_value *)arg); }
 qa_save_value *qa_bot_lib_vars_checkpoint(qa_bot_lib_vars *v, qa_bot_memory_capture *memory) {
   qa_save_value *object = lib_sv(qa_save_value_object());
+  /* A freed allocation raises from the capture reference: the partial image goes with it. */
+  qa_cleanup object_node;
+  qa_cleanup_push(&object_node, checkpoint_unwind, object);
   lib_set_num(object, "nextPointer", (double)v->next_pointer);
   lib_set_num(object, "head", v->head);
+  /* Every node is attached before the reference that can raise is read. */
   qa_save_value *records = lib_sv(qa_save_value_array());
-  for (size_t pointer = 0; pointer < v->record_capacity; pointer++) {
-    if (v->records[pointer] == NULL) continue;
-    qa_save_value *entry = lib_sv(qa_save_value_object());
-    lib_set_num(entry, "pointer", (double)pointer);
-    lib_set_num(entry, "allocation",
-                (double)qa_bot_memory_capture_reference(memory, &v->records[pointer]->allocation));
-    lib_push(records, entry);
-  }
   lib_set(object, "records", records);
-  qa_save_value *strings = lib_sv(qa_save_value_array());
-  for (size_t pointer = 0; pointer < v->string_capacity; pointer++) {
-    if (!v->strings[pointer].live) continue;
+  for (size_t i = 0; i < v->record_count; i++) {
     qa_save_value *entry = lib_sv(qa_save_value_object());
-    lib_set_num(entry, "pointer", (double)pointer);
+    lib_push(records, entry);
+    lib_set_num(entry, "pointer", (double)v->records[i].pointer);
     lib_set_num(entry, "allocation",
-                (double)qa_bot_memory_capture_reference(memory, &v->strings[pointer].allocation));
-    lib_set_num(entry, "offset", (double)v->strings[pointer].offset);
-    lib_push(strings, entry);
+                (double)qa_bot_memory_capture_reference(memory, &v->records[i].record->allocation));
   }
+  qa_save_value *strings = lib_sv(qa_save_value_array());
   lib_set(object, "strings", strings);
+  for (size_t i = 0; i < v->string_count; i++) {
+    qa_save_value *entry = lib_sv(qa_save_value_object());
+    lib_push(strings, entry);
+    lib_set_num(entry, "pointer", (double)v->strings[i].pointer);
+    lib_set_num(entry, "allocation",
+                (double)qa_bot_memory_capture_reference(memory, &v->strings[i].cell.allocation));
+    lib_set_num(entry, "offset", (double)v->strings[i].cell.offset);
+  }
+  qa_cleanup_pop(&object_node);
   return object;
+}
+/* The partial restore (TS builds fresh Maps and drops them on a throw). */
+typedef struct restore_tables {
+  qa_bot_lib_record_entry *records;
+  size_t record_count, record_capacity;
+  bool records_unsorted;
+  qa_bot_lib_string_entry *strings;
+  size_t string_count, string_capacity;
+  bool strings_unsorted;
+  bool *visited;
+} restore_tables;
+static void restore_tables_free(void *arg) {
+  restore_tables *t = arg;
+  for (size_t i = 0; i < t->record_count; i++) free(t->records[i].record);
+  free(t->records);
+  free(t->strings);
+  free(t->visited);
 }
 void qa_bot_lib_vars_restore(qa_bot_lib_vars *v, const qa_save_value *value,
                              qa_bot_memory_restored *memory) {
@@ -307,15 +388,29 @@ void qa_bot_lib_vars_restore(qa_bot_lib_vars *v, const qa_save_value *value,
   double head = lib_int_min(&reader, "head", 0);
   lib_field(&reader, "records", &records);
   lib_field(&reader, "strings", &strings);
-  bool live = false;
-  for (size_t i = 0; i < v->record_capacity && !live; i++) live = v->records[i] != NULL;
-  for (size_t i = 0; i < v->string_capacity && !live; i++) live = v->strings[i].live;
-  if (live || next < 1 || next > 4294967296.0)
+  /* TS reads the whole image (a SaveFormatError for any malformed cell) before it validates. */
+  for (size_t i = 0, n = qa_save_reader_list_count(&records); i < n; i++) {
+    qa_save_reader entry;
+    lib_item(&records, i, &entry);
+    (void)lib_int_min(&entry, "pointer", 1);
+    (void)lib_int_min(&entry, "allocation", 0);
+    qa_save_reader_destroy(&entry);
+  }
+  for (size_t i = 0, n = qa_save_reader_list_count(&strings); i < n; i++) {
+    qa_save_reader entry;
+    lib_item(&strings, i, &entry);
+    (void)lib_int_min(&entry, "pointer", 1);
+    (void)lib_int_min(&entry, "allocation", 0);
+    (void)lib_int_min(&entry, "offset", 0);
+    qa_save_reader_destroy(&entry);
+  }
+  if (v->record_count != 0 || v->string_count != 0 || next < 1 || next > 4294967296.0)
     qa_ui_script_plain_error("Invalid bot library variable restoration");
-  size_t cells = (size_t)next + 1;
-  bool *pointers = lib_alloc(cells);
-  qa_bot_lib_string_pointer *new_strings = lib_alloc(cells * sizeof *new_strings);
-  qa_bot_lib_var **new_records = lib_alloc(cells * sizeof *new_records);
+  /* Released when the image raises (TS leaves its maps to the GC). The tables hold only the
+   * saved entries: a pointer ID near 2^32 costs nothing (TS Maps). */
+  restore_tables t = {0};
+  qa_cleanup tables_cleanup;
+  qa_cleanup_push(&tables_cleanup, restore_tables_free, &t);
   size_t string_count = qa_save_reader_list_count(&strings);
   for (size_t i = 0; i < string_count; i++) {
     qa_save_reader entry;
@@ -324,14 +419,16 @@ void qa_bot_lib_vars_restore(qa_bot_lib_vars *v, const qa_save_value *value,
     double reference = lib_int_min(&entry, "allocation", 0);
     double offset = lib_int_min(&entry, "offset", 0);
     qa_save_reader_destroy(&entry);
-    if (pointer < 1 || pointer >= next || pointers[(size_t)pointer])
+    /* admit(): an ID below nextPointer that neither map holds yet (TS `pointers` Set). */
+    if (pointer < 1 || pointer >= next ||
+        string_index(t.strings, t.string_count, t.strings_unsorted, (int64_t)pointer) < t.string_count)
       qa_ui_script_plain_error("Invalid saved bot variable pointer");
-    pointers[(size_t)pointer] = true;
     qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
     if (offset < 0 || offset >= (double)allocation.length ||
         memchr(allocation.bytes + (size_t)offset, 0, allocation.length - (size_t)offset) == NULL)
       qa_ui_script_plain_error("Invalid saved bot variable string");
-    new_strings[(size_t)pointer] = (qa_bot_lib_string_pointer){true, allocation, (int64_t)offset};
+    string_put(&t.strings, &t.string_count, &t.string_capacity, &t.strings_unsorted, (int64_t)pointer,
+               (qa_bot_lib_string_pointer){true, allocation, (int64_t)offset});
   }
   size_t record_count = qa_save_reader_list_count(&records);
   for (size_t i = 0; i < record_count; i++) {
@@ -340,46 +437,53 @@ void qa_bot_lib_vars_restore(qa_bot_lib_vars *v, const qa_save_value *value,
     double pointer = lib_int_min(&entry, "pointer", 1);
     double reference = lib_int_min(&entry, "allocation", 0);
     qa_save_reader_destroy(&entry);
-    if (pointer < 1 || pointer >= next || pointers[(size_t)pointer])
+    if (pointer < 1 || pointer >= next ||
+        string_index(t.strings, t.string_count, t.strings_unsorted, (int64_t)pointer) < t.string_count ||
+        record_index(t.records, t.record_count, t.records_unsorted, (int64_t)pointer) < t.record_count)
       qa_ui_script_plain_error("Invalid saved bot variable pointer");
-    pointers[(size_t)pointer] = true;
     qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
     if (allocation.length < RECORD_BYTES + 1)
       qa_ui_script_plain_error("Saved bot variable record is truncated");
     uint32_t a = lib_u32(allocation.bytes), b = lib_u32(allocation.bytes + 4);
-    if (a >= cells || b >= cells || !new_strings[a].live || !new_strings[b].live)
+    if (string_index(t.strings, t.string_count, t.strings_unsorted, a) >= t.string_count ||
+        string_index(t.strings, t.string_count, t.strings_unsorted, b) >= t.string_count)
       qa_ui_script_plain_error("Saved bot variable string reference is missing");
-    new_records[(size_t)pointer] = bind(v, allocation);
+    qa_bot_lib_var *record = bind(v, allocation);
+    record_put(&t.records, &t.record_count, &t.record_capacity, &t.records_unsorted, (int64_t)pointer, record);
   }
-  bool *visited = lib_alloc(cells);
+  t.visited = lib_alloc(t.record_count);
   size_t visited_count = 0;
   for (double pointer = head; pointer != 0;) {
-    qa_bot_lib_var *record = pointer < (double)cells ? new_records[(size_t)pointer] : NULL;
-    if (record == NULL || visited[(size_t)pointer])
+    size_t index = record_index(t.records, t.record_count, t.records_unsorted, (int64_t)pointer);
+    if (index >= t.record_count || t.visited[index])
       qa_ui_script_plain_error("Invalid saved bot variable list");
-    visited[(size_t)pointer] = true;
+    t.visited[index] = true;
     visited_count++;
-    pointer = lib_u32(record->allocation.bytes + 20);
+    pointer = lib_u32(t.records[index].record->allocation.bytes + 20);
   }
   if (visited_count != record_count)
     qa_ui_script_plain_error("Saved bot variable list has unreachable records");
+  qa_cleanup_pop(&tables_cleanup);
   free(v->records);
   free(v->strings);
-  v->records = new_records;
-  v->record_capacity = cells;
-  v->strings = new_strings;
-  v->string_capacity = cells;
+  v->records = t.records;
+  v->record_count = t.record_count;
+  v->record_capacity = t.record_capacity;
+  v->records_unsorted = t.records_unsorted;
+  v->strings = t.strings;
+  v->string_count = t.string_count;
+  v->string_capacity = t.string_capacity;
+  v->strings_unsorted = t.strings_unsorted;
   v->head = (uint32_t)head;
   v->next_pointer = (int64_t)next;
-  free(pointers);
-  free(visited);
+  free(t.visited);
   qa_save_reader_destroy(&records);
   qa_save_reader_destroy(&strings);
   qa_save_reader_destroy(&reader);
 }
 int64_t qa_bot_lib_vars_reference(qa_bot_lib_vars *v, const qa_bot_lib_var *variable) {
-  for (size_t pointer = 0; pointer < v->record_capacity; pointer++)
-    if (v->records[pointer] == variable) return (int64_t)pointer;
+  for (size_t i = 0; i < v->record_count; i++)
+    if (v->records[i].record == variable) return (int64_t)v->records[i].pointer;
   qa_ui_script_plain_error("Bot library variable reference belongs to another owner");
 }
 qa_bot_lib_var *qa_bot_lib_vars_resolve(qa_bot_lib_vars *v, int64_t pointer) {

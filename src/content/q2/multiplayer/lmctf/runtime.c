@@ -419,51 +419,76 @@ static void rd_sub(const qa_save_reader *r, const char *name, qa_save_reader *ou
   if (!qa_save_reader_field(r, name, out)) qa_raise("Error", 0, 0, "Out of memory");
 }
 
+struct restored_maps { const char **list; char **owned; size_t count; };
+static void restored_maps_free(void *arg) {
+  struct restored_maps *maps = arg;
+  for (size_t i = 0; i < maps->count; i++) free(maps->owned[i]);
+  free(maps->owned);
+  free(maps->list);
+}
+struct restored_player { qa_actor_id actor; qa_lmctf_player_state state; };
+struct restored_players { struct restored_player *list; size_t count; };
+/* The player states read so far, when a reader raises before they reach the context. */
+static void restored_players_free(void *arg) {
+  struct restored_players *players = arg;
+  for (size_t i = 0; i < players->count; i++) qa_lmctf_player_state_destroy(&players->list[i].state);
+  free(players->list);
+}
 void qa_q2_lmctf_restore(qa_q2_lmctf *lmctf, const qa_save_reader *reader, qa_q2_game_services *g) {
   qa_lmctf_grapple_equipment *equipment = qa_lmctf_grapple_module_equipment(lmctf->grapple);
   if (equipment != NULL) qa_lmctf_grapple_bind(equipment, g);
+  /* TS Object.assign(this.rules, { ...every field read... }): the rules change only when every field was read. */
   qa_save_reader rules;
   rd_sub(reader, "rules", &rules);
-  lmctf->rules.time_limit_minutes = rd_finite(&rules, "timeLimitMinutes");
-  lmctf->rules.frag_limit = rd_integer(&rules, "fragLimit");
+  qa_lmctf_rules next = lmctf->rules;
+  next.time_limit_minutes = rd_finite(&rules, "timeLimitMinutes");
+  next.frag_limit = rd_integer(&rules, "fragLimit");
+  struct restored_maps maps = {0};
+  qa_cleanup maps_cleanup;
+  qa_cleanup_push(&maps_cleanup, restored_maps_free, &maps);
   {
     qa_save_reader list;
     rd_sub(&rules, "mapList", &list);
     size_t count = qa_save_reader_list_count(&list);
-    const char **maps = qa_q2mp_xalloc(malloc((count == 0 ? 1 : count) * sizeof *maps));
-    char **owned = qa_q2mp_xalloc(malloc((count == 0 ? 1 : count) * sizeof *owned));
+    maps.list = qa_q2mp_xalloc(calloc(count == 0 ? 1 : count, sizeof *maps.list));
+    maps.owned = qa_q2mp_xalloc(calloc(count == 0 ? 1 : count, sizeof *maps.owned));
     for (size_t i = 0; i < count; i++) {
       qa_save_reader item;
       if (!qa_save_reader_item(&list, i, &item)) qa_raise("Error", 0, 0, "Out of memory");
-      owned[i] = qa_q2mp_dup(qa_save_reader_string(&item));
-      maps[i] = owned[i];
+      maps.owned[i] = qa_q2mp_dup(qa_save_reader_string(&item));
+      maps.list[i] = maps.owned[i];
+      maps.count = i + 1;
       qa_save_reader_destroy(&item);
     }
-    free(lmctf->rules.map_list);
-    free_restored_maps(lmctf);
-    lmctf->rules.map_list = maps;
-    lmctf->rules.map_count = count;
-    lmctf->restored_maps = owned;
-    lmctf->restored_map_count = count;
     qa_save_reader_destroy(&list);
   }
-  lmctf->rules.ctf_flags = rd_integer_min(&rules, "ctfFlags", 0);
-  lmctf->rules.ref_flags = rd_integer_min(&rules, "refFlags", 0);
-  lmctf->rules.runes = rd_integer_min(&rules, "runes", 0);
-  lmctf->rules.skin_set = rd_integer(&rules, "skinSet");
-  lmctf->rules.flag_init = rd_bool(&rules, "flagInit");
-  lmctf->rules.disabled_weapons = rd_integer_min(&rules, "disabledWeapons", 0);
-  lmctf->rules.fast_switch = rd_bool(&rules, "fastSwitch");
-  lmctf->rules.auto_lock = rd_bool(&rules, "autoLock");
-  lmctf->rules.countdown_seconds = rd_finite(&rules, "countdownSeconds");
-  lmctf->rules.quad_seconds = rd_finite(&rules, "quadSeconds");
+  next.ctf_flags = rd_integer_min(&rules, "ctfFlags", 0);
+  next.ref_flags = rd_integer_min(&rules, "refFlags", 0);
+  next.runes = rd_integer_min(&rules, "runes", 0);
+  next.skin_set = rd_integer(&rules, "skinSet");
+  next.flag_init = rd_bool(&rules, "flagInit");
+  next.disabled_weapons = rd_integer_min(&rules, "disabledWeapons", 0);
+  next.fast_switch = rd_bool(&rules, "fastSwitch");
+  next.auto_lock = rd_bool(&rules, "autoLock");
+  next.countdown_seconds = rd_finite(&rules, "countdownSeconds");
+  next.quad_seconds = rd_finite(&rules, "quadSeconds");
   qa_save_reader_destroy(&rules);
+  qa_cleanup_pop(&maps_cleanup);
+  free(lmctf->rules.map_list);
+  free_restored_maps(lmctf);
+  next.map_list = maps.list;
+  next.map_count = maps.count;
+  lmctf->rules = next;
+  lmctf->restored_maps = maps.owned;
+  lmctf->restored_map_count = maps.count;
   qa_lmctf_grapple_module_states_clear(lmctf->grapple);
   qa_save_reader players_reader;
   rd_sub(reader, "players", &players_reader);
   size_t player_count = qa_save_reader_list_count(&players_reader);
-  struct restored { qa_actor_id actor; qa_lmctf_player_state state; };
-  struct restored *restored = qa_q2mp_xalloc(malloc((player_count == 0 ? 1 : player_count) * sizeof *restored));
+  struct restored_player *restored = qa_q2mp_xalloc(malloc((player_count == 0 ? 1 : player_count) * sizeof *restored));
+  struct restored_players pending = {restored, 0};
+  qa_cleanup players_cleanup;
+  qa_cleanup_push(&players_cleanup, restored_players_free, &pending);
   static const double team_choices[3] = {0, 1, 2};
   static const double hook_choices[3] = {0, 1, 2};
   for (size_t i = 0; i < player_count; i++) {
@@ -477,13 +502,13 @@ void qa_q2_lmctf_restore(qa_q2_lmctf *lmctf, const qa_save_reader *reader, qa_q2
         lmctf->hooks.player(lmctf->hooks.ctx, owned.id) == NULL) {
       qa_save_reader_destroy(&entry);
       qa_save_reader_destroy(&players_reader);
-      free(restored);
       qa_raise("Error", 0, 0, "LMCTF restore requires an admitted source player");
     }
     restored[i].actor = owned.id;
     rd_sub(&entry, "state", &saved);
     qa_lmctf_player_state *state = &restored[i].state;
     qa_lmctf_player_state_init(state);
+    pending.count = i + 1;
     state->plasma_mode = rd_bool(&saved, "plasmaMode");
     rd_sub(&saved, "team", &field);
     state->team = qa_save_reader_choice_number(&field, team_choices, 3);
@@ -572,6 +597,7 @@ void qa_q2_lmctf_restore(qa_q2_lmctf *lmctf, const qa_save_reader *reader, qa_q2
   rd_sub(reader, "runes", &sub);
   qa_lmctf_runes_restore(lmctf->runes, rd_bool(&sub, "forward"));
   qa_save_reader_destroy(&sub);
+  qa_cleanup_pop(&players_cleanup);
   qa_lmctf_context_clear(&lmctf->context);
   for (size_t i = 0; i < player_count; i++) qa_lmctf_context_set(&lmctf->context, restored[i].actor, restored[i].state);
   free(restored);
@@ -649,7 +675,10 @@ void qa_q2_lmctf_admitted(qa_q2_lmctf *lmctf, qa_q2_entity *entity, qa_q2_game_s
 void qa_q2_lmctf_player_spawned(qa_q2_lmctf *lmctf, qa_q2_entity *entity, qa_q2_game_services *g) {
   qa_lmctf_player_state *state = qa_lmctf_player(&lmctf->context, entity->actor.id);
   qa_lmctf_grapple_module_abort(lmctf->grapple, entity->actor, g);
-  qa_lmctf_grapple_module_state_ref(lmctf->grapple, entity->actor.id)->hook_held = false;
+  /* TS grapple.state(actor).hookHeld = false: with no equipment that state is a throwaway object, and the inactive
+   * map stays empty (dropInventory depends on that). */
+  if (qa_lmctf_grapple_module_equipment(lmctf->grapple) != NULL)
+    qa_lmctf_grapple_module_state_ref(lmctf->grapple, entity->actor.id)->hook_held = false;
   size_t en = 0;
   const qa_inventory_entry *entries = qa_shared_inventory_table_entries(g->host->inventory, entity->actor.id, &en);
   bool has_hook = false;
@@ -738,7 +767,9 @@ void qa_q2_lmctf_drop_inventory(qa_q2_lmctf *lmctf, qa_q2_entity *entity, qa_q2_
   qa_lmctf_runes_drop(lmctf->runes, entity->actor.id, g);
   qa_lmctf_grapple_state *hook = qa_lmctf_grapple_module_state_has(lmctf->grapple, entity->actor.id)
       ? qa_lmctf_grapple_module_state_ref(lmctf->grapple, entity->actor.id) : NULL;
-  if (hook != NULL && hook->has_hook) qa_lmctf_grapple_module_abort(lmctf->grapple, entity->actor, g);
+  /* TS `states.get(actor)?.hook === null ? undefined : abort()`: only a state with no hook skips the abort; a
+   * player with no state at all (every player when the shared grapple is in use) is aborted too. */
+  if (hook == NULL || hook->has_hook) qa_lmctf_grapple_module_abort(lmctf->grapple, entity->actor, g);
 }
 
 void qa_q2_lmctf_player_death(qa_q2_lmctf *lmctf, qa_q2_entity *entity, qa_q2_game_services *g) {
@@ -841,16 +872,18 @@ bool qa_q2_lmctf_command(qa_q2_lmctf *lmctf, qa_q2_entity *entity, qa_q2_game_se
   }
   if (strcmp(name, "drop") == 0 || strcmp(name, "use") == 0) {
     char *joined = join_args(args, arg_count);
-    char requested[512];
-    lower_into(requested, sizeof requested, joined);
+    char *requested = qa_js_to_lower_case(joined); /* the whole text: endsWith looks at its tail */
     free(joined);
-    if (strcmp(requested, "flag") == 0 || strcmp(requested, "enemy flag") == 0) {
+    if (!requested) qa_range_error("Out of memory");
+    size_t len = strlen(requested);
+    bool flag = strcmp(requested, "flag") == 0 || strcmp(requested, "enemy flag") == 0;
+    bool rune = strcmp(requested, "rune") == 0 || (len >= 9 && strcmp(requested + len - 9, " artifact") == 0);
+    free(requested);
+    if (flag) {
       qa_lmctf_flags_drop(lmctf->flags, entity, g);
       return true;
     }
-    size_t len = strlen(requested);
-    if (strcmp(requested, "rune") == 0 || (len >= 9 && strcmp(requested + len - 9, " artifact") == 0))
-      return qa_lmctf_runes_drop(lmctf->runes, entity->actor.id, g);
+    if (rune) return qa_lmctf_runes_drop(lmctf->runes, entity->actor.id, g);
     return false;
   }
   return false;

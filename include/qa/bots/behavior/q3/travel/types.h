@@ -1,8 +1,7 @@
 /* Port of src/bots/behavior/q3/travel/types.ts (types only). Interfaces
  * become fn+ctx tables. BotMoveVariable / ServerTraceResult are mirrors
- * of movement-state.ts / content q3 world.ts records not yet landed as C
- * headers; NavigationRuntime (navigation/runtime.ts, bots-b unported) is
- * an opaque handle here. bots-a's *_bots_a tables are narrower subsets.
+ * of movement-state.ts / content q3 world.ts records; NavigationRuntime
+ * (navigation/runtime.ts) is an opaque handle here. bots-a's *_bots_a tables are narrower subsets.
  * GPL-2.0-or-later. */
 #ifndef QA_BOTS_BEHAVIOR_Q3_TRAVEL_TYPES_H
 #define QA_BOTS_BEHAVIOR_Q3_TRAVEL_TYPES_H
@@ -65,6 +64,9 @@ typedef struct qa_source_bot_travel_host {
 /* AasAsset reachability record plus its graph edge. */
 typedef struct qa_travel_reachability {
   qa_aas_reach_rec reach; qa_navigation_edge graph_edge;
+  /* TS travelTime as a JS number: a graph edge's Math.max(1, Math.trunc(travelSeconds * 100)) can
+     be NaN or past int64; reach.travel_time holds its ToInt32-free integer form (NaN reads 0). */
+  double travel_time_number;
 } qa_travel_reachability;
 typedef enum qa_bot_movement_variable_name {
   QA_BMV_SV_MAX_STEP, QA_BMV_SV_MAX_BARRIER, QA_BMV_SV_GRAVITY, QA_BMV_ROCKET_LAUNCHER_INDEX,

@@ -1,6 +1,7 @@
 /* Port of src/network/q3/client-authorization.ts. GPL-2.0-or-later. */
 #include "qa/network/q3/client_authorization.h"
 #include "qa/foundation/support.h"
+#include "qa/network/common/js_number.h"
 #include "qa/network/q3/connectionless.h"
 #include <netdb.h>
 #include <netinet/in.h>
@@ -44,14 +45,17 @@ static double cvar_integer(qa_cvar_registry *cvars, const char *name) {
   qa_cvar_read_free(&snap);
   return value;
 }
+static qa_cvar_registry *options_cvars(const qa_q3_client_authorization_options *o) {
+  return o->cvars_of != NULL ? o->cvars_of(o->ctx) : o->cvars;
+}
 void qa_q3_client_authorization_request(qa_q3_client_authorization *a, qa_q3_client_auth_assert_fn assert_current, void *assert_ctx,
                                         qa_q3_client_auth_send_fn send, void *send_ctx) {
   qa_q3_client_authorization_options *o = &a->options;
   assert_current(assert_ctx);
   /* The key is sent in cleartext to a legacy authority, so it leaves the machine only when the player opts in. */
   qa_cvar_snapshot registered;
-  if (qa_cvar_registry_register(o->cvars, "cl_authorizeKey", "0", QA_CVAR_FLAG_ARCHIVE, &registered)) qa_cvar_read_free(&registered);
-  if (cvar_integer(o->cvars, "cl_authorizeKey") == 0) return;
+  if (qa_cvar_registry_register(options_cvars(o), "cl_authorizeKey", "0", QA_CVAR_FLAG_ARCHIVE, &registered)) qa_cvar_read_free(&registered);
+  if (cvar_integer(options_cvars(o), "cl_authorizeKey") == 0) return;
   if (!a->has_address) {
     qa_q3_mirror_ipv4_address addr; memset(&addr, 0, sizeof addr);
     char err[128] = "";
@@ -72,7 +76,7 @@ void qa_q3_client_authorization_request(qa_q3_client_authorization *a, qa_q3_cli
     strcpy(key, "demota");
   } else {
     uint8_t bytes[33];
-    qa_q3_cd_key_state_read_authorization(o->keys, bytes, sizeof bytes);
+    qa_q3_cd_key_state_read_authorization(o->keys_of != NULL ? o->keys_of(o->ctx) : o->keys, bytes, sizeof bytes);
     size_t n = 0;
     for (int i = 0; i < 32; i++) {
       uint8_t b = bytes[i];
@@ -82,14 +86,17 @@ void qa_q3_client_authorization_request(qa_q3_client_authorization *a, qa_q3_cli
     key[n] = 0;
   }
   qa_cvar_snapshot snap;
-  if (qa_cvar_registry_register(o->cvars, "cl_anonymous", "0", QA_CVAR_FLAG_INIT | QA_CVAR_FLAG_SYSTEM_INFO, &snap)) qa_cvar_read_free(&snap);
-  double anonymous = cvar_integer(o->cvars, "cl_anonymous");
+  if (qa_cvar_registry_register(options_cvars(o), "cl_anonymous", "0", QA_CVAR_FLAG_INIT | QA_CVAR_FLAG_SYSTEM_INFO, &snap)) qa_cvar_read_free(&snap);
+  double anonymous = cvar_integer(options_cvars(o), "cl_anonymous");
   assert_current(assert_ctx);
   char buf[96];
-  snprintf(buf, sizeof buf, "getKeyAuthorize %lld %s", (long long)anonymous, key);
+  snprintf(buf, sizeof buf, "getKeyAuthorize %s %s", QA_JS_NUMBER(anonymous), key); /* `${anonymous}` */
   uint8_t *packet = NULL; size_t len = 0;
   if (qa_q3_encode_connectionless_text(buf, &packet, &len)) {
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, packet);
     send(send_ctx, &a->address, packet, len);
+    qa_cleanup_pop(&guard);
     free(packet);
   }
   assert_current(assert_ctx);

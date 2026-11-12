@@ -30,4 +30,18 @@ bool qa_fm_entity_origin(const qa_q3_entity *entity, qa_vec3 *out);
 const qa_vec3 *qa_fm_tag_spawn_origins(qa_app_shared_simulation *sim, size_t *out_count);
 /* TS balancedTeam over each unassigned player. */
 void qa_fm_assign_teams(qa_app_shared_simulation *sim, qa_ss_map *teams, const qa_actor_id *players, size_t player_count);
+void qa_fm_register_transform(qa_app_shared_simulation *sim, const char *provider, const char *id,
+    void (*transform)(void *ctx, const void *request, void *out_request));
+/* ForeignMatchStrategy (foreign-match-host.ts) members of each rule; tick() is qa_app_shared_sim_tick_*. */
+bool qa_app_foreign_horde_blocks_checkpoint(qa_app_shared_simulation *sim);
+void qa_app_foreign_horde_release(qa_app_shared_simulation *sim, qa_actor_id actor);
+bool qa_app_foreign_tag_blocks_checkpoint(qa_app_shared_simulation *sim);
+void qa_app_foreign_tag_release(qa_app_shared_simulation *sim, qa_actor_id actor);
+void qa_app_foreign_tag_register_combat(qa_app_shared_simulation *sim);
+bool qa_app_foreign_flags_blocks_checkpoint(qa_app_shared_simulation *sim);
+void qa_app_foreign_flags_release(qa_app_shared_simulation *sim, qa_actor_id actor);
+void qa_app_foreign_flags_register_combat(qa_app_shared_simulation *sim);
+bool qa_app_foreign_deathball_blocks_checkpoint(qa_app_shared_simulation *sim);
+void qa_app_foreign_deathball_release(qa_app_shared_simulation *sim, qa_actor_id actor);
+void qa_app_foreign_deathball_register_combat(qa_app_shared_simulation *sim);
 #endif

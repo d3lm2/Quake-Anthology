@@ -16,7 +16,7 @@ static bool has_flag(const char **flags, size_t n, const char *f) { for (size_t 
 return false; }
 static char *dups(const char *s) { size_t n = strlen(s); char *p = malloc(n + 1); if (p) memcpy(p, s, n + 1); return p;
 }
-static void take(qa_bot_knowledge *k, const char *label, char **errs, size_t n) { for (size_t i = 0; i < n; i++) { char buf[2048]; snprintf(buf, sizeof buf, "%s: %s", label, errs[i]); k->errors = realloc(k->errors, (k->error_count + 1) * sizeof *k->errors); k->errors[k->error_count++] = dups(buf); } }
+static void take(qa_bot_knowledge *k, const char *label, char **errs, size_t n) { for (size_t i = 0; i < n; i++) { size_t l = strlen(label) + 2 + strlen(errs[i]); char *buf = malloc(l + 1); if (!buf) return; snprintf(buf, l + 1, "%s: %s", label, errs[i]); k->errors = realloc(k->errors, (k->error_count + 1) * sizeof *k->errors); k->errors[k->error_count++] = buf; } }
 static void push_err(qa_bot_knowledge *k, const char *msg) { k->errors = realloc(k->errors, (k->error_count + 1) * sizeof *k->errors); k->errors[k->error_count++] = dups(msg); }
 bool qa_bot_knowledge_init(qa_bot_knowledge *k, qa_bot_data_files f, qa_bot_data_format format, qa_weapon_number_fn wn, void *wn_ctx) {
   memset(k, 0, sizeof *k); k->format = format;
@@ -27,7 +27,7 @@ bool qa_bot_knowledge_init(qa_bot_knowledge *k, qa_bot_data_files f, qa_bot_data
   k->weapon_count = k->weapons_r.entry_count; k->weapons = calloc(k->weapon_count ? k->weapon_count : 1, sizeof *k->weapons);
   for (size_t i = 0; i < k->weapon_count; i++) { qa_weapon_entry *w = &k->weapons_r.entries[i];
     if (w->identity.is_q2_classname) { double bit = 0; bool ok = wn && wn(wn_ctx, w->identity.classname, &bit);
-      if (!ok) { char buf[1024]; snprintf(buf, sizeof buf, "weapons.txt: no inventory binding for Q2 classname \"%s\"", w->identity.classname); push_err(k, buf); } w->number = ok ? bit : 0; }
+      if (!ok) { size_t l = strlen(w->identity.classname) + 64; char *buf = malloc(l); if (buf) { snprintf(buf, l, "weapons.txt: no inventory binding for Q2 classname \"%s\"", w->identity.classname); push_err(k, buf); free(buf); } } w->number = ok ? bit : 0; }
     k->weapons[i].entry = w; k->weapons[i].is_melee = has_flag(w->flags, w->flag_count, "melee"); k->weapons[i].is_electric = has_flag(w->flags, w->flag_count, "electric");
     k->weapons[i].needs_ammo = w->identity.is_q2_classname ? (strcmp(w->ammo_name, "") && strcmp(w->ammo_name, "none")) : (strcmp(w->ammo, "") && strcmp(w->ammo, "none")); }
   if (!qa_parse_items(&k->items_r, f.items)) return false;
@@ -134,16 +134,31 @@ bool qa_choose_weapon(const qa_bot_weapon_rec *ws, size_t count, qa_bot_weapon_c
   if (!best) return false;
   out->weapon = best; out->number = best->entry->number; return true;
 }
-static void strip_us(const char *in, char *out, size_t cap) { size_t j = 0; for (size_t i = 0; in[i] && j + 1 < cap; i++) if (in[i] != '_') out[j++] = in[i]; out[j] = 0; }
+/* TS name.replace(/_/g, ""), on heap text (no length cap). */
+static char *strip_us(const char *in) {
+  char *out = malloc(strlen(in) + 1);
+  if (!out) return NULL;
+  size_t j = 0;
+  for (size_t i = 0; in[i]; i++) if (in[i] != '_') out[j++] = in[i];
+  out[j] = 0;
+  return out;
+}
 const qa_bot_weapon_rec *qa_weapon_for_item(const qa_bot_weapon_rec *ws, size_t count, const char *item_name) {
   for (size_t i = 0; i < count; i++) if (!strcmp(ws[i].entry->name, item_name)) return &ws[i];
   const char *base = item_name; if (!strncmp(base, "weapon_", 7)) base += 7;
-  char key[512]; strip_us(base, key, sizeof key); size_t klen = strlen(key);
+  char *key = strip_us(base);
+  if (!key) return NULL;
+  size_t klen = strlen(key);
   const qa_bot_weapon_rec *best = NULL; size_t best_len = 0;
   for (size_t i = 0; i < count; i++) { const qa_weapon_entry *e = ws[i].entry; if (e->identity.is_q2_classname || !strcmp(e->name, "")) continue;
-    char name[512]; strip_us(e->name, name, sizeof name); size_t nl = strlen(name);
-    bool pre = (nl <= klen && !strncmp(key, name, nl)) || (klen <= nl && !strncmp(name, key, klen)); if (!pre) continue;
+    char *name = strip_us(e->name);
+    if (!name) break;
+    size_t nl = strlen(name);
+    bool pre = (nl <= klen && !strncmp(key, name, nl)) || (klen <= nl && !strncmp(name, key, klen));
+    free(name);
+    if (!pre) continue;
     if (!best || nl > best_len) { best = &ws[i]; best_len = nl; } }
+  free(key);
   return best;
 }
 double qa_bot_item_value(const qa_bot_item_rec *item, qa_bot_item_context ctx) {

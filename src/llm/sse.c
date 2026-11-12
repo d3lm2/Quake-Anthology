@@ -130,6 +130,10 @@ bool qa_llm_consume_sse(qa_llm_http_response *response, qa_llm_abort_signal *sig
   bool stream_error = false; /* non-LlmSettingsError failure class */
   size_t bytes = 0;
   uint8_t chunk[8192];
+  /* TextDecoder("utf-8") strips a byte order mark at the start of the stream
+     (ignoreBOM is false). Bun strips it only when the first decode() call's
+     bytes hold the whole mark: one split across the first two chunks stays. */
+  bool bom_checked = false;
 
   if (!qa_llm_check_request_abort(signal, error)) ok = false;
   while (ok && !state.stopped && !state.failed) {
@@ -160,8 +164,13 @@ bool qa_llm_consume_sse(qa_llm_http_response *response, qa_llm_abort_signal *sig
     } else {
       valid = raw.length;
     }
+    size_t skip = 0;
+    if (!bom_checked && length > 0) {
+      bom_checked = true;
+      if (valid >= 3 && raw.data[0] == 0xef && raw.data[1] == 0xbb && raw.data[2] == 0xbf) skip = 3;
+    }
     if (valid > 0) {
-      qa_llm_strbuf_append_n(&state.buffer, raw.data, valid);
+      qa_llm_strbuf_append_n(&state.buffer, raw.data + skip, valid - skip);
       memmove(raw.data, raw.data + valid, raw.length - valid);
       raw.length -= valid;
     }

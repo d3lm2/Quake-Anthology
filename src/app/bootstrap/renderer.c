@@ -25,7 +25,7 @@ static double *captures_take(captures *c, size_t *out_count) {
   return armed;
 }
 static void captures_complete(captures *c, const qa_image_level *image, const double *ids, size_t count) {
-  if (count != 0 && image == NULL) qa_range_error("Renderer capture has no pixels");
+  if (count != 0 && image == NULL) qa_raise("Error", 0, 0, "Renderer capture has no pixels");
   if (image == NULL) return;
   for (size_t i = 0; i < count; i++) {
     for (size_t j = 0; j < c->pending_count; j++) {
@@ -86,6 +86,7 @@ struct qa_app_prepared_renderer_restart {
   qa_render_image_journal journal;
   int phase; /* 0 prepared, 1 published, 2 discarded */
   bool retired_done;
+  qa_sdl_window_presentation presentation; /* the previous window's, captured by prepareRestart */
 };
 /* TS WorkerRenderer swap/failed callbacks into FrameCaptures, gated on
  * the bundle still being the current backend. */
@@ -142,7 +143,7 @@ static void native_worker_swap(void *ctx, const qa_image_level *image, const dou
   native_impl *impl = ctx;
   if (impl->hook_complete) impl->hook_complete(impl->hook_ctx, impl, image, ids, count);
   if (qa_sdl_window_backend(impl->window) == QA_SDL_BACKEND_CPU) {
-    if (image == NULL) qa_range_error("CPU renderer presentation has no pixels");
+    if (image == NULL) qa_raise("Error", 0, 0, "CPU renderer presentation has no pixels");
     qa_sdl_window_present(impl->window, image->pixels.bytes, image->pixels.length);
   }
 }
@@ -236,9 +237,21 @@ static void native_close_window(void *ctx) {
 }
 typedef struct window_open_scope { const qa_sdl_window_options *options; qa_sdl_window *window; bool opened; } window_open_scope;
 static void open_window_parked(void *ctx) { window_open_scope *s = ctx; s->opened = qa_sdl_window_open(s->options, s->window); }
+/* Where the window opens: TS NativeRenderer.open passes resizable only; a restart's candidate copies the previous
+ * window's resizable flag (flags & 0x20), display index and position. */
+typedef struct window_placement { bool resizable; double display_index; bool has_position; double x, y; } window_placement;
+static bool open_bundle_placed(const char *kind, double width, double height, bool hidden, bool worker,
+                               qa_renderer_resource_owner owner, double gamma, const window_placement *placement,
+                               qa_app_native_backend_bundle *out);
 bool qa_app_open_native_backend_bundle(void *unused, const char *kind, double width, double height, bool hidden, bool worker,
                                        qa_renderer_resource_owner owner, double gamma, qa_app_native_backend_bundle *out) {
   (void)unused;
+  window_placement placement = {true, -1, false, 0, 0};
+  return open_bundle_placed(kind, width, height, hidden, worker, owner, gamma, &placement, out);
+}
+static bool open_bundle_placed(const char *kind, double width, double height, bool hidden, bool worker,
+                               qa_renderer_resource_owner owner, double gamma, const window_placement *placement,
+                               qa_app_native_backend_bundle *out) {
   memset(out, 0, sizeof *out);
   bool is_gl = kind != NULL && strcmp(kind, "gl") == 0;
   if (kind == NULL || (!is_gl && strcmp(kind, "cpu") != 0)) qa_range_error("Unknown renderer backend");
@@ -250,9 +263,11 @@ bool qa_app_open_native_backend_bundle(void *unused, const char *kind, double wi
   if (!impl->window) { free(impl); return false; }
   qa_sdl_window_options options; memset(&options, 0, sizeof options);
   options.title = "Quake"; options.width = width; options.height = height;
-  options.hidden = hidden; options.resizable = true;
+  options.hidden = hidden; options.resizable = placement->resizable;
   options.backend = is_gl ? QA_SDL_BACKEND_GL : QA_SDL_BACKEND_CPU;
-  options.display_index = -1;
+  options.display_index = placement->display_index;
+  options.has_position = placement->has_position;
+  options.position_x = placement->x; options.position_y = placement->y;
   window_open_scope open_scope = {&options, impl->window, false};
   qa_worker_renderer_with_parked_contexts(open_window_parked, &open_scope);
   if (!open_scope.opened) { free(impl->window); free(impl); return false; }
@@ -331,7 +346,7 @@ qa_app_native_renderer *qa_app_native_renderer_open(qa_app_native_renderer_host 
   r->color = (qa_vec4){1, 1, 1, 1};
   captures_init(&r->caps);
   if (images != NULL) {
-    if (!owner_same(images->owner, owner)) { free(r); qa_range_error("Renderer image registry belongs to another owner"); }
+    if (!owner_same(images->owner, owner)) { free(r); qa_raise("Error", 0, 0, "Renderer image registry belongs to another owner"); }
     r->images = images;
   } else {
     r->images = calloc(1, sizeof *r->images);
@@ -387,12 +402,12 @@ double qa_app_native_renderer_swap_interval(qa_app_native_renderer *r) {
   if (r->current.is_worker) return r->current.worker_swap_interval;
   if (strcmp(window_backend_name(r), "gl") != 0) return 0;
   int32_t interval = qa_sdl_window_swap_interval(r->current.window);
-  if (interval != -1 && interval != 0 && interval != 1) qa_range_error("SDL returned an unsupported swap interval");
+  if (interval != -1 && interval != 0 && interval != 1) qa_raise("Error", 0, 0, "SDL returned an unsupported swap interval");
   return interval;
 }
 static void writable(qa_app_native_renderer *r) {
-  if (r->closed) qa_range_error("Native renderer is closed");
-  if (r->preparing || r->pending_restart != NULL) qa_range_error("Native renderer restart is prepared");
+  if (r->closed) qa_raise("Error", 0, 0, "Native renderer is closed");
+  if (r->preparing || r->pending_restart != NULL) qa_raise("Error", 0, 0, "Native renderer restart is prepared");
 }
 void qa_app_native_renderer_set_swap_interval(qa_app_native_renderer *r, double interval) {
   writable(r);
@@ -418,18 +433,26 @@ static void apply_image(qa_app_native_renderer *r, qa_image_resource_operation o
   if (r->current.is_worker) { if (r->current.apply_image_resource) r->current.apply_image_resource(r->current.ctx, operation); }
   else qa_render_executor_image(&r->executor, operation);
 }
+/* TS restoreContext: a serial GL renderer's window gets its context back after another window's was current. */
+static void restore_context(qa_app_native_renderer *r) {
+  if (!r->closed && !r->current.is_worker && r->current.window != NULL && strcmp(window_backend_name(r), "gl") == 0)
+    qa_sdl_window_make_current(r->current.window);
+}
 /* TS dispose runs inside withParkedContexts; native_close_window parks again, which
  * skips the workers already parked here. */
+typedef struct dispose_scope { qa_app_native_renderer *r; qa_app_native_backend_bundle *bundle; } dispose_scope;
 static void dispose_body(void *ctx) {
-  qa_app_native_backend_bundle *bundle = ctx;
+  dispose_scope *scope = ctx;
+  qa_app_native_backend_bundle *bundle = scope->bundle;
   if (bundle->window && bundle->is_gl && !bundle->is_worker) qa_sdl_window_make_current(bundle->window);
   if (bundle->close_backend) bundle->close_backend(bundle->ctx);
   if (bundle->close_window) bundle->close_window(bundle->ctx);
   else if (bundle->window) qa_sdl_window_close(bundle->window);
+  restore_context(scope->r);
 }
 static void dispose_bundle(qa_app_native_renderer *r, qa_app_native_backend_bundle *bundle) {
-  (void)r;
-  qa_worker_renderer_with_parked_contexts(dispose_body, bundle);
+  dispose_scope scope = {r, bundle};
+  qa_worker_renderer_with_parked_contexts(dispose_body, &scope);
 }
 qa_app_prepared_renderer_restart *qa_app_native_renderer_prepare_restart(qa_app_native_renderer *r, const char *kind, bool has_worker, bool worker) {
   writable(r);
@@ -450,7 +473,16 @@ qa_app_prepared_renderer_restart *qa_app_native_renderer_prepare_restart(qa_app_
   qa_app_native_backend_bundle candidate; memset(&candidate, 0, sizeof candidate);
   bool (*open_bundle)(void *, const char *, double, double, bool, bool, qa_renderer_resource_owner, double, qa_app_native_backend_bundle *) =
       r->host.open_bundle ? r->host.open_bundle : qa_app_open_native_backend_bundle;
-  bool opened = open_bundle(r->host.ctx, kind, presentation.size.width, presentation.size.height, true, worker, r->owner, r->gamma, &candidate);
+  bool opened;
+  if (open_bundle == qa_app_open_native_backend_bundle) {
+    /* SdlWindow.open({ ..., resizable: (previousWindow.flags & 0x20) !== 0, displayIndex, position }); a test host's
+     * own opener keeps its signature. */
+    window_placement placement = {(qa_sdl_window_flags(r->current.window) & 0x20u) != 0, presentation.display_index, true,
+                                  presentation.position.x, presentation.position.y};
+    opened = open_bundle_placed(kind, presentation.size.width, presentation.size.height, true, worker, r->owner, r->gamma,
+                                &placement, &candidate);
+  } else
+    opened = open_bundle(r->host.ctx, kind, presentation.size.width, presentation.size.height, true, worker, r->owner, r->gamma, &candidate);
   if (!opened) { qa_render_image_journal_destroy(&p->journal); r->preparing = false; free(p); return NULL; }
   p->candidate = candidate;
   install_capture_hooks(r, &p->candidate);
@@ -477,15 +509,17 @@ qa_app_prepared_renderer_restart *qa_app_native_renderer_prepare_restart(qa_app_
     dispose_bundle(r, &p->candidate);
     qa_render_image_journal_destroy(&p->journal);
     r->preparing = false; free(p);
-    qa_range_error("Prepared renderer drawable dimensions changed");
+    qa_raise("Error", 0, 0, "Prepared renderer drawable dimensions changed");
   }
   if (r->closed) {
     dispose_bundle(r, &p->candidate);
     qa_render_image_journal_destroy(&p->journal);
     r->preparing = false; free(p);
-    qa_range_error("Renderer closed during restart preparation");
+    qa_raise("Error", 0, 0, "Renderer closed during restart preparation");
   }
+  restore_context(r);
   p->previous = r->current;
+  p->presentation = presentation;
   r->preparing = false;
   r->pending_restart = p;
   if (r->restart_count == r->restart_cap) {
@@ -510,9 +544,8 @@ static void publish_windows(void *ctx) {
 }
 void qa_app_prepared_renderer_restart_publish(qa_app_prepared_renderer_restart *p) {
   qa_app_native_renderer *r = p->renderer;
-  if (p->phase != 0 || r->pending_restart != p || r->closed) qa_range_error("Renderer restart is no longer prepared");
-  qa_sdl_window_presentation presentation = qa_sdl_window_capture_presentation(p->previous.window);
-  publish_scope scope = {p, &presentation};
+  if (p->phase != 0 || r->pending_restart != p || r->closed) qa_raise("Error", 0, 0, "Renderer restart is no longer prepared");
+  publish_scope scope = {p, &p->presentation};
   qa_worker_renderer_with_parked_contexts(publish_windows, &scope);
   r->current = p->candidate;
   if (r->journal_live) qa_render_image_journal_destroy(&r->journal);
@@ -556,7 +589,7 @@ static const char *encoding_name(qa_render_image_kind kind) {
   return kind == QA_RENDER_IMAGE_INDEXED8 ? "indexed8" : kind == QA_RENDER_IMAGE_RGBA8 ? "rgba8" : "depth32f";
 }
 qa_app_renderer_diagnostics qa_app_native_renderer_diagnostics(qa_app_native_renderer *r) {
-  if (r->closed) qa_range_error("Native renderer is closed");
+  if (r->closed) qa_raise("Error", 0, 0, "Native renderer is closed");
   qa_app_native_renderer_synchronize(r);
   qa_app_renderer_diagnostics d; memset(&d, 0, sizeof d);
   d.backend = window_backend_name(r);
@@ -609,7 +642,7 @@ static void renderer_resize(qa_app_native_renderer *r) {
   }
 }
 static void renderer_swap(qa_app_native_renderer *r, const double *ids, size_t count) {
-  if (r->current.is_worker) qa_range_error("Worker swaps execute on their owning thread");
+  if (r->current.is_worker) qa_raise("Error", 0, 0, "Worker swaps execute on their owning thread");
   if (r->current.is_cpu && r->current.finish) r->current.finish(r->current.ctx);
   if (count != 0) {
     qa_image_level image; memset(&image, 0, sizeof image);
@@ -645,7 +678,7 @@ static qa_execution_command to_execution(qa_render_command command, const double
 }
 void qa_app_native_renderer_execute(qa_app_native_renderer *r, qa_render_frame frame) {
   writable(r);
-  if (!owner_same(frame.owner, r->owner)) qa_range_error("Frame belongs to another renderer lifetime");
+  if (!owner_same(frame.owner, r->owner)) qa_raise("Error", 0, 0, "Frame belongs to another renderer lifetime");
   renderer_resize(r);
   if (r->current.is_worker) {
     bool has_swap = false;
@@ -685,12 +718,12 @@ void qa_app_native_renderer_execute(qa_app_native_renderer *r, qa_render_frame f
 }
 uint8_t *qa_app_native_renderer_read_pixels(qa_app_native_renderer *r, size_t *out_length) {
   if (strcmp(window_backend_name(r), "cpu") != 0)
-    qa_range_error("GL captures must be requested before presentation with captureNextFrame()");
+    qa_raise("Error", 0, 0, "GL captures must be requested before presentation with captureNextFrame()");
   if (r->current.is_worker) {
-    if (r->current.read_pixels == NULL) qa_range_error("CPU renderer backend is unavailable");
+    if (r->current.read_pixels == NULL) qa_raise("Error", 0, 0, "CPU renderer backend is unavailable");
     return r->current.read_pixels(r->current.ctx, out_length);
   }
-  if (!r->current.is_cpu) qa_range_error("CPU renderer backend is unavailable");
+  if (!r->current.is_cpu) qa_raise("Error", 0, 0, "CPU renderer backend is unavailable");
   if (r->current.finish) r->current.finish(r->current.ctx);
   size_t len = 0; const uint8_t *px = r->current.pixels ? r->current.pixels(r->current.ctx, &len) : NULL;
   uint8_t *copy = malloc(len ? len : 1);
@@ -723,7 +756,8 @@ void qa_app_native_renderer_close(qa_app_native_renderer *r) {
   if (r->pending_restart) qa_app_prepared_renderer_restart_discard(r->pending_restart);
   captures_fail(&r->caps, "Renderer closed before the requested frame was presented");
   dispose_bundle(r, &r->current);
-  /* images.close() + drain */
+  /* images.close(); images.drainPendingOperations(): a registry the caller passed in is closed too */
+  qa_scene_image_registry_close(r->images);
   size_t op_count = 0;
   qa_image_resource_operation *ops = qa_scene_image_registry_drain_pending(r->images, &op_count);
   free(ops);

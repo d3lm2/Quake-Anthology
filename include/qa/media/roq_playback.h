@@ -89,7 +89,7 @@ typedef struct qa_roq_playback {
   void (*before_raw_stream_reset)(void *ctx);
   qa_roq_scratch *scratch; /* borrowed, nullable */
   qa_roq_decoder decoder;
-  uint32_t epoch;
+  double epoch; /* TS number: restored checkpoints keep any safe integer */
   int64_t last_time;
   qa_roq_playback_status state;
   bool has_frame;

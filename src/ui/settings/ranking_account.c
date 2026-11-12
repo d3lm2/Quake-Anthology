@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/ui/common/controls.h"
@@ -68,9 +69,13 @@ static bool editable(account_state *s) {
   return !s->busy && strcmp(view.player.kind, "active") != 0
          && strcmp(view.player.kind, "pending") != 0;
 }
+/* text.trim() === "": JS white space over UTF-8 code points. */
 static bool blank(const char *text) {
-  for (; *text != '\0'; text++)
-    if (!qa_input_js_space((unsigned char)*text)) return false;
+  for (const char *p = text; *p != '\0';) {
+    size_t space = qa_js_white_space_length(p);
+    if (space == 0) return false;
+    p += space;
+  }
   return true;
 }
 

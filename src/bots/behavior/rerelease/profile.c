@@ -101,18 +101,29 @@ qa_bot_usercmd qa_rerelease_bot_behavior_think(qa_rerelease_bot_behavior *behavi
   qa_bot_usercmd command = qa_bot_brain_think(&behavior->brain, world);
   cb->post_think(cb->ctx, q1 ? "Bot_PostThink" : "Bot_EndFrame", command);
   double now = cb->time(cb->ctx);
-  size_t kept = 0;
+  /* TS splits the queue into ready and kept first and only then delivers the ready ones, so a chat
+     queued during delivery lands in the kept queue and is not delivered this frame. */
+  size_t kept = 0, ready_count = 0;
+  qa_rerelease_pending_chat *ready = NULL;
+  for (size_t i = 0; i < behavior->pending_count; i++)
+    if (behavior->pending_chats[i].time <= now) ready_count++;
+  if (ready_count) {
+    ready = malloc(ready_count * sizeof *ready);
+    if (!ready) qa_range_error("Out of memory");
+  }
+  ready_count = 0;
   for (size_t i = 0; i < behavior->pending_count; i++) {
     qa_rerelease_pending_chat entry = behavior->pending_chats[i];
-    if (entry.time <= now) {
-      qa_bot_chat_event event = {entry.locstring, entry.type, entry.delay_ms, entry.team_only};
-      cb->chat(cb->ctx, event);
-      free(entry.locstring); free(entry.type);
-    } else {
-      behavior->pending_chats[kept++] = entry;
-    }
+    if (entry.time <= now) ready[ready_count++] = entry;
+    else behavior->pending_chats[kept++] = entry;
   }
   behavior->pending_count = kept;
+  for (size_t i = 0; i < ready_count; i++) {
+    qa_bot_chat_event event = {ready[i].locstring, ready[i].type, ready[i].delay_ms, ready[i].team_only};
+    cb->chat(cb->ctx, event);
+  }
+  for (size_t i = 0; i < ready_count; i++) { free(ready[i].locstring); free(ready[i].type); }
+  free(ready);
   return command;
 }
 void qa_rerelease_bot_behavior_set_objective_goal(qa_rerelease_bot_behavior *behavior, const qa_bot_vec3 *point) {
@@ -171,7 +182,7 @@ oom:
 bool qa_rerelease_bot_behavior_restore(qa_rerelease_bot_behavior *behavior, const qa_rerelease_behavior_checkpoint *checkpoint) {
   if (checkpoint->version != 1 || checkpoint->source != behavior->source ||
       !checkpoint->definition || !behavior->definition || strcmp(checkpoint->definition, behavior->definition))
-    qa_range_error("Rerelease behavior checkpoint belongs to another mounted source definition");
+    qa_raise("Error", 0, 0, "Rerelease behavior checkpoint belongs to another mounted source definition");
   if (!qa_bot_brain_restore(&behavior->brain, &checkpoint->brain)) return false;
   qa_xorshift32_restore(&behavior->random, checkpoint->rng);
   qa_rerelease_pending_chat *fresh = NULL;

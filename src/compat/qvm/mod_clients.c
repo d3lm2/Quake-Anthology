@@ -41,7 +41,7 @@ static client_slot *require_entry(qa_qvm_mod_client_bindings *bindings, qa_actor
                   qa_same_actor(resolved, actor);
   if (entry == NULL || !has_client ||
       (entry->has_client && !qa_same_client(entry->client, client)) || !resolves)
-    qa_range_error("QVM component client identity is no longer live");
+    qa_raise("Error", 0, 0, "QVM component client identity is no longer live");
   if (!entry->has_client) {
     entry->has_client = true;
     entry->client = client;
@@ -124,7 +124,7 @@ bool qa_qvm_mod_client_bindings_slot(qa_qvm_mod_client_bindings *bindings, qa_ac
   }
   free(reserved);
   if (slot >= (int64_t)bindings->operations.declaration->maximum)
-    qa_range_error("QVM component source client capacity exceeded");
+    qa_raise("Error", 0, 0, "QVM component source client capacity exceeded");
   if (bindings->entry_count == bindings->entry_capacity) {
     bindings->entry_capacity = bindings->entry_capacity == 0 ? 8 : bindings->entry_capacity * 2;
     bindings->entries = realloc(bindings->entries, bindings->entry_capacity * sizeof(client_slot));
@@ -150,7 +150,7 @@ static void run_calls(qa_qvm_mod_client_bindings *bindings, const qa_qvm_mod_sou
 static void admit(qa_qvm_mod_client_bindings *bindings, qa_actor_id actor) {
   int64_t slot = 0;
   if (!qa_qvm_mod_client_bindings_slot(bindings, actor, &slot))
-    qa_range_error("QVM component admission requires a live client");
+    qa_raise("Error", 0, 0, "QVM component admission requires a live client");
   client_slot required = *require_entry(bindings, actor);
   bindings->operations.project(bindings->operations.ctx, actor);
   if (!required.admitted) {
@@ -174,6 +174,16 @@ static void admit(qa_qvm_mod_client_bindings *bindings, qa_actor_id actor) {
     bindings->operations.admitted(bindings->operations.ctx, actor);
 }
 
+typedef struct forget_scope {
+  qa_qvm_mod_client_bindings *bindings;
+  qa_actor_id actor;
+} forget_scope;
+
+static void forget_on_raise(void *arg) {
+  forget_scope *scope = arg;
+  qa_qvm_mod_client_bindings_forget(scope->bindings, scope->actor);
+}
+
 static void client_event(void *ctx, qa_mod_client_event event) {
   qa_qvm_mod_client_bindings *bindings = ctx;
   qa_actor_id actor = event.identity.actor;
@@ -187,7 +197,12 @@ static void client_event(void *ctx, qa_mod_client_event event) {
     (void)require_entry(bindings, actor);
     run_calls(bindings, bindings->operations.declaration->disconnect,
               bindings->operations.declaration->disconnect_count, actor);
+    /* TS try { release(actor) } finally { entries.delete(actor) }. */
+    forget_scope scope = {bindings, actor};
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, forget_on_raise, &scope);
     bindings->operations.release(bindings->operations.ctx, actor);
+    qa_cleanup_pop(&guard);
     qa_qvm_mod_client_bindings_forget(bindings, actor);
   }
 }
@@ -210,18 +225,36 @@ static void remove_application(qa_qvm_mod_client_bindings *bindings, qa_mod_clie
   }
 }
 
+static void open_close_body(void *ctx) {
+  open_cleanup *cleanup = ctx;
+  cleanup->close(cleanup->close_ctx);
+}
+
+/* TS () => { try { close?.() } finally { remove() } }. */
 static void run_open_cleanup(void *ctx) {
   open_cleanup *cleanup = ctx;
-  if (cleanup->close != NULL) cleanup->close(cleanup->close_ctx);
+  qa_caught_error failure;
+  bool ok = cleanup->close == NULL || qa_try(open_close_body, cleanup, &failure);
   remove_application(cleanup->bindings, cleanup->application);
   free(cleanup);
+  if (!ok) qa_rethrow(&failure);
+}
+
+typedef struct open_scope {
+  qa_qvm_mod_client_bindings *bindings;
+  qa_mod_client_application *application;
+} open_scope;
+
+static void remove_on_raise(void *arg) {
+  open_scope *scope = arg;
+  remove_application(scope->bindings, scope->application);
 }
 
 static void input_open(void *ctx, qa_mod_client_application *application,
                        void (**cleanup)(void *cleanup_ctx), void **cleanup_ctx) {
   qa_qvm_mod_client_bindings *bindings = ctx;
   client_slot *entry = require_entry(bindings, application->identity.actor);
-  if (!entry->admitted) qa_range_error("QVM input callback requires admitted source client state");
+  if (!entry->admitted) qa_raise("Error", 0, 0, "QVM input callback requires admitted source client state");
   if (bindings->application_count == bindings->application_capacity) {
     bindings->application_capacity = bindings->application_capacity == 0 ? 8 : bindings->application_capacity * 2;
     bindings->applications = realloc(bindings->applications, bindings->application_capacity * sizeof *bindings->applications);
@@ -230,8 +263,13 @@ static void input_open(void *ctx, qa_mod_client_application *application,
   bindings->applications[bindings->application_count++] = application;
   void (*close)(void *) = NULL;
   void *close_ctx = NULL;
+  /* TS try { close = openInput?.(application) } catch { remove(); throw }. */
+  open_scope scope = {bindings, application};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, remove_on_raise, &scope);
   if (bindings->operations.open_input != NULL)
     bindings->operations.open_input(bindings->operations.ctx, application, &close, &close_ctx);
+  qa_cleanup_pop(&guard);
   open_cleanup *state = malloc(sizeof *state);
   if (state == NULL) qa_range_error("QVM memory allocation failed");
   state->bindings = bindings;
@@ -265,7 +303,16 @@ void qa_qvm_mod_client_bindings_start(qa_qvm_mod_client_bindings *bindings) {
   bindings->has_unsubscribe = true;
   size_t count = 0;
   const qa_mod_client_identity *clients = services->clients(services->ctx, &count);
-  for (size_t i = 0; i < count; i++) admit(bindings, clients[i].actor);
+  /* TS iterates the array clients() returned; admission runs source code that
+   * may change the host's client list, so the actors are copied first. */
+  qa_actor_id *actors = malloc((count == 0 ? 1 : count) * sizeof *actors);
+  if (actors == NULL) qa_range_error("QVM memory allocation failed");
+  for (size_t i = 0; i < count; i++) actors[i] = clients[i].actor;
+  qa_cleanup actors_cleanup;
+  qa_cleanup_push(&actors_cleanup, free, actors);
+  for (size_t i = 0; i < count; i++) admit(bindings, actors[i]);
+  qa_cleanup_pop(&actors_cleanup);
+  free(actors);
   qa_mod_client_input_operations operations;
   memset(&operations, 0, sizeof operations);
   operations.ctx = bindings;
@@ -331,6 +378,8 @@ void qa_qvm_mod_client_bindings_frame(qa_qvm_mod_client_bindings *bindings,
     }
   }
   qa_js_sort(clients, count, sizeof *clients, compare_slot);
+  qa_cleanup clients_cleanup;
+  qa_cleanup_push(&clients_cleanup, free, clients);
   for (size_t i = 0; i < count; i++) {
     for (size_t c = 0; c < call_count; c++) {
       client_slot *current = find_entry(bindings, clients[i].entry.actor);
@@ -340,6 +389,7 @@ void qa_qvm_mod_client_bindings_frame(qa_qvm_mod_client_bindings *bindings,
       invoke(invoke_ctx, &calls[c], clients[i].entry.actor);
     }
   }
+  qa_cleanup_pop(&clients_cleanup);
   free(clients);
 }
 
@@ -358,7 +408,7 @@ size_t qa_qvm_mod_client_bindings_players(qa_qvm_mod_client_bindings *bindings,
 size_t qa_qvm_mod_client_bindings_checkpoint(qa_qvm_mod_client_bindings *bindings,
                                              qa_qvm_mod_client_slot *out, size_t capacity) {
   if (bindings->application_count != 0)
-    qa_range_error("Cannot save during QVM component input application");
+    qa_raise("Error", 0, 0, "Cannot save during QVM component input application");
   client_slot *entries = bindings->entries;
   for (size_t i = 0; i < bindings->entry_count && i < capacity; i++) {
     out[i].actor = entries[i].actor;
@@ -379,13 +429,21 @@ void qa_qvm_mod_client_bindings_forget(qa_qvm_mod_client_bindings *bindings, qa_
   }
 }
 
+static void unsubscribe_input_body(void *ctx) {
+  qa_qvm_mod_client_bindings *bindings = ctx;
+  bindings->unsubscribe_input.invoke(bindings->unsubscribe_input.ctx);
+}
+
 void qa_qvm_mod_client_bindings_close(qa_qvm_mod_client_bindings *bindings) {
-  if (bindings->has_unsubscribe_input) bindings->unsubscribe_input.invoke(bindings->unsubscribe_input.ctx);
+  /* TS try { unsubscribeInput?.() } finally { the rest }. */
+  qa_caught_error failure;
+  bool ok = !bindings->has_unsubscribe_input || qa_try(unsubscribe_input_body, bindings, &failure);
   bindings->has_unsubscribe_input = false;
   if (bindings->has_unsubscribe) bindings->unsubscribe.invoke(bindings->unsubscribe.ctx);
   bindings->has_unsubscribe = false;
   bindings->application_count = 0;
   bindings->entry_count = 0;
+  if (!ok) qa_rethrow(&failure);
 }
 
 const char *qa_qvm_mod_client_bindings_get_userinfo(qa_qvm_mod_client_bindings *bindings, int64_t slot) {
@@ -398,7 +456,7 @@ const char *qa_qvm_mod_client_bindings_get_userinfo(qa_qvm_mod_client_bindings *
 void qa_qvm_mod_client_bindings_set_userinfo(qa_qvm_mod_client_bindings *bindings, int64_t slot, const char *value) {
   client_slot *entry = at_slot(bindings, slot);
   if (entry == NULL || !entry->has_client)
-    qa_range_error("QVM component cannot update an unbound source client");
+    qa_raise("Error", 0, 0, "QVM component cannot update an unbound source client");
   qa_mod_client_services *services = bindings->operations.services;
   services->set_userinfo(services->ctx, entry->client, value);
 }
@@ -496,7 +554,7 @@ qa_q3_wire_user_command qa_qvm_mod_client_bindings_get_user_command(qa_qvm_mod_c
   const qa_mod_client_command_receipt *accepted =
       entry == NULL || !entry->has_client ? NULL : services->command(services->ctx, entry->client);
   if (entry == NULL || accepted == NULL)
-    qa_range_error("QVM component usercmd requires an accepted destination client command");
+    qa_raise("Error", 0, 0, "QVM component usercmd requires an accepted destination client command");
   const qa_actor_command *input = &accepted->input;
   double milliseconds = accepted->time.kind == QA_SOURCE_TIME_SECONDS ? accepted->time.value * 1000 : accepted->time.value;
   bindings->operations.player_state(bindings->operations.ctx, entry_actor, &ps);

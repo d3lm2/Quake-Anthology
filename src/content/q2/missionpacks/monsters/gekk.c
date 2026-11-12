@@ -7,6 +7,7 @@
 
 #include "mp_internal.h"
 #include "qa/content/q2/base/monsters/common.h"
+#include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/monsters/ai.h"
 #include "qa/content/q2/missionpacks/monsters/tables/xatrix_gekk.h"
 #include "qa/content/q2/rerelease/monsters/common.h"
@@ -105,17 +106,22 @@ static void acid_gib(qa_q2m_context *c, const char *part, double damage, bool he
   qa_q2_game_services *game = c->game;
   qa_body_state body = q2mpm_body(game, entity);
   qa_q2_entity *gib = head ? entity : game->create(game->ctx, "acid_gib", NULL, 0);
-  qa_q2_source_callbacks_register(game->source_callbacks, loogie_callbacks());
   {
+    /* TS register({ think: { G_FreeEdict }, die: { acid_gib_die } }): no loogie touch here. */
+    static qa_q2_named_think thinks[1];
     static qa_q2_named_die dies[1];
-    static bool dies_ready;
-    if (!dies_ready) {
+    static bool ready;
+    if (!ready) {
+      thinks[0].name = "G_FreeEdict";
+      thinks[0].cb = QA_Q2_FREE_ENTITY;
       dies[0].name = "acid_gib_die";
       dies[0].cb = (qa_q2_die){NULL, gib_die_fn};
-      dies_ready = true;
+      ready = true;
     }
     qa_q2_callback_definitions definitions;
     memset(&definitions, 0, sizeof definitions);
+    definitions.think = thinks;
+    definitions.think_count = 1;
     definitions.die = dies;
     definitions.die_count = 1;
     qa_q2_source_callbacks_register(game->source_callbacks, definitions);
@@ -129,10 +135,7 @@ static void acid_gib(qa_q2m_context *c, const char *part, double damage, bool he
                                              y4, z4)));
   char model[64];
   snprintf(model, sizeof model, "models/objects/gekkgib/%s/tris.md2", part);
-  char *model_copy = malloc(strlen(model) + 1);
-  if (!model_copy) qa_raise("Error", 0, 0, "Out of memory in gekk gib");
-  strcpy(model_copy, model);
-  gib->model = model_copy;
+  gib->model = qa_q2_intern(model); /* the gib borrows its model name: one kept copy per part, not one per gib */
   gib->clip_mask = QA_Q2M_MASK_SHOT;
   gib->flags = q2mpm_or(gib->flags, 2048);
   gib->damage = 2;
@@ -261,7 +264,7 @@ static bool check_jump(qa_q2m_context *c) {
   double size = enemy.bounds.max.z - enemy.bounds.min.z;
   if (body.origin.z + body.bounds.min.z > minimum + 0.75 * size
       || body.origin.z + body.bounds.max.z < minimum + 0.25 * size) return false;
-  double distance = hypot(body.origin.x - enemy.origin.x, body.origin.y - enemy.origin.y);
+  double distance = qa_js_hypot2(body.origin.x - enemy.origin.x, body.origin.y - enemy.origin.y);
   return !(distance < 100 || (distance > 100 && q2mpm_rnd(c->game) < 0.9));
 }
 static void run_move(qa_q2m_context *c) {
@@ -393,7 +396,7 @@ static bool check_attack_fn(void *ctx, qa_q2m_context *c) {
   qa_body_state enemy;
   if (!qa_q2m_enemy_body(c, &enemy)) return false;
   qa_vec3 origin = q2mpm_body(c->game, c->entity).origin;
-  bool close = hypot(origin.x - enemy.origin.x, origin.y - enemy.origin.y) >= 100 || origin.z < enemy.origin.z;
+  bool close = qa_js_hypot2(origin.x - enemy.origin.x, origin.y - enemy.origin.y) >= 100 || origin.z < enemy.origin.z;
   if (check_jump(c) || (close && !wet(c))) { c->state->attack_state = QA_Q2M_ATTACK_MISSILE; return true; }
   return false;
 }
@@ -421,7 +424,7 @@ static void launch(qa_q2m_context *c, double forward, double up) {
   memset(&change, 0, sizeof change);
   change.has_velocity = true;
   change.velocity = qa_add3_double(body.velocity, qa_add3_double(qa_scale3_double(axes.forward, forward), qa_scale3_double(axes.up, up)));
-  q2mpm_move_body(c->game, c->entity, change, true, false);
+  q2mpm_move_body(c->game, c->entity, change, false, false); /* TS game.move(entity, { velocity }): links */
 }
 static void hold_run(qa_q2m_context *c, double seconds) {
   q2mpm_set_move(c, "gekk_move_run_start");
@@ -483,7 +486,7 @@ static void shrink_fn(void *ctx, qa_q2m_context *c) {
   change.has_bounds = true;
   change.bounds = body.bounds;
   change.bounds.max.z = 0;
-  q2mpm_move_body(c->game, c->entity, change, true, false);
+  q2mpm_move_body(c->game, c->entity, change, false, false); /* TS game.move(entity, { bounds }): links the shrunken box */
 }
 static void attack_fn(void *ctx, qa_q2m_context *c) {
   (void)ctx;

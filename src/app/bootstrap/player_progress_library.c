@@ -13,6 +13,7 @@ struct qa_app_player_progress_library {
   qa_app_progress_store_fn store_fn; void *store_ctx;
   qa_app_progress_participant_fn participant_fn; void *participant_ctx;
   owned_row *rows; size_t row_count;
+  qa_ui_library_entry *views; /* the entries() array: one contiguous view per row */
   char *message;
   double generation;
 };
@@ -37,6 +38,7 @@ static void clear_rows(qa_app_player_progress_library *library) {
     free(library->rows[i].id); free(library->rows[i].label); free(library->rows[i].detail);
   }
   free(library->rows); library->rows = NULL; library->row_count = 0;
+  free(library->views); library->views = NULL;
 }
 static void set_message(qa_app_player_progress_library *library, char *message) {
   free(library->message); library->message = message;
@@ -58,7 +60,7 @@ void qa_app_player_progress_library_destroy(qa_app_player_progress_library *libr
 const qa_ui_library_entry *qa_app_player_progress_library_entries(
     qa_app_player_progress_library *library, size_t *out_count) {
   *out_count = library->row_count;
-  return library->row_count == 0 ? NULL : &library->rows[0].view;
+  return library->row_count == 0 ? NULL : library->views;
 }
 const char *qa_app_player_progress_library_status(qa_app_player_progress_library *library) {
   return library->message;
@@ -91,8 +93,7 @@ static owned_row entry_of(const qa_app_player_progress_event *event) {
 }
 void qa_app_player_progress_library_load(qa_app_player_progress_library *library) {
   double generation = ++library->generation;
-  const char *participant = library->participant_fn(library->participant_ctx);
-  char *participant_copy = dup_text(participant);
+  char *participant_copy = dup_text(library->participant_fn(library->participant_ctx));
   clear_rows(library);
   set_message(library, dup_text("Loading progress..."));
   const char *error = NULL;
@@ -100,17 +101,22 @@ void qa_app_player_progress_library_load(qa_app_player_progress_library *library
   if (generation != library->generation || strcmp(participant_copy, library->participant_fn(library->participant_ctx)) != 0) {
     free(participant_copy); return;
   }
-  free(participant_copy);
   if (store == NULL) {
+    free(participant_copy);
     set_message(library, format2("Cannot read progress: %s", error != NULL ? error : "", ""));
     return;
   }
   const qa_app_player_progress_event **events = NULL;
-  size_t count = qa_app_player_progress_store_list(store, participant, &events);
+  size_t count = qa_app_player_progress_store_list(store, participant_copy, &events);
+  free(participant_copy);
   if (count > 0) {
     library->rows = calloc(count, sizeof *library->rows);
-    if (library->rows == NULL) qa_range_error("Out of memory");
-    for (size_t i = 0; i < count; i++) library->rows[i] = entry_of(events[i]);
+    library->views = calloc(count, sizeof *library->views);
+    if (library->rows == NULL || library->views == NULL) qa_range_error("Out of memory");
+    for (size_t i = 0; i < count; i++) {
+      library->rows[i] = entry_of(events[i]);
+      library->views[i] = library->rows[i].view;
+    }
     library->row_count = count;
   }
   free((void *)events);

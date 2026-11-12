@@ -47,6 +47,47 @@ static const char *const *argument_block(const char *const *argv, size_t argc) {
   }
   return (const char *const *)block;
 }
+static qa_q3_wire_trajectory trajectory_from_fields(qa_qvm_trajectory t) {
+  qa_q3_wire_trajectory out;
+  memset(&out, 0, sizeof out);
+  out.type = t.type;
+  out.time = t.time;
+  out.duration = t.duration;
+  out.base = t.base;
+  out.delta = t.delta;
+  return out;
+}
+static void entity_record_from_fields(qa_q3_entity_state_record *out, const qa_qvm_entity_state_fields *f) {
+  qa_q3_entity_state_init(out);
+  out->number = f->number;
+  out->e_type = f->e_type;
+  out->e_flags = f->e_flags;
+  out->pos = trajectory_from_fields(f->pos);
+  out->apos = trajectory_from_fields(f->apos);
+  out->time = f->time;
+  out->time2 = f->time2;
+  out->origin = f->origin;
+  out->origin2 = f->origin2;
+  out->angles = f->angles;
+  out->angles2 = f->angles2;
+  out->other_entity_num = f->other_entity_num;
+  out->other_entity_num2 = f->other_entity_num2;
+  out->ground_entity_num = f->ground_entity_num;
+  out->constant_light = f->constant_light;
+  out->loop_sound = f->loop_sound;
+  out->modelindex = f->modelindex;
+  out->modelindex2 = f->modelindex2;
+  out->client_num = f->client_num;
+  out->frame = f->frame;
+  out->solid = f->solid;
+  out->event = f->event;
+  out->event_parm = f->event_parm;
+  out->powerups = f->powerups;
+  out->weapon = f->weapon;
+  out->legs_anim = f->legs_anim;
+  out->torso_anim = f->torso_anim;
+  out->generic1 = f->generic1;
+}
 /* slot => bounds.get(slot) ?? null over the publication rows. */
 static bool publication_bounds(void *ctx, double number, qa_bounds *out) {
   const qa_qvm_mod_scene_publication *source = ctx;
@@ -63,20 +104,25 @@ void qa_app_select_component_scene(const qa_qvm_mod_scene_publication *source, q
   if (player == NULL) qa_raise("Error", 0, 0, "Component snapshot has no admitted viewing player");
   /* TS new Map(entities.map(row => [number, bounds])): the last row of a number wins. */
   qa_app_q3_snapshot_source_entity *rows = xcalloc(source->entity_count, sizeof *rows);
+  qa_cleanup rows_cleanup, records_cleanup;
+  qa_cleanup_push(&rows_cleanup, free, rows);
   qa_q3_entity_state_record *records = xcalloc(source->entity_count, sizeof *records);
+  qa_cleanup_push(&records_cleanup, free, records);
   for (size_t i = 0; i < source->entity_count; i++) {
-    qa_q3_entity_state_init(&records[i]);
-    records[i].number = (int32_t)source->entities[i].state->number;
+    /* state.copyFrom(row.state): the selector reads the whole state (portal generic1/origin2 among it). */
+    entity_record_from_fields(&records[i], source->entities[i].state);
     rows[i].state = &records[i]; rows[i].linked = source->entities[i].linked;
     rows[i].server_flags = source->entities[i].server_flags; rows[i].single_client = source->entities[i].single_client;
   }
   qa_q3_player_state_record selector;
   memset(&selector, 0, sizeof selector);
   selector.client_num = (int32_t)player->slot; selector.origin = player->state.origin;
-  selector.viewheight = (int32_t)player->state.view_height;
-  qa_app_q3_snapshot_selection *selection = qa_app_select_application_q3_snapshot(&selector, rows, source->entity_count,
+  /* TS passes player.state.viewHeight as a number: a fractional height is not truncated. */
+  qa_app_q3_snapshot_selection *selection = qa_app_select_application_q3_snapshot_from(&selector, player->state.view_height, rows, source->entity_count,
       queries, publication_bounds, (void *)source, leaf_count, print, print_ctx);
   if (selection == NULL) qa_range_error("Out of memory");
+  qa_cleanup_pop(&records_cleanup);
+  qa_cleanup_pop(&rows_cleanup);
   const qa_q3_visible_entities *visible = qa_app_q3_snapshot_selection_visible(selection);
   memset(out, 0, sizeof *out);
   out->revision = (int64_t)source->revision;

@@ -41,12 +41,16 @@ struct qa_ui_source_record {
   bool hash_heap;
   qa_ui_script_allocation hash_allocation;
   uint32_t heads[QA_UI_SOURCE_DEFINE_HASH_BUCKETS];
+  /* TS Map<bucket, id>: presence and insertion order (captured in order). */
+  bool head_present[QA_UI_SOURCE_DEFINE_HASH_BUCKETS];
+  uint16_t head_order[QA_UI_SOURCE_DEFINE_HASH_BUCKETS];
+  size_t head_count;
   bool hash_freed;
   bool record_freed;
   const qa_ui_script_memory *memory;
   bool has_memory;
   qa_ui_precomp_token *token;
-  source_indent **indents; /* index id-1 */
+  source_indent **indents; /* TS Map<id, indent>: live, insertion order */
   size_t indent_count, indent_cap;
   int64_t next_indent;
   qa_ui_script_punctuation_spec *punctuations; /* shallow; text owned here */
@@ -208,11 +212,9 @@ void qa_ui_source_record_destroy(qa_ui_source_record *record) {
   if (record == NULL) return;
   for (size_t index = 0; index < record->indent_count; index++) {
     source_indent *indent = record->indents[index];
-    if (indent != NULL) {
-      if (indent->heap)
-        qa_ui_script_memory_free(record->memory, &indent->allocation);
-      free(indent);
-    }
+    if (indent->heap)
+      qa_ui_script_memory_free(record->memory, &indent->allocation);
+    free(indent);
   }
   free(record->indents);
   qa_ui_precomp_token_destroy(record->token);
@@ -353,6 +355,28 @@ void qa_ui_source_record_set_skip(qa_ui_source_record *record,
   else record->m_skip = value;
 }
 
+static void managed_head_set(qa_ui_source_record *record, int64_t bucket,
+                             uint32_t id) {
+  if (!record->head_present[bucket]) {
+    record->head_present[bucket] = true;
+    record->head_order[record->head_count++] = (uint16_t)bucket;
+  }
+  record->heads[bucket] = id;
+}
+static void managed_head_delete(qa_ui_source_record *record, int64_t bucket) {
+  if (!record->head_present[bucket]) return;
+  record->head_present[bucket] = false;
+  record->heads[bucket] = 0;
+  for (size_t i = 0; i < record->head_count; i++) {
+    if (record->head_order[i] == bucket) {
+      memmove(&record->head_order[i], &record->head_order[i + 1],
+              (record->head_count - i - 1) * sizeof record->head_order[0]);
+      record->head_count--;
+      return;
+    }
+  }
+}
+
 static void check_hash_pointer(qa_ui_source_record *record) {
   if (record->heap
       && rd_u32(record->allocation.bytes, OFF_DEFINE_HASH) != 1)
@@ -371,8 +395,10 @@ uint32_t qa_ui_source_record_hash_head(qa_ui_source_record *record,
 void qa_ui_source_record_set_hash_head(qa_ui_source_record *record,
                                        int64_t bucket, uint32_t id) {
   if (!record->hash_heap) {
-    if (bucket >= 0 && bucket < QA_UI_SOURCE_DEFINE_HASH_BUCKETS)
-      record->heads[bucket] = id;
+    if (bucket >= 0 && bucket < QA_UI_SOURCE_DEFINE_HASH_BUCKETS) {
+      if (id == 0) managed_head_delete(record, bucket);
+      else managed_head_set(record, bucket, id);
+    }
     return;
   }
   check_hash_pointer(record);
@@ -388,12 +414,18 @@ static void set_indent_head(qa_ui_source_record *record, uint32_t value) {
     wr_u32(record->allocation.bytes, OFF_INDENT_STACK, value);
   else record->m_indent = value;
 }
+static source_indent *find_indent(qa_ui_source_record *record, int64_t id) {
+  for (size_t index = 0; index < record->indent_count; index++)
+    if (record->indents[index]->id == id) return record->indents[index];
+  return NULL;
+}
 static source_indent *top_indent(qa_ui_source_record *record) {
   uint32_t id = get_indent_head(record);
   if (id == 0) return NULL;
-  if (id > record->indent_count || record->indents[id - 1] == NULL)
+  source_indent *indent = find_indent(record, id);
+  if (indent == NULL)
     qa_range_error("source indent pointer does not identify a live allocation");
-  return record->indents[id - 1];
+  return indent;
 }
 
 bool qa_ui_source_record_has_current_indent(qa_ui_source_record *record) {
@@ -408,8 +440,6 @@ static bool grow_indents(qa_ui_source_record *record, size_t need) {
   while (cap < need) cap *= 2;
   source_indent **grown = realloc(record->indents, cap * sizeof *grown);
   if (grown == NULL) return false;
-  for (size_t index = record->indent_cap; index < cap; index++)
-    grown[index] = NULL;
   record->indents = grown;
   record->indent_cap = cap;
   return true;
@@ -418,19 +448,19 @@ static bool grow_indents(qa_ui_source_record *record, size_t need) {
 void qa_ui_source_record_push_indent(qa_ui_source_record *record,
                                      qa_ui_source_indent_type type,
                                      bool skip) {
+  if (!grow_indents(record, record->indent_count + 1))
+    qa_range_error("source record allocation failed");
   source_indent *indent = calloc(1, sizeof *indent);
   if (indent == NULL) qa_range_error("source record allocation failed");
-  indent->id = record->next_indent++;
   indent->heap = record->has_memory;
   if (indent->heap
       && !qa_ui_script_memory_allocate(record->memory, INDENT_BYTES, false,
-                                       &indent->allocation))
+                                       &indent->allocation)) {
+    free(indent);
     qa_range_error("source record allocation failed");
-  if (!grow_indents(record, (size_t)indent->id))
-    qa_range_error("source record allocation failed");
-  record->indents[indent->id - 1] = indent;
-  if ((size_t)indent->id > record->indent_count)
-    record->indent_count = (size_t)indent->id;
+  }
+  indent->id = record->next_indent++;
+  record->indents[record->indent_count++] = indent;
   indent_set_type(indent, type);
   indent_set_script(indent, qa_ui_source_record_script(record));
   indent_set_skip(indent, skip ? 1 : 0);
@@ -441,7 +471,14 @@ void qa_ui_source_record_push_indent(qa_ui_source_record *record,
 }
 
 static void free_indent(qa_ui_source_record *record, source_indent *indent) {
-  record->indents[indent->id - 1] = NULL;
+  for (size_t index = 0; index < record->indent_count; index++) {
+    if (record->indents[index] == indent) {
+      memmove(&record->indents[index], &record->indents[index + 1],
+              (record->indent_count - index - 1) * sizeof *record->indents);
+      record->indent_count--;
+      break;
+    }
+  }
   if (indent->heap)
     qa_ui_script_memory_free(record->memory, &indent->allocation);
   free(indent);
@@ -564,9 +601,8 @@ qa_save_value *qa_ui_source_record_capture_save_state(
     qa_save_value *heads = qa_save_value_array();
     if (heads == NULL) goto oom;
     bool ok = set_str(hash, "kind", "managed");
-    for (int64_t bucket = 0;
-         ok && bucket < QA_UI_SOURCE_DEFINE_HASH_BUCKETS; bucket++) {
-      if (record->heads[bucket] == 0) continue;
+    for (size_t order = 0; ok && order < record->head_count; order++) {
+      int64_t bucket = record->head_order[order];
       qa_save_value *entry = qa_save_value_object();
       ok = entry != NULL && set_num(entry, "bucket", (double)bucket)
            && set_num(entry, "id", (double)record->heads[bucket])
@@ -584,7 +620,6 @@ qa_save_value *qa_ui_source_record_capture_save_state(
   if (!set_num(object, "nextIndent", (double)record->next_indent)) goto oom;
   for (size_t index = 0; index < record->indent_count; index++) {
     source_indent *indent = record->indents[index];
-    if (indent == NULL) continue;
     qa_save_value *entry = qa_save_value_object();
     qa_save_value *state = indent_capture(indent, capture);
     bool ok = entry != NULL && state != NULL
@@ -674,6 +709,19 @@ static bool fld_is_heap(const qa_save_reader *reader) {
   return heap;
 }
 
+/* Frees the C record without freeing its allocations: on a failed restore
+   they belong to the restore owner, as in TS where the record is dropped. */
+void qa_ui_source_record_discard(qa_ui_source_record *record) {
+  if (record == NULL) return;
+  for (size_t index = 0; index < record->indent_count; index++)
+    free(record->indents[index]);
+  record->indent_count = 0;
+  record->hash_heap = false;
+  record->heap = false;
+  qa_ui_source_record_destroy(record);
+}
+static void record_discard(void *raw) { qa_ui_source_record_discard(raw); }
+
 qa_ui_source_record *qa_ui_source_record_restore_save_state(
     const qa_save_value *value, const qa_ui_script_memory *memory,
     bool has_memory, const qa_ui_script_memory_restore *restore) {
@@ -684,6 +732,9 @@ qa_ui_source_record *qa_ui_source_record_restore_save_state(
     qa_save_reader_destroy(&reader);
     return NULL;
   }
+  /* A malformed save raises anywhere below. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, record_discard, record);
   record->memory = memory;
   record->has_memory = has_memory;
   record->next_indent = 1;
@@ -740,9 +791,10 @@ qa_ui_source_record *qa_ui_source_record_restore_save_state(
       }
       int64_t bucket = fld_int_min(&entry, "bucket", 0);
       if (bucket >= QA_UI_SOURCE_DEFINE_HASH_BUCKETS
-          || record->heads[bucket] != 0)
+          || record->head_present[bucket])
         qa_save_reader_fail(&entry, "invalid hash bucket");
-      record->heads[bucket] = (uint32_t)fld_int_min(&entry, "id", 0);
+      managed_head_set(record, bucket,
+                       (uint32_t)fld_int_min(&entry, "id", 0));
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&heads);
@@ -764,9 +816,7 @@ qa_ui_source_record *qa_ui_source_record_restore_save_state(
         goto oom;
       }
       int64_t id = fld_int_min(&entry, "id", 1);
-      if (id >= record->next_indent
-          || (id <= (int64_t)record->indent_count
-              && record->indents[id - 1] != NULL))
+      if (id >= record->next_indent || find_indent(record, id) != NULL)
         qa_save_reader_fail(&entry, "invalid indent identity");
       qa_save_reader state;
       if (!fld(&entry, "state", &state)) {
@@ -775,7 +825,10 @@ qa_ui_source_record *qa_ui_source_record_restore_save_state(
         qa_save_reader_destroy(&reader);
         goto oom;
       }
-      source_indent *indent = calloc(1, sizeof *indent);
+      source_indent *indent =
+          grow_indents(record, record->indent_count + 1)
+              ? calloc(1, sizeof *indent)
+              : NULL;
       if (indent == NULL) {
         qa_save_reader_destroy(&state);
         qa_save_reader_destroy(&entry);
@@ -794,6 +847,9 @@ qa_ui_source_record *qa_ui_source_record_restore_save_state(
         qa_save_reader_destroy(&reader);
         goto oom;
       }
+      /* Listed before its fields are read, so a malformed state frees it
+         with the record (TS drops both). */
+      record->indents[record->indent_count++] = indent;
       if (fld_is_heap(&indent_reader)) {
         if (!has_memory)
           qa_save_reader_fail(&indent_reader,
@@ -811,16 +867,6 @@ qa_ui_source_record *qa_ui_source_record_restore_save_state(
       }
       qa_save_reader_destroy(&indent_reader);
       qa_save_reader_destroy(&state);
-      if (!grow_indents(record, (size_t)id)) {
-        free(indent);
-        qa_save_reader_destroy(&entry);
-        qa_save_reader_destroy(&indents);
-        qa_save_reader_destroy(&reader);
-        goto oom;
-      }
-      record->indents[id - 1] = indent;
-      if ((size_t)id > record->indent_count)
-        record->indent_count = (size_t)id;
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&indents);
@@ -873,9 +919,11 @@ qa_ui_source_record *qa_ui_source_record_restore_save_state(
     }
     qa_save_reader_destroy(&field);
   }
+  qa_cleanup_pop(&guard);
   qa_save_reader_destroy(&reader);
   return record;
 oom:
-  qa_ui_source_record_destroy(record);
+  qa_cleanup_pop(&guard);
+  record_discard(record);
   return NULL;
 }

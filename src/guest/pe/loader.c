@@ -8,20 +8,15 @@
 #include "qa/guest/pe/directories.h"
 #include "qa/foundation/js.h"
 
-static void *xmalloc(size_t size) {
-  void *p = malloc(size == 0 ? 1 : size);
-  if (p == NULL) qa_pe_error(QA_PE_STAGE_MAPPING, "out of memory");
-  return p;
-}
-static void *xcalloc(size_t count, size_t size) {
-  void *p = calloc(count == 0 ? 1 : count, size == 0 ? 1 : size);
-  if (p == NULL) qa_pe_error(QA_PE_STAGE_MAPPING, "out of memory");
-  return p;
-}
-static void *xrealloc(void *p, size_t size) {
-  void *next = realloc(p, size == 0 ? 1 : size);
-  if (next == NULL) qa_pe_error(QA_PE_STAGE_MAPPING, "out of memory");
-  return next;
+/* Through the PE allocation scope: a load that raises frees what it built. */
+static void *xmalloc(size_t size) { return qa_pe_xmalloc(size); }
+static void *xcalloc(size_t count, size_t size) { return qa_pe_xcalloc(count, size); }
+static void *xrealloc(void *p, size_t size) { return qa_pe_xrealloc(p, size); }
+/* A relocation target is page + offset as a TS number: past 2^32 it is out of every range, not a wrapped RVA. */
+static uint32_t relocation_rva(const qa_pe_image_reader *reader, uint64_t rva, size_t size) {
+  if (rva > UINT32_MAX)
+    qa_pe_error(QA_PE_STAGE_RELOCATION, "range %llu+%zu exceeds %zu", (unsigned long long)rva, size, reader->len);
+  return (uint32_t)rva;
 }
 static char *make_label(qa_pe_owned_strings *pool, const char *id, const char *suffix) {
   size_t len = strlen(id) + 1 + strlen(suffix);
@@ -63,7 +58,11 @@ static void relocate(qa_pe_image_reader *image) {
       uint16_t entry = qa_pe_reader_u16(&source, at);
       int type = entry >> 12;
       if (type == 0) continue;
-      uint32_t rva = page + (entry & 0xfff);
+      const uint64_t target = (uint64_t)page + (entry & 0xfff);
+      const int pointer_bytes = reader.pe->abi.pointer_bytes;
+      const size_t target_size = type == 10 && pointer_bytes == 8 ? 8 : pointer_bytes == 4 && type == 3 ? 4 : 2;
+      const bool known = (type == 10 && pointer_bytes == 8) || (pointer_bytes == 4 && type >= 1 && type <= 4);
+      uint32_t rva = known && type != 4 ? relocation_rva(&reader, target, target_size) : (uint32_t)target;
       patch next; memset(&next, 0, sizeof next);
       next.rva = rva;
       if (type == 10 && reader.pe->abi.pointer_bytes == 8) {
@@ -81,6 +80,8 @@ static void relocate(qa_pe_image_reader *image) {
         if (at + 2 >= block + size) qa_pe_error(QA_PE_STAGE_RELOCATION, "HIGHADJ lacks its signed low word");
         at += 2;
         int64_t low = as_int_n(qa_pe_reader_u16(&source, at), 16);
+        rva = relocation_rva(&reader, target, 2); /* after the low word, as TS reads */
+        next.rva = rva;
         next.width = 2;
         next.value = (uint64_t)(((int64_t)qa_pe_image_reader_u16(&reader, rva) << 16) + low + delta + 0x8000) >> 16;
       } else {
@@ -95,7 +96,7 @@ static void relocate(qa_pe_image_reader *image) {
     }
     block += size;
   }
-  free(source_bytes);
+  qa_pe_xfree(source_bytes);
   qa_js_sort(patches, patch_count, sizeof(patch), cmp_patch);
   int64_t end = -1;
   for (size_t i = 0; i < patch_count; i++) {
@@ -108,11 +109,33 @@ static void relocate(qa_pe_image_reader *image) {
       case 8: qa_pe_reader_set_u64(&reader.reader, patches[i].rva, value); break;
     }
   }
-  free(patches);
+  qa_pe_xfree(patches);
+}
+
+/* TS mapPeImage's catch: the image mapped just before its protections failed is unmapped again. */
+typedef struct map_rollback {
+  qa_pe_image *out;
+  qa_mapped_memory_ext *ext;
+  qa_guest_core_address address;
+  size_t image_size;
+  bool protecting;
+} map_rollback;
+static void map_unmap(void *arg) {
+  map_rollback *rollback = arg;
+  qa_gmem_unmap(rollback->ext, rollback->address, rollback->image_size);
+}
+static void map_abandon(void *arg) {
+  map_rollback *rollback = arg;
+  qa_caught_error ignored;
+  if (rollback->protecting) (void)qa_try(map_unmap, rollback, &ignored);
+  memset(rollback->out, 0, sizeof *rollback->out); /* its blocks belong to the scope, which frees them */
 }
 
 void qa_map_pe_image(qa_pe_image *out, const qa_map_pe_image_options *options) {
   memset(out, 0, sizeof *out);
+  map_rollback rollback = {out, options->memory_ext, {0}, 0, false};
+  qa_pe_scope scope;
+  qa_pe_scope_begin(&scope, map_abandon, &rollback);
   qa_parse_pe(&out->pe, options->bytes, options->bytes_len);
   const qa_pe_file *pe = &out->pe;
   qa_mapped_guest_memory *memory = options->memory;
@@ -177,10 +200,14 @@ void qa_map_pe_image(qa_pe_image *out, const qa_map_pe_image_options *options) {
   }
   char *image_label = make_label(&out->strings, module_id, "PE image");
   (void)qa_gmem_map(ext, base, pe->image_size, QA_PERM_READ_WRITE, image_label, bytes, pe->image_size);
+  rollback.address = address;
+  rollback.image_size = pe->image_size;
+  rollback.protecting = true;
   qa_gmem_protect(ext, address, pe->image_size, QA_PERM_NONE);
   for (size_t i = 0; i < at; i++)
     qa_gmem_protect(ext, qa_memory_offset(memory, address, (int64_t)(image_mappings[i].base - base)),
                     image_mappings[i].byte_length, image_mappings[i].permissions);
+  rollback.protecting = false;
 
   qa_guest_unwind_region *unwind = xcalloc(unwind_record_count, sizeof(qa_guest_unwind_region));
   for (size_t i = 0; i < unwind_record_count; i++) {
@@ -202,7 +229,7 @@ void qa_map_pe_image(qa_pe_image *out, const qa_map_pe_image_options *options) {
     }
     mappings[final_count++] = live[i];
   }
-  free(image_mappings);
+  qa_pe_xfree(image_mappings);
 
   qa_guest_image *image = &out->image;
   image->module = module;
@@ -224,6 +251,51 @@ void qa_map_pe_image(qa_pe_image *out, const qa_map_pe_image_options *options) {
   if (has_load_config) out->load_configuration = load_config;
   out->unwind_records = unwind_records;
   out->unwind_record_count = unwind_record_count;
+  qa_pe_scope_commit(&scope);
+}
+
+typedef struct bind_write { qa_guest_core_address slot; uint8_t bytes[8]; uint8_t previous[8]; } bind_write;
+typedef struct bind_state {
+  qa_mapped_guest_memory *memory;
+  qa_mapped_memory_ext *ext;
+  bind_write *writes;
+  size_t write_count;
+  qa_guest_mapping *regions; /* copies: the host's listing is reused by later calls */
+  size_t region_count;
+  size_t protected_count;
+} bind_state;
+static void bind_write_all(void *arg) {
+  bind_state *state = arg;
+  for (size_t i = 0; i < state->write_count; i++)
+    qa_memory_write(state->memory, state->writes[i].slot, state->writes[i].bytes, (size_t)state->memory->pointer_bytes);
+}
+/* TS: `try { protect...; try { write... } catch { restore the previous bytes; throw } }`. */
+static void bind_protect_and_write(void *arg) {
+  bind_state *state = arg;
+  for (size_t i = 0; i < state->region_count; i++) {
+    qa_guest_core_address address = {0};
+    if (!qa_memory_pointer(state->memory, state->regions[i].base, &address))
+      qa_pe_error(QA_PE_STAGE_IMPORTS, "null IAT region");
+    qa_gmem_protect(state->ext, address, state->regions[i].byte_length,
+                    qa_guest_permissions_has_execute(state->regions[i].permissions)
+                        ? QA_PERM_READ_WRITE_EXECUTE : QA_PERM_READ_WRITE);
+    state->protected_count = i + 1;
+  }
+  qa_caught_error caught;
+  if (qa_try(bind_write_all, state, &caught)) return;
+  for (size_t i = 0; i < state->write_count; i++)
+    qa_memory_write(state->memory, state->writes[i].slot, state->writes[i].previous, (size_t)state->memory->pointer_bytes);
+  qa_rethrow(&caught);
+}
+/* TS `finally`: the regions made writable get their permissions back. */
+static void bind_restore(void *arg) {
+  bind_state *state = arg;
+  for (size_t i = 0; i < state->protected_count; i++) {
+    qa_guest_core_address address = {0};
+    if (!qa_memory_pointer(state->memory, state->regions[i].base, &address))
+      qa_pe_error(QA_PE_STAGE_IMPORTS, "null IAT protection address");
+    qa_gmem_protect(state->ext, address, state->regions[i].byte_length, state->regions[i].permissions);
+  }
 }
 
 void qa_bind_pe_imports(const qa_pe_image *image, qa_mapped_guest_memory *memory,
@@ -231,10 +303,11 @@ void qa_bind_pe_imports(const qa_pe_image *image, qa_mapped_guest_memory *memory
                         qa_guest_import_resolution **out, size_t *out_count) {
   if (memory->pointer_bytes != image->image.abi.pointer_bytes)
     qa_pe_error(QA_PE_STAGE_IMPORTS, "image belongs to another guest address space");
+  qa_pe_scope scope;
+  qa_pe_scope_begin(&scope, NULL, NULL); /* a raise below frees the lists */
   size_t count = image->image.import_count;
   qa_guest_import_resolution *resolutions = xcalloc(count, sizeof(qa_guest_import_resolution));
-  typedef struct write_entry { qa_guest_core_address slot; uint8_t *bytes; } write_entry;
-  write_entry *writes = xcalloc(count, sizeof(write_entry));
+  bind_write *writes = xcalloc(count, sizeof(bind_write));
   size_t live_count = 0;
   const qa_guest_mapping *live = qa_gmem_mappings(memory_ext, &live_count);
   for (size_t i = 0; i < count; i++) {
@@ -250,20 +323,19 @@ void qa_bind_pe_imports(const qa_pe_image *image, qa_mapped_guest_memory *memory
     bool mapped = false;
     for (size_t j = 0; live != NULL && j < live_count; j++)
       if (address.byte_offset >= live[j].base
-          && address.byte_offset < live[j].base + live[j].byte_length
+          && address.byte_offset - live[j].base < live[j].byte_length
           && live[j].permissions != QA_PERM_NONE) mapped = true;
     bool in_range = memory->pointer_bytes == 8 ? address.byte_offset > 0
         : (address.byte_offset > 0 && address.byte_offset < limit);
     if (!in_range || !mapped)
       qa_pe_error(QA_PE_STAGE_IMPORTS, "resolved symbol is not a mapped address in this guest space");
-    uint8_t *bytes = xcalloc((size_t)memory->pointer_bytes, 1);
-    for (int b = 0; b < memory->pointer_bytes; b++) bytes[b] = (uint8_t)(address.byte_offset >> (b * 8));
+    for (int b = 0; b < memory->pointer_bytes; b++) writes[i].bytes[b] = (uint8_t)(address.byte_offset >> (b * 8));
     writes[i].slot = import_->slot;
-    writes[i].bytes = bytes;
-    (void)qa_memory_copy; /* TS snapshots previous bytes for rollback; abort makes it moot */
+    qa_memory_copy(memory, import_->slot, writes[i].previous, (size_t)memory->pointer_bytes);
     resolutions[i] = resolution;
   }
-  const qa_guest_mapping **regions = xcalloc(live_count, sizeof *regions);
+  live = qa_gmem_mappings(memory_ext, &live_count);
+  qa_guest_mapping *regions = xcalloc(live_count, sizeof *regions);
   size_t region_count = 0;
   for (size_t i = 0; live != NULL && i < live_count; i++) {
     bool overlaps = false;
@@ -271,27 +343,16 @@ void qa_bind_pe_imports(const qa_pe_image *image, qa_mapped_guest_memory *memory
       if (writes[j].slot.byte_offset < live[i].base + live[i].byte_length
           && writes[j].slot.byte_offset + (uint64_t)memory->pointer_bytes > live[i].base)
         overlaps = true;
-    if (overlaps) regions[region_count++] = &live[i];
+    if (overlaps) regions[region_count++] = live[i];
   }
-  for (size_t i = 0; i < region_count; i++) {
-    qa_guest_core_address address = {0};
-    if (!qa_memory_pointer(memory, regions[i]->base, &address))
-      qa_pe_error(QA_PE_STAGE_IMPORTS, "null IAT region");
-    qa_gmem_protect(memory_ext, address, regions[i]->byte_length,
-                    qa_guest_permissions_has_execute(regions[i]->permissions)
-                        ? QA_PERM_READ_WRITE_EXECUTE : QA_PERM_READ_WRITE);
-  }
-  for (size_t i = 0; i < count; i++)
-    qa_memory_write(memory, writes[i].slot, writes[i].bytes, (size_t)memory->pointer_bytes);
-  for (size_t i = 0; i < region_count; i++) {
-    qa_guest_core_address address = {0};
-    if (!qa_memory_pointer(memory, regions[i]->base, &address))
-      qa_pe_error(QA_PE_STAGE_IMPORTS, "null IAT protection address");
-    qa_gmem_protect(memory_ext, address, regions[i]->byte_length, regions[i]->permissions);
-  }
-  for (size_t i = 0; i < count; i++) free(writes[i].bytes);
-  free(writes);
-  free(regions);
+  bind_state state = {memory, memory_ext, writes, count, regions, region_count, 0};
+  qa_caught_error caught;
+  const bool bound = qa_try(bind_protect_and_write, &state, &caught);
+  bind_restore(&state); /* a failure here replaces the first error, as a throw from `finally` does */
+  if (!bound) qa_rethrow(&caught);
+  qa_pe_xfree(writes);
+  qa_pe_xfree(regions);
   *out = resolutions;
   *out_count = count;
+  qa_pe_scope_commit(&scope);
 }

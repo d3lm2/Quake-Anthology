@@ -60,6 +60,6 @@ void qa_render_executor_execute(qa_render_executor *e,qa_execution_command comma
     exec_ops(e,command.view.operations,command.view.operation_count);
     break;
   case QA_EXEC_COMMAND_SWAP_BUFFERS: e->services.swap(e->services.ctx,command.captures,command.capture_count); break;
-  default: qa_range_error("Unhandled render command: %d",(int)command.kind);
+  default: qa_raise("Error", 0, 0, "Unhandled render command: %d",(int)command.kind);
   }
 }

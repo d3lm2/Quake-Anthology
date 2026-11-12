@@ -5,6 +5,7 @@
 #include <string.h>
 #include "qa/world/gameplay/q1_aim.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
 static qa_q1_visibility_client client_at(void *ctx, int64_t slot) {
   qa_compat_qc_client_host *h = ctx; qa_compat_qc_world_host *w = h->world;
   qa_compat_qc_words *words = qa_compat_qc_entity_memory_at(w->options.entities, slot);
@@ -85,7 +86,10 @@ static void b_aim(void *ctx, qa_compat_qc_machine *m) {
   for (size_t i = 0; i < count; i++) ids[i] = targets[i].actor;
   AimCtx c = {s, m, ref, actor.id, targets, count};
   qa_q1_aim_targets at = {ids, count, &c, aim_body, aim_eligible, aim_trace};
+  /* The target list is released when an eligibility read refuses a projected reference. */
+  qa_cleanup ids_scope; qa_cleanup_push(&ids_scope, free, ids);
   qa_vec3 result = qa_aim_q1(body.value.origin, forward, s->aim_threshold(s->ctx), at);
+  qa_cleanup_pop(&ids_scope);
   free(ids);
   qa_compat_qc_machine_return_vector(m, result);
 }

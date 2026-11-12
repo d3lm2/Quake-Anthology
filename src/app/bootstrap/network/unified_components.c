@@ -125,6 +125,8 @@ static qa_q3_source_game_state_record read_state(const qa_save_reader *reader) {
   size_t offset_count = qa_save_reader_list_count(&offsets_reader);
   double maximum = count > 0 ? count - 1 : 0;
   int32_t *offsets = xmalloc(offset_count * sizeof *offsets);
+  qa_cleanup offsets_guard; /* a malformed offset or table must not strand the list */
+  qa_cleanup_push(&offsets_guard, free, offsets);
   for (size_t i = 0; i < offset_count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(&offsets_reader, i, &item)) qa_range_error("out of memory");
@@ -142,6 +144,7 @@ static qa_q3_source_game_state_record read_state(const qa_save_reader *reader) {
       if (data[j] == 0) { terminated = true; break; }
     if (!terminated) qa_save_reader_fail(reader, "unterminated original configstring");
   }
+  qa_cleanup_pop(&offsets_guard);
   qa_q3_source_game_state_record out;
   out.string_offsets = offsets;
   out.string_data = xmalloc(16000);
@@ -165,28 +168,48 @@ static qa_save_value *write_commands(const qa_qvm_cp_scene_command *commands, si
   }
   return list;
 }
-static size_t read_commands(const qa_save_reader *reader, qa_qvm_cp_scene_command **out) {
+/* TS text.length <= 8192 && !text.includes("\0"): UTF-16 units (a four-byte UTF-8
+ * character is two), and a held NUL makes the whole length exceed strlen. */
+static bool command_argument_ok(const qa_save_reader *reader, const char **out) {
+  size_t length = 0;
+  const char *text = qa_save_reader_string_length(reader, &length);
+  size_t units = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)text[i];
+    if ((c & 0xc0) != 0x80) units += c >= 0xf0 ? 2 : 1;
+  }
+  *out = text;
+  return units <= 8192 && length == strlen(text);
+}
+/* *out and *out_count follow every allocation, so the update's free releases a list a
+ * malformed entry abandons. */
+static void read_commands(const qa_save_reader *reader, qa_qvm_cp_scene_command **out, size_t *out_count) {
   size_t count = qa_save_reader_list_count(reader);
-  qa_qvm_cp_scene_command *commands = xmalloc(count * sizeof *commands);
+  qa_qvm_cp_scene_command *commands = calloc(count ? count : 1, sizeof *commands);
+  if (!commands) qa_range_error("out of memory");
+  *out = commands;
+  *out_count = 0;
   for (size_t i = 0; i < count; i++) {
     qa_save_reader row;
     if (!qa_save_reader_item(reader, i, &row)) qa_range_error("out of memory");
+    *out_count = i + 1;
     qa_save_reader sequence = field_of(&row, "sequence");
     commands[i].sequence = (int64_t)bounded_int(&sequence, 1, 2147483647);
     qa_save_reader_destroy(&sequence);
     qa_save_reader args = field_of(&row, "arguments");
     size_t arg_count = qa_save_reader_list_count(&args);
-    const char **arguments = xmalloc(arg_count * sizeof *arguments);
+    const char **arguments = calloc(arg_count ? arg_count : 1, sizeof *arguments);
+    if (!arguments) qa_range_error("out of memory");
+    commands[i].arguments = (const char *const *)arguments;
     for (size_t j = 0; j < arg_count; j++) {
       qa_save_reader item;
       if (!qa_save_reader_item(&args, j, &item)) qa_range_error("out of memory");
-      const char *text = qa_save_reader_string(&item);
-      if (strlen(text) > 8192) qa_save_reader_fail(&item, "invalid component command argument");
+      const char *text = NULL;
+      if (!command_argument_ok(&item, &text)) qa_save_reader_fail(&item, "invalid component command argument");
       arguments[j] = copy_text(text);
+      commands[i].argument_count = j + 1;
       qa_save_reader_destroy(&item);
     }
-    commands[i].arguments = (const char *const *)arguments;
-    commands[i].argument_count = arg_count;
     qa_save_reader_destroy(&args);
     qa_save_reader_destroy(&row);
   }
@@ -196,8 +219,6 @@ static size_t read_commands(const qa_save_reader *reader, qa_qvm_cp_scene_comman
     if (i > 0 && commands[i].sequence != commands[i - 1].sequence + 1) invalid = true;
   }
   if (invalid) qa_save_reader_fail(reader, "invalid original reliable command window");
-  *out = commands;
-  return count;
 }
 static void commands_free(qa_qvm_cp_scene_command *commands, size_t count) {
   for (size_t i = 0; i < count; i++) {
@@ -301,7 +322,7 @@ qa_app_unified_component_update qa_app_unified_read_component_update(const qa_sa
     qa_save_reader base = field_of(&source, "commandBase");
     state->command_base = bounded_int(&base, 0, 2147483647);
     qa_save_reader commands = field_of(&source, "commands");
-    state->command_count = read_commands(&commands, &state->commands);
+    read_commands(&commands, &state->commands, &state->command_count);
   }
   const char **providers = xmalloc((count ? count : 1) * sizeof *providers);
   qa_cleanup providers_guard;
@@ -572,4 +593,75 @@ void qa_app_unified_component_frames_free(qa_app_unified_component_frames *frame
   free(frames->sources);
   qa_app_unified_native_frames_free(frames->native, frames->native_count);
   memset(frames, 0, sizeof *frames);
+}
+/* Two passes over the same walk: the first sizes the block, the second copies into it. Lists
+ * come first (malloc alignment), then the strings. */
+typedef struct clone_arena { char *base; size_t lists, strings, list_at, string_at; } clone_arena;
+static const char *arena_text(clone_arena *arena, const char *text) {
+  if (text == NULL) return NULL;
+  size_t n = strlen(text) + 1;
+  if (arena->base == NULL) { arena->strings += n; return text; }
+  char *out = arena->base + arena->string_at;
+  memcpy(out, text, n);
+  arena->string_at += n;
+  return out;
+}
+static void *arena_list(clone_arena *arena, const void *items, size_t size) {
+  size_t rounded = (size + sizeof(max_align_t) - 1) / sizeof(max_align_t) * sizeof(max_align_t);
+  if (arena->base == NULL) { arena->lists += rounded; return (void *)items; }
+  void *out = arena->base + arena->list_at;
+  if (size) memcpy(out, items, size);
+  arena->list_at += rounded;
+  return out;
+}
+static void clone_walk(clone_arena *arena, const qa_app_unified_component_identity *source,
+    qa_app_unified_component_identity *out) {
+  *out = *source;
+  out->identity_wire = NULL;
+  const qa_mod_identity *identity = &source->identity;
+  qa_module_identity *modules = arena_list(arena, identity->modules,
+      identity->module_count * sizeof *identity->modules);
+  qa_provider_checkpoint_ref *providers = arena_list(arena, identity->providers,
+      identity->provider_count * sizeof *identity->providers);
+  out->owner.provider = arena_text(arena, source->owner.provider);
+  out->identity.selection.product = arena_text(arena, identity->selection.product);
+  out->identity.selection.id = arena_text(arena, identity->selection.id);
+  out->identity.source.provider = arena_text(arena, identity->source.provider);
+  out->identity.source.content = arena_text(arena, identity->source.content);
+  out->identity.declaration_digest = arena_text(arena, identity->declaration_digest);
+  for (size_t i = 0; i < identity->module_count; i++) {
+    const char *id = arena_text(arena, identity->modules[i].id);
+    const char *path = arena_text(arena, identity->modules[i].artifact_path);
+    const char *digest = arena_text(arena, identity->modules[i].digest);
+    const char *revision = arena_text(arena, identity->modules[i].revision);
+    if (arena->base) {
+      modules[i].id = id;
+      modules[i].artifact_path = path;
+      modules[i].digest = digest;
+      modules[i].revision = revision;
+    }
+  }
+  for (size_t i = 0; i < identity->provider_count; i++) {
+    const char *provider = arena_text(arena, identity->providers[i].provider);
+    const char *schema = arena_text(arena, identity->providers[i].schema);
+    if (arena->base) {
+      providers[i].provider = provider;
+      providers[i].schema = schema;
+    }
+  }
+  out->identity.modules = identity->module_count ? modules : NULL;
+  out->identity.providers = identity->provider_count ? providers : NULL;
+  out->abi = arena_text(arena, source->abi);
+  out->runtime = arena_text(arena, source->runtime);
+}
+qa_app_unified_component_identity qa_app_unified_component_identity_clone(
+    const qa_app_unified_component_identity *source, void **block) {
+  clone_arena arena = {0};
+  qa_app_unified_component_identity out;
+  clone_walk(&arena, source, &out);
+  arena.base = xmalloc(arena.lists + arena.strings);
+  arena.string_at = arena.lists;
+  clone_walk(&arena, source, &out);
+  *block = arena.base;
+  return out;
 }

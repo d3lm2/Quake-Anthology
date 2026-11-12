@@ -8,6 +8,8 @@
 #include "qa/content/roots.h"
 #include "qa/content/q2/base/player/types.h"
 #include "qa/content/q2/rerelease/types.h"
+#include "qa/foundation/caught_message.h"
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/materials/sky.h"
@@ -61,7 +63,7 @@ struct qa_app_rerelease_presentation {
   /* Cleared catalogs and returned bindings stay alive with the presentation (TS GC: a binding keeps its settings). */
   catalog_entry **retired; size_t retired_count, retired_cap;
   language_binding **bindings; size_t binding_count, binding_cap;
-  qa_cvar_registry *language_settings;
+  qa_ui_setting_cvars language_settings; /* TS languageSettings: null, or input.sharedSettings()'s view */
   seat_state *seats; size_t seat_count;
   name_entry *names; size_t name_count, name_cap;
   /* TS EventRing<RereleaseSource | q2-player>(8192) and
@@ -158,7 +160,7 @@ static void free_seat(qa_app_rerelease_presentation *p, seat_state *s) {
   free(s->sky_content); free(s->sky_name);
 }
 qa_app_rerelease_presentation *qa_app_rerelease_presentation_create(qa_app_application_assets *assets,
-    const qa_app_rerelease_seat *seats, size_t seat_count, qa_cvar_registry *language_settings) {
+    const qa_app_rerelease_seat *seats, size_t seat_count, qa_ui_setting_cvars language_settings) {
   qa_app_rerelease_presentation *p = calloc(1, sizeof *p);
   if (!p) return NULL;
   p->assets = assets;
@@ -252,7 +254,7 @@ void qa_app_rerelease_publish_seats(qa_app_rerelease_presentation *p, const qa_a
   for (size_t i = 0; i < seat_count; i++) {
     long found = -1;
     for (size_t j = 0; j < p->seat_count; j++)
-      if (!retained[j] && qa_same_seat(p->seats[j].binding.seat, seats[i].seat) && qa_same_actor(p->seats[j].binding.actor, seats[i].actor)) found = (long)j;
+      if (found < 0 && !retained[j] && qa_same_seat(p->seats[j].binding.seat, seats[i].seat) && qa_same_actor(p->seats[j].binding.actor, seats[i].actor)) found = (long)j; /* find: the first */
     if (found >= 0) {
       next[i] = p->seats[found];
       next[i].sky_view.images = next[i].sky_images; /* the view points into the moved seat's own images */
@@ -314,12 +316,12 @@ void qa_app_rerelease_receive(qa_app_rerelease_presentation *p, const qa_app_sim
   }
 }
 const char *qa_app_rerelease_selected_language(qa_app_rerelease_presentation *p, qa_seat_id id) {
-  if (p->language_settings == NULL) {
+  if (!qa_ui_setting_cvars_present(&p->language_settings)) {
     for (size_t i = 0; i < p->seat_count; i++) if (qa_same_seat(p->seats[i].binding.seat, id)) return p->seats[i].language;
     return "english";
   }
   free(p->language_scratch);
-  p->language_scratch = qa_ui_read_seat_language(p->language_settings, id.index);
+  p->language_scratch = qa_ui_read_seat_language(qa_ui_setting_cvars_get(&p->language_settings), id.index);
   return p->language_scratch ? p->language_scratch : "english";
 }
 static seat_state *find_seat(qa_app_rerelease_presentation *p, qa_seat_id id) {
@@ -371,6 +373,24 @@ static const char *language_load_files(void *ctx, qa_loc_load_tier *out_primary,
   }
   return NULL;
 }
+/* language.charAt(0).toUpperCase() + language.slice(1): the first UTF-16 unit through JS toUpperCase (a
+ * supplementary character's high surrogate is unchanged). */
+static char *language_label(const char *language) {
+  unsigned char lead = (unsigned char)language[0];
+  if (lead == 0 || lead >= 0xf0) return xdup(language);
+  size_t width = lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  char first[5] = {0};
+  memcpy(first, language, width);
+  char *upper = qa_js_to_upper_case(first);
+  if (!upper) qa_range_error("Out of memory");
+  size_t a = strlen(upper), b = strlen(language + width);
+  char *out = malloc(a + b + 1);
+  if (!out) { free(upper); qa_range_error("Out of memory"); }
+  memcpy(out, upper, a);
+  memcpy(out + a, language + width, b + 1);
+  free(upper);
+  return out;
+}
 static void language_failed_ignored(void *ctx, const char *message) { (void)ctx; (void)message; } /* () => undefined */
 static int compare_text(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 static bool has_text(char **items, size_t count, const char *text) {
@@ -421,8 +441,7 @@ static catalog_entry *create_catalog(qa_app_rerelease_presentation *p, seat_stat
     language_load *load = &entry->loads[i];
     load->mounts = provider.mounts;
     load->language = languages[i]; /* taken */
-    entry->labels[i] = xdup(load->language);
-    entry->labels[i][0] = (char)toupper((unsigned char)entry->labels[i][0]); /* charAt(0).toUpperCase() + slice(1) */
+    entry->labels[i] = language_label(load->language); /* charAt(0).toUpperCase() + slice(1) */
     entry->choices[i] = (qa_ui_language_choice){load->language, entry->labels[i], load, language_load_files};
   }
   free(languages);
@@ -433,9 +452,10 @@ static catalog_entry *create_catalog(qa_app_rerelease_presentation *p, seat_stat
     qa_range_error("Out of memory");
   const char *error = qa_ui_native_language_settings_select(&entry->settings, selection);
   if (error != NULL) {
-    char message[1024];
-    snprintf(message, sizeof message, "%s", error);
+    char *message = xdup(error);
     free_catalog(entry); /* TS: a rejected pending catalog leaves seat.catalogs */
+    qa_cleanup message_guard;
+    qa_cleanup_push(&message_guard, free, message);
     qa_raise("Error", 0, 0, "%s", message);
   }
   return entry;
@@ -538,7 +558,8 @@ static void binding_write(void *ctx, const char *value) {
   if (!installed) qa_raise("Error", 0, 0, "Language is not installed: %s", value);
   /* The closure's seat object: a seat publishSeats dropped no longer reaches any catalog or view. */
   seat_state *seat = find_bound_seat(b);
-  if (b->presentation->language_settings != NULL) qa_ui_write_seat_language(b->presentation->language_settings, b->seat.index, value);
+  if (qa_ui_setting_cvars_present(&b->presentation->language_settings))
+    qa_ui_write_seat_language(qa_ui_setting_cvars_get(&b->presentation->language_settings), b->seat.index, value);
   else if (seat != NULL) set_str(&seat->language, value);
   if (seat != NULL) clear_catalogs(b->presentation, seat);
   /* this.catalog(seat, content).catch(failed) */
@@ -546,9 +567,16 @@ static void binding_write(void *ctx, const char *value) {
   qa_caught_error caught;
   if (!qa_try(binding_reload, &call, &caught)) {
     /* failed(error): the C callback receives String(error), "<name>: <message>". */
-    char text[QA_CAUGHT_MESSAGE_CAPACITY + 64];
-    snprintf(text, sizeof text, "%s: %s", caught.name, caught.message);
+    const char *message = qa_caught_message(&caught);
+    size_t size = strlen(caught.name) + strlen(message) + 3;
+    char *text = malloc(size);
+    if (!text) qa_range_error("Out of memory");
+    snprintf(text, size, "%s: %s", caught.name, message);
+    qa_cleanup text_guard;
+    qa_cleanup_push(&text_guard, free, text);
     b->failed(b->failed_ctx, text);
+    qa_cleanup_pop(&text_guard);
+    free(text);
   }
 }
 bool qa_app_rerelease_language_binding(qa_app_rerelease_presentation *p, qa_seat_id id, qa_content_id content,
@@ -587,7 +615,10 @@ static void load_sky_images(providers source, qa_content_id content, const char 
     char *path = malloc(size);
     if (!path) qa_range_error("Out of memory");
     snprintf(path, size, "env/%s%s", name, qa_sky_face_suffixes[i]);
+    qa_cleanup path_guard;
+    qa_cleanup_push(&path_guard, free, path);
     const qa_scene_texture *image = qa_scene_texture_loader_load(provider.textures, path, &options);
+    qa_cleanup_pop(&path_guard);
     free(path);
     out[i] = (image != NULL ? image : provider.textures->missing)->image;
   }
@@ -639,13 +670,8 @@ static void admit_print(qa_app_rerelease_presentation *p, const qa_app_sim_prese
     qa_range_error("Out of memory");
   p->print_count++;
 }
-void qa_app_rerelease_prepare(qa_app_rerelease_presentation *p) {
-  while (p->pending_count > 0) {
-    qa_app_sim_presentation_event owned = p->pending[p->pending_head];
-    memset(&p->pending[p->pending_head], 0, sizeof owned);
-    p->pending_head = (p->pending_head + 1) % QA_APP_RERELEASE_RING;
-    p->pending_count--;
-    const qa_app_sim_presentation_event *source = &owned;
+static void prepare_one(qa_app_rerelease_presentation *p, const qa_app_sim_presentation_event *source) {
+  {
     if (strcmp(source->kind, "q2-player") == 0) {
       const qa_q2_player_event *player = source->q2_player;
       if (strcmp(player->kind, "userinfo") == 0) {
@@ -658,8 +684,7 @@ void qa_app_rerelease_prepare(qa_app_rerelease_presentation *p) {
               set_name(&p->seats[i].names, &p->seats[i].name_count, &p->seats[i].name_cap, player->slot, player->name);
         }
       }
-      qa_app_sim_presentation_event_release(&owned);
-      continue;
+      return;
     }
     const qa_q2_rerelease_event *event = source->q2_rerelease;
     if (strcmp(event->kind, "sky") == 0) {
@@ -686,27 +711,54 @@ void qa_app_rerelease_prepare(qa_app_rerelease_presentation *p) {
           seat->sky_view.images = seat->sky_images;
         }
       }
-      qa_app_sim_presentation_event_release(&owned);
-      continue;
+      return;
     }
     bool story = strcmp(event->kind, "story") == 0;
-    if (!story && strcmp(event->kind, "localized-print") != 0) { qa_app_sim_presentation_event_release(&owned); continue; }
+    if (!story && strcmp(event->kind, "localized-print") != 0) return;
     for (size_t i = 0; i < p->seat_count; i++) {
       seat_state *seat = &p->seats[i];
       if (source->has_recipient && !qa_same_actor(source->recipient, seat->binding.actor)) continue;
       if (!story && event->has_actor && !qa_same_actor(event->actor, seat->binding.actor)) continue;
       char *text = qa_app_rerelease_localize_message(p, seat->binding.seat, source->content, event->text,
                                                      story ? NULL : event->args, story ? 0 : event->arg_count);
+      qa_cleanup text_guard;
+      qa_cleanup_push(&text_guard, free, text);
       if (story) {
         set_str(&seat->story, text);
         seat->has_story_source = true;
         set_str(&seat->story_content, source->content);
         set_str(&seat->story_text, event->text);
       } else admit_print(p, source, seat->binding.actor, event->level, text);
+      qa_cleanup_pop(&text_guard);
       free(text);
     }
-    qa_app_sim_presentation_event_release(&owned);
   }
+}
+/* pending.take(cursor) then retire: the whole batch leaves the ring first, so a raise drops the rest of it, as
+ * the TS loop over the taken array does. */
+typedef struct taken_batch { qa_app_sim_presentation_event *items; size_t count, at; } taken_batch;
+static void release_batch(void *v) {
+  taken_batch *batch = v;
+  for (size_t i = batch->at; i < batch->count; i++) qa_app_sim_presentation_event_release(&batch->items[i]);
+  free(batch->items);
+}
+void qa_app_rerelease_prepare(qa_app_rerelease_presentation *p) {
+  taken_batch batch = {calloc(p->pending_count ? p->pending_count : 1, sizeof *batch.items), p->pending_count, 0};
+  if (!batch.items) qa_range_error("Out of memory");
+  for (size_t i = 0; i < batch.count; i++) {
+    batch.items[i] = p->pending[p->pending_head];
+    memset(&p->pending[p->pending_head], 0, sizeof *p->pending);
+    p->pending_head = (p->pending_head + 1) % QA_APP_RERELEASE_RING;
+  }
+  p->pending_count = 0;
+  qa_cleanup batch_guard;
+  qa_cleanup_push(&batch_guard, release_batch, &batch);
+  for (; batch.at < batch.count; batch.at++) {
+    prepare_one(p, &batch.items[batch.at]);
+    qa_app_sim_presentation_event_release(&batch.items[batch.at]);
+  }
+  qa_cleanup_pop(&batch_guard);
+  free(batch.items);
   for (size_t i = 0; i < p->seat_count; i++) {
     seat_state *seat = &p->seats[i];
     if (!seat->has_story_source) continue;
@@ -736,18 +788,18 @@ bool qa_app_rerelease_story_active(qa_app_rerelease_presentation *p, qa_actor_id
 qa_app_rerelease_view qa_app_rerelease_view_of(qa_app_rerelease_presentation *p, qa_actor_id actor, double seconds) {
   qa_app_rerelease_view view; memset(&view, 0, sizeof view);
   seat_state *seat = NULL;
-  for (size_t i = 0; i < p->seat_count; i++) if (qa_same_actor(p->seats[i].binding.actor, actor)) { seat = &p->seats[i]; }
+  for (size_t i = 0; i < p->seat_count && seat == NULL; i++) if (qa_same_actor(p->seats[i].binding.actor, actor)) seat = &p->seats[i];
   if (seat != NULL && seat->fog_received) { view.has_fog = true; view.fog.fog = qa_app_rerelease_fog_current(&seat->fog, seconds); }
   view.sky = (seat != NULL && seat->has_sky) ? &seat->sky_view : p->has_sky ? &p->sky_view : NULL;
   return view;
 }
 void qa_app_rerelease_draw_story(qa_app_rerelease_presentation *p, qa_actor_id actor, qa_app_rerelease_draw draw, double scale) {
   seat_state *seat = NULL;
-  for (size_t i = 0; i < p->seat_count; i++) if (qa_same_actor(p->seats[i].binding.actor, actor)) seat = &p->seats[i];
+  for (size_t i = 0; i < p->seat_count && seat == NULL; i++) if (qa_same_actor(p->seats[i].binding.actor, actor)) seat = &p->seats[i];
   if (seat == NULL || seat->story[0] == '\0') return;
   if (!qa_same_seat(draw.text_seat, seat->binding.seat)) qa_raise("Error", 0, 0, "Story font belongs to another seat");
   double width = 0, height = 0;
   draw.layout(draw.ctx, seat->story, scale, &width, &height);
-  double max_width = width > 1 ? width : 1;
+  double max_width = qa_js_max(1, width);
   draw.draw(draw.ctx, seat->story, scale, max_width, (draw.width - width) / 2, (draw.height - height) / 2);
 }

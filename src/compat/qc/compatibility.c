@@ -2,6 +2,7 @@
 #include "qa/compat/qc/compatibility.h"
 #include <stdlib.h>
 #include <string.h>
+#include "qa/content/json_text.h"
 #include "qa/content/mods/callbacks.h"
 #include "qa/content/mods/match.h"
 #include "qa/foundation/support.h"
@@ -19,7 +20,8 @@ static void compatibility_cleanup(void *arg) { qa_compat_qc_quakec_compatibility
 bool qa_compat_qc_read_quakec_compatibility(const uint8_t *bytes, size_t length, const char *digest, qa_compat_qc_quakec_compatibility *out) {
   memset(out, 0, sizeof *out); out->message_dialect = "known-retail";
   if (!bytes) return true;
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  /* TS JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)): invalid UTF-8 is a TypeError. */
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (!value) return false;
   out->tree = value;
   /* A throw abandons the result, which TS leaves to the GC. */

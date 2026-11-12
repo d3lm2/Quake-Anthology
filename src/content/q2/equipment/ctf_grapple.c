@@ -25,7 +25,7 @@ static shot project_actor(qa_actor_id actor, qa_q2_game_services *g, const char 
   qa_angle_vectors axes = qa_math_angle_vectors_rule(angles, QA_ANGLE_RULE_NATIVE);
   double side = strcmp(hand, "left") == 0 ? -offset.y : strcmp(hand, "center") == 0 ? 0 : offset.y;
   qa_body_state_result body = qa_shared_body_table_read(g->host->bodies, actor);
-  if (!body.has_value) qa_range_error("Q2 projection requires a shared actor body");
+  if (!body.has_value) qa_raise("Error", 0, 0, "Q2 projection requires a shared actor body");
   qa_vec3 origin = body.value.origin;
   if (g->options.edition == QA_Q2_EDITION_CLASSIC) {
     qa_vec3 start = qa_q2_add(qa_q2_add(qa_q2_add(origin, qa_q2_scale(axes.forward, offset.x)), qa_q2_scale(axes.right, side)), (qa_vec3){0, 0, view_height + offset.z});
@@ -47,7 +47,9 @@ struct qa_q2_ctf_grapple_equipment {
   void *can_ctx;
   qa_ctf_grapple_settings (*settings)(void *, qa_actor_id, qa_q2_game_services *);
   void *settings_ctx;
-  state_entry *states; size_t count, cap;
+  /* TS Map<ActorId, state object>: each state is its own allocation, so a state
+   * handed to a caller stays put while other actors' states come and go. */
+  state_entry **states; size_t count, cap;
   struct release_ctx **bound; size_t bound_count, bound_cap; /* one owned binding per bound game */
   qa_q2_named_touch touches[1];
   qa_q2_named_die dies[1];
@@ -62,20 +64,23 @@ static bool can_damage_of(qa_q2_ctf_grapple_equipment *e, qa_actor_id owner, qa_
   return e->can_damage ? e->can_damage(e->can_ctx, owner, target) : true;
 }
 static qa_ctf_grapple_state *find_state(qa_q2_ctf_grapple_equipment *e, qa_actor_id a) {
-  for (size_t i = 0; i < e->count; i++) if (qa_same_actor(e->states[i].id, a)) return &e->states[i].v;
+  for (size_t i = 0; i < e->count; i++) if (qa_same_actor(e->states[i]->id, a)) return &e->states[i]->v;
   return NULL;
 }
 qa_ctf_grapple_state *qa_q2_ctf_grapple_state(qa_q2_ctf_grapple_equipment *e, qa_actor_id a) {
   qa_ctf_grapple_state *s = find_state(e, a);
   if (s) return s;
   if (e->count == e->cap) { e->cap = e->cap ? e->cap * 2 : 8; e->states = realloc(e->states, e->cap * sizeof *e->states); if (!e->states) qa_range_error("out of memory"); }
-  e->states[e->count].id = a;
-  qa_ctf_grapple_state_init(&e->states[e->count].v);
-  return &e->states[e->count++].v;
+  state_entry *entry = malloc(sizeof *entry);
+  if (!entry) qa_range_error("out of memory");
+  entry->id = a;
+  qa_ctf_grapple_state_init(&entry->v);
+  e->states[e->count++] = entry;
+  return &entry->v;
 }
 static void delete_state(qa_q2_ctf_grapple_equipment *e, qa_actor_id a) {
   for (size_t i = 0; i < e->count; i++)
-    if (qa_same_actor(e->states[i].id, a)) { memmove(&e->states[i], &e->states[i + 1], (e->count - i - 1) * sizeof *e->states); e->count--; return; }
+    if (qa_same_actor(e->states[i]->id, a)) { free(e->states[i]); memmove(&e->states[i], &e->states[i + 1], (e->count - i - 1) * sizeof *e->states); e->count--; return; }
 }
 static bool live(qa_q2_game_services *g, qa_actor_id id) { return qa_session_actor_registry_is_live(g->host->actors, id); }
 
@@ -121,8 +126,8 @@ static void on_release(void *c, qa_owned_actor actor) {
     if (hook && live(g, hook->actor.id)) { loop_hook(hook, g, ""); g->cancel(g->ctx, hook); g->remove(g->ctx, hook); }
   }
   for (size_t i = 0; i < e->count; i++) {
-    qa_ctf_grapple_state *st = &e->states[i].v;
-    qa_actor_id owner = e->states[i].id;
+    qa_ctf_grapple_state *st = &e->states[i]->v;
+    qa_actor_id owner = e->states[i]->id;
     if (!st->has_grapple || !qa_same_actor(st->grapple, actor.id)) continue;
     st->has_grapple = false; st->grapple_state = "fly";
     st->grapple_release_time = g->host->now(g->host->ctx) + (g->options.edition == QA_Q2_EDITION_RERELEASE ? 1 : 0);
@@ -214,7 +219,10 @@ void qa_q2_ctf_grapple_touch(qa_q2_ctf_grapple_equipment *e, qa_q2_entity *hook,
     reset_hook(e, hook, g);
     return;
   }
-  source->grapple_state = "pull";
+  /* The table may have moved or lost the owner during the calls above; TS writes
+   * the state object it holds, which is then an orphan. */
+  source = find_state(e, owner);
+  if (source) source->grapple_state = "pull";
   hook->has_enemy = true; hook->enemy = contact.other;
   g->solid(g->ctx, hook, "none");
   const char *anchor = e->hooks.anchor(e->hooks.ctx, contact.other, g);
@@ -422,6 +430,7 @@ void qa_q2_ctf_grapple_destroy(qa_q2_ctf_grapple_equipment *e) {
     qa_session_actor_registry_off_release(e->bound[i]->actors, e->bound[i]->subscription);
     free(e->bound[i]);
   }
+  for (size_t i = 0; i < e->count; i++) free(e->states[i]);
   free(e->states); free(e->bound); free(e->buf);
   free(e);
 }
@@ -430,7 +439,10 @@ qa_q2_callback_definitions qa_q2_ctf_grapple_callbacks(qa_q2_ctf_grapple_equipme
 qa_ctf_grapple_state *qa_q2_ctf_grapple_find_state(qa_q2_ctf_grapple_equipment *e, qa_actor_id a) { return find_state(e, a); }
 size_t qa_q2_ctf_grapple_state_count(const qa_q2_ctf_grapple_equipment *e) { return e->count; }
 qa_ctf_grapple_state *qa_q2_ctf_grapple_state_at(qa_q2_ctf_grapple_equipment *e, size_t index, qa_actor_id *out_actor) {
-  *out_actor = e->states[index].id;
-  return &e->states[index].v;
+  *out_actor = e->states[index]->id;
+  return &e->states[index]->v;
 }
-void qa_q2_ctf_grapple_clear_states(qa_q2_ctf_grapple_equipment *e) { e->count = 0; }
+void qa_q2_ctf_grapple_clear_states(qa_q2_ctf_grapple_equipment *e) {
+  for (size_t i = 0; i < e->count; i++) free(e->states[i]);
+  e->count = 0;
+}

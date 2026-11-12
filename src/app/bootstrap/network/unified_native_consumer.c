@@ -14,6 +14,11 @@ typedef struct entry {
   qa_mod_client_presentation_frame frame;
   qa_native_q2_hud_frame native_frame; /* storage behind frame */
   struct qa_app_unified_native_consumers *owner;
+  /* Owned copies (the decoded update or frame is freed once applied; TS entries hold the
+   * objects): active from the activation, identity/hud/configs from the latest update. A frame
+   * read before an update keeps the hud and configs it was read with (frame_* blocks). */
+  void *active_block, *identity_block, *hud_block, *configs_block;
+  void *frame_hud_block, *frame_configs_block; bool frame_uses_current;
 } entry;
 struct qa_app_unified_native_consumers {
   qa_app_unified_native_consumer_options options;
@@ -70,10 +75,75 @@ static bool source_frame(void *ctx, qa_actor_id actor, qa_mod_client_presentatio
   return true;
 }
 static void entry_free(entry *e) {
-  free(e->hud.configstrings);
-  free(e->hud.inventory);
-  free(e->configs);
+  free(e->active_block);
+  free(e->identity_block);
+  free(e->hud_block);
+  free(e->configs_block);
+  free(e->frame_hud_block);
+  free(e->frame_configs_block);
   free(e);
+}
+static qa_app_unified_native_identity identity_clone(const qa_app_unified_native_identity *source,
+    void **block) {
+  qa_app_unified_component_identity wide;
+  memset(&wide, 0, sizeof wide);
+  wide.owner = source->owner;
+  wide.identity = source->identity;
+  wide.generation = source->generation;
+  wide = qa_app_unified_component_identity_clone(&wide, block);
+  qa_app_unified_native_identity out;
+  memset(&out, 0, sizeof out);
+  out.owner = wide.owner;
+  out.identity = wide.identity;
+  out.generation = source->generation;
+  return out;
+}
+static size_t text_size(const char *text) { return text ? strlen(text) + 1 : 0; }
+static const char *text_put(char **cursor, const char *text) {
+  if (!text) return NULL;
+  size_t n = strlen(text) + 1;
+  char *out = *cursor;
+  memcpy(out, text, n);
+  *cursor += n;
+  return out;
+}
+/* configstring entries then their values, in one block. */
+static qa_native_q2_config_string *configs_clone(const qa_native_q2_config_string *configs,
+    size_t count, void **block) {
+  size_t size = count * sizeof *configs;
+  for (size_t i = 0; i < count; i++) size += text_size(configs[i].value);
+  qa_native_q2_config_string *out = xmalloc(size);
+  char *cursor = (char *)(out + count);
+  for (size_t i = 0; i < count; i++) {
+    out[i].index = configs[i].index;
+    out[i].value = text_put(&cursor, configs[i].value);
+  }
+  *block = out;
+  return out;
+}
+/* inventory, configstring entries, then every string, in one block. */
+static qa_app_unified_native_hud_state hud_clone(const qa_app_unified_native_hud_state *source,
+    void **block) {
+  qa_app_unified_native_hud_state out = *source;
+  size_t inventory = source->inventory_count * sizeof *source->inventory;
+  size_t configs = source->configstring_count * sizeof *source->configstrings;
+  size_t size = inventory + configs + text_size(source->mode) + text_size(source->protocol.kind)
+      + text_size(source->layout);
+  for (size_t i = 0; i < source->configstring_count; i++) size += text_size(source->configstrings[i].value);
+  char *base = xmalloc(size);
+  out.inventory = (double *)base;
+  if (inventory) memcpy(out.inventory, source->inventory, inventory);
+  out.configstrings = (qa_native_q2_config_string *)(base + inventory);
+  char *cursor = base + inventory + configs;
+  for (size_t i = 0; i < source->configstring_count; i++) {
+    out.configstrings[i].index = source->configstrings[i].index;
+    out.configstrings[i].value = text_put(&cursor, source->configstrings[i].value);
+  }
+  out.mode = text_put(&cursor, source->mode);
+  out.protocol.kind = text_put(&cursor, source->protocol.kind);
+  out.layout = text_put(&cursor, source->layout);
+  *block = base;
+  return out;
 }
 static void commit_track(qa_app_unified_native_commit *commit, entry *e) {
   entry **grown = realloc(commit->created, (commit->created_count + 1) * sizeof *grown);
@@ -82,10 +152,12 @@ static void commit_track(qa_app_unified_native_commit *commit, entry *e) {
   commit->created[commit->created_count++] = e;
 }
 static void cleanup_commit(void *arg) { qa_app_unified_native_commit_free(arg); }
+static void entry_unwind(void *arg) { entry_free(arg); }
 static entry *create_entry(qa_app_unified_native_consumers *c,
     const qa_app_unified_native_state *metadata, bool camera_only) {
+  /* TS preparedMods.find: the first qualified module. */
   const qa_prepared_mod *prepared = NULL;
-  for (size_t i = 0; i < c->options.prepared_mod_count; i++)
+  for (size_t i = 0; i < c->options.prepared_mod_count && !prepared; i++)
     if (qa_same_mod_identity(&c->options.prepared_mods[i].identity,
             &metadata->identity.identity)) prepared = &c->options.prepared_mods[i];
   char *instance = qa_mod_instance_provider(metadata->identity.identity.selection);
@@ -109,19 +181,18 @@ static entry *create_entry(qa_app_unified_native_consumers *c,
     qa_raise("Error", 0, 0, "Remote native presentation has no Q2 source edition");
   entry *e = calloc(1, sizeof *e);
   if (!e) qa_range_error("out of memory");
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, entry_unwind, e);
   e->owner = c;
   e->edition = edition;
   e->view = prepared->client_presentation.view;
-  e->identity = metadata->identity;
+  e->identity = identity_clone(&metadata->identity, &e->identity_block);
   e->has_hud = metadata->has_hud;
-  e->hud = metadata->hud;
-  /* The arrays belong to the update; the entry owns copies once a commit runs. */
-  e->hud.configstrings = NULL;
-  e->hud.configstring_count = 0;
-  e->hud.inventory = NULL;
-  e->hud.inventory_count = 0;
-  e->active.owner = metadata->identity.owner;
-  e->active.identity = metadata->identity.identity;
+  if (metadata->has_hud) e->hud = hud_clone(&metadata->hud, &e->hud_block);
+  qa_app_unified_native_identity active = identity_clone(&metadata->identity, &e->active_block);
+  qa_cleanup_pop(&guard);
+  e->active.owner = active.owner;
+  e->active.identity = active.identity;
   e->active.source.ctx = e;
   e->active.source.generation = metadata->identity.generation;
   e->active.source.frame = source_frame;
@@ -326,6 +397,21 @@ qa_app_unified_native_commit *qa_app_unified_native_consumers_prepare(
   qa_cleanup_pop(&frames_guard);
   return commit;
 }
+typedef struct update_blocks { void *identity, *hud, *configs; } update_blocks;
+static void update_blocks_free(void *arg) {
+  update_blocks *blocks = arg;
+  free(blocks->identity);
+  free(blocks->hud);
+  free(blocks->configs);
+}
+/* A committed frame was read with the entry's current hud and configs. */
+static void frame_adopt(entry *e) {
+  free(e->frame_hud_block);
+  free(e->frame_configs_block);
+  e->frame_hud_block = NULL;
+  e->frame_configs_block = NULL;
+  e->frame_uses_current = true;
+}
 void qa_app_unified_native_commit_run(qa_app_unified_native_commit *commit) {
   qa_app_unified_native_consumers *c = commit->consumers;
   if (commit->action == 0) {
@@ -348,6 +434,7 @@ void qa_app_unified_native_commit_run(qa_app_unified_native_commit *commit) {
     e->has_frame = true;
     e->frame_viewer = commit->pending_frames[0].viewer;
     e->frame = commit->pending_frames[0].value;
+    frame_adopt(e);
     return;
   }
   if (commit->action == 1) {
@@ -375,31 +462,40 @@ void qa_app_unified_native_commit_run(qa_app_unified_native_commit *commit) {
     for (size_t i = 0; i < commit->pending_update_count; i++) {
       entry *e = commit->pending_updates[i].entry;
       const qa_app_unified_native_state *metadata = commit->pending_updates[i].metadata;
-      e->identity = metadata->identity;
-      free(e->hud.configstrings);
-      free(e->hud.inventory);
-      e->has_hud = metadata->has_hud;
-      e->hud = metadata->hud;
-      e->hud.configstrings = NULL;
-      e->hud.inventory = NULL;
-      if (metadata->has_hud) {
-        e->hud.configstrings = xmalloc(
-            metadata->hud.configstring_count * sizeof *e->hud.configstrings);
-        if (metadata->hud.configstring_count)
-          memcpy(e->hud.configstrings, metadata->hud.configstrings,
-              metadata->hud.configstring_count * sizeof *e->hud.configstrings);
-        e->hud.inventory = xmalloc(metadata->hud.inventory_count * sizeof *e->hud.inventory);
-        if (metadata->hud.inventory_count)
-          memcpy(e->hud.inventory, metadata->hud.inventory,
-              metadata->hud.inventory_count * sizeof *e->hud.inventory);
+      /* Copy first: the pending configs may be this entry's current block. */
+      update_blocks blocks = {NULL, NULL, NULL};
+      qa_cleanup guard;
+      qa_cleanup_push(&guard, update_blocks_free, &blocks);
+      qa_app_unified_native_identity identity = identity_clone(&metadata->identity, &blocks.identity);
+      qa_app_unified_native_hud_state hud;
+      memset(&hud, 0, sizeof hud);
+      if (metadata->has_hud) hud = hud_clone(&metadata->hud, &blocks.hud);
+      qa_native_q2_config_string *configs = commit->pending_updates[i].has_configs
+          ? configs_clone(commit->pending_updates[i].configs, commit->pending_updates[i].config_count,
+              &blocks.configs)
+          : NULL;
+      qa_cleanup_pop(&guard);
+      free(e->identity_block);
+      e->identity_block = blocks.identity;
+      e->identity = identity;
+      if (e->has_frame && e->frame_uses_current) {
+        /* The frame was read with the current hud and configs: it keeps them. */
+        free(e->frame_hud_block);
+        free(e->frame_configs_block);
+        e->frame_hud_block = e->hud_block;
+        e->frame_configs_block = e->configs_block;
+        e->frame_uses_current = false;
+      } else {
+        free(e->hud_block);
+        free(e->configs_block);
       }
-      free(e->configs);
+      e->has_hud = metadata->has_hud;
+      e->hud = hud;
+      e->hud_block = blocks.hud;
       e->has_configs = commit->pending_updates[i].has_configs;
-      e->config_count = commit->pending_updates[i].config_count;
-      e->configs = xmalloc(e->config_count * sizeof *e->configs);
-      if (e->config_count)
-        memcpy(e->configs, commit->pending_updates[i].configs,
-            e->config_count * sizeof *e->configs);
+      e->config_count = configs ? commit->pending_updates[i].config_count : 0;
+      e->configs = configs;
+      e->configs_block = blocks.configs;
       c->options.admit_replicated_owner(c->options.ctx, metadata->identity.owner,
           metadata->identity.identity.source.content);
     }
@@ -410,6 +506,7 @@ void qa_app_unified_native_commit_run(qa_app_unified_native_commit *commit) {
     e->has_frame = true;
     e->frame_viewer = commit->pending_frames[i].viewer;
     e->frame = commit->pending_frames[i].value;
+    frame_adopt(e);
   }
 }
 void qa_app_unified_native_commit_free(qa_app_unified_native_commit *commit) {

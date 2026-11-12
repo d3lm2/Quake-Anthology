@@ -84,13 +84,26 @@ void qa_remote_application_retry_downloads(qa_remote_application *app, const qa_
 }
 
 /* ---- dispatchCommands (TS 2929-2948) ----------------------------------- */
+/* The detached pending batch: a raise drops the commands not yet run with it (TS
+ * replaced this.commands before the loop, so the rest of `pending` is garbage). */
+typedef struct dispatch_scope { qa_remote_command *pending; size_t count, next; } dispatch_scope;
+static void dispatch_scope_release(void *arg) {
+  dispatch_scope *scope = arg;
+  for (size_t i = scope->next; i < scope->count; i++) qa_remote_command_free(&scope->pending[i]);
+  free(scope->pending);
+  scope->pending = NULL; scope->count = scope->next = 0;
+}
 void qa_remote_application_dispatch_commands(qa_remote_application *app) {
   qa_remote_command *pending = app->commands;
   size_t count = app->command_count;
   app->commands = NULL;
   app->command_count = 0;
   app->command_capacity = 0;
+  dispatch_scope scope = {pending, count, 0};
+  qa_cleanup batch_guard;
+  qa_cleanup_push(&batch_guard, dispatch_scope_release, &scope);
   for (size_t index = 0; index < count; index++) {
+    scope.next = index;
     qa_app_video_restart *restart = qa_remote_application_video_restart(app);
     if (restart != NULL && qa_app_video_restart_pending(restart)) {
       /* this.commands.unshift(...pending.slice(index)) */
@@ -103,12 +116,14 @@ void qa_remote_application_dispatch_commands(qa_remote_application *app) {
       app->commands = merged;
       app->command_count = total;
       app->command_capacity = total + 1;
+      qa_cleanup_pop(&batch_guard);
       free(pending);
       return;
     }
     qa_remote_command *command = &pending[index];
     qa_cleanup guard;
     qa_cleanup_push(&guard, (void (*)(void *))qa_remote_command_free, command);
+    scope.next = index + 1; /* the current command has its own guard */
     if (app->ownership.borrowed) {
       qa_command_context source;
       if (command->has_source) source = command->source;
@@ -132,6 +147,7 @@ void qa_remote_application_dispatch_commands(qa_remote_application *app) {
     qa_cleanup_pop(&guard);
     qa_remote_command_free(command);
   }
+  qa_cleanup_pop(&batch_guard);
   free(pending);
 }
 
@@ -353,15 +369,15 @@ static recording_feed *prepare_feed(qa_remote_application *app, const qa_command
   feed->app = app;
   feed->peer = peer;
   feed->network = *network;
-  feed->root = strdup(app->remote_content != NULL ? app->remote_content->write_root : app->configuration->settings->root);
-  if (feed->root == NULL) qa_range_error("Out of memory");
+  feed->root = qa_remote_application_game_folder(app); /* root: this.gameFolder() */
   return feed;
 }
 /* The standalone ClientDemoRecording host (TS standaloneRecording). */
 typedef struct standalone_host { qa_remote_application *app; recording_feed *feed; char error[QA_CAUGHT_MESSAGE_CAPACITY]; } standalone_host;
 static const char *standalone_root(void *ctx) {
   standalone_host *host = ctx;
-  if (host->feed == NULL) return "Recording has no selected source";
+  /* root() throws; a returned text would be taken as the folder. */
+  if (host->feed == NULL) qa_raise("Error", 0, 0, "Recording has no selected source");
   return host->feed->root;
 }
 typedef struct seed_call { standalone_host *host; qa_command_context source; qa_app_demo_recording_seed *out; } seed_call;
@@ -476,13 +492,22 @@ static void execute_print(execute_call *call, const char *text) {
   else if (call->app->host.base.print != NULL) call->app->host.base.print(call->app->host.base.ctx, text);
 }
 static void execute_print_ctx(void *ctx, const char *text) { execute_print(ctx, text); }
+/* A template string has no length cap (cvar values and download paths are unbounded). */
 static void execute_printf(execute_call *call, const char *format, ...) {
-  char line[2048];
-  va_list args;
+  va_list args, copy;
   va_start(args, format);
-  vsnprintf(line, sizeof line, format, args);
+  va_copy(copy, args);
+  int length = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *line = length < 0 ? NULL : malloc((size_t)length + 1);
+  if (line == NULL) { va_end(args); qa_range_error("Out of memory"); }
+  vsnprintf(line, (size_t)length + 1, format, args);
   va_end(args);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, line);
   execute_print(call, line);
+  qa_cleanup_pop(&guard);
+  free(line);
 }
 static bool configuration_has_seat(const qa_remote_configuration *configuration, qa_seat_id id) {
   for (size_t i = 0; i < configuration->seat_count; i++)
@@ -583,7 +608,12 @@ static void execute_body(void *ctx) {
     if (arg_count == 0) {
       char *top = qa_cvar_registry_variable_string(cvars, "topcolor"), *bottom = qa_cvar_registry_variable_string(cvars, "bottomcolor");
       if (top == NULL || bottom == NULL) { free(top); free(bottom); qa_range_error("Out of memory"); }
+      qa_cleanup top_guard, bottom_guard;
+      qa_cleanup_push(&top_guard, free, top);
+      qa_cleanup_push(&bottom_guard, free, bottom);
       execute_printf(call, "\"color\" is \"%s %s\"\n", top, bottom);
+      qa_cleanup_pop(&bottom_guard);
+      qa_cleanup_pop(&top_guard);
       free(top);
       free(bottom);
       return;
@@ -801,7 +831,8 @@ static void execute_body(void *ctx) {
     free(argv);
     if (handled) return;
   }
-  if (source->kind != QA_REMOTE_SOURCE_LIVE) raise_text("Gameplay commands require a live server");
+  /* this.source is read again: the commands above can promote or retire the primary seat. */
+  if (qa_remote_application_source(app)->kind != QA_REMOTE_SOURCE_LIVE) raise_text("Gameplay commands require a live server");
   qa_remote_presentation_player_command(remote, selected.actor, name, args, arg_count);
 }
 void qa_remote_application_execute_remote_command(qa_remote_application *app, const qa_remote_command *command) {

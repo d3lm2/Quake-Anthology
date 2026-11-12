@@ -303,12 +303,12 @@ static double finale_text_width(void *ctx, const char *line, double scale) {
   qa_text_layout_destroy(&layout);
   return width;
 }
-static void finale_draw_text(void *ctx, const char *line, double scale, long max_glyphs, double x, double y) {
+static void finale_draw_text(void *ctx, const char *line, double scale, double max_glyphs, double x, double y) {
   qa_app_world_seat_presentation *p = ctx;
   if (p->current_draw == NULL) return;
   qa_text_layout layout;
   qa_text_layout_options options = finale_text(p, line, scale);
-  options.has_max_glyphs = true; options.max_glyphs = (double)max_glyphs;
+  options.has_max_glyphs = true; options.max_glyphs = max_glyphs;
   if (!qa_seat_text_presentation_draw(&p->text, p->current_draw, &options, (qa_vec2){x, y}, 0, &layout)) qa_range_error("Out of memory");
   qa_text_layout_destroy(&layout);
 }
@@ -546,7 +546,11 @@ void qa_app_world_seat_presentation_receive(qa_app_world_seat_presentation *p, c
     if (event->payload.kind != QA_SIM_EVENT_MESSAGE || event->payload.event.text == NULL) continue;
     pending_message message = { heap_text(event->payload.event.text), event->payload.has_source_presentation_sequence,
                                 event->payload.source_presentation_sequence };
-    if (qa_event_ring_admit(&p->pending_messages, &message) == 0) { free(message.text); qa_range_error("Event ring capacity exhausted"); }
+    /* EventRing.admit: a full ring raises its RangeError; the copy is released first */
+    if (qa_event_ring_append(&p->pending_messages, &message) == 0) {
+      free(message.text);
+      qa_range_error("Event ring capacity exhausted (%zu undrained records); drain before admitting more", p->pending_messages.capacity);
+    }
   }
 }
 static bool owns(const qa_app_world_seat_presentation *p, qa_actor_id actor) { return qa_same_actor(actor, local_actor(p)); }
@@ -556,7 +560,10 @@ static bool q2_message_kind(const char *kind) {
 static void admit_copy(qa_event_ring *ring, const qa_app_sim_presentation_event *event) {
   qa_app_sim_presentation_event copy;
   if (!qa_app_sim_presentation_event_copy(&copy, event)) qa_range_error("Out of memory");
-  if (qa_event_ring_admit(ring, &copy) == 0) { qa_app_sim_presentation_event_release(&copy); qa_range_error("Event ring capacity exhausted"); }
+  if (qa_event_ring_append(ring, &copy) == 0) {
+    qa_app_sim_presentation_event_release(&copy);
+    qa_range_error("Event ring capacity exhausted (%zu undrained records); drain before admitting more", ring->capacity);
+  }
 }
 static void clear_component_client(component_client *client) {
   qa_app_q2_native_hud_clear(client->hud);
@@ -585,6 +592,8 @@ void qa_app_world_seat_presentation_source_events(qa_app_world_seat_presentation
   /* Q1MapFog takes its event view. */
   qa_app_q1_fog_event *fog = calloc(event_count == 0 ? 1 : event_count, sizeof *fog);
   if (fog == NULL) qa_range_error("Out of memory");
+  qa_cleanup fog_guard;
+  qa_cleanup_push(&fog_guard, free, fog);
   for (size_t i = 0; i < event_count; i++) {
     const qa_app_sim_presentation_event *e = &events[i];
     fog[i].kind = e->kind; fog[i].has_owner = e->has_owner; if (e->has_owner) fog[i].owner = e->owner;
@@ -596,6 +605,7 @@ void qa_app_world_seat_presentation_source_events(qa_app_world_seat_presentation
     }
   }
   qa_app_q1_map_fog_receive(p->q1_fog, fog, event_count);
+  qa_cleanup_pop(&fog_guard);
   free(fog);
   qa_app_q1_service_presentation_receive(p->q1_services, events, event_count);
   for (size_t i = 0; i < event_count; i++)
@@ -621,7 +631,10 @@ void qa_app_world_seat_presentation_source_events(qa_app_world_seat_presentation
     if (strcmp(e->kind, "q2-player") == 0 && strcmp(e->q2_player->kind, "print") == 0) continue;
     ui_events[ui_count++] = *e;
   }
+  qa_cleanup ui_guard;
+  qa_cleanup_push(&ui_guard, free, ui_events);
   qa_app_seat_ui_receive(p->options.ui, ui_events, ui_count);
+  qa_cleanup_pop(&ui_guard);
   free(ui_events);
   qa_app_source_finale_receive(p->finale, events, event_count);
   for (size_t i = 0; i < event_count; i++) {
@@ -1475,6 +1488,7 @@ static void close_replacements(qa_app_world_seat_image_refresh *refresh) {
 static void refresh_release(void *value) {
   qa_app_world_seat_image_refresh *refresh = value;
   close_replacements(refresh);
+  qa_app_seat_ui_image_refresh_discard(refresh->hud); /* prepared but never committed (or the sky prepare raised) */
   free(refresh);
 }
 qa_app_world_seat_image_refresh *qa_app_world_seat_presentation_prepare_image_refresh(qa_app_world_seat_presentation *p,

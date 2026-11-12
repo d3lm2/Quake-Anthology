@@ -4,10 +4,13 @@
 #include "qa/foundation/support.h"
 #include <stdlib.h>
 #include <string.h>
+static void writer_free(void *arg) { qa_binary_writer_destroy(arg); }
 static void vw(qa_binary_writer *w, qa_vec3 v) { qa_binary_writer_f32(w, v.x); qa_binary_writer_f32(w, v.y); qa_binary_writer_f32(w, v.z); }
 uint8_t *qa_write_aas(const qa_aas_asset *world, size_t *out_length) {
   size_t total = 124 + world->bbox_count*32 + world->vertex_count*12 + world->plane_count*20 + world->edge_count*8 + world->edge_index_count*4 + world->face_count*24 + world->face_index_count*4 + world->area_count*48 + world->setting_count*28 + world->reachability_count*44 + world->node_count*12 + world->portal_count*20 + world->portal_index_count*4 + world->cluster_count*16;
   qa_binary_writer w; if (!qa_binary_writer_init(&w, (int64_t)total)) return NULL;
+  /* writer.i32/u16/f32 throw (RangeError) on a value outside the field; the buffer goes with it. */
+  qa_cleanup writer_guard; qa_cleanup_push(&writer_guard, writer_free, &w);
   /* Header placeholders rewritten after lumps: simpler single pass with known offsets. */
   int64_t offsets[14], off = 124;
   size_t sizes[14] = {world->bbox_count*32, world->vertex_count*12, world->plane_count*20, world->edge_count*8, world->edge_index_count*4, world->face_count*24, world->face_index_count*4, world->area_count*48, world->setting_count*28, world->reachability_count*44, world->node_count*12, world->portal_count*20, world->portal_index_count*4, world->cluster_count*16};
@@ -28,8 +31,13 @@ uint8_t *qa_write_aas(const qa_aas_asset *world, size_t *out_length) {
   for (size_t i = 0; i < world->portal_count; i++) { const qa_aas_portal_rec *p = &world->portals[i]; qa_binary_writer_i32(&w, p->area); qa_binary_writer_i32(&w, p->front_cluster); qa_binary_writer_i32(&w, p->back_cluster); qa_binary_writer_i32(&w, p->cluster_areas[0]); qa_binary_writer_i32(&w, p->cluster_areas[1]); }
   for (size_t i = 0; i < world->portal_index_count; i++) qa_binary_writer_i32(&w, world->portal_indexes[i]);
   for (size_t i = 0; i < world->cluster_count; i++) { const qa_aas_cluster_rec *c = &world->clusters[i]; qa_binary_writer_i32(&w, c->area_count); qa_binary_writer_i32(&w, c->reachability_area_count); qa_binary_writer_i32(&w, c->portal_count); qa_binary_writer_i32(&w, c->first_portal); }
+  qa_cleanup_pop(&writer_guard);
   uint8_t *outp = qa_binary_writer_finish(&w, out_length); qa_binary_writer_destroy(&w); if (!outp) return NULL;
   for (size_t i = 8; i < 124 && i < *out_length; i++) outp[i] = (uint8_t)(outp[i] ^ (uint8_t)((i - 8) * 119 & 255));
-  qa_aas_asset check; if (!qa_parse_aas(&check, outp, *out_length, world->source, true, world->bsp_checksum)) { free(outp); return NULL; } qa_aas_asset_destroy(&check);
+  /* parseAas validation throws out of writeAas; the output is released. */
+  qa_cleanup output_guard; qa_cleanup_push(&output_guard, free, outp);
+  qa_aas_asset check; bool parsed = qa_parse_aas(&check, outp, *out_length, world->source, true, world->bsp_checksum);
+  qa_cleanup_pop(&output_guard);
+  if (!parsed) { free(outp); return NULL; } qa_aas_asset_destroy(&check);
   return outp;
 }

@@ -1,6 +1,7 @@
 /* Port of src/contracts/source-items.ts (runtime helpers). GPL-2.0-or-later. */
 #include "qa/contracts/source_items.h"
 
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include <stdnoreturn.h>
 #include <stdio.h>
@@ -67,27 +68,24 @@ size_t qa_source_item_action_names(qa_source_item_action_calls calls,
   return count;
 }
 
-/* ASCII fold; TS toLowerCase is Unicode (noted in the header). */
-static char fold(char c) {
-  if (c >= 'A' && c <= 'Z') return (char)(c - 'A' + 'a');
-  return c;
-}
-
-/* Streaming equality of two normalized strings: both sides fold
- * case; each side optionally drops U+0020 spaces (the TS
- * replaceAll(" ", "")). Mirrors the three TS comparisons. */
-static bool normalized_equal(const char *left, bool strip_left,
-                             const char *right, bool strip_right) {
-  const char *a = left != NULL ? left : "";
-  const char *b = right != NULL ? right : "";
-  for (;;) {
-    if (strip_left) while (*a == ' ') a++;
-    if (strip_right) while (*b == ' ') b++;
-    if (*a == '\0' || *b == '\0') return *a == *b;
-    if (fold(*a) != fold(*b)) return false;
-    a++;
-    b++;
+/* TS `value.toLowerCase()` (Unicode, over the UTF-8 text), optionally with every U+0020
+ * removed after it (`.replaceAll(" ", "")`). Malloc'd. */
+static char *normalized(const char *text, bool strip) {
+  char *lowered = qa_js_to_lower_case(text != NULL ? text : "");
+  if (lowered == NULL) qa_range_error("Out of memory");
+  if (strip) {
+    size_t out = 0;
+    for (size_t i = 0; lowered[i] != '\0'; i++)
+      if (lowered[i] != ' ') lowered[out++] = lowered[i];
+    lowered[out] = '\0';
   }
+  return lowered;
+}
+static bool normalized_equal(const char *left, bool strip_left, const char *requested) {
+  char *value = normalized(left, strip_left);
+  bool same = strcmp(value, requested) == 0;
+  free(value);
+  return same;
 }
 
 qa_source_item_named_result qa_source_item_named(
@@ -95,12 +93,17 @@ qa_source_item_named_result qa_source_item_named(
     qa_item_id original, size_t *match_indices, size_t match_capacity) {
   qa_source_item_named_result result = {QA_SOURCE_ITEM_NAMED_NONE, 0, false, 0};
   /* requested = text.toLowerCase().replaceAll(" ", "") */
+  char *requested = normalized(text, true);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, requested);
   for (size_t i = 0; i < count; i++) {
     /* Exact canonical IDs win: only the text side drops spaces. */
-    if (normalized_equal(items[i].item, false, text, true)) {
+    if (normalized_equal(items[i].item, false, requested)) {
       result.kind = QA_SOURCE_ITEM_NAMED_MATCH;
       result.item_index = i;
       result.exact = true;
+      qa_cleanup_pop(&guard);
+      free(requested);
       return result;
     }
   }
@@ -110,6 +113,8 @@ qa_source_item_named_result qa_source_item_named(
         result.kind = QA_SOURCE_ITEM_NAMED_MATCH;
         result.item_index = i;
         result.exact = false;
+        qa_cleanup_pop(&guard);
+        free(requested);
         return result;
       }
     }
@@ -117,7 +122,7 @@ qa_source_item_named_result qa_source_item_named(
   size_t first = 0;
   size_t matches = 0;
   for (size_t i = 0; i < count; i++) {
-    if (normalized_equal(items[i].label, true, text, true)) {
+    if (normalized_equal(items[i].label, true, requested)) {
       if (matches == 0) first = i;
       if (match_indices != NULL && matches < match_capacity) {
         match_indices[matches] = i;
@@ -133,5 +138,7 @@ qa_source_item_named_result qa_source_item_named(
     result.item_index = first;
     result.exact = false;
   }
+  qa_cleanup_pop(&guard);
+  free(requested);
   return result;
 }

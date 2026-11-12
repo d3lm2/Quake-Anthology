@@ -6,10 +6,9 @@
 #include <string.h>
 #include "qa/foundation/js.h"
 
-static bool is_space(char ch) {
-  return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\v'
-      || ch == '\f';
-}
+/* JS white space (the \s of /(\s+)/u, trim, trimEnd, trimStart) over UTF-8:
+ * the byte length of the white-space character at `p`, or 0. */
+static size_t space_at(const char *p) { return qa_js_white_space_length(p); }
 
 typedef struct lines { char **items; size_t count, capacity; } lines;
 
@@ -36,13 +35,23 @@ static char *dup_range(const char *first, const char *last) {
 }
 
 static char *trim_end_dup(const char *text) {
-  size_t length = strlen(text);
-  while (length > 0 && is_space(text[length - 1])) length--;
+  size_t length = 0;
+  for (const char *p = text; *p != '\0';) {
+    size_t space = space_at(p);
+    if (space > 0) { p += space; continue; }
+    p++;
+    while ((*p & 0xc0) == 0x80) p++;
+    length = (size_t)(p - text);
+  }
   return dup_range(text, text + length);
 }
 
 static bool blank(const char *text) {
-  for (; *text != '\0'; text++) if (!is_space(*text)) return false;
+  for (const char *p = text; *p != '\0';) {
+    size_t space = space_at(p);
+    if (space == 0) return false;
+    p += space;
+  }
   return true;
 }
 
@@ -103,10 +112,14 @@ bool qa_ui_get_caption_commands(const qa_active_caption *captions,
       const char *p = paragraph;
       while (ok && p <= pend) {
         const char *piece_first = p;
-        bool sep = p < pend && is_space(*p);
+        bool sep = p < pend && space_at(p) > 0;
         if (p < pend) {
-          if (sep) while (p < pend && is_space(*p)) p++;
-          else while (p < pend && !is_space(*p)) p++;
+          if (sep) {
+            size_t space;
+            while (p < pend && (space = space_at(p)) > 0) p += space;
+          } else {
+            while (p < pend && space_at(p) == 0) p++;
+          }
         }
         char *piece = dup_range(piece_first, p);
         if (piece == NULL) { ok = false; break; }
@@ -128,7 +141,7 @@ bool qa_ui_get_caption_commands(const qa_active_caption *captions,
           }
           /* for (const character of word.trimStart()) */
           const char *word = piece;
-          while (is_space(*word)) word++;
+          for (size_t space; (space = space_at(word)) > 0;) word += space;
           const unsigned char *ch = (const unsigned char *)word;
           while (ok && *ch != 0) {
             const unsigned char *next = ch + 1;

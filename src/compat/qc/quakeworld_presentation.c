@@ -40,11 +40,11 @@ void qa_compat_qc_present_quakeworld_message(qa_compat_qc_routed_message entry, 
     host.present_local(host.ctx, track, target, state, NULL); return;
   }
   if (strcmp(k, "sound") == 0 || strcmp(k, "stop-sound") == 0) {
-    if (!entry.has_actor) qa_range_error("QW %s had no owned actor when written", k);
+    if (!entry.has_actor) qa_raise("Error", 0, 0, "QW %s had no owned actor when written", k);
     host.present_local(host.ctx, to_nq(*message), target, state, &entry.actor); return;
   }
   if (strcmp(k, "muzzle-flash") == 0) {
-    if (!entry.has_actor) qa_range_error("QW muzzle flash had no owned actor when written");
+    if (!entry.has_actor) qa_raise("Error", 0, 0, "QW muzzle flash had no owned actor when written");
     qa_vec3 mo, ma;
     if (host.muzzle(host.ctx, entry.actor, &mo, &ma)) {
       qa_q1_event e; memset(&e,0,sizeof e); e.kind="effect"; e.effect="muzzleflash"; e.has_actor=true; e.actor=entry.actor;
@@ -55,7 +55,9 @@ void qa_compat_qc_present_quakeworld_message(qa_compat_qc_routed_message entry, 
   }
   if (strcmp(k, "set-view") == 0) {
     qa_netquake_message sv = to_nq(*message);
-    state.receive(state.ctx, &sv, 1, target, entry.has_actor ? &entry.actor : NULL); return;
+    /* TS receive(..., entry.actor): a null owner clears the view (all-zero actor, token NULL). */
+    static const qa_actor_id null_view;
+    state.receive(state.ctx, &sv, 1, target, entry.has_actor ? &entry.actor : &null_view); return;
   }
   static const char *const passthrough[] = {"nop","stat","stufftext","center-print","finale","set-angle","light-style","static","static-sound","damage","pause","killed-monster","found-secret","sell-screen"};
   for (size_t i = 0; i < sizeof passthrough / sizeof *passthrough; i++) if (strcmp(k, passthrough[i]) == 0) {
@@ -63,5 +65,5 @@ void qa_compat_qc_present_quakeworld_message(qa_compat_qc_routed_message entry, 
     state.receive(state.ctx, &msg, 1, target, NULL);
     host.present_local(host.ctx, msg, target, state, NULL); return;
   }
-  qa_range_error("QW component service %s requires a destination owner binding", k);
+  qa_raise("Error", 0, 0, "QW component service %s requires a destination owner binding", k);
 }

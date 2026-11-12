@@ -11,6 +11,8 @@
 #include "qa/persistence/save_image.h"
 #include "qa/foundation/support.h"
 #include "qa/text/localization_key.h"
+#include "qa/foundation/caught_message.h"
+#include <stdarg.h>
 
 /* Finale */
 static bool actor_eq(qa_actor_id a, qa_actor_id b) { return qa_same_actor(a, b); }
@@ -72,6 +74,28 @@ static char *print_text(qa_compat_qc_machine *m, int64_t first, bool keyed) {
   free(key);
   return text;
 }
+/* A copy of a guest string of any length (the argument buffer is reused by the next read). */
+static char *dup_text(const char *text) {
+  char *copy = strdup(text);
+  if (!copy) qa_range_error("QC presentation allocation failed");
+  return copy;
+}
+static char *format_text(const char *format, ...) {
+  va_list args, measure;
+  va_start(args, format); va_copy(measure, args);
+  int needed = vsnprintf(NULL, 0, format, measure); va_end(measure);
+  char *text = needed < 0 ? NULL : malloc((size_t)needed + 1);
+  if (!text) { va_end(args); qa_range_error("QC presentation allocation failed"); }
+  vsnprintf(text, (size_t)needed + 1, format, args); va_end(args);
+  return text;
+}
+/* print(text) with a formatted text that is released when the sink raises. */
+static void print_formatted(PS *s, char *text) {
+  if (!text) qa_range_error("QC presentation allocation failed");
+  qa_cleanup scope; qa_cleanup_push(&scope, free, text);
+  s->services.print(s->services.ctx, text);
+  qa_cleanup_pop(&scope); free(text);
+}
 enum { W_FINALE, W_EXFLAGS, W_INERT, W_INERT0, W_BPRINT, W_EXBPRINT, W_LOCALCMD, W_MAKESTATIC, W_SPRINT, W_CENTERPRINT, W_STUFFCMD, W_EXSPRINT, W_EXCENTER, W_PRECACHE_SOUND, W_PRECACHE_MODEL, W_PRECACHE_FILE, W_SOUND, W_LOCALSOUND, W_AMBIENT, W_PARTICLE, W_LIGHTSTYLE };
 static void pres_fn(void *ctx, qa_compat_qc_machine *m) {
   struct Ctx { const char *name; PS *state; int which; } *c = ctx;
@@ -84,21 +108,24 @@ static void pres_fn(void *ctx, qa_compat_qc_machine *m) {
     case W_INERT: return;
     case W_BPRINT: case W_EXBPRINT: {
       const bool keyed = c->which == W_EXBPRINT;
-      if (sv->broadcast_print) { char *t = print_text(m, qw ? 1 : 0, keyed); double lvl = qw ? trunc(qa_compat_qc_machine_arg_float(m, 0)) : 2; sv->broadcast_print(sv->ctx, t ? t : "", lvl); free(t); return; }
-      if (!qw) {
-        char *t = print_text(m, 0, keyed); char *plain = qa_plain_localization_text(t ? t : ""); sv->print(sv->ctx, plain ? plain : ""); free(plain);
-        if (!sv->print_broadcasts_to_clients && sv->nq) { qa_netquake_message msg; memset(&msg,0,sizeof msg); msg.kind="print"; msg.text=t; sv->nq->route(sv->nq->ctx, &msg, 1, (qa_compat_qc_message_destination){QA_QC_DEST_BROADCAST, true, {{NULL,0},0,0,NULL}, {0,0,0}, NULL}, NULL, NULL, 0); }
-        free(t); return;
+      /* The print text is released when a sink or route raises. */
+      char *t = print_text(m, qw ? 1 : 0, keyed);
+      if (!t) qa_range_error("QC print allocation failed");
+      qa_cleanup scope; qa_cleanup_push(&scope, free, t);
+      if (sv->broadcast_print) { double lvl = qw ? trunc(qa_compat_qc_machine_arg_float(m, 0)) : 2; sv->broadcast_print(sv->ctx, t, lvl); }
+      else {
+        print_formatted(s, qa_plain_localization_text(t));
+        if (!qw) {
+          if (!sv->print_broadcasts_to_clients && sv->nq) { qa_netquake_message msg; memset(&msg,0,sizeof msg); msg.kind="print"; msg.text=t; sv->nq->route(sv->nq->ctx, &msg, 1, (qa_compat_qc_message_destination){QA_QC_DEST_BROADCAST, true, {{NULL,0},0,0,NULL}, {0,0,0}, NULL}, NULL, NULL, 0); }
+        } else if (!sv->print_broadcasts_to_clients) { qa_compat_qc_routed_message e; memset(&e,0,sizeof e); e.message.kind="print"; e.message.level=trunc(qa_compat_qc_machine_arg_float(m,0)); e.message.text=t; qw->route(qw->ctx, &e, 1, (qa_compat_qc_message_destination){QA_QC_DEST_BROADCAST, true, {{NULL,0},0,0,NULL}, {0,0,0}, NULL}); }
       }
-      char *t = print_text(m, 1, keyed); char *plain = qa_plain_localization_text(t ? t : ""); sv->print(sv->ctx, plain ? plain : ""); free(plain);
-      if (!sv->print_broadcasts_to_clients) { qa_compat_qc_routed_message e; memset(&e,0,sizeof e); e.message.kind="print"; e.message.level=trunc(qa_compat_qc_machine_arg_float(m,0)); e.message.text=t; qw->route(qw->ctx, &e, 1, (qa_compat_qc_message_destination){QA_QC_DEST_BROADCAST, true, {{NULL,0},0,0,NULL}, {0,0,0}, NULL}); }
-      free(t); return;
+      qa_cleanup_pop(&scope); free(t); return;
     }
     case W_LOCALCMD: { qa_q1_event e; memset(&e,0,sizeof e); e.kind="server-command"; e.text=qa_compat_qc_machine_arg_string(m,0); do_emit(s,e); return; }
     case W_MAKESTATIC: {
       qa_compat_qc_words *w = qa_compat_qc_entity_memory_from_reference(m->entities, qa_compat_qc_machine_arg_int(m,0));
-      const char *path0 = qa_compat_qc_strings_get(&m->strings, qa_compat_qc_words_int(w, qa_compat_qc_machine_field_offset(m,"model")));
-      char path[512]; snprintf(path,sizeof path,"%s",path0);
+      char *path = dup_text(qa_compat_qc_strings_get(&m->strings, qa_compat_qc_words_int(w, qa_compat_qc_machine_field_offset(m,"model"))));
+      qa_cleanup path_scope; qa_cleanup_push(&path_scope, free, path);
       qa_compat_qc_precached_resource res; bool has=false;
       if (path[0]) { has = sv->lookup(sv->ctx,"model",path,&res); if(!has && path[0]=='*'){ res=sv->precache(sv->ctx,"model",path); has=true; } }
       if (path[0] && !has) { qa_compat_qc_machine_fail(m, "makestatic model was not precached: %s", path); }
@@ -112,45 +139,50 @@ static void pres_fn(void *ctx, qa_compat_qc_machine *m) {
       e.has_origin=true; e.origin = qa_compat_qc_words_vector(w, qa_compat_qc_machine_field_offset(m,"origin"));
       e.angles = qa_compat_qc_words_vector(w, qa_compat_qc_machine_field_offset(m,"angles"));
       do_emit(s, e);
+      qa_cleanup_pop(&path_scope); free(path);
       remove_b.fn(remove_b.ctx, m); return;
     }
     case W_SPRINT: case W_CENTERPRINT: case W_STUFFCMD: case W_EXSPRINT: case W_EXCENTER: {
       const char *name = c->name; bool center = c->which==W_CENTERPRINT||c->which==W_EXCENTER;
       qa_owned_actor actor = s->world->actor(s->world->ctx, qa_compat_qc_entity_memory_slot(s->world->entities, qa_compat_qc_machine_arg_int(m,0)));
       char *t = print_text(m, (qw && c->which==W_SPRINT) ? 2 : 1, c->which==W_EXSPRINT || c->which==W_EXCENTER);
+      if (!t) qa_range_error("QC print allocation failed");
+      qa_cleanup text_scope; qa_cleanup_push(&text_scope, free, t); /* released when a route or sink raises */
       qa_compat_qc_message_destination dest = {QA_QC_DEST_CLIENT, true, actor.id, {0,0,0}, NULL};
-      if (qw) {
-        if (!qw->client(qw->ctx, actor.id)) { char buf[256]; snprintf(buf,sizeof buf,"tried to %s to a non-client\n", name); sv->print(sv->ctx, buf); free(t); return; }
-        qa_compat_qc_routed_message e; memset(&e,0,sizeof e); e.has_actor=true; e.actor=actor.id;
-        bool is_sprint = c->which==W_SPRINT||c->which==W_EXSPRINT;
-        e.message.kind = is_sprint ? "print" : center ? "center-print" : "stufftext";
-        if (is_sprint) e.message.level = c->which==W_SPRINT ? trunc(qa_compat_qc_machine_arg_float(m,1)) : 2;
-        e.message.text = t; qw->route(qw->ctx, &e, 1, dest); free(t); return;
-      }
       bool is_sprint = c->which==W_SPRINT||c->which==W_EXSPRINT;
-      if (sv->nq) {
-        if (!sv->nq->client(sv->nq->ctx, actor.id)) {
-          free(t);
-          if (c->which == W_STUFFCMD) qa_compat_qc_machine_fail(m, "Client message addressed a non-client");
-          char buf[64]; snprintf(buf, sizeof buf, "tried to %s to a non-client\n", center ? "centerprint" : "sprint");
-          sv->print(sv->ctx, buf);
-          return;
+      if (qw) {
+        if (!qw->client(qw->ctx, actor.id)) print_formatted(s, format_text("tried to %s to a non-client\n", name));
+        else {
+          qa_compat_qc_routed_message e; memset(&e,0,sizeof e); e.has_actor=true; e.actor=actor.id;
+          e.message.kind = is_sprint ? "print" : center ? "center-print" : "stufftext";
+          if (is_sprint) e.message.level = c->which==W_SPRINT ? trunc(qa_compat_qc_machine_arg_float(m,1)) : 2;
+          e.message.text = t; qw->route(qw->ctx, &e, 1, dest);
         }
-        qa_netquake_message msg; memset(&msg,0,sizeof msg); msg.kind = is_sprint?"print":center?"center-print":"stufftext"; msg.text=t;
-        sv->nq->route(sv->nq->ctx, &msg, 1, dest, NULL, NULL, 0); free(t); return;
+      } else if (sv->nq) {
+        if (!sv->nq->client(sv->nq->ctx, actor.id)) {
+          if (c->which == W_STUFFCMD) qa_compat_qc_machine_fail(m, "Client message addressed a non-client");
+          print_formatted(s, format_text("tried to %s to a non-client\n", center ? "centerprint" : "sprint"));
+        } else {
+          qa_netquake_message msg; memset(&msg,0,sizeof msg); msg.kind = is_sprint?"print":center?"center-print":"stufftext"; msg.text=t;
+          sv->nq->route(sv->nq->ctx, &msg, 1, dest, NULL, NULL, 0);
+        }
+      } else {
+        if (!sv->message) qa_compat_qc_machine_fail(m, "Missing client message service");
+        qa_network_event ev; memset(&ev,0,sizeof ev);
+        ev.kind = is_sprint ? QA_NETWORK_EVENT_PRINT : center ? QA_NETWORK_EVENT_CENTER_PRINT : QA_NETWORK_EVENT_COMMAND_TEXT;
+        ev.level = 2; ev.text = t; sv->message(sv->ctx, ev, actor.id);
       }
-      if (!sv->message) { free(t); qa_compat_qc_machine_fail(m, "Missing client message service"); }
-      qa_network_event ev; memset(&ev,0,sizeof ev);
-      ev.kind = is_sprint ? QA_NETWORK_EVENT_PRINT : center ? QA_NETWORK_EVENT_CENTER_PRINT : QA_NETWORK_EVENT_COMMAND_TEXT;
-      ev.level = 2; ev.text = t; sv->message(sv->ctx, ev, actor.id); free(t); return;
+      qa_cleanup_pop(&text_scope); free(t); return;
     }
     case W_PRECACHE_SOUND: case W_PRECACHE_MODEL: {
       const char *kind = c->which==W_PRECACHE_SOUND?"sound":"model";
       if (!sv->loading(sv->ctx)) { qa_compat_qc_machine_fail(m, "PF_Precache_*: Precache can only be done in spawn functions"); }
-      const char *name0 = qa_compat_qc_machine_arg_string(m,0); char name[512]; snprintf(name,sizeof name,"%s",name0);
+      char *name = dup_text(qa_compat_qc_machine_arg_string(m,0));
+      qa_cleanup name_scope; qa_cleanup_push(&name_scope, free, name);
       qa_compat_qc_machine_return_int(m, qa_compat_qc_machine_arg_int(m,0));
       if (!name[0] || (unsigned char)name[0] <= 32) { qa_compat_qc_machine_fail(m, "Bad string"); }
-      do_register(s, sv->precache(sv->ctx, kind, name)); return;
+      do_register(s, sv->precache(sv->ctx, kind, name));
+      qa_cleanup_pop(&name_scope); free(name); return;
     }
     case W_PRECACHE_FILE: qa_compat_qc_machine_return_int(m, qa_compat_qc_machine_arg_int(m,0)); return;
     case W_SOUND: {
@@ -163,9 +195,10 @@ static void pres_fn(void *ctx, qa_compat_qc_machine *m) {
       int channel_id = (int)channel & 7;
       const char *sc; char chnum[8];
       switch(channel_id){case 0:sc="auto";break;case 1:sc="weapon";break;case 2:sc="voice";break;case 3:sc="item";break;case 4:sc="body";break;default:snprintf(chnum,sizeof chnum,"%d",channel_id);sc=chnum;break;}
-      const char *path0 = qa_compat_qc_machine_arg_string(m,2); char path[512]; snprintf(path,sizeof path,"%s",path0);
+      char *path = dup_text(qa_compat_qc_machine_arg_string(m,2));
+      qa_cleanup path_scope; qa_cleanup_push(&path_scope, free, path);
       qa_compat_qc_precached_resource res;
-      if (!sv->lookup(sv->ctx,"sound",path,&res)) { char buf[600]; snprintf(buf,sizeof buf,"SV_StartSound: %s not precacheed\n",path); sv->print(sv->ctx,buf); return; }
+      if (!sv->lookup(sv->ctx,"sound",path,&res)) { print_formatted(s, format_text("SV_StartSound: %s not precacheed\n",path)); qa_cleanup_pop(&path_scope); free(path); return; }
       do_register(s,res);
       qa_owned_actor actor = s->world->actor(s->world->ctx, qa_compat_qc_entity_memory_slot(s->world->entities, qa_compat_qc_machine_arg_int(m,0)));
       const qa_numeric_operations *n=m->numeric; void *nc=n->ctx;
@@ -179,7 +212,7 @@ static void pres_fn(void *ctx, qa_compat_qc_machine *m) {
         e.message.channel=(double)channel_id; e.message.index=res.index; e.message.origin=pos; e.message.volume=volume; e.message.attenuation=attenuation;
         bool reliable = ((int)channel & 8)!=0;
         qw->route(qw->ctx,&e,1,(qa_compat_qc_message_destination){QA_QC_DEST_MULTICAST,reliable,actor.id,pos,reliable||!qw->phs(qw->ctx)?"all":"phs"});
-        return;
+        qa_cleanup_pop(&path_scope); free(path); return;
       }
       if (sv->nq && sv->nq->native(sv->nq->ctx)) {
         qa_compat_qc_words *w = qa_compat_qc_entity_memory_from_reference(m->entities, qa_compat_qc_machine_arg_int(m,0));
@@ -190,15 +223,18 @@ static void pres_fn(void *ctx, qa_compat_qc_machine *m) {
         msg.channel=channel_id; msg.index=res.index; msg.origin=center; msg.volume=volume; msg.attenuation=attenuation;
         sv->nq->route(sv->nq->ctx,&msg,1,(qa_compat_qc_message_destination){QA_QC_DEST_BROADCAST,false,actor.id,center,NULL},NULL,NULL,0);
       }
-      qa_q1_event e; memset(&e,0,sizeof e); e.kind="sound"; e.has_actor=true; e.actor=actor.id; e.path=path; e.sound_channel=sc; e.volume=volume/255; e.attenuation=attenuation; do_emit(s,e); return;
+      qa_q1_event e; memset(&e,0,sizeof e); e.kind="sound"; e.has_actor=true; e.actor=actor.id; e.path=path; e.sound_channel=sc; e.volume=volume/255; e.attenuation=attenuation; do_emit(s,e);
+      qa_cleanup_pop(&path_scope); free(path); return;
     }
     case W_LOCALSOUND: {
-      const char *path0 = qa_compat_qc_machine_arg_string(m,1); char path[512]; snprintf(path,sizeof path,"%s",path0);
+      char *path = dup_text(qa_compat_qc_machine_arg_string(m,1));
+      qa_cleanup path_scope; qa_cleanup_push(&path_scope, free, path);
       qa_compat_qc_precached_resource res; bool has=sv->lookup(sv->ctx,"sound",path,&res);
       qa_owned_actor actor = s->world->actor(s->world->ctx, qa_compat_qc_entity_memory_slot(s->world->entities, qa_compat_qc_machine_arg_int(m,0)));
       if (has) do_register(s,res);
       if (qw || (sv->nq && sv->nq->native(sv->nq->ctx))) {
-        if (!has) { char buf[600]; snprintf(buf,sizeof buf,"SV_StartSound: %s not precacheed\n",path); sv->print(sv->ctx,buf); return; }
+        if (!has) { print_formatted(s, format_text("SV_StartSound: %s not precacheed\n",path)); qa_cleanup_pop(&path_scope); free(path); return; }
+        qa_cleanup_pop(&path_scope); free(path); /* the routed sound carries the precache index */
         qa_compat_qc_words *w = qa_compat_qc_entity_memory_from_reference(m->entities, qa_compat_qc_machine_arg_int(m,0));
         qa_vec3 origin=qa_compat_qc_words_vector(w,qa_compat_qc_machine_field_offset(m,"origin"));
         qa_compat_qc_message_destination dest={QA_QC_DEST_CLIENT,true,actor.id,{0,0,0},NULL};
@@ -209,14 +245,19 @@ static void pres_fn(void *ctx, qa_compat_qc_machine *m) {
         msg.channel=0; msg.index=res.index; msg.origin=origin; msg.volume=255; msg.attenuation=0;
         sv->nq->route(sv->nq->ctx,&msg,1,dest,NULL,NULL,0); return;
       }
-      qa_q1_event e; memset(&e,0,sizeof e); e.kind="sound"; e.has_actor=true; e.actor=actor.id; e.path=path; e.sound_channel="auto"; e.volume=1; e.attenuation=0; do_emit(s,e); return;
+      qa_q1_event e; memset(&e,0,sizeof e); e.kind="sound"; e.has_actor=true; e.actor=actor.id; e.path=path; e.sound_channel="auto"; e.volume=1; e.attenuation=0; do_emit(s,e);
+      qa_cleanup_pop(&path_scope); free(path); return;
     }
     case W_AMBIENT: {
-      const char *path0 = qa_compat_qc_machine_arg_string(m,1); char path[512]; snprintf(path,sizeof path,"%s",path0);
+      char *path = dup_text(qa_compat_qc_machine_arg_string(m,1));
+      qa_cleanup path_scope; qa_cleanup_push(&path_scope, free, path);
       qa_compat_qc_precached_resource res;
-      if (!sv->lookup(sv->ctx,"sound",path,&res)) { char buf[600]; snprintf(buf,sizeof buf,"no precache: %s\n",path); sv->print(sv->ctx,buf); return; }
-      do_register(s,res);
-      qa_q1_event e; memset(&e,0,sizeof e); e.kind="ambient"; e.has_origin=true; e.origin=qa_compat_qc_machine_arg_vector(m,0); e.path=path; e.volume=qa_compat_qc_machine_arg_float(m,2); e.attenuation=qa_compat_qc_machine_arg_float(m,3); do_emit(s,e); return;
+      if (!sv->lookup(sv->ctx,"sound",path,&res)) print_formatted(s, format_text("no precache: %s\n",path));
+      else {
+        do_register(s,res);
+        qa_q1_event e; memset(&e,0,sizeof e); e.kind="ambient"; e.has_origin=true; e.origin=qa_compat_qc_machine_arg_vector(m,0); e.path=path; e.volume=qa_compat_qc_machine_arg_float(m,2); e.attenuation=qa_compat_qc_machine_arg_float(m,3); do_emit(s,e);
+      }
+      qa_cleanup_pop(&path_scope); free(path); return;
     }
     case W_PARTICLE: { qa_q1_event e; memset(&e,0,sizeof e); e.kind="particles"; e.has_origin=true; e.origin=qa_compat_qc_machine_arg_vector(m,0); e.direction=qa_compat_qc_machine_arg_vector(m,1); e.color=trunc(qa_compat_qc_machine_arg_float(m,2)); e.count=trunc(qa_compat_qc_machine_arg_float(m,3)); do_emit(s,e); return; }
     case W_LIGHTSTYLE: {
@@ -238,7 +279,7 @@ qa_compat_qc_presentation_bindings qa_compat_qc_create_presentation_bindings(qa_
   static const char *const inert0[] = {"ex_bot_movetopoint","ex_bot_followentity","ex_walkpathtogoal","ex_promptchoice"};
   for (size_t i = 0; i < 4; i++) INSTALL(inert0[i], W_INERT0);
   bool qw = world->program->api.kind == QA_QUAKEC_API_Q1_QUAKEWORLD;
-  if (qw && !services.qw) qa_range_error("QuakeWorld presentation requires routed message services");
+  if (qw && !services.qw) qa_raise("Error", 0, 0, "QuakeWorld presentation requires routed message services");
   INSTALL("bprint", W_BPRINT); INSTALL("ex_bprint", W_EXBPRINT);
   INSTALL("localcmd", W_LOCALCMD); INSTALL("makestatic", W_MAKESTATIC);
   if (services.message || (qw && services.qw)) {
@@ -282,11 +323,11 @@ static void emit_nq_effects(B *b, qa_netquake_message *messages, size_t count, c
   qa_cleanup scope; qa_cleanup_push(&scope, effect_scope_free, &s);
   for (size_t i = 0; i < count; i++) {
     long long offset = s.encoded.cursize;
-    if (strcmp(messages[i].kind, "entity") == 0) qa_range_error("QC cannot write host entity snapshots");
+    if (strcmp(messages[i].kind, "entity") == 0) qa_raise("Error", 0, 0, "QC cannot write host entity snapshots");
     qa_write_netquake_message(&s.encoded, b->decoder.protocol, &messages[i], b->decoder.rerelease_messages, b->decoder.standard_quake);
     if (strcmp(messages[i].kind, "temporary-entity") != 0) {
       if (routed) continue;
-      qa_range_error("Unsupported QC broadcast message %s", messages[i].kind);
+      qa_raise("Error", 0, 0, "Unsupported QC broadcast message %s", messages[i].kind);
     }
     qa_actor_id owner; bool has_owner = owner_get(owners, owner_count, offset + 2, &owner);
     s.effects[i] = qa_compat_qc_quake_temporary_event(messages[i].effect, has_owner ? &owner : NULL, false); s.has[i] = true;
@@ -315,8 +356,13 @@ static void route_buffer(B *b, qa_size_buf *buffer, const qa_compat_qc_owner_ent
     s.view_has = calloc(s.count ? s.count : 1, sizeof *s.view_has);
     if (!s.view_targets || !s.view_has) qa_range_error("message view allocation failed");
     for (size_t i = 0; i < s.count; i++) {
-      if (strcmp(s.nq[i].kind, "entity") == 0) qa_range_error("QC cannot write host entity snapshots");
-      if (strcmp(s.nq[i].kind, "set-view") == 0) s.view_has[i] = owner_get(owners, owner_count, s.encoded.cursize + 1, &s.view_targets[i]);
+      if (strcmp(s.nq[i].kind, "entity") == 0) qa_raise("Error", 0, 0, "QC cannot write host entity snapshots");
+      /* TS viewTargets.set(index, owners.get(offset) ?? null): every set-view has an entry, null when the
+       * written entity had no owned actor (all-zero actor, token NULL). */
+      if (strcmp(s.nq[i].kind, "set-view") == 0) {
+        s.view_has[i] = true;
+        if (!owner_get(owners, owner_count, s.encoded.cursize + 1, &s.view_targets[i])) memset(&s.view_targets[i], 0, sizeof s.view_targets[i]);
+      }
       qa_write_netquake_message(&s.encoded, b->decoder.protocol, &s.nq[i], b->decoder.rerelease_messages, b->decoder.standard_quake);
     }
     qa_size_buf_destroy(&s.encoded); s.has_encoded = false;
@@ -329,7 +375,7 @@ static void route_buffer(B *b, qa_size_buf *buffer, const qa_compat_qc_owner_ent
     qa_cleanup_pop(&scope); route_scope_free(&s);
     return;
   }
-  if (!b->qw) qa_range_error("Missing QuakeWorld routing service");
+  if (!b->qw) qa_raise("Error", 0, 0, "Missing QuakeWorld routing service");
   size_t len = 0; s.bytes = qa_size_buf_bytes(buffer, &len);
   s.qw = qa_quakeworld_decoder_decode(&b->qw_decoder, s.bytes, len, 0, &s.count);
   if (!qa_size_buf_init(&s.encoded, maxsize, false)) qa_range_error("message buffer allocation failed");
@@ -337,14 +383,14 @@ static void route_buffer(B *b, qa_size_buf *buffer, const qa_compat_qc_owner_ent
   s.entries = calloc(s.count ? s.count : 1, sizeof *s.entries);
   if (!s.entries) qa_range_error("message entry allocation failed");
   for (size_t i = 0; i < s.count; i++) {
-    if (strcmp(s.qw[i].kind, "packet-entities") == 0 || strcmp(s.qw[i].kind, "invalid-delta") == 0) qa_range_error("QC cannot write snapshot entity deltas");
+    if (strcmp(s.qw[i].kind, "packet-entities") == 0 || strcmp(s.qw[i].kind, "invalid-delta") == 0) qa_raise("Error", 0, 0, "QC cannot write snapshot entity deltas");
     long long offset = s.encoded.cursize;
     qa_write_quakeworld_message(&s.encoded, b->qw_decoder.protocol, &s.qw[i]);
     qa_actor_id actor; bool has = false;
     if (strcmp(s.qw[i].kind, "temporary-entity") == 0 && s.qw[i].effect.kind == QA_TE_BEAM) has = owner_get(owners, owner_count, offset + 2, &actor);
     else if (strcmp(s.qw[i].kind, "sound") == 0 || strcmp(s.qw[i].kind, "stop-sound") == 0) has = owner_get(owners, owner_count, -offset - 2, &actor);
     else if (strcmp(s.qw[i].kind, "muzzle-flash") == 0 || strcmp(s.qw[i].kind, "set-view") == 0) has = owner_get(owners, owner_count, offset + 1, &actor);
-    if (strcmp(s.qw[i].kind, "temporary-entity") == 0 && s.qw[i].effect.kind == QA_TE_BEAM && !has) qa_range_error("QC beam had no owned actor when written");
+    if (strcmp(s.qw[i].kind, "temporary-entity") == 0 && s.qw[i].effect.kind == QA_TE_BEAM && !has) qa_raise("Error", 0, 0, "QC beam had no owned actor when written");
     s.entries[i].message = s.qw[i]; s.entries[i].has_actor = has; if (has) s.entries[i].actor = actor;
   }
   qa_size_buf_destroy(&s.encoded); s.has_encoded = false;
@@ -434,9 +480,9 @@ bool qa_compat_qc_broadcast_messages_init(B *b, qa_compat_qc_presentation_world 
   qa_quakeworld_profile qwproto = {"q1-quakeworld", 28, 0, 0};
   qa_quakeworld_decoder_init(&b->qw_decoder, qwproto);
   bool is_qw = world->program->api.kind == QA_QUAKEC_API_Q1_QUAKEWORLD;
-  if (is_qw && !qw) qa_range_error("QuakeWorld messages require routed message services");
-  if (!is_qw && qw) qa_range_error("NetQuake messages cannot use QuakeWorld routes");
-  if (is_qw && nq) qa_range_error("QuakeWorld cannot use NetQuake routes");
+  if (is_qw && !qw) qa_raise("Error", 0, 0, "QuakeWorld messages require routed message services");
+  if (!is_qw && qw) qa_raise("Error", 0, 0, "NetQuake messages cannot use QuakeWorld routes");
+  if (is_qw && nq) qa_raise("Error", 0, 0, "QuakeWorld cannot use NetQuake routes");
   static const struct { const char *name; int which; } defs[8] = {{"WriteByte",BW_BYTE},{"WriteChar",BW_CHAR},{"WriteShort",BW_SHORT},{"WriteLong",BW_LONG},{"WriteCoord",BW_COORD},{"WriteAngle",BW_ANGLE},{"WriteString",BW_STRING},{"WriteEntity",BW_ENTITY}};
   size_t n = 0;
   for (int i = 0; i < 8; i++) { b->ctxs[n].self=b; b->ctxs[n].which=defs[i].which; b->host_entries[n]=(qa_compat_qc_host_binding){defs[i].name, {&b->ctxs[n], write_fn}}; n++; }
@@ -455,7 +501,7 @@ void qa_compat_qc_broadcast_messages_flush_signon(B *b) {
   if (b->nq) return;
   qa_compat_qc_routed_buffer *entry = routed_get(b, "signon");
   if (entry && entry->buffer.cursize >= QA_Q1_MAX_DATAGRAM - 512) {
-    if (b->signon_buffers == 7) qa_range_error("QW MAX_SIGNON_BUFFERS exhausted");
+    if (b->signon_buffers == 7) qa_raise("Error", 0, 0, "QW MAX_SIGNON_BUFFERS exhausted");
     b->signon_buffers++;
     route_buffer(b, &entry->buffer, entry->owners, entry->owner_count, (qa_compat_qc_message_destination){QA_QC_DEST_SIGNON,false,{{NULL,NULL},0,0,NULL},{0,0,0},NULL});
     routed_delete(b, "signon");
@@ -467,8 +513,15 @@ void qa_compat_qc_broadcast_messages_set_dropped(B *b, void *ctx, void (*dropped
 static void route_dropping(B *b, void (*route)(void *), void *ctx) {
   qa_caught_error caught;
   if (qa_try(route, ctx, &caught) || !b->dropped) return;
-  char text[QA_CAUGHT_MESSAGE_CAPACITY + 32]; snprintf(text, sizeof text, "Dropped QC message: %s\n", caught.message);
+  /* TS `Dropped QC message: ${error.message}\n`: the whole message. */
+  const char *message = qa_caught_message(&caught);
+  size_t length = strlen("Dropped QC message: \n") + strlen(message) + 1;
+  char *text = malloc(length);
+  if (!text) qa_range_error("message drop allocation failed");
+  snprintf(text, length, "Dropped QC message: %s\n", message);
+  qa_cleanup scope; qa_cleanup_push(&scope, free, text);
   b->dropped(b->dropped_ctx, text);
+  qa_cleanup_pop(&scope); free(text);
 }
 typedef struct { B *b; qa_compat_qc_routed_buffer entry; } FlushRoute;
 static void flush_route(void *ctx) { FlushRoute *f = ctx; route_buffer(f->b, &f->entry.buffer, f->entry.owners, f->entry.owner_count, f->entry.destination); }
@@ -507,7 +560,7 @@ void qa_compat_qc_broadcast_messages_flush(B *b) {
 uint8_t *qa_compat_qc_broadcast_capture_netquake_messages(B *b, const qa_netquake_message *messages, size_t count, size_t *out_len) {
   qa_size_buf buffer; if (!qa_size_buf_init(&buffer, 8000, false)) return NULL;
   for (size_t i = 0; i < count; i++) {
-    if (strcmp(messages[i].kind, "entity") == 0) qa_range_error("QC cannot write host entity snapshots");
+    if (strcmp(messages[i].kind, "entity") == 0) qa_raise("Error", 0, 0, "QC cannot write host entity snapshots");
     qa_write_netquake_message(&buffer, b->decoder.protocol, &messages[i], b->decoder.rerelease_messages, b->decoder.standard_quake);
   }
   uint8_t *r = qa_size_buf_bytes(&buffer, out_len); qa_size_buf_destroy(&buffer); return r;
@@ -545,7 +598,8 @@ qa_compat_qc_message_destination qa_compat_qc_read_destination(const qa_save_rea
     qa_save_reader_destroy(&af);
     r.reliable = qa_save_reader_literal_boolean(&rf, true); qa_save_reader_destroy(&rf); return r;
   }
-  r.kind = QA_QC_DEST_MULTICAST; r.reliable = qa_save_reader_boolean(&rf); qa_save_reader_destroy(&rf);
+  /* TS literal order: origin x, y, z, then visibility, then reliable. */
+  r.kind = QA_QC_DEST_MULTICAST;
   qa_save_reader of, xf, yf, zf, vf;
   qa_save_reader_field(reader, "origin", &of);
   qa_save_reader_field(&of, "x", &xf); r.origin.x = qa_save_reader_finite(&xf); qa_save_reader_destroy(&xf);
@@ -555,6 +609,7 @@ qa_compat_qc_message_destination qa_compat_qc_read_destination(const qa_save_rea
   qa_save_reader_field(reader, "visibility", &vf);
   static const char *const vis[3] = {"all","pvs","phs"};
   r.visibility = qa_save_reader_choice_string(&vf, vis, 3); qa_save_reader_destroy(&vf);
+  r.reliable = qa_save_reader_boolean(&rf); qa_save_reader_destroy(&rf);
   return r;
 }
 /* Capture/restore */
@@ -574,10 +629,16 @@ static qa_save_value *vec_value(double x, double y, double z) {
   qa_save_value *o = qa_save_value_object(); if (!o) return NULL;
   qa_save_value_set(o, "x", qa_save_value_number(x)); qa_save_value_set(o, "y", qa_save_value_number(y)); qa_save_value_set(o, "z", qa_save_value_number(z)); return o;
 }
+/* captureWireEntity writes origin and angles as three-number lists, which is what the wire entity readers take. */
+static qa_save_value *triple_value(const double v[3]) {
+  qa_save_value *list = qa_save_value_array(); if (!list) return NULL;
+  for (int i = 0; i < 3; i++) qa_save_value_push(list, qa_save_value_number(v[i]));
+  return list;
+}
 static qa_save_value *wire_value(const qa_captured_wire_entity *s, bool qw, double number, double flags) {
   qa_save_value *o = qa_save_value_object(); if (!o) return NULL;
-  qa_save_value_set(o, "origin", vec_value(s->origin[0], s->origin[1], s->origin[2]));
-  qa_save_value_set(o, "angles", vec_value(s->angles[0], s->angles[1], s->angles[2]));
+  qa_save_value_set(o, "origin", triple_value(s->origin));
+  qa_save_value_set(o, "angles", triple_value(s->angles));
   qa_save_value_set(o, "modelindex", qa_save_value_number(s->modelindex));
   qa_save_value_set(o, "frame", qa_save_value_number(s->frame));
   qa_save_value_set(o, "colormap", qa_save_value_number(s->colormap));
@@ -627,8 +688,9 @@ static qa_save_value *destination_value(qa_compat_qc_message_destination d) {
   qa_save_value_set(o, "kind", qa_save_value_string(kind));
   if (d.kind == QA_QC_DEST_CLIENT) { qa_saved_actor_id s = qa_saved_actor_id_of(d.actor); qa_save_value *a = qa_save_value_object();
     qa_save_value_set(a, "slot", qa_save_value_number(s.slot)); qa_save_value_set(a, "generation", qa_save_value_number(s.generation)); qa_save_value_set(o, "actor", a); }
-  if (d.kind != QA_QC_DEST_SIGNON) qa_save_value_set(o, "reliable", qa_save_value_boolean(d.reliable));
+  /* TS key order: client {kind, actor, reliable}, broadcast {kind, reliable}, multicast {kind, origin, visibility, reliable}. */
   if (d.kind == QA_QC_DEST_MULTICAST) { qa_save_value_set(o, "origin", vec_value(d.origin.x, d.origin.y, d.origin.z)); qa_save_value_set(o, "visibility", qa_save_value_string(d.visibility)); }
+  if (d.kind != QA_QC_DEST_SIGNON) qa_save_value_set(o, "reliable", qa_save_value_boolean(d.reliable));
   return o;
 }
 qa_save_value *qa_compat_qc_broadcast_messages_capture(B *b) {
@@ -656,9 +718,14 @@ qa_save_value *qa_compat_qc_broadcast_messages_capture(B *b) {
   qa_save_value_set(o, "routedBuffers", arr);
   return o;
 }
+static void routed_buffer_free(void *arg) {
+  qa_compat_qc_routed_buffer *entry = arg;
+  free(entry->key); qa_size_buf_destroy(&entry->buffer); free(entry->owners);
+  entry->key = NULL; entry->owners = NULL; entry->owner_count = 0;
+}
 static void restore_buffer(const qa_save_reader *reader, qa_size_buf *target, const uint8_t *bytes, size_t length, bool overflowed) {
   if ((long long)length > target->maxsize) qa_save_reader_fail(reader, "saved message exceeds buffer capacity");
-  qa_size_buf_clear(target); memcpy(target->data, bytes, length); target->cursize = (long long)length; target->overflowed = overflowed;
+  qa_size_buf_clear(target); if (length != 0) memcpy(target->data, bytes, length); /* empty bytes may be NULL */ target->cursize = (long long)length; target->overflowed = overflowed;
 }
 static void read_owners(const qa_save_reader *field, qa_compat_qc_actor_resolver resolve, qa_compat_qc_owner_entry **out, size_t *out_n, size_t *out_cap) {
   *out = NULL; *out_n = 0; *out_cap = 0;
@@ -703,15 +770,21 @@ void qa_compat_qc_broadcast_messages_restore(B *b, const qa_save_value *value, q
     int64_t max_allowed = 8000 > QA_Q1_MAX_MSGLEN * 5 ? 8000 : QA_Q1_MAX_MSGLEN * 5;
     if (maxsize > max_allowed) qa_save_reader_fail(&reader, "invalid routed buffer capacity");
     qa_save_reader aof; qa_save_reader_field(&entry, "allowoverflow", &aof); bool ao = qa_save_reader_boolean(&aof); qa_save_reader_destroy(&aof);
-    if (routed_get(b, key)) qa_save_reader_fail(&reader, "duplicate routed buffer");
-    if (b->routed_count == b->routed_capacity) { size_t c = b->routed_capacity ? b->routed_capacity*2 : 4; b->routed = realloc(b->routed, c*sizeof *b->routed); b->routed_capacity = c; }
-    qa_compat_qc_routed_buffer *rb = &b->routed[b->routed_count++]; memset(rb, 0, sizeof *rb);
-    rb->key = strdup(key); qa_size_buf_init(&rb->buffer, maxsize, ao);
+    /* TS order: new SizeBuf, bytes, overflowed, the capacity check, then the duplicate key, then the owners. */
+    qa_compat_qc_routed_buffer restored; memset(&restored, 0, sizeof restored);
+    if (!qa_size_buf_init(&restored.buffer, maxsize, ao)) qa_range_error("routed buffer allocation failed");
+    qa_cleanup restored_scope; qa_cleanup_push(&restored_scope, routed_buffer_free, &restored);
     qa_save_reader byf, ovf, owf;
     qa_save_reader_field(&entry, "bytes", &byf); size_t ebl = 0; const uint8_t *ebb = qa_save_reader_bytes(&byf, &ebl);
     qa_save_reader_field(&entry, "overflowed", &ovf); bool eov = qa_save_reader_boolean(&ovf); qa_save_reader_destroy(&ovf);
-    restore_buffer(&reader, &rb->buffer, ebb, ebl, eov); qa_save_reader_destroy(&byf);
-    qa_save_reader_field(&entry, "owners", &owf); read_owners(&owf, resolve, &rb->owners, &rb->owner_count, &rb->owner_capacity); qa_save_reader_destroy(&owf);
+    restore_buffer(&reader, &restored.buffer, ebb, ebl, eov); qa_save_reader_destroy(&byf);
+    if (routed_get(b, key)) qa_save_reader_fail(&reader, "duplicate routed buffer");
+    qa_save_reader_field(&entry, "owners", &owf); read_owners(&owf, resolve, &restored.owners, &restored.owner_count, &restored.owner_capacity); qa_save_reader_destroy(&owf);
+    restored.key = strdup(key);
+    if (!restored.key) qa_range_error("routed buffer allocation failed");
+    if (b->routed_count == b->routed_capacity) { size_t c = b->routed_capacity ? b->routed_capacity*2 : 4; qa_compat_qc_routed_buffer *grown = realloc(b->routed, c*sizeof *b->routed); if (!grown) qa_range_error("routed buffer allocation failed"); b->routed = grown; b->routed_capacity = c; }
+    qa_cleanup_pop(&restored_scope);
+    qa_compat_qc_routed_buffer *rb = &b->routed[b->routed_count++]; *rb = restored;
     rb->has_destination = has_dest; rb->destination = dest;
     qa_save_reader_destroy(&entry);
   }
@@ -724,7 +797,7 @@ qa_save_value *qa_compat_qc_broadcast_capture_entries(B *b, const qa_compat_qc_r
   qa_save_value_set(o, "flags", qa_save_value_number(qa_q1_protocol_flags(b->qw_decoder.protocol)));
   qa_save_value *arr = qa_save_value_array();
   for (size_t i = 0; i < count; i++) {
-    if (strcmp(entries[i].message.kind, "packet-entities") == 0 || strcmp(entries[i].message.kind, "invalid-delta") == 0) qa_range_error("QC source messages cannot contain snapshot entity deltas");
+    if (strcmp(entries[i].message.kind, "packet-entities") == 0 || strcmp(entries[i].message.kind, "invalid-delta") == 0) qa_raise("Error", 0, 0, "QC source messages cannot contain snapshot entity deltas");
     qa_size_buf buffer; qa_size_buf_init(&buffer, QA_Q1_MAX_MSGLEN * 5, false);
     qa_write_quakeworld_message(&buffer, b->qw_decoder.protocol, &entries[i].message);
     size_t len = 0; uint8_t *bytes = qa_size_buf_bytes(&buffer, &len); qa_size_buf_destroy(&buffer);
@@ -742,6 +815,14 @@ void qa_compat_qc_routed_messages_free(qa_compat_qc_routed_message *entries, siz
   for (size_t i = 0; i < count; i++) qa_quakeworld_message_destroy(&entries[i].message);
   free(entries);
 }
+typedef struct { qa_quakeworld_decoder *decoder; qa_compat_qc_routed_message *entries; size_t count; qa_quakeworld_message *batch; size_t batch_count; } RestoredEntries;
+static void restored_entries_free(void *arg) {
+  RestoredEntries *owned = arg;
+  for (size_t i = 0; i < owned->batch_count; i++) qa_quakeworld_message_destroy(&owned->batch[i]);
+  free(owned->batch);
+  qa_compat_qc_routed_messages_free(owned->entries, owned->count);
+  qa_quakeworld_decoder_destroy(owned->decoder);
+}
 qa_compat_qc_routed_message *qa_compat_qc_broadcast_restore_entries(B *b, const qa_save_value *value, qa_compat_qc_actor_resolver resolve, size_t *out_count) {
   (void)b;
   qa_save_reader reader; qa_save_reader_init(&reader, value, "qc.routed");
@@ -752,16 +833,20 @@ qa_compat_qc_routed_message *qa_compat_qc_broadcast_restore_entries(B *b, const 
   size_t n = qa_save_reader_list_count(&ef);
   qa_compat_qc_routed_message *out = calloc(n ? n : 1, sizeof *out);
   if (!out) { qa_save_reader_destroy(&ef); qa_save_reader_destroy(&reader); qa_quakeworld_decoder_destroy(&decoder); return NULL; }
+  /* A refused entry releases the decoder, the entries read so far and the decoded batch. */
+  RestoredEntries owned = {&decoder, out, 0, NULL, 0};
+  qa_cleanup scope; qa_cleanup_push(&scope, restored_entries_free, &owned);
   for (size_t i = 0; i < n; i++) {
     qa_save_reader item, bf, af; qa_save_reader_item(&ef, i, &item);
     qa_save_reader_field(&item, "bytes", &bf); size_t bl = 0; const uint8_t *bb = qa_save_reader_bytes(&bf, &bl);
-    size_t mc = 0; qa_quakeworld_message *messages = qa_quakeworld_decoder_decode(&decoder, bb, bl, 0, &mc);
+    owned.batch = qa_quakeworld_decoder_decode(&decoder, bb, bl, 0, &owned.batch_count);
     qa_save_reader_destroy(&bf);
-    if (mc != 1 || strcmp(messages[0].kind, "packet-entities") == 0 || strcmp(messages[0].kind, "invalid-delta") == 0) qa_save_reader_fail(&item, "invalid saved source message");
-    out[i].message = messages[0]; free(messages);
+    if (owned.batch_count != 1 || strcmp(owned.batch[0].kind, "packet-entities") == 0 || strcmp(owned.batch[0].kind, "invalid-delta") == 0) qa_save_reader_fail(&item, "invalid saved source message");
+    out[i].message = owned.batch[0]; free(owned.batch); owned.batch = NULL; owned.batch_count = 0; owned.count = i + 1;
     qa_save_reader_field(&item, "actor", &af); out[i].has_actor = read_qc_actor(&af, resolve, &out[i].actor); qa_save_reader_destroy(&af);
     qa_save_reader_destroy(&item);
   }
+  qa_cleanup_pop(&scope);
   qa_save_reader_destroy(&ef); qa_save_reader_destroy(&reader); qa_quakeworld_decoder_destroy(&decoder);
   *out_count = n; return out;
 }

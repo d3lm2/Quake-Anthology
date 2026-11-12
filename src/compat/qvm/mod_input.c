@@ -39,7 +39,7 @@ static qa_q3_wire_user_command read_wire_user_command(const qa_qvm_writable_view
 
 static double scalar_value(int32_t result, const char *encoding) {
   double value = strcmp(encoding, "int32") == 0 ? (double)result : (double)qa_bits_to_float32((uint32_t)result);
-  if (!isfinite(value)) qa_range_error("QVM input returned a nonfinite scalar");
+  if (!isfinite(value)) qa_raise("Error", 0, 0, "QVM input returned a nonfinite scalar");
   return value;
 }
 
@@ -50,11 +50,11 @@ static void validate_pointer(qa_qvm_mod_input *input, const qa_qvm_mod_input_poi
     double offset = pointer->indirections.values[i];
     if (!isfinite(offset) || offset != trunc(offset) || offset < 0 || offset > 9007199254740991.0) invalid = true;
   }
-  if (invalid) qa_range_error("Invalid QVM input pointer path");
+  if (invalid) qa_raise("Error", 0, 0, "Invalid QVM input pointer path");
   if (!pointer->is_global) {
     if (!isfinite(pointer->index) || pointer->index != trunc(pointer->index) || pointer->index < 0 ||
         pointer->index > 9007199254740991.0 || pointer->index >= QVM_MAX_PRIVATE_ARGUMENT_WORDS)
-      qa_range_error("Invalid QVM input pointer argument");
+      qa_raise("Error", 0, 0, "Invalid QVM input pointer argument");
   } else {
     /* TS dataView(address, 4) rejects non-safe-integer addresses via
      * writes.range; check before the int64 cast truncates them. */
@@ -72,7 +72,7 @@ static int64_t resolve_address(const qa_qvm_mod_input_pointer *pointer, qa_qvm_m
   if (!pointer->is_global) {
     size_t offset = (size_t)(int64_t)pointer->index * 4;
     if (offset > call->words_length || call->words_length - offset < 4)
-      qa_range_error("Offset is outside the bounds of the DataView");
+      qa_range_error("Out of bounds access");
     uint32_t bits = (uint32_t)call->words[offset] | ((uint32_t)call->words[offset + 1] << 8) |
                     ((uint32_t)call->words[offset + 2] << 16) | ((uint32_t)call->words[offset + 3] << 24);
     address = (int32_t)bits;
@@ -154,7 +154,7 @@ static qa_mod_client_input_output read_field(qa_qvm_mod_input *input, const qa_q
     result.vector_value.y = (double)qa_qvm_writable_view_get_float32(&view, 4, true);
     result.vector_value.z = (double)qa_qvm_writable_view_get_float32(&view, 8, true);
     if (!isfinite(result.vector_value.x) || !isfinite(result.vector_value.y) || !isfinite(result.vector_value.z))
-      qa_range_error("QVM input returned nonfinite angles");
+      qa_raise("Error", 0, 0, "QVM input returned nonfinite angles");
     return result;
   }
   result.number_value = scalar_value(qa_qvm_writable_view_get_int32(&view, 0, true), output->value_encoding) /
@@ -265,9 +265,31 @@ typedef struct declaration_group {
   size_t count;
 } declaration_group;
 
+static bool same_pointer_path(const qa_qvm_mod_input_pointer *a, const qa_qvm_mod_input_pointer *b) {
+  return a->is_global == b->is_global && a->index == b->index && a->address == b->address && a->offset == b->offset &&
+         a->indirections.values == b->indirections.values && a->indirections.count == b->indirections.count;
+}
+
+/* TS `capture.selected.has(output)` is object identity: the outputs handed to output() are the declared
+ * objects the constructor registered. In C a declared output can reach the two calls through different
+ * storage: a caller registers a flattened copy of several bindings' rows and later passes one binding's own
+ * array (mod_provider.c), or passes a filtered copy. Struct assignment keeps every borrowed pointer of the
+ * row (its inputs list, its indirection lists), so a copy of one declared handler or command row is the row
+ * whose fields and borrowed storage are all the same; two separately declared rows own separate storage. */
+static bool same_declaration(const qa_qvm_mod_input_output *a, const qa_qvm_mod_input_output *b) {
+  if (a == b) return true;
+  if (strcmp(a->kind, b->kind) != 0 || strcmp(a->kind, "field") == 0) return false;
+  if (a->entry != b->entry || strcmp(a->actor_record, b->actor_record) != 0) return false;
+  if (!same_pointer_path(&a->actor_pointer, &b->actor_pointer)) return false;
+  if (a->inputs != b->inputs || a->input_count != b->input_count) return false;
+  if (strcmp(a->kind, "command") == 0) return same_pointer_path(&a->command, &b->command);
+  if (a->has_returns != b->has_returns) return false;
+  return !a->has_returns || (strcmp(a->returns_encoding, b->returns_encoding) == 0 && a->returns_value == b->returns_value);
+}
+
 static bool is_selected(const capture *capture, const qa_qvm_mod_input_output *output) {
   for (size_t i = 0; i < capture->selected_count; i++)
-    if (&capture->selected[i] == output) return true;
+    if (same_declaration(&capture->selected[i], output)) return true;
   return false;
 }
 
@@ -296,6 +318,10 @@ static int32_t invoke_hook(void *ctx, qa_qvm_module_function_call *call) {
   qa_actor_id actor = capture->application->identity.actor;
   const qa_qvm_mod_input_output **selected = xmalloc(group->count * sizeof *selected);
   size_t selected_count = 0;
+  /* The pointer paths below read guest memory and may be refused. */
+  invoke_unwind_ctx unwind = {capture, capture->command_count, selected, NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, invoke_unwind, &unwind);
   for (size_t i = 0; i < group->count; i++) {
     int64_t left;
     int64_t right;
@@ -306,8 +332,11 @@ static int32_t invoke_hook(void *ctx, qa_qvm_module_function_call *call) {
       selected[selected_count++] = output;
   }
   command_capture *local = xmalloc(selected_count * sizeof *local);
+  unwind.local = local;
   size_t local_count = 0;
   size_t start = capture->command_count;
+  /* TS builds the whole list, then pushes it: a refused read pushes nothing
+   * (the unwind truncates back to `start`). */
   for (size_t i = 0; i < selected_count; i++) {
     if (strcmp(selected[i]->kind, "command") != 0) continue;
     int64_t address = resolve_address(&selected[i]->command, call);
@@ -324,11 +353,9 @@ static int32_t invoke_hook(void *ctx, qa_qvm_module_function_call *call) {
     capture->commands[capture->command_count++] = local[local_count];
     local_count++;
   }
-  invoke_unwind_ctx unwind = {capture, start, selected, local};
-  qa_cleanup guard;
-  qa_cleanup_push(&guard, invoke_unwind, &unwind);
   int32_t result = proceed_call(call);
-  qa_cleanup_pop(&guard);
+  /* TS try { return finish(call.proceed()); } finally { remove(); }: the
+   * commands leave the capture when finish() raises too. */
   if (capture_active(input, capture)) {
     for (size_t i = 0; i < selected_count; i++) {
       if (strcmp(selected[i]->kind, "handler") != 0) continue;
@@ -349,11 +376,18 @@ static int32_t invoke_hook(void *ctx, qa_qvm_module_function_call *call) {
     process_commands(input, capture, local, local_count, true);
     for (size_t i = 0; i < local_count; i++) capture->commands[start + i].before = local[i].before;
   }
+  qa_cleanup_pop(&guard);
   /* Remove this invocation's commands from the capture list. */
   capture->command_count = start;
   free(selected);
   free(local);
   return result;
+}
+
+static void close_on_raise(void *arg) {
+  qa_qvm_mod_input *input = arg;
+  qa_qvm_mod_input_close(input);
+  qa_qvm_mod_input_destroy(input);
 }
 
 void qa_qvm_mod_input_init(qa_qvm_mod_input *input, const qa_qvm_mod_input_operations *operations,
@@ -362,6 +396,10 @@ void qa_qvm_mod_input_init(qa_qvm_mod_input *input, const qa_qvm_mod_input_opera
   input->operations = *operations;
   double *entries_seen = xmalloc(output_count * sizeof *entries_seen);
   size_t entry_count = 0;
+  /* TS catch { this.close(); throw }: a refused output or hook removes what was bound. */
+  qa_cleanup seen_cleanup, refused;
+  qa_cleanup_push(&seen_cleanup, free, entries_seen);
+  qa_cleanup_push(&refused, close_on_raise, input);
   for (size_t i = 0; i < output_count; i++) {
     const qa_qvm_mod_input_output *output = &outputs[i];
     const char *record_id = strcmp(output->kind, "field") == 0 ? output->record : output->actor_record;
@@ -372,15 +410,15 @@ void qa_qvm_mod_input_init(qa_qvm_mod_input *input, const qa_qvm_mod_input_opera
         break;
       }
     }
-    if (record == NULL) qa_range_error("QVM input output names an undeclared actor record");
+    if (record == NULL) qa_raise("Error", 0, 0, "QVM input output names an undeclared actor record");
     if (strcmp(output->kind, "field") == 0) {
       double size = strcmp(output->value_input, "view-angles") == 0 ? 12 : 4;
       if (!isfinite(output->offset) || output->offset != trunc(output->offset) || output->offset < 0 ||
           output->offset > 9007199254740991.0 || output->offset + size > record->stride)
-        qa_range_error("QVM input output exceeds its actor record");
+        qa_raise("Error", 0, 0, "QVM input output exceeds its actor record");
       if (strcmp(output->value_input, "view-angles") != 0 &&
           (!isfinite(output->value_scale) || output->value_scale <= 0))
-        qa_range_error("QVM input field scale must be positive");
+        qa_raise("Error", 0, 0, "QVM input field scale must be positive");
       continue;
     }
     validate_pointer(input, &output->actor_pointer);
@@ -391,7 +429,7 @@ void qa_qvm_mod_input_init(qa_qvm_mod_input *input, const qa_qvm_mod_input_opera
           (strcmp(output->returns_encoding, "float32") == 0
                ? !isfinite((double)(float)value)
                : value != trunc(value) || value < -2147483648.0 || value > 2147483647.0))
-        qa_range_error("Invalid QVM input handler return value");
+        qa_raise("Error", 0, 0, "Invalid QVM input handler return value");
     }
     bool seen = false;
     for (size_t e = 0; e < entry_count; e++) if (entries_seen[e] == output->entry) seen = true;
@@ -399,10 +437,12 @@ void qa_qvm_mod_input_init(qa_qvm_mod_input *input, const qa_qvm_mod_input_opera
   }
   input->removal_ids = xmalloc(entry_count * sizeof *input->removal_ids);
   input->groups = xmalloc(entry_count * sizeof *input->groups);
-  input->group_count = entry_count;
+  input->group_count = 0;
   for (size_t e = 0; e < entry_count; e++) {
     declaration_group *group = xmalloc(sizeof *group);
+    group->declarations = NULL;
     input->groups[e] = group;
+    input->group_count = e + 1;
     group->input = input;
     group->outputs = outputs;
     group->declarations = xmalloc(output_count * sizeof *group->declarations);
@@ -418,6 +458,8 @@ void qa_qvm_mod_input_init(qa_qvm_mod_input *input, const qa_qvm_mod_input_opera
     input->removal_ids[input->removal_count++] =
         qa_qvm_module_bind_invocation(operations->module, &reference, invoke_hook, group);
   }
+  qa_cleanup_pop(&refused);
+  qa_cleanup_pop(&seen_cleanup);
   free(entries_seen);
 }
 
@@ -495,12 +537,14 @@ static void output_finish(void *ctx) {
   free_capture(unwind->created);
 }
 
+static void free_capture_on_raise(void *arg) { free_capture(arg); }
+
 qa_mod_client_input_output *qa_qvm_mod_input_run_output(qa_qvm_mod_input *input,
                                                     const qa_qvm_mod_input_output *outputs, size_t output_count,
                                                     qa_mod_client_application *application,
                                                     qa_qvm_mod_input_run_fn run, void *run_ctx, size_t *out_count) {
   if (input->application_count == 0 || input->applications[input->application_count - 1] != application)
-    qa_range_error("QVM input output requires its live application");
+    qa_raise("Error", 0, 0, "QVM input output requires its live application");
   qa_actor_id actor = application->identity.actor;
   if (input->capture_count == input->capture_capacity) {
     input->capture_capacity = input->capture_capacity == 0 ? 4 : input->capture_capacity * 2;
@@ -509,7 +553,10 @@ qa_mod_client_input_output *qa_qvm_mod_input_run_output(qa_qvm_mod_input *input,
   }
   capture *created = xmalloc(sizeof *created);
   memset(created, 0, sizeof *created);
-  capture_stack(input)[input->capture_count++] = created;
+  /* TS reads the fields before it pushes the capture: a refused field read
+   * leaves no capture on the stack. */
+  qa_cleanup unpushed;
+  qa_cleanup_push(&unpushed, free_capture_on_raise, created);
   created->application = application;
   created->selected = outputs;
   created->selected_count = output_count;
@@ -523,15 +570,18 @@ qa_mod_client_input_output *qa_qvm_mod_input_run_output(qa_qvm_mod_input *input,
       created->field_count++;
     }
   }
+  qa_cleanup_pop(&unpushed);
+  capture_stack(input)[input->capture_count++] = created;
   output_unwind_ctx unwind = {input, created};
   qa_cleanup guard;
   qa_cleanup_push(&guard, output_finish, &unwind);
   run(run_ctx);
-  qa_cleanup_pop(&guard);
   qa_mod_client_input_output *result = NULL;
   *out_count = 0;
-  if (capture_active(input, created)) {
-    reconcile(input, created, true);
+  bool active = capture_active(input, created);
+  if (active) reconcile(input, created, true); /* inside the TS try: the finally pops */
+  qa_cleanup_pop(&guard);
+  if (active) {
     size_t total = created->change_count + created->consumed_count;
     result = xmalloc(total * sizeof *result);
     if (created->change_count != 0)

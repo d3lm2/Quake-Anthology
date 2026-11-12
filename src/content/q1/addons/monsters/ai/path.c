@@ -172,6 +172,8 @@ static qa_vec3 reader_point(const qa_save_reader *reader) {
   return point;
 }
 static void q1_free_decoded_save(void *value) { qa_save_value_free(value); }
+/* A route under construction when a malformed save raises (TS leaves it to the GC). */
+static void q1_free_partial_route(void *route) { qa_navigation_route_destroy(route); }
 static void nav_restore(void *ctx, const uint8_t *bytes, size_t length) {
   navigation *nav = ctx;
   qa_q1_services *game = nav->game;
@@ -203,6 +205,8 @@ static void nav_restore(void *ctx, const uint8_t *bytes, size_t length) {
     if (!same_map) qa_save_reader_fail(&reader, "saved navigation map is unavailable");
     qa_navigation_route route;
     memset(&route, 0, sizeof route);
+    qa_cleanup route_cleanup; /* nodes, edges and points are owned until path_set takes them */
+    qa_cleanup_push(&route_cleanup, q1_free_partial_route, &route);
     route.map = runtime->graph->map;
     qa_save_reader list;
     field(&reader, "nodes", &list);
@@ -253,6 +257,7 @@ static void nav_restore(void *ctx, const uint8_t *bytes, size_t length) {
     field(&reader, "goal", &goal);
     const qa_vec3 goal_point = reader_point(&goal);
     qa_save_reader_destroy(&goal);
+    qa_cleanup_pop(&route_cleanup);
     (void)path_set(nav, actor, goal_point, route, cursor);
     qa_save_reader_destroy(&reader);
   }

@@ -24,6 +24,7 @@ struct qa_compat_q2_native_weapon_dispatcher {
 };
 typedef qa_compat_q2_native_weapon_dispatcher dispatcher_state;
 
+void qa_compat_q2_native_weapon_dispatcher_destroy(dispatcher_state *s);
 static frame *push_frame(dispatcher_state *s) {
   if (s->frame_count == s->frame_capacity) {
     size_t next = s->frame_capacity == 0 ? 4 : s->frame_capacity * 2;
@@ -74,20 +75,25 @@ static qa_guest_call_result dispatch(void *ctx, const qa_guest_call_value *value
   if (processor != NULL && runner->free_processor != NULL) runner->free_processor(runner->ctx, processor);
   return call.result;
 }
-typedef struct decision_call { qa_compat_q2_inline_continuation *continuation; } decision_call;
-static void decision_body(void *value) { decision_call *c = value; c->continuation->execute(c->continuation->ctx); }
+typedef struct decision_call { qa_compat_q2_inline_continuation *continuation; dispatcher_state *s; const qa_native_weapon_decision *region; qa_actor_id actor; const double *originals; } decision_call;
+/* The TS try block: the cleared input bits are written inside it, so the finally puts them back. */
+static void decision_body(void *value) {
+  decision_call *c = value; dispatcher_state *s = c->s;
+  for (size_t i = 0; i < c->region->field_count; i++)
+    s->operations.write(s->operations.ctx, c->actor, c->region->fields[i].field, (double)(to_int32(c->originals[i]) & ~to_int32(c->region->fields[i].clear_mask)));
+  c->continuation->execute(c->continuation->ctx);
+}
 static void decision(void *ctx, qa_compat_q2_inline_continuation *continuation) {
   region_binding *binding = ctx; dispatcher_state *s = binding->owner; const qa_native_weapon_decision *region = binding->region;
   frame *top = s->frame_count == 0 ? NULL : &s->frames[s->frame_count - 1];
   if (top != NULL) top->reached_decision = true;
   if (top == NULL || top->committed_input || s->operations.selected(s->operations.ctx, top->actor)) { continuation->execute(continuation->ctx); return; }
   qa_actor_id actor = top->actor;
-  if (!s->operations.current(s->operations.ctx, actor)) qa_range_error("Native weapon input outlived its source actor");
+  if (!s->operations.current(s->operations.ctx, actor)) qa_raise("Error", 0, 0, "Native weapon input outlived its source actor");
   double *originals = calloc(region->field_count == 0 ? 1 : region->field_count, sizeof *originals); if (originals == NULL) qa_range_error("Out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, free, originals); /* a field read or write can raise */
   for (size_t i = 0; i < region->field_count; i++) originals[i] = s->operations.read(s->operations.ctx, actor, region->fields[i].field);
-  for (size_t i = 0; i < region->field_count; i++)
-    s->operations.write(s->operations.ctx, actor, region->fields[i].field, (double)(to_int32(originals[i]) & ~to_int32(region->fields[i].clear_mask)));
-  decision_call call = {continuation};
+  decision_call call = {continuation, s, region, actor, originals};
   qa_compat_q2_native_thrown thrown;
   bool completed = qa_compat_q2_native_try(decision_body, &call, &thrown);
   /* Regions contain source reads, never source writes; preserve unrelated bits defensively. */
@@ -96,28 +102,43 @@ static void decision(void *ctx, qa_compat_q2_inline_continuation *continuation) 
     int32_t now = to_int32(s->operations.read(s->operations.ctx, actor, region->fields[i].field));
     s->operations.write(s->operations.ctx, actor, region->fields[i].field, (double)((now & ~mask) | (to_int32(originals[i]) & mask)));
   }
-  free(originals);
+  qa_cleanup_pop(&node); free(originals);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
+}
+typedef struct create_call { dispatcher_state *s; qa_guest_address entry; const qa_native_weapon_decision *decisions; size_t decision_count; qa_provider_id provider; } create_call;
+static void create_body(void *value) {
+  create_call *c = value; dispatcher_state *s = c->s; const qa_compat_q2_native_weapon_host *host = &s->host;
+  size_t arguments = (size_t)s->dispatcher->arguments;
+  qa_compat_q2_guest_call_signature signature; memset(&signature, 0, sizeof signature);
+  signature.abi = s->abi; signature.parameters = s->parameters; signature.parameter_count = arguments; signature.result_is_void = true; signature.variadic = false;
+  /* `${provider}:weapon-dispatcher` with no length limit; the entry binding copies the id. */
+  const char *provider = c->provider != NULL ? c->provider : "";
+  size_t need = strlen(provider) + sizeof ":weapon-dispatcher";
+  char *id = malloc(need); if (id == NULL) qa_range_error("Out of memory");
+  (void)snprintf(id, need, "%s:weapon-dispatcher", provider);
+  qa_cleanup node; qa_cleanup_push(&node, free, id);
+  s->binding = qa_compat_q2_native_entry_bind(host->memory, host->runner, host->ctx, host->invoke, c->entry, id, signature, s, dispatch, NULL, NULL);
+  qa_cleanup_pop(&node); free(id);
+  for (size_t i = 0; i < c->decision_count; i++) {
+    s->regions[i].owner = s; s->regions[i].region = &c->decisions[i];
+    s->regions[i].handle = host->runner->bind_inline_region_accepts(host->runner->ctx, qa_compat_q2_mem_offset(host->memory, host->image_base, (int64_t)c->decisions[i].entry),
+        qa_compat_q2_mem_offset(host->memory, host->image_base, (int64_t)c->decisions[i].join), s->abi, &s->regions[i], decision, NULL, NULL);
+  }
 }
 dispatcher_state *qa_compat_q2_native_weapon_dispatcher_create(const qa_native_weapon_dispatcher *dispatcher, const qa_native_weapon_decision *decisions, size_t decision_count,
     qa_native_abi abi, qa_compat_q2_native_weapon_host host, qa_provider_id provider, qa_compat_q2_native_weapon_operations operations) {
+  /* TS resolves the entry before anything is bound: a throw here leaves nothing behind. */
+  qa_guest_address entry = !strcmp(dispatcher->entry.kind, "rva") ? qa_compat_q2_mem_offset(host.memory, host.image_base, (int64_t)dispatcher->entry.rva) : host.entry(host.ctx, dispatcher->entry.name);
   dispatcher_state *s = calloc(1, sizeof *s); if (s == NULL) qa_range_error("Out of memory");
   s->dispatcher = dispatcher; s->host = host; s->operations = operations; s->abi = abi;
-  qa_guest_address entry = !strcmp(dispatcher->entry.kind, "rva") ? qa_compat_q2_mem_offset(host.memory, host.image_base, (int64_t)dispatcher->entry.rva) : host.entry(host.ctx, dispatcher->entry.name);
   size_t arguments = (size_t)dispatcher->arguments;
   s->parameters = calloc(arguments == 0 ? 1 : arguments, sizeof *s->parameters); if (s->parameters == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < arguments; i++) { s->parameters[i].is_aggregate = false; s->parameters[i].storage = "pointer"; }
-  qa_compat_q2_guest_call_signature signature; memset(&signature, 0, sizeof signature);
-  signature.abi = abi; signature.parameters = s->parameters; signature.parameter_count = arguments; signature.result_is_void = true; signature.variadic = false;
-  char id[256]; (void)snprintf(id, sizeof id, "%s:weapon-dispatcher", provider);
-  s->binding = qa_compat_q2_native_entry_bind(host.memory, host.runner, host.ctx, host.invoke, entry, id, signature, s, dispatch, NULL, NULL);
   s->regions = calloc(decision_count == 0 ? 1 : decision_count, sizeof *s->regions); if (s->regions == NULL) qa_range_error("Out of memory");
-  s->region_count = decision_count;
-  for (size_t i = 0; i < decision_count; i++) {
-    s->regions[i].owner = s; s->regions[i].region = &decisions[i];
-    s->regions[i].handle = host.runner->bind_inline_region_accepts(host.runner->ctx, qa_compat_q2_mem_offset(host.memory, host.image_base, (int64_t)decisions[i].entry),
-        qa_compat_q2_mem_offset(host.memory, host.image_base, (int64_t)decisions[i].join), abi, &s->regions[i], decision, NULL, NULL);
-  }
+  s->region_count = decision_count; /* handles stay 0 until bound */
+  /* TS catch: a bind that throws closes the ones made before it. */
+  create_call call = {s, entry, decisions, decision_count, provider}; qa_caught_error caught;
+  if (!qa_try(create_body, &call, &caught)) { qa_compat_q2_native_weapon_dispatcher_destroy(s); qa_rethrow(&caught); }
   return s;
 }
 bool qa_compat_q2_native_weapon_dispatcher_current_actor(const dispatcher_state *s, qa_actor_id *out) {
@@ -182,7 +203,9 @@ stage *qa_compat_q2_native_mod_weapon_stage_create(const qa_native_weapon_stage 
   qa_compat_q2_native_weapon_operations forwarded = operations;
   forwarded.ctx = s; forwarded.actor = forward_actor; forwarded.current = forward_current; forwarded.selected = forward_selected; forwarded.read = forward_read;
   forwarded.write = forward_write; forwarded.completed = forward_completed; forwarded.cancellation = forward_cancellation; forwarded.committed_input = stage_committed;
+  qa_cleanup node; qa_cleanup_push(&node, free, s); /* a dispatcher that fails to bind raises */
   s->dispatcher = qa_compat_q2_native_weapon_dispatcher_create(&definition->dispatcher, definition->decisions, definition->decision_count, abi, host, provider, forwarded);
+  qa_cleanup_pop(&node);
   return s;
 }
 bool qa_compat_q2_native_mod_weapon_stage_continuing(stage *s, qa_actor_id actor) {
@@ -198,7 +221,7 @@ static qa_item_id selected_item(stage *s, qa_actor_id actor, qa_native_item_poin
   const qa_native_weapon_selection *selection = &s->definition->selection;
   for (size_t i = 0; i < selection->value_count; i++)
     if (o->resolve(o->ctx, selection->values[i].address).byte_offset == pointer.byte_offset) return selection->values[i].item;
-  qa_range_error("Original native selected an undeclared source weapon");
+  qa_raise("Error", 0, 0, "Original native selected an undeclared source weapon");
 }
 qa_item_id qa_compat_q2_native_mod_weapon_stage_active(stage *s, qa_actor_id actor) { return selected_item(s, actor, s->definition->selection.active); }
 qa_item_id qa_compat_q2_native_mod_weapon_stage_pending(stage *s, qa_actor_id actor) {

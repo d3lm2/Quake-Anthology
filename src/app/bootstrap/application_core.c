@@ -82,6 +82,42 @@ char *qa_application_cvar_string(qa_cvar_registry *cvars, const char *name) {
 }
 
 void qa_application_print(qa_application *app, const char *text) { app->host.print(app->host.ctx, text); }
+/* TS hostWithConsoleLog(host, text => application?.logConsole(text)): the log decides whether the game's trigger asks
+ * for it, then the host prints. */
+static void logged_host_print(void *ctx, const char *text) {
+  qa_application *app = ctx;
+  if (app->console_log_attached) qa_app_console_log_write(&app->console_log, text);
+  app->unlogged_host.print(app->unlogged_host.ctx, text);
+}
+/* consoleLog: () => consoleLogMode(this.sourceCvars(), this.options.consoleDebug), () => Application.gameFilesRoot(...) */
+static double console_log_mode(void *ctx) {
+  qa_application *app = ctx;
+  return qa_app_console_log_mode(qa_application_source_cvars(app, app->world_simulation), app->launch_options.console_debug);
+}
+static char *console_log_root(void *ctx) {
+  qa_application *app = ctx;
+  return qa_application_game_files_root(&app->launch_options, app->loaded_content);
+}
+char *qa_application_stock_game_directory(qa_app_loaded_content *content, const qa_app_options *options, const char *fallback) {
+  return qa_app_stock_game_directory(qa_app_loaded_content_catalog(content), qa_app_loaded_content_recipe(content),
+                                     options->native_config_root, fallback);
+}
+char *qa_application_game_files_root(const qa_app_options *options, qa_app_loaded_content *content) {
+  qa_config_store config = qa_application_source_config(options, content);
+  char *root = qa_application_stock_game_directory(content, options, config.root);
+  qa_config_store_destroy(&config);
+  return root;
+}
+bool qa_application_native_saves(qa_application *app, qa_native_save_layout *out) {
+  const qa_content_catalog *catalog = qa_app_loaded_content_catalog(app->loaded_content);
+  const qa_executable_recipe *recipe = qa_app_loaded_content_recipe(app->loaded_content);
+  qa_app_stock_native *folders = qa_app_stock_game_folders(catalog, recipe, app->launch_options.native_config_root);
+  if (folders == NULL) return false;
+  qa_native_save_product product = qa_app_native_save_product(&qa_content_catalog_product(catalog, recipe->engine_behavior.content)->expectation);
+  qa_native_save_layout_build(&folders->layout, &product, out);
+  qa_app_stock_native_destroy(folders);
+  return true;
+}
 void qa_application_printf(qa_application *app, const char *format, ...) {
   va_list args;
   va_start(args, format);
@@ -213,6 +249,9 @@ qa_application *qa_application_construct(qa_app_options launch_options, qa_app_l
   app->world_simulation = world_simulation;
   app->host = host;
   app->original_host = host;
+  app->unlogged_host = host;
+  if (host.print != NULL) { app->host.ctx = app; app->host.print = logged_host_print; }
+  qa_app_console_log_init(&app->console_log, console_log_mode, console_log_root, app);
   app->identity = identity;
   app->ownership = ownership;
   if (local_seat_count != 0) {
@@ -267,13 +306,20 @@ static void free_request_ring(qa_event_ring *ring, qa_event_cursor *cursor) {
   qa_event_ring_destroy(ring);
 }
 
+/* A world replacement's debug graph is one of the application's kept records (application_transition.c keeps each
+ * candidate when it is created); only the graph the application was constructed or opened with is the struct's own. */
+static bool kept_record(const qa_application *app, const void *record) {
+  for (size_t i = 0; i < app->seat_record_count; i++)
+    if (app->seat_records[i].record == record) return true;
+  return false;
+}
 /* TS GC of a closed Application: frees the storage the struct owns. */
 void qa_application_destroy(qa_application *app) {
   if (app == NULL) return;
   /* openSource's simulation, content, session and configuration owners go first (they borrow the application's identity). */
   qa_application_open_free(app);
   qa_app_view_settings_destroy(app->view_settings);
-  free(app->debug_graph);
+  if (!kept_record(app, app->debug_graph)) free(app->debug_graph);
   free_request_ring(&app->requested_commands, &app->requested_cursor);
   size_t round_count = 0;
   qa_app_sim_presentation_event *rounds = qa_event_ring_take(&app->round_presentation_events, &app->round_cursor, &round_count);
@@ -293,7 +339,10 @@ void qa_application_destroy(qa_application *app) {
   for (size_t i = 0; i < app->published_userinfo_count; i++) free(app->published_userinfo[i]);
   free(app->published_userinfo_cvars); free(app->published_userinfo);
   free(app->key_profile_simulations); free(app->key_profiles);
-  free(app->client_inputs); free(app->deferred_input);
+  for (size_t i = 0; i < app->client_input_count; i++) free((char *)app->client_inputs[i].text);
+  free(app->client_inputs);
+  for (size_t i = 0; i < app->deferred_input_count; i++) free((char *)app->deferred_input[i].text);
+  free(app->deferred_input);
   free_presentation_events(app->source_events, app->source_event_count);
   qa_app_unhandled_effects_free(app->unhandled_effects, app->unhandled_effect_count);
   if (app->server_profile_store_value != NULL) { qa_config_store_destroy(app->server_profile_store_value); free(app->server_profile_store_value); }
@@ -326,6 +375,8 @@ void qa_application_destroy(qa_application *app) {
   if (app->dedicated_console != NULL) { qa_dedicated_console_destroy(app->dedicated_console); free(app->dedicated_console); }
   if (app->dedicated_commands != NULL && app->dedicated_commands != app->source_commands) qa_command_buffer_destroy(app->dedicated_commands);
   if (app->published_source_commands != NULL) app->published_source_commands->destroy(app->published_source_commands->ctx);
+  for (size_t i = app->retired_source_command_count; i-- > 0;) app->retired_source_commands[i]->destroy(app->retired_source_commands[i]->ctx);
+  free(app->retired_source_commands);
   if (app->source_commands != NULL) qa_command_buffer_destroy(app->source_commands);
   qa_application_services_free(app);
   qa_application_seats_free(app);
@@ -473,9 +524,11 @@ bool qa_application_level_recovery_available(qa_application *app, qa_app_shared_
           || qa_app_shared_sim_quakec_source(simulation) != NULL);
 }
 
+const char *qa_application_simulation_mode(qa_app_shared_simulation *simulation) { return simulation->options.mode; }
+
 /* TS enableStartupPersistence. */
 void qa_application_enable_startup_persistence(qa_application *app) {
-  if (app->launch_options.dedicated || (app->prepared_startup != NULL && qa_app_prepared_startup_pending(app->prepared_startup))) return;
+  if (app->prepared_startup != NULL && qa_app_prepared_startup_pending(app->prepared_startup)) return;
   app->archive_persistence = true;
   if (app->graphical != NULL) qa_app_application_input_enable_archive_persistence(app->graphical->input);
   if (app->image_settings != NULL) qa_app_image_settings_enable_persistence(app->image_settings);
@@ -508,8 +561,10 @@ bool qa_application_world_failed(const qa_application *app) { return app->fatal_
 bool qa_application_finished(const qa_application *app) {
   return app->stopping || app->closed || (app->launch_options.has_frame_limit && app->frames >= app->launch_options.frame_limit);
 }
-/* TS get videoRestart: owned applications hold their own (borrowed ones read the client's). */
-qa_app_video_restart *qa_application_video_restart(qa_application *app) { return app->owned_video_restart; }
+/* TS get videoRestart: owned applications hold their own, borrowed ones read the client's. */
+qa_app_video_restart *qa_application_video_restart(qa_application *app) {
+  return app->ownership.borrowed_client != NULL ? app->ownership.borrowed_client->video_restart : app->owned_video_restart;
+}
 void qa_application_pump_client_input(qa_application *app) {
   if (app->graphical != NULL) qa_app_application_input_pump(app->graphical->input, false);
 }
@@ -568,7 +623,10 @@ bool qa_application_input(qa_application *app, const qa_seat_input_event *event)
   if (app->world_operation != QA_APPLICATION_IDLE) {
     if (app->graphical == NULL) return false;
     grow((void **)&app->deferred_input, &app->deferred_input_capacity, app->deferred_input_count + 1, sizeof *app->deferred_input);
-    app->deferred_input[app->deferred_input_count++] = *event;
+    /* TS keeps the event object; the caller's text is transient, so the deferred event owns a copy. */
+    qa_seat_input_event kept = *event;
+    if (kept.text != NULL) kept.text = checked(strdup(kept.text));
+    app->deferred_input[app->deferred_input_count++] = kept;
     return true;
   }
   size_t players = qa_application_local_player_count(app);
@@ -580,14 +638,28 @@ bool qa_application_input(qa_application *app, const qa_seat_input_event *event)
   }
   return app->graphical != NULL && qa_app_application_input_input(app->graphical->input, event);
 }
+/* Deferred events own their text (qa_application_input). */
+typedef struct deferred_events { qa_seat_input_event *events; size_t count; } deferred_events;
+static void deferred_events_free(void *raw) {
+  deferred_events *pending = raw;
+  for (size_t i = 0; i < pending->count; i++) free((char *)pending->events[i].text);
+  free(pending->events);
+  pending->events = NULL;
+  pending->count = 0;
+}
+void qa_application_deferred_input_release(qa_seat_input_event *event) { free((char *)event->text); event->text = NULL; }
 /* TS resumeInput. */
 void qa_application_resume_input(qa_application *app) {
   qa_seat_input_event *events = app->deferred_input;
   size_t count = app->deferred_input_count;
   app->deferred_input = NULL; app->deferred_input_count = 0; app->deferred_input_capacity = 0;
+  qa_cleanup guard;
+  deferred_events pending = {events, count};
+  qa_cleanup_push(&guard, deferred_events_free, &pending);
   if (!app->closed) for (size_t i = 0; i < count; i++)
     if (app->graphical != NULL) (void)qa_app_application_input_input(app->graphical->input, &events[i]);
-  free(events);
+  qa_cleanup_pop(&guard);
+  deferred_events_free(&pending);
 }
 
 /* ---- 2784-2789 (requestQuit / queueCommand, public API) ---- */
@@ -596,6 +668,7 @@ void qa_application_queue_command(qa_application *app, const char *name,
     const char *const *arguments, size_t argument_count, const qa_seat_id *seat) {
   qa_application_queue_command_source(app, name, arguments, argument_count, seat, NULL);
 }
+static void request_release(void *request) { qa_application_command_request_free(request); }
 void qa_application_queue_command_source(qa_application *app, const char *name, const char *const *arguments,
     size_t argument_count, const qa_seat_id *seat, const qa_command_context *source) {
   qa_application_command_request request;
@@ -608,7 +681,11 @@ void qa_application_queue_command_source(qa_application *app, const char *name, 
   if (seat != NULL) { request.has_seat = true; request.seat = *seat; }
   /* The request outlives the invocation (TS keeps its context alive): own a copy. */
   if (source != NULL) { request.has_source = true; request.source = qa_command_context_copy(source); }
+  /* A full ring raises RangeError (TS admit); the request it did not take is freed. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, request_release, &request);
   (void)qa_event_ring_admit(&app->requested_commands, &request);
+  qa_cleanup_pop(&guard);
 }
 
 
@@ -1117,18 +1194,34 @@ qa_config_store qa_application_client_config(const qa_app_options *options, qa_a
   return product_config(options, content, qa_app_loaded_content_recipe(content)->engine_behavior.content);
 }
 
+/* The archive write (qa_app_save_cvar_archive) can raise; TS propagates it, so the store and the entries are released
+ * on that path (TS GC). */
+static void archive_store_cleanup(void *store) { qa_config_store_destroy(store); }
+typedef struct archive_entries { qa_cvar_archive_entry *entries; size_t count; } archive_entries;
+static void archive_entries_cleanup(void *arg) {
+  archive_entries *list = arg;
+  qa_app_cvar_archive_entries_free(list->entries, list->count);
+  list->entries = NULL;
+  list->count = 0;
+}
 /* TS saveSourceArchive(options, content, simulation, overrides). */
 void qa_application_save_source_archive(qa_application *app, const qa_app_options *options, qa_app_loaded_content *content,
     qa_app_shared_simulation *simulation, qa_app_team_arena_overrides *overrides) {
   qa_cvar_registry *cvars = qa_application_source_cvars(app, simulation);
   if (cvars == NULL) return;
   qa_config_store store = qa_application_source_config(options, content);
+  qa_cleanup store_guard;
+  qa_cleanup_push(&store_guard, archive_store_cleanup, &store);
   const qa_executable_recipe *recipe = qa_app_loaded_content_recipe(content);
   const char *owner[3] = { "source", recipe->map.entities.content, recipe->map.entities.provider };
-  size_t count = 0;
-  qa_cvar_archive_entry *entries = qa_app_team_arena_archive_entries(cvars, overrides, false, 0, &count);
-  qa_app_save_cvar_archive(&store, owner, 3, cvars, entries, count);
-  qa_app_cvar_archive_entries_free(entries, count);
+  archive_entries list = { NULL, 0 };
+  list.entries = qa_app_team_arena_archive_entries(cvars, overrides, false, 0, &list.count);
+  qa_cleanup entries_guard;
+  qa_cleanup_push(&entries_guard, archive_entries_cleanup, &list);
+  qa_app_save_cvar_archive(&store, owner, 3, cvars, list.entries, list.count);
+  qa_cleanup_pop(&entries_guard);
+  archive_entries_cleanup(&list);
+  qa_cleanup_pop(&store_guard);
   qa_config_store_destroy(&store);
 }
 /* TS saveClientArchives(options, content, clients, overrides). */
@@ -1136,16 +1229,22 @@ void qa_application_save_client_archives(qa_application *app, const qa_app_optio
     const qa_seat_id *seats, qa_cvar_registry *const *cvars, size_t count, qa_app_team_arena_overrides *overrides) {
   (void)app; /* TS member reads only its arguments */
   qa_config_store store = qa_application_client_config(options, content);
+  qa_cleanup store_guard;
+  qa_cleanup_push(&store_guard, archive_store_cleanup, &store);
   const qa_executable_recipe *recipe = qa_app_loaded_content_recipe(content);
   for (size_t i = 0; i < count; i++) {
     char index[40];
     qa_net_js_number((double)seats[i].index, index, sizeof index);
     const char *owner[4] = { "client", recipe->engine_behavior.content, recipe->engine_behavior.provider, index };
-    size_t entry_count = 0;
-    qa_cvar_archive_entry *entries = qa_app_team_arena_archive_entries(cvars[i], overrides, true, (double)seats[i].index, &entry_count);
-    qa_app_save_cvar_archive(&store, owner, 4, cvars[i], entries, entry_count);
-    qa_app_cvar_archive_entries_free(entries, entry_count);
+    archive_entries list = { NULL, 0 };
+    list.entries = qa_app_team_arena_archive_entries(cvars[i], overrides, true, (double)seats[i].index, &list.count);
+    qa_cleanup entries_guard;
+    qa_cleanup_push(&entries_guard, archive_entries_cleanup, &list);
+    qa_app_save_cvar_archive(&store, owner, 4, cvars[i], list.entries, list.count);
+    qa_cleanup_pop(&entries_guard);
+    archive_entries_cleanup(&list);
   }
+  qa_cleanup_pop(&store_guard);
   qa_config_store_destroy(&store);
 }
 
@@ -1661,7 +1760,12 @@ void qa_application_guest_options(qa_app_loaded_content *content, const qa_app_o
   const void *prepared_q2 = qa_app_loaded_content_prepared_q2_game(content, &edition);
   if (prepared_q2 != NULL) {
     const qa_catalog_discovered_product *product = qa_content_catalog_product(catalog, recipe->map.entities.content);
-    record->directory = product_user_directory(options, product);
+    {
+      /* stockGameDirectory(content, options, product.userContent?.root ?? userProductDirectory(...)) */
+      char *fallback = product_user_directory(options, product);
+      record->directory = qa_application_stock_game_directory(content, options, fallback);
+      free(fallback);
+    }
     make_directories(record->directory);
     record->writable = checked(qa_app_sim_classic_guest_files_create(record->directory, NULL, 0));
     if (product->loose_root != NULL) record->installed = checked(qa_app_sim_classic_guest_files_create(product->loose_root, NULL, 0));
@@ -1699,7 +1803,9 @@ void qa_application_guest_options(qa_app_loaded_content *content, const qa_app_o
   record->q3.has_game_type = true;
   record->q3.game_type = same_string(recipe->match.provider, "q3:ctf") || same_string(product->expectation.campaign, "ctf")
       || same_string(product->expectation.campaign, "lrctf") ? 4 : same_string(options->mode, "singleplayer") ? 2 : 0;
-  char *root = product_user_directory(options, product);
+  char *root_fallback = product_user_directory(options, product);
+  char *root = qa_application_stock_game_directory(content, options, root_fallback); /* stockGameDirectory(content, options, ...) */
+  free(root_fallback);
   bool initialized = qa_user_file_store_init(&record->files, root);
   free(root);
   if (!initialized) qa_range_error("Out of memory");

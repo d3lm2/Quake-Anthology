@@ -26,7 +26,10 @@ static const char *const orders[] = {"hold your position", "hold this position",
 static const char *const game_names[] = {"Free For All", "Tournament", "Single Player", "Team Deathmatch",
     "Capture the Flag", "One Flag CTF", "Overload", "Harvester"};
 static double s32(double v) { return qa_js_to_int32(v); }
-static double imul(double a, double b) { return (int32_t)(qa_js_to_int32(a) * qa_js_to_int32(b)); }
+/* Math.imul wraps; a signed C product of cvar-sized operands is undefined past 2^31. */
+static double imul(double a, double b) {
+  return qa_js_to_int32((double)((uint32_t)qa_js_to_int32(a) * (uint32_t)qa_js_to_int32(b)));
+}
 static double slot_get(qa_q3_base_player_state_slots *s, double i) { return qa_q3_base_player_state_slots_get(s, (size_t)i); }
 static void slot_set(qa_q3_base_player_state_slots *s, double i, double v) { qa_q3_base_player_state_slots_set(s, (size_t)i, v); }
 
@@ -864,7 +867,8 @@ static void cast_vote(qa_q3_ta_game_command_runtime *r, qa_q3_game_entity *entit
   print_to(r, entity, "Vote cast.\n");
   client->ps.e_flags = (double)(qa_js_to_int32(client->ps.e_flags) | EF_VOTED);
   char *text = arguments_at(args, 1, 64);
-  if (text[0] == 'y' || text[1] == 'Y' || text[1] == '1') {
+  /* TS charAt(1) of an empty text is ""; the C buffer of one has no byte at index 1. */
+  if (text[0] == 'y' || (text[0] != '\0' && (text[1] == 'Y' || text[1] == '1'))) {
     vote->yes = s32(vote->yes + 1);
     set_config_number(r, 10, vote->yes);
   } else {
@@ -887,12 +891,14 @@ static void call_team_vote(qa_q3_ta_game_command_runtime *r, qa_q3_game_entity *
   char *parameter = bounded_dup("", 1);
   size_t parameter_length = 0;
   for (size_t index = 2; index < args->length; index++) {
-    if (parameter_length >= MAX_STRING_CHARS) {
+    /* TS order: the separating space is appended first, then the overflow check and the
+     * piece capacity both see the length that includes it. */
+    size_t extra = index > 2 ? 1 : 0;
+    if (parameter_length + extra >= MAX_STRING_CHARS) {
       free(command); free(parameter);
       game_command_error("Team vote arguments overflow the source string buffer"); }
-    char *piece = arguments_at(args, index, MAX_STRING_CHARS - parameter_length);
+    char *piece = arguments_at(args, index, MAX_STRING_CHARS - (parameter_length + extra));
     size_t piece_length = strlen(piece);
-    size_t extra = index > 2 ? 1 : 0;
     char *grown = realloc(parameter, parameter_length + extra + piece_length + 1);
     if (!grown) { free(piece); free(command); free(parameter); qa_range_error("out of memory"); }
     parameter = grown;
@@ -979,7 +985,8 @@ static void cast_team_vote(qa_q3_ta_game_command_runtime *r, qa_q3_game_entity *
   print_to(r, entity, "Team vote cast.\n");
   client->ps.e_flags = (double)(qa_js_to_int32(client->ps.e_flags) | EF_TEAMVOTED);
   char *text = arguments_at(args, 1, 64);
-  if (text[0] == 'y' || text[1] == 'Y' || text[1] == '1') {
+  /* TS charAt(1) of an empty text is ""; the C buffer of one has no byte at index 1. */
+  if (text[0] == 'y' || (text[0] != '\0' && (text[1] == 'Y' || text[1] == '1'))) {
     vote->yes = s32(vote->yes + 1);
     set_config_number(r, 16 + offset, vote->yes);
   } else {

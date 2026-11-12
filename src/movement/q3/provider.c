@@ -82,7 +82,7 @@ static qa_movement_state wrapped_state(provider_move *m) {
 }
 static void resume(provider_move *m, qa_movement_state wrapped) {
   if (wrapped.kind != QA_MOVEMENT_STATE_Q3)
-    qa_range_error("Input callback changed Quake III movement family");
+    qa_raise("Error", 0, 0, "Input callback changed Quake III movement family");
   qa_q3_movement_state state = wrapped.as.q3;
   m->source_state = state;
   qa_mod_client_movement_mode mode;
@@ -115,8 +115,9 @@ static void append_effect(provider_move *m, qa_movement_effect effect) {
   }
   if (m->effect_count == m->effect_capacity) {
     m->effect_capacity = m->effect_capacity ? m->effect_capacity * 2 : 8;
-    m->effects = realloc(m->effects, m->effect_capacity * sizeof *m->effects);
-    if (m->effects == NULL) qa_range_error("Out of memory");
+    qa_ordered_movement_effect *grown = realloc(m->effects, m->effect_capacity * sizeof *m->effects);
+    if (grown == NULL) qa_range_error("Out of memory");
+    m->effects = grown;
   }
   m->effects[m->effect_count] = (qa_ordered_movement_effect){
       m->substep, (double)m->effect_count, m->frame.time, effect};
@@ -148,7 +149,7 @@ static double opt_contents(void *ctx, qa_vec3 point, qa_actor_id pass_actor) {
   qa_actor_id pass_copy = pass_actor; query.pass_actor = &pass_copy;
   qa_point_contents_result contents = m->services.scene.point_contents(m->services.scene.ctx, query);
   if (contents.kind == NULL || strcmp(contents.kind, "q3") != 0)
-    qa_range_error("Q3 point contents queries require Q3 content flags");
+    qa_raise("TypeError", 0, 0, "Q3 point contents queries require Q3 content flags");
   return contents.contents;
 }
 static void application_end(provider_move *m) {
@@ -175,7 +176,7 @@ static bool opt_begin_step(void *ctx, qa_q3_motion *state, qa_q3_move_command *a
         m->services.input_application.ctx, user_command(m->command), m->frame, wrapped_state(m));
     if (!before.is_continue) { m->removed = true; return false; }
     if (before.command.kind != QA_USER_COMMAND_Q3)
-      qa_range_error("Input output changed command dialect");
+      qa_raise("Error", 0, 0, "Input output changed command dialect");
     *active_command = qa_q3_command(before.command.as.q3);
     m->command = *active_command;
     resume(m, before.state);
@@ -184,7 +185,7 @@ static bool opt_begin_step(void *ctx, qa_q3_motion *state, qa_q3_move_command *a
   qa_user_command effective = qa_client_stance_command(user_command(m->command), has_stance,
                                                        has_stance && outputs->stance);
   if (effective.kind != QA_USER_COMMAND_Q3)
-    qa_range_error("Client stance changed movement dialect");
+    qa_raise("Error", 0, 0, "Client stance changed movement dialect");
   *active_command = qa_q3_command(effective.as.q3);
   m->command = *active_command;
   qa_mod_client_movement_mode mode;
@@ -255,12 +256,24 @@ static void opt_contact(void *ctx, qa_trace_result trace) {
   append_effect(m, effect);
 }
 
+typedef struct provider_try {
+  provider_move *m; qa_q3_motion *motion; qa_q3_motion_options *options; qa_q3_motion_result result;
+} provider_try;
+static void provider_move_body(void *ctx) {
+  provider_try *call = ctx;
+  call->result = qa_q3_move_player(call->motion, call->m->command, call->options);
+}
+/* application?.end(movementState(), true): a raise from end replaces the step's error, as a throw in a JS catch does. */
+static void application_end_failed(void *ctx) {
+  provider_move *m = ctx;
+  (void)m->services.input_application.end(m->services.input_application.ctx, wrapped_state(m), true, true, NULL);
+}
 static qa_movement_result provider_do_move(void *ctx, qa_movement_input input_in, qa_movement_services services) {
   qa_q3_movement_provider_options *options = ctx;
   qa_q3_movement_input input = input_in;
   if (input.profile.numeric.arithmetic.kind != QA_ARITHMETIC_BINARY32 ||
       services.numeric.profile.arithmetic.kind != QA_ARITHMETIC_BINARY32)
-    qa_range_error("The Q3 movement implementation requires binary32 operations");
+    qa_raise("TypeError", 0, 0, "The Q3 movement implementation requires binary32 operations");
   qa_q3_movement_state source = input.state.as.q3;
   provider_move m = {0};
   m.input = input; m.services = services; m.options = options;
@@ -323,7 +336,16 @@ static qa_movement_result provider_do_move(void *ctx, qa_movement_input input_in
   motion_options.event = opt_event; motion_options.animation = opt_animation;
   motion_options.weapon = opt_weapon; motion_options.torso = opt_torso;
   motion_options.firing = opt_firing; motion_options.contact = opt_contact;
-  qa_q3_motion_result result = qa_q3_move_player(&motion, m.command, &motion_options);
+  /* try { result = movePlayer(...) } catch (error) { if (applicationOpen) application?.end(movementState(), true); throw error; } */
+  provider_try call = {&m, &motion, &motion_options, {0}};
+  qa_caught_error caught;
+  if (!qa_try(provider_move_body, &call, &caught)) {
+    qa_caught_error ended;
+    bool end_failed = m.application_open && !qa_try(application_end_failed, &m, &ended);
+    free(m.effects);
+    qa_rethrow(end_failed ? &ended : &caught);
+  }
+  qa_q3_motion_result result = call.result;
   if (m.application_open) application_end(&m);
   qa_movement_result out = {0};
   out.kind = "q3"; out.actor = input.actor.id; out.command_sequence = input.command_sequence;

@@ -1,12 +1,12 @@
 /*
  * Port of src/core/q3-cd-key.ts: common CD-key state from id Software's
  * common.c, cl_main.c and cl_ui.c. C accommodations:
- *  - The TS imports CvarFlag/CvarRegistry from cvars/index (not yet
- *    ported) but uses only `markModifiedFlags(CvarFlag.Archive)`;
- *    that becomes a callback plus the Archive flag value 1.
+ *  - The TS imports CvarFlag/CvarRegistry from cvars/index but uses only
+ *    `markModifiedFlags(CvarFlag.Archive)`; that becomes a callback
+ *    passed QA_CVAR_FLAG_ARCHIVE.
  *  - The async Q3KeyStorage (Promise-based) becomes synchronous
  *    callbacks; load_text returns a borrowed string or NULL.
- *  - sourceCommandText (commands/text.ts, not yet ported) cuts at an
+ *  - sourceCommandText (commands/text.ts) cuts at an
  *    embedded NUL and checks charCodes; inherent to C byte strings.
  *    A TS charCode > 255 makes validation fail there; here the same
  *    inputs fail by byte length or alphabet instead.

@@ -40,6 +40,7 @@ void qa_remote_options_copy(const qa_app_options *options, qa_app_options *out) 
   out->server_profile_path = dup_or_null(options->server_profile_path);
   out->corpus_root = dup_or_null(options->corpus_root);
   out->user_content_root = dup_or_null(options->user_content_root);
+  out->native_config_root = dup_or_null(options->native_config_root);
   out->addon_content_roots = NULL;
   if (options->addon_content_root_count > 0) {
     out->addon_content_roots = xcalloc(options->addon_content_root_count, sizeof *out->addon_content_roots);

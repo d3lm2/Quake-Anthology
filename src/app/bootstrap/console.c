@@ -29,37 +29,37 @@ typedef struct {
   qa_command_origin origin; /* Copied: source is owners()'s own by-value parameter. */
 } owners_t;
 static owners_t owners(qa_app_console_routing *routing, qa_command_context source) {
-  if (routing->closed) qa_range_error("Application console owner is closed");
+  if (routing->closed) qa_raise("Error", 0, 0, "Application console owner is closed");
   qa_app_console_routing_options *options = &routing->options;
   qa_command_dialect dialect = options->source_dialect(options->ctx);
   qa_command_context fallback_ctx = qa_cvar_registry_context(options->fallback);
-  if (!same_session(source.session, fallback_ctx.session)) qa_range_error("Console command belongs to another session");
-  if (dialect != qa_cvar_registry_dialect(options->fallback)) qa_range_error("Changing source command dialect requires a new console owner");
+  if (!same_session(source.session, fallback_ctx.session)) qa_raise("Error", 0, 0, "Console command belongs to another session");
+  if (dialect != qa_cvar_registry_dialect(options->fallback)) qa_raise("Error", 0, 0, "Changing source command dialect requires a new console owner");
   owners_t out = {0};
   out.has_server = options->server(options->ctx, &out.server);
   out.origin = *caller(&source.origin);
-  if (out.origin.kind == QA_COMMAND_ORIGIN_REMOTE_CLIENT) qa_range_error("Remote client cvars require an explicit client owner");
+  if (out.origin.kind == QA_COMMAND_ORIGIN_REMOTE_CLIENT) qa_raise("Error", 0, 0, "Remote client cvars require an explicit client owner");
   out.seat = out.origin.kind == QA_COMMAND_ORIGIN_LOCAL_SEAT ? options->seat(options->ctx, out.origin.seat) : NULL;
   out.input = out.origin.kind == QA_COMMAND_ORIGIN_SERVER_CONSOLE || !options->input ? NULL
       : options->input(options->ctx, out.origin.kind == QA_COMMAND_ORIGIN_LOCAL_SEAT,
                        out.origin.kind == QA_COMMAND_ORIGIN_LOCAL_SEAT ? out.origin.seat : (qa_seat_id){0});
   out.movement = options->movement ? options->movement(options->ctx) : NULL;
   if (out.movement && !same_session(qa_cvar_registry_context(out.movement).session, source.session))
-    qa_range_error("Movement cvars belong to another session");
+    qa_raise("Error", 0, 0, "Movement cvars belong to another session");
   qa_cvar_registry *check[3] = {out.has_server ? out.server.cvars : NULL, out.seat, out.input};
   for (size_t i = 0; i < 3; i++) {
     if (!check[i]) continue;
     if (!same_session(qa_cvar_registry_context(check[i]).session, source.session) || qa_cvar_registry_dialect(check[i]) != dialect)
-      qa_range_error("Console cvar registry has another session or source dialect");
+      qa_raise("Error", 0, 0, "Console cvar registry has another session or source dialect");
   }
   if (out.input) {
     qa_command_context input_ctx = qa_cvar_registry_context(out.input);
     if (caller(&input_ctx.origin)->kind != QA_COMMAND_ORIGIN_LOCAL_SEAT)
-      qa_range_error("Mouse settings require a local seat owner");
+      qa_raise("Error", 0, 0, "Mouse settings require a local seat owner");
   }
   if (out.origin.kind == QA_COMMAND_ORIGIN_LOCAL_SEAT) {
     if (!same_session(out.origin.seat.session, source.session) || !same_session(out.origin.client.session, source.session))
-      qa_range_error("Console seat belongs to another session");
+      qa_raise("Error", 0, 0, "Console seat belongs to another session");
     qa_cvar_registry *seat_check[2] = {out.seat, out.input};
     for (size_t i = 0; i < 2; i++) {
       if (!seat_check[i]) continue;
@@ -67,7 +67,7 @@ static owners_t owners(qa_app_console_routing *routing, qa_command_context sourc
       const qa_command_origin *seat_origin = caller(&registry_ctx.origin);
       if (seat_origin->kind != QA_COMMAND_ORIGIN_LOCAL_SEAT || !qa_same_seat(seat_origin->seat, out.origin.seat) ||
           !(seat_origin->client.token == out.origin.client.token && seat_origin->client.slot == out.origin.client.slot && seat_origin->client.generation == out.origin.client.generation))
-        qa_range_error("Console cvar registry belongs to another seat");
+        qa_raise("Error", 0, 0, "Console cvar registry belongs to another seat");
     }
   }
   return out;
@@ -81,7 +81,7 @@ static bool has_cvar(qa_cvar_registry *registry, const char *name) {
 }
 qa_app_console_routing *qa_app_console_routing_create(qa_app_console_routing_options options) {
   if (options.source_dialect(options.ctx) != qa_cvar_registry_dialect(options.fallback))
-    qa_range_error("Console dialect must match the source game");
+    qa_raise("Error", 0, 0, "Console dialect must match the source game");
   qa_app_console_routing *routing = calloc(1, sizeof *routing);
   if (!routing) return NULL;
   routing->options = options;
@@ -90,6 +90,8 @@ qa_app_console_routing *qa_app_console_routing_create(qa_app_console_routing_opt
 void qa_app_console_routing_destroy(qa_app_console_routing *routing) { free(routing); }
 qa_cvar_registry *qa_app_console_routing_owner(qa_app_console_routing *routing, const char *name_input, qa_command_context source) {
   char *name = qa_source_command_text(name_input);
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, free, name);
   owners_t found = owners(routing, source);
   qa_cvar_registry *shared = routing->options.shared ? routing->options.shared(routing->options.ctx) : NULL;
   qa_cvar_registry *result;
@@ -99,7 +101,7 @@ qa_cvar_registry *qa_app_console_routing_owner(qa_app_console_routing *routing, 
   else {
     bool seat_has = has_cvar(found.seat, name), movement_has = has_cvar(found.movement, name);
     if (seat_has && movement_has && found.seat != found.movement) {
-      qa_range_error("Console cvar %s has conflicting seat and movement declarations", name);
+      qa_raise("Error", 0, 0, "Console cvar %s has conflicting seat and movement declarations", name);
     }
     if (seat_has) result = found.seat;
     else if (movement_has) result = found.movement;
@@ -107,6 +109,7 @@ qa_cvar_registry *qa_app_console_routing_owner(qa_app_console_routing *routing, 
     else if (found.origin.kind == QA_COMMAND_ORIGIN_SERVER_CONSOLE && found.has_server) result = found.server.cvars;
     else result = found.seat ? found.seat : routing->options.fallback;
   }
+  qa_cleanup_pop(&cleanup);
   free(name);
   return result;
 }

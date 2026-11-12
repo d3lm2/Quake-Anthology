@@ -9,7 +9,7 @@
  * definitions owner below. */
 typedef struct qa_app_q3_server_cvar_settings { double max_clients; const char *map_name; } qa_app_q3_server_cvar_settings;
 typedef struct qa_app_q3_server_cvar_definitions {
-  qa_collision_cvar_definition items[24];
+  qa_collision_cvar_definition items[25];
   size_t count;
   char protocol_value[32];
   char maxclients_value[32];
@@ -18,7 +18,7 @@ typedef struct qa_app_q3_server_cvar_definitions {
  * the definitions must not be copied or outlive *out. */
 void qa_app_q3_server_cvar_definitions_make(qa_app_q3_server_cvar_definitions *out, qa_app_q3_server_cvar_settings settings);
 /* TS q3ServerCvarNames: borrowed static names. */
-extern const char *const qa_app_q3_server_cvar_names[24];
-#define QA_APP_Q3_SERVER_CVAR_NAME_COUNT 24
+extern const char *const qa_app_q3_server_cvar_names[25];
+#define QA_APP_Q3_SERVER_CVAR_NAME_COUNT 25
 void qa_app_register_q3_server_cvars(qa_cvar_registry *cvars, qa_app_q3_server_cvar_settings settings);
 #endif

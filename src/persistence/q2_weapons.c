@@ -16,8 +16,8 @@ static qa_save_reader item(const qa_save_reader *reader, size_t index) {
     qa_save_reader_fail(reader, "out of memory");
   return out;
 }
-/* TS readSavedActor (save-image.ts, not yet ported as a module):
- * {slot: integer(0), generation: integer(0)}. Local copy only. */
+/* TS readSavedActor (save-image.ts): {slot: integer(0), generation: integer(0)},
+ * the same reads as qa_read_saved_actor (persistence/save_image.c). */
 static qa_saved_actor_id read_actor(const qa_save_reader *reader) {
   qa_saved_actor_id actor;
   qa_save_reader slot = field(reader, "slot");
@@ -215,19 +215,22 @@ fail:
 
 static void read_q2_weapon_state(const qa_save_reader *reader, qa_q2w_state *out) {
   memset(out, 0, sizeof *out);
+  /* TS readQ2WeaponState reads weapon and phase first; handReservation tests them. */
+  const char *state_weapon, *state_phase;
+  { qa_save_reader w = field(reader, "weapon");
+    state_weapon = qa_save_reader_is_null(&w) ? NULL : qa_save_reader_string(&w);
+    qa_save_reader_destroy(&w);
+    qa_save_reader ph = field(reader, "phase");
+    static const char *const phases[] = {"activating", "ready", "firing", "dropping"};
+    state_phase = qa_save_reader_choice_string(&ph, phases, 4);
+    qa_save_reader_destroy(&ph); }
   { qa_save_reader f0 = field(reader, "primaryHandoff");
     static const char *const ch2[] = {"active", "holstering", "holstered"};
     { const char *handoff = qa_save_reader_is_undefined(&f0) ? "active" : qa_save_reader_choice_string(&f0, ch2, 3);
       (*out).primary_handoff = strcmp(handoff, "holstering") == 0 ? QA_Q2W_HANDOFF_HOLSTERING : strcmp(handoff, "holstered") == 0 ? QA_Q2W_HANDOFF_HOLSTERED : QA_Q2W_HANDOFF_ACTIVE; }
     qa_save_reader_destroy(&f0); }
   { qa_save_reader f1 = field(reader, "handReservation");
-    { qa_save_reader w = field(reader, "weapon");
-      const char *weapon = qa_save_reader_is_null(&w) ? NULL : qa_save_reader_string(&w);
-      qa_save_reader_destroy(&w);
-      qa_save_reader ph = field(reader, "phase");
-      static const char *const phases[] = {"activating", "ready", "firing", "dropping"};
-      const char *phase = qa_save_reader_choice_string(&ph, phases, 4);
-      qa_save_reader_destroy(&ph);
+    { const char *weapon = state_weapon, *phase = state_phase;
       bool grenade_firing = weapon != NULL && strcmp(weapon, "grenades") == 0 && strcmp(phase, "firing") == 0;
       if (qa_save_reader_is_undefined(&f1)) {
         if (grenade_firing) qa_save_reader_fail(&f1, "legacy active hand grenade has no ammunition reservation");
@@ -302,7 +305,12 @@ static void read_q2_weapon_state(const qa_save_reader *reader, qa_q2w_state *out
     (*out).kick_angles = qa_read_vector(&f18);
     qa_save_reader_destroy(&f18); }
   { qa_save_reader f19 = field(reader, "kickTime");
-    (*out).kick_time = qa_save_reader_is_undefined(&f19) ? number_field(reader, "kickUntil") - number_field(reader, "kickDuration") : qa_save_reader_number(&f19);
+    if (qa_save_reader_is_undefined(&f19)) {
+      /* TS n("kickUntil") - n("kickDuration"): kickUntil is read (and fails) first. */
+      double until = number_field(reader, "kickUntil");
+      double duration = number_field(reader, "kickDuration");
+      (*out).kick_time = until - duration;
+    } else (*out).kick_time = qa_save_reader_number(&f19);
     qa_save_reader_destroy(&f19); }
   { qa_save_reader f20 = field(reader, "kickUntil");
     (*out).kick_until = qa_save_reader_number(&f20);
@@ -579,8 +587,11 @@ qa_q2w_state qa_read_q2_weapon_state(const qa_save_reader *reader) {
   return out;
 }
 qa_q2w_weapons_checkpoint qa_read_q2_weapons_checkpoint(const qa_save_reader *reader, qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2w_weapons_checkpoint out;
   read_q2_weapons_checkpoint(reader, &out, owner);
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 uint8_t *qa_encode_q2_weapons_checkpoint(const qa_q2w_weapons_checkpoint *checkpoint, size_t *out_length) {
@@ -592,12 +603,19 @@ uint8_t *qa_encode_q2_weapons_checkpoint(const qa_q2w_weapons_checkpoint *checkp
 }
 bool qa_decode_q2_weapons_checkpoint(const uint8_t *bytes, size_t length, qa_q2w_weapons_checkpoint *out,
                                      qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_save_value *root = qa_decode_checkpoint_value(bytes, length);
-  if (root == NULL) return false;
+  if (root == NULL) { qa_persist_decoded_leave(&owner_scope); return false; }
   qa_save_reader reader;
-  if (!qa_save_reader_init(&reader, root, "q2-weapons")) { qa_save_value_free(root); return false; }
+  if (!qa_save_reader_init(&reader, root, "q2-weapons")) {
+    qa_save_value_free(root);
+    qa_persist_decoded_leave(&owner_scope);
+    return false;
+  }
   owner->root = root;
   read_q2_weapons_checkpoint(&reader, out, owner);
   qa_save_reader_destroy(&reader);
+  qa_persist_decoded_leave(&owner_scope);
   return true;
 }

@@ -223,7 +223,8 @@ const void *const *qa_app_q1_client_network_poll(qa_app_q1_client_network *n,
         else free(response);
       }
       if (strcmp(messages[i].kind, "entity") == 0) qa_netquake_signon_first_entity(&n->signon);
-      if (strcmp(messages[i].kind, "disconnect") == 0) disconnected = true;
+      /* TS returns at the disconnect: the messages after it are not handled. */
+      if (strcmp(messages[i].kind, "disconnect") == 0) { disconnected = true; break; }
     }
     qa_cleanup_pop(&messages_guard);
     datagram_scope_release(&scope);

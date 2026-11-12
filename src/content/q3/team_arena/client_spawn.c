@@ -22,7 +22,10 @@ enum { CONTENTS_BODY = 0x2000000, EF_DEAD = 1, EF_TELEPORT_BIT = 4, EF_KAMIKAZE 
 #define CONTENTS_CORPSE 0x4000000
 #define CONTENTS_NODROP_BITS (-2147483647 - 1) /* 0x80000000 as int32 bits */
 static double s32(double v) { return qa_js_to_int32(v); }
-static double imul(double a, double b) { return (int32_t)(qa_js_to_int32(a) * qa_js_to_int32(b)); }
+/* Math.imul wraps; a signed C product (g_inactivity * 1000) is undefined past 2^31. */
+static double imul(double a, double b) {
+  return qa_js_to_int32((double)((uint32_t)qa_js_to_int32(a) * (uint32_t)qa_js_to_int32(b)));
+}
 static double slot_get(qa_q3_base_player_state_slots *s, double i) { return qa_q3_base_player_state_slots_get(s, (size_t)i); }
 static void slot_set(qa_q3_base_player_state_slots *s, double i, double v) { qa_q3_base_player_state_slots_set(s, (size_t)i, v); }
 static qa_vec3 player_mins(void) { return qa_math_vec3(-15, -15, -24); }
@@ -39,7 +42,7 @@ void qa_q3_ta_spawn_player_start(qa_q3_game_entity *entity, const qa_q3_spawn_va
   qa_q3_ta_spawn_deathmatch_point(entity, variables);
 }
 static qa_q3_game_client *client_of(qa_q3_game_entity *entity) {
-  if (entity->client == NULL) qa_range_error("Client spawning requires a client entity");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "Client spawning requires a client entity");
   return entity->client;
 }
 void qa_q3_ta_set_client_view_angle(qa_q3_game_entity *entity, qa_vec3 angles) {
@@ -50,7 +53,8 @@ void qa_q3_ta_set_client_view_angle(qa_q3_game_entity *entity, qa_vec3 angles) {
     double scaled = (float)((double)(float)(src[i] * 65536) / 360);
     delta[i] = s32((double)(qa_qvm_float_to_int(scaled) & 65535) - cmd[i]);
   }
-  client->ps.delta_angles = qa_math_vec3(delta[0], delta[1], delta[2]);
+  /* TS stores the int32 deltas in a plain object, not through vec3(): no binary32 rounding. */
+  client->ps.delta_angles = (qa_vec3){delta[0], delta[1], delta[2]};
   entity->s.angles = qa_math_vec3(angles.x, angles.y, angles.z);
   client->ps.viewangles = entity->s.angles;
 }
@@ -63,7 +67,7 @@ void qa_q3_ta_client_spawn_state_init(qa_q3_ta_client_spawn_state *s) { memset(s
 void qa_q3_ta_client_spawn_runtime_init(qa_q3_ta_client_spawn_runtime *r,
     qa_q3_ta_client_spawn_host host, qa_q3_ta_client_spawn_state *state) {
   if (host.think_pool != host.pool || host.think_world != host.world)
-    qa_range_error("Client spawning and thinking must share entity storage and world");
+    qa_raise("Error", 0, 0, "Client spawning and thinking must share entity storage and world");
   r->host = host;
   qa_q3_ta_client_spawn_state_init(&r->owned_state);
   r->state = state ? state : &r->owned_state;
@@ -117,7 +121,7 @@ void qa_q3_ta_client_spawn_runtime_restore_save_state(qa_q3_ta_client_spawn_runt
 static qa_q3_game_client *owned_client(qa_q3_ta_client_spawn_runtime *r, qa_q3_game_entity *entity) {
   if (qa_q3_entity_pool_get(r->host.pool, entity->slot) != entity || entity->slot >= r->host.pool->max_clients ||
       entity->client != qa_q3_entity_pool_client_at(r->host.pool, entity->slot))
-    qa_range_error("Client does not belong to the configured pool slot");
+    qa_raise("Error", 0, 0, "Client does not belong to the configured pool slot");
   return client_of(entity);
 }
 bool qa_q3_ta_client_spawn_runtime_spot_would_telefrag(qa_q3_ta_client_spawn_runtime *r, qa_q3_game_entity *spot) {
@@ -147,7 +151,7 @@ qa_q3_game_entity *qa_q3_ta_client_spawn_runtime_select_random(qa_q3_ta_client_s
   }
   if (count == 0) return qa_q3_find_entity(r->host.pool, NULL, QA_Q3_FIELD_CLASSNAME, "info_player_deathmatch");
   int32_t chosen = qa_game_random_rand(r->host.random) % (int32_t)count;
-  if (chosen < 0) qa_range_error("Random spawn index invariant");
+  if (chosen < 0) qa_raise("Error", 0, 0, "Random spawn index invariant");
   return points[chosen];
 }
 qa_q3_ta_spawn_point qa_q3_ta_client_spawn_runtime_select_spawn_point(qa_q3_ta_client_spawn_runtime *r, qa_vec3 avoid) {
@@ -170,11 +174,11 @@ qa_q3_ta_spawn_point qa_q3_ta_client_spawn_runtime_select_spawn_point(qa_q3_ta_c
   }
   if (count == 0) {
     qa_q3_game_entity *fallback = qa_q3_find_entity(r->host.pool, NULL, QA_Q3_FIELD_CLASSNAME, "info_player_deathmatch");
-    if (fallback == NULL) qa_range_error("Couldn't find a spawn point");
+    if (fallback == NULL) qa_raise("Error", 0, 0, "Couldn't find a spawn point");
     return pose(fallback);
   }
   double index = trunc((float)(qa_game_random_random(r->host.random) * trunc((double)count / 2)));
-  if (index < 0 || index >= (double)count) qa_range_error("Farthest spawn index invariant");
+  if (index < 0 || index >= (double)count) qa_raise("Error", 0, 0, "Farthest spawn index invariant");
   return pose(points[(size_t)index].entity);
 }
 qa_q3_ta_spawn_point qa_q3_ta_client_spawn_runtime_select_initial(qa_q3_ta_client_spawn_runtime *r) {
@@ -205,11 +209,11 @@ qa_q3_ta_spawn_point qa_q3_ta_client_spawn_runtime_select_team(qa_q3_ta_client_s
     return fallback == NULL ? qa_q3_ta_client_spawn_runtime_select_spawn_point(r, qa_math_vec3(0, 0, 0)) : pose(fallback);
   }
   int32_t chosen = qa_game_random_rand(r->host.random) % (int32_t)count;
-  if (chosen < 0) qa_range_error("Team spawn index invariant");
+  if (chosen < 0) qa_raise("Error", 0, 0, "Team spawn index invariant");
   return pose(points[chosen]);
 }
 void qa_q3_ta_client_spawn_runtime_init_body_queue(qa_q3_ta_client_spawn_runtime *r) {
-  if (r->state->has_body_queue) qa_range_error("Body queue is already initialized for this map");
+  if (r->state->has_body_queue) qa_raise("Error", 0, 0, "Body queue is already initialized for this map");
   for (int i = 0; i < QA_Q3_TA_BODY_QUEUE_SIZE; i++) {
     qa_q3_game_entity *entity = qa_q3_entity_pool_spawn(r->host.pool);
     qa_q3_game_entity_set_classname(entity, "bodyque");
@@ -235,10 +239,10 @@ qa_q3_game_entity *qa_q3_ta_client_spawn_runtime_copy_to_body_queue(qa_q3_ta_cli
   double time = r->host.frame(r->host.ctx).time;
   r->host.world->unlink(r->host.world->ctx, entity->slot);
   if ((qa_js_to_int32(r->host.world->point_contents(r->host.world->ctx, entity->s.origin, -1)) & CONTENTS_NODROP_BITS) != 0) return NULL;
-  if (!r->state->has_body_queue) qa_range_error("Body queue must be initialized before copying a corpse");
+  if (!r->state->has_body_queue) qa_raise("Error", 0, 0, "Body queue must be initialized before copying a corpse");
   qa_q3_game_entity *body = (r->state->body_queue_index >= 0 && r->state->body_queue_index < QA_Q3_TA_BODY_QUEUE_SIZE)
       ? r->state->body_queue_entities[(size_t)r->state->body_queue_index] : NULL;
-  if (body == NULL) qa_range_error("Body queue index invariant");
+  if (body == NULL) qa_raise("Error", 0, 0, "Body queue index invariant");
   r->state->body_queue_index = (double)((qa_js_to_int32(r->state->body_queue_index) + 1) % QA_Q3_TA_BODY_QUEUE_SIZE);
   r->host.world->unlink(r->host.world->ctx, body->slot);
   body->s = entity->s;
@@ -333,7 +337,7 @@ void qa_q3_ta_client_spawn_runtime_client_spawn(qa_q3_ta_client_spawn_runtime *r
     memset(seen, 0, sizeof seen);
     for (;;) {
       int32_t state = (r->host.random->seed & 0x7fff) | (client->pers.initial_spawn ? 0x8000 : 0);
-      if (seen[state]) qa_range_error("No permitted spawn point in the complete game RNG cycle");
+      if (seen[state]) qa_raise("Error", 0, 0, "No permitted spawn point in the complete game RNG cycle");
       seen[state] = true;
       qa_q3_ta_spawn_point selected;
       if (!client->pers.initial_spawn && client->pers.local_client) {

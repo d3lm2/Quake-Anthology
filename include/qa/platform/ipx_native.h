@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "qa/foundation/support.h"
+
 /*
  * Mirror of IpxAddress from src/network/common/endpoint.ts (TS
  * owner; no C home yet). Platform-prefixed to stay collision-proof.
@@ -34,7 +36,9 @@ typedef struct qa_platform_ipx_bind_options {
 
 typedef struct qa_platform_ipx_error {
   bool unsupported; /* UnsupportedTransportError("ipx-native", ...) */
-  char message[320];
+  /* Holds every composed message whole: a caught error's text (below QA_CAUGHT_MESSAGE_CAPACITY)
+   * under the bind-failure prefix, or a capability reason (below 256) under "ipx-native: ". */
+  char message[QA_CAUGHT_MESSAGE_CAPACITY + 128];
 } qa_platform_ipx_error;
 
 /* Mirror of ReceiveEvent<IpxAddress> from

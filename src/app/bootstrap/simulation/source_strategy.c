@@ -106,12 +106,21 @@ static bool loading_inventory_coverage(qa_app_shared_simulation *sim, bool nativ
   (void)sim; (void)native; (void)qvm; (void)out; return false;
 }
 static bool loading_capture_guest_save(qa_app_shared_simulation *sim, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx,
-    qa_app_sim_rerelease_guest_save *out) {
-  (void)sim; (void)next_frame; (void)frame_ctx; (void)out; return false;
+    bool autosave, qa_app_sim_rerelease_guest_save *out) {
+  (void)sim; (void)next_frame; (void)frame_ctx; (void)autosave; (void)out; return false;
 }
-static bool loading_original_save(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *guest_save, qa_persist_decoded *owner,
-    qa_provider_checkpoint *out) {
-  (void)sim; (void)guest_save; (void)owner; (void)out; return false;
+static bool loading_original_save(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *guest_save, bool autosave,
+    qa_persist_decoded *owner, qa_provider_checkpoint *out) {
+  (void)sim; (void)guest_save; (void)autosave; (void)owner; (void)out; return false;
+}
+static void loading_import_loading(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported,
+    qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx) {
+  (void)sim; (void)imported; (void)next_frame; (void)frame_ctx;
+  qa_raise("Error", 0, 0, "An original save folder needs a native Quake II game module");
+}
+static void loading_import_original(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported) {
+  (void)sim; (void)imported;
+  qa_raise("Error", 0, 0, "An original save folder needs a native Quake II game module");
 }
 static void loading_restore_loading(qa_app_shared_simulation *sim, const qa_save_image *save, qa_app_shared_sim_next_frame_fn next_frame,
     void *frame_ctx) {
@@ -722,6 +731,8 @@ static qa_app_source_strategy loading_strategy(void) {
   s.capture_guest_save = loading_capture_guest_save;
   s.original_save = loading_original_save;
   s.restore_loading = loading_restore_loading;
+  s.import_loading = loading_import_loading;
+  s.import_original = loading_import_original;
   s.restore_guest = loading_restore_guest;
   s.monster_proxy = loading_monster_proxy;
   s.restore_continuation = loading_save;
@@ -770,7 +781,8 @@ static void q1_pre_frame(qa_app_shared_simulation *sim, const qa_app_source_pre_
         : st_up_positive(command);
     double buttons = command ? st_buttons(command) : player->buttons;
     double impulse = 0;
-    if (!(command && st_impulse(command, &impulse))) impulse = received && received->arsenal ? received->arsenal->impulse : 0;
+    /* "impulse" in command ? command.impulse : (received?.arsenal?.impulse ?? 0) */
+    if (!(command && st_impulse(command, &impulse))) impulse = received && received->arsenal && received->arsenal->has_impulse ? received->arsenal->impulse : 0;
     qa_comp_q1_source_input source_input = {!player->has_cutscene && (qa_js_to_int32(buttons) & 1) != 0, !player->has_cutscene && jump,
                                             (qa_js_to_int32(buttons) & 4) != 0, impulse};
     qa_comp_q1_source_composition_input(sim->source.q1_composition, player->actor.id, source_input);
@@ -785,7 +797,7 @@ static bool q1_pre_think(qa_app_shared_simulation *sim, qa_app_sim_movement_play
       : st_up_positive(effective);
   /* command.arsenal?.impulse ?? ("impulse" in effective ? effective.impulse : 0) */
   double impulse = 0;
-  if (command->arsenal) impulse = command->arsenal->impulse;
+  if (command->arsenal && command->arsenal->has_impulse) impulse = command->arsenal->impulse;
   else if (!st_impulse(effective, &impulse)) impulse = 0;
   qa_comp_q1_source_input input = {(qa_js_to_int32(st_buttons(effective)) & 1) != 0, jump, (qa_js_to_int32(st_buttons(effective)) & 4) != 0, impulse};
   qa_comp_q1_source_composition_input(sim->source.q1_composition, player->actor.id, input);
@@ -1340,6 +1352,7 @@ static void q2_sync_gravity(qa_app_shared_simulation *sim) {
   if (gravity != qa_app_sim_shared_physics_gravity(sim->physics)) qa_app_shared_sim_set_world_gravity(sim, gravity);
 }
 static void q2_after_step(qa_app_shared_simulation *sim) { qa_q2_emit_shadow_lights(sim->source.product->services); }
+static void q2_checking_rules_off(void *ctx) { ((qa_app_shared_simulation *)ctx)->checking_q2_rules = false; }
 static void q2_finish_frame(qa_app_shared_simulation *sim, bool run) {
   qa_q2_game_services *game = sim->source.product->services;
   for (size_t i = 0; i < sim->player_states.count; i++) {
@@ -1372,9 +1385,11 @@ static void q2_finish_frame(qa_app_shared_simulation *sim, bool run) {
   }
   qa_q2_product_runtime_after_player_frames(sim->source.product);
   qa_q2m_monsters_end_frame(&sim->source.product->monsters, sim->source.product->services);
-  /* host.withQ2Rules(() => source.product.checkRules()) */
+  /* host.withQ2Rules(() => source.product.checkRules()): its finally clears the flag after a raise too. */
   sim->checking_q2_rules = true;
+  qa_cleanup checking; qa_cleanup_push(&checking, q2_checking_rules_off, sim);
   qa_q2_product_runtime_check_rules(sim->source.product);
+  qa_cleanup_pop(&checking);
   sim->checking_q2_rules = false;
 }
 static qa_owned_actor q2_prepare_bot(qa_app_shared_simulation *sim, qa_client_id client) {
@@ -1404,8 +1419,14 @@ static void q2_configure_admitted(qa_app_shared_simulation *sim, qa_owned_actor 
   if (entity == NULL) return;
   const char *appearance = player->character_appearance.provider, *slash = strrchr(appearance, '/');
   const char *model = player->character == QA_GAME_FAMILY_Q2 ? (slash ? slash + 1 : appearance) : "male";
-  char text[256];
-  if (!userinfo) snprintf(text, sizeof text, "\\name\\Player %lld\\skin\\%s/grunt\\fov\\90", (long long)client.slot + 1, model);
+  /* `\\name\\Player ${client.slot + 1}\\skin\\${model}/grunt\\fov\\90`, whole */
+  char *text = NULL;
+  if (!userinfo) {
+    text = malloc(strlen(model) + 64);
+    if (text == NULL) qa_range_error("Out of memory");
+    sprintf(text, "\\name\\Player %lld\\skin\\%s/grunt\\fov\\90", (long long)client.slot + 1, model);
+  }
+  qa_cleanup text_node; qa_cleanup_push(&text_node, free, text);
   qa_q2_player_admission admission; memset(&admission, 0, sizeof admission);
   admission.slot = client.slot; admission.userinfo = userinfo ? userinfo : text; admission.initialize_inventory = false;
   admission.has_use_q2_weapons = true; admission.use_q2_weapons = !sim->has_selected_arsenal; /* host.usesQ2Weapons() */
@@ -1416,6 +1437,7 @@ static void q2_configure_admitted(qa_app_shared_simulation *sim, qa_owned_actor 
     landmark.relative_velocity = travel->landmark_relative_velocity; landmark.relative_view_angles = travel->landmark_relative_view_angles;
   }
   qa_q2_product_runtime_admit(source->product, actor, admission, has_landmark ? &landmark : NULL);
+  qa_cleanup_pop(&text_node); free(text);
 }
 static bool q2_admit_carry(qa_app_shared_simulation *sim, qa_owned_actor actor, qa_q2_entity *entity, const qa_app_sim_travel_player *carried) {
   (void)actor;
@@ -1443,7 +1465,7 @@ static void q2_store_userinfo(qa_app_shared_simulation *sim, qa_actor_id actor, 
   (void)client;
   qa_q2_base_player_state *player = st_q2_state(sim, actor);
   if (!player) qa_raise("Error", 0, 0, "Component userinfo has no Q2 player");
-  snprintf(player->userinfo, sizeof player->userinfo, "%s", userinfo);
+  qa_q2_base_player_state_set_userinfo(player, userinfo);
 }
 static void q2_update_userinfo(qa_app_shared_simulation *sim, qa_actor_id actor, const char *userinfo, const char *previous) {
   qa_q2_base_player_state *state = st_q2_state(sim, actor);
@@ -1455,8 +1477,9 @@ static void q2_update_userinfo(qa_app_shared_simulation *sim, qa_actor_id actor,
   bool same_request = before_fov == after_fov || (before_fov && after_fov && strcmp(before_fov, after_fov) == 0);
   qa_ss_info_free(&after);
   qa_ss_info_free(&before);
-  qa_app_sim_movement_player *player = qa_app_shared_sim_require_player(sim, actor);
   qa_q2_players_userinfo_changed(sim->source.product->players, entity, sim->source.product->services, userinfo);
+  /* host.hasCutscene(actor) requires the player after the source saw the change. */
+  qa_app_sim_movement_player *player = qa_app_shared_sim_require_player(sim, actor);
   if (player->has_cutscene || state->has_chase_target || qa_js_bit_and(entity->flags, 0x4000) != 0 || same_request) state->fov = previous_fov;
   qa_q2_base_player_view *view = qa_ss_map_get(&sim->q2_views, &actor);
   if (view && view->fov == previous_fov) view->fov = state->fov;
@@ -1503,8 +1526,10 @@ static bool q2_monsters_searching(qa_app_shared_simulation *sim, const qa_actor_
     if ((qa_js_to_int32(entity->server_flags) & 4) == 0 || st_health(sim, entity->actor.id) <= 0) continue;
     qa_q2m_context *context = qa_q2m_monsters_context(&sim->source.product->monsters, entity->actor.id);
     qa_q2m_state *state = context ? context->state : NULL;
-    if (player == NULL ? !(entity->has_enemy && !game->host->is_player(game->host->ctx, entity->enemy))
-                       : !(entity->has_enemy && qa_same_actor(entity->enemy, *player))) continue;
+    /* player === null ? entity.enemy !== null && !isPlayer(entity.enemy) : entity.enemy === null || !sameActor(entity.enemy, player):
+     * with no player, a monster hunting a non-player is skipped and one with no enemy counts (G_MonstersSearchingFor). */
+    if (player == NULL ? entity->has_enemy && !game->host->is_player(game->host->ctx, entity->enemy)
+                       : !entity->has_enemy || !qa_same_actor(entity->enemy, *player)) continue;
     if (state && state->lost_sight && st_time_seconds(sim) > state->trail_time + 5) continue;
     return true;
   }
@@ -1804,17 +1829,17 @@ static void q2_native_assert_savable(qa_app_shared_simulation *sim) {
     qa_raise("Error", 0, 0, "Native Quake II original saves require a non-deathmatch source game");
 }
 static bool q2_native_capture_guest_save(qa_app_shared_simulation *sim, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx,
-    qa_app_sim_rerelease_guest_save *out) {
+    bool autosave, qa_app_sim_rerelease_guest_save *out) {
   if (!qa_ss_is(sim->source.edition, "rerelease")) return false;
-  *out = qa_app_sim_rerelease_guest_world_write_save_loading(sim->source.rerelease_world, false, next_frame, frame_ctx);
+  *out = qa_app_sim_rerelease_guest_world_write_save_loading(sim->source.rerelease_world, autosave, next_frame, frame_ctx);
   return true;
 }
-static bool q2_native_original_save(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *guest_save, qa_persist_decoded *owner,
-    qa_provider_checkpoint *out) {
+static bool q2_native_original_save(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *guest_save, bool autosave,
+    qa_persist_decoded *owner, qa_provider_checkpoint *out) {
   qa_cvar_registry *cvars = sim->q2_server_registry;
   if (cvars == NULL || qa_cvar_registry_variable_value(cvars, "deathmatch") != 0)
     qa_raise("Error", 0, 0, "Native Quake II original saves require a non-deathmatch source game");
-  qa_app_shared_sim_native_original_checkpoint(sim, guest_save, owner, out);
+  qa_app_shared_sim_native_original_checkpoint(sim, guest_save, autosave, owner, out);
   return true;
 }
 static bool q2_native_proxy_allocate(qa_app_shared_simulation *sim, double *slot) {
@@ -1900,6 +1925,8 @@ static qa_app_source_strategy q2_native_strategy(void) {
   s.capture_guest_save = q2_native_capture_guest_save;
   s.original_save = q2_native_original_save;
   s.restore_loading = qa_ss_q2_native_restore_loading;
+  s.import_loading = qa_ss_q2_native_import_loading;
+  s.import_original = qa_ss_q2_native_import_original;
   s.restore_guest = qa_ss_q2_native_restore_guest;
   s.monster_proxy = q2_native_monster_proxy;
   return s;
@@ -1909,10 +1936,15 @@ static qa_app_source_strategy q2_native_strategy(void) {
 static void q3_begin_actor_turns(qa_app_shared_simulation *sim, qa_frame_context frame) {
   qa_app_q3_source_runtime_begin_frame(sim->source.q3, frame);
 }
+typedef struct q3_command_scope { qa_app_shared_simulation *sim; qa_owned_actor actor; } q3_command_scope;
+static void q3_command_clear(void *ctx) { q3_command_scope *scope = ctx; qa_ss_map_delete(&scope->sim->q3_commands, &scope->actor); }
 static bool q3_player_think(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player, const qa_actor_command *command) {
   /* host.setQ3Command(player.actor, command); try { game.playerThink(command) } finally { host.setQ3Command(player.actor, null) } */
   qa_ss_map_set(&sim->q3_commands, &player->actor, command);
+  q3_command_scope scope = {sim, player->actor};
+  qa_cleanup clear; qa_cleanup_push(&clear, q3_command_clear, &scope);
   qa_app_q3_source_runtime_player_think(sim->source.q3, *command);
+  qa_cleanup_pop(&clear);
   qa_ss_map_delete(&sim->q3_commands, &player->actor);
   qa_app_shared_sim_sync_q3_player(sim, player);
   return true;
@@ -1931,7 +1963,8 @@ static void q3_finish_frame(qa_app_shared_simulation *sim, bool run) {
   for (size_t i = 0; i < sim->player_states.count; i++) {
     qa_app_sim_movement_player *player = st_player_at(sim, i);
     if (!player->intermission && player->character == QA_GAME_FAMILY_Q3 && st_health(sim, player->actor.id) <= 0) {
-      qa_q3_game_entity *entity = qa_app_q3_source_runtime_record_by_actor(sim->source.q3, player->actor.id);
+      /* game.records.nativeByActor: a foreign proxy record is not consulted */
+      qa_q3_game_entity *entity = qa_q3_base_entity_records_native_by_actor(qa_app_q3_source_runtime_records(sim->source.q3), true, player->actor.id);
       if (entity && entity->client) entity->client->ps.viewheight = -16;
     }
   }

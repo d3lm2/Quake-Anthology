@@ -4,6 +4,7 @@
  * Layout and status: docs/application_layout.md. TS async members are
  * synchronous (PORTING.md). GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
+#include "qa/formats/text_decoder.h"
 #include "application_internal.h"
 #include "simulation/shared_simulation_internal.h"
 #include <ctype.h>
@@ -11,7 +12,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/foundation/js_case.h"
+#include "qa/core/commands/text.h"
 #include "qa/app/bootstrap/audio/commands.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/app/bootstrap/component_commands.h"
 #include "qa/app/bootstrap/console.h"
 #include "qa/app/bootstrap/frame_time.h"
@@ -49,9 +53,10 @@ static char *dup_text(const char *text) {
   return out;
 }
 static bool is(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
+/* TS toLowerCase of console text (one byte per code unit): A-Z and U+00C0-U+00DE except U+00D7 fold. */
 static char *lower_text(const char *text) {
   char *out = dup_text(text);
-  for (char *p = out; *p != '\0'; p++) *p = (char)tolower((unsigned char)*p);
+  for (char *p = out; *p != '\0'; p++) *p = (char)qa_js_latin1_lower((unsigned char)*p);
   return out;
 }
 static void grow(void **items, size_t *capacity, size_t needed, size_t size) {
@@ -293,7 +298,11 @@ static bool actions_client_input(void *ctx, const qa_seat_input_event *event) {
   qa_application_q3_seat_client *source = graphical_q3(app, event->seat);
   if (source == NULL || !qa_app_application_q3_client_captures_input(source->client)) return false;
   grow((void **)&app->client_inputs, &app->client_input_capacity, app->client_input_count + 1, sizeof *app->client_inputs);
-  app->client_inputs[app->client_input_count++] = *event;
+  /* TS keeps the event object; the platform's text is transient, so the queued event owns a copy
+   * (qa_application_deferred_input_release frees it). */
+  qa_seat_input_event kept = *event;
+  if (kept.text != NULL) kept.text = checked(strdup(kept.text));
+  app->client_inputs[app->client_input_count++] = kept;
   return true;
 }
 static bool actions_startup_reader(void *ctx, qa_app_console_script_files *scripts, const qa_app_options *options,
@@ -369,16 +378,29 @@ void qa_application_input_actions_destroy(qa_application_input_actions *actions)
 }
 
 /* ---- 1354-1360 ---- */
+/* Queued client inputs own their text (actions_client_input); a raise in one input frees the batch. */
+typedef struct client_input_batch { qa_seat_input_event *events; size_t count; } client_input_batch;
+static void client_input_batch_free(void *ctx) {
+  client_input_batch *batch = ctx;
+  for (size_t i = 0; i < batch->count; i++) qa_application_deferred_input_release(&batch->events[i]);
+  free(batch->events);
+  batch->events = NULL;
+  batch->count = 0;
+}
 void qa_application_dispatch_client_inputs(qa_application *app) {
   qa_seat_input_event *events = app->client_inputs;
   size_t count = app->client_input_count;
   app->client_inputs = NULL; app->client_input_count = 0; app->client_input_capacity = 0;
+  client_input_batch batch = {events, count};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, client_input_batch_free, &batch);
   for (size_t i = 0; i < count; i++) {
     qa_application_q3_seat_client *source = graphical_q3(app, events[i].seat);
     if (source == NULL) continue;
     qa_app_application_q3_client_input(source->client, &events[i]);
   }
-  free(events);
+  qa_cleanup_pop(&guard);
+  client_input_batch_free(&batch);
 }
 
 /* ---- 1362-1374 bindServerSettingCommand ---- */
@@ -456,14 +478,16 @@ void qa_application_mod_command(qa_application *app, qa_command_invocation *comm
 }
 
 /* ---- 1681-1695 kickTargets ---- */
-static void strip_colors_lower(const char *text, char *out, size_t capacity) {
-  /* name.replace(/\^[0-9]/g, "").toLowerCase() */
+/* name.replace(/\^[0-9]/g, "").toLowerCase() over console text; malloc'd. */
+static char *strip_colors_lower(const char *text) {
+  char *out = checked(malloc(strlen(text) + 1));
   size_t n = 0;
-  for (size_t i = 0; text[i] != '\0' && n + 1 < capacity; i++) {
+  for (size_t i = 0; text[i] != '\0'; i++) {
     if (text[i] == '^' && text[i + 1] >= '0' && text[i + 1] <= '9') { i++; continue; }
-    out[n++] = (char)tolower((unsigned char)text[i]);
+    out[n++] = (char)qa_js_latin1_lower((unsigned char)text[i]);
   }
   out[n] = '\0';
+  return out;
 }
 size_t qa_application_kick_targets(qa_application *app, const char *const *args, size_t count, qa_actor_id **out) {
   qa_app_shared_simulation *simulation = app->world_simulation;
@@ -487,18 +511,24 @@ size_t qa_application_kick_targets(qa_application *app, const char *const *args,
       take = app->bots != NULL && app->bots->actor(app->bots->ctx, player->client, &bot);
     } else {
       const char *name = "";
-      char scratch[2048];
+      char *scratch = NULL; /* the userinfo name value: it cannot be longer than the userinfo */
       if (source != NULL) {
         qa_q3_game_client *client = qa_q3_entity_pool_client_at(qa_app_q3_source_runtime_pool(source), (double)player->client.slot);
         name = client->pers.netname == NULL ? "" : client->pers.netname;
       } else if (q2 != NULL) {
         qa_q2_base_player_state *state = qa_q2_players_get_state(q2->players, actor);
-        if (state != NULL) name = qa_app_q2_operator_player_name(state->userinfo, state->name, scratch, sizeof scratch);
+        if (state != NULL) {
+          size_t scratch_size = (state->userinfo != NULL ? strlen(state->userinfo) : 0) + 1;
+          scratch = checked(malloc(scratch_size));
+          name = qa_app_q2_operator_player_name(state->userinfo, state->name, scratch, scratch_size);
+        }
       }
-      char slot[32], stripped[2048];
+      char slot[32];
       (void)snprintf(slot, sizeof slot, "%u", (unsigned)player->client.slot);
-      strip_colors_lower(name, stripped, sizeof stripped);
+      char *stripped = strip_colors_lower(name);
+      free(scratch);
       take = strcmp(slot, target) == 0 || strcmp(stripped, lowered) == 0;
+      free(stripped);
     }
     if (take) selected[selected_count++] = actor;
   }
@@ -594,66 +624,17 @@ void qa_application_write_game_log(qa_application *app, qa_app_shared_simulation
   char *name = qa_application_cvar_string(cvars, "g_log");
   if (name[0] == '\0') { free(name); free(line); return; }
   bool sync = qa_cvar_registry_variable_value(cvars, "g_logSync") != 0;
-  if (app->game_log == NULL || strcmp(app->game_log->name, name) != 0 || app->game_log->sync != sync) {
-    qa_application_close_game_log(app);
-    qa_config_store config = qa_application_source_config(&app->launch_options, app->loaded_content);
-    qa_user_file_store store;
-    if (!qa_user_file_store_init(&store, config.root)) qa_range_error("Out of memory");
-    qa_config_store_destroy(&config);
-    qa_writable_binary_file *file = checked(calloc(1, sizeof *file));
-    bool opened = qa_user_file_store_open(&store, name, sync ? QA_WRITABLE_APPEND_SYNC : QA_WRITABLE_APPEND,
-        game_log_print, app, file);
-    qa_user_file_store_destroy(&store);
-    if (!opened) {
-      free(file);
-      qa_application_printf(app, "WARNING: Couldn't open logfile: %s\n", name);
-      free(name); free(line);
-      return;
-    }
-    app->game_log = checked(malloc(sizeof *app->game_log));
-    app->game_log->name = name; name = NULL;
-    app->game_log->sync = sync;
-    app->game_log->file = file;
-  }
+  char *root = qa_application_game_files_root(&app->launch_options, app->loaded_content);
+  bool written = qa_app_append_log_write(&app->game_log, root, name, sync, line, game_log_print, app);
+  free(root);
+  if (!written) qa_application_printf(app, "WARNING: Couldn't open logfile: %s\n", name);
   free(name);
-  (void)qa_writable_binary_file_write(app->game_log->file, (const uint8_t *)line, strlen(line));
   free(line);
 }
-void qa_application_close_game_log(qa_application *app) {
-  if (app->game_log != NULL) {
-    qa_writable_binary_file_close(app->game_log->file);
-    free(app->game_log->file);
-    free(app->game_log->name);
-    free(app->game_log);
-  }
-  app->game_log = NULL;
-}
-
-/* TextDecoder("utf-8").decode(bytes): malformed sequences become U+FFFD
- * (WHATWG maximal-subpart replacement). */
-static char *utf8_decode_text(const uint8_t *bytes, size_t count) {
-  char *out = checked(malloc(count * 3 + 1));
-  size_t n = 0, i = 0;
-  while (i < count) {
-    uint8_t b = bytes[i];
-    size_t need = 0; uint8_t lower = 0x80, upper = 0xBF;
-    if (b < 0x80) { out[n++] = (char)b; i++; continue; }
-    if (b >= 0xC2 && b <= 0xDF) need = 1;
-    else if (b >= 0xE0 && b <= 0xEF) { need = 2; if (b == 0xE0) lower = 0xA0; if (b == 0xED) upper = 0x9F; }
-    else if (b >= 0xF0 && b <= 0xF4) { need = 3; if (b == 0xF0) lower = 0x90; if (b == 0xF4) upper = 0x8F; }
-    else { out[n++] = (char)0xEF; out[n++] = (char)0xBF; out[n++] = (char)0xBD; i++; continue; }
-    size_t j = 1;
-    for (; j <= need && i + j < count; j++) {
-      uint8_t c = bytes[i + j];
-      if (c < lower || c > upper) break;
-      lower = 0x80; upper = 0xBF;
-    }
-    if (j == need + 1) { memcpy(out + n, bytes + i, need + 1); n += need + 1; i += need + 1; }
-    else { out[n++] = (char)0xEF; out[n++] = (char)0xBF; out[n++] = (char)0xBD; i += j; }
-  }
-  out[n] = '\0';
-  return out;
-}
+void qa_application_close_game_log(qa_application *app) { qa_app_append_log_close(&app->game_log); }
+/* TS logConsole / closeConsoleLog. */
+void qa_application_log_console(qa_application *app, const char *text) { qa_app_console_log_write(&app->console_log, text); }
+void qa_application_close_console_log(qa_application *app) { qa_app_console_log_close(&app->console_log); }
 
 /* ---- 1382-1393 createDebugGraphOverlay ---- */
 typedef struct graph_overlay_draw { const qa_draw2d *draw; } graph_overlay_draw;
@@ -787,9 +768,14 @@ void qa_application_publish_source_commands(qa_application *app, qa_application_
   app->release_source_commands.fn = NULL; app->release_source_commands.ctx = NULL;
   app->has_source_command_binding = true;
   app->source_command_binding = options;
-  /* C ownership: the previously published preparation is unreferenced now. */
-  if (app->published_source_commands != NULL && app->published_source_commands != prepared)
-    app->published_source_commands->destroy(app->published_source_commands->ctx);
+  /* C ownership: the previously published preparation is still reachable (the input actions made while it was
+   * published route their console through its Q2 console until their input retires): it is destroyed with the
+   * application. */
+  if (app->published_source_commands != NULL && app->published_source_commands != prepared) {
+    app->retired_source_commands = checked(realloc(app->retired_source_commands,
+        (app->retired_source_command_count + 1) * sizeof *app->retired_source_commands));
+    app->retired_source_commands[app->retired_source_command_count++] = app->published_source_commands;
+  }
   app->published_source_commands = prepared;
   if (app->source_commands == NULL) app->source_commands = qa_application_create_source_command_buffer(app, options);
   else qa_command_buffer_set_profile(app->source_commands, options->dialect, NULL);
@@ -1134,16 +1120,22 @@ static qa_script_read_result prep_read_script(void *ctx, const char *name, qa_co
     const char *text = prep->mods == NULL ? NULL : qa_mod_commands_read_script(prep->mods, name, source);
     return script_text(text == NULL ? NULL : dup_text(text));
   }
-  if (prep->selected.read_script != NULL) {
-    qa_script_read_result selected = prep->selected.read_script(prep->selected.read_script_ctx, name, source);
-    if (selected.kind != QA_SCRIPT_READ_READY || selected.has_text) return selected;
-  }
+  /* selected.readScript?.(name, source) ?? readSourceScript(...): every TS readScript is async, so a defined one
+   * returns a Promise and `??` never falls back, even when it resolves to undefined. */
+  if (prep->selected.read_script != NULL)
+    return prep->selected.read_script(prep->selected.read_script_ctx, name, source);
   uint8_t *bytes = NULL;
   size_t count = 0;
   if (!prep->read_source_script.open(prep->read_source_script.ctx, name, &bytes, &count)) return script_text(NULL);
-  char *text = utf8_decode_text(bytes, count);
+  /* new TextDecoder().decode(bytes): the BOM dropped, ill-formed bytes U+FFFD, U+0000 as C0 80. The string reaches the
+   * buffer as it is: insertScript's sourceCommandText cuts it at U+0000 and throws RangeError for a character above
+   * U+00FF after the "execing" line (core/commands text_utf8). */
+  char *decoded = qa_text_decoder_decode(bytes, count, NULL);
   free(bytes);
-  return script_text(text);
+  if (decoded == NULL) qa_range_error("Out of memory");
+  qa_script_read_result result = script_text(decoded);
+  result.text_utf8 = true;
+  return result;
 }
 static int prep_source_command(void *ctx, qa_command_invocation *command, bool registered) {
   source_prep *prep = ctx;
@@ -1163,11 +1155,10 @@ static int prep_source_command(void *ctx, qa_command_invocation *command, bool r
     return 1;
   }
   if (registered) {
-    qa_caught_error error;
-    (void)snprintf(error.message, sizeof error.message, "Command %s belongs to the primary world; component %s has no declared command with that name",
-        name, command->source.producer->module.id);
-    free(name);
-    qa_raise("Error", 0, 0, "%s", error.message);
+    qa_cleanup name_guard; /* the raise formats from `name` before its cleanups free it */
+    qa_cleanup_push(&name_guard, free, name);
+    qa_raise("Error", 0, 0, "Command %s belongs to the primary world; component %s has no declared command with that name",
+             name, command->source.producer->module.id);
   }
   free(name);
   return 0;

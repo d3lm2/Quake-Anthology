@@ -53,7 +53,7 @@ static void store_flags(uint8_t *p, int32_t value) {
  * once the allocation has been reset, ahead of any lazy vector argument. */
 static uint8_t *input_bytes(qa_bot_action_buffer *b, int64_t client) {
   if (!b->has_inputs)
-    qa_range_error("bot action input allocation has been shut down");
+    qa_raise("Error", 0, 0, "bot action input allocation has been shut down");
   if (client < 0 || client >= b->client_capacity)
     qa_range_error("bot action client %lld outside 0..%lld", (long long)client,
                    (long long)(b->client_capacity - 1));
@@ -146,12 +146,12 @@ void qa_bot_action_buffer_restore(qa_bot_action_buffer *b, const qa_save_value *
   qa_save_reader_destroy(&field);
   qa_save_reader_destroy(&reader);
   if (b->has_inputs || capacity < 0 || capacity > (double)QA_MAX_SAFE_INTEGER)
-    qa_range_error("Invalid bot action restoration");
+    qa_raise("Error", 0, 0, "Invalid bot action restoration");
   qa_bot_memory_allocation allocation = {NULL, 0, NULL};
   if (has_allocation) {
     allocation = qa_bot_memory_restored_allocation(restored, (int64_t)reference);
     if ((double)allocation.length != capacity * QA_BOT_INPUT_BYTES)
-      qa_range_error("Saved bot action allocation size mismatch");
+      qa_raise("Error", 0, 0, "Saved bot action allocation size mismatch");
   }
   b->client_capacity = (int64_t)capacity;
   b->allocation = allocation;

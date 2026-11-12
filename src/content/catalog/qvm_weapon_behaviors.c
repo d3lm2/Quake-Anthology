@@ -1,13 +1,14 @@
 /* Port of src/content/catalog/qvm-weapon-behaviors.ts.
  * GPL-2.0-or-later. */
 #include "qa/content/catalog/qvm_weapon_behaviors.h"
+#include "qa/content/json_text.h"
 
 #include "catalog_internal.h"
 
 bool qa_read_qvm_weapon_behavior_document(
     const uint8_t *bytes, size_t length, qa_qvm_weapon_behavior_document *out) {
   memset(out, 0, sizeof *out);
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (value == NULL) return false;
   qa_save_reader reader = {0};
   if (!qa_save_reader_init(&reader, value, "qvm-weapon-behaviors.json")) {
@@ -15,10 +16,11 @@ bool qa_read_qvm_weapon_behavior_document(
     return false;
   }
   qa_save_reader version = {0}, profiles = {0};
-  bool ok = qa_save_reader_field(&reader, "version", &version) &&
-            qa_save_reader_field(&reader, "profiles", &profiles);
+  /* TS order: version is read and checked before profiles is looked up. */
+  bool ok = qa_save_reader_field(&reader, "version", &version);
+  if (ok) (void)qa_save_reader_literal_number(&version, 1);
+  ok = ok && qa_save_reader_field(&reader, "profiles", &profiles);
   if (ok) {
-    (void)qa_save_reader_literal_number(&version, 1);
     out->profile_count = qa_save_reader_list_count(&profiles);
     out->profiles = profiles.value != NULL
                         ? (const qa_save_value *const *)profiles.value->items
@@ -37,6 +39,28 @@ void qa_qvm_weapon_behavior_document_free(
     qa_qvm_weapon_behavior_document *document) {
   qa_save_value_free(document->tree);
   memset(document, 0, sizeof *document);
+}
+
+/* C ownership (TS GC): what a raise or a false return in
+ * qa_load_qvm_weapon_behavior drops. The path is the caller's only on a
+ * return; the service values are the caller's only on success. */
+typedef struct qvm_load_scope {
+  char *path;
+  qa_qvm_weapon_behavior_services *services;
+  qa_catalog_qvm_artifact *artifact;
+  qa_catalog_qvm_weapon_profile *profile;
+} qvm_load_scope;
+static void release_qvm_service_values(qvm_load_scope *scope) {
+  if (scope->services->release != NULL &&
+      (scope->artifact->service_value != NULL || scope->profile->service_value != NULL))
+    scope->services->release(scope->services->ctx, scope->artifact, scope->profile);
+  scope->artifact->service_value = NULL;
+  scope->profile->service_value = NULL;
+}
+static void release_qvm_load_scope(void *arg) {
+  qvm_load_scope *scope = arg;
+  release_qvm_service_values(scope);
+  free(scope->path);
 }
 
 bool qa_load_qvm_weapon_behavior(qa_catalog_mounted_reader mounts,
@@ -66,12 +90,15 @@ bool qa_load_qvm_weapon_behavior(qa_catalog_mounted_reader mounts,
   qa_save_reader_destroy(&abi_reader);
   qa_save_reader_destroy(&reader);
   if (path == NULL) return false;
-  *owned_path = path;
+  qa_catalog_qvm_artifact artifact = {0};
+  qa_catalog_qvm_weapon_profile profile = {0};
+  qvm_load_scope scope = {path, &services, &artifact, &profile};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, release_qvm_load_scope, &scope);
   qa_catalog_opened_resource opened = {0};
   bool found = mounts.open(mounts.ctx, path, &opened);
   if (!found)
     qa_catalog_error("Declared QVM behavior artifact is missing: %s", path);
-  qa_catalog_qvm_artifact artifact = {0};
   artifact.kind = NULL;
   artifact.role = "qagame";
   artifact.abi_profile = abi_profile;
@@ -79,13 +106,17 @@ bool qa_load_qvm_weapon_behavior(qa_catalog_mounted_reader mounts,
   artifact.module.artifact_path = path;
   artifact.module.digest = opened.reference.digest;
   artifact.module.revision = opened.reference.digest;
-  if (!services.resolve_artifact(services.ctx, &artifact, opened.bytes,
-                                 opened.byte_length)) return false;
-  if (artifact.kind == NULL || strcmp(artifact.kind, "bytecode") != 0)
+  bool ok = services.resolve_artifact(services.ctx, &artifact, opened.bytes,
+                                      opened.byte_length);
+  if (ok && (artifact.kind == NULL || strcmp(artifact.kind, "bytecode") != 0))
     qa_catalog_error("QVM weapon behavior requires actual bytecode");
-  qa_catalog_qvm_weapon_profile profile = {0};
-  if (!services.read_profile(services.ctx, declaration, &artifact, &profile))
+  ok = ok && services.read_profile(services.ctx, declaration, &artifact, &profile);
+  qa_cleanup_pop(&cleanup);
+  *owned_path = path;
+  if (!ok) {
+    release_qvm_service_values(&scope);
     return false;
+  }
   out->artifact = artifact;
   out->resource = opened.reference;
   out->profile = profile;

@@ -18,10 +18,9 @@ enum { SOLID = 1, WATER = 32, PLAYERCLIP = 0x10000, BODY = 0x2000000 };
 /* botlib AAS_InitSettings default for the phys_maxvelocity libvar. */
 #define PHYS_MAX_VELOCITY 320
 static double fr(double v) { return (double)(float)v; }
+/* TS `throw new Error(...)`: raised, so a catch above sees it; aborts when none is active. */
 static noreturn void fail(const char *format, const char *text) {
-  fprintf(stderr, format, text);
-  fputc('\n', stderr);
-  abort();
+  qa_raise("Error", 0, 0, format, text);
 }
 static qa_vec3 ma(qa_vec3 origin, double distance, qa_vec3 direction) {
   return qa_add3(origin, qa_scale3(direction, distance));
@@ -623,9 +622,8 @@ static bool travel(travel_step *t, qa_travel_reachability reach, bool airborne,
     return true;
   }
   default:
-    fprintf(stderr, "Source bot travel %lld has no implemented action routine\n",
-            (long long)(reach.reach.travel_type & QA_TRAVEL_MASK));
-    abort();
+    qa_raise("Error", 0, 0, "Source bot travel %lld has no implemented action routine",
+             (long long)(reach.reach.travel_type & QA_TRAVEL_MASK));
   }
 }
 static double now(travel_step *t) { return fr(t->host->time(t->host->ctx)); }

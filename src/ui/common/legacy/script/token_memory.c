@@ -356,14 +356,12 @@ void qa_ui_source_token_clear_whitespace(qa_ui_source_token_memory *token) {
 void qa_ui_source_token_string(qa_ui_source_token_memory *token,
                                char out[QA_UI_SOURCE_TOKEN_STRING_BYTES]) {
   uint8_t *bytes = qa_ui_source_token_bytes(token);
-  for (size_t index = 0; index < STRING_BYTES; index++) {
-    if (bytes[index] == 0) {
-      memcpy(out, bytes, index);
-      out[index] = '\0';
-      return;
-    }
-  }
-  qa_range_error("token_t string lacks a terminator within its 1024-byte field");
+  /* TS: a name of 1024 characters fails the read with its last byte
+     unwritten; the string ends at the field limit (1023 bytes). */
+  size_t index = 0;
+  while (index < STRING_BYTES - 1 && bytes[index] != 0) index++;
+  memcpy(out, bytes, index);
+  out[index] = '\0';
 }
 
 size_t qa_ui_source_token_string_length(qa_ui_source_token_memory *token) {

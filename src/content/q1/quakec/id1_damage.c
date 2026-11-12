@@ -500,6 +500,7 @@ static int64_t binding_field(const qa_q1qc_program *program, const char *name) {
   if (value == NULL) qa_q1qc_error("progs.dat", "missing id1 field %s", name);
   return value->offset;
 }
+static void destroy_binding(void *arg) { qa_q1_id1_damage_binding_destroy(arg); }
 qa_q1_id1_damage_binding *qa_q1_id1_damage_binding_create(
     qa_q1qc_source source, qa_gameplay_authority *authority,
     qa_q1qc_machine_fn machine, void *machine_ctx,
@@ -520,6 +521,10 @@ qa_q1_id1_damage_binding *qa_q1_id1_damage_binding_create(
     binding->has_projection = true;
     binding->projection = *projection;
   }
+  /* A rejected stage, scale or layout raises out of the constructor; the
+   * partial binding is released there (the TS garbage). */
+  qa_cleanup node;
+  qa_cleanup_push(&node, destroy_binding, binding);
   const qa_q1qc_program *program = source.program;
   binding->program = qa_q1_id1_program_binding_get(program, NULL);
   binding->armor_stage = qa_q1qc_armor_stage_create(program, declared_armor);
@@ -621,6 +626,7 @@ qa_q1_id1_damage_binding *qa_q1_id1_damage_binding_create(
                                                            function_run};
   binding->inline_boundary = (qa_q1qc_inline_boundary){binding, binding->boundary_regions,
                                                        binding->boundary_region_count, inline_run};
+  qa_cleanup_pop(&node);
   return binding;
 }
 void qa_q1_id1_damage_binding_destroy(qa_q1_id1_damage_binding *binding) {

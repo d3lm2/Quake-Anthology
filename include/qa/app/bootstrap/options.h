@@ -42,6 +42,9 @@ typedef struct qa_app_options {
   char *server_profile_path;          /* owned, NULL = absent */
   char *corpus_root;                  /* owned */
   char *user_content_root;            /* owned, NULL = absent */
+  /* TS nativeConfigRoot: redirects a stock game's own configuration files (normally in its game folder or
+   * Saved Games) beneath this folder; for sandboxes and tests whose game data is read-only. */
+  char *native_config_root;           /* owned, NULL = absent */
   qa_nightdive_addon_root *addon_content_roots; size_t addon_content_root_count;
   char *product;                      /* owned */
   char *map_product;                  /* owned, NULL = absent */
@@ -68,6 +71,7 @@ typedef struct qa_app_options {
   bool has_display_gamma; double display_gamma;
   bool trusted_networks_only; /* TS trustedNetworksOnly (--lan-only) */
   bool dedicated;
+  bool console_debug;                 /* TS consoleDebug (`-condebug`): Quake appends its console to qconsole.log in the game folder */
   double width, height, seats;
   double skill;                       /* 0..3 */
   bool has_bot_skill; double bot_skill;

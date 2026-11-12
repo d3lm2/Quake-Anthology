@@ -32,22 +32,17 @@ qa_q1_id1_environment *qa_q1_id1_environment_create_foreign(qa_q1qc_source sourc
                                                             const qa_q1qc_foreign_source *foreign,
                                                             qa_q1qc_machine_fn machine,
                                                             void *machine_ctx) {
-  qa_q1_id1_environment *environment = xmalloc(sizeof *environment);
-  memset(environment, 0, sizeof *environment);
-  environment->source = source;
-  if (foreign != NULL) environment->foreign = *foreign;
-  environment->machine = machine;
-  environment->machine_ctx = machine_ctx;
-  environment->binding = qa_q1_id1_program_binding_get(source.program, NULL);
-  for (size_t i = 0; i < environment->binding->environment_count; i++) {
-    const qa_q1_environmental_site *site = &environment->binding->environment[i];
+  /* Validated before the allocation so a mismatch raise leaves nothing behind. */
+  const qa_q1_id1_program_binding *binding = qa_q1_id1_program_binding_get(source.program, NULL);
+  for (size_t i = 0; i < binding->environment_count; i++) {
+    const qa_q1_environmental_site *site = &binding->environment[i];
     const qa_q1qc_statement *statement =
         site->statement >= 0 && (size_t)site->statement < source.program->statement_count
             ? &source.program->statements[site->statement] : NULL;
     const qa_q1qc_function *caller = qa_q1qc_function_at(source.program, site->caller);
     if (strcmp(caller->name, site->name) != 0 || statement == NULL ||
         statement->opcode != QA_Q1QC_OP_CALL4 ||
-        statement->a != environment->binding->damage_global || statement->b != 0 ||
+        statement->a != binding->damage_global || statement->b != 0 ||
         statement->c != 0) {
       char message[128];
       (void)snprintf(message, sizeof message, "id1 environmental statement %lld mismatch",
@@ -55,6 +50,13 @@ qa_q1_id1_environment *qa_q1_id1_environment_create_foreign(qa_q1qc_source sourc
       env_error(message);
     }
   }
+  qa_q1_id1_environment *environment = xmalloc(sizeof *environment);
+  memset(environment, 0, sizeof *environment);
+  environment->source = source;
+  if (foreign != NULL) environment->foreign = *foreign;
+  environment->machine = machine;
+  environment->machine_ctx = machine_ctx;
+  environment->binding = binding;
   return environment;
 }
 void qa_q1_id1_environment_destroy(qa_q1_id1_environment *environment) { free(environment); }

@@ -43,6 +43,7 @@
 #include "qa/content/q3/base/combat_bridge.h"
 #include "qa/content/composition/q2_q3_items.h"
 #include "foreign_match_host.h"
+#include "qa/app/bootstrap/simulation/monster_admission.h"
 /* TS leaves an unregistered Q3 bridge policy to the GC; the simulation frees it with itself. */
 static void ss_release_q3_bridge_policy(void *ctx) {
   qa_combat_policy policy;
@@ -52,9 +53,7 @@ static void ss_release_q3_bridge_policy(void *ctx) {
 }
 
 static noreturn void wl_fail(const char *format, ...) {
-  char message[1024];
-  va_list args; va_start(args, format); vsnprintf(message, sizeof message, format, args); va_end(args);
-  qa_raise("Error", 0, 0, "%s", message);
+  va_list args; va_start(args, format); qa_ss_raise_error(format, args);
 }
 static void *wl_alloc(size_t count, size_t size) {
   void *memory = calloc(count ? count : 1, size);
@@ -359,7 +358,9 @@ void qa_ss_q2_native_set_match_team(qa_app_shared_simulation *sim, qa_actor_id a
   if (!qa_app_shared_sim_player_client(sim, actor, &client)) wl_fail("Original team command has no client");
   char *rest = wl_join_rest(args);
   wl_native_command command = {sim, (double)client.slot + 1, args, rest};
+  qa_cleanup rest_node; qa_cleanup_push(&rest_node, free, rest); /* a raising command frees the joined text */
   qa_app_q2_game_callback(wl_native_command_run, &command);
+  qa_cleanup_pop(&rest_node);
   free(rest);
 }
 void qa_ss_q3_qvm_set_match_team(qa_app_shared_simulation *sim, qa_actor_id actor, const char *requested) {
@@ -579,7 +580,7 @@ qa_app_sim_network_restart_plan qa_app_shared_sim_source_restart_plan(qa_app_sha
   qa_app_shared_sim_assert_open(sim);
   if ((sim->strategy->as_q3(sim) == NULL)) return (qa_app_sim_network_restart_plan){false, "Selected provider has no same-map source reset"};
   if (sim->has_selected_arsenal || sim->has_selected_weapon_source || sim->monster_sources.count != 0 || sim->grapple != NULL
-      || sim->hand_grenades != NULL || qa_app_shared_sim_foreign_tag(sim) || qa_app_shared_sim_foreign_lmctf(sim) || qa_app_shared_sim_foreign_deathball(sim))
+      || sim->hand_grenades != NULL || qa_app_foreign_match_rules_blocks_checkpoint(sim))
     return (qa_app_sim_network_restart_plan){false, "Selected adjunct providers and foreign match modes require full world replacement"};
   const char *compatibility = qa_app_q3_source_runtime_restart_compatibility(sim->source.q3);
   return qa_ss_is(compatibility, "compatible") ? (qa_app_sim_network_restart_plan){true, NULL}
@@ -750,6 +751,7 @@ void qa_app_shared_sim_set_source_view_roll(qa_app_shared_simulation *sim, qa_ac
 void qa_app_shared_sim_advance_q1_punch(qa_app_shared_simulation *sim) {
   const qa_numeric_operations *numeric = qa_create_numeric_operations(&qa_q1_donor_profile);
   size_t count; qa_actor_id *players = wl_players(sim, &count);
+  qa_cleanup players_cleanup; qa_cleanup_push(&players_cleanup, free, players); /* q1Punch.advance can raise */
   bool netquake = (sim->strategy->as_quakec(sim) != NULL) && qa_ss_is(qa_app_sim_quakec_source_kind(sim->source.quakec), "netquake");
   for (size_t i = 0; i < count; i++) {
     qa_actor_id actor = players[i];
@@ -762,6 +764,7 @@ void qa_app_shared_sim_advance_q1_punch(qa_app_shared_simulation *sim) {
     qa_vec3 punch_angles = qa_app_sim_q1_player_punch_advance(sim->q1_punch, actor, qa_ss_seconds(sim->source_frame.elapsed), *numeric);
     if (netquake_state) player->state.as.q1.punch_angles = punch_angles;
   }
+  qa_cleanup_pop(&players_cleanup);
   free(players);
 }
 
@@ -880,7 +883,7 @@ static void wl_fq2_teleport_player(void *ctx, qa_actor_id actor, qa_vec3 origin,
   qa_app_sim_movement_player *player = qa_app_shared_sim_require_player(sim, actor);
   qa_body_state body; bool has_body = qa_app_shared_sim_body(sim, actor, &body);
   qa_q2_player_movement_change change; memset(&change, 0, sizeof change);
-  change.kind = "teleport"; change.origin = origin; change.angles = angles; change.velocity = has_body ? body.velocity : qa_ss_zero;
+  change.kind = "teleport"; change.origin = origin; change.angles = angles; change.velocity = has_body ? body.velocity : qa_zero_vec3;
   change.command_angles = player->command_angles; change.hold_milliseconds = 160; change.spectator = false;
   qa_app_shared_sim_set_player_movement(sim, actor, change);
 }
@@ -1060,7 +1063,7 @@ static void wl_fq1_weapon_changed(void *ctx, qa_actor_id actor, qa_item_id acqui
   (void)acquired; /* TS weaponChanged: actor => ... */
   qa_app_shared_simulation *sim = ((wl_foreign_q1 *)ctx)->sim;
   qa_app_sim_movement_player *player = qa_app_shared_sim_require_player(sim, actor);
-  player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+  qa_app_shared_sim_assign_player_arsenal(sim, player);
 }
 static bool wl_fq1_prompt_supported(void *ctx, qa_actor_id actor) {
   qa_app_shared_simulation *sim = ((wl_foreign_q1 *)ctx)->sim;
@@ -1070,9 +1073,12 @@ static bool wl_fq1_prompt_supported(void *ctx, qa_actor_id actor) {
 static void wl_fq1_restart_session(void *ctx, const char *map, double flags) {
   wl_foreign_q1 *world = ctx; qa_app_shared_simulation *sim = world->sim;
   sim->q1_restart = true; sim->foreign_q1_world.campaign.flags = flags;
-  char name[512]; snprintf(name, sizeof name, "q1:%s", map);
+  /* `q1:${map}`: the map name is whole. */
+  size_t length = strlen(map) + 4;
+  char *name = qa_app_shared_sim_keep(sim, length);
+  snprintf(name, length, "q1:%s", map);
   qa_transition_intent intent; memset(&intent, 0, sizeof intent);
-  intent.kind = "campaign-level"; intent.campaign = world->campaign; intent.map = qa_app_shared_sim_intern(sim, name);
+  intent.kind = "campaign-level"; intent.campaign = world->campaign; intent.map = name;
   intent.spawn_point = ""; intent.gate_count = 0; intent.cause = NULL;
   qa_event_ring_admit(&sim->transitions, &intent);
 }
@@ -1145,7 +1151,8 @@ void qa_app_shared_sim_create_foreign_world(qa_app_shared_simulation *sim) {
 }
 
 /* ---- spawnForeignWorld (1338-1360) ---- */
-static void wl_report_unsupported(const char *const *classnames, size_t count) {
+/* Raises the TS report Error; frees `classnames` and, when given, the Q1 report they point into. */
+static noreturn void wl_report_unsupported(const char **classnames, size_t count, qa_q1_spawn_report *q1_report) {
   size_t length = 1;
   for (size_t i = 0; i < count; i++) length += strlen(classnames[i]) + 2;
   char *joined = wl_alloc(length, 1); size_t written = 0;
@@ -1156,10 +1163,13 @@ static void wl_report_unsupported(const char *const *classnames, size_t count) {
     if (written++) strcat(joined, ", ");
     strcat(joined, classnames[i]);
   }
-  char message[2048];
-  snprintf(message, sizeof message, "Unimplemented authored foreign spawns: %s", joined);
-  free(joined);
-  wl_fail("%s", message);
+  free(classnames);
+  if (q1_report) qa_q1_spawn_report_free(q1_report);
+  /* The message is whole (TS template string); the list lives until the next report on this thread. */
+  static __thread char *last;
+  free(last);
+  last = joined;
+  wl_fail("Unimplemented authored foreign spawns: %s", last);
 }
 /* ordinals minus the guest lane's selected-monster replacements; malloc'd. */
 static double *wl_keep_ordinals(qa_app_shared_simulation *sim, const double *ordinals, size_t ordinal_count, const char *edition, size_t *out_count) {
@@ -1184,7 +1194,7 @@ void qa_app_shared_sim_spawn_foreign_world(qa_app_shared_simulation *sim, const 
     if (report.unsupported_count != 0) {
       const char **names = wl_alloc(report.unsupported_count, sizeof *names);
       for (size_t i = 0; i < report.unsupported_count; i++) names[i] = report.unsupported[i]->classname;
-      wl_report_unsupported(names, report.unsupported_count);
+      wl_report_unsupported(names, report.unsupported_count, NULL);
     }
     return;
   }
@@ -1205,7 +1215,7 @@ void qa_app_shared_sim_spawn_foreign_world(qa_app_shared_simulation *sim, const 
     if (report.foreign_count != 0) {
       const char **names = wl_alloc(report.foreign_count, sizeof *names);
       for (size_t i = 0; i < report.foreign_count; i++) names[i] = report.foreign[i].classname;
-      wl_report_unsupported(names, report.foreign_count);
+      wl_report_unsupported(names, report.foreign_count, &report);
     }
     qa_q1_spawn_report_free(&report);
   }
@@ -1397,7 +1407,7 @@ qa_victim_armor_context qa_app_shared_sim_victim_armor_context(qa_app_shared_sim
     ? (qa_q2_entity_services_game(target->q2_services)->options.edition == QA_Q2_EDITION_RERELEASE ? "rerelease" : "classic")
     : strstr(sim->recipe.inventory.content, ":rerelease:") ? "rerelease" : "classic";
   qa_body_state body; bool has_body = qa_app_shared_sim_body(sim, request.target, &body);
-  qa_vec3 contact = has_body ? qa_ss_subtract(request.point, body.origin) : qa_ss_zero;
+  qa_vec3 contact = has_body ? qa_ss_subtract(request.point, body.origin) : qa_zero_vec3;
   qa_actor_id world;
   bool world_inflictor = request.attack.inflictor && qa_app_shared_sim_world_actor(sim, &world) && qa_same_actor(world, *request.attack.inflictor);
   qa_vec3 direction = request.attack.cause.kind == QA_ATTACK_CAUSE_Q1 && has_body && contact.x == 0 && contact.y == 0 && contact.z == 0
@@ -1412,42 +1422,6 @@ qa_victim_armor_context qa_app_shared_sim_victim_armor_context(qa_app_shared_sim
   return context;
 }
 static qa_victim_armor_context wl_armor_context(void *ctx, qa_damage_request request) { return qa_app_shared_sim_victim_armor_context(ctx, request); }
-static void wl_tag_damage(void *ctx, const void *input, void *output) {
-  qa_app_shared_simulation *sim = ctx; const qa_damage_request *request = input; qa_damage_request *out = output;
-  *out = *request;
-  if (!sim->has_tag_owner || qa_same_actor(request->target, sim->tag_owner)
-      || (request->attack.attacker && qa_same_actor(*request->attack.attacker, sim->tag_owner))) return;
-  out->amount = trunc(request->amount * 3 / 4);
-}
-static void wl_lmctf_damage(void *ctx, const void *input, void *output) {
-  qa_app_shared_simulation *sim = ctx; const qa_damage_request *request = input; qa_damage_request *out = output;
-  *out = *request;
-  double amount = request->amount;
-  bool has_attacker = request->attack.attacker != NULL; qa_actor_id attacker = has_attacker ? *request->attack.attacker : request->target;
-  /* Native g_runes: Damage multiplies outgoing by 1.75, Resist divides incoming
-   * by 1.75, Vampire returns half the health damage dealt. */
-  if (has_attacker && qa_ss_is(qa_app_shared_sim_lmctf_rune_held(sim, attacker), "damage")) amount = trunc((float)(amount * 1.75));
-  if (qa_ss_is(qa_app_shared_sim_lmctf_rune_held(sim, request->target), "resist")) amount = trunc((float)(amount / 1.75));
-  if (has_attacker && !qa_same_actor(attacker, request->target) && amount > 0 && qa_ss_is(qa_app_shared_sim_lmctf_rune_held(sim, attacker), "vampire")) {
-    qa_owned_actor owned; qa_combat_state_result health = qa_gameplay_authority_read(sim->combat, attacker);
-    if (qa_session_actor_registry_resolve_owned(sim->actors, attacker, &owned) && health.has_value)
-      qa_gameplay_authority_set_health(sim->combat, owned, qa_js_min(250, health.value.health + qa_js_shr(amount, 1)));
-  }
-  if (amount != request->amount) out->amount = amount;
-}
-static void wl_deathball_damage(void *ctx, const void *input, void *output) {
-  qa_app_shared_simulation *sim = ctx; const qa_damage_request *request = input; qa_damage_request *out = output;
-  *out = *request;
-  /* Native DeathBall: the ball takes 1 damage from every hit. */
-  if (sim->has_deathball && qa_same_actor(request->target, sim->deathball.id) && request->amount != 1) out->amount = 1;
-}
-static void wl_register_transform(qa_app_shared_simulation *sim, const char *provider, const char *id,
-    void (*transform)(void *ctx, const void *request, void *out_request)) {
-  qa_mod_operation_registration registration; memset(&registration, 0, sizeof registration);
-  registration.identity = (qa_mod_registration_identity){provider, id, 0};
-  registration.kind = QA_MOD_TRANSFORM; registration.ctx = sim; registration.transform = transform;
-  if (qa_mod_operation_register(qa_gameplay_authority_damage_operation(sim->combat), registration) < 0) qa_range_error("Out of memory");
-}
 /* Q1 policy source effects: the current Q1 combat source's folded effects. */
 static bool wl_q1_effects(qa_app_shared_simulation *sim, qa_q1_damage_source_effects *out) {
   qa_q1_services *game = qa_app_shared_sim_q1_combat_source(sim);
@@ -1544,9 +1518,7 @@ static qa_q2_combat_context wl_q2_context(void *ctx, qa_damage_request request, 
 void qa_app_shared_sim_register_combat(qa_app_shared_simulation *sim) {
   qa_provider_id id = sim->recipe.combat.provider;
   qa_victim_armor_policy armor = qa_native_victim_armor(wl_armor_context, sim);
-  if (qa_app_shared_sim_foreign_tag(sim)) wl_register_transform(sim, "q2:tag", "q2:tag/damage", wl_tag_damage);
-  if (qa_app_shared_sim_foreign_lmctf(sim)) wl_register_transform(sim, "q2:lmctf", "q2:lmctf/runes", wl_lmctf_damage);
-  if (qa_app_shared_sim_foreign_deathball(sim)) wl_register_transform(sim, "q2:deathball", "q2:deathball/ball", wl_deathball_damage);
+  qa_app_foreign_match_rules_register_combat(sim);
   qa_game_family family = qa_app_sim_provider_family(id);
   if (family == QA_GAME_FAMILY_Q1) {
     qa_q1_combat_policy_options options; memset(&options, 0, sizeof options);
@@ -1657,7 +1629,7 @@ bool qa_app_shared_sim_q1_visibility_eye(qa_app_shared_simulation *sim, qa_actor
   if (entry && entry->kind == QA_APP_SIM_ACTOR_EXECUTION_Q1 && entry->q1_entity->monster != NULL) {
     qa_q1_base_monster *monster = qa_q1_creatures_monsters_get(qa_q1_creatures_for(entry->q1_services), entry->q1_entity->actor);
     qa_vec3 eye;
-    if (monster && qa_q1_base_monster_eye(monster, entry->q1_entity->actor.id, &eye)) { *out = (qa_q1_client_eye){eye, qa_ss_zero}; return true; }
+    if (monster && qa_q1_base_monster_eye(monster, entry->q1_entity->actor.id, &eye)) { *out = (qa_q1_client_eye){eye, qa_zero_vec3}; return true; }
   }
   qa_monster_target_observation target;
   *out = (qa_q1_client_eye){body.origin, {0, 0, wl_monster_target(sim, actor, &target) ? target.view_height : 0}};
@@ -1729,8 +1701,8 @@ qa_owned_actor qa_app_shared_sim_register_q2_native_client_mode(qa_app_shared_si
     arsenal.provider = sim->weapon_provider.provider; arsenal.active_weapon = NULL; arsenal.ammo = NULL; arsenal.ammo_count = 0;
     arsenal.state.kind = "q2"; arsenal.state.gun_frame = 0; arsenal.state.state = 0; arsenal.state.pending_weapon = NULL;
     arsenal.state.machinegun_shots = 0; arsenal.state.grenade_time = (qa_source_time){QA_SOURCE_TIME_SECONDS, 0}; arsenal.state.grenade_blew_up = false;
-    qa_app_sim_movement_player *player = qa_app_shared_sim_create_player(sim, actor, client, has_body ? body.origin : qa_ss_zero,
-        has_body ? body.angles : qa_ss_zero, arsenal);
+    qa_app_sim_movement_player *player = qa_app_shared_sim_create_player(sim, actor, client, has_body ? body.origin : qa_zero_vec3,
+        has_body ? body.angles : qa_zero_vec3, arsenal);
     qa_ss_map_set(&sim->native_movement_players, &actor, &player);
     qa_app_shared_sim_attach_native_character(sim, player);
   }
@@ -2366,7 +2338,8 @@ void qa_app_shared_sim_bind_native_input(qa_app_shared_simulation *sim) {
       qa_compat_q2_native_primary_weapons_destroy(sim->native_primary_weapons); sim->native_primary_weapons = NULL;
     }
     const qa_compat_q2_native_primary_profile *primary = qa_app_shared_sim_native_primary(sim);
-    if (primary == NULL) wl_fail("Native primary weapon source is unqualified");
+    /* this.nativePrimary()?.weapons ?? null */
+    if (primary == NULL || primary->weapons == NULL) wl_fail("Native primary weapon source is unqualified");
     qa_app_sim_native_primary_weapon_context *context = qa_app_shared_sim_keep(sim, sizeof *context);
     qa_compat_q2_native_primary_weapon_hooks hooks; memset(&hooks, 0, sizeof hooks);
     hooks.ctx = sim; hooks.selected = wl_native_weapon_selected; hooks.completed = wl_native_weapon_completed; hooks.spawned = wl_native_weapon_spawned;
@@ -2461,10 +2434,12 @@ void qa_app_shared_sim_bind_native_input(qa_app_shared_simulation *sim) {
     sim->has_dispose_native_pickup_supply = true; sim->dispose_native_pickup_supply = (qa_ss_dispose){supply, wl_supply_dispose};
     size_t count = 0;
     qa_actor_id *players = wl_players(sim, &count);
+    qa_cleanup players_cleanup; qa_cleanup_push(&players_cleanup, free, players); /* a raising binding frees the list */
     for (size_t i = 0; i < count; i++) {
       qa_owned_actor owner_actor;
       if (qa_app_shared_sim_resolve_owned(sim, players[i], &owner_actor)) qa_app_shared_sim_bind_selected_original_pickups(sim, owner_actor);
     }
+    qa_cleanup_pop(&players_cleanup);
     free(players);
   }
   wl_input_services *record = qa_app_shared_sim_keep(sim, sizeof *record);
@@ -2488,6 +2463,7 @@ void qa_app_shared_sim_tick_native_characters(qa_app_shared_simulation *sim) {
   size_t count = sim->source.clients.count;
   qa_owned_actor *clients = wl_alloc(count, sizeof *clients);
   for (size_t i = 0; i < count; i++) clients[i] = *(qa_owned_actor *)qa_ss_map_value_at(&sim->source.clients, i);
+  qa_cleanup cleanup; qa_cleanup_push(&cleanup, free, clients); /* a raising guest or character read frees the snapshot */
   for (size_t i = 0; i < count; i++) {
     qa_owned_actor actor = clients[i];
     qa_app_sim_movement_player **entry = qa_ss_map_get(&sim->native_movement_players, &actor);
@@ -2549,6 +2525,7 @@ void qa_app_shared_sim_tick_native_characters(qa_app_shared_simulation *sim) {
       free((void *)result.effects);
     }
   }
+  qa_cleanup_pop(&cleanup);
   free(clients);
 }
 
@@ -2613,7 +2590,7 @@ typedef struct wl_monster_movement { qa_app_shared_simulation *sim; qa_app_sim_s
 static double wl_move_random(void *ctx) { return qa_app_sim_source_random_next_integer(((wl_monster_movement *)ctx)->random); }
 static qa_bounds wl_absolute_bounds(qa_app_shared_simulation *sim, qa_actor_id actor, qa_body_state body) {
   qa_linked_body_result linked = qa_shared_body_table_linked(wl_bodies(sim), actor);
-  return linked.has_value ? linked.value.absolute_bounds : (qa_bounds){qa_ss_add(body.origin, body.bounds.min), qa_ss_add(body.origin, body.bounds.max)};
+  return linked.has_value ? linked.value.absolute_bounds : (qa_bounds){qa_add3(body.origin, body.bounds.min), qa_add3(body.origin, body.bounds.max)};
 }
 static bool wl_move_read_target(void *ctx, qa_actor_id actor, qa_q1_monster_move_target *out) {
   qa_app_shared_simulation *sim = ((wl_monster_movement *)ctx)->sim;
@@ -2840,6 +2817,8 @@ static bool wl_creature_kill(void *ctx, qa_q1_base_monster *monster) {
 static void wl_creature_finale(void *ctx, qa_q1_base_monster *monster) {
   (void)ctx; wl_fail("Selected creature finale is unavailable: %s", monster->entity->classname);
 }
+static void wl_free_save_value(void *value) { qa_save_value_free(value); }
+static void wl_destroy_save_reader(void *reader) { qa_save_reader_destroy(reader); }
 static bool wl_creatures_capture(void *ctx, uint8_t **out, size_t *out_length) {
   wl_monster_source *source = ctx;
   qa_save_value *root = qa_save_value_object();
@@ -2853,11 +2832,16 @@ static bool wl_creatures_capture(void *ctx, uint8_t **out, size_t *out_length) {
 static void wl_creatures_restore(void *ctx, const uint8_t *bytes, size_t length) {
   wl_monster_source *source = ctx;
   qa_save_value *value = qa_decode_checkpoint_value(bytes, length);
+  /* A malformed checkpoint raises below: the decoded value is released with it. */
+  qa_cleanup value_cleanup; qa_cleanup_push(&value_cleanup, wl_free_save_value, value);
   qa_save_reader reader, version;
   if (!value || !qa_save_reader_init(&reader, value, "q1:selected-creatures")) qa_range_error("Out of memory");
+  qa_cleanup reader_cleanup; qa_cleanup_push(&reader_cleanup, wl_destroy_save_reader, &reader);
   if (!qa_save_reader_field(&reader, "version", &version)) qa_range_error("Out of memory");
+  qa_cleanup version_cleanup; qa_cleanup_push(&version_cleanup, wl_destroy_save_reader, &version);
   qa_save_reader_literal_number(&version, 1);
   qa_q1_creatures_restore_fields(source->creatures, &reader);
+  qa_cleanup_pop(&version_cleanup); qa_cleanup_pop(&reader_cleanup); qa_cleanup_pop(&value_cleanup);
   qa_save_reader_destroy(&version); qa_save_reader_destroy(&reader);
   qa_save_value_free(value);
 }
@@ -2998,6 +2982,7 @@ void qa_app_shared_sim_attach_monster(qa_app_shared_simulation *sim, qa_owned_ac
 /* ---- prepareSelectedMonsters / prepareGuestMonsters (1377-1681) ---- */
 typedef struct wl_selected_behavior {
   qa_app_shared_simulation *sim;
+  qa_app_sim_monster_admission admission; /* const admission = this.monsterAdmission(() => selected) */
   bool guest;
   qa_app_sim_monster_map map;
   qa_q2m_monsters *authored_monsters;  /* NULL = TS null */
@@ -3019,15 +3004,7 @@ typedef struct wl_placement {
   qa_actor_id *blockers; size_t blocker_count, blocker_capacity;
   const qa_actor_id *excluded; size_t excluded_count;
 } wl_placement;
-static double wl_medium(qa_app_sim_selected_monster_source *source, qa_vec3 origin) {
-  if (qa_ss_is(source->kind, "q2")) {
-    qa_q2_game_services *game = qa_q2_entity_services_game(source->q2->game);
-    return qa_js_to_int32(game->host->point_contents(game->host->ctx, origin)) & 56;
-  }
-  qa_q1_contents contents = source->game->host.contents(source->game->host.ctx, origin);
-  return qa_ss_is(contents, "water") ? 32 : qa_ss_is(contents, "slime") ? 16 : qa_ss_is(contents, "lava") ? 8 : 0;
-}
-static bool wl_same_medium(void *ctx, qa_vec3 origin) { wl_placement *placement = ctx; return wl_medium(placement->source, origin) == placement->original_medium; }
+static bool wl_same_medium(void *ctx, qa_vec3 origin) { wl_placement *placement = ctx; return qa_app_sim_monster_source_medium(placement->source, origin) == placement->original_medium; }
 static qa_trace_result wl_placement_trace(void *ctx, qa_trace_query query) {
   wl_placement *placement = ctx;
   return qa_shared_trace_excluding(placement->behavior->sim->scene, query, placement->excluded, placement->excluded_count);
@@ -3039,12 +3016,6 @@ static void wl_placement_blocked(void *ctx, qa_actor_id actor) {
   placement->blockers[placement->blocker_count++] = actor;
 }
 static void wl_blocked_ignored(void *ctx, qa_actor_id actor) { (void)ctx; (void)actor; } /* blockedBy: () => undefined */
-static qa_trace_policy wl_monster_policy(const qa_app_sim_selected_monster_source *source) {
-  qa_trace_policy policy; memset(&policy, 0, sizeof policy);
-  if (qa_ss_is(source->kind, "q1")) { policy.kind = "q1"; policy.move = "normal"; policy.has_hull = false; }
-  else { policy.kind = "q2"; policy.contents_mask = 1; policy.leaf_contents = "merged"; }
-  return policy;
-}
 static const qa_q1_base_monster_species *wl_species_for(const char *classname) {
   for (size_t i = 0; i < QA_Q1_BASE_SPECIES_COUNT; i++)
     for (size_t j = 0; j < QA_Q1_BASE_SPECIES[i].classname_count; j++)
@@ -3057,11 +3028,6 @@ static const char *wl_q1_property(const qa_q1_entity *entity, const char *key) {
 }
 static const char *wl_locomotion_name(const char *movement) {
   return qa_ss_is(movement, "fly") || qa_ss_is(movement, "swim") ? movement : "walk";
-}
-static noreturn void wl_placement_obstructed(qa_app_shared_simulation *sim, qa_authored_monster *entry, qa_monster_definition_reference definition) {
-  char ordinal[40];
-  wl_fail("Selected monster placement obstructed in %s: source %s %s -> %s/%s", sim->recipe.map.geometry.requested_path,
-    qa_ss_number_text(entry->source_ordinal, ordinal), entry->base.classname, definition.source.provider, definition.classname);
 }
 static qa_app_sim_nearby_placement wl_search(wl_placement *placement, qa_body_state body, const char *locomotion, const qa_actor_id *world,
     qa_vec3 origin, qa_bounds bounds, const char *native_locomotion, qa_trace_query query, bool record_blockers,
@@ -3083,18 +3049,14 @@ static void wl_apply_placement(qa_app_shared_simulation *sim, qa_owned_actor act
 static bool wl_validate_placement(void *ctx, qa_authored_monster *entry, qa_monster_definition_reference definition, const qa_vec3 *relocated) {
   wl_selected_behavior *behavior = ctx; qa_app_shared_simulation *sim = behavior->sim;
   qa_owned_actor actor = entry->base.actor;
-  qa_body_state body;
-  if (!qa_app_shared_sim_body(sim, actor.id, &body)) wl_fail("Started selected monster has no shared body");
-  qa_app_sim_selected_monster_source *source = qa_app_shared_sim_monster_source_for(sim, definition);
-  qa_trace_query query; memset(&query, 0, sizeof query);
-  query.start = body.origin; query.end = body.origin; query.shape = (qa_trace_shape){"box", body.bounds};
-  query.target.is_model = false; query.pass_actor = &actor.id;
-  query.numeric = qa_app_sim_provider_timing(sim->recipe, definition.source.provider).numeric;
-  query.policy = wl_monster_policy(source);
-  qa_trace_result trace = qa_shared_geometry_trace(sim->scene, query);
-  if (!trace.start_solid && !trace.all_solid) return true;
+  const qa_app_sim_monster_admission *admission = &behavior->admission;
+  qa_app_sim_monster_admission_probe probe = qa_app_sim_monster_admission_probe_entry(admission, entry, definition);
+  if (!probe.solid) return true;
+  qa_body_state body = probe.body;
+  qa_app_sim_selected_monster_source *source = probe.source;
+  qa_trace_query query = qa_app_sim_monster_admission_query(admission, entry, definition, source);
   qa_actor_id world; bool has_world = qa_app_shared_sim_world_actor(sim, &world);
-  wl_placement placement = {behavior, source, wl_medium(source, body.origin), NULL, 0, 0, NULL, 0};
+  wl_placement placement = {behavior, source, qa_app_sim_monster_source_medium(source, body.origin), NULL, 0, 0, NULL, 0};
   if (behavior->guest) {
     const qa_q2m_definition *native = behavior->modules ? qa_q2m_monsters_definition(&behavior->modules->monsters, entry->base.classname,
         qa_q2_entity_services_game(behavior->modules->game)) : NULL;
@@ -3110,7 +3072,7 @@ static bool wl_validate_placement(void *ctx, qa_authored_monster *entry, qa_mons
     if (position) found = wl_search(&placement, body, "walk", has_world ? &world : NULL, relocated ? *relocated : qa_q1_parse_vector(position),
         native_bounds, wl_locomotion_name(native_movement), query, false, NULL, 0);
     qa_q2_entities_free(authored, authored_count);
-    if (!found.found) wl_placement_obstructed(sim, entry, definition);
+    if (!found.found) qa_app_sim_monster_admission_obstructed(admission, entry, definition);
     wl_apply_placement(sim, actor, body, found);
     qa_shared_body_table_link(wl_bodies(sim), actor, NULL);
     return true;
@@ -3126,8 +3088,8 @@ static bool wl_validate_placement(void *ctx, qa_authored_monster *entry, qa_mons
   qa_q2_entity *q2_entity = source_game ? qa_q2_game_entity_of(source_game, &actor.id) : NULL;
   qa_q2_game_services *map_game = map_q1 ? NULL : qa_q2_entity_services_game(map.q2);
   qa_q2_spawn_fields *authored = NULL; size_t authored_count = 0;
-  if (!map_q1 && qa_ss_is(sim->world_kind, "q2-bsp") &&
-      !qa_q2_parse_entities(sim->world_entities, map_game->options.edition, &authored, &authored_count)) qa_range_error("Out of memory");
+  /* TS parses this.options.world.entities for any Q2 map program; only the preservation check needs a Q2 world. */
+  if (!map_q1 && !qa_q2_parse_entities(sim->world_entities, map_game->options.edition, &authored, &authored_count)) qa_range_error("Out of memory");
   size_t ordinal = (size_t)entry->source_ordinal;
   const qa_q2_spawn_fields *authored_q2 = ordinal < authored_count ? &authored[ordinal] : NULL;
   const qa_q2m_definition *native = !map_q1 && behavior->authored_monsters ? qa_q2m_monsters_definition(behavior->authored_monsters, entry->base.classname, map_game) : NULL;
@@ -3146,7 +3108,7 @@ static bool wl_validate_placement(void *ctx, qa_authored_monster *entry, qa_mons
   double flags = entity ? entity->movement_flags : q2_entity ? q2_entity->flags : 0;
   int32_t bits = qa_js_to_int32(flags);
   const char *locomotion = (bits & 2) != 0 ? "swim" : (bits & 1) != 0 ? "fly" : "walk";
-  qa_vec3 authored_origin = relocated ? *relocated : position ? qa_q1_parse_vector(position) : qa_ss_zero;
+  qa_vec3 authored_origin = relocated ? *relocated : position ? qa_q1_parse_vector(position) : qa_zero_vec3;
   qa_app_sim_nearby_placement found = wl_no_placement();
   if (position) found = wl_search(&placement, body, locomotion, has_world ? &world : NULL, authored_origin, native_bounds,
       wl_locomotion_name(native_movement), query, true, NULL, 0);
@@ -3192,7 +3154,7 @@ static bool wl_validate_placement(void *ctx, qa_authored_monster *entry, qa_mons
       return false;
     }
     free(doors); free(candidates); free(placement.blockers); qa_q2_entities_free(authored, authored_count);
-    wl_placement_obstructed(sim, entry, definition);
+    qa_app_sim_monster_admission_obstructed(admission, entry, definition);
   }
   free(placement.blockers); qa_q2_entities_free(authored, authored_count);
   wl_apply_placement(sim, actor, body, found);
@@ -3220,61 +3182,29 @@ static bool wl_placement_ready(void *ctx, qa_authored_monster *entry) {
   }
   return true;
 }
-static void wl_resume(void *ctx, qa_actor_id actor, const qa_actor_id *activator) {
-  qa_app_shared_simulation *sim = ((wl_selected_behavior *)ctx)->sim;
-  qa_app_sim_actor_execution *entry = qa_ss_map_get(&sim->actor_executions, &actor);
-  if (!entry || entry->kind == QA_APP_SIM_ACTOR_EXECUTION_Q3 || entry->kind == QA_APP_SIM_ACTOR_EXECUTION_Q3_SOURCE || entry->kind == QA_APP_SIM_ACTOR_EXECUTION_QUAKEC)
-    wl_fail("Activated monster has no creature source continuation");
-  if (entry->kind == QA_APP_SIM_ACTOR_EXECUTION_Q1) {
-    qa_q1_actor *entity = entry->q1_entity; qa_q1_services *services = entry->q1_services;
-    qa_q1_bound_action start = entity->think;
-    qa_q1_cancel(services, entity);
-    if (start.fn) start.fn(start.ctx, services, entity);
-    if (qa_session_actor_registry_is_live(sim->actors, actor) && activator && entity->use.fn) entity->use.fn(entity->use.ctx, services, entity, NULL, activator);
-  } else {
-    qa_q2_entity *entity = entry->q2_entity; qa_q2_game_services *services = qa_q2_entity_services_game(entry->q2_services);
-    qa_q2_think start = entity->think;
-    services->cancel(services->ctx, entity);
-    if (start.fn) start.fn(start.ctx, entity, services);
-    if (qa_session_actor_registry_is_live(sim->actors, actor) && activator && entity->use.fn) entity->use.fn(entity->use.ctx, entity, services, NULL, activator);
-  }
-}
-static bool wl_enemy(void *ctx, qa_actor_id actor, qa_actor_id *out) {
-  qa_app_shared_simulation *sim = ((wl_selected_behavior *)ctx)->sim;
-  qa_app_sim_actor_execution *entry = qa_ss_map_get(&sim->actor_executions, &actor);
-  if (entry && entry->kind == QA_APP_SIM_ACTOR_EXECUTION_Q1) {
-    if (!entry->q1_entity->monster || !entry->q1_entity->monster->has_enemy) return false;
-    *out = entry->q1_entity->monster->enemy; return true;
-  }
-  if (entry && entry->kind == QA_APP_SIM_ACTOR_EXECUTION_Q2 && entry->q2_entity->has_enemy) { *out = entry->q2_entity->enemy; return true; }
-  return false;
-}
-static bool wl_old_enemy(void *ctx, qa_actor_id actor, qa_actor_id *out) {
-  qa_app_shared_simulation *sim = ((wl_selected_behavior *)ctx)->sim;
-  qa_app_sim_actor_execution *entry = qa_ss_map_get(&sim->actor_executions, &actor);
-  if (entry && entry->kind == QA_APP_SIM_ACTOR_EXECUTION_Q1) {
-    if (!entry->q1_entity->monster || !entry->q1_entity->monster->has_old_enemy) return false;
-    *out = entry->q1_entity->monster->old_enemy; return true;
-  }
-  if (entry && entry->kind == QA_APP_SIM_ACTOR_EXECUTION_Q2 && entry->read_monster) {
-    qa_q2m_state *state = entry->read_monster(entry->ctx);
-    if (state && state->has_old_enemy) { *out = state->old_enemy; return true; }
-  }
-  return false;
-}
-static void wl_set_route(void *ctx, qa_actor_id actor, const qa_actor_id *goal, double pause_until) {
-  qa_app_shared_simulation *sim = ((wl_selected_behavior *)ctx)->sim;
-  qa_monster_definition_reference definition;
-  if (!sim->selected_monsters || !qa_app_sim_selected_monsters_definition(sim->selected_monsters, actor, &definition))
-    wl_fail("Selected route actor has no creature definition");
-  qa_app_sim_selected_monster_source *source = qa_app_shared_sim_monster_source_for(sim, definition);
-  if (qa_ss_is(source->kind, "q2")) { qa_q2m_monsters_set_route(&source->q2->monsters, actor, goal, pause_until); return; }
-  qa_q1_actor *entity = qa_q1_get_entity(source->game, &actor);
-  if (!entity) wl_fail("Selected Q1 route actor has no source continuation");
-  qa_q1_set_monster_route(source->game, entity, goal, pause_until);
-}
 static void wl_attach(void *ctx, qa_owned_actor actor, qa_monster_definition_reference definition, const qa_monster_mission *mission) {
   qa_app_shared_sim_attach_monster(((wl_selected_behavior *)ctx)->sim, actor, definition, mission);
+}
+/* The `...admission` spread of the TS behavior object: resume, enemy, oldEnemy and setRoute are MonsterAdmission's. */
+static void wl_resume(void *ctx, qa_actor_id actor, const qa_actor_id *activator) { qa_app_sim_monster_admission_resume(&((wl_selected_behavior *)ctx)->admission, actor, activator); }
+static bool wl_enemy(void *ctx, qa_actor_id actor, qa_actor_id *out) { return qa_app_sim_monster_admission_enemy(&((wl_selected_behavior *)ctx)->admission, actor, out); }
+static bool wl_old_enemy(void *ctx, qa_actor_id actor, qa_actor_id *out) { return qa_app_sim_monster_admission_old_enemy(&((wl_selected_behavior *)ctx)->admission, actor, out); }
+static void wl_set_route(void *ctx, qa_actor_id actor, const qa_actor_id *goal, double pause_until) {
+  qa_app_sim_monster_admission_set_route(&((wl_selected_behavior *)ctx)->admission, actor, goal, pause_until);
+}
+/* TS monsterAdmission(selected): `selected()` is the simulation's selectedMonsters once the constructor has stored it. */
+static qa_app_sim_actor_execution *wl_admission_execution(void *ctx, qa_actor_id actor) { return qa_ss_map_get(&((qa_app_shared_simulation *)ctx)->actor_executions, &actor); }
+static qa_app_sim_selected_monster_source *wl_admission_source_for(void *ctx, qa_monster_definition_reference definition) { return qa_app_shared_sim_monster_source_for(ctx, definition); }
+static bool wl_admission_definition_of(void *ctx, qa_actor_id actor, qa_monster_definition_reference *out) {
+  qa_app_shared_simulation *sim = ctx;
+  return sim->selected_monsters != NULL && qa_app_sim_selected_monsters_definition(sim->selected_monsters, actor, out);
+}
+static qa_app_sim_monster_admission wl_monster_admission(qa_app_shared_simulation *sim) {
+  qa_app_sim_monster_admission admission; memset(&admission, 0, sizeof admission);
+  admission.services.recipe = &sim->recipe; admission.services.actors = sim->actors; admission.services.physics = sim->physics;
+  admission.services.scene = sim->scene; admission.services.ctx = sim; admission.services.execution = wl_admission_execution;
+  admission.services.source_for = wl_admission_source_for; admission.services.definition_of = wl_admission_definition_of;
+  return admission;
 }
 static qa_app_sim_selected_monster_behavior wl_behavior(wl_selected_behavior *record) {
   return (qa_app_sim_selected_monster_behavior){record, wl_attach, wl_validate_placement, wl_placement_ready, wl_enemy, wl_old_enemy,
@@ -3335,6 +3265,7 @@ void qa_app_shared_sim_prepare_selected_monsters(qa_app_shared_simulation *sim) 
     wl_fail("Selected monster map admission currently requires a Q1 or Q2 authored map");
   /* On a foreign map the authored-family adjunct foundation is the map program. */
   wl_selected_behavior *behavior = qa_app_shared_sim_keep(sim, sizeof *behavior);
+  behavior->admission = wl_monster_admission(sim);
   behavior->sim = sim; behavior->guest = false;
   qa_app_sim_monster_map map; memset(&map, 0, sizeof map);
   if (sim->has_foreign_q1_world) { map.kind = "q1"; map.q1 = sim->foreign_q1_world.modules->game; }
@@ -3405,6 +3336,7 @@ void qa_app_shared_sim_prepare_guest_monsters(qa_app_shared_simulation *sim) {
   if (qa_ss_is(sim->world_kind, "q3-bsp") && all_map_defined) return;
   bool rerelease = qa_ss_is(edition, "rerelease");
   wl_selected_behavior *behavior = qa_app_shared_sim_keep(sim, sizeof *behavior);
+  behavior->admission = wl_monster_admission(sim);
   behavior->sim = sim; behavior->guest = true; behavior->edition = edition;
   behavior->timing = qa_app_sim_provider_timing(sim->recipe, reference.provider);
   qa_app_sim_source_random *random = qa_app_sim_source_random_create(sim->options.seed, rerelease ? "q2-rerelease" : "classic");
@@ -3491,7 +3423,7 @@ void qa_app_shared_sim_admit_guest_monsters(qa_app_shared_simulation *sim) {
     qa_vec3 origin = qa_q1_parse_vector(origin_text ? origin_text : "0 0 0");
     const char *angle_text = qa_q2_spawn_get(replacement->fields, "angle");
     double angle = angle_text ? qa_js_string_to_number(angle_text) : 0;
-    qa_body_state body = {origin, {0, angle, 0}, qa_ss_zero, {qa_ss_zero, qa_ss_zero}, NULL};
+    qa_body_state body = {origin, {0, angle, 0}, qa_zero_vec3, {qa_zero_vec3, qa_zero_vec3}, NULL};
     qa_shared_body_table_create_body(wl_bodies(sim), actor, body);
     qa_combat_state combat; memset(&combat, 0, sizeof combat);
     combat.health = 0; combat.armor.regular.kind = QA_REGULAR_ARMOR_NONE; combat.armor.powered.kind = "none";
@@ -3515,6 +3447,8 @@ void qa_app_shared_sim_sync_guest_monster_proxies(qa_app_shared_simulation *sim)
   }
 }
 static void wl_turn_position(void *ctx, qa_owned_actor actor, double out[2]) { qa_app_shared_sim_source_position(ctx, actor.id, out); }
+static void wl_free_visited(void *ctx) { free(((qa_app_sim_actor_visited *)ctx)->actors); }
+static void wl_free_turns(void *ctx) { qa_app_sim_ordered_actor_turns_destroy(ctx); }
 static void wl_execute(qa_app_shared_simulation *sim, const qa_app_sim_actor_execution *execution, qa_frame_context frame, qa_app_sim_actor_visited *visited) {
   qa_app_sim_actor_execution entry = *execution;
   qa_app_sim_actor_execution_frame context = {sim->actors, wl_bodies(sim), sim->physics, sim->scheduler, frame,
@@ -3536,7 +3470,10 @@ void qa_app_shared_sim_run_guest_monsters(qa_app_shared_simulation *sim) {
   }
   qa_app_shared_sim_begin_monster_frames(sim, qa_js_round(wl_time(sim) * 1000), true);
   qa_app_sim_actor_visited visited; memset(&visited, 0, sizeof visited);
+  /* A raising turn frees the visited set and the turn cursor. */
+  qa_cleanup visited_node; qa_cleanup_push(&visited_node, wl_free_visited, &visited);
   qa_app_sim_ordered_actor_turns *turns = qa_app_sim_ordered_actor_turns_create(sim->actors, wl_turn_position, sim);
+  qa_cleanup turns_node; qa_cleanup_push(&turns_node, wl_free_turns, turns);
   qa_owned_actor actor;
   while (qa_app_sim_ordered_actor_turns_next(turns, &visited, &actor)) {
     qa_app_sim_actor_execution *execution = qa_ss_map_get(&sim->actor_executions, &actor.id);
@@ -3558,6 +3495,7 @@ void qa_app_shared_sim_run_guest_monsters(qa_app_shared_simulation *sim) {
     if (!qa_app_sim_selected_monsters_before_turn(sim->selected_monsters, actor.id) || !qa_session_actor_registry_is_live(sim->actors, actor.id)) continue;
     wl_execute(sim, execution, source->clock.frame, &visited);
   }
+  qa_cleanup_pop(&turns_node); qa_cleanup_pop(&visited_node);
   qa_app_sim_ordered_actor_turns_destroy(turns);
   free(visited.actors);
   for (size_t i = 0; i < sim->monster_sources.count; i++) {

@@ -18,20 +18,26 @@ static const uint8_t *snapshot(qa_compat_q2_memory *memory, qa_guest_address add
   (void)memory;
   snapshot_buf_t *b = NULL;
   for (snapshot_buf_t *x = snapshots; x; x = x->next) if (x->length == length) b = x;
-  if (!b) { b = calloc(1, sizeof *b); b->length = length; b->bytes = calloc(length ? (size_t)length : 1, 1); b->next = snapshots; snapshots = b; }
+  if (!b) {
+    b = calloc(1, sizeof *b); uint8_t *bytes = calloc(length ? (size_t)length : 1, 1);
+    if (!b || !bytes) { free(b); free(bytes); qa_range_error("Out of memory"); }
+    b->length = length; b->bytes = bytes; b->next = snapshots; snapshots = b;
+  }
   memory->copy_into(memory->ctx, address, b->bytes, (size_t)length, length);
   return b->bytes;
 }
 static qa_vec3 rvec(const uint8_t *v, size_t o) { return (qa_vec3){qa_compat_q2_view_f32(v, o), qa_compat_q2_view_f32(v, o + 4), qa_compat_q2_view_f32(v, o + 8)}; }
-static bool same_float(double a, double b) { /* Object.is on float32-read doubles */ return a == b || (a != a && b != b); }
+/* Object.is: NaN is NaN, and +0 is not -0 (a field that went from 0 to -0 is a new vector, not the retained one). */
+static bool same_float(double a, double b) { return a != a ? b != b : a == b && signbit(a) == signbit(b); }
 static qa_vec3 retain(const uint8_t *view, size_t off, bool has_prev, qa_vec3 prev) {
   qa_vec3 next = rvec(view, off);
   return has_prev && same_float(prev.x, next.x) && same_float(prev.y, next.y) && same_float(prev.z, next.z) ? prev : next;
 }
 qa_compat_q2_rerelease_public_edict *qa_compat_q2_rerelease_public_edict_create(qa_compat_q2_memory *memory, qa_raw_entity_view record) {
-  qa_compat_q2_rerelease_public_edict *e = calloc(1, sizeof *e); if (!e) return NULL;
   qa_compat_q2_rerelease_layouts_ensure();
+  /* The constructor's check comes first: a record the memory refuses allocates nothing. */
   memory->check(memory->ctx, record.address, qa_compat_q2_rerelease_edict_layout.byte_length, "read");
+  qa_compat_q2_rerelease_public_edict *e = calloc(1, sizeof *e); if (!e) return NULL;
   e->memory = memory; e->record = record; return e;
 }
 void qa_compat_q2_rerelease_public_edict_destroy(qa_compat_q2_rerelease_public_edict *e) { free(e); }
@@ -76,12 +82,15 @@ void qa_compat_q2_rerelease_public_edict_set_vector(const qa_compat_q2_rerelease
 }
 qa_guest_address qa_compat_q2_rerelease_public_edict_client(const qa_compat_q2_rerelease_public_edict *e) {
   qa_guest_address address;
-  if (!qa_compat_q2_rerelease_public_edict_pointer(e, "client", &address)) qa_range_error("API2023 source slot has no public client prefix");
+  if (!qa_compat_q2_rerelease_public_edict_pointer(e, "client", &address)) qa_raise("Error", 0, 0, "API2023 source slot has no public client prefix");
   e->memory->check(e->memory->ctx, address, qa_compat_q2_rerelease_client_layout.byte_length, "read");
   return address;
 }
 qa_q2_rerelease_player_state qa_compat_q2_rerelease_public_edict_player_state(const qa_compat_q2_rerelease_public_edict *e) {
   return qa_compat_q2_read_rerelease_player_state(e->memory, qa_compat_q2_rerelease_public_edict_client(e));
+}
+qa_q2_rerelease_player_state qa_compat_q2_rerelease_public_edict_player_state_into(const qa_compat_q2_rerelease_public_edict *e, double *stats) {
+  return qa_compat_q2_read_rerelease_player_state_into(e->memory, qa_compat_q2_rerelease_public_edict_client(e), stats);
 }
 qa_vec3 qa_compat_q2_rerelease_public_edict_player_velocity(const qa_compat_q2_rerelease_public_edict *e) {
   const qa_compat_q2_memory * m;

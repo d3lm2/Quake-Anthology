@@ -49,5 +49,9 @@ typedef struct qa_q3_visible_entities {
   qa_q3_entity_state_record **entities; size_t entity_count;
 } qa_q3_visible_entities;
 bool qa_q3_select_snapshot_entities(const qa_q3_player_state_record *player, const qa_q3_visibility_bindings *host, qa_q3_visible_entities *out);
+/* The same with the eye height as a JS number (player->viewheight is ignored): a published
+ * player's view height can be fractional, where the int32 record field would truncate it. */
+bool qa_q3_select_snapshot_entities_from(const qa_q3_player_state_record *player, double viewheight,
+                                         const qa_q3_visibility_bindings *host, qa_q3_visible_entities *out);
 void qa_q3_visible_entities_destroy(qa_q3_visible_entities *v);
 #endif

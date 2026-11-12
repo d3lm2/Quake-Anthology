@@ -35,8 +35,17 @@ qa_game_roots qa_resolve_game_roots(const char *root);
 void qa_game_roots_free(qa_game_roots *roots);
 
 bool qa_has_game_anchor(const char *root);
+/* TS isInstallRoot: true when a path is a game install rather than a writable
+ * user-content tree: it is the content root in use, or it holds a game's base
+ * directory (`id1`, `baseq2`, `baseq3`) directly. User trees keep games under
+ * canonical family folders (`q1/id1`), so they never match. */
+bool qa_is_install_root(const char *path, const char *content_root);
 
 void qa_content_free_string_list(char **list, size_t count);
+
+/* os.homedir(): $HOME when set, else the effective user's password
+ * database directory. Borrowed; valid until the next call. */
+const char *qa_content_home_directory(void);
 /* `home` NULL means homedir(). False only on OOM. */
 bool qa_steam_common_directories(const char *home, char ***out, size_t *out_count);
 

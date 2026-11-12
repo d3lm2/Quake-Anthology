@@ -11,7 +11,7 @@ void qa_app_q3_map_launch_make(qa_app_q3_map_launch *out, qa_q3_product_policy p
   const char *const *commands = qa_q3_product_map_commands(policy, &count);
   bool known = false;
   for (size_t i = 0; i < count; i++) if (strcmp(commands[i], command) == 0) known = true;
-  if (!known) qa_range_error("Unknown Q3 map command: %s", command);
+  if (!known) qa_raise("Error", 0, 0, "Unknown Q3 map command: %s", command);
   bool single_player = strncmp(command, "sp", 2) == 0;
   double game_type = single_player ? 2 : current_game_type == 2 ? 0 : current_game_type;
   memset(out, 0, sizeof *out);

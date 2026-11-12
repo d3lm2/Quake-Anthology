@@ -21,6 +21,14 @@ static double *copy_doubles(const double *values, size_t count) {
   memcpy(copy, values, count * sizeof *copy);
   return copy;
 }
+static char *copy_text(const char *text) {
+  if (!text) text = "";
+  size_t length = strlen(text);
+  char *copy = malloc(length + 1);
+  if (!copy) qa_range_error("Out of memory");
+  memcpy(copy, text, length + 1);
+  return copy;
+}
 
 typedef struct kept_string { struct kept_string *next; char text[]; } kept_string;
 static kept_string *KEPT_STRINGS;
@@ -59,9 +67,9 @@ void qa_q2_base_player_state_checkpoint_capture(const qa_q2_base_player_state *s
   out->use_q2_weapons = state->use_q2_weapons; out->use_q2_inventory = state->use_q2_inventory;
   out->spawn_inventory = copy_entries(state->spawn_inventory, state->spawn_inventory_count);
   out->spawn_inventory_count = state->spawn_inventory_count;
-  (void)snprintf(out->userinfo, sizeof out->userinfo, "%s", state->userinfo);
-  (void)snprintf(out->name, sizeof out->name, "%s", state->name);
-  (void)snprintf(out->skin, sizeof out->skin, "%s", state->skin);
+  out->userinfo = copy_text(state->userinfo);
+  out->name = copy_text(state->name);
+  out->skin = copy_text(state->skin);
   out->gender = state->gender;
   out->fov = state->fov; out->hand = state->hand;
   out->spectator = state->spectator; out->requested_spectator = state->requested_spectator;
@@ -104,6 +112,9 @@ void qa_q2_base_player_state_checkpoint_clear(qa_q2_base_player_state_checkpoint
   qa_q2_base_player_carry_clear(&checkpoint->coop_respawn);
   free(checkpoint->flood_times);
   checkpoint->flood_times = NULL; checkpoint->flood_time_count = 0;
+  free((char *)checkpoint->userinfo); checkpoint->userinfo = NULL;
+  free((char *)checkpoint->skin); checkpoint->skin = NULL;
+  free((char *)checkpoint->name); checkpoint->name = NULL;
 }
 
 void qa_q2_base_player_state_checkpoint_restore(qa_q2_base_player_state *state,
@@ -118,9 +129,9 @@ void qa_q2_base_player_state_checkpoint_restore(qa_q2_base_player_state *state,
   state->spawn_inventory = copy_entries(checkpoint->spawn_inventory, checkpoint->spawn_inventory_count);
   state->spawn_inventory_count = checkpoint->spawn_inventory_count;
   keep_entries(state->spawn_inventory, state->spawn_inventory_count);
-  (void)snprintf(state->userinfo, sizeof state->userinfo, "%s", checkpoint->userinfo);
-  (void)snprintf(state->name, sizeof state->name, "%s", checkpoint->name);
-  (void)snprintf(state->skin, sizeof state->skin, "%s", checkpoint->skin);
+  qa_q2_base_player_state_set_userinfo(state, checkpoint->userinfo ? checkpoint->userinfo : "");
+  qa_q2_base_player_state_set_name(state, checkpoint->name ? checkpoint->name : "");
+  qa_q2_base_player_state_set_skin(state, checkpoint->skin ? checkpoint->skin : "", checkpoint->skin ? strlen(checkpoint->skin) : 0);
   state->gender = qa_q2_checkpoint_keep_string(checkpoint->gender); state->fov = checkpoint->fov;
   state->hand = qa_q2_checkpoint_keep_string(checkpoint->hand);
   state->spectator = checkpoint->spectator; state->requested_spectator = checkpoint->requested_spectator;

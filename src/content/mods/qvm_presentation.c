@@ -1,5 +1,6 @@
 /* Port of src/content/mods/qvm-presentation.ts. GPL-2.0-or-later. */
 #include "qa/content/mods/qvm_presentation.h"
+#include "qa/content/json_text.h"
 #include "qa/content/mods/declaration.h"
 
 #include <math.h>
@@ -343,7 +344,7 @@ qa_qvm_mod_presentation_declaration *qa_read_qvm_mod_presentation_declaration(
 
 qa_qvm_mod_presentation_declaration *qa_read_qvm_mod_presentation(
     const uint8_t *bytes, size_t length) {
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (value == NULL) return NULL;
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, "qvm-presentation")) return NULL;

@@ -17,88 +17,79 @@ static char *dupstr(const char *s) { size_t n = strlen(s) + 1; char *p = malloc(
 static char *dupn(const char *s, size_t n) { char *p = malloc(n + 1); if (p) { memcpy(p, s, n); p[n] = '\0'; } return p; }
 static bool is_safe_d(double v) { return isfinite(v) && v == trunc(v) && v >= -9007199254740991.0 && v <= 9007199254740991.0; }
 
-/* --- Minimal URL handling: scheme://host[:port]/path --- */
+/* --- URL handling through libcurl's RFC 3986 parser (new URL(...) for the parts used here):
+ * relative Location references ("//host/x", "?q", "../x") resolve against the current URL,
+ * the scheme and host compare case-insensitively, and the origin carries the effective port. --- */
 #define RANGE_THRESHOLD (1024.0 * 1024.0)
-struct url_parts { char *scheme, *host, *path, *origin; int port; bool has_userinfo; };
-static void url_free(struct url_parts *u) { free(u->scheme); free(u->host); free(u->path); free(u->origin); memset(u, 0, sizeof *u); }
+struct url_parts { char *scheme, *host, *origin; bool has_userinfo; };
+static void url_free(struct url_parts *u) { free(u->scheme); free(u->host); free(u->origin); memset(u, 0, sizeof *u); }
+static void ascii_lower(char *text) { for (; text && *text; text++) *text = (char)tolower((unsigned char)*text); }
 static int url_parse(const char *url, struct url_parts *out) {
   memset(out, 0, sizeof *out);
-  const char *sep = strstr(url, "://");
-  if (!sep) return 0;
-  out->scheme = dupn(url, (size_t)(sep - url));
-  const char *rest = sep + 3;
-  const char *slash = strchr(rest, '/');
-  const char *auth_end = slash ? slash : url + strlen(url);
-  const char *at = NULL;
-  for (const char *p = rest; p < auth_end; p++) if (*p == '@') at = p;
-  const char *hostport = at ? at + 1 : rest;
-  out->has_userinfo = at != NULL;
-  const char *colon = NULL;
-  for (const char *p = hostport; p < auth_end; p++) if (*p == ':') colon = p;
-  /* IPv6 literals keep brackets in host. */
-  if (hostport[0] == '[') {
-    const char *closeb = strchr(hostport, ']');
-    if (closeb && closeb < auth_end) {
-      out->host = dupn(hostport + 1, (size_t)(closeb - hostport - 1));
-      out->port = (closeb + 1 < auth_end && closeb[1] == ':') ? atoi(closeb + 2) : 0;
-    }
-  } else if (colon) {
-    out->host = dupn(hostport, (size_t)(colon - hostport));
-    out->port = atoi(colon + 1);
-  } else out->host = dupn(hostport, (size_t)(auth_end - hostport));
-  if (!out->port) out->port = strcmp(out->scheme, "https") == 0 ? 443 : 80;
-  out->path = dupstr(slash ? slash : "/");
-  size_t need = strlen(out->scheme) + strlen(out->host) + 32;
+  CURLU *handle = curl_url();
+  if (!handle) return 0;
+  if (curl_url_set(handle, CURLUPART_URL, url, CURLU_NON_SUPPORT_SCHEME) != CURLUE_OK) { curl_url_cleanup(handle); return 0; }
+  char *scheme = NULL, *host = NULL, *port = NULL, *user = NULL, *password = NULL;
+  (void)curl_url_get(handle, CURLUPART_SCHEME, &scheme, 0);
+  (void)curl_url_get(handle, CURLUPART_HOST, &host, 0);
+  (void)curl_url_get(handle, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT);
+  (void)curl_url_get(handle, CURLUPART_USER, &user, 0);
+  (void)curl_url_get(handle, CURLUPART_PASSWORD, &password, 0);
+  /* URL.username / URL.password: an empty "@" is no credential. */
+  out->has_userinfo = (user && user[0]) || (password && password[0]);
+  out->scheme = dupstr(scheme ? scheme : "");
+  out->host = dupstr(host ? host : "");
+  ascii_lower(out->scheme); ascii_lower(out->host);
+  size_t need = strlen(out->scheme) + strlen(out->host) + (port ? strlen(port) : 0) + 8;
   out->origin = malloc(need);
-  snprintf(out->origin, need, "%s://%s:%d", out->scheme, out->host, out->port);
-  return 1;
+  if (out->origin) snprintf(out->origin, need, "%s://%s:%s", out->scheme, out->host, port ? port : "");
+  curl_free(scheme); curl_free(host); curl_free(port); curl_free(user); curl_free(password);
+  curl_url_cleanup(handle);
+  return out->scheme && out->host && out->origin;
 }
+/* new URL(location, base).href; NULL when the reference does not resolve. */
 static char *url_resolve(const char *base, const char *location) {
-  if (strstr(location, "://")) return dupstr(location);
-  struct url_parts b;
-  if (!url_parse(base, &b)) return dupstr(location);
-  char *out = NULL;
-  if (location[0] == '/') {
-    size_t need = strlen(b.origin) + strlen(location) + 1;
-    out = malloc(need); snprintf(out, need, "%s%s", b.origin, location);
-  } else {
-    /* Relative to base directory. */
-    const char *last = strrchr(b.path, '/');
-    size_t dirlen = last ? (size_t)(last - b.path) + 1 : 0;
-    size_t need = strlen(b.origin) + dirlen + strlen(location) + 1;
-    out = malloc(need);
-    snprintf(out, need, "%s%.*s%s", b.origin, (int)dirlen, b.path, location);
-  }
-  url_free(&b);
+  CURLU *handle = curl_url();
+  if (!handle) return NULL;
+  char *href = NULL, *out = NULL;
+  if (curl_url_set(handle, CURLUPART_URL, base, CURLU_NON_SUPPORT_SCHEME) == CURLUE_OK
+      && curl_url_set(handle, CURLUPART_URL, location, CURLU_NON_SUPPORT_SCHEME) == CURLUE_OK
+      && curl_url_get(handle, CURLUPART_URL, &href, 0) == CURLUE_OK)
+    out = dupstr(href);
+  curl_free(href);
+  curl_url_cleanup(handle);
   return out;
 }
 
 /* --- HTTP response --- */
-struct http_response {
-  int status; char *headers; uint8_t *body; size_t body_len, body_cap;
-  int fd; bool headers_done; size_t content_length; bool has_content_length; size_t received;
-};
-static const char *header_get(const char *headers, const char *name, char *buf, size_t bufsz) {
+/* Headers.get(name): every field with the name, case-insensitively, joined with ", ", each value
+ * stripped of leading and trailing HTTP whitespace. Malloc'd; NULL when absent. */
+static char *header_value(const char *headers, const char *name) {
   size_t nl = strlen(name);
-  const char *p = headers;
-  while (p && *p) {
-    const char *eol = strstr(p, "\r\n");
+  char *out = NULL; size_t used = 0;
+  for (const char *p = headers; p && *p;) {
+    const char *eol = strpbrk(p, "\r\n");
     size_t linelen = eol ? (size_t)(eol - p) : strlen(p);
-    if (linelen > nl && p[nl] == ':') {
-      bool match = true;
-      for (size_t i = 0; i < nl; i++) if (tolower((unsigned char)p[i]) != tolower((unsigned char)name[i])) match = false;
-      if (match) {
-        const char *v = p + nl + 1;
-        while (v < p + linelen && (*v == ' ' || *v == '\t')) v++;
-        size_t vn = (size_t)((p + linelen) - v);
-        if (vn >= bufsz) vn = bufsz - 1;
-        memcpy(buf, v, vn); buf[vn] = '\0'; return buf;
-      }
+    if (linelen > nl && p[nl] == ':' && strncasecmp(p, name, nl) == 0) {
+      const char *v = p + nl + 1, *e = p + linelen;
+      while (v < e && (*v == ' ' || *v == '\t')) v++;
+      while (e > v && (e[-1] == ' ' || e[-1] == '\t')) e--;
+      size_t vn = (size_t)(e - v);
+      char *grown = realloc(out, used + (out ? 2 : 0) + vn + 1);
+      if (!grown) { free(out); qa_range_error("out of memory"); }
+      if (out) { memcpy(grown + used, ", ", 2); used += 2; }
+      out = grown;
+      memcpy(out + used, v, vn); used += vn; out[used] = '\0';
     }
     if (!eol) break;
-    p = eol + 2;
+    p = eol + 1;
   }
-  return NULL;
+  return out;
+}
+static bool header_present(const char *headers, const char *name) {
+  char *value = header_value(headers, name);
+  free(value);
+  return value != NULL;
 }
 /* One request, no redirect following, through libcurl (fetch with redirect: 'manual').
  * Returns the status, -1 on a transport error before a status, -3 when aborted. A failure
@@ -157,7 +148,10 @@ static int http_once(const char *url, const char *method, const char *extra_head
   curl_easy_setopt(easy, CURLOPT_URL, url);
   curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 0L);
-  curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, 30000L);
+  /* IDLE_TIMEOUT_MILLISECONDS covers headers and each wait for the next chunk, not the transfer. */
+  curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, 30000L);
+  curl_easy_setopt(easy, CURLOPT_LOW_SPEED_LIMIT, 1L);
+  curl_easy_setopt(easy, CURLOPT_LOW_SPEED_TIME, 30L);
   curl_easy_setopt(easy, CURLOPT_HTTPHEADER, list);
   curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, identity ? "identity" : "");
   curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, http_on_header);
@@ -222,11 +216,11 @@ static int http_fetch_buffered(const char *url, const char *method, const char *
     }
     free(body.data);
     if (aborted && *aborted) { free(headers); result = -3; break; }
-    char loc[2048];
-    const char *location = headers ? header_get(headers, "location", loc, sizeof loc) : NULL;
-    if (redirects == 4 || !location) { free(headers); result = -4; break; }
+    char *location = headers ? header_value(headers, "location") : NULL;
+    if (redirects == 4 || !location) { free(location); free(headers); result = -4; break; }
     char *next = url_resolve(current, location);
-    struct url_parts np; url_parse(next, &np);
+    free(location);
+    struct url_parts np; url_parse(next ? next : "", &np);
     bool same_origin = np.origin && orig.origin && strcmp(np.origin, orig.origin) == 0;
     if (!same_origin || np.has_userinfo) { url_free(&np); free(next); free(headers); result = -4; break; }
     url_free(&np); free(headers); free(current); current = next;
@@ -251,19 +245,24 @@ static bool content_range_matches(const char *range, double start, double end, d
   return content_range_digits(&p, '-', &first) && content_range_digits(&p, '/', &last) &&
          content_range_digits(&p, '\0', &size) && first == start && last == end && size == total;
 }
+/* value !== null && /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) */
 static bool content_length_of(const char *headers, double *out) {
-  char buf[128];
-  if (!header_get(headers, "content-length", buf, sizeof buf)) return false;
-  for (const char *p = buf; *p; p++) if (!isdigit((unsigned char)*p)) return false;
-  double v = strtod(buf, NULL);
-  if (!is_safe_d(v)) return false;
+  char *value = header_value(headers, "content-length");
+  if (!value) return false;
+  bool digits = value[0] != '\0';
+  for (const char *p = value; *p; p++) if (!isdigit((unsigned char)*p)) digits = false;
+  double v = digits ? strtod(value, NULL) : 0;
+  free(value);
+  if (!digits || !is_safe_d(v)) return false;
   *out = v; return true;
 }
 static bool identity_encoding(const char *headers) {
-  char buf[128];
-  if (!header_get(headers, "content-encoding", buf, sizeof buf)) return true;
-  for (char *p = buf; *p; p++) *p = (char)tolower((unsigned char)*p);
-  return strcmp(buf, "identity") == 0;
+  char *value = header_value(headers, "content-encoding");
+  if (!value) return true;
+  ascii_lower(value);
+  bool identity = strcmp(value, "identity") == 0;
+  free(value);
+  return identity;
 }
 uint8_t *qa_fetch_http_download_metadata(const char *url, double maximum_bytes, const bool *aborted, size_t *out_len) {
   if (!is_safe_d(maximum_bytes) || maximum_bytes < 0) qa_range_error("Invalid HTTP metadata size limit");
@@ -311,7 +310,7 @@ struct http_transfer_state {
   int phase;
   struct http_op *ops[8]; size_t op_count;
   qa_download_sink sink; bool have_sink, published;
-  double probe_total; char etag[512]; bool retry_identity;
+  double probe_total; char *etag; bool retry_identity;
   qa_download_span *spans; size_t span_count;
   double *span_received; int *span_attempt; bool *span_done;
   bool has_primary, primary_unsupported; char primary[QA_CAUGHT_MESSAGE_CAPACITY];
@@ -332,7 +331,6 @@ struct qa_http_download_queue {
   double concurrency, range_streams;
   struct http_entry **entries; size_t count, capacity;
   double active; bool package_active, closed; long long generation;
-  double total_received; /* TS totalReceived, against options.total_budget_bytes */
   CURLM *multi;
 };
 void qa_http_download_result_destroy(qa_http_download_result *r) { free(r->digest); free(r->reason); memset(r, 0, sizeof *r); }
@@ -358,6 +356,7 @@ static void transfer_free(qa_http_download_queue *q, struct http_transfer_state 
   for (size_t i = 0; i < t->op_count; i++) op_destroy(q, t->ops[i]);
   t->op_count = 0;
   free(t->spans); free(t->span_received); free(t->span_attempt); free(t->span_done);
+  free(t->etag);
   free(t);
 }
 static void entry_free(struct http_entry *e) {
@@ -396,7 +395,7 @@ void qa_http_download_queue_enqueue(qa_http_download_queue *q, qa_http_download_
   if (existing) {
     if (strcmp(existing->url, request.url) != 0 || strcmp(existing->kind, request.kind) != 0
         || !same_expectation(existing->expected, request.expected) || existing->validate != request.validate)
-      qa_range_error("Conflicting HTTP download identity for one destination");
+      qa_raise("Error", 0, 0, "Conflicting HTTP download identity for one destination");
     return;
   }
   if (q->count == q->capacity) {
@@ -436,10 +435,6 @@ static const char *transfer_current(qa_http_download_queue *q, struct http_trans
 typedef struct report_scope { qa_http_download_queue *q; struct http_entry *e; double received; bool has_total; double total; } report_scope;
 static void report_body(void *ctx) {
   report_scope *scope = ctx;
-  qa_http_download_queue *q = scope->q;
-  q->total_received += qa_js_max(0, scope->received - scope->e->received);
-  if (q->options.has_total_budget_bytes && q->total_received > q->options.total_budget_bytes)
-    qa_range_error("HTTP download quota exceeded");
   scope->e->received = scope->received; scope->e->has_total = scope->has_total; scope->e->total = scope->total;
   scope->q->options.progress(scope->q->options.ctx, scope->e->path, scope->received, scope->has_total, scope->total);
 }
@@ -500,6 +495,14 @@ static int op_on_progress(void *ctx, curl_off_t a, curl_off_t b, curl_off_t c, c
   struct http_transfer_state *t = op->owner;
   return q->closed || t->generation != q->generation || t->entry->aborted ? 1 : 0;
 }
+static void append_header(struct http_op *op, const char *prefix, const char *value) {
+  size_t n = strlen(prefix) + strlen(value) + 1;
+  char *line = malloc(n);
+  if (!line) qa_range_error("out of memory");
+  snprintf(line, n, "%s%s", prefix, value);
+  op->list = curl_slist_append(op->list, line);
+  free(line);
+}
 static void op_start(qa_http_download_queue *q, struct http_op *op) {
   static bool initialized = false;
   if (!initialized) { curl_global_init(CURL_GLOBAL_DEFAULT); initialized = true; }
@@ -512,16 +515,14 @@ static void op_start(qa_http_download_queue *q, struct http_op *op) {
   op->easy = curl_easy_init();
   if (!op->easy) qa_range_error("out of memory");
   struct http_transfer_state *t = op->owner;
-  char line[700];
+  char line[128];
   /* Accept-Encoding: identity on every request but metadata; If-Range / If-Match pin the probe's ETag. */
   if (op->kind == OP_RANGE) {
     snprintf(line, sizeof line, "Range: bytes=%s-%s", QA_JS_NUMBER(op->start), QA_JS_NUMBER(t->spans[op->span].end));
     op->list = curl_slist_append(op->list, line);
-    snprintf(line, sizeof line, "If-Range: %s", t->etag);
-    op->list = curl_slist_append(op->list, line);
+    append_header(op, "If-Range: ", t->etag);
   } else if (op->kind == OP_WHOLE && t->retry_identity) {
-    snprintf(line, sizeof line, "If-Match: %s", t->etag);
-    op->list = curl_slist_append(op->list, line);
+    append_header(op, "If-Match: ", t->etag);
   }
   curl_easy_setopt(op->easy, CURLOPT_URL, op->url);
   curl_easy_setopt(op->easy, CURLOPT_NOSIGNAL, 1L);
@@ -582,31 +583,34 @@ static bool op_validate(qa_http_download_queue *q, struct http_op *op) {
   const char *retired = transfer_current(q, t, &caught);
   if (retired) { op_fail(op, retired); return false; }
   const char *headers = op->headers ? op->headers : "";
-  char etag_text[512];
-  const char *etag = header_get(headers, "etag", etag_text, sizeof etag_text);
+  char *etag = header_value(headers, "etag");
   if (op->kind == OP_RANGE) {
     const qa_download_span *span = &t->spans[op->span];
-    if (etag && strcmp(etag, t->etag) != 0) { op_fail(op, "HTTP ranged representation changed"); return false; }
+    if (etag && strcmp(etag, t->etag) != 0) { free(etag); op_fail(op, "HTTP ranged representation changed"); return false; }
     if (op->status == 200 || op->status == 416) {
+      free(etag);
       op->unsupported = true;
       op_fail(op, "HTTP server rejected byte ranges");
       return false;
     }
-    char range_text[256], length_text[64];
-    const char *range = header_get(headers, "content-range", range_text, sizeof range_text);
+    char *range = header_value(headers, "content-range");
     double length = 0;
-    bool has_length = header_get(headers, "content-length", length_text, sizeof length_text) != NULL;
+    bool has_length = header_present(headers, "content-length");
     bool length_ok = content_length_of(headers, &length);
-    if (op->status != 206 || !etag || !identity_encoding(headers) || !range
-        || !content_range_matches(range, op->start, span->end, t->probe_total)
-        || (has_length && (!length_ok || length != span->end - op->start + 1))) {
+    bool valid = op->status == 206 && etag && identity_encoding(headers) && range
+        && content_range_matches(range, op->start, span->end, t->probe_total)
+        && !(has_length && (!length_ok || length != span->end - op->start + 1));
+    free(range); free(etag);
+    if (!valid) {
       op_fail(op, "Invalid HTTP byte range response");
       return false;
     }
     return true;
   }
   /* openResponse */
-  if (op->status != 200 || (t->retry_identity && (!etag || strcmp(etag, t->etag) != 0 || !identity_encoding(headers)))) {
+  bool rejected = op->status != 200 || (t->retry_identity && (!etag || strcmp(etag, t->etag) != 0 || !identity_encoding(headers)));
+  free(etag);
+  if (rejected) {
     char text[64];
     snprintf(text, sizeof text, "HTTP download status %ld", op->status);
     op_fail(op, text);
@@ -650,10 +654,10 @@ static bool op_chunk(qa_http_download_queue *q, struct http_op *op, const uint8_
 }
 /* downloadResponse's redirect step after a 3xx; false with an error when it throws. */
 static bool op_redirect(qa_http_download_queue *q, struct http_op *op) {
-  char location_text[2048];
-  const char *location = header_get(op->headers ? op->headers : "", "location", location_text, sizeof location_text);
-  if (op->redirects == 4 || !location) { op_fail(op, "HTTP download redirect limit or missing location"); return false; }
+  char *location = header_value(op->headers ? op->headers : "", "location");
+  if (op->redirects == 4 || !location) { free(location); op_fail(op, "HTTP download redirect limit or missing location"); return false; }
   char *next = url_resolve(op->url, location);
+  free(location);
   struct url_parts np, origin;
   url_parse(next ? next : "", &np);
   url_parse(op->owner->entry->url, &origin);
@@ -730,20 +734,15 @@ static void transfer_probed(qa_http_download_queue *q, struct http_transfer_stat
   const char *headers = op->headers ? op->headers : "";
   double total = 0;
   bool has_total = ok && content_length_of(headers, &total);
-  char accept[64], stored[512];
-  const char *accept_value = ok ? header_get(headers, "accept-ranges", accept, sizeof accept) : NULL;
-  const char *etag_value = ok ? header_get(headers, "etag", stored, sizeof stored) : NULL;
+  char *accept_value = ok ? header_value(headers, "accept-ranges") : NULL;
+  char *etag_value = ok ? header_value(headers, "etag") : NULL;
   bool ranges = false;
-  if (accept_value) {
-    char lowered[64];
-    size_t i = 0;
-    for (; accept_value[i] && i + 1 < sizeof lowered; i++) lowered[i] = (char)tolower((unsigned char)accept_value[i]);
-    lowered[i] = '\0';
-    ranges = strcmp(lowered, "bytes") == 0;
-  }
+  if (accept_value) { ascii_lower(accept_value); ranges = strcmp(accept_value, "bytes") == 0; }
+  free(accept_value);
   bool usable = ok && op->status == 200 && identity_encoding(headers) && has_total && total > RANGE_THRESHOLD && ranges
       && etag_value && strong_etag(etag_value);
-  if (usable) snprintf(t->etag, sizeof t->etag, "%s", etag_value);
+  if (usable) { free(t->etag); t->etag = etag_value; }
+  else free(etag_value);
   op_remove(q, t, op);
   const char *failure = transfer_current(q, t, &caught);
   if (failure) { transfer_fail(q, t, failure, false); return; }
@@ -888,6 +887,9 @@ static void queue_start(qa_http_download_queue *q, struct http_entry *e) {
   qa_caught_error caught;
   const char *failure = transfer_current(q, t, &caught);
   if (failure) transfer_fail(q, t, failure, false);
+  /* downloadResponse rejects a URL with credentials before any request; the HEAD probe
+   * swallows it and the whole-file request then fails with it. */
+  else if (!url_ok(e->url)) transfer_fail(q, t, "Invalid download URL", false);
   else if (q->range_streams > 1 && (e->expected.is_protocol ? e->expected.maximum_bytes : e->expected.byte_length) > RANGE_THRESHOLD) {
     t->phase = PHASE_PROBE;
     op_new(q, t, OP_HEAD, 0);
@@ -1013,7 +1015,7 @@ void qa_http_download_queue_retry(qa_http_download_queue *q, const char *path) {
   struct http_entry *e = queue_find(q, path);
   if (!e || e->state != ENTRY_DONE || e->transfer
       || !(e->result_kind && (strcmp(e->result_kind, "fallback") == 0 || strcmp(e->result_kind, "cancelled") == 0)))
-    qa_range_error("Only a settled HTTP fallback or cancellation can be retried");
+    qa_raise("Error", 0, 0, "Only a settled HTTP fallback or cancellation can be retried");
   qa_http_download_request req;
   req.path = e->path; req.url = e->url; req.kind = e->kind; req.expected = e->expected;
   req.validate = e->validate; req.validate_ctx = e->validate_ctx;

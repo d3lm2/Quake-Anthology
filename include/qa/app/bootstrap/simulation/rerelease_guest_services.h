@@ -45,7 +45,10 @@ void qa_app_sim_rerelease_guest_services_set_configstring(qa_app_sim_rerelease_g
 const char *qa_app_sim_rerelease_guest_services_resource(qa_app_sim_rerelease_guest_services *services, const char *kind, double index);
 double qa_app_sim_rerelease_guest_services_resource_index(qa_app_sim_rerelease_guest_services *services, const char *kind, const char *name);
 qa_q2_rerelease_entity_state qa_app_sim_rerelease_guest_services_entity_state(qa_app_sim_rerelease_guest_services *services, double slot);
+/* TS playerState(slot): a new state per call. The plain form borrows its stats from compat's ring of 256 buffers (fine for
+ * a reader that uses them at once); a holder passes its own 64 numbers to the _into form. */
 qa_q2_rerelease_player_state qa_app_sim_rerelease_guest_services_player_state(qa_app_sim_rerelease_guest_services *services, double slot);
+qa_q2_rerelease_player_state qa_app_sim_rerelease_guest_services_player_state_into(qa_app_sim_rerelease_guest_services *services, double slot, double *stats);
 double qa_app_sim_rerelease_guest_services_player_ping(qa_app_sim_rerelease_guest_services *services, double slot);
 void qa_app_sim_rerelease_guest_services_set_player_ping(qa_app_sim_rerelease_guest_services *services, double slot, double ping);
 /* clusters borrow services storage valid until the next link update. */

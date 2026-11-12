@@ -150,16 +150,22 @@ static void sound_set_listener(void *ctx, double client, qa_vec3 origin, qa_axis
 }
 static bool sound_background(void *ctx, const char *intro, const char *loop) {
   qa_app_application_q3_services *s = ctx;
-  char buffer[2048];
-  snprintf(buffer, sizeof buffer, "%s %s", intro, loop);
+  size_t length = strlen(intro) + strlen(loop) + 2; /* `${intro} ${loop}` */
+  char *buffer = malloc(length);
+  if (buffer == NULL) qa_range_error("Out of memory");
+  snprintf(buffer, length, "%s %s", intro, loop);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, buffer);
   s->options.audio.play_music(s->options.audio.ctx,
                               qa_app_application_q3_assets_content(s->options.media), buffer);
+  qa_cleanup_pop(&guard);
+  free(buffer);
   return true;
 }
 static void sink_emit(void *ctx, const qa_render_command *command) {
   qa_app_application_q3_services *s = ctx;
   if (command->kind == QA_RENDER_COMMAND_SWAP_BUFFERS)
-    qa_range_error("Cgame cannot present the shared framebuffer");
+    qa_raise("Error", 0, 0, "Cgame cannot present the shared framebuffer");
   s->options.output_command(s->options.output_ctx, command);
 }
 static void sink_text(void *ctx, const qa_material_text_draw *draw) {

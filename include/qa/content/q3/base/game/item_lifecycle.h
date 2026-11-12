@@ -23,8 +23,11 @@ typedef struct qa_q3_item_registry {
   const qa_q3_base_item_definition *items; size_t count; qa_q3_base_product product;
   uint8_t *registered; /* owned, count bytes of 0/1 (TS #registered) */
 } qa_q3_item_registry;
-/* TS new ItemRegistry(product): items/count view itemList(product). */
+/* TS new ItemRegistry(product): items/count view itemList(product). A constructor: *registry may be
+ * uninitialised storage (nothing in it is read or freed), and every field is written. To build a registry
+ * again in the same storage, call qa_q3_item_registry_destroy first; init alone would leak the old table. */
 void qa_q3_item_registry_init(qa_q3_item_registry *registry, qa_q3_base_product product);
+/* Frees the registration table and leaves the registry empty; safe to call twice. */
 void qa_q3_item_registry_destroy(qa_q3_item_registry *registry);
 void qa_q3_item_registry_register(qa_q3_item_registry *registry, const qa_q3_base_item_definition *item);
 bool qa_q3_item_registry_is_registered(qa_q3_item_registry *registry, const qa_q3_base_item_definition *item);

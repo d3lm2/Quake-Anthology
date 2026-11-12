@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include "qa/persistence/value.h"
 #include "qa/foundation/js.h"
@@ -29,6 +30,17 @@ static bool is_array(const qa_save_value *value) {
   return value != NULL && value->kind == QA_SAVE_ARRAY;
 }
 
+typedef struct environments_parse {
+  qa_save_value *root;
+  qa_reverb_environment *environments;
+  size_t count;
+} environments_parse;
+static void environments_parse_free(void *arg) {
+  environments_parse *parse = arg;
+  qa_reverb_environments_free(parse->environments, parse->count);
+  qa_save_value_free(parse->root);
+}
+
 bool qa_parse_environments(const char *text, qa_environment_warn_fn warn,
                            void *warn_ctx, qa_reverb_environment **out,
                            size_t *out_count) {
@@ -40,6 +52,10 @@ bool qa_parse_environments(const char *text, qa_environment_warn_fn warn,
   bool ok = false;
   qa_reverb_environment *environments = NULL;
   size_t count = 0;
+  /* Every rejection below raises: release the tree and what was built. */
+  environments_parse parse = {root, NULL, 0};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, environments_parse_free, &parse);
   if (!is_record(root))
     plain_error("Sound environments require an environments array");
   const qa_save_value *entries = qa_save_value_get(root, "environments");
@@ -49,6 +65,8 @@ bool qa_parse_environments(const char *text, qa_environment_warn_fn warn,
   if (count > 0) {
     environments = calloc(count, sizeof *environments);
     if (environments == NULL) goto done;
+    parse.environments = environments;
+    parse.count = count;
   }
   for (size_t i = 0; i < count; i++) {
     const qa_save_value *value = entries->items[i];
@@ -117,10 +135,17 @@ bool qa_parse_environments(const char *text, qa_environment_warn_fn warn,
           }
         if (preset_index == -1) {
           if (warn != NULL) {
-            char message[512];
-            snprintf(message, sizeof message,
-                     "Missing sound environment preset %s", preset->text);
+            static const char prefix[] = "Missing sound environment preset ";
+            size_t length = strlen(preset->text);
+            char *message = malloc(sizeof prefix + length);
+            if (message == NULL) goto done;
+            memcpy(message, prefix, sizeof prefix - 1);
+            memcpy(message + sizeof prefix - 1, preset->text, length + 1);
+            qa_cleanup message_guard;
+            qa_cleanup_push(&message_guard, free, message);
             warn(message, warn_ctx);
+            qa_cleanup_pop(&message_guard);
+            free(message);
           }
           preset_index = QA_REVERB_PRESET_PLAIN;
         }
@@ -133,6 +158,7 @@ bool qa_parse_environments(const char *text, qa_environment_warn_fn warn,
   environments = NULL;
   ok = true;
 done:
+  qa_cleanup_pop(&guard);
   if (environments != NULL) qa_reverb_environments_free(environments, count);
   qa_save_value_free(root);
   return ok;
@@ -223,17 +249,6 @@ int64_t qa_environment_reverb_preset_index(
   return reverb->current_preset;
 }
 
-static bool equals_ignore_case(const char *a, const char *b) {
-  /* TS toLowerCase comparison; materials are ASCII in practice. */
-  while (*a != '\0' && *b != '\0') {
-    char ca = *a >= 'A' && *a <= 'Z' ? (char)(*a + 32) : *a;
-    char cb = *b >= 'A' && *b <= 'Z' ? (char)(*b + 32) : *b;
-    if (ca != cb) return false;
-    a++;
-    b++;
-  }
-  return *a == *b;
-}
 
 void qa_environment_reverb_update(qa_environment_reverb *reverb,
                                   qa_vec3 origin, double milliseconds) {
@@ -251,17 +266,18 @@ void qa_environment_reverb_update(qa_environment_reverb *reverb,
         (qa_vec3){hit.end.x - origin.x, hit.end.y - origin.y,
                   hit.end.z - origin.z +
                       (reverb->probe_index == 1 && hit.sky ? 4096 : 0)};
+    /* Math.max(...xs)/Math.min(...xs): a NaN coordinate stays NaN. */
     double min_x = reverb->results[0].x, max_x = min_x;
     double min_y = reverb->results[0].y, max_y = min_y;
     double min_z = reverb->results[0].z, max_z = min_z;
     for (int i = 1; i < 14; i++) {
       qa_vec3 p = reverb->results[i];
-      if (p.x < min_x) min_x = p.x;
-      if (p.x > max_x) max_x = p.x;
-      if (p.y < min_y) min_y = p.y;
-      if (p.y > max_y) max_y = p.y;
-      if (p.z < min_z) min_z = p.z;
-      if (p.z > max_z) max_z = p.z;
+      min_x = qa_js_min(min_x, p.x);
+      max_x = qa_js_max(max_x, p.x);
+      min_y = qa_js_min(min_y, p.y);
+      max_y = qa_js_max(max_y, p.y);
+      min_z = qa_js_min(min_z, p.z);
+      max_z = qa_js_max(max_z, p.z);
     }
     double average =
         (max_x - min_x + max_y - min_y + max_z - min_z) / 3;
@@ -291,7 +307,7 @@ void qa_environment_reverb_update(qa_environment_reverb *reverb,
       bool match = entry->materials == NULL;
       if (!match && floor.material != NULL)
         for (size_t j = 0; j < entry->material_count; j++)
-          if (equals_ignore_case(entry->materials[j], floor.material)) {
+          if (qa_js_equals_ignore_case(entry->materials[j], floor.material)) {
             match = true;
             break;
           }

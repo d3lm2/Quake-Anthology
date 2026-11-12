@@ -374,7 +374,7 @@ uint8_t *qa_q2_encode_batch_move(qa_q2_wire_codec *wire, bool has_last_frame,
   if (!qa_q2_message_create(&m, 32768)) return NULL;
   /* TS: (frames.length - 1) << 5, negative when there are no frames. */
   int32_t extra = kind_is(&wire->selected_protocol, "q2-q2pro")
-                      ? (int32_t)(((int64_t)frame_count - 1) << 5)
+                      ? (int32_t)(((int64_t)frame_count - 1) * 32) /* a left shift of -1 is undefined in C */
                       : 0;
   qa_q2_msg_write_byte(&m, (double)((!has_last_frame ? 10 : 11) | extra));
   codec->write_batch_move(codec, &m, has_last_frame, last_frame, frames, frame_count);

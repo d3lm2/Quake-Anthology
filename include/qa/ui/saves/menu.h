@@ -9,8 +9,7 @@
  *    menu stays busy ("Working...") until the operation settles, as
  *    the TS run() awaits it; menus disposed while an operation is
  *    pending keep their state until it settles (TS GC).
- *  - Mirror (TS owner not yet ported, removed when it lands):
- *    qa_ui_startup_save_list mirrors StartupSaveList/StartupSaveRow
+ *  - Mirror: qa_ui_startup_save_list mirrors StartupSaveList/StartupSaveRow
  *    (src/app/bootstrap/startup-saves.ts).
  *  - The service is borrowed and must outlive the menus; a NULL
  *    service is the TS undefined. Its recovery.restart is carried

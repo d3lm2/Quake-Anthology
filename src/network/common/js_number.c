@@ -1,5 +1,6 @@
 /* See include/qa/network/common/js_number.h. GPL-2.0-or-later. */
 #include "qa/network/common/js_number.h"
+#include "qa/foundation/js.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,21 +9,10 @@ void qa_net_js_number(double value, char *buffer, size_t capacity) {
   if (isnan(value)) { snprintf(buffer, capacity, "NaN"); return; }
   if (isinf(value)) { snprintf(buffer, capacity, value < 0 ? "-Infinity" : "Infinity"); return; }
   if (value == 0) { snprintf(buffer, capacity, "0"); return; }
-  char scientific[40];
-  for (int precision = 0; precision < 17; precision++) {
-    snprintf(scientific, sizeof scientific, "%.*e", precision, value);
-    if (strtod(scientific, NULL) == value) break;
-  }
-  const char *cursor = scientific;
-  const char *sign = "";
-  if (*cursor == '-') { sign = "-"; cursor++; }
+  const char *sign = value < 0 ? "-" : "";
   char digits[24];
-  int k = 0;
-  for (; *cursor && *cursor != 'e'; cursor++)
-    if (*cursor != '.') digits[k++] = *cursor;
-  int n = atoi(cursor + 1) + 1;
-  while (k > 1 && digits[k - 1] == '0') k--;
-  digits[k] = '\0';
+  int n = qa_js_shortest_digits(value, digits) + 1; /* value = 0.digits x 10^n */
+  int k = (int)strlen(digits);
   if (k <= n && n <= 21) {
     int used = snprintf(buffer, capacity, "%s%s", sign, digits);
     for (int i = k; i < n && (size_t)used + 1 < capacity; i++) buffer[used++] = '0';

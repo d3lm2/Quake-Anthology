@@ -58,7 +58,7 @@ static void release_image_data(void *p) { qa_image_data_destroy(p); }
 static void release_level(void *p) { qa_image_level_destroy(p); }
 static void release_chain(void *p) { qa_mip_chain_destroy(p); }
 static void release_q2(void *p) { qa_q2_mipmapped_image_destroy(p); }
-static void require_open(qa_scene_texture_loader *l) { if (l->closed) qa_range_error("Scene texture loader is closed"); }
+static void require_open(qa_scene_texture_loader *l) { if (l->closed) qa_raise("Error", 0, 0, "Scene texture loader is closed"); }
 static const qa_texture_sampling REPEAT_SAMP = { "repeat", "linear-mipmap-nearest" };
 static tex_rec *new_rec(qa_scene_texture_loader *l) {
   impl *o = im(l);
@@ -197,7 +197,7 @@ void qa_scene_texture_loader_destroy(qa_scene_texture_loader *l) {
 }
 const qa_scene_texture *qa_scene_texture_loader_q1_embedded(qa_scene_texture_loader *l, qa_q1_mip_texture texture) {
   if (!texture.is_embedded) return NULL;
-  if (!l->palette) qa_range_error("Embedded Quake textures require their content palette");
+  if (!l->palette) qa_raise("Error", 0, 0, "Embedded Quake textures require their content palette");
   /* The registered content (texture record and image operation) keeps the
    * level array and fullbright range: they live as long as the loader. */
   impl *o = im(l);
@@ -262,7 +262,7 @@ const qa_scene_texture *qa_scene_texture_loader_sample_surface(qa_scene_texture_
   int present = 0, is_null = 0;
   const qa_scene_texture *existing = cache_get(o, key, &present, &is_null);
   if (present) {
-    if (is_null) qa_range_error("Surface sampling cache lost its texture");
+    if (is_null) qa_raise("Error", 0, 0, "Surface sampling cache lost its texture");
     return existing;
   }
   qa_render_image original = texture->content;

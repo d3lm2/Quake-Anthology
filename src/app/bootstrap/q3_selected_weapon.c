@@ -9,6 +9,7 @@
 #include "qa/content/q3/presentation/ref_entity.h"
 #include "qa/core/game_numeric.h"
 #include "qa/core/math.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/movement/q3/constants.h"
@@ -105,11 +106,10 @@ static const qa_q3_player_animation_config *animation_for(qa_app_selected_q3_wea
   qa_content_opened_resource resource;
   if (!qa_content_mounted_open(mounts, path, NULL, NULL, &resource))
     qa_raise("Error", 0, 0, "Selected Q3 weapon animation configuration is missing");
-  char *text = malloc(resource.byte_length + 1);
-  if (text == NULL) qa_range_error("Out of memory");
-  memcpy(text, resource.bytes, resource.byte_length);
-  text[resource.byte_length] = '\0';
+  /* new TextDecoder().decode(resource.bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD. */
+  char *text = qa_text_decoder_decode(resource.bytes, resource.byte_length, NULL);
   free(resource.bytes);
+  if (text == NULL) qa_range_error("Out of memory");
   animation_entry *entry = calloc(1, sizeof *entry);
   if (entry == NULL) qa_range_error("Out of memory");
   qa_cleanup text_guard, entry_guard;

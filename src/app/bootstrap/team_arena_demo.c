@@ -29,14 +29,29 @@ static bool map_ok(const char *map) {
 bool qa_app_team_arena_demo_lookup(const char *map, double game_type, double protocol,
                                    bool (*exists)(void *ctx, const char *path), void *ctx,
                                    qa_app_team_arena_demo *out) {
-  if (!map_ok(map) || game_type != trunc(game_type) || game_type < 0 || protocol != trunc(protocol) || protocol < 0)
-    qa_range_error("Invalid Team Arena demo selection");
-  char name[1024], path[1100];
-  snprintf(name, sizeof name, "%s_%s", map, QA_JS_NUMBER(game_type));
-  snprintf(path, sizeof path, "demos/%s.dm_%s", name, QA_JS_NUMBER(protocol));
-  if (!exists(ctx, path)) return false;
-  out->name = qa_input_dup(name);
-  out->path = qa_input_dup(path);
-  if (out->name == NULL || out->path == NULL) qa_range_error("Out of memory");
+  /* Number.isInteger: finite and integral. */
+  if (!map_ok(map) || !isfinite(game_type) || game_type != trunc(game_type) || game_type < 0
+      || !isfinite(protocol) || protocol != trunc(protocol) || protocol < 0)
+    qa_raise("Error", 0, 0, "Invalid Team Arena demo selection");
+  char game_type_text[32], protocol_text[32];
+  snprintf(game_type_text, sizeof game_type_text, "%s", QA_JS_NUMBER(game_type));
+  snprintf(protocol_text, sizeof protocol_text, "%s", QA_JS_NUMBER(protocol));
+  size_t name_size = strlen(map) + strlen(game_type_text) + 2;
+  char *name = malloc(name_size);
+  if (name == NULL) qa_range_error("Out of memory");
+  snprintf(name, name_size, "%s_%s", map, game_type_text);
+  size_t path_size = name_size + strlen(protocol_text) + 16;
+  char *path = malloc(path_size);
+  if (path == NULL) { free(name); qa_range_error("Out of memory"); }
+  snprintf(path, path_size, "demos/%s.dm_%s", name, protocol_text);
+  qa_cleanup name_guard, path_guard;
+  qa_cleanup_push(&name_guard, free, name);
+  qa_cleanup_push(&path_guard, free, path);
+  bool found = exists(ctx, path);
+  qa_cleanup_pop(&path_guard);
+  qa_cleanup_pop(&name_guard);
+  if (!found) { free(name); free(path); return false; }
+  out->name = name;
+  out->path = path;
   return true;
 }

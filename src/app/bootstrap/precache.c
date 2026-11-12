@@ -12,6 +12,7 @@
 #include "qa/content/q2/foundation/effect_resources.h"
 #include "qa/content/q3/presentation/character_resources.h"
 #include "qa/content/q3/presentation/players.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/app/bootstrap/application_class.h"
 #include "qa/app/bootstrap/assets.h"
@@ -267,15 +268,14 @@ qa_app_resource_requests qa_app_application_resource_requests(qa_app_precache_co
     }
   }
   /* Transient sounds per distinct q2 content. */
-  qa_content_id seen[64];
-  size_t seen_count = 0;
+  const char **seen = NULL;
+  size_t seen_count = 0, seen_cap = 0;
   size_t total_before = requests.count;
   for (size_t i = 0; i <= total_before; i++) {
     qa_content_id id = i == 0 ? native : requests.items[i - 1].content;
-    bool duplicate = false;
-    for (size_t s = 0; s < seen_count; s++) if (strcmp(seen[s], id) == 0) duplicate = true;
-    if (duplicate || seen_count >= 64) continue;
-    seen[seen_count++] = id;
+    size_t before = seen_count;
+    add_unique(&seen, &seen_count, &seen_cap, id);
+    if (seen_count == before) continue;
     const qa_catalog_product_expectation *product =
         &qa_content_catalog_product(content.catalog, id)->expectation;
     if (product->family != QA_GAME_FAMILY_Q2) continue;
@@ -283,6 +283,7 @@ qa_app_resource_requests qa_app_application_resource_requests(qa_app_precache_co
     if (strcmp(product->edition, "rerelease") == 0 || strcmp(product->campaign, "rogue") == 0)
       append_names(&requests, id, NULL, 0, QA_Q2_ROGUE_TRANSIENT_SOUNDS, QA_Q2_ROGUE_TRANSIENT_SOUNDS_COUNT);
   }
+  free(seen);
   /* Filter + dedupe by content\0path, first wins (TS Map). */
   qa_app_resource_requests filtered = {0};
   filtered.backing_count = requests.backing_count;
@@ -390,14 +391,14 @@ void qa_app_prepare_application_resources(qa_app_precache_content content, qa_ap
       char *prefix = malloc(size);
       if (prefix == NULL) qa_range_error("Out of memory");
       snprintf(prefix, size, "Optional resource preload skipped: %s/%s", request->content, request->path);
-      print_skipped(print, print_ctx, prefix, caught.message);
+      print_skipped(print, print_ctx, prefix, qa_caught_message(&caught));
       free(prefix);
     }
   }
   free(skins);
   qa_app_resource_requests_destroy(&requests);
   qa_caught_error caught;
-  if (!qa_try(footsteps_run, audio, &caught)) print_skipped(print, print_ctx, "Optional character footsteps preload skipped", caught.message);
+  if (!qa_try(footsteps_run, audio, &caught)) print_skipped(print, print_ctx, "Optional character footsteps preload skipped", qa_caught_message(&caught));
 }
 
 /* Application's prepareApplicationResources call: content is assets.content, progress is host.loading?.stage. */

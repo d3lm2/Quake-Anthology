@@ -11,7 +11,10 @@
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 
-typedef struct move { qa_q2_entity *e; qa_vec3 destination; double speed; qa_q2_think done; } move;
+/* TS WeakMap<Q2Entity, state>: the entry dies with its entity. A C entity is
+ * freed at release and its address reused, so an entry also records the actor
+ * id; a pointer match with another id is a dead entity's entry. */
+typedef struct move { qa_q2_entity *e; qa_actor_id actor; qa_vec3 destination; double speed; qa_q2_think done; } move;
 struct qa_q2_angular_motion {
   char *prefix;
   move *moves; size_t count, cap;
@@ -22,12 +25,25 @@ struct qa_q2_angular_motion {
 };
 
 static move *find_move(qa_q2_angular_motion *m, qa_q2_entity *e) {
-  for (size_t i = 0; i < m->count; i++) if (m->moves[i].e == e) return &m->moves[i];
+  for (size_t i = 0; i < m->count; i++) {
+    if (m->moves[i].e != e) continue;
+    if (qa_same_actor(m->moves[i].actor, e->actor.id)) return &m->moves[i];
+    memmove(&m->moves[i], &m->moves[i + 1], (m->count - i - 1) * sizeof *m->moves);
+    m->count--;
+    return NULL;
+  }
   return NULL;
+}
+/* Entries of released entities, dropped before the table grows. */
+static void drop_dead_moves(qa_q2_angular_motion *m, qa_q2_game_services *g) {
+  size_t kept = 0;
+  for (size_t i = 0; i < m->count; i++)
+    if (qa_session_actor_registry_is_live(g->host->actors, m->moves[i].actor)) m->moves[kept++] = m->moves[i];
+  m->count = kept;
 }
 static move *state_of(qa_q2_angular_motion *m, qa_q2_entity *e) {
   move *s = find_move(m, e);
-  if (!s) qa_range_error("Q2 angular callback has no active move");
+  if (!s) qa_raise("Error", 0, 0, "Q2 angular callback has no active move");
   return s;
 }
 static void delete_move(qa_q2_angular_motion *m, qa_q2_entity *e) {
@@ -104,7 +120,7 @@ qa_q2_angular_motion_checkpoint qa_q2_angular_motion_capture(qa_q2_angular_motio
     move *st = find_move(m, entities[i]);
     if (!st) continue;
     const char *done = qa_q2_think_name(g->source_callbacks, st->done, st->done.fn != NULL);
-    if (!done) qa_range_error("Q2 angular move checkpoint has no end function");
+    if (!done) qa_raise("Error", 0, 0, "Q2 angular move checkpoint has no end function");
     m->cp[m->cp_count++] = (qa_q2_angular_motion_entry){
       {(double)entities[i]->actor.id.slot, (double)entities[i]->actor.id.generation}, st->destination, st->speed, done};
   }
@@ -118,9 +134,14 @@ void qa_q2_angular_motion_restore(qa_q2_angular_motion *m, qa_q2_game_services *
     qa_q2_entity *e = g->entity(g->ctx, &owner.id);
     bool has = false;
     qa_q2_think done = qa_q2_think_resolve(g->source_callbacks, cp.entries[i].done, &has);
-    if (!e || !has) qa_range_error("Q2 angular move checkpoint has no actor or end function");
-    if (m->count == m->cap) { m->cap = m->cap ? m->cap * 2 : 8; m->moves = realloc(m->moves, m->cap * sizeof *m->moves); if (!m->moves) qa_range_error("out of memory"); }
-    m->moves[m->count++] = (move){e, cp.entries[i].destination, cp.entries[i].speed, done};
+    if (!e || !has) qa_raise("Error", 0, 0, "Q2 angular move checkpoint has no actor or end function");
+    /* TS moves.set(entity, ...): a second entry for one entity replaces the first. */
+    move *st = find_move(m, e);
+    if (!st) {
+      if (m->count == m->cap) { m->cap = m->cap ? m->cap * 2 : 8; m->moves = realloc(m->moves, m->cap * sizeof *m->moves); if (!m->moves) qa_range_error("out of memory"); }
+      st = &m->moves[m->count++];
+    }
+    *st = (move){e, e->actor.id, cp.entries[i].destination, cp.entries[i].speed, done};
   }
 }
 
@@ -128,9 +149,10 @@ void qa_q2_angular_motion_move_to(qa_q2_angular_motion *m, qa_q2_entity *e, qa_q
   qa_q2_source_callbacks_register(g->source_callbacks, m->defs);
   move *st = find_move(m, e);
   if (!st) {
+    if (m->count == m->cap) drop_dead_moves(m, g);
     if (m->count == m->cap) { m->cap = m->cap ? m->cap * 2 : 8; m->moves = realloc(m->moves, m->cap * sizeof *m->moves); if (!m->moves) qa_range_error("out of memory"); }
     st = &m->moves[m->count++];
-    st->e = e;
+    st->e = e; st->actor = e->actor.id;
   }
   st->destination = dest; st->done = done;
   st->speed = (g->options.edition == QA_Q2_EDITION_RERELEASE && e->accel != e->speed) ? 0 : e->speed;

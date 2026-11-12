@@ -10,21 +10,29 @@
 typedef struct ctx {
   qa_compat_q2_classic_guest_host *host; qa_compat_q2_memory *memory; qa_guest_address address, scratch;
   uint8_t *view; qa_q2_classic_pmove *pm; const qa_movement_body_shape *body;
-  /* canonical entity cache: pointer offset -> hit */
-  struct { int64_t key; qa_q2_movement_entity hit; } canonical[64]; size_t canonical_count;
-  qa_q2_surface_info surfaces[16]; char surface_names[16][17]; size_t surface_count;
+  /* TS `canonical` Map: pointer offset -> hit, one observe per pointer for the whole move, with no size limit. */
+  struct canonical_entry { int64_t key; qa_q2_movement_entity hit; } *canonical; size_t canonical_count, canonical_cap;
+  /* One record per trace surface (TS builds a new object per trace); they live until the move ends, so a trace the
+   * move keeps (groundsurface, trace.source.surface) never points at reused or released storage. */
+  struct surface_node *surfaces;
 } ctx_t;
+typedef struct surface_node { struct surface_node *next; qa_q2_surface_info info; char name[17]; } surface_node;
 static bool entity_of(ctx_t *c, bool has, qa_guest_address pointer, qa_q2_movement_entity *out) {
   if (!has) return false;
   for (size_t i = 0; i < c->canonical_count; i++) if (c->canonical[i].key == pointer.byte_offset) { *out = c->canonical[i].hit; return true; }
   qa_compat_q2_classic_edicts *edicts = qa_compat_q2_classic_guest_host_get_edicts(c->host);
   qa_raw_entity_view record = qa_compat_q2_classic_edicts_from_pointer(edicts, pointer);
   qa_owned_actor actor;
-  if (!qa_compat_q2_classic_edicts_observe(edicts, pointer, &actor)) qa_range_error("Pmove callback returned an inactive edict");
+  if (!qa_compat_q2_classic_edicts_observe(edicts, pointer, &actor)) qa_raise("Error", 0, 0, "Pmove callback returned an inactive edict");
   qa_q2_movement_entity result; memset(&result, 0, sizeof result);
   if (record.slot == 0) { result.kind = QA_TRACE_HIT_WORLD; result.model = 0; }
   else { result.kind = QA_TRACE_HIT_ACTOR; result.actor = actor.id; }
-  if (c->canonical_count < 64) { c->canonical[c->canonical_count].key = pointer.byte_offset; c->canonical[c->canonical_count].hit = result; c->canonical_count++; }
+  if (c->canonical_count == c->canonical_cap) {
+    size_t cap = c->canonical_cap ? c->canonical_cap * 2 : 16; struct canonical_entry *grown = realloc(c->canonical, cap * sizeof *grown);
+    if (!grown) qa_range_error("API 3 Pmove out of memory");
+    c->canonical = grown; c->canonical_cap = cap;
+  }
+  c->canonical[c->canonical_count].key = pointer.byte_offset; c->canonical[c->canonical_count].hit = result; c->canonical_count++;
   *out = result; return true;
 }
 static bool pointer_of(ctx_t *c, bool has, qa_q2_movement_entity hit, qa_guest_address *out) {
@@ -62,7 +70,7 @@ static void commit(ctx_t *c) {
   qa_compat_q2_view_set_i32(view, 48, qa_js_to_int32(pm->numtouch));
   int n = pm->numtouch < 32 ? (int)pm->numtouch : 32;
   for (int i = 0; i < n; i++) {
-    if (i >= 32) qa_range_error("Pmove exceeded MAXTOUCH");
+    if (i >= 32) qa_raise("Error", 0, 0, "Pmove exceeded MAXTOUCH");
     qa_guest_address a; bool has = pointer_of(c, true, pm->touchents[i], &a);
     qa_compat_q2_mem_write_pointer(c->memory, qa_compat_q2_mem_offset(c->memory, c->address, 52 + i * 4), has, a);
   }
@@ -82,10 +90,10 @@ static void reload(ctx_t *c) {
   pm->cmd.forwardmove = qa_compat_q2_view_i16(view, 36); pm->cmd.sidemove = qa_compat_q2_view_i16(view, 38);
   pm->cmd.upmove = qa_compat_q2_view_i16(view, 40); pm->cmd.impulse = view[42]; pm->cmd.lightlevel = view[43];
   pm->snapinitial = qa_compat_q2_view_i32(view, 44) != 0; pm->numtouch = qa_compat_q2_view_i32(view, 48);
-  if (pm->numtouch < 0 || pm->numtouch > 32) qa_range_error("Source callback set an invalid Pmove touch count");
+  if (pm->numtouch < 0 || pm->numtouch > 32) qa_raise("Error", 0, 0, "Source callback set an invalid Pmove touch count");
   for (int i = 0; i < (int)pm->numtouch; i++) {
     qa_guest_address a; bool has = qa_compat_q2_mem_read_pointer(c->memory, qa_compat_q2_mem_offset(c->memory, c->address, 52 + i * 4), &a);
-    if (!entity_of(c, has, a, &pm->touchents[i])) qa_range_error("Source callback set a null Pmove touch");
+    if (!entity_of(c, has, a, &pm->touchents[i])) qa_raise("Error", 0, 0, "Source callback set a null Pmove touch");
   }
   vec_float(view, 180, pm->viewangles); pm->viewheight = qa_compat_q2_view_f32(view, 192);
   vec_float(view, 196, pm->mins); vec_float(view, 208, pm->maxs);
@@ -98,7 +106,7 @@ static qa_q2_trace trace_cb(void *vctx, qa_q2_vec3 start, qa_q2_vec3 mins, qa_q2
   ctx_t *c = vctx; current_actor(c); commit(c);
   qa_guest_address target;
   if (!qa_compat_q2_mem_read_pointer(c->memory, qa_compat_q2_mem_offset(c->memory, c->address, 232), &target))
-    qa_range_error("Source cleared Pmove trace callback");
+    qa_raise("Error", 0, 0, "Source cleared Pmove trace callback");
   static const qa_guest_value_layout pp[] = {{false,"pointer",{0}},{false,"pointer",{0}},{false,"pointer",{0}},{false,"pointer",{0}}};
   double *vecs[] = {start, mins, maxs, end};
   qa_guest_call_value args[4];
@@ -107,7 +115,7 @@ static qa_q2_trace trace_cb(void *vctx, qa_q2_vec3 start, qa_q2_vec3 mins, qa_q2
   qa_guest_call_result result = qa_compat_q2_classic_guest_host_invoke(
       c->host, target, qa_compat_q2_classic_signature(pp, 4, false, qa_compat_q2_q2_trace, false), args, 4, NULL, opts->instruction_budget);
   reload(c); current_actor(c);
-  if (result.kind != QA_GUEST_VALUE_AGGREGATE || result.bytes.length != 56) qa_range_error("API 3 Pmove trace returned an invalid trace_t");
+  if (result.kind != QA_GUEST_VALUE_AGGREGATE || result.bytes.length != 56) qa_raise("Error", 0, 0, "API 3 Pmove trace returned an invalid trace_t");
   const uint8_t *data = result.bytes.bytes;
   qa_guest_address_result hit_ptr = qa_compat_q2_mem_pointer(c->memory, (int64_t)qa_compat_q2_view_u32(data, 52));
   qa_q2_movement_entity hit; bool has_hit = entity_of(c, hit_ptr.has_value, hit_ptr.value, &hit);
@@ -115,17 +123,17 @@ static qa_q2_trace trace_cb(void *vctx, qa_q2_vec3 start, qa_q2_vec3 mins, qa_q2
   plane.plane.normal = (qa_vec3){qa_compat_q2_view_f32(data, 24), qa_compat_q2_view_f32(data, 28), qa_compat_q2_view_f32(data, 32)};
   plane.plane.distance = qa_compat_q2_view_f32(data, 36); plane.type = data[40]; plane.signbits = data[41];
   qa_guest_address_result surf_ptr = qa_compat_q2_mem_pointer(c->memory, (int64_t)qa_compat_q2_view_u32(data, 44));
-  const qa_q2_surface_info *surface = NULL; qa_q2_surface_info surf_storage;
+  const qa_q2_surface_info *surface = NULL;
   if (surf_ptr.has_value) {
-    size_t idx = c->surface_count < 16 ? c->surface_count++ : 15;
     uint8_t raw[16]; c->memory->copy(c->memory->ctx, surf_ptr.value, raw, 16);
     size_t ln = 0; while (ln < 16 && raw[ln]) ln++;
-    memcpy(c->surface_names[idx], raw, ln); c->surface_names[idx][ln] = 0;
-    c->surfaces[idx].name = c->surface_names[idx];
-    c->surfaces[idx].flags = qa_compat_q2_mem_read_i32(c->memory, qa_compat_q2_mem_offset(c->memory, surf_ptr.value, 16));
-    c->surfaces[idx].value = qa_compat_q2_mem_read_i32(c->memory, qa_compat_q2_mem_offset(c->memory, surf_ptr.value, 20));
-    c->surfaces[idx].material = "";
-    surf_storage = c->surfaces[idx]; surface = &surf_storage;
+    double flags = qa_compat_q2_mem_read_i32(c->memory, qa_compat_q2_mem_offset(c->memory, surf_ptr.value, 16));
+    double value = qa_compat_q2_mem_read_i32(c->memory, qa_compat_q2_mem_offset(c->memory, surf_ptr.value, 20));
+    surface_node *node = calloc(1, sizeof *node); if (!node) qa_range_error("API 3 Pmove out of memory");
+    memcpy(node->name, raw, ln); node->name[ln] = 0;
+    node->info.name = node->name; node->info.flags = flags; node->info.value = value; node->info.material = "";
+    node->next = c->surfaces; c->surfaces = node;
+    surface = &node->info;
   }
   double fraction = qa_compat_q2_view_f32(data, 8); bool all_solid = qa_compat_q2_view_i32(data, 0) != 0;
   qa_trace_result source; memset(&source, 0, sizeof source);
@@ -149,26 +157,27 @@ static double contents_cb(void *vctx, qa_q2_vec3 point) {
   ctx_t *c = vctx; current_actor(c); commit(c);
   qa_guest_address target;
   if (!qa_compat_q2_mem_read_pointer(c->memory, qa_compat_q2_mem_offset(c->memory, c->address, 236), &target))
-    qa_range_error("Source cleared Pmove contents callback");
+    qa_raise("Error", 0, 0, "Source cleared Pmove contents callback");
   static const qa_guest_value_layout pp[] = {{false,"pointer",{0}}};
   qa_guest_call_value arg = qa_compat_q2_call_pointer(true, prepare_vector(c, 0, point));
   const qa_compat_q2_classic_guest_host_options *opts = qa_compat_q2_classic_guest_host_get_options(c->host);
   qa_guest_call_result result = qa_compat_q2_classic_guest_host_invoke(
       c->host, target, qa_compat_q2_classic_signature(pp, 1, false, qa_compat_q2_q2_int, false), &arg, 1, NULL, opts->instruction_budget);
   reload(c); current_actor(c);
-  if (result.kind != QA_GUEST_VALUE_INT32) qa_range_error("API 3 Pmove pointcontents did not return int");
+  if (result.kind != QA_GUEST_VALUE_INT32) qa_raise("Error", 0, 0, "API 3 Pmove pointcontents did not return int");
   return result.number_value;
 }
 typedef struct run_ctx { qa_compat_q2_classic_guest_host *host; qa_guest_address address; qa_compat_q2_classic_guest_pmove_options options; } run_ctx_t;
-static void run_movement(void *vctx, const qa_movement_body_shape *body) {
-  run_ctx_t *rc = vctx;
+typedef struct move_ctx { run_ctx_t *rc; const qa_movement_body_shape *body; ctx_t c; } move_ctx_t;
+static void move_body(void *vctx) {
+  move_ctx_t *mc = vctx; run_ctx_t *rc = mc->rc; const qa_movement_body_shape *body = mc->body;
   qa_compat_q2_classic_guest_host *host = rc->host; qa_guest_address address = rc->address;
   qa_compat_q2_memory *memory = qa_compat_q2_classic_guest_host_get_memory(host);
   uint8_t *view = memory->borrow(memory->ctx, address, QA_COMPAT_Q2_CLASSIC_PMOVE_BYTES);
-  qa_guest_address scratch = memory->allocate(memory->ctx, 48, false, 0, "API 3 nested Pmove vectors");
   qa_q2_classic_pmove pm; memset(&pm, 0, sizeof pm);
-  ctx_t c; memset(&c, 0, sizeof c);
-  c.host = host; c.memory = memory; c.address = address; c.scratch = scratch; c.view = view; c.pm = &pm; c.body = body;
+  ctx_t *cp = &mc->c;
+#define c (*cp)
+  c.host = host; c.memory = memory; c.address = address; c.view = view; c.pm = &pm; c.body = body;
   pm.ctx = &c;
   pm.s.pm_type = qa_compat_q2_view_i32(view, 0);
   vec_short(view, 4, pm.s.origin); vec_short(view, 10, pm.s.velocity);
@@ -196,8 +205,23 @@ static void run_movement(void *vctx, const qa_movement_body_shape *body) {
     pm.s.pm_flags = pose->crouched ? (double)((int)pm.s.pm_flags | QA_Q2_PMF_DUCKED) : (double)((int)pm.s.pm_flags & ~QA_Q2_PMF_DUCKED);
   }
   commit(&c);
-  memory->unmap(memory->ctx, scratch, 48);
+#undef c
 }
+static void run_movement(void *vctx, const qa_movement_body_shape *body) {
+  run_ctx_t *rc = vctx;
+  qa_compat_q2_memory *memory = qa_compat_q2_classic_guest_host_get_memory(rc->host);
+  /* TS borrows the view before allocating the scratch, so a bad pmove address faults with nothing mapped. */
+  (void)memory->borrow(memory->ctx, rc->address, QA_COMPAT_Q2_CLASSIC_PMOVE_BYTES);
+  move_ctx_t mc; memset(&mc, 0, sizeof mc); mc.rc = rc; mc.body = body;
+  mc.c.scratch = memory->allocate(memory->ctx, 48, false, 0, "API 3 nested Pmove vectors");
+  /* try { ... } finally { memory.unmap(scratch, 48) }: a guest callback that raises leaves no scratch mapped. */
+  qa_caught_error caught; const bool completed = qa_try(move_body, &mc, &caught);
+  free(mc.c.canonical);
+  while (mc.c.surfaces != NULL) { surface_node *next = mc.c.surfaces->next; free(mc.c.surfaces); mc.c.surfaces = next; }
+  memory->unmap(memory->ctx, mc.c.scratch, 48);
+  if (!completed) qa_rethrow(&caught);
+}
+
 void qa_compat_q2_run_classic_guest_pmove(qa_guest_address address, qa_compat_q2_classic_guest_host *host,
                                           qa_compat_q2_classic_guest_pmove_options options) {
   qa_compat_q2_memory *memory = qa_compat_q2_classic_guest_host_get_memory(host);
@@ -205,7 +229,7 @@ void qa_compat_q2_run_classic_guest_pmove(qa_guest_address address, qa_compat_q2
   qa_guest_address scratch_a, scratch_b;
   bool has_trace = qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, address, 232), &scratch_a);
   bool has_contents = qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, address, 236), &scratch_b);
-  if (!has_trace || !has_contents) qa_range_error("API 3 Pmove callback pointer is null");
+  if (!has_trace || !has_contents) qa_raise("Error", 0, 0, "API 3 Pmove callback pointer is null");
   if (options.equipment) {
     double g = options.numeric.to_int32(options.numeric.ctx, options.numeric.multiply(options.numeric.ctx, qa_compat_q2_view_i16(view, 18), options.equipment->gravity_scale));
     qa_compat_q2_view_set_i16(view, 18, qa_js_to_int32(g));

@@ -6,7 +6,8 @@
 
 #include "qa/foundation/support.h"
 
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
+static void free_slot(void *slot) { free(*(void **)slot); }
 static void *xmalloc(size_t size) {
   void *p = malloc(size == 0 ? 1 : size);
   if (p == NULL) qa_range_error("Guest runtime out of memory");
@@ -14,7 +15,7 @@ static void *xmalloc(size_t size) {
 }
 
 const qa_call_value *qa_guest_argument(const qa_call_value *args, size_t count, size_t index) {
-  if (index >= count) qa_range_error("Missing guest argument %zu", index);
+  if (index >= count) qa_raise("TypeError", 0, 0, "Missing guest argument %zu", index);
   return &args[index];
 }
 uint64_t qa_guest_integer_u64(const qa_call_value *args, size_t count, size_t index) {
@@ -97,9 +98,16 @@ void qa_move_bytes(const qa_mapped_guest_memory *memory, const qa_mapped_memory_
     ext->move(ext->ctx, destination, source, byte_length);
     return;
   }
+  /* TS copies the source (a read fault first), then writes it (a write fault). The ranges are checked in that
+   * order before the copy is sized, so a faulting move holds no buffer of a length the guest chose. */
+  qa_memory_check(memory, source, byte_length, QA_ACCESS_READ);
+  qa_memory_check(memory, destination, byte_length, QA_ACCESS_WRITE);
   uint8_t *bytes = xmalloc(byte_length);
+  qa_cleanup bytes_node;
+  qa_cleanup_push(&bytes_node, free, bytes);
   qa_memory_copy(memory, source, bytes, byte_length);
   qa_memory_write(memory, destination, bytes, byte_length);
+  qa_cleanup_pop(&bytes_node);
   free(bytes);
 }
 void qa_fill_bytes(const qa_mapped_guest_memory *memory, const qa_mapped_memory_ext *ext,
@@ -108,9 +116,13 @@ void qa_fill_bytes(const qa_mapped_guest_memory *memory, const qa_mapped_memory_
     ext->fill(ext->ctx, address, byte_length, value);
     return;
   }
+  qa_memory_check(memory, address, byte_length, QA_ACCESS_WRITE); /* before a buffer of the guest's length */
   uint8_t *bytes = xmalloc(byte_length);
   memset(bytes, value & 0xff, byte_length);
+  qa_cleanup bytes_node;
+  qa_cleanup_push(&bytes_node, free, bytes);
   qa_memory_write(memory, address, bytes, byte_length);
+  qa_cleanup_pop(&bytes_node);
   free(bytes);
 }
 char *qa_read_string(const qa_mapped_guest_memory *memory, const qa_mapped_memory_ext *ext,
@@ -122,14 +134,26 @@ char *qa_read_string(const qa_mapped_guest_memory *memory, const qa_mapped_memor
     text[length] = '\0';
     return text;
   }
-  char *text = xmalloc(maximum + 1);
+  /* Grown as the string is read: a read that faults part way frees it (TS drops the partial string). */
+  size_t capacity = 64;
+  char *text = xmalloc(capacity);
+  void *owned = text;
+  qa_cleanup text_node;
+  qa_cleanup_push(&text_node, free_slot, &owned);
   size_t length = 0;
   for (size_t i = 0; i < maximum; i++) {
     uint8_t unit = (uint8_t)qa_read_unsigned(memory,
         qa_memory_offset(memory, address, (int64_t)i), 1);
-    if (unit == 0) { text[length] = '\0'; return text; }
+    if (unit == 0) { text[length] = '\0'; qa_cleanup_pop(&text_node); return text; }
+    if (length + 2 > capacity) {
+      capacity *= 2;
+      char *grown = realloc(text, capacity);
+      if (grown == NULL) qa_range_error("Guest runtime out of memory");
+      owned = text = grown;
+    }
     text[length++] = (char)unit;
   }
+  qa_cleanup_pop(&text_node);
   free(text);
   qa_range_error("Guest string exceeds checked maximum");
   return NULL;
@@ -154,14 +178,25 @@ size_t qa_string_length(const qa_mapped_guest_memory *memory, const qa_mapped_me
 }
 uint16_t *qa_read_string_wide(const qa_mapped_guest_memory *memory, qa_guest_core_address address,
                               size_t maximum, size_t *out_length) {
-  uint16_t *text = xmalloc((maximum + 1) * sizeof(uint16_t));
+  size_t capacity = 64;
+  uint16_t *text = xmalloc(capacity * sizeof(uint16_t));
+  void *owned = text;
+  qa_cleanup text_node;
+  qa_cleanup_push(&text_node, free_slot, &owned);
   size_t length = 0;
   for (size_t i = 0; i < maximum; i++) {
     uint16_t unit = (uint16_t)qa_read_unsigned(memory,
         qa_memory_offset(memory, address, (int64_t)(i * 2)), 2);
-    if (unit == 0) { text[length] = 0; *out_length = length; return text; }
+    if (unit == 0) { text[length] = 0; *out_length = length; qa_cleanup_pop(&text_node); return text; }
+    if (length + 2 > capacity) {
+      capacity *= 2;
+      uint16_t *grown = realloc(text, capacity * sizeof(uint16_t));
+      if (grown == NULL) qa_range_error("Guest runtime out of memory");
+      owned = text = grown;
+    }
     text[length++] = unit;
   }
+  qa_cleanup_pop(&text_node);
   free(text);
   qa_range_error("Guest string exceeds checked maximum");
   return NULL;

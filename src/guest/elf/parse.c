@@ -8,19 +8,60 @@
 
 #include "qa/foundation/support.h"
 
+/* Everything an inspection allocates is recorded while it runs, so a malformed file that raises part way frees
+ * what was built so far (TS leaves it to the collector). */
+typedef struct alloc_scope { void **items; size_t count, cap; struct alloc_scope *previous; } alloc_scope;
+static _Thread_local alloc_scope *active_scope;
+static void scope_track(void *p) {
+  alloc_scope *scope = active_scope;
+  if (scope == NULL) return;
+  if (scope->count == scope->cap) {
+    size_t cap = scope->cap == 0 ? 64 : scope->cap * 2;
+    void **items = realloc(scope->items, cap * sizeof *items);
+    if (items == NULL) { free(p); qa_range_error("ELF: out of memory"); }
+    scope->items = items; scope->cap = cap;
+  }
+  scope->items[scope->count++] = p;
+}
+static void scope_replace(uintptr_t old, void *next) {
+  alloc_scope *scope = active_scope;
+  if (scope == NULL || old == (uintptr_t)next) return;
+  for (size_t i = scope->count; i-- > 0;)
+    if ((uintptr_t)scope->items[i] == old) {
+      if (next != NULL) scope->items[i] = next;
+      else scope->items[i] = scope->items[--scope->count];
+      return;
+    }
+}
+static void scope_abandon(void *arg) {
+  alloc_scope *scope = arg;
+  for (size_t i = 0; i < scope->count; i++) free(scope->items[i]);
+  free(scope->items);
+  active_scope = scope->previous;
+}
+static void xfree(void *p) {
+  if (p == NULL) return;
+  scope_replace((uintptr_t)p, NULL);
+  free(p);
+}
 static void *xmalloc(size_t size) {
   void *p = malloc(size == 0 ? 1 : size);
   if (p == NULL) qa_range_error("ELF: out of memory");
+  scope_track(p);
   return p;
 }
 static void *xcalloc(size_t count, size_t size) {
   void *p = calloc(count == 0 ? 1 : count, size == 0 ? 1 : size);
   if (p == NULL) qa_range_error("ELF: out of memory");
+  scope_track(p);
   return p;
 }
 static void *xrealloc(void *p, size_t size) {
+  const uintptr_t old = (uintptr_t)p; /* the address only: realloc may have released the block */
   void *next = realloc(p, size == 0 ? 1 : size);
   if (next == NULL) qa_range_error("ELF: out of memory");
+  if (old == 0) scope_track(next);
+  else scope_replace(old, next);
   return next;
 }
 static char *xstrndup(const uint8_t *bytes, size_t len) {
@@ -31,13 +72,14 @@ static char *xstrndup(const uint8_t *bytes, size_t len) {
 }
 static char *xstrdup(const char *text) { return xstrndup((const uint8_t *)text, strlen(text)); }
 
+/* TS `throw new ElfError(message)`: error.name "ElfError", message "ELF: <message>". */
 static void elf_error(const char *format, ...) {
-  char buffer[512];
+  char buffer[QA_CAUGHT_MESSAGE_CAPACITY];
   va_list args;
   va_start(args, format);
   (void)vsnprintf(buffer, sizeof buffer, format, args);
   va_end(args);
-  qa_range_error("ELF: %s", buffer);
+  qa_raise("ElfError", 0, 0, "ELF: %s", buffer);
 }
 
 const char *qa_elf_relocation_table_name(qa_elf_relocation_table table) {
@@ -97,12 +139,22 @@ size_t qa_elf_file_offset(const qa_elf_segment_info *segments, size_t segment_co
     const qa_elf_segment_info *segment = &segments[i];
     if (segment->type != 1 || address < segment->address) continue;
     uint64_t displacement = address - segment->address;
-    if (displacement + size <= segment->file_size)
+    /* TS adds as bigint: a displacement near 2^64 must not wrap into range. */
+    if (size <= segment->file_size && displacement <= segment->file_size - size)
       return segment->offset + qa_elf_checked_number(displacement, "segment displacement");
   }
   elf_error("virtual file range 0x%llx+%zu has no PT_LOAD backing",
             (unsigned long long)address, size);
   return 0;
+}
+
+/* TS adds file-supplied addresses as bigint, so a sum past 2^64 is an address no PT_LOAD segment backs; the wrapped
+ * uint64 could name one. `size` is the range the caller is about to look up. */
+static uint64_t address_add(uint64_t address, uint64_t displacement, size_t size) {
+  uint64_t sum = address + displacement;
+  if (sum < address)
+    elf_error("virtual file range 0x1%016llx+%zu has no PT_LOAD backing", (unsigned long long)sum, size);
+  return sum;
 }
 
 static const qa_elf_dynamic_entry *dynamic_entry(const qa_elf_inspection_full *elf, uint64_t tag) {
@@ -138,7 +190,8 @@ typedef struct string_ctx {
 static char *dynamic_string(string_ctx *ctx, uint64_t index) {
   size_t offset = qa_elf_checked_number(index, "string index");
   if (!ctx->has_strtab || offset >= ctx->strsize) elf_error("dynamic string exceeds DT_STRTAB/DT_STRSZ");
-  size_t file = qa_elf_file_offset(ctx->segments, ctx->segment_count, ctx->strtab + index, ctx->strsize - offset);
+  size_t file = qa_elf_file_offset(ctx->segments, ctx->segment_count,
+                                   address_add(ctx->strtab, index, ctx->strsize - offset), ctx->strsize - offset);
   return rd_string(ctx->r, file, ctx->strsize - offset);
 }
 
@@ -272,7 +325,7 @@ static void read_relocations(reader *r, const qa_elf_segment_info *segments, siz
       }
     }
   }
-  free(seen);
+  xfree(seen);
   *out = list.items; *out_count = list.count;
 }
 
@@ -294,29 +347,32 @@ static void read_versions(reader *r, const qa_elf_segment_info *segments, size_t
       size_t p = qa_elf_file_offset(segments, segment_count, current, needed ? 16 : 20);
       if (rd_u16(r, p) != 1) elf_error("unsupported symbol version record");
       uint16_t aux_count = needed ? rd_u16(r, p + 2) : rd_u16(r, p + 6);
-      uint64_t auxiliary = current + rd_u32(r, p + (needed ? 8 : 12));
+      uint64_t auxiliary = address_add(current, rd_u32(r, p + (needed ? 8 : 12)), needed ? 16 : 8);
       if (aux_count == 0) elf_error("version record has no name");
       for (uint16_t j = 0; j < aux_count; j++) {
         size_t a = qa_elf_file_offset(segments, segment_count, auxiliary, needed ? 16 : 8);
         if (needed || j == 0) {
           int index = (needed ? rd_u16(r, a + 6) : rd_u16(r, p + 4)) & 0x7fff;
           uint16_t flags = needed ? rd_u16(r, a + 4) : rd_u16(r, p + 2);
+          /* TS reads the name and the library before it rejects a repeated index. */
+          char *name = dynamic_string(ctx, rd_u32(r, a + (needed ? 8 : 0)));
+          char *library = needed ? dynamic_string(ctx, rd_u32(r, p + 4)) : xstrdup("");
           for (size_t k = 0; k < *out_count; k++)
             if ((*out)[k].index == index) elf_error("duplicate version index %d", index);
           if (*out_count == cap) { cap = cap == 0 ? 8 : cap * 2; *out = xrealloc(*out, cap * sizeof **out); }
           version_entry *entry = &(*out)[(*out_count)++];
           entry->index = index;
-          entry->name = dynamic_string(ctx, rd_u32(r, a + (needed ? 8 : 0)));
-          entry->library = needed ? dynamic_string(ctx, rd_u32(r, p + 4)) : xstrdup("");
+          entry->name = name;
+          entry->library = library;
           entry->weak = (flags & 2) != 0;
         }
         uint32_t next = rd_u32(r, a + (needed ? 12 : 4));
         if (j + 1 < aux_count && next == 0) elf_error("truncated version auxiliary chain");
-        auxiliary += next;
+        if (j + 1 < aux_count) auxiliary = address_add(auxiliary, next, needed ? 16 : 8);
       }
       uint32_t next = rd_u32(r, p + (needed ? 12 : 16));
       if (i + 1 < count && next == 0) elf_error("truncated version chain");
-      current += next;
+      if (i + 1 < count) current = address_add(current, next, needed ? 16 : 20);
     }
   }
 }
@@ -326,19 +382,19 @@ static size_t gnu_symbol_count(reader *r, const qa_elf_segment_info *segments, s
   size_t header = qa_elf_file_offset(segments, segment_count, address, 16);
   uint32_t buckets = rd_u32(r, header), first = rd_u32(r, header + 4), bloom = rd_u32(r, header + 8);
   if (buckets == 0 || bloom == 0) elf_error("invalid GNU hash table");
-  uint64_t bucket_address = address + 16 + (uint64_t)bloom * (wide ? 8 : 4);
+  uint64_t bucket_address = address_add(address, 16 + (uint64_t)bloom * (wide ? 8 : 4), (size_t)buckets * 4);
   size_t bucket_offset = qa_elf_file_offset(segments, segment_count, bucket_address, (size_t)buckets * 4);
-  uint64_t chains = bucket_address + (uint64_t)buckets * 4;
+  uint64_t chains = address_add(bucket_address, (uint64_t)buckets * 4, 4);
   size_t count = first;
   for (uint32_t bucket = 0; bucket < buckets; bucket++) {
-    uint32_t symbol = rd_u32(r, bucket_offset + (size_t)bucket * 4);
+    uint64_t symbol = rd_u32(r, bucket_offset + (size_t)bucket * 4); /* a TS number: it does not wrap at 2^32 */
     if (symbol == 0) continue;
     if (symbol < first) elf_error("GNU hash bucket precedes symbol offset");
     /* Chains of a well-formed table are disjoint and ascending; a start inside the counted range only repeats a walk. */
     if (symbol < count) continue;
     for (;;) {
       uint32_t hash = rd_u32(r, qa_elf_file_offset(segments, segment_count,
-                                                   chains + (uint64_t)(symbol - first) * 4, 4));
+                                                   address_add(chains, (symbol - first) * 4, 4), 4));
       if (symbol + 1 > count) count = symbol + 1;
       symbol++;
       if ((hash & 1) != 0) break;
@@ -383,8 +439,11 @@ static void read_symbols(reader *r, const qa_elf_segment_info *segments, size_t 
     else { elf_error("cannot bound dynamic symbols without hash or section metadata"); count = 0; }
     offset = qa_elf_file_offset(segments, segment_count, symtab, count * stride);
   }
+  /* TS divides as numbers: a section size that is no multiple of the entry size is a fractional count, which
+   * agrees with nothing. */
   if (symbol_section != NULL
-      && (symbol_section->entry_size != stride || symbol_section->size / stride != count))
+      && (symbol_section->entry_size != stride || symbol_section->size % stride != 0
+          || symbol_section->size / stride != count))
     elf_error("symbol count or entry size disagrees with section metadata");
   range(r, offset, count * stride);
   uint64_t versym = 0;
@@ -432,6 +491,10 @@ static void read_symbols(reader *r, const qa_elf_segment_info *segments, size_t 
 
 void qa_inspect_elf(qa_elf_inspection_full *out, const uint8_t *bytes, size_t len) {
   memset(out, 0, sizeof *out);
+  alloc_scope scope = {NULL, 0, 0, active_scope};
+  qa_cleanup scope_node;
+  qa_cleanup_push(&scope_node, scope_abandon, &scope);
+  active_scope = &scope;
   reader r = {bytes, len};
   reader *rp = &r;
   if (rd_u32(rp, 0) != 0x464c457f) elf_error("invalid magic");
@@ -525,12 +588,12 @@ void qa_inspect_elf(qa_elf_inspection_full *out, const uint8_t *bytes, size_t le
     sections[i] = raw[i].section;
     if (names != NULL) {
       if (raw[i].name_offset >= names->section.size) elf_error("section name exceeds string table");
-      free(sections[i].name);
+      xfree(sections[i].name);
       sections[i].name = rd_string(rp, names->section.offset + raw[i].name_offset,
                                     names->section.size - raw[i].name_offset);
     }
   }
-  free(raw);
+  xfree(raw);
 
   qa_elf_dynamic_entry *dynamic = NULL; size_t dynamic_count = 0;
   read_dynamic(rp, segments, phnum, wide, &dynamic, &dynamic_count);
@@ -548,8 +611,8 @@ void qa_inspect_elf(qa_elf_inspection_full *out, const uint8_t *bytes, size_t le
   qa_elf_symbol *symbols = NULL; size_t symbol_count = 0;
   read_symbols(rp, segments, phnum, sections, shnum, dynamic, dynamic_count, wide,
                versions, version_count, &ctx, &symbols, &symbol_count);
-  for (size_t k = 0; k < version_count; k++) { free(versions[k].name); free(versions[k].library); }
-  free(versions);
+  for (size_t k = 0; k < version_count; k++) { xfree(versions[k].name); xfree(versions[k].library); }
+  xfree(versions);
   for (size_t i = 0; i < relocation_count; i++)
     if (relocations[i].symbol_index >= symbol_count && relocations[i].symbol_index != 0)
       elf_error("relocation symbol index exceeds symbol table");
@@ -584,6 +647,10 @@ void qa_inspect_elf(qa_elf_inspection_full *out, const uint8_t *bytes, size_t le
   out->interpreter = interpreter == NULL ? NULL : rd_string(rp, interpreter->offset, interpreter->file_size);
   out->symbols = symbols; out->symbol_count = symbol_count;
   out->relocations = relocations; out->relocation_count = relocation_count;
+  /* Complete: the allocations now belong to `out`. */
+  qa_cleanup_pop(&scope_node);
+  active_scope = scope.previous;
+  free(scope.items);
 }
 
 void qa_elf_inspection_full_free(qa_elf_inspection_full *elf) {

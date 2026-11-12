@@ -6,6 +6,8 @@
  * calls; a TS throw is a qa_raise. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "startup_application_internal.h"
+#include "qa/foundation/caught_message.h"
+#include "qa/input/support.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,17 +161,18 @@ void qa_startup_save_frontend_input(qa_startup_application *app) {
       fresh.history_count = has_lines ? lines : 0;
       fresh.rumble = true;
       fresh.rumble_strength = 1;
+      fresh.rumble_strength_absent = true; /* the TS literal has no rumbleStrength */
       fresh.controller = controller;
       stored = qa_config_store_save_seat(settings, path, &fresh);
       free((void *)recent);
       free(controller.serial);
     }
-    if (!stored) qa_raise("Error", 0, 0, "Could not write %s", path);
+    if (!stored) qa_settings_raise_write_failure();
   }
   qa_seat_id keyboard;
   bool has_keyboard = qa_input_router_keyboard_seat(router, &keyboard);
   if (!qa_config_store_save_input_routing(settings, "input/routing.json", has_keyboard ? (double)keyboard.index : 0, has_keyboard))
-    qa_raise("Error", 0, 0, "Could not write input/routing.json");
+    qa_settings_raise_write_failure();
   qa_cleanup_pop(&guard);
   free(app->frontend_routing_baseline);
   app->frontend_routing_baseline = routing;
@@ -183,7 +186,7 @@ static void persist_body(void *ctx) { persist_preferences(ctx); }
 /* A settings write failure (full disk, read-only folder) is reported; it does not end the application. */
 void qa_startup_persist_preferences_or_warn(qa_startup_application *app) {
   qa_caught_error caught;
-  if (!qa_try(persist_body, app, &caught)) qa_startup_printf(app, "Could not save settings: %s\n", caught.message);
+  if (!qa_try(persist_body, app, &caught)) qa_startup_printf(app, "Could not save settings: %s\n", qa_caught_message(&caught));
 }
 void qa_startup_refresh_preference_baseline(qa_startup_application *app, bool force) {
   qa_app_options options;
@@ -207,6 +210,9 @@ void qa_startup_refresh_preference_baseline(qa_startup_application *app, bool fo
   }
   /* Never persist before the first baseline load: writing the (default)
    * global tuning first would clobber the per-product seat profile being read. */
+  char *previous_product = app->baseline_product != NULL ? qa_startup_dup(app->baseline_product) : NULL;
+  qa_cleanup previous_guard;
+  qa_cleanup_push(&previous_guard, free, previous_product);
   if (app->baseline_product != NULL) qa_startup_persist_preferences_or_warn(app);
   /* this.model.catalog.product(options.product): a missing product still names its settings root. */
   const qa_catalog_discovered_product *product = qa_content_catalog_product(qa_app_startup_selection_catalog(app->model), options.product);
@@ -234,11 +240,31 @@ void qa_startup_refresh_preference_baseline(qa_startup_application *app, bool fo
   qa_startup_set_text(&app->baseline_product, options.product);
   qa_startup_set_text(&app->baseline_input, input_key);
   if (app->graphics != NULL) {
-    qa_app_startup_input_profile *profile = qa_app_startup_input_profile_retained(app->preference_store,
-        qa_app_startup_input_profile_input(app->graphics->input_profile));
+    qa_seat_input *input = qa_app_startup_input_profile_input(app->graphics->input_profile);
+    const char *components[1] = {product->id};
+    qa_app_stock_native *native = qa_app_stock_native_config(qa_app_startup_selection_catalog(app->model), product->id, components, 1,
+        options.native_config_root, true, options.user_content_root);
+    size_t item_count = 0;
+    qa_weapon_binding_item *binding_items = qa_app_startup_selection_binding_items(app->model, &item_count);
+    qa_command_dialect movement = qa_app_movement_dialect(&options, NULL);
+    /* Another product has its own bindings; keeping the previous product's would save them over it. */
+    qa_app_startup_input_profile *profile;
+    if (previous_product != NULL && !eq(previous_product, options.product)) {
+      profile = qa_app_startup_input_profile_open_native(app->preference_store, input, movement, binding_items, item_count, native);
+    } else {
+      size_t default_count = 0;
+      qa_input_binding *defaults = qa_default_bindings(0, movement, binding_items, item_count, &default_count);
+      if (defaults == NULL) qa_range_error("Out of memory");
+      profile = qa_app_startup_input_profile_retained_native(app->preference_store, input, native, defaults, default_count);
+      for (size_t i = 0; i < default_count; i++) qa_input_binding_dispose(&defaults[i]);
+      free(defaults);
+    }
+    qa_weapon_binding_items_free(binding_items, item_count);
     qa_app_startup_input_profile_destroy(app->graphics->input_profile);
     app->graphics->input_profile = profile;
   }
+  qa_cleanup_pop(&previous_guard);
+  free(previous_product);
   qa_cleanup_pop(&key_guard);
   free(input_key);
   qa_cleanup_pop(&guard);
@@ -255,7 +281,7 @@ static void stage_body(void *ctx) {
   qa_startup_launch(call->app, call->action, true);
 }
 const char *qa_startup_stage_lobby_launch(qa_startup_application *app, qa_app_startup_action *action) {
-  static char message[sizeof ((qa_caught_error *)0)->message];
+  static char *message; /* the whole caught message, valid until the next failed launch */
   if (app->closed || app->stopping || app->lobby_transition) return "The client cannot start another lobby transition";
   app->lobby_transition = true;
   stage_call call = {app, action};
@@ -263,29 +289,41 @@ const char *qa_startup_stage_lobby_launch(qa_startup_application *app, qa_app_st
   bool launched = qa_try(stage_body, &call, &caught);
   app->lobby_transition = false;
   if (launched) return NULL;
-  snprintf(message, sizeof message, "%s", caught.message);
-  return message;
+  return qa_startup_keep_text(&message, qa_caught_message(&caught));
 }
 
 /* ---- connectOptions(options) ----------------------------------------------------- */
+/* The byte offset of text.slice(-units) over UTF-8 text: the start of the last `units` UTF-16 units
+ * (a code point above U+FFFF is two; an invalid byte, which TextDecoder reads as U+FFFD, is one).
+ * A cut through a surrogate pair starts after the pair: UTF-8 cannot hold the lone low surrogate. */
+static size_t utf16_tail_offset(const char *text, size_t length, size_t units) {
+  size_t at = length, taken = 0;
+  while (at > 0) {
+    size_t start = at - 1;
+    while (start > 0 && at - start < 4 && ((unsigned char)text[start] & 0xc0) == 0x80) start--;
+    unsigned char lead = (unsigned char)text[start];
+    size_t need = lead < 0x80 ? 1 : (lead & 0xe0) == 0xc0 ? 2 : (lead & 0xf0) == 0xe0 ? 3 : (lead & 0xf8) == 0xf0 ? 4 : 0;
+    size_t width = 1, cost = 1;
+    if (need != 0 && need == at - start) { width = need; cost = need == 4 ? 2 : 1; }
+    if (taken + cost > units) break;
+    taken += cost;
+    at -= width;
+  }
+  return at;
+}
 static void remote_print(void *ctx, const char *text) {
   qa_startup_application *app = ctx;
   qa_startup_application_print(app, text);
-  /* message = text.trim(); if (message !== "") this.status = message.slice(-512) */
-  const char *start = text;
-  while (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r' || *start == '\v' || *start == '\f') start++;
-  size_t length = strlen(start);
-  while (length > 0 && (start[length - 1] == ' ' || start[length - 1] == '\t' || start[length - 1] == '\n' || start[length - 1] == '\r'
-      || start[length - 1] == '\v' || start[length - 1] == '\f'))
-    length--;
-  if (length == 0) return;
-  if (length > 512) { start += length - 512; length = 512; }
-  char *status = malloc(length + 1);
-  if (status == NULL) qa_range_error("Out of memory");
-  memcpy(status, start, length);
-  status[length] = '\0';
+  /* message = text.trim(); if (message !== "") this.status = message.slice(-512): JS white space by
+   * code point, and the last 512 UTF-16 units. */
+  char *message = qa_input_js_trim(text);
+  if (message == NULL) qa_range_error("Out of memory");
+  size_t length = strlen(message);
+  if (length == 0) { free(message); return; }
+  size_t offset = utf16_tail_offset(message, length, 512);
+  if (offset > 0) memmove(message, message + offset, length - offset + 1);
   free(app->status);
-  app->status = status;
+  app->status = message;
 }
 static void plain_print(void *ctx, const char *text) { qa_startup_application_print(ctx, text); }
 static const char *display_renderer(qa_startup_application *app, const char *fallback) {
@@ -683,7 +721,7 @@ void qa_startup_launch(qa_startup_application *app, qa_app_startup_action *actio
   qa_caught_error caught;
   if (qa_try(launch_body, &state, &caught)) return;
   app->last_frame = qa_startup_now();
-  qa_startup_set_text(&app->status, caught.message);
+  qa_startup_set_text(&app->status, qa_caught_message(&caught));
   qa_startup_printf(app, "%s\n", app->status);
   if (app->graphics != NULL) qa_app_startup_menu_set_status(app->graphics->menu, app->status, false);
   if (is_publication_error(&caught) || qa_startup_current_source(app) != previous) {
@@ -779,7 +817,7 @@ static void publish_demo_intent(qa_startup_application *app) {
     app->stopping = true;
     qa_rethrow(&caught);
   }
-  qa_startup_printf(app, "%s\n", caught.message);
+  qa_startup_printf(app, "%s\n", qa_caught_message(&caught));
 }
 
 /* ---- publishPendingSource() ---------------------------------------------------- */
@@ -814,7 +852,7 @@ void qa_startup_publish_pending_source(qa_startup_application *app) {
     bool opened = qa_try(movie_body, app, &caught);
     free(app->opening_movie.name);
     memset(&app->opening_movie, 0, sizeof app->opening_movie);
-    if (!opened && !app->closed && !app->stopping) qa_startup_printf(app, "%s\n", caught.message);
+    if (!opened && !app->closed && !app->stopping) qa_startup_printf(app, "%s\n", qa_caught_message(&caught));
   }
   if (app->closed || app->stopping) return;
   if (app->has_pending_recording) {
@@ -823,7 +861,7 @@ void qa_startup_publish_pending_source(qa_startup_application *app) {
     memset(&app->pending_recording, 0, sizeof app->pending_recording);
     recording_call call = {app, &intent};
     qa_caught_error caught;
-    if (!qa_try(recording_body, &call, &caught)) qa_startup_printf(app, "%s\n", caught.message);
+    if (!qa_try(recording_body, &call, &caught)) qa_startup_printf(app, "%s\n", qa_caught_message(&caught));
     if (app->recording != NULL && qa_app_client_demo_recording_path(app->recording) == NULL)
       memset(&app->recording_preparation, 0, sizeof app->recording_preparation);
     free(intent.name);
@@ -1055,11 +1093,11 @@ void qa_startup_application_run(qa_startup_application *app) {
 }
 
 /* ---- close() ------------------------------------------------------------------------ */
-typedef struct close_errors { char messages[16][sizeof ((qa_caught_error *)0)->message]; size_t count; } close_errors;
+/* TS collects every failure into an AggregateError whose message is only its own text. */
+typedef struct close_errors { size_t count; } close_errors;
 static void collect(close_errors *errors, void (*step)(void *ctx), void *ctx) {
   qa_caught_error caught;
   if (qa_try(step, ctx, &caught)) return;
-  if (errors->count < 16) snprintf(errors->messages[errors->count], sizeof errors->messages[0], "%s", caught.message);
   errors->count++;
 }
 static void close_addons(void *ctx) { qa_app_addon_library_close(((qa_startup_application *)ctx)->addons); }
@@ -1128,6 +1166,7 @@ void qa_startup_application_close(qa_startup_application *app) {
   if (app->closed) return;
   app->closed = true;
   app->stopping = true;
+  qa_app_console_log_close(&app->console_log);
   /* lobbyTransition?.cancel(new Error("Startup closed before lobby launch")): the C transition runs inside its lobby call. */
   app->lobby_transition = false;
   close_errors errors;
@@ -1142,8 +1181,8 @@ void qa_startup_application_close(qa_startup_application *app) {
   if (app->game != NULL) *qa_app_frontend_preferences_values(app->preferences) = qa_application_frontend_settings(app->game);
   {
     qa_caught_error caught;
-    if (!qa_try(close_save_controls, app, &caught)) qa_startup_printf(app, "Could not save controls: %s\n", caught.message);
-    if (!qa_try(close_save_audio, app, &caught)) qa_startup_printf(app, "Could not save audio settings: %s\n", caught.message);
+    if (!qa_try(close_save_controls, app, &caught)) qa_startup_printf(app, "Could not save controls: %s\n", qa_caught_message(&caught));
+    if (!qa_try(close_save_audio, app, &caught)) qa_startup_printf(app, "Could not save audio settings: %s\n", qa_caught_message(&caught));
   }
   collect(&errors, close_lobby, app);
   collect(&errors, close_devices, app);
@@ -1169,5 +1208,5 @@ void qa_startup_application_close(qa_startup_application *app) {
   app->client = NULL;
   app->game = NULL;
   app->remote = NULL;
-  if (errors.count != 0) qa_raise("AggregateError", 0, 0, "Shared client shutdown failed: %s", errors.messages[0]);
+  if (errors.count != 0) qa_raise("AggregateError", 0, (long long)errors.count, "Shared client shutdown failed");
 }

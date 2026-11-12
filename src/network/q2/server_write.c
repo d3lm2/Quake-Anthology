@@ -57,12 +57,12 @@ static void params_from_result(const qa_q2_server_data_result *r,
   p->protocol_revision = r->protocol_revision;
   p->servercount = r->servercount;
   p->attractloop = r->attractloop;
-  p->gamedir = r->gamedir;
+  p->gamedir = r->gamedir != NULL ? r->gamedir : "";
   p->clientnum = r->clientnum;
   p->has_clientnums = r->has_clientnums;
   p->clientnums = r->clientnums;
   p->clientnum_count = r->clientnum_count;
-  p->levelname = r->levelname;
+  p->levelname = r->levelname != NULL ? r->levelname : "";
   p->server_state = r->server_state;
   p->has_r1q2_version = r->has_r1q2_version;
   p->r1q2_version = r->r1q2_version;

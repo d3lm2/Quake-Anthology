@@ -41,7 +41,8 @@ void qa_q2rm_slam_radius_damage(qa_q2m_context *context, qa_vec3 origin, double 
   qa_q2_entity *entity = context->entity;
   qa_vec3 point = origin;
   size_t count = 0;
-  const qa_actor_id *actors = game->host->nearby(game->host->ctx, q2rm_body(game, entity).origin, radius * 2, &count);
+  /* Copied: the damage below can run another nearby() query, which reuses the host's result buffer. */
+  qa_actor_id *actors = qa_q2_game_nearby_copy(game, q2rm_body(game, entity).origin, radius * 2, &count);
   for (size_t i = 0; i < count; i++) {
     qa_actor_id actor = actors[i];
     if (qa_same_actor(actor, entity->actor.id)) continue;
@@ -70,6 +71,7 @@ void qa_q2rm_slam_radius_damage(qa_q2m_context *context, qa_vec3 origin, double 
       qa_shared_body_table_write(game->host->bodies, owned, written);
     }
   }
+  free(actors);
 }
 
 static void slam(qa_q2m_context *c) {

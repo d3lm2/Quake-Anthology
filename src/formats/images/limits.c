@@ -11,6 +11,5 @@ static bool safe_integer(double value) {
 
 bool qa_image_size_allowed(double width, double height) {
   return safe_integer(width) && safe_integer(height) && width > 0 && height > 0 &&
-         width <= QA_MAX_IMAGE_DIMENSION && height <= QA_MAX_IMAGE_DIMENSION &&
-         width * height <= QA_MAX_IMAGE_PIXELS;
+         width * height * 4 <= 2147483647.0;
 }

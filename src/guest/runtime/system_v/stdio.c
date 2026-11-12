@@ -13,7 +13,8 @@ static void *xmalloc(size_t size) {
   if (p == NULL) qa_range_error("Guest runtime out of memory");
   return p;
 }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void free_slot(void *slot) { free(*(void **)slot); }
 static qa_guest_core_address off(const qa_mapped_guest_memory *m, qa_guest_core_address a, int64_t d) {
   return qa_memory_offset(m, a, d);
 }
@@ -66,7 +67,7 @@ static qa_guest_core_address create_file(qa_system_v_stdio *stdio, int descripto
 static int descriptor_of(qa_system_v_stdio *stdio, qa_guest_core_address file) {
   qa_mapped_guest_memory *m = stdio->host->memory;
   if ((qa_memory_read_u32(m, file) & 0xffff0000u) != 0xfbad0000u)
-    qa_range_error("Invalid guest FILE magic");
+    qa_raise("TypeError", 0, 0, "Invalid guest FILE magic");
   return qa_gmem_read_i32(m, off(m, file, stdio->layout.descriptor));
 }
 static bool orient(qa_system_v_stdio *stdio, qa_guest_core_address file, bool wide) {
@@ -114,6 +115,8 @@ int qa_system_v_stdio_flush(qa_system_v_stdio *stdio, qa_guest_core_address file
                                       "no standard output capability supplied");
     size_t length = (size_t)(next.byte_offset - base.byte_offset);
     uint8_t *bytes = xmalloc(length);
+    qa_cleanup held;
+    qa_cleanup_push(&held, free_slot, &bytes);
     qa_memory_copy(m, base, bytes, length);
     size_t written = 0;
     while (written < length) {
@@ -124,11 +127,13 @@ int qa_system_v_stdio_flush(qa_system_v_stdio *stdio, qa_guest_core_address file
       if (count <= 0 || (size_t)count > length - written) {
         qa_memory_write(m, base, bytes + written, length - written);
         write_ptr(m, field(stdio, file, 5), true, off(m, base, (int64_t)(length - written)));
+        qa_cleanup_pop(&held);
         free(bytes);
         return file_error(stdio, file, 5);
       }
       written += (size_t)count;
     }
+    qa_cleanup_pop(&held);
     free(bytes);
     write_ptr(m, field(stdio, file, 5), true, base);
   }
@@ -265,10 +270,16 @@ static qa_call_result stdio_impl(void *ctx, const qa_guest_core_call_context *co
       size_t total = size * qa_guest_count(args, count, 2);
       size_t written = 0;
       if (total != 0) {
+        /* TS evaluates the FILE argument, then the source, then copies (checked before sizing). */
+        qa_guest_core_address file = qa_guest_required_pointer(args, count, 3);
+        qa_guest_core_address source = qa_guest_required_pointer(args, count, 0);
+        qa_memory_check(m, source, total, QA_ACCESS_READ);
         uint8_t *bytes = xmalloc(total);
-        qa_memory_copy(m, qa_guest_required_pointer(args, count, 0), bytes, total);
-        written = qa_system_v_stdio_write(stdio, qa_guest_required_pointer(args, count, 3),
-                                          bytes, total, context);
+        qa_cleanup held;
+        qa_cleanup_push(&held, free_slot, &bytes);
+        qa_memory_copy(m, source, bytes, total);
+        written = qa_system_v_stdio_write(stdio, file, bytes, total, context);
+        qa_cleanup_pop(&held);
         free(bytes);
       }
       return size_result(stdio, size == 0 ? 0 : written / size);
@@ -316,6 +327,7 @@ static void reg(qa_system_v_stdio *stdio, int kind, const char *name,
                 qa_abi_storage result) {
   stdio_state *state = xmalloc(sizeof *state);
   state->stdio = stdio; state->kind = kind; state->name = NULL;
+  qa_system_v_own(stdio->host, state, free);
   qa_system_v_implementation impl = {state, stdio_impl};
   qa_system_v_service(stdio->host, "libc.so.6", name, versions, version_count, parameters,
                       parameter_count, result_is_void, result, impl);
@@ -338,9 +350,7 @@ void qa_system_v_stdio_init(qa_system_v_stdio *stdio, qa_system_v_service_host *
     qa_system_v_data(host, "libc.so.6", names[i], version, slot, (size_t)m->pointer_bytes);
     char io_name[32];
     (void)snprintf(io_name, sizeof io_name, "_IO_2_1_%s_", names[i]);
-    char *io_copy = xmalloc(strlen(io_name) + 1);
-    strcpy(io_copy, io_name);
-    qa_system_v_data(host, "libc.so.6", io_copy, m->pointer_bytes == 4 ? "GLIBC_2.1" : version,
+    qa_system_v_data(host, "libc.so.6", io_name, m->pointer_bytes == 4 ? "GLIBC_2.1" : version,
                      values[i], (size_t)stdio->layout.size + (size_t)m->pointer_bytes);
   }
   const char *versions[] = {version, NULL};
@@ -369,8 +379,7 @@ void qa_system_v_stdio_init(qa_system_v_stdio *stdio, qa_system_v_service_host *
   for (size_t index = 0; index < 19; index++) {
     char name_buffer[64];
     (void)snprintf(name_buffer, sizeof name_buffer, "__guest_IO_file_%s", operations[index]);
-    char *name = xmalloc(strlen(name_buffer) + 1);
-    strcpy(name, name_buffer);
+    const char *name = name_buffer;
     qa_guest_core_address address;
     if (strcmp(operations[index], "sync") == 0) {
       reg(stdio, S_SYNC, name, null_versions, 1, &ptr, 1, false, i32);
@@ -399,9 +408,7 @@ void qa_system_v_stdio_init(qa_system_v_stdio *stdio, qa_system_v_service_host *
     } else {
       char name_buffer[64];
       (void)snprintf(name_buffer, sizeof name_buffer, "__guest_IO_wfile_%s", operations[index]);
-      char *name = xmalloc(strlen(name_buffer) + 1);
-      strcpy(name, name_buffer);
-      address = qa_system_v_unavailable(host, "libc.so.6", name, &ptr, 1, true, i32,
+      address = qa_system_v_unavailable(host, "libc.so.6", name_buffer, &ptr, 1, true, i32,
                                         "this wide FILE virtual operation is not implemented");
       has = true;
     }

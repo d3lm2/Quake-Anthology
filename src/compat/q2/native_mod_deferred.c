@@ -121,7 +121,7 @@ void qa_compat_q2_native_mod_deferred_damage_state_changed(state_t *s, double sl
   const qa_native_mod_deferred_damage *d = s->definition;
   if (hits(range, d->receipt, 1) && scalar(s, slot, d->blood, false, 0) != 0) {
     qa_damage_request request;
-    if (!s->current(s->current_ctx, &request) || !qa_same_actor(request.target, actor.id)) qa_range_error("Native deferred damage has no original attack provenance");
+    if (!s->current(s->current_ctx, &request) || !qa_same_actor(request.target, actor.id)) qa_raise("Error", 0, 0, "Native deferred damage has no original attack provenance");
     size_t index = find_pending(s, actor.id);
     if (index != (size_t)-1) retain_request(s->pending[index], request);
     else { pending_t *entry = new_pending(actor.id); retain_request(entry, request); append_pending(s, entry); }
@@ -146,9 +146,11 @@ void qa_compat_q2_native_mod_deferred_damage_state_process(state_t *s, qa_actor_
   size_t index = find_pending(s, actor); double blood = scalar(s, slot, s->definition->blood, false, 0);
   if (index == (size_t)-1 || blood == 0) { original(original_ctx); return; }
   pending_t *entry = take_pending(s, actor);
+  qa_cleanup node; qa_cleanup_push(&node, free, entry); /* the guest reads and the capture can raise */
   entry->request.knockback = scalar(s, slot, s->definition->knockback, false, 0);
   entry->request.point = qa_compat_q2_read_classic_vector(s->host->memory, at(s, slot, s->definition->point));
   entry->request = qa_capture_request(entry->request);
+  qa_cleanup_pop(&node);
   pending_t **top = qa_compat_q2_grow((void **)&s->processing, &s->processing_count, &s->processing_capacity, sizeof *top); *top = entry;
   process_call call = {s, entry, slot, blood, original_ctx, original};
   qa_compat_q2_native_mod_finally(process_body, &call, process_cleanup, &call);
@@ -166,6 +168,7 @@ static void restore_attack(const state_t *s, pending_t *entry, const qa_q2_attac
 }
 saved_t *qa_compat_q2_native_mod_deferred_damage_state_checkpoint(state_t *s, size_t *out_count) {
   saved_t *records = calloc(s->pending_count + 1, sizeof *records); if (records == NULL) qa_range_error("Out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, free, records); /* a guest read can raise */
   size_t count = 0; const qa_native_mod_deferred_damage *d = s->definition;
   for (size_t i = 0; i < s->pending_count; i++) {
     const pending_t *entry = s->pending[i]; const qa_damage_request *request = &entry->request;
@@ -181,6 +184,7 @@ saved_t *qa_compat_q2_native_mod_deferred_damage_state_checkpoint(state_t *s, si
     r->has_attacker = pointer_slot(s, slot, d->attacker, &r->attacker_slot);
     r->has_inflictor = pointer_slot(s, slot, d->inflictor, &r->inflictor_slot);
   }
+  qa_cleanup_pop(&node);
   *out_count = count; return records;
 }
 /* TS restoreRequest. */
@@ -188,31 +192,36 @@ static pending_t *restore_request(const state_t *s, const saved_t *record) {
   qa_actor_id target = reference(s, record->target);
   qa_actor_source_result source = qa_session_actor_registry_source_of(s->services->actors, target);
   if (!source.has_value || !qa_compat_q2_text_equal(source.provider, s->host->memory->module.id) || !qa_session_actor_registry_is_live(s->services->actors, target))
-    qa_range_error("Saved deferred damage target is not owned by this native mod");
+    qa_raise("Error", 0, 0, "Saved deferred damage target is not owned by this native mod");
   pending_t *entry = new_pending(target);
+  qa_cleanup node; qa_cleanup_push(&node, free, entry); /* a saved reference or the capture can raise */
   entry->request.target = target; entry->request.amount = record->amount; entry->request.knockback = record->knockback_req;
   entry->request.point = record->point_req; entry->request.direction = record->direction; entry->request.normal = record->normal; entry->request.delivery = record->delivery;
   restore_attack(s, entry, &record->attack);
   entry->request = qa_capture_request(entry->request);
+  qa_cleanup_pop(&node);
   return entry;
 }
 void qa_compat_q2_native_mod_deferred_damage_state_validate_saved(state_t *s, const saved_t *records, size_t count) {
   for (size_t i = 0; i < count; i++) free(restore_request(s, &records[i]));
 }
+typedef struct { pending_t **entries; size_t count; } prepared_list;
+static void release_prepared(void *v) { prepared_list *l = v; for (size_t i = 0; i < l->count; i++) free(l->entries[i]); free(l->entries); }
 void qa_compat_q2_native_mod_deferred_damage_state_restore(state_t *s, const saved_t *records, size_t count) {
   pending_t **prepared = calloc(count + 1, sizeof *prepared); if (prepared == NULL) qa_range_error("Out of memory");
+  prepared_list list = {prepared, count}; qa_cleanup node; qa_cleanup_push(&node, release_prepared, &list); /* entries not yet pending */
   for (size_t i = 0; i < count; i++) prepared[i] = restore_request(s, &records[i]);
   const qa_compat_q2_native_mod_host *h = s->host; const qa_native_mod_deferred_damage *d = s->definition; qa_compat_q2_memory *memory = h->memory;
   for (size_t i = 0; i < count; i++) {
     double table_count = h->entities(h->ctx).count;
     if ((records[i].has_attacker && records[i].attacker_slot >= table_count) || (records[i].has_inflictor && records[i].inflictor_slot >= table_count))
-      qa_range_error("Saved deferred damage pointer exceeds the restored source table");
+      qa_raise("Error", 0, 0, "Saved deferred damage pointer exceeds the restored source table");
   }
   qa_compat_q2_native_mod_deferred_damage_state_clear(s);
   for (size_t i = 0; i < count; i++) {
     const saved_t *record = &records[i];
     qa_actor_source_result source = qa_session_actor_registry_source_of(s->services->actors, prepared[i]->request.target);
-    if (!source.has_value) qa_range_error("Saved deferred damage target lost its source slot");
+    if (!source.has_value) qa_raise("Error", 0, 0, "Saved deferred damage target lost its source slot");
     double slot = (double)source.slot;
     qa_guest_address none; memset(&none, 0, sizeof none);
     qa_guest_address a2 = at(s, slot, d->attacker);
@@ -230,6 +239,7 @@ void qa_compat_q2_native_mod_deferred_damage_state_restore(state_t *s, const sav
     size_t existing = find_pending(s, prepared[i]->request.target);
     if (existing != (size_t)-1) { free(s->pending[existing]); s->pending[existing] = prepared[i]; }
     else append_pending(s, prepared[i]);
+    prepared[i] = NULL; /* owned by pending now */
   }
-  free(prepared);
+  qa_cleanup_pop(&node); free(prepared);
 }

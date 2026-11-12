@@ -17,6 +17,7 @@ struct qa_app_q1_client_commands {
   const char **names; size_t count;
   command_ctx *ctxs;
   char *doc_storage; /* usage/example scratch, one block */
+  const char **examples; /* one example slot per command: the buffer borrows the documentation's arrays */
 };
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 static void handler(void *v, qa_command_invocation *invocation) {
@@ -33,8 +34,11 @@ static void handler(void *v, qa_command_invocation *invocation) {
       if (extended == NULL) qa_range_error("Out of memory");
       for (size_t i = 0; i < arg_count; i++) extended[i] = args[i];
       extended[arg_count] = "all";
+      qa_cleanup node;
+      qa_cleanup_push(&node, free, extended);
       ctx->execute(ctx->execute_ctx, "give", extended, arg_count + 1,
           origin->kind == QA_COMMAND_ORIGIN_LOCAL_SEAT ? &origin->seat : NULL, invocation->source);
+      qa_cleanup_pop(&node);
       free(extended);
       return;
     }
@@ -69,7 +73,9 @@ qa_app_q1_client_commands *qa_app_register_q1_client_commands(qa_command_buffer 
   registration->names = calloc(total, sizeof *registration->names);
   registration->ctxs = calloc(total, sizeof *registration->ctxs);
   registration->doc_storage = calloc(total, 256);
-  if (registration->names == NULL || registration->ctxs == NULL || registration->doc_storage == NULL)
+  registration->examples = calloc(total, sizeof *registration->examples);
+  if (registration->names == NULL || registration->ctxs == NULL || registration->doc_storage == NULL ||
+      registration->examples == NULL)
     qa_range_error("Out of memory");
   static const char *const give_examples[] = {"give all", "give health 100"};
   for (size_t i = 0; i < total; i++) {
@@ -81,7 +87,7 @@ qa_app_q1_client_commands *qa_app_register_q1_client_commands(qa_command_buffer 
       snprintf(usage, 256, "give [client slot: server console only] <all|health|armor|weapons|ammo|keys|item> [amount]");
     else
       snprintf(usage, 256, "%s [client slot: server console only]", name);
-    const char *example_storage[1];
+    const char **example_storage = &registration->examples[i];
     example_storage[0] = name;
     qa_command_documentation documentation = {summary, usage,
         is(name, "give") ? give_examples : example_storage, is(name, "give") ? 2 : 1, NULL, 0};
@@ -97,7 +103,8 @@ void qa_app_q1_client_commands_release(qa_app_q1_client_commands *registration) 
   qa_app_q1_view_commands_release(registration->view);
   for (size_t i = 0; i < registration->count; i++)
     qa_command_buffer_unregister(registration->commands, registration->names[i], NULL, NULL, false);
-  free(registration->names); free(registration->ctxs); free(registration->doc_storage); free(registration);
+  free(registration->names); free(registration->ctxs); free(registration->doc_storage);
+  free(registration->examples); free(registration);
 }
 qa_actor_id qa_app_resolve_q1_host_command_actor(const char *name,
     const char *const *args, size_t arg_count, const qa_command_context *source,
@@ -110,25 +117,30 @@ qa_actor_id qa_app_resolve_q1_host_command_actor(const char *name,
     bool digits = target != NULL && target[0] != '\0';
     if (digits) for (const char *p = target; *p != '\0'; p++) if (!isdigit((unsigned char)*p)) digits = false;
     if ((!takes_arguments && arg_count != 1) || target == NULL || !digits) {
-      char slots[256] = "";
-      for (size_t i = 0; i < player_count; i++) {
-        char piece[32];
-        snprintf(piece, sizeof piece, "%s%lld", i == 0 ? "" : ", ", (long long)players[i].client.slot);
-        strncat(slots, piece, sizeof slots - strlen(slots) - 1);
-      }
-      qa_range_error("Usage: %s <client slot>; connected slots: %s", name, player_count == 0 ? "none" : slots);
+      /* players.map(slot).join(", ") || "none", whole. */
+      size_t size = 8 + player_count * 24;
+      char *slots = malloc(size);
+      if (slots == NULL) qa_range_error("Out of memory");
+      size_t used = 0;
+      slots[0] = '\0';
+      for (size_t i = 0; i < player_count; i++)
+        used += (size_t)snprintf(slots + used, size - used, "%s%lld", i == 0 ? "" : ", ", (long long)players[i].client.slot);
+      qa_cleanup node;
+      qa_cleanup_push(&node, free, slots);
+      qa_raise("Error", 0, 0, "Usage: %s <client slot>; connected slots: %s", name, player_count == 0 ? "none" : slots);
     }
-    long long slot = strtoll(target, NULL, 10);
+    /* Number(target) over /^\d+$/: a decimal value, compared exactly with the slot. */
+    double slot = strtod(target, NULL);
     for (size_t i = 0; i < player_count; i++)
-      if (players[i].client.slot == slot) return players[i].actor;
-    qa_range_error("Client slot %s is not on the server", target);
+      if ((double)players[i].client.slot == slot) return players[i].actor;
+    qa_raise("Error", 0, 0, "Client slot %s is not on the server", target);
   }
   if (!takes_arguments && arg_count != 0)
-    qa_range_error("%s: only the server console may select a client slot", name);
+    qa_raise("Error", 0, 0, "%s: only the server console may select a client slot", name);
   if (origin != NULL && (origin->kind == QA_COMMAND_ORIGIN_REMOTE_CLIENT || origin->kind == QA_COMMAND_ORIGIN_LOCAL_SEAT)) {
     for (size_t i = 0; i < player_count; i++)
       if (qa_same_client(players[i].client, origin->client)) return players[i].actor;
-    qa_range_error("Command requires an admitted client");
+    qa_raise("Error", 0, 0, "Command requires an admitted client");
   }
   return local_actor(local_actor_ctx);
 }

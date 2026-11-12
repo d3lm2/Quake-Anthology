@@ -186,8 +186,6 @@ hypot	src/app/bootstrap/simulation/qvm_grapple_source.c	ts-arity	Math.hypot with
 hypot	src/app/bootstrap/simulation/qvm_grapple_source.c	ts-count	Math.hypot x2, hypot/qa_js_hypot*/qa_hypot3 x0 (sqrt of a sum is not Math.hypot)	absent	hanging test and horizontalSpeed (TS lines 304, 323) are not ported in C
 hypot	src/app/bootstrap/simulation/qvm_weapon_behavior.c	ts-arity	Math.hypot with 3+ arguments x1, qa_js_hypot3/qa_js_hypot x0	absent	launch speed length (TS line 231) is not ported in C
 hypot	src/app/bootstrap/simulation/qvm_weapon_behavior.c	ts-count	Math.hypot x1, hypot/qa_js_hypot*/qa_hypot3 x0 (sqrt of a sum is not Math.hypot)	absent	launch speed length (TS line 231) is not ported in C
-hypot	src/app/bootstrap/simulation/runtime.c	ts-arity	Math.hypot with 3+ arguments x12, qa_js_hypot3/qa_js_hypot x0	absent	none of the 17 runtime.ts Math.hypot sites (spawn selection, xyspeed, goal distances) is ported in runtime*.c yet
-hypot	src/app/bootstrap/simulation/runtime.c	ts-count	Math.hypot x17, hypot/qa_js_hypot*/qa_hypot3 x0 (sqrt of a sum is not Math.hypot)	absent	none of the 17 runtime.ts Math.hypot sites (spawn selection, xyspeed, goal distances) is ported in runtime*.c yet
 hypot	src/content/q1/base/projectiles.c	ts-count	Math.hypot x2, hypot/qa_js_hypot*/qa_hypot3 x1 (sqrt of a sum is not Math.hypot)	absent	the Bloody Nightmare grenade boost (TS line 195) is not ported in C; the angle site uses hypot(x, y)
 hypot	src/content/q2/base/player/index.c	ts-count	Math.hypot x2, hypot/qa_js_hypot*/qa_hypot3 x1 (sqrt of a sum is not Math.hypot)	same	TS computes the same Math.hypot(velocity.x, velocity.y) twice (endFrame and updateBob); C computes it once in the bob update with two-argument hypot
 # round/pow/helper/libm (js-num)
@@ -467,7 +465,6 @@ bitwise64	src/app/bootstrap/simulation/q3/presentation.c	qa_app_q3_pool_models	(
 bitwise64	src/app/bootstrap/simulation/q3/presentation.c	qa_app_q3_pool_models	((long long)state->e_flags) & 0x80	same	x & m with m a constant (or constant conditional) in 0..2^31-1: the result is the low bits of x, identical to ToInt32(x) & m for every integral x, and non-negative
 bitwise64	src/app/bootstrap/simulation/q3/runtime.c	qa_app_q3_source_runtime_run_actor	((long long)entity.flags) & 1	same	x & m with m a constant (or constant conditional) in 0..2^31-1: the result is the low bits of x, identical to ToInt32(x) & m for every integral x, and non-negative
 bitwise64	src/app/bootstrap/simulation/q3/runtime.c	t_step_holdable	((long long)ps->pm_flags) & QA_Q3_FLAG_RESPAWNED	same	x & m with m a constant (or constant conditional) in 0..2^31-1: the result is the low bits of x, identical to ToInt32(x) & m for every integral x, and non-negative
-bitwise64	src/app/bootstrap/simulation/runtime.c	c_qc_spawn_map	(int64_t)trunc(qa_compat_qc_words_float(words, c_qc_field(g, "spawnflags"))) & (int64_t)excluded	same	& excluded spawnflag mask (2048 or a NOT_EASY/NOT_MEDIUM/NOT_HARD bit, below 2^31) tested != 0: only low bits observed
 bitwise64	src/bots/behavior/library/character.c	parse_tokens	index_token->flags & QA_UI_SCRIPT_NUMBER_INTEGER	same	x & m with m a constant (or constant conditional) in 0..2^31-1: the result is the low bits of x, identical to ToInt32(x) & m for every integral x, and non-negative
 bitwise64	src/bots/behavior/library/character.c	parse_tokens	value_token->flags & QA_UI_SCRIPT_NUMBER_FLOAT	same	x & m with m a constant (or constant conditional) in 0..2^31-1: the result is the low bits of x, identical to ToInt32(x) & m for every integral x, and non-negative
 bitwise64	src/bots/behavior/library/chat.c	source_random	value & 0x7fff	same	x & m with m a constant (or constant conditional) in 0..2^31-1: the result is the low bits of x, identical to ToInt32(x) & m for every integral x, and non-negative
@@ -1491,7 +1488,6 @@ parse	src/app/bootstrap/options.c	integer_value	*	same	value passed /^[0-9]+$/ f
 parse	src/app/bootstrap/q1_client_commands.c	qa_app_resolve_q1_host_command_actor	*	same	target passed /^\d+$/; slots are small integers, and a digit run beyond LLONG_MAX (clamped) matches no slot, as its Number() does not
 parse	src/app/bootstrap/q2_console.c	dumpuser_handler	*	same	guarded by /^\d+$/ (all_digits); strtod of a digit run equals Number()
 parse	src/app/bootstrap/simulation/events.c	q1_event	*	same	Q1SoundChannel is a TS union of names and the integers -1, 5, 6, 7; C carries those integers as their decimal text, which strtol reads exactly
-parse	src/app/bootstrap/simulation/runtime.c	qa_app_sim_concrete_simulation_admit_player	*	c-only	concrete-host scaffolding (docs/PORT_COMPLETION.md step 4 deletes it); no TS counterpart
 fixed	src/app/bootstrap/splash.c	qa_app_run_splash_child	*	same	tick lines carry Date.now(), an integer; the parent drains and discards them
 parse	src/app/bootstrap/view_settings.c	json_number_after	*	same	strtod runs only on a token already matched against the JSON number grammar, which JSON.parse converts with the same correct rounding
 parse	src/bots/behavior/library/chat.c	js_number	*	same	Number(): the function validates the full StrDecimalLiteral grammar (and radix literals by hand) before strtod sees a plain decimal literal
@@ -1968,7 +1964,6 @@ float2int	src/bots/navigation/estimate_aas.c	qa_aas_estimate_area_time	*	same	ch
 float2int	src/bots/navigation/helpers.c	qa_nav_contents	*	same	contents are int32 collision contents
 float2int	src/bots/navigation/runtime.c	qa_navigation_runtime_restore_checkpoint	*	same	restore: save-reader safe integers
 float2int	src/bots/navigation/construct.c	*	*	same	every BSP index goes through at_check_d (finite, integral, in range) first; node keys are qa_js_round/floor of finite map coordinates divided by 8/4 or by linkDistance >= 8, exact for |coordinate| < 2^66 (a corrupt BSP vertex beyond that would overflow the int64 key where TS builds a string key; not fixed)
-float2int	src/app/bootstrap/application.c	*	*	same	seats is a validated seat count (>= 0 checked)
 float2int	src/app/bootstrap/audio/music.c	*	*	same	the %lld print is guarded integral and below 1e15 (String() gives the same digits); track numbers and CD tracks are integral command arguments checked before use
 float2int	src/app/bootstrap/audio/output_settings.c	*	*	same	sample rate/bits/channels are validated integers from the settings schema; the kHz print is guarded integral below 1e15
 float2int	src/app/bootstrap/audio/playlist.c	*	*	same	floor(random * (index + 1)) with random in [0, 1): an index in [0, index]
@@ -2038,7 +2033,6 @@ float2int	src/app/bootstrap/simulation/quakec_mod.c	*	*	same	restore: front/rear
 float2int	src/app/bootstrap/simulation/quakec_player_ui.c	*	*	same	weapon bits are small table constants
 float2int	src/app/bootstrap/simulation/quakec_weapon_behavior.c	*	*	same	restore: save-reader integers
 float2int	src/app/bootstrap/simulation/rerelease_guest_services.c	*	*	same	configstring indices and ranges are range-checked integers from the guest ABI (validated before indexing); max clients is a validated count
-float2int	src/app/bootstrap/simulation/runtime.c	*	*	same	actor-registry revisions are integral counters; max clients is a validated count; spawnflags now go through ToInt32
 float2int	src/app/bootstrap/splash.c	*	*	same	width/height are the positive integral window size; pixel offsets are integral loop positions
 float2int	src/app/bootstrap/startup_menu.c	*	*	same	pages and scroll positions are non-negative integral menu state
 float2int	src/app/bootstrap/team_arena_skirmish.c	*	*	same	cursor indices are non-negative integral menu indices (idx checked < 5)
@@ -2049,7 +2043,6 @@ bitwise64	src/app/bootstrap/effects/q3.c	qa_app_q3_application_effects_event	qa_
 bitwise64	src/app/bootstrap/network/remote_q1.c	qa_app_q1_remote_player_ui	*	same	ToInt32(items) & a weapon bit constant from the Q1 table (at most 1 << 31 stored as a non-negative double; compared != 0 only), so the zero test matches JS
 bitwise64	src/app/bootstrap/seat_hud_state.c	qa_app_seat_source_hud_presentation	*	same	ToInt32(rune_items) & a rune bit constant below 2^31, compared with 0
 bitwise-sign	src/app/bootstrap/simulation/random.c	qa_app_sim_source_random_next_unit	*	same	uint32 & 0x7fff is below 2^31, so the unsigned result equals the JS signed one
-hypot	src/app/bootstrap/simulation/runtime.c	ts-count	Math.hypot x18, hypot/qa_js_hypot*/qa_hypot3 x0 (sqrt of a sum is not Math.hypot)	absent	none of the 18 runtime.ts Math.hypot sites is ported in runtime*.c yet; the port must use qa_js_hypot2/3
 bitwise64	src/bots/behavior/q3/navigation.c	qa_source_bot_navigation_movement_view_target	*	same	travel_type is an int32 AAS field; & 0xffffff keeps low bits ToInt32 also keeps, non-negative
 bitwise64	src/bots/behavior/q3/travel/routing.c	qa_travel_graph_select_from	*	same	area contents are int32 AAS fields, travel flags are TFL constants and table entries below 2^24, MRF_BLOCKEDBYAVOIDSPOT is 256: every operand and result stays below 2^31, so int64 and ToInt32 agree
 round	src/content/q1/addons/monsters/ai/controller.c	qa_q1am_mg3_sight_sound_super	*	same	TS is Math.floor(random() * 3 + 0.5) itself
@@ -2091,3 +2084,368 @@ float2int	src/app/bootstrap/demo_local_recording.c	publish_q3	(int64_t)host->tim
 float2int	src/app/bootstrap/match_results.c	qa_app_match_rankings_bind	(size_t)slot	same	slot_in_range checked a safe integer in 0..255 first (TS Number.isSafeInteger guard)
 float2int	src/app/bootstrap/match_results.c	qa_app_match_rankings_unbind	(size_t)slot	same	slot_in_range checked a safe integer in 0..255 first
 float2int	src/app/bootstrap/match_results.c	settle_record	(size_t)player->slot	same	guarded by slot_in_range; out-of-range slots read TS undefined (skipped)
+# audits (2026-11-11): sites new since the last classification pass (mostly app/bootstrap and simulation after the TS drift); every covered site read.
+case	src/app/bootstrap/addon_library.c	import_operation	*	same	".zip" suffix test: a UTF-8 byte >= 0x80 never folds to ASCII, and no non-ASCII character lowercases to a lone z, i or p, so ASCII folding equals the TS toLowerCase compare
+float2int	src/app/bootstrap/application_bots.c	guest_random	*	same	nextInteger returns an integral double in int32 range
+float2int	src/app/bootstrap/application_bots.c	guest_create_client	*	same	slot is a guest client number, an integer below the session's client maximum
+float2int	src/app/bootstrap/application_bots.c	guest_snapshot_entity	*	same	guarded 0 <= sequence < entity_count; the guest passes integral sequences (int syscall argument)
+float2int	src/app/bootstrap/application_commands.c	actions_local_player_capacity	*	same	slot is a loop counter over integral client slots
+float2int	src/app/bootstrap/application_core.c	rh_status	*	same	slot is an integral client slot from the rankings host
+float2int	src/app/bootstrap/application_core.c	guest_configstring	*	same	index is a guest configstring index (int syscall argument), integral and in range
+float2int	src/app/bootstrap/application_core.c	guest_clock_counter	*	same	trunc of a finite performance-clock millisecond count (far below 2^53)
+float2int	src/app/bootstrap/application_core.c	guest_q2_clock_counter	*	same	tick counter is an integral double incremented from 0
+float2int	src/app/bootstrap/application_core.c	guest_real_time	*	c-only	time_t for localtime of a finite wall clock (Date); seconds fit time_t
+float2int	src/app/bootstrap/application_open.c	open_body	*	same	seats validated integer 1..4 and slots integral client slots below the session maximum
+float2int	src/app/bootstrap/application_open_graphical.c	new_players	*	same	index is an integral seat index below the seat count (<= 4)
+case	src/app/bootstrap/application_seats.c	same_lower	*	same	compares seat/cvar names against ASCII command words; UTF-8 bytes >= 0x80 never fold to ASCII, matching toLowerCase on these ASCII targets
+float2int	src/app/bootstrap/application_seats.c	results_read	*	same	max_clients is a validated integral cvar value, capped by QA_Q3_MAX_CLIENTS in the same condition
+float2int	src/app/bootstrap/application_seats.c	qa_application_publish_local_guest_snapshots_with	*	same	sequences and server time are integral counters (int32 wire fields of the local Q3 client state)
+float2int	src/app/bootstrap/application_seats.c	lg_source_actor	*	same	number is an integral entity number from the Q3 snapshot
+float2int	src/app/bootstrap/application_seats.c	saved_clients_body	*	same	slot is an integral saved client slot (validated by the save reader)
+float2int	src/app/bootstrap/application_seats.c	userinfo_free	*	same	cvar flags are an integral bit set below 2^31
+float2int	src/app/bootstrap/application_services.c	bots_disconnect	*	same	slot is an integral client slot
+float2int	src/app/bootstrap/application_step.c	qa_application_recover_dedicated_frame	*	same	fmod of a non-negative integral fault counter by the ring length: integral 0..length-1
+float2int	src/app/bootstrap/application_transition.c	saved_bot_client	*	same	slot/generation are safe integers read by the save reader's integer checks
+sort	src/app/bootstrap/application_travel.c	sorted_clients	*	same	keys are distinct client slots, so stability cannot show
+sort	src/app/bootstrap/application_travel.c	qa_application_local_viewport	*	same	keys are distinct seat indexes, so stability cannot show
+float2int	src/app/bootstrap/audio.c	channel_number	*	same	channel is an integral sound channel from the event (the int16 wire or guest int argument)
+float2int	src/app/bootstrap/audio.c	qa_app_application_audio_create	*	same	seed is an integral random seed (options seed validated integer)
+float2int	src/app/bootstrap/audio.c	q3_footsteps	*	same	prior->number is a Q3 footstep enum value (integral 0..6)
+float2int	src/app/bootstrap/audio.c	qa_app_application_audio_frame	*	same	leaf_index is an integral BSP leaf index returned by the point lookup (checked >= 0 and < leaf count)
+float2int	src/app/bootstrap/campaign_cinematic.c	read_audio	*	same	values come from qa_save_reader_choice_number / integer_min (safe integers) and samples are range-checked to the int16/uint8 width before the store
+float2int	src/app/bootstrap/campaign_cinematic.c	prepare_images	*	same	rate read with qa_save_reader_integer_min (safe integer >= 1)
+float2int	src/app/bootstrap/component_drawings.c	line_lifetime	*	same	lifetime is an integral frame count from the guest drawing call
+float2int	src/app/bootstrap/component_scene.c	qa_app_select_component_scene	(int32_t)player->slot	same	slot is an integral client slot below 64
+float2int	src/app/bootstrap/component_scene.c	qa_app_select_component_scene	(int64_t)source->revision	same	revision counters are integral doubles incremented from 0
+float2int	src/app/bootstrap/component_scene.c	qa_app_select_component_scene	(int64_t)source->game_state_revision	same	revision counters are integral doubles incremented from 0
+float2int	src/app/bootstrap/component_scene.c	qa_app_select_component_scene	(int64_t)source->entities[i].state->number	same	entity numbers are integral (< 1024)
+float2int	src/app/bootstrap/component_scene.c	qa_app_select_component_scene	(int64_t)command->sequence	same	command sequences are integral counters
+case	src/app/bootstrap/cvar_archives.c	archive_command	*	same	compares against lower-case ASCII command names; UTF-8 bytes >= 0x80 never fold to ASCII
+float2int	src/app/bootstrap/effects.c	q2_effect	*	same	guarded integral 0 <= color < 7 in the same condition
+float2int	src/app/bootstrap/effects.c	q2_entities	*	same	guarded integral 0 <= frame < 6 in the same condition
+float2int	src/app/bootstrap/effects.c	build_beam	*	same	segment is a loop counter from 0 below steps <= MAX_BEAM_SEGMENTS
+float2int	src/app/bootstrap/frame_loop.c	monotonic_sleep	*	c-only	nanosleep timespec of a finite non-negative delay; TS awaits a timer (Bun.sleep)
+case	src/app/bootstrap/mod_presentations.c	producer_engine_command	*	same	engine command names are ASCII identifiers; the lower-cased key is compared with ASCII names only
+parse	src/app/bootstrap/mod_presentation.c	qa_app_free_memory	*	c-only	reads /proc/meminfo MemAvailable (Bun os.freemem reads the same field)
+float2int	src/app/bootstrap/mod_presentation.c	cvar_info_string	*	same	maximum_length is an integral QVM int argument (negative mapped to 1024 before the cast)
+float2int	src/app/bootstrap/mod_presentation.c	context	*	same	time is an integral millisecond count from the QVM presentation clock
+bitwise64	src/app/bootstrap/mod_presentation.c	output_scene	*	same	render_flags is an int32 refdef flag set from the QVM; & with a small constant equals the ToInt32 result
+float2int	src/app/bootstrap/mod_presentation.c	create_run	*	same	baseline is an integral frame/sequence counter
+float2int	src/app/bootstrap/mod_presentation.c	consume_run	*	same	sequence is an integral counter
+float2int	src/app/bootstrap/mod_presentation.c	frame_run	*	same	sequence is an integral counter
+case	src/app/bootstrap/native_migration.c	demo_file	*	same	compares extension bytes with ASCII letters d/m; bytes >= 0x80 never fold to ASCII
+parse	src/app/bootstrap/network/q2_mvd_presentation.c	inline_model_index	*	same	path is "*" followed by digits (checked by the caller's inline-model test); strtod equals Number() on a decimal digit string
+float2int	src/app/bootstrap/network/unified_event_values.c	actor_of	*	same	slot/generation decoded by the unified event codec's safe-integer readers
+parse	src/app/bootstrap/network/unified_event_values.c	sound_channel	*	same	strtod over the constant decimal strings "-1","5","6","7": equals Number()
+parse	src/app/bootstrap/network/unified_event_values.c	read_sound_channel	*	same	strtod over the constant decimal strings "-1","5","6","7": equals Number()
+float2int	src/app/bootstrap/network/unified_event_values.c	r_q1_addon	*	same	lightning style decoded as a choice of 1, 2 or 3 (unified_event_codec.c ev_f_choice)
+float2int	src/app/bootstrap/network/unified_event_values.c	r_q1_composition	*	same	slot, colors, flags and rune items decoded by the codec's integer readers (integral, in range)
+float2int	src/app/bootstrap/network/unified_event_values.c	qa_app_unified_simulation_event_view	*	same	seat index/slot/generation decoded by the codec's integer readers
+float2int	src/app/bootstrap/original_save.c	import_counter	*	same	trunc of a finite performance-clock millisecond count
+float2int	src/app/bootstrap/presentation.c	qa_app_world_seat_presentation_frame	*	same	console metrics columns and trunc(height/line height) are finite non-negative integers (max(1, ...) guards the row count)
+float2int	src/app/bootstrap/presentation_scene.c	qa_app_application_world_scene_style	*	same	NaN mapped to 0 and 0 <= position < length checked before the index
+truthy	src/app/bootstrap/presentation_state.c	read_presentation_owner	*	same	safe_integer_check returns bool (the flagged double is its argument)
+truthy	src/app/bootstrap/presentation_state.c	qa_app_presentation_state_restore	*	same	safe_integer_check returns bool (the flagged double is its argument)
+float2int	src/app/bootstrap/presentation_state.c	qa_app_presentation_state_light_styles	*	same	0 <= position < length checked before the index (NaN takes the NaN branch)
+float2int	src/app/bootstrap/q2_native_saves.c	clock_of	*	c-only	time_t for localtime of a finite wall clock (Date); seconds fit time_t
+bitwise64	src/app/bootstrap/q3_client.c	output_scene	*	same	render_flags is an int32 refdef flag set; & with a small constant equals the ToInt32 result
+bitwise64	src/app/bootstrap/q3_client.c	qa_app_application_q3_client_supplemental_weapon_camera	*	same	render_flags is an int32 refdef flag set; & with a small constant equals the ToInt32 result
+bitwise64	src/app/bootstrap/q3_client.c	qa_app_application_q3_client_frame	*	same	render_flags is an int32 refdef flag set; & with a small constant equals the ToInt32 result
+bitwise-sign	src/app/bootstrap/q3_client.c	qa_app_application_q3_client_input	*	same	key code is a Unicode code point (< 2^21) and QA_KEY_CHAR_FLAG is 1024: bit 31 stays clear, so the unsigned result equals the signed JS one
+float2int	src/app/bootstrap/q3_client.c	portal	*	same	surface indexes from the visibility query are integral and checked against surface_count next
+float2int	src/app/bootstrap/q3_client/client_state.c	source_command_read	*	same	command numbers are integral int32 QVM arguments
+float2int	src/app/bootstrap/q3_client/client_state.c	connection_configstring	*	same	configstring index is an integral QVM argument
+float2int	src/app/bootstrap/q3_client/client_state.c	connection_command_read	*	same	command numbers are integral int32 QVM arguments
+parse	src/app/bootstrap/q3_client/qvm_scalars.c	free_memory	*	c-only	reads /proc/meminfo MemAvailable (Bun os.freemem reads the same field)
+float2int	src/app/bootstrap/remote_access.c	qa_app_remote_access_next_generation	*	same	the cast is evaluated only after 0 <= slot <= 2^53-1 (safe-integer test)
+float2int	src/app/bootstrap/remote_access.c	qa_app_remote_access_identity_actor	*	same	slot/generation are integral identity fields from the session
+float2int	src/app/bootstrap/remote_access.c	qa_app_remote_access_identity_client	*	same	slot/generation are integral identity fields from the session
+float2int	src/app/bootstrap/remote_application_cinematic.c	audio_milliseconds	*	same	finite non-negative clock milliseconds; (int64_t) truncation is Math.trunc here
+float2int	src/app/bootstrap/remote_application_commands.c	is_safe_integer	*	same	the cast is evaluated only after the NaN and +-(2^53-1) range checks
+float2int	src/app/bootstrap/remote_application_commands.c	execute_body	*	same	index is a parsed seat index validated as an integer 0..3
+float2int	src/app/bootstrap/remote_application_open.c	open_body	*	same	the cast is evaluated only after 1 <= seats <= 4
+float2int	src/app/bootstrap/remote_application_seats.c	qa_remote_application_retire_remote_seat	*	same	qport is a 16-bit wire value (integral 0..65535)
+float2int	src/app/bootstrap/remote_application_seats.c	select_run	*	same	generation is an integral counter
+float2int	src/app/bootstrap/remote_application_seats.c	hook_load_q2_world	*	same	layout maxima are protocol constants (integral, > 1 checked)
+float2int	src/app/bootstrap/remote_application_seat.c	*	*	same	ping/command/configstring numbers are integral QVM int arguments
+float2int	src/app/bootstrap/remote_application_step.c	advance_live	*	same	finite non-negative presentation-time milliseconds; truncation is Math.trunc here
+float2int	src/app/bootstrap/remote_application_unified.c	host_open_plan	*	same	generation number read from a save number validated as a safe integer by the open plan
+float2int	src/app/bootstrap/remote_application_world.c	q2_config_names	*	same	layout maximum is a protocol constant (integral, > 1 checked)
+float2int	src/app/bootstrap/remote_application_world.c	qa_remote_application_select_remote_content	*	same	generation is an integral counter
+float2int	src/app/bootstrap/remote_seat_view.c	*	*	same	ping/command/configstring numbers are integral QVM int arguments
+case	src/app/bootstrap/rerelease_presentation.c	create_catalog	*	same	ASCII "loc_"/".txt" affixes and an ASCII language id; bytes >= 0x80 never fold to ASCII (the TS toLowerCase id of a non-ASCII name differs only for names the TS regexp rejects too)
+sort	src/app/bootstrap/rerelease_presentation.c	create_catalog	*	same	distinct language ids, so stability cannot show
+float2int	src/app/bootstrap/seat_hud_state.c	qa_app_seat_source_hud_prepare	*	same	color is (ToInt32 & 255), so index = color*3+c is integral 0..767 and checked < length
+case	src/app/bootstrap/server_browser.c	http_url	*	same	URL scheme compare is ASCII case-insensitive (WHATWG scheme parsing)
+float2int	src/app/bootstrap/server_master_list.c	qa_app_fetch_server_master_list	*	c-only	curl timeout plumbing: the sites are curl_easy_setopt's type-check macro expansion around a finite, >= 1 millisecond timeout (TS uses an AbortSignal timer)
+case	src/app/bootstrap/server_master_list.c	qa_app_fetch_server_master_list	*	same	URL scheme compare is ASCII case-insensitive (WHATWG scheme parsing)
+float2int	src/app/bootstrap/simulation/arsenal/q3_source.c	forget_presented	*	same	slot >= 0 and < presented_count checked first; slots are integral client numbers
+float2int	src/app/bootstrap/simulation/arsenal/q3_source.c	presented_at	*	same	slots are integral client numbers (callers pass 0..63)
+float2int	src/app/bootstrap/simulation/arsenal/q3_source.c	qa_app_q3_selected_source_create	*	same	seed is an integral random seed
+float2int	src/app/bootstrap/simulation/arsenal/q3_source.c	respawn_operation	*	same	index is a loop counter below the persistant slot count
+float2int	src/app/bootstrap/simulation/arsenal/q3_source.c	qa_app_q3_selected_source_restore	*	same	random state read with qa_save_reader_integer (safe integer)
+float2int	src/app/bootstrap/simulation/arsenal/q3_source_legacy.c	qa_app_restore_legacy_q3_source	*	same	random seed validated as a safe integer by the legacy reader
+float2int	src/app/bootstrap/simulation/bots.c	restore_weapon	*	same	saved weapon is an integral weapon number from the checkpoint reader
+float2int	src/app/bootstrap/simulation/bots.c	qa_app_sim_bot_arsenal_restore_checkpoint	*	same	handles are integral (validated by the checkpoint reader)
+float2int	src/app/bootstrap/simulation/bots.c	qa_app_sim_restored_bot_reliable_commands	*	same	sequence/acknowledge are integral checkpoint counters
+float2int	src/app/bootstrap/simulation/bots.c	services_connect	*	same	client is an integral client number
+float2int	src/app/bootstrap/simulation/bots.c	services_shutdown_client	*	same	client is an integral client number
+float2int	src/app/bootstrap/simulation/bots.c	services_remove_queued_begin	*	same	client is an integral client number
+float2int	src/app/bootstrap/simulation/bots.c	application_bot_log	*	same	resume_position is an integral byte offset, checked <= file size first
+float2int	src/app/bootstrap/simulation/bots.c	encode_command	*	same	command weapon is an integral weapon number from the bot command
+float2int	src/app/bootstrap/simulation/bots.c	snapshot_entity	*	same	entity numbers are integral (< 1024)
+float2int	src/app/bootstrap/simulation/bots.c	reset_weapon	*	same	observed weapon is an integral weapon number
+float2int	src/app/bootstrap/simulation/bots.c	restore_orchestration_image	*	same	client/entity numbers are integral checkpoint values
+float2int	src/app/bootstrap/simulation/bots.c	restore_checkpoint	*	same	entry number is integral and checked < QA_Q3_MAX_GENTITIES first
+float2int	src/app/bootstrap/simulation/bots.c	library_random	*	same	nextInteger returns an integral double in int32 range
+float2int	src/app/bootstrap/simulation/bot_mover_connections.c	qa_app_sim_application_train_connections	*	same	shape_model is an integral inline model index of a mover
+float2int	src/app/bootstrap/simulation/bot_objectives.c	objectives_team	*	same	team numbers are small integral enum values
+bitwise64	src/app/bootstrap/simulation/bot_prediction.c	projection_stop	*	same	stop-event flag set of small constants (< 2^12); no bit reaches 31, so 64-bit and ToInt32 results agree
+float2int	src/app/bootstrap/simulation/bot_q3_knowledge.c	candidates	*	same	weapon numbers are integral Q3 weapon ids
+float2int	src/app/bootstrap/simulation/bot_q3_knowledge.c	source_weapon	*	same	weapon numbers are integral Q3 weapon ids
+float2int	src/app/bootstrap/simulation/bot_rerelease.c	default_skill	*	same	index checked integral and 0 <= index < skill_count in the same condition
+float2int	src/app/bootstrap/simulation/bot_rerelease.c	identify	*	same	entity numbers are integral
+float2int	src/app/bootstrap/simulation/bot_rerelease.c	connect_client	*	same	nextInteger returns an integral double in int32 range
+float2int	src/app/bootstrap/simulation/bot_rerelease.c	add	*	same	max_clients is an integral validated cvar value
+float2int	src/app/bootstrap/simulation/bot_rerelease.c	console_command	*	same	at is a parsed integer index checked 0 <= at < skill_count first
+float2int	src/app/bootstrap/simulation/bot_rerelease.c	restore	*	same	read with qa_save_reader_integer (safe integer)
+float2int	src/app/bootstrap/simulation/bot_rerelease_world.c	self_of	*	same	weapon numbers and water levels (0..3) are integral
+float2int	src/app/bootstrap/simulation/bot_rerelease_world.c	build_entities	*	same	water level 0..3 and spawnflags (integral bit set below 2^31 from the entity lump's integer parse)
+float2int	src/app/bootstrap/simulation/bot_selected_knowledge.c	qa_app_sim_native_q3_weapon_knowledge	*	same	weapon numbers are integral Q3 weapon ids
+float2int	src/app/bootstrap/simulation/bot_world.c	configstring_get	*	same	index is an integral QVM int argument (544..607 range tested first)
+float2int	src/app/bootstrap/simulation/bot_world.c	configstring_set	*	same	index is an integral QVM int argument
+float2int	src/app/bootstrap/simulation/bot_world.c	max_clients	*	same	max_clients is an integral validated cvar value
+float2int	src/app/bootstrap/simulation/bot_world.c	world_point_contents	*	same	contents is an integral uint32 content mask
+float2int	src/app/bootstrap/simulation/bot_world.c	world_trace	*	same	pass entity number is an integral QVM int argument
+float2int	src/app/bootstrap/simulation/bot_world.c	read_entity	*	same	qa_save_reader_integer_min returns a safe integer
+float2int	src/app/bootstrap/simulation/bot_world.c	read_strings	*	same	qa_save_reader_integer_min returns a safe integer
+float2int	src/app/bootstrap/simulation/bot_world.c	qa_app_sim_shared_bot_world_restore_checkpoint	*	same	qa_save_reader_integer_min returns a safe integer
+case	src/app/bootstrap/simulation/classic_guest_files.c	protected_write	*	same	suffixes are ASCII; UTF-8 bytes >= 0x80 never fold to ASCII
+float2int	src/app/bootstrap/simulation/classic_guest_services.c	configstring	*	same	index checked integral and 0 <= index < CONFIGSTRINGS first
+float2int	src/app/bootstrap/simulation/classic_guest_services.c	store_configstring	*	same	callers pass an index already checked integral and in range; slot is index minus a base, tested 0 < slot < 256
+float2int	src/app/bootstrap/simulation/classic_guest_services.c	multicast	*	same	destination is an integral guest int argument
+float2int	src/app/bootstrap/simulation/classic_guest_services.c	qa_app_sim_classic_guest_services_create	*	same	max_clients is an integral validated option (1..256)
+float2int	src/app/bootstrap/simulation/classic_guest_services.c	qa_app_sim_classic_guest_services_set_player_view_roll	*	same	view_angles is an integral struct field offset from the ABI profile
+float2int	src/app/bootstrap/simulation/classic_guest_services.c	set_proxy_actor	*	same	slot >= 0 checked first; slots are integral entity numbers
+float2int	src/app/bootstrap/simulation/classic_guest_services.c	stand_in_actor	*	same	slot >= 0 and < capacity checked first; slots are integral entity numbers
+float2int	src/app/bootstrap/simulation/classic_guest_source.c	core_fields	*	same	byte offsets and counts are integral ABI layout constants
+float2int	src/app/bootstrap/simulation/classic_guest_source.c	core_layout	*	same	byte lengths and alignments are integral ABI layout constants
+float2int	src/app/bootstrap/simulation/classic_guest_source.c	byte_count	*	same	the cast follows the safe-integer and >= 0 check
+float2int	src/app/bootstrap/simulation/classic_guest_source.c	r_invoke_common	*	same	instruction budget is an integral host constant
+float2int	src/app/bootstrap/simulation/classic_guest_source.c	r_unwind	*	same	depth is an integral call depth
+float2int	src/app/bootstrap/simulation/classic_guest_source.c	lifecycle	*	same	instruction budget is an integral host constant
+float2int	src/app/bootstrap/simulation/classic_guest_world.c	qa_app_sim_classic_guest_world_entity_states	*	same	slot is an integral entity number
+float2int	src/app/bootstrap/simulation/guest_monsters.c	qa_app_sim_plan_guest_monsters	*	same	ordinal is an integral authored-entity ordinal (>= 0), checked < span_count next
+float2int	src/app/bootstrap/simulation/native_mod_host.c	observe_writes	*	same	byte length is an integral guest structure size
+float2int	src/app/bootstrap/simulation/native_mod_host.c	c_game_entry	*	same	export offsets are integral ABI table offsets
+float2int	src/app/bootstrap/simulation/native_mod_host.c	r_project_player_view	*	same	height = trunc(view height) checked finite and in -128..127 first (TS writeInt8 after the same check)
+float2int	src/app/bootstrap/simulation/native_mod_host.c	r_game_entry	*	same	export offsets are integral ABI table offsets
+float2int	src/app/bootstrap/simulation/native_mod_presentation.c	read_actor	*	same	qa_save_reader_integer_min returns a safe integer
+float2int	src/app/bootstrap/simulation/native_mod_presentation.c	qa_app_sim_native_mod_presentation_publish	*	same	sound is an integral sound index (formats the error text)
+float2int	src/app/bootstrap/simulation/native_q2_rerelease_pak.c	level_entries	*	same	configstring indexes are integral
+float2int	src/app/bootstrap/simulation/native_q2_rerelease_pak.c	qa_app_sim_q2_rerelease_pak_entries_of	*	same	seconds is an integral finite timestamp; the negative branch reproduces BigInt.asUintN(64)
+float2int	src/app/bootstrap/simulation/navigation.c	qa_app_sim_application_bot_navigation_restore_checkpoint	*	same	client numbers are integral checkpoint values
+sort	src/app/bootstrap/simulation/network.c	entity_states	*	same	keys are distinct entity numbers, so stability cannot show
+float2int	src/app/bootstrap/simulation/network_q1.c	player_slot	*	same	slot checked >= 0 and integral first
+float2int	src/app/bootstrap/simulation/network_q1.c	board_slot	*	same	slot checked >= 0 and integral first (same guard as player_slot)
+sort	src/app/bootstrap/simulation/network_q1.c	entities	*	same	keys are distinct entity numbers, so stability cannot show
+float2int	src/app/bootstrap/simulation/network_q1.c	host_observe	*	same	snapshot entries are integral client slots below the board count
+float2int	src/app/bootstrap/simulation/network_q1.c	slot_taken	*	same	slot < player_count checked first; slots are integral
+float2int	src/app/bootstrap/simulation/network_q1.c	host_admit	*	same	slot is an integral free client slot
+float2int	src/app/bootstrap/simulation/network_q1_quakec.c	player_slot	*	same	slot checked >= 0 and integral first
+float2int	src/app/bootstrap/simulation/network_q1_quakec.c	board_slot	*	same	slot checked >= 0 and integral by the callers' player_slot guard; integral client slots
+float2int	src/app/bootstrap/simulation/network_q1_quakec.c	entity_at	*	same	slot is an integral QC entity number
+float2int	src/app/bootstrap/simulation/network_q1_quakec.c	host_observe	*	same	order/snapshot entries are integral client slots below the table counts
+float2int	src/app/bootstrap/simulation/network_q1_quakec.c	host_admit	*	same	slot < player_count checked first; slots are integral free client slots
+float2int	src/app/bootstrap/simulation/network_q1_quakec.c	host_spawn	*	same	order entries and slots are integral; slot < board_count checked first
+float2int	src/app/bootstrap/simulation/network_q1_quakec.c	host_command	*	same	order entries are integral client slots below the player count
+float2int	src/app/bootstrap/simulation/network_q2_guest_core.c	player_slot	*	same	slot checked >= 0 and integral first
+float2int	src/app/bootstrap/simulation/network_q2_guest_core.c	qa_app_sim_q2_guest_host_core_headnode_visible	*	same	child index is an integral BSP node index (non-negative child branch)
+float2int	src/app/bootstrap/simulation/network_q2_rerelease_native.c	player_slot	*	same	slot checked >= 0 and integral first
+float2int	src/app/bootstrap/simulation/network_q2_rerelease_native.c	admit_body	*	same	slot is an integral free client slot
+float2int	src/app/bootstrap/simulation/network_q3.c	adm_private_clients	*	same	cvar_integer returns an integral value
+float2int	src/app/bootstrap/simulation/network_q3.c	host_pure	*	same	server id and checksums are integral int32 values
+float2int	src/app/bootstrap/simulation/network_q3.c	host_game_state	*	same	baseline numbers and client entity are integral entity numbers
+float2int	src/app/bootstrap/simulation/network_q3.c	vis_link	*	same	clusters and areas are integral BSP indexes
+float2int	src/app/bootstrap/simulation/network_q3.c	vis_point_leaf	*	same	leaf indexes are integral BSP indexes
+float2int	src/app/bootstrap/simulation/network_q3.c	vis_leaf_area	*	same	area indexes are integral BSP indexes
+float2int	src/app/bootstrap/simulation/network_q3.c	vis_leaf_cluster	*	same	cluster indexes are integral BSP indexes
+bitwise64	src/app/bootstrap/simulation/network_q3.c	vis_pvs_byte	*	same	bit is 0..7; the byte value never reaches bit 31
+float2int	src/app/bootstrap/simulation/network_q3.c	host_snapshot	*	same	count is an integral entity count (> 0 checked)
+float2int	src/app/bootstrap/simulation/network_qw.c	entity_at	*	same	slot is an integral QC entity number
+float2int	src/app/bootstrap/simulation/network_qw.c	require_client	*	same	slot checked 0 <= slot < 32 first; integral client slot
+float2int	src/app/bootstrap/simulation/network_qw.c	client_delete	*	same	slot is an integral client slot below 32
+float2int	src/app/bootstrap/simulation/network_qw.c	client_set	*	same	slot is an integral client slot below 32
+float2int	src/app/bootstrap/simulation/network_qw.c	spawn_messages	*	same	order entries are integral client slots below 32
+float2int	src/app/bootstrap/simulation/network_qw.c	flush	*	same	order entries are integral client slots below 32
+float2int	src/app/bootstrap/simulation/network_qw.c	phase_action	*	same	player slot is an integral client slot below 32
+float2int	src/app/bootstrap/simulation/network_qw.c	admit_body	*	same	index is an integral free client slot below 32
+float2int	src/app/bootstrap/simulation/network_qw.c	host_admit	*	same	order entries and index are integral client slots; index < 32 checked
+float2int	src/app/bootstrap/simulation/network_qw.c	download_read	*	same	QW download offsets and chunk sizes are integral byte counts; start/end are clamped to 0..length first (slice)
+float2int	src/app/bootstrap/simulation/network_qw.c	host_signon	*	same	player slot is an integral client slot below 32
+float2int	src/app/bootstrap/simulation/network_qw.c	host_observe	*	same	order entries are integral client slots below 32
+float2int	src/app/bootstrap/simulation/network_qw.c	host_frame	*	same	value indexes and order entries are integral client slots below 32
+float2int	src/app/bootstrap/simulation/network_unified.c	entry_at	*	same	slot is an integral client slot (callers check >= 0)
+float2int	src/app/bootstrap/simulation/network_unified.c	slot_taken	*	same	slot < slot_count checked first; slots are integral
+float2int	src/app/bootstrap/simulation/network_unified.c	host_admit	*	same	slot is an integral free client slot
+float2int	src/app/bootstrap/simulation/q3/guest_artifact.c	qa_app_prepare_q3_game	*	same	weapon numbers are integral Q3 weapon ids
+float2int	src/app/bootstrap/simulation/q3/guest_bots.c	observation_at	*	same	number checked integral and 0 <= number < MAX_ENTITIES first
+float2int	src/app/bootstrap/simulation/q3/guest_bots.c	nav_entity_model_index	*	same	model index is an integral QVM int field
+float2int	src/app/bootstrap/simulation/q3/guest_bots.c	nav_entity_type	*	same	entity type is an integral QVM int field
+float2int	src/app/bootstrap/simulation/q3/guest_bots.c	nav_entity_weapon	*	same	weapon is an integral QVM int field
+float2int	src/app/bootstrap/simulation/q3/guest_bots.c	goal_entity_info	*	same	type and model index are integral QVM int fields
+float2int	src/app/bootstrap/simulation/q3/guest_bots.c	service_update_entity	*	same	number is range-checked first (AAS_UpdateEntity) and integral (QVM int); pointer is a QVM int address
+float2int	src/app/bootstrap/simulation/q3/guest_bots.c	qa_app_q3_guest_bots_restore	*	same	info.number validated integral and in range by the restore reader
+float2int	src/app/bootstrap/simulation/q3/native_guest_source.c	system_v_now	*	same	trunc of a finite wall clock in seconds
+float2int	src/app/bootstrap/simulation/q3/native_guest_source.c	n_client_connect	*	same	denied is an integral guest pointer word (int32)
+float2int	src/app/bootstrap/simulation/q3/native_guest_source.c	n_restore	*	same	byte lengths are integral, validated by the checkpoint reader
+float2int	src/app/bootstrap/simulation/q3/presentation.c	qa_app_q3_pool_presentation_state	*	same	num_entities is an integral entity count (> 0 checked)
+float2int	src/app/bootstrap/simulation/q3/presentation.c	inline_model_path	*	same	index checked integral and >= 0 first
+float2int	src/app/bootstrap/simulation/q3/qvm_engine.c	e_client_disconnect	*	same	client is an integral client number
+float2int	src/app/bootstrap/simulation/quakec_source.c	lh_actor	*	same	slot is an integral QC entity number
+float2int	src/app/bootstrap/simulation/quakec_source.c	lh_name	*	same	index checked integral and 1 <= index <= count first
+bitwise-sign	src/app/bootstrap/simulation/quakec_source.c	native_weapons	*	same	index is 1..8 (weapon bit), so 1u << (index-1) never sets bit 31
+float2int	src/app/bootstrap/simulation/quakec_source.c	construct	*	same	max_clients is an integral validated option
+float2int	src/app/bootstrap/simulation/quakec_source.c	qa_app_sim_quakec_source_client_spawn_point	*	same	the QC stage returns an integral entity reference
+float2int	src/app/bootstrap/simulation/quakec_source.c	client_slot_of	*	same	slot is an integral client slot
+float2int	src/app/bootstrap/simulation/quakec_source.c	read_views	*	same	index read with fint (integer >= 0) and checked < count first
+float2int	src/app/bootstrap/simulation/qvm_component_state.c	qa_app_sim_qvm_component_state_restore	*	same	qa_save_reader_integer_min returns a safe integer >= 0
+float2int	src/app/bootstrap/simulation/qvm_component_state.c	spatial_trace	*	same	slot_of returns an integral entity number
+float2int	src/app/bootstrap/simulation/qvm_component_state.c	spatial_area_entities	*	same	slot_of returns an integral entity number
+float2int	src/app/bootstrap/simulation/qvm_weapon_behavior.c	run_attach	*	same	instruction indexes are integral QVM program indexes
+float2int	src/app/bootstrap/simulation/qvm_weapon_behavior.c	run_restore_static	*	same	saved pointer is an integral QVM address validated by the checkpoint reader
+float2int	src/app/bootstrap/simulation/random.c	qa_app_sim_source_random_create	*	same	seed is an integral uint32 seed (validated option)
+bitwise64	src/app/bootstrap/simulation/rerelease_guest_services.c	*	*	same	guest flag words (movement flags, svflags, entity flags) are uint32/int32 values masked with small constants; no bit 31 reaches the result
+bitwise64	src/app/bootstrap/simulation/rerelease_guest_world.c	qa_app_sim_rerelease_guest_world_entity_states	*	same	server flags are a uint32 guest word masked with 1
+float2int	src/app/bootstrap/simulation/rerelease_weapon_behavior.c	live	*	same	field offsets are integral ABI layout constants
+float2int	src/app/bootstrap/simulation/rerelease_weapon_behavior.c	set_time	*	same	Math.round of finite non-negative game seconds * 1000
+float2int	src/app/bootstrap/simulation/rerelease_weapon_behavior.c	step_body	*	same	Math.round of finite non-negative game seconds * 1000
+float2int	src/app/bootstrap/simulation/rerelease_weapon_behavior.c	intercept	*	same	AT() field offsets are integral ABI layout constants
+float2int	src/app/bootstrap/simulation/rerelease_weapon_behavior.c	restore_body	*	same	Math.round of finite non-negative saved game seconds * 1000
+float2int	src/app/bootstrap/simulation/shared_simulation_arsenal.c	qa_app_shared_sim_submit_debug_shapes	*	same	lifetime is an integral millisecond count from the guest debug call
+bitwise64	src/app/bootstrap/simulation/shared_simulation_arsenal.c	*	*	same	buttons, pm_flags and dmflags are integral int32 bit sets masked with small constants; no bit 31 reaches the result
+float2int	src/app/bootstrap/simulation/shared_simulation_arsenal.c	ss_grapple_gravity_scale	*	same	the grapple gravity scale is 0 or 1 (TS returns 0 | 1; contracts/equipment.h)
+float2int	src/app/bootstrap/simulation/shared_simulation_arsenal.c	ss_q3_player_pose	*	same	team is an integral Q3 team enum value
+float2int	src/app/bootstrap/simulation/shared_simulation_checkpoint.c	qa_app_shared_sim_restore_selected_monsters	*	same	proxy slot is an integral validated entity number
+float2int	src/app/bootstrap/simulation/shared_simulation_checkpoint.c	qa_app_shared_sim_restore_foreign_q1_world	*	same	skill validated as a choice of 0..3 by the reader
+float2int	src/app/bootstrap/simulation/shared_simulation_checkpoint.c	qa_app_shared_sim_checkpoint_from_source	*	same	actor slot/generation are integral uint32 identity fields
+float2int	src/app/bootstrap/simulation/shared_simulation_checkpoint.c	qa_app_shared_sim_restore	*	same	skill read as a choice of 0..3; ordinal read with qa_save_reader_integer_min (safe integer)
+sort	src/app/bootstrap/simulation/shared_simulation_core.c	qa_app_shared_sim_client_identities	*	same	keys are distinct client slots, so stability cannot show
+sort	src/app/bootstrap/simulation/shared_simulation_core.c	qa_app_shared_sim_players	*	same	comparator orders by slot then actor (a total order), so stability cannot show
+float2int	src/app/bootstrap/simulation/shared_simulation_core.c	ss_cargo_at_source	*	same	slot is an integral entity number
+float2int	src/app/bootstrap/simulation/shared_simulation_core.c	ss_create	*	same	skill (0..3) and max_clients are integral validated options
+sort	src/app/bootstrap/simulation/shared_simulation_plan.c	qa_app_shared_sim_plan_step	*	same	sorts plain non-negative finite deadline values: equal values are indistinguishable, so stability cannot show
+float2int	src/app/bootstrap/simulation/shared_simulation_players.c	ss_cycle	*	same	((index + k) mod length) over integral index/length: an integral 0..length-1
+float2int	src/app/bootstrap/simulation/shared_simulation_players.c	qa_ss_q1_pre_command	*	same	keep = max(0, 62 - integral prefix units): integral and non-negative
+float2int	src/app/bootstrap/simulation/shared_simulation_players.c	qa_app_shared_sim_select_q3_spawn_weapon	*	same	stat index is an integral schema constant; candidate weapons are 1..15
+float2int	src/app/bootstrap/simulation/shared_simulation_source.c	ss_q1_emit	*	same	attack variant is a small integral enum value
+float2int	src/app/bootstrap/simulation/shared_simulation_source.c	ss_create_quakec	*	same	skill is an integral validated option 0..3
+float2int	src/app/bootstrap/simulation/shared_simulation_source.c	ss_q1_set_cvar	*	same	the callers pass skill as Math.trunc of the bounded cvar value (0..3)
+float2int	src/app/bootstrap/simulation/shared_simulation_source.c	ss_qvm_pickup_actor	*	same	slot is an integral entity number
+sort	src/app/bootstrap/simulation/shared_simulation_step.c	qa_app_shared_sim_run_qvm_selected_actors	*	same	sorts plain non-negative finite deadline values: equal values are indistinguishable, so stability cannot show
+float2int	src/app/bootstrap/simulation/shared_simulation_turns.c	qa_app_sim_ordered_actor_turns_next	*	same	registry revision is an integral counter
+float2int	src/app/bootstrap/simulation/shared_simulation_worlds.c	wl_fq1_set_cvar	*	same	the callers pass skill as Math.trunc of the bounded cvar value (0..3)
+float2int	src/app/bootstrap/simulation/shared_simulation_worlds.c	wl_create_foreign_q1_world	*	same	skill is an integral validated option 0..3
+float2int	src/app/bootstrap/simulation/shared_simulation_worlds.c	wl_nav_path_to_goal	*	same	path flags are an integral bit set
+float2int	src/app/bootstrap/simulation/shared_simulation_worlds.c	wl_validate_placement	*	same	source ordinals are integral (>= 0) authored-entity ordinals
+float2int	src/app/bootstrap/simulation/shared_simulation_worlds.c	qa_app_shared_sim_admit_guest_monsters	*	same	proxy slot is an integral entity number
+float2int	src/app/bootstrap/simulation/shared_simulation_worlds.c	wl_random_restore	*	same	random state fields validated as integers by the checkpoint reader
+float2int	src/app/bootstrap/simulation/weapon_behavior_runtime.c	restore_quakec	*	same	random state fields validated as integers by the checkpoint reader
+float2int	src/app/bootstrap/startup_application.c	qa_startup_application_connection_options	*	same	protocol version is an integral validated option
+float2int	src/app/bootstrap/startup_application_graphics.c	draw_console_overlay	*	same	console metrics columns and trunc(height/line height) are finite non-negative integers (max(1, ...) guards the row count)
+float2int	src/app/bootstrap/startup_application_launch.c	sleep_ms	*	c-only	nanosleep timespec of a finite non-negative delay; TS awaits a timer
+case	src/app/bootstrap/startup_application_library.c	movie_visible	*	same	lower-cased file names are compared with ASCII movie names; bytes >= 0x80 never fold to ASCII
+sort	src/app/bootstrap/startup_application_library.c	movie_refresh	*	same	names are distinct, so stability cannot show
+float2int	src/app/bootstrap/startup_selection.c	slice_index	*	same	relative is trunc'd, NaN mapped to 0 and clamped to 0..length first (slice normalization)
+float2int	src/app/bootstrap/startup_source.c	q3_register_cvar	*	same	cvar integer value is integral (parsed with the cvar integer rules)
+float2int	src/audio/types.c	qa_source_sound_channel_number	*	same	channel is an integral channel number checked 1..7 (Q3) or 1..4 first
+sort	src/bots/behavior/assets.c	list_loose	*	same	names are distinct, so stability cannot show
+bitwise64	src/bots/behavior/library/weights.c	expect_integer	*	same	token flags are a small int bit set
+bitwise64	src/bots/behavior/library/weights.c	qa_bot_source_unit_random	*	same	raw is a non-negative int31 random value; & 0x7fff keeps it below bit 31
+float2int	src/bots/behavior/prediction.c	qa_project_bot_movement	*	same	qa_js_bit_and returns an int32 value
+float2int	src/bots/behavior/q3/ai_decision.c	qa_bot_clear_path_bots_a	*	same	entity numbers are integral
+bitwise64	src/bots/behavior/q3/navigation.c	qa_source_bot_navigation_best_reachable_from_jump_pad_area	*	same	area contents are an int32 AAS bit set masked with 128
+float2int	src/bots/behavior/q3/navigation_services.c	*	*	same	modelindex, eType and weapon are integral entity-state fields
+bitwise64	src/bots/navigation/aas.c	qa_aas_trace_client_bbox	*	same	AAS presence bits and plane numbers are small non-negative integers
+bitwise64	src/bots/navigation/estimate_aas.c	area_cache	*	same	travel times are small non-negative integers; the sum stays far below 2^31 before & 0xffff
+sort	src/bots/navigation/estimate_store.c	index_build	*	same	pairs are distinct (key, value) entries ordered by both, so stability cannot show
+bitwise64	src/bots/navigation/rerelease_path.c	link_allowed	*	same	request flags are a small int bit set
+sort	src/bots/navigation/rerelease_path.c	nearest_node	*	same	comparator breaks distance ties by scan order (a total order)
+sort	src/bots/navigation/runtime.c	scope_key	*	same	modes, blocked ids and enabled entries are distinct keys, so stability cannot show
+bitwise64	src/bots/navigation/runtime.c	qa_navigation_runtime_nearest	*	same	node presence/flags are small int bit sets masked with constants below bit 31
+case	src/compat/q2/classic/printf.c	qa_compat_q2_classic_printf_n	*	port-of-c	the TS emulates the guest libc printf %F/%E/%G/%X, which upper-cases ASCII digits and letters only (the formatted text is ASCII)
+bitwise64	src/compat/q2/native_combat_call.c	validate_value_layout	*	same	alignment is a small positive integral ABI constant (power-of-two test)
+bitwise64	src/compat/q2/rerelease/world_profile.c	validate_layout	*	same	alignment is a small positive integral ABI constant (power-of-two test)
+float2int	src/compat/qc/executor.c	restore_impl	*	same	entity count cast only after the integral and safe-range test; statement/function/argument counts are integral checkpoint values validated by the reader
+float2int	src/compat/qc/mod_provider.c	client_maximum	*	same	client maximum is an integral declaration value
+float2int	src/compat/qvm/bot_library_syscalls.c	goal_from_record	*	same	goal fields are int32 words read from QVM memory
+float2int	src/compat/qvm/bot_navigation_syscalls.c	goal	*	same	goal fields are int32 words read from QVM memory
+bitwise64	src/compat/qvm/bot_navigation_syscalls.c	qa_qvm_bot_navigation_syscall	*	same	node flags are a small int bit set
+float2int	src/compat/qvm/bot_navigation_syscalls.c	qa_qvm_bot_navigation_syscall	*	same	staged/read fields are int32 words read from QVM memory
+float2int	src/compat/qvm/cvar_syscalls.c	registry_info_string	*	same	maximum_length is an integral QVM int argument (negative mapped first)
+case	src/compat/qvm/file_syscalls.c	immutable_name	*	port-of-c	ioq3 FS_FilenameCompare-style ASCII-insensitive suffix test, as the TS does with its ASCII fold over the same constant suffixes
+case	src/content/catalog/addons.c	url_dot	*	same	"%2e" percent-encoding compare is ASCII case-insensitive (WHATWG single-dot segment)
+case	src/content/catalog/addons.c	url_dot_dot	*	same	"%2e" percent-encoding compare is ASCII case-insensitive (WHATWG double-dot segment)
+case	src/content/catalog/addons.c	parse_url	tolower((unsigned char)text[i])	same	scheme characters are validated ASCII letters/digits/+-. first; WHATWG lower-cases the scheme ASCII-only
+float2int	src/content/composition/q2_q3_items.c	holdable_pickup	*	same	pick is an integral index from the random choice (floor of random * count)
+round	src/content/q1/base/monster_actions.c	qa_q1_wizard_fast_fire	*	same	the TS spells the same Math.floor(random * 2 + 0.5)
+float2int	src/content/q1/missionpacks/monsters/species_variants.c	tier_index	*	same	index checked integral and 0..2 first
+case	src/content/q2/base/player/index.c	qa_q2_players_super_userinfo_changed	*	port-of-c	Q2 gender letter test (id's tolower on the first byte); TS lower-cases the first code unit and compares with 'f'/'m' only
+float2int	src/content/q2/base/player/index.c	qa_q2_players_super_death	*	same	floor(random * 4) of random in [0,1): integral 0..3
+float2int	src/content/q2/foundation/motion.c	curve_sample	*	same	index checked integral and in range first
+float2int	src/content/q3/base/game/misc_spawn.c	shooter	*	same	weapon is an integral Q3 weapon constant chosen by classname
+float2int	src/content/q3/presentation/events.c	source_entity_event	*	same	client_num range-checked 0..63 and event_parm checked integral and >= 0 before the casts
+truthy	src/content/q3/presentation/players.c	powerups	*	same	powerups is an integral int32 bit set (never NaN)
+float2int	src/content/q3/presentation/world_mark_projector.c	qa_q3_pres_world_mark_projector_init	*	same	index and shader checked >= 0, in range and integral (round trip) before use
+float2int	src/core/binary/index.c	qa_binary_reader_check_number	*	same	cast only when safe_integer(offset)
+float2int	src/core/cvars/setting_declarations.c	q2_mode_write	*	same	index checked integral and 0..10 first
+float2int	src/formats/q1_map/index.c	require_acyclic	*	same	node indexes are validated non-negative integral BSP indexes (known/range checks)
+fixed	src/foundation/js.c	qa_js_shortest_digits	*	same	glibc %.*e is correctly rounded; used to search the shortest round-tripping digits of Number.prototype.toString
+float2int	src/guest/core/memory.c	qa_sparse_restore_allocator	*	same	allocator image fields validated as safe non-negative integers by the checkpoint reader
+float2int	src/guest/runtime/system_v/runtime.c	qa_system_v_guest_runtime_restore_heap_state	*	same	heap block sizes validated as safe non-negative integers by the checkpoint reader
+bitwise64	src/guest/runtime/windows/crt.c	qa_ucrt_quick_sort	*	port-of-c	UCRT qsort midpoint over non-negative element counts (the TS emulation uses the same >> 1)
+float2int	src/guest/runtime/windows/runtime.c	qa_windows_guest_runtime_restore_heap_state	*	same	heap, reservation, FLS and TLS fields validated as safe integers by the checkpoint reader
+parse	src/llm/auth.c	json_parse_scalar	*	same	strtod over text already matched to the JSON number grammar: both are correctly rounded, as JSON.parse
+parse	src/llm/auth.c	url_component_decode	*	same	strtol over two validated hex digits
+float2int	src/llm/settings.c	url_host	*	same	ipv4 is integral and below 2^32 (the WHATWG limit check precedes)
+case	src/llm/settings.c	url_dot_segment	*	same	"%2e" percent-encoding compare is ASCII case-insensitive (WHATWG)
+case	src/llm/settings.c	url_dot_dot_segment	*	same	"%2e" percent-encoding compare is ASCII case-insensitive (WHATWG)
+float2int	src/network/common/peer_table.c	qa_peer_table_init	*	same	cast only after the positive safe-integer check
+float2int	src/network/q2/codecs/kexdemo.c	solid_set	*	same	solid_in_table checks the number integral and inside the table first
+float2int	src/network/q2/codecs/kexdemo.c	solid_get	*	same	callers check solid_in_table (integral, inside the table) first
+float2int	src/network/q2/mvd_playback.c	read_serverdata	*	same	frame offset is an integral header field read as an int32 from the MVD bytes
+float2int	src/network/q2/mvd_playback.c	qa_q2_mvd_playback_read_records	*	same	command op is a byte read from the wire (integral 0..255)
+float2int	src/network/q3/server_message.c	validate_entities	*	same	cast only after the integral, finite and < 1023 check
+float2int	src/network/q3/server_message.c	read_packet_entities	*	same	parse-entity numbers and old indexes are integral counters (REFRESH_OLD macro)
+float2int	src/network/q3/server_message.c	write_packet_entities	*	same	entity numbers validated integral below 1023 by validate_entities
+case	src/network/services/http_downloads.c	ascii_lower	*	same	HTTP header names are ASCII tokens; fetch's Headers lower-cases ASCII only (ByteString names)
+case	src/network/services/http_downloads.c	header_value	*	same	HTTP header names compare ASCII case-insensitively (fetch Headers)
+parse	src/persistence/execution.c	note_wide	*	c-only	strtoll only tests whether an already validated bigint text fits int64 (ERANGE); TS keeps any bigint, so C records the wide ones
+float2int	src/persistence/q2_classic_guest.c	validate_level_state	*	same	cast only after the safe-integer and range checks
+float2int	src/persistence/q2_containers.c	qa_q2_classic_portal_bytes	*	same	range checked first; the (int64_t) round trip is evaluated only for 0 <= portal < 1024
+float2int	src/persistence/q2_containers.c	qa_q2_rerelease_portal_bytes	*	same	range checked first; the (int64_t) round trip is evaluated only for in-range values
+float2int	src/persistence/q2_save_folder.c	container_configstrings	*	same	cast only after the integral 0 <= index < 2^53 check
+float2int	src/persistence/q2_selection.c	qa_q2_saved_settings_from	*	same	cast only for skill 0..3
+case	src/persistence/save_policy.c	ends_with_extension	*	same	extensions are lower-case ASCII; UTF-8 bytes >= 0x80 never fold to ASCII
+sort	src/persistence/source_items.c	read_held_weapon_declaration	*	same	sorts integers read with qa_save_reader_integer_min only to find a repeat (Set size): order and stability do not matter
+sort	src/persistence/value.c	js_entry_order	*	same	array-index keys of one object are distinct, so stability cannot show
+parse	src/persistence/value.c	lex_number	*	same	strtod over a token already matched to the JSON number grammar: both are correctly rounded, as JSON.parse
+float2int	src/render/scene/models/stencil_shadow.c	vertex_index	*	same	cast only after the integral and in-range check
+float2int	src/app/bootstrap/mod_presentation.c	output_scene	(int64_t)scene->source.render_flags	same	render_flags is an integral int32 refdef flag set from the QVM
+float2int	src/app/bootstrap/q3_client.c	output_scene	(int64_t)owned->source.render_flags	same	render_flags is an integral int32 refdef flag set from the QVM
+float2int	src/app/bootstrap/q3_client.c	qa_app_application_q3_client_supplemental_weapon_camera	(int64_t)s->scene->source.render_flags	same	render_flags is an integral int32 refdef flag set from the QVM
+float2int	src/app/bootstrap/q3_client.c	qa_app_application_q3_client_frame	(int64_t)scene->source.render_flags	same	render_flags is an integral int32 refdef flag set from the QVM
+float2int	src/app/bootstrap/simulation/rerelease_guest_world.c	qa_app_sim_rerelease_guest_world_entity_states	(int64_t)info.server_flags	same	server flags are a uint32 guest word (integral)
+float2int	src/app/bootstrap/simulation/shared_simulation_arsenal.c	qa_ss_q1_player_weapon	(int64_t)player->buttons	same	buttons are an integral input bit set (0..2^31)
+float2int	src/app/bootstrap/simulation/shared_simulation_arsenal.c	qa_app_shared_sim_q2_weapon_input	*	same	buttons and pm_flags are integral input/movement bit sets
+float2int	src/app/bootstrap/simulation/shared_simulation_arsenal.c	qa_ss_q2_granted_weapon	*	same	dmflags is an integral validated cvar bit set
+float2int	src/compat/q2/rerelease/world_profile.c	validate_layout	*	same	alignment is a small positive integral ABI constant
+float2int	src/compat/qvm/mod_provider.c	decode_host_state	*	same	qa_save_reader_integer_min values are validated integers; record stride/capacity and the client maximum are integral declaration constants (gate-symbols)
+float2int	src/compat/qvm/mod_provider.c	begin_body	*	same	call global addresses are integral QVM memory addresses from the mod declaration (gate-symbols)
+float2int	src/compat/qvm/mod_provider.c	invoke_body	*	same	call entry is an integral QVM instruction address from the mod declaration (gate-symbols)
+float2int	src/compat/qvm/mod_provider.c	context_body	*	same	context offsets are integral byte offsets from the mod declaration (gate-symbols)
+float2int	src/compat/qvm/mod_provider.c	initialize_body	*	same	call entry is an integral QVM instruction address from the mod declaration (gate-symbols)
+float2int	src/app/bootstrap/q3_client/assets.c	world_model_bounds	*	same	guarded: the index is tested non-negative, integral and below 2^32 before the cast (TS models[index] is undefined otherwise) (gate-symbols)
+float2int	src/app/bootstrap/simulation/bot_world.c	inline_model_number	*	same	guarded: only an integral value within 2^53 is cast; NaN, fractions and larger values return the no-model sentinel (TS compares them with integer model numbers, never equal) (gate-symbols)
+bitwise64	src/bots/navigation/aas_reachability_geometry.c	qa_aas_crossings_any_contents	*	same	area contents are int32 values from the AAS settings lump and the mask is a small positive constant (gate-symbols)
+parse	src/content/catalog/addons.c	parse_url	strtol(pair, NULL, 16)	same	the two characters are tested with isxdigit before the call: a percent escape byte (gate-symbols)

@@ -12,6 +12,6 @@ void qa_app_presentation_time_advance(qa_app_presentation_time *clock, double wa
   clock->has_committed = true;
 }
 double qa_app_presentation_time_milliseconds(const qa_app_presentation_time *clock) {
-  if (!clock->has_committed) qa_range_error("Presentation clock has no committed frame");
+  if (!clock->has_committed) qa_raise("Error", 0, 0, "Presentation clock has no committed frame");
   return clock->committed_milliseconds;
 }

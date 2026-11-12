@@ -46,6 +46,13 @@ qa_ss_step_plan qa_app_shared_sim_plan_step(qa_app_shared_simulation *sim, qa_in
   qa_ss_selected_weapon_source *selected_q2 = sim->has_selected_weapon_source && qa_ss_is(sim->selected_weapon_source.kind, "q2")
       ? &sim->selected_weapon_source : NULL;
   plan.map_start_milliseconds = selected_q2 ? selected_q2->map_milliseconds : now_milliseconds;
+  /* TS reads the selected Q3 clock after building the map deadlines; nothing between has an effect, and reading it
+   * first keeps its throw from leaking the deadline sets. */
+  qa_clock_profile selected_q3_clock; memset(&selected_q3_clock, 0, sizeof selected_q3_clock);
+  if (sim->selected_q3_source) {
+    selected_q3_clock = qa_app_sim_provider_timing(sim->recipe, sim->weapon_provider.provider).clock;
+    if (selected_q3_clock.kind != QA_CLOCK_Q3) ss_fail("Selected Q3 source clock changed");
+  }
   ss_deadlines map = {0}, all = {0}, q3 = {0}, weapons = {0};
   if (active) ss_deadline_add(&map, plan.map_start_milliseconds);
   else if (plan.map_run && profile.kind == QA_CLOCK_Q3) {
@@ -63,13 +70,10 @@ qa_ss_step_plan qa_app_shared_sim_plan_step(qa_app_shared_simulation *sim, qa_in
   plan.map_end_milliseconds = end;
   if (map.count == 0) ss_deadline_add(&all, end);
   else for (size_t i = 0; i < map.count; i++) ss_deadline_add(&all, map.values[i]);
-  if (sim->selected_q3_source) {
-    qa_clock_profile clock = qa_app_sim_provider_timing(sim->recipe, sim->weapon_provider.provider).clock;
-    if (clock.kind != QA_CLOCK_Q3) ss_fail("Selected Q3 source clock changed");
-    if (!paused) for (double due = sim->selected_q3_next; due <= sim->selected_milliseconds; due += clock.server_frame_milliseconds) {
+  if (sim->selected_q3_source && !paused)
+    for (double due = sim->selected_q3_next; due <= sim->selected_milliseconds; due += selected_q3_clock.server_frame_milliseconds) {
       ss_deadline_add(&all, due); ss_deadline_add(&q3, due);
     }
-  }
   if (plan.map_run) {
     if (selected_q2) for (double due = selected_q2->next_milliseconds; due <= end; due += selected_q2->interval_milliseconds) {
       ss_deadline_add(&all, due); ss_deadline_add(&weapons, due);

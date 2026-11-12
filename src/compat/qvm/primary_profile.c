@@ -17,6 +17,14 @@ static void *xmalloc(size_t size) {
   return result;
 }
 
+static void *xzalloc(size_t size) {
+  void *result = xmalloc(size);
+  memset(result, 0, size);
+  return result;
+}
+
+static void profile_free_on_raise(void *arg) { qa_qvm_primary_profile_free(arg); }
+
 static qa_save_reader field(const qa_save_reader *reader, const char *name) {
   qa_save_reader out;
   if (!qa_save_reader_field(reader, name, &out)) qa_range_error("QVM memory allocation failed");
@@ -442,25 +450,28 @@ void qa_qvm_read_primary_profile(const qa_save_reader *reader, const qa_resolved
                                  const qa_resolved_resource_reference *declaration,
                                  qa_qvm_primary_profile *out) {
   memset(out, 0, sizeof *out);
+  /* TS leaves a refused declaration's parts to the GC. */
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, profile_free_on_raise, out);
   out->declaration = declaration;
-  out->input = xmalloc(sizeof *out->input);
+  out->input = xzalloc(sizeof *out->input);
   qa_save_reader input_reader = field(reader, "input");
   qa_qvm_read_primary_input(&input_reader, artifact, out->input);
   qa_save_reader_destroy(&input_reader);
-  out->weapons = xmalloc(sizeof *out->weapons);
+  out->weapons = xzalloc(sizeof *out->weapons);
   qa_save_reader weapons_reader = field(reader, "weapons");
   qa_qvm_read_primary_weapons(&weapons_reader, artifact, catalog, catalog_count, has_catalog, out->weapons);
   qa_save_reader_destroy(&weapons_reader);
   qa_qvm_inventory_records records = {(int64_t)out->weapons->client_stride, (int64_t)out->weapons->entity_stride};
-  out->inventory = xmalloc(sizeof *out->inventory);
+  out->inventory = xzalloc(sizeof *out->inventory);
   qa_save_reader inventory_reader = field(reader, "inventory");
   qa_qvm_read_primary_inventory_profile(&inventory_reader, artifact, &records, out->inventory);
   qa_save_reader_destroy(&inventory_reader);
-  out->pickups = xmalloc(sizeof *out->pickups);
+  out->pickups = xzalloc(sizeof *out->pickups);
   qa_save_reader pickups_reader = field(reader, "pickups");
   qa_qvm_read_primary_pickup_profile(&pickups_reader, artifact, out->pickups);
   qa_save_reader_destroy(&pickups_reader);
-  out->combat = xmalloc(sizeof *out->combat);
+  out->combat = xzalloc(sizeof *out->combat);
   qa_save_reader combat_reader = field(reader, "combat");
   qa_qvm_read_primary_combat(&combat_reader, artifact, out->combat);
   qa_save_reader_destroy(&combat_reader);
@@ -515,6 +526,7 @@ void qa_qvm_read_primary_profile(const qa_save_reader *reader, const qa_resolved
       }
     }
   }
+  qa_cleanup_pop(&refused);
 }
 
 void qa_qvm_primary_profile_free(qa_qvm_primary_profile *profile) {

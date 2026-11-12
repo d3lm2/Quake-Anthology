@@ -134,4 +134,8 @@ qa_weapon_binding_item *qa_app_startup_selection_binding_items(qa_app_startup_se
 const char *qa_app_startup_selection_binding_items_key(qa_app_startup_selection_model *m);
 qa_ui_binding_capabilities qa_app_startup_selection_binding_capabilities(qa_app_startup_selection_model *m);
 void qa_app_startup_selection_resolve(qa_app_startup_selection_model *m, qa_app_startup_launch *out);
+/* TS monsterLabel(classname), the roster and creature-choice label (malloc'd UTF-8). */
+char *qa_app_startup_monster_label(const char *classname);
+/* The Team Arena team choice label, id.charAt(0).toUpperCase() + id.slice(1) (malloc'd UTF-8). */
+char *qa_app_startup_team_label(const char *id);
 #endif

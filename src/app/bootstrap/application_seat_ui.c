@@ -53,6 +53,7 @@ static void operation_free(save_menu_operation *operation) {
 }
 /* The queued run: TS () => this.replaceWorld(...), saveGame(overwrite === null ? namedPath(name) : path(overwrite)),
  * restoreSavedGame(saves.path(id)). */
+static void native_layout_cleanup(void *layout) { qa_native_save_layout_destroy(layout); }
 static void save_menu_run(qa_application *app, void *ctx) {
   save_menu_operation *operation = ctx;
   qa_app_startup_saves *saves = operation->record->saves;
@@ -66,9 +67,16 @@ static void save_menu_run(qa_application *app, void *ctx) {
     free(copy);
     return;
   }
-  char *path = operation->kind == SAVE_MENU_SAVE && operation->overwrite == NULL
-      ? qa_app_startup_saves_named_path(saves, operation->name)
-      : dup_text(qa_app_startup_saves_path(saves, operation->kind == SAVE_MENU_SAVE ? operation->overwrite : operation->id));
+  char *path;
+  if (operation->kind == SAVE_MENU_SAVE && operation->overwrite == NULL) {
+    /* await saves.namedPath(name, this.nativeSaves()) */
+    qa_native_save_layout native;
+    bool has_native = qa_application_native_saves(app, &native);
+    qa_cleanup native_guard;
+    if (has_native) qa_cleanup_push(&native_guard, native_layout_cleanup, &native);
+    path = qa_app_startup_saves_named_path_native(saves, operation->name, has_native ? &native : NULL);
+    if (has_native) { qa_cleanup_pop(&native_guard); qa_native_save_layout_destroy(&native); }
+  } else path = dup_text(qa_app_startup_saves_path(saves, operation->kind == SAVE_MENU_SAVE ? operation->overwrite : operation->id));
   qa_cleanup guard;
   qa_cleanup_push(&guard, free, path);
   if (operation->kind == SAVE_MENU_SAVE) qa_application_save_game(app, path, NULL);
@@ -159,7 +167,11 @@ qa_ui_saved_game_menu_service qa_application_save_menu(qa_application *app, qa_a
     size_t external_count = 0;
     const char *const *external = qa_application_external_save_directories(app, &external_count);
     startup_saves_box *box = checked(calloc(1, sizeof *box));
-    box->saves = qa_app_startup_saves_create(catalog, qa_application_save_directory(app), external, external_count);
+    size_t native_count = 0;
+    qa_app_native_save_folder *native_folders = qa_app_native_save_folders(catalog, app->launch_options.native_config_root, &native_count);
+    box->saves = qa_app_startup_saves_create_native(catalog, qa_application_save_directory(app), external, external_count,
+        native_folders, native_count);
+    qa_app_native_save_folders_free(native_folders, native_count);
     if (box->saves == NULL) { free(box); qa_range_error("Out of memory"); }
     keep_record(app, box, startup_saves_box_release);
     app->saved_games = box->saves;
@@ -212,10 +224,10 @@ static bool ui_rankings_take(void *ctx) {
   source_options_record *record = ctx;
   return qa_application_take_ranking_menu_request(record->app, record->seat);
 }
-/* nativeHudLocalizer: content => rerelease.sourceLocalizer(seat, content), applied to the text. */
-static char *ui_native_hud_localizer(void *ctx, qa_content_id content, const char *text, const char *const *args, size_t count) {
+/* nativeHudLocalizer: content => rerelease.sourceLocalizer(seat, content). */
+static qa_app_rerelease_localizer *ui_native_hud_localizer(void *ctx, qa_content_id content) {
   source_options_record *record = ctx;
-  return qa_app_rerelease_source_localize(record->rerelease, record->seat, content, text, args, count);
+  return qa_app_rerelease_source_localizer(record->rerelease, record->seat, content);
 }
 static char *ui_localize(void *ctx, qa_content_id content, const char *text, const char *const *args, size_t count) {
   source_options_record *record = ctx;

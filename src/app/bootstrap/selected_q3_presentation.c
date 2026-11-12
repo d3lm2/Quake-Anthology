@@ -56,15 +56,12 @@ static void attempt(cleanup_failures *failures, void (*fn)(void *ctx), void *ctx
   if (failures->count++ == 0) failures->first = caught;
 }
 static void raise_aggregate(const cleanup_failures *failures, const char *message) {
-  qa_raise("AggregateError", 0, (long long)failures->count, "%s (%zu errors; first %s: %s)", message, failures->count,
-           failures->first.name, failures->first.message);
+  qa_raise("AggregateError", 0, (long long)failures->count, "%s", message);
 }
 /* TS catch (error) { try { close() } catch (cleanup) { throw new AggregateError([error, cleanup], message) } throw error }. */
 static void close_or_aggregate(void (*close)(void *ctx), void *ctx, const qa_caught_error *error, const char *message) {
   qa_caught_error cleanup;
-  if (!qa_try(close, ctx, &cleanup))
-    qa_raise("AggregateError", 0, 2, "%s (first %s: %s; cleanup %s: %s)", message, error->name, error->message,
-             cleanup.name, cleanup.message);
+  if (!qa_try(close, ctx, &cleanup)) qa_raise("AggregateError", 0, 2, "%s", message);
   qa_rethrow(error);
 }
 
@@ -387,9 +384,7 @@ qa_app_selected_q3_presentation *qa_app_selected_q3_presentation_create(
     qa_caught_error cleanup;
     bool closed = qa_try(close_run, p, &cleanup);
     qa_app_selected_q3_presentation_destroy(p);
-    if (!closed)
-      qa_raise("AggregateError", 0, 2, "Selected Q3 presentation initialization and cleanup failed (first %s: %s; cleanup %s: %s)",
-               error.name, error.message, cleanup.name, cleanup.message);
+    if (!closed) qa_raise("AggregateError", 0, 2, "Selected Q3 presentation initialization and cleanup failed");
     qa_rethrow(&error);
   }
   return p;

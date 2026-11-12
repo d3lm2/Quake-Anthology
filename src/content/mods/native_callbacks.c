@@ -1,5 +1,6 @@
 /* Port of src/content/mods/native-callbacks.ts. GPL-2.0-or-later. */
 #include "qa/content/mods/native_callbacks.h"
+#include "qa/content/json_text.h"
 #include "qa/content/mods/declaration.h"
 
 #include <math.h>
@@ -9,6 +10,7 @@
 #include "qa/content/mods/client_input.h"
 #include "qa/content/mods/client_outputs.h"
 #include "qa/content/mods/item_actions.h"
+#include "qa/content/model_attachment.h"
 #include "qa/content/mods/match.h"
 #include "qa/content/mods/pickups.h"
 #include "qa/contracts/content.h"
@@ -52,12 +54,6 @@ static double fint(const qa_save_reader *r, const char *name, double min) {
 static double fnum(const qa_save_reader *r, const char *name) {
   qa_save_reader f = field(r, name);
   double v = qa_save_reader_number(&f);
-  qa_save_reader_destroy(&f);
-  return v;
-}
-static double ffinite(const qa_save_reader *r, const char *name) {
-  qa_save_reader f = field(r, name);
-  double v = qa_save_reader_finite(&f);
   qa_save_reader_destroy(&f);
   return v;
 }
@@ -109,8 +105,8 @@ static double nullable_int(const qa_save_reader *r, const char *name, bool *has)
   return v;
 }
 
-/* Mirror of normalizeResourcePath (TS owner:
- * src/content/mounts/paths.ts) until that module lands. Returns a
+/* Private copy of normalizeResourcePath (TS owner:
+ * src/content/mounts/paths.ts; qa_normalize_resource_path). Returns a
  * malloc'd normalized copy; invalid paths abort with the TS
  * RangeError message. */
 static char *normalize_resource_path(const char *path) {
@@ -151,64 +147,22 @@ static qa_source_item_icon_declaration *read_item_icon(const qa_save_reader *r) 
   icon->path = normalize_resource_path(fstr(r, "path"));
   if (strcmp(icon->kind, "image") == 0) return icon;
   icon->lump = fstr(r, "lump");
-  size_t len = strlen(icon->lump);
-  if (len == 0 || len > 16)
+  /* lump.length in 1..16 UTF-16 units, as readItemIconDeclaration counts. */
+  size_t units = 0;
+  for (const unsigned char *at = (const unsigned char *)icon->lump; *at != '\0'; at++) {
+    if ((*at & 0xc0) == 0x80) continue; /* continuation byte */
+    units += *at >= 0xf0 ? 2 : 1;       /* astral characters are surrogate pairs */
+  }
+  if (units == 0 || units > 16)
     qa_save_reader_fail(r, "Item icon requires a valid WAD lump name");
   return icon;
 }
 
-static qa_vec3 read_vec_finite(const qa_save_reader *r) {
-  qa_vec3 v = {ffinite(r, "x"), ffinite(r, "y"), ffinite(r, "z")};
-  return v;
-}
-static double dot3(qa_vec3 a, qa_vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-
-/* Mirror of readModelGrip (TS owner:
- * src/content/model-attachment.ts). Plain-Error throws use
- * qa_range_error's abort with the identical message text. */
+/* readModelGrip (TS owner: src/content/model-attachment.ts): the one reader,
+ * so every axis element is read before the count is checked and the two
+ * plain-Error throws keep their class. It allocates nothing. */
 static qa_model_transform read_model_grip(const qa_save_reader *grip) {
-  qa_save_reader axis_reader = field(grip, "axis");
-  size_t count = qa_save_reader_list_count(&axis_reader);
-  qa_vec3 axis[3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
-  for (size_t i = 0; i < count && i < 3; i++) {
-    qa_save_reader entry = item(&axis_reader, i);
-    axis[i] = read_vec_finite(&entry);
-    qa_save_reader_destroy(&entry);
-  }
-  qa_save_reader_destroy(&axis_reader);
-  if (count != 3) qa_range_error("Model grip requires three source axes");
-  qa_vec3 cross = {axis[0].y * axis[1].z - axis[0].z * axis[1].y,
-                   axis[0].z * axis[1].x - axis[0].x * axis[1].z,
-                   axis[0].x * axis[1].y - axis[0].y * axis[1].x};
-  bool bad = false;
-  for (size_t i = 0; i < 3; i++)
-    if (fabs(dot3(axis[i], axis[i]) - 1) > 0.001) bad = true;
-  if (fabs(dot3(axis[0], axis[1])) > 0.001 || fabs(dot3(axis[0], axis[2])) > 0.001 ||
-      fabs(dot3(axis[1], axis[2])) > 0.001 || dot3(cross, axis[2]) < 0.999)
-    bad = true;
-  if (bad) qa_range_error("Model grip axes must form a rotation");
-  qa_model_transform transform;
-  memset(&transform, 0, sizeof transform);
-  if (fpresent(grip, "scale")) {
-    qa_save_reader f = field(grip, "scale");
-    transform.scale = read_vec_finite(&f);
-    qa_save_reader_destroy(&f);
-  } else {
-    transform.scale.x = 1;
-    transform.scale.y = 1;
-    transform.scale.z = 1;
-  }
-  if (transform.scale.x == 0 || transform.scale.y == 0 || transform.scale.z == 0)
-    qa_save_reader_fail(grip, "Model grip scale must be invertible");
-  {
-    qa_save_reader f = field(grip, "origin");
-    transform.origin = read_vec_finite(&f);
-    qa_save_reader_destroy(&f);
-  }
-  transform.axis.vectors[0] = axis[0];
-  transform.axis.vectors[1] = axis[1];
-  transform.axis.vectors[2] = axis[2];
-  return transform;
+  return qa_read_model_grip(grip);
 }
 
 static const char *read_held_digest(const qa_save_reader *r) {
@@ -1593,7 +1547,7 @@ qa_native_mod_declaration *qa_read_native_mod_declaration(
 
 qa_native_mod_declaration *qa_read_native_mod_callbacks(const uint8_t *bytes,
     size_t length) {
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (value == NULL) return NULL;
   qa_cleanup cleanup;
   qa_cleanup_push(&cleanup, qa_mod_declaration_free_parsed_value, value);

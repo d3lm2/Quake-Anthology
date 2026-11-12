@@ -21,24 +21,24 @@ qa_qvm_host_result qa_qvm_host_word(double value) {
 int32_t qa_qvm_host_call_word(const qa_qvm_host_call *call, size_t index) {
   size_t offset = index * 4;
   const uint8_t *words = call->base.words;
+  /* TS call.words.getInt32: the native DataView refusal. */
   if (offset > call->base.words_length || call->base.words_length - offset < 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   uint32_t bits = (uint32_t)words[offset] | ((uint32_t)words[offset + 1] << 8) |
                   ((uint32_t)words[offset + 2] << 16) | ((uint32_t)words[offset + 3] << 24);
   return (int32_t)bits;
 }
 
 float qa_qvm_host_call_word_f32(const qa_qvm_host_call *call, size_t offset) {
-  qa_qvm_host_call shifted = *call;
   int32_t bits_word;
-  (void)shifted;
   if (offset % 4 != 0 || offset > call->base.words_length || call->base.words_length - offset < 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   bits_word = qa_qvm_host_call_word(call, offset / 4);
   float value;
   uint32_t bits = (uint32_t)bits_word;
   memcpy(&value, &bits, sizeof value);
-  return value;
+  /* DataView.getFloat32 yields the canonical quiet NaN for every payload. */
+  return isnan(value) ? NAN : value;
 }
 
 static bool modern(qa_qvm_abi_profile profile) {
@@ -76,7 +76,8 @@ static bool decode_legacy_game(int32_t code, int32_t *out) {
 }
 
 noreturn void qa_qvm_reject_syscall(const qa_qvm_host_call *call) {
-  qa_range_error("Unbound %s QVM syscall %d", call->role, (int)call->code);
+  /* TS QvmUnboundSyscallError (extends Error), carrying the trap code. */
+  qa_raise("QvmUnboundSyscallError", 0, call->code, "Unbound %s QVM syscall %d", call->role, (int)call->code);
 }
 
 qa_qvm_host_result qa_qvm_reject_syscall_host(void *ctx, const qa_qvm_host_call *call) {
@@ -126,7 +127,7 @@ static void classify(qa_qvm_role role, const qa_qvm_module_syscall *call, qa_qvm
 
 qa_qvm_game_memory qa_qvm_host_call_game_memory(const qa_qvm_host_call *call) {
   if (call->game_memory.ops != NULL) return call->game_memory;
-  if (call->guest == NULL) qa_range_error("QVM host call has no guest memory");
+  if (call->guest == NULL) qa_raise("Error", 0, 0, "QVM host call has no guest memory");
   return qa_qvm_memory_game_memory(call->guest);
 }
 
@@ -162,11 +163,11 @@ qa_qvm_host_result qa_qvm_system_call_invoke(const qa_qvm_system_call *system_ca
       supported = (trap >= 0 && trap <= 58) || (trap >= 100 && trap <= 106) ||
                   (strcmp(role, "cgame") == 0 ? (trap == 107 || trap == 108) : (trap == 110 || trap == 111));
     }
-    if (!supported) qa_range_error("Legacy QVM ABI service %s/%d is not implemented", role, (int)trap);
+    if (!supported) qa_raise("Error", 0, 0, "Legacy QVM ABI service %s/%d is not implemented", role, (int)trap);
   }
   qa_qvm_memory *current = call->guest;
   if (current->bytes != call->memory)
-    qa_range_error("QVM syscall memory belongs to another allocation");
+    qa_raise("Error", 0, 0, "QVM syscall memory belongs to another allocation");
   const qa_qvm_game_memory game = qa_qvm_memory_game_memory(current);
   qa_qvm_host_result result = 0;
   if (qa_qvm_intrinsic_syscall(role, abi_profile, call->words, call->words_length, &game, &result)) return result;

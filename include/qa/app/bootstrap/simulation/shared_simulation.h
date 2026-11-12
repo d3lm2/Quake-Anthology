@@ -5,10 +5,6 @@
  * classic/rerelease guest, Q3 QVM guest, QuakeC, TS Q3, TS Q1, TS Q2) and
  * step is one frame pipeline.
  *
- * This is the real class. The movement-only "concrete host" in runtime.h
- * (qa_app_sim_shared_simulation) is the temporary path main.c uses until the
- * connection step; it is a different type.
- *
  * The method layout (TS method, C function, C file, status) is
  * docs/runtime_layout.md. TS async methods are synchronous here, with an
  * explicit next_frame pump (PORTING.md). TS throws reach the caller through

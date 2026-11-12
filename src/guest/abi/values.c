@@ -200,12 +200,12 @@ qa_abi_value_layout qa_inferred_layout(const qa_call_value *value, bool promote)
 uint64_t qa_encode_integer_value(qa_abi_storage storage, const qa_call_value *value,
                                  const qa_mapped_guest_memory *memory) {
   if (storage == QA_STORAGE_POINTER) {
-    if (value->kind != QA_CALL_POINTER) qa_range_error("Pointer ABI argument requires a guest pointer");
+    if (value->kind != QA_CALL_POINTER) qa_raise("TypeError", 0, 0, "Pointer ABI argument requires a guest pointer");
     return !value->pointer_has ? 0 : qa_memory_offset(memory, value->pointer, 0).byte_offset;
   }
   if (value->kind != QA_CALL_INT32 && value->kind != QA_CALL_UINT32
       && value->kind != QA_CALL_INT64 && value->kind != QA_CALL_UINT64)
-    qa_range_error("Integer ABI argument requires an integer value");
+    qa_raise("TypeError", 0, 0, "Integer ABI argument requires an integer value");
   if ((value->kind == QA_CALL_INT32 || value->kind == QA_CALL_UINT32)
       && (value->number != floor(value->number) || fabs(value->number) > 9007199254740991.0))
     qa_range_error("Integer ABI argument is not an exact integer");
@@ -230,7 +230,7 @@ uint8_t *qa_encode_value(const qa_abi_value_layout *layout, const qa_call_value 
         || (int64_t)value->bytes_len != layout->layout.byte_length
         || value->layout.byte_length != layout->layout.byte_length
         || value->layout.pointer_bytes != layout->layout.pointer_bytes)
-      qa_range_error("Aggregate call value differs from its signature");
+      qa_raise("TypeError", 0, 0, "Aggregate call value differs from its signature");
     size_t len = value->bytes_len;
     uint8_t *bytes = (uint8_t *)malloc(len == 0 ? 1 : len);
     if (bytes == NULL) return NULL;
@@ -239,19 +239,20 @@ uint8_t *qa_encode_value(const qa_abi_value_layout *layout, const qa_call_value 
     return bytes;
   }
   int width = qa_storage_bytes(layout->storage, memory->pointer_bytes);
+  const bool floating = layout->storage == QA_STORAGE_FLOAT32 || layout->storage == QA_STORAGE_FLOAT64;
+  /* The value is checked and encoded before the buffer exists: every throw here is a raise. */
+  if (floating && value->kind != QA_CALL_FLOAT32 && value->kind != QA_CALL_FLOAT64)
+    qa_raise("TypeError", 0, 0, "Floating ABI argument requires a floating value");
+  const uint64_t raw = floating ? 0 : qa_encode_integer_value(layout->storage, value, memory);
   uint8_t *bytes = (uint8_t *)calloc((size_t)width, 1);
   if (bytes == NULL) return NULL;
   if (out_len != NULL) *out_len = (size_t)width;
-  if (layout->storage == QA_STORAGE_FLOAT32 || layout->storage == QA_STORAGE_FLOAT64) {
-    if (value->kind != QA_CALL_FLOAT32 && value->kind != QA_CALL_FLOAT64) {
-      free(bytes);
-      qa_range_error("Floating ABI argument requires a floating value");
-    }
+  if (floating) {
     if (layout->storage == QA_STORAGE_FLOAT32) { float f = (float)value->number; memcpy(bytes, &f, 4); }
     else memcpy(bytes, &value->number, 8);
     return bytes;
   }
-  store_le(bytes, qa_encode_integer_value(layout->storage, value, memory), width);
+  store_le(bytes, raw, width);
   return bytes;
 }
 qa_call_value qa_decode_value(const qa_abi_value_layout *layout, const uint8_t *bytes, size_t len,

@@ -10,8 +10,15 @@ void qa_q2mpm_state_init(qa_q2mpm_monster_state *state) {
   state->flyer_next_move = QA_Q2MPM_FLYER_NONE;
   state->widow_damage_multiplier = 1;
 }
+static void clear_actors(qa_q2mpm_monster_state *state) {
+  for (size_t i = 0; i < state->actor_count; i++) {
+    free(state->actors[i]->state.chosen_reinforcements);
+    free(state->actors[i]);
+  }
+  state->actor_count = 0;
+}
 void qa_q2mpm_state_destroy(qa_q2mpm_monster_state *state) {
-  for (size_t i = 0; i < state->actor_count; i++) free(state->actors[i].state.chosen_reinforcements);
+  clear_actors(state);
   free(state->actors);
   for (size_t i = 0; i < state->bound_count; i++)
     qa_session_actor_registry_off_release(state->bound_registries[i], state->bound_subscriptions[i]);
@@ -21,8 +28,9 @@ void qa_q2mpm_state_destroy(qa_q2mpm_monster_state *state) {
 }
 static void release_actor(void *ctx, qa_owned_actor actor) {
   qa_q2mpm_monster_state *state = ctx;
-  for (size_t i = 0; i < state->actor_count; i++) if (qa_same_actor(state->actors[i].actor, actor.id)) {
-    free(state->actors[i].state.chosen_reinforcements);
+  for (size_t i = 0; i < state->actor_count; i++) if (qa_same_actor(state->actors[i]->actor, actor.id)) {
+    free(state->actors[i]->state.chosen_reinforcements);
+    free(state->actors[i]);
     memmove(&state->actors[i], &state->actors[i + 1], (state->actor_count - i - 1) * sizeof *state->actors);
     state->actor_count--;
     return;
@@ -46,17 +54,18 @@ void qa_q2mpm_state_bind(qa_q2mpm_monster_state *state, qa_q2_game_services *gam
 }
 qa_q2mpm_rogue_state *qa_q2mpm_state_get(qa_q2mpm_monster_state *state, qa_q2_entity *entity) {
   for (size_t i = 0; i < state->actor_count; i++)
-    if (qa_same_actor(state->actors[i].actor, entity->actor.id)) return &state->actors[i].state;
+    if (qa_same_actor(state->actors[i]->actor, entity->actor.id)) return &state->actors[i]->state;
   if (state->actor_count == state->actor_cap) {
     size_t cap = state->actor_cap ? state->actor_cap * 2 : 8;
-    qa_q2mpm_actor_state *grown = realloc(state->actors, cap * sizeof *grown);
+    qa_q2mpm_actor_state **grown = realloc(state->actors, cap * sizeof *grown);
     if (!grown) qa_raise("Error", 0, 0, "Out of memory growing mission-pack monster state");
     state->actors = grown;
     state->actor_cap = cap;
   }
-  qa_q2mpm_actor_state *entry = &state->actors[state->actor_count++];
+  qa_q2mpm_actor_state *entry = calloc(1, sizeof *entry);
+  if (!entry) qa_raise("Error", 0, 0, "Out of memory growing mission-pack monster state");
   entry->actor = entity->actor.id;
-  memset(&entry->state, 0, sizeof entry->state);
+  state->actors[state->actor_count++] = entry;
   return &entry->state;
 }
 void qa_q2mpm_monsters_checkpoint_free(qa_q2mpm_monsters_checkpoint *checkpoint) {
@@ -78,15 +87,15 @@ bool qa_q2mpm_state_capture(qa_q2mpm_monster_state *state, qa_q2_game_services *
   out->widow_damage_multiplier = state->widow_damage_multiplier;
   size_t live = 0;
   for (size_t i = 0; i < state->actor_count; i++)
-    if (qa_session_actor_registry_is_live(game->host->actors, state->actors[i].actor)) live++;
+    if (qa_session_actor_registry_is_live(game->host->actors, state->actors[i]->actor)) live++;
   if (live) {
     out->actors = calloc(live, sizeof *out->actors);
     if (!out->actors) return false;
   }
   for (size_t i = 0; i < state->actor_count; i++) {
-    qa_actor_id actor = state->actors[i].actor;
+    qa_actor_id actor = state->actors[i]->actor;
     if (!qa_session_actor_registry_is_live(game->host->actors, actor)) continue;
-    const qa_q2mpm_rogue_state *saved = &state->actors[i].state;
+    const qa_q2mpm_rogue_state *saved = &state->actors[i]->state;
     qa_q2mpm_checkpoint_actor *entry = &out->actors[out->actor_count++];
     entry->actor.slot = (double)actor.slot;
     entry->actor.generation = (double)actor.generation;
@@ -120,8 +129,7 @@ static void restore_optional(qa_q2_game_services *game, bool has, qa_saved_actor
   if (has) *out = qa_session_actor_registry_reference_saved(game->host->actors, saved, NULL);
 }
 void qa_q2mpm_state_restore(qa_q2mpm_monster_state *state, qa_q2_game_services *game, const qa_q2mpm_monsters_checkpoint *checkpoint) {
-  for (size_t i = 0; i < state->actor_count; i++) free(state->actors[i].state.chosen_reinforcements);
-  state->actor_count = 0;
+  clear_actors(state);
   state->flyer_next_move = checkpoint->flyer_next_move;
   state->widow_shots_fired = checkpoint->widow_shots_fired;
   state->widow_damage_multiplier = checkpoint->widow_damage_multiplier;
@@ -142,6 +150,9 @@ void qa_q2mpm_state_restore(qa_q2mpm_monster_state *state, qa_q2_game_services *
     restored->widow_quad_until = value->widow_quad_until;
     restored->widow_double_until = value->widow_double_until;
     restored->widow_invulnerable_until = value->widow_invulnerable_until;
+    /* Map.set replaces the whole value when a checkpoint repeats an actor. */
+    free(restored->chosen_reinforcements);
+    restored->chosen_reinforcements = NULL;
     restored->reinforcement_count = value->reinforcement_count;
     restored->reinforcement_cap = value->reinforcement_count;
     if (value->reinforcement_count) {

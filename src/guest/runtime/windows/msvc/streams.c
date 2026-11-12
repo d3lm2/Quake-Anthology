@@ -30,8 +30,9 @@ static char *concat3(const char *a, const char *b, const char *c) {
   strcpy(out, a); strcat(out, b); strcat(out, c);
   return out;
 }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
+static void free_slot(void *slot) { free(*(void **)slot); }
 
 typedef struct streams_ctx {
   qa_windows_service_host *host;
@@ -63,12 +64,18 @@ static qa_call_result virtual_call(streams_ctx *s, const qa_guest_core_call_cont
   qa_abi_storage *all_params = xmalloc((parameter_count + 1) * sizeof *all_params);
   all_params[0] = QA_STORAGE_POINTER;
   for (size_t i = 0; i < parameter_count; i++) all_params[i + 1] = parameters[i];
+  qa_cleanup held_params;
+  qa_cleanup_push(&held_params, free_slot, &all_params);
   qa_call_value *all_args = xmalloc((extra_count + 1) * sizeof *all_args);
+  qa_cleanup held_args;
+  qa_cleanup_push(&held_args, free_slot, &all_args);
   all_args[0] = qa_call_pointer(true, object);
   for (size_t i = 0; i < extra_count; i++) all_args[i + 1] = extra[i];
   qa_call_result value = qa_windows_invoke(s->host, context, target, all_params,
                                            parameter_count + 1, result_is_void, result,
                                            all_args, extra_count + 1, false);
+  qa_cleanup_pop(&held_args);
+  qa_cleanup_pop(&held_params);
   free(all_params); free(all_args);
   return value;
 }
@@ -86,7 +93,7 @@ static qa_guest_core_address make_table(streams_ctx *s, const char *const *names
   for (size_t i = 0; i < count; i++) {
     qa_guest_core_address target = {0};
     if (!qa_windows_resolve_address(s->host, library, names[i], &target))
-      qa_range_error("Missing MSVC method %s", names[i]);
+      qa_raise("Error", 0, 0, "Missing MSVC method %s", names[i]);
     write_ptr(s, at(s, result, (int64_t)i * 8), true, target);
   }
   qa_gmem_protect(s->host->memory_ext, result, count * 8, QA_PERM_READ);
@@ -100,9 +107,10 @@ static void stream_setstate(streams_ctx *s, const qa_guest_core_call_context *co
                      qa_guest_core_address object, int state) {
   (void)context;
   qa_mapped_guest_memory *memory = s->host->memory;
+  const int current = qa_gmem_read_i32(memory, at(s, object, 16));
   qa_guest_core_address buffer = {0};
   bool has_buffer = read_ptr(s, at(s, object, 72), &buffer);
-  int value = (qa_gmem_read_i32(memory, at(s, object, 16)) | state | (has_buffer ? 0 : 4)) & 0x17;
+  int value = (current | state | (has_buffer ? 0 : 4)) & 0x17;
   qa_gmem_write_i32(memory, at(s, object, 16), value);
   if ((value & qa_gmem_read_i32(memory, at(s, object, 20))) != 0)
     qa_unsupported_windows_import(library, "ios_base::failure",
@@ -234,31 +242,173 @@ static void suffix(streams_ctx *s, const qa_guest_core_call_context *context,
                                   NULL, 0)) == -1)
     stream_setstate(s, context, base, 4);
 }
+static void buffer_lock(streams_ctx *s, const qa_guest_core_call_context *context,
+                        qa_guest_core_address buffer, int slot_index) {
+  qa_call_result result = virtual_call(s, context, buffer, slot_index, NULL, 0, true,
+                                       QA_STORAGE_INT32, NULL, 0);
+  qa_call_value_free(&result);
+}
+typedef struct flush_body {
+  streams_ctx *s;
+  const qa_guest_core_call_context *context;
+  qa_guest_core_address object, base, buffer;
+} flush_body;
+static void flush_run(void *arg) {
+  flush_body *body = arg;
+  streams_ctx *s = body->s;
+  qa_mapped_guest_memory *memory = s->host->memory;
+  if (qa_gmem_read_i32(memory, at(s, body->base, 16)) == 0) {
+    qa_guest_core_address tied = {0};
+    if (read_ptr(s, at(s, body->base, 80), &tied) && tied.byte_offset != body->object.byte_offset)
+      flush_stream(s, body->context, tied);
+    if (qa_gmem_read_i32(memory, at(s, body->base, 16)) == 0 &&
+        result_integer(virtual_call(s, body->context, body->buffer, 13, NULL, 0, false,
+                                    QA_STORAGE_INT32, NULL, 0)) == -1)
+      stream_setstate(s, body->context, body->base, 4);
+  }
+  suffix(s, body->context, body->object);
+}
 static void flush_stream(streams_ctx *s, const qa_guest_core_call_context *context,
                          qa_guest_core_address object) {
-  qa_mapped_guest_memory *memory = s->host->memory;
   qa_guest_core_address base = virtual_ios(s, object);
   qa_guest_core_address buffer = {0};
   if (!read_ptr(s, at(s, base, 72), &buffer)) return;
-  qa_call_result lock_result = virtual_call(s, context, buffer, 1, NULL, 0, true,
-                                            QA_STORAGE_INT32, NULL, 0);
-  qa_call_value_free(&lock_result);
-  /* TS try/finally: the unlock also runs on throw; in C a throw aborts. */
-  if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0) {
+  buffer_lock(s, context, buffer, 1);
+  /* TS try/finally: the buffer is unlocked however the body ends. */
+  flush_body body = {s, context, object, base, buffer};
+  qa_caught_error caught;
+  const bool done = qa_try(flush_run, &body, &caught);
+  buffer_lock(s, context, buffer, 2);
+  if (!done) qa_rethrow(&caught);
+}
+
+typedef struct insert_body {
+  streams_ctx *s;
+  const qa_guest_core_call_context *context;
+  const qa_call_value *args;
+  size_t count;
+  int bits;
+  qa_guest_core_address object, base;
+  bool has_buffer; qa_guest_core_address buffer;
+  bool has_source; qa_guest_core_address source;
+  char *fill_text; /* owned while held */
+} insert_body;
+static void insert_int_run(void *arg) {
+  insert_body *body = arg;
+  streams_ctx *s = body->s;
+  qa_mapped_guest_memory *memory = s->host->memory;
+  const qa_guest_core_call_context *context = body->context;
+  const qa_call_value *args = body->args;
+  size_t count = body->count;
+  int bits = body->bits;
+  qa_guest_core_address object = body->object, base = body->base, buffer = body->buffer;
+  bool has_buffer = body->has_buffer;
+  if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0 && has_buffer) {
     qa_guest_core_address tied = {0};
     if (read_ptr(s, at(s, base, 80), &tied) && tied.byte_offset != object.byte_offset)
       flush_stream(s, context, tied);
-    if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0 &&
-        result_integer(virtual_call(s, context, buffer, 13, NULL, 0, false,
-                                      QA_STORAGE_INT32, NULL, 0)) == -1)
-      stream_setstate(s, context, base, 4);
+    if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0) {
+      qa_guest_core_address implementation = ref(s, ref(s, at(s, base, 64)));
+      if (implementation.byte_offset != s->locale->global.byte_offset ||
+          qa_memory_read_u64(memory, at(s, implementation, 24)) != 0)
+        qa_unsupported_windows_import(
+            library, "ostream integer insertion",
+            "custom num_put locale requires facet dispatch");
+      int32_t flags = qa_gmem_read_i32(memory, at(s, base, 24));
+      int basefield = flags & 0xe00;
+      int radix = basefield == 0x400 ? 8 : basefield == 0x800 ? 16 : 10;
+      uint64_t raw = qa_guest_integer_u64(args, count, 1);
+      bool negative = false;
+      uint64_t magnitude;
+      if (radix == 10) {
+        int64_t signed_value = bits == 32 ? (int32_t)raw : (int64_t)raw;
+        negative = signed_value < 0;
+        magnitude = negative ? (uint64_t)(~((uint64_t)signed_value) + 1)
+                             : (uint64_t)signed_value;
+      } else {
+        magnitude = bits == 32 ? (uint32_t)raw : raw;
+      }
+      char digits_buffer[32];
+      int digit_count = 0;
+      uint64_t remaining = magnitude;
+      do {
+        int digit = (int)(remaining % (uint64_t)radix);
+        digits_buffer[digit_count++] = (char)(digit < 10 ? '0' + digit : 'a' + digit - 10);
+        remaining /= (uint64_t)radix;
+      } while (remaining != 0);
+      char digits[32];
+      for (int i = 0; i < digit_count; i++) digits[i] = digits_buffer[digit_count - 1 - i];
+      digits[digit_count] = '\0';
+      char prefix[4] = "";
+      if (negative) strcpy(prefix, "-");
+      else if (radix == 10 && (flags & 0x20) != 0) strcpy(prefix, "+");
+      if (radix != 10 && magnitude != 0 && (flags & 8) != 0)
+        strcpy(prefix, radix == 16 ? "0x" : "0");
+      if ((flags & 4) != 0) {
+        for (char *c = digits; *c != '\0'; c++)
+          if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
+        for (char *c = prefix; *c != '\0'; c++)
+          if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
+      }
+      int64_t width = qa_gmem_read_i64(memory, at(s, base, 40));
+      if (width > 0x1000000) qa_range_error("MSVC numeric field exceeds limit");
+      int64_t fill_count = width - (int64_t)strlen(prefix) - digit_count;
+      if (fill_count < 0) fill_count = 0;
+      uint8_t fill_char = qa_memory_read_u8(memory, at(s, base, 88));
+      int adjustment = flags & 0x1c0;
+      /* text = left: prefix+digits+fill; internal: prefix+fill+digits;
+       * else fill+prefix+digits. */
+      bool failed = false;
+      const char *parts[3];
+      char *fill_text = xmalloc((size_t)fill_count + 1);
+      body->fill_text = fill_text;
+      memset(fill_text, fill_char, (size_t)fill_count);
+      fill_text[fill_count] = '\0';
+      if (adjustment == 0x40) { parts[0] = prefix; parts[1] = digits; parts[2] = fill_text; }
+      else if (adjustment == 0x100) { parts[0] = prefix; parts[1] = fill_text; parts[2] = digits; }
+      else { parts[0] = fill_text; parts[1] = prefix; parts[2] = digits; }
+      for (size_t part = 0; part < 3 && !failed; part++)
+        for (size_t i = 0; parts[part][i] != '\0'; i++)
+          if (put_char(s, context, buffer, (uint8_t)parts[part][i]) == -1) {
+            stream_setstate(s, context, base, 4);
+            failed = true;
+            break;
+          }
+      body->fill_text = NULL;
+      free(fill_text);
+      qa_gmem_write_i64(memory, at(s, base, 40), 0);
+    }
   }
+  stream_setstate(s, context, base, 0);
   suffix(s, context, object);
-  qa_call_result unlock_result = virtual_call(s, context, buffer, 2, NULL, 0, true,
-                                              QA_STORAGE_INT32, NULL, 0);
-  qa_call_value_free(&unlock_result);
 }
-
+static void insert_buffer_run(void *arg) {
+  insert_body *body = arg;
+  streams_ctx *s = body->s;
+  qa_mapped_guest_memory *memory = s->host->memory;
+  const qa_guest_core_call_context *context = body->context;
+  qa_guest_core_address object = body->object, base = body->base, target = body->buffer;
+  qa_guest_core_address source = body->source;
+  bool has_target = body->has_buffer, has_source = body->has_source;
+  bool copied = false;
+  int insert_state = 0;
+  if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0 && has_target && has_source) {
+    qa_guest_core_address tied = {0};
+    if (read_ptr(s, at(s, base, 80), &tied) && tied.byte_offset != object.byte_offset)
+      flush_stream(s, context, tied);
+    if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0)
+      for (;;) {
+        int character = get_char(s, context, source, false);
+        if (character == -1) break;
+        if (put_char(s, context, target, character) == -1) { insert_state |= 4; break; }
+        (void)get_char(s, context, source, true);
+        copied = true;
+      }
+  }
+  qa_gmem_write_i64(memory, at(s, base, 40), 0);
+  stream_setstate(s, context, base, !has_source ? 4 : insert_state | (copied ? 0 : 2));
+  suffix(s, context, object);
+}
 typedef struct stream_state {
   streams_ctx *s;
   int kind;
@@ -360,12 +510,14 @@ static qa_call_result stream_impl(void *ctx, const qa_guest_core_call_context *c
                         (int)(base.byte_offset - object.byte_offset) - 32);
       return qa_call_void();
     }
-    case ST_OSTREAM_DELETE:
-      qa_range_error(
-          "Unsupported Windows guest import msvcp140.dll!basic_ostream deleting destructor: "
-          "standalone deleting destructor at %llx is not implemented",
-          (unsigned long long)qa_guest_required_pointer(args, count, 0).byte_offset);
+    case ST_OSTREAM_DELETE: {
+      char detail[96];
+      (void)snprintf(detail, sizeof detail,
+                     "standalone deleting destructor at %llx is not implemented",
+                     (unsigned long long)qa_guest_required_pointer(args, count, 0).byte_offset);
+      qa_unsupported_windows_import(library, "basic_ostream deleting destructor", detail);
       return qa_call_void();
+    }
     case ST_BUFFER_DTOR:
       buffer_dtor(s, context, qa_guest_required_pointer(args, count, 0));
       return qa_call_void();
@@ -496,135 +648,25 @@ static qa_call_result stream_impl(void *ctx, const qa_guest_core_call_context *c
       return virtual_call(s, context, ref(s, at(s, base, 72)), 10, params, 4, false,
                           QA_STORAGE_POINTER, extra, 4);
     }
-    case ST_INSERT_INT: {
-      int bits = state->number;
-      qa_guest_core_address object = qa_guest_required_pointer(args, count, 0);
-      qa_guest_core_address base = virtual_ios(s, object);
-      qa_guest_core_address buffer = {0};
-      bool has_buffer = read_ptr(s, at(s, base, 72), &buffer);
-      if (has_buffer) {
-        qa_call_result r = virtual_call(s, context, buffer, 1, NULL, 0, true,
-                                        QA_STORAGE_INT32, NULL, 0);
-        qa_call_value_free(&r);
-      }
-      if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0 && has_buffer) {
-        qa_guest_core_address tied = {0};
-        if (read_ptr(s, at(s, base, 80), &tied) && tied.byte_offset != object.byte_offset)
-          flush_stream(s, context, tied);
-        if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0) {
-          qa_guest_core_address implementation = ref(s, ref(s, at(s, base, 64)));
-          if (implementation.byte_offset != s->locale->global.byte_offset ||
-              qa_memory_read_u64(memory, at(s, implementation, 24)) != 0)
-            qa_unsupported_windows_import(
-                library, "ostream integer insertion",
-                "custom num_put locale requires facet dispatch");
-          int32_t flags = qa_gmem_read_i32(memory, at(s, base, 24));
-          int basefield = flags & 0xe00;
-          int radix = basefield == 0x400 ? 8 : basefield == 0x800 ? 16 : 10;
-          uint64_t raw = qa_guest_integer_u64(args, count, 1);
-          bool negative = false;
-          uint64_t magnitude;
-          if (radix == 10) {
-            int64_t signed_value = bits == 32 ? (int32_t)raw : (int64_t)raw;
-            negative = signed_value < 0;
-            magnitude = negative ? (uint64_t)(~((uint64_t)signed_value) + 1)
-                                 : (uint64_t)signed_value;
-          } else {
-            magnitude = bits == 32 ? (uint32_t)raw : raw;
-          }
-          char digits_buffer[32];
-          int digit_count = 0;
-          uint64_t remaining = magnitude;
-          do {
-            int digit = (int)(remaining % (uint64_t)radix);
-            digits_buffer[digit_count++] = (char)(digit < 10 ? '0' + digit : 'a' + digit - 10);
-            remaining /= (uint64_t)radix;
-          } while (remaining != 0);
-          char digits[32];
-          for (int i = 0; i < digit_count; i++) digits[i] = digits_buffer[digit_count - 1 - i];
-          digits[digit_count] = '\0';
-          char prefix[4] = "";
-          if (negative) strcpy(prefix, "-");
-          else if (radix == 10 && (flags & 0x20) != 0) strcpy(prefix, "+");
-          if (radix != 10 && magnitude != 0 && (flags & 8) != 0)
-            strcpy(prefix, radix == 16 ? "0x" : "0");
-          if ((flags & 4) != 0) {
-            for (char *c = digits; *c != '\0'; c++)
-              if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
-            for (char *c = prefix; *c != '\0'; c++)
-              if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
-          }
-          int64_t width = qa_gmem_read_i64(memory, at(s, base, 40));
-          if (width > 0x1000000) qa_range_error("MSVC numeric field exceeds limit");
-          int64_t fill_count = width - (int64_t)strlen(prefix) - digit_count;
-          if (fill_count < 0) fill_count = 0;
-          uint8_t fill_char = qa_memory_read_u8(memory, at(s, base, 88));
-          int adjustment = flags & 0x1c0;
-          /* text = left: prefix+digits+fill; internal: prefix+fill+digits;
-           * else fill+prefix+digits. */
-          bool failed = false;
-          const char *parts[3];
-          char *fill_text = xmalloc((size_t)fill_count + 1);
-          memset(fill_text, fill_char, (size_t)fill_count);
-          fill_text[fill_count] = '\0';
-          if (adjustment == 0x40) { parts[0] = prefix; parts[1] = digits; parts[2] = fill_text; }
-          else if (adjustment == 0x100) { parts[0] = prefix; parts[1] = fill_text; parts[2] = digits; }
-          else { parts[0] = fill_text; parts[1] = prefix; parts[2] = digits; }
-          for (size_t part = 0; part < 3 && !failed; part++)
-            for (size_t i = 0; parts[part][i] != '\0'; i++)
-              if (put_char(s, context, buffer, (uint8_t)parts[part][i]) == -1) {
-                stream_setstate(s, context, base, 4);
-                failed = true;
-                break;
-              }
-          free(fill_text);
-          qa_gmem_write_i64(memory, at(s, base, 40), 0);
-        }
-      }
-      stream_setstate(s, context, base, 0);
-      suffix(s, context, object);
-      if (has_buffer) {
-        qa_call_result r = virtual_call(s, context, buffer, 2, NULL, 0, true,
-                                        QA_STORAGE_INT32, NULL, 0);
-        qa_call_value_free(&r);
-      }
-      return qa_call_pointer(true, object);
-    }
+    case ST_INSERT_INT:
     case ST_INSERT_BUFFER: {
-      qa_guest_core_address object = qa_guest_required_pointer(args, count, 0);
-      qa_guest_core_address base = virtual_ios(s, object);
-      qa_guest_core_address target = {0}, source = {0};
-      bool has_target = read_ptr(s, at(s, base, 72), &target);
-      bool has_source = qa_guest_pointer_argument(args, count, 1, &source);
-      bool copied = false;
-      int insert_state = 0;
-      if (has_target) {
-        qa_call_result r = virtual_call(s, context, target, 1, NULL, 0, true,
-                                        QA_STORAGE_INT32, NULL, 0);
-        qa_call_value_free(&r);
-      }
-      if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0 && has_target && has_source) {
-        qa_guest_core_address tied = {0};
-        if (read_ptr(s, at(s, base, 80), &tied) && tied.byte_offset != object.byte_offset)
-          flush_stream(s, context, tied);
-        if (qa_gmem_read_i32(memory, at(s, base, 16)) == 0)
-          for (;;) {
-            int character = get_char(s, context, source, false);
-            if (character == -1) break;
-            if (put_char(s, context, target, character) == -1) { insert_state |= 4; break; }
-            (void)get_char(s, context, source, true);
-            copied = true;
-          }
-      }
-      qa_gmem_write_i64(memory, at(s, base, 40), 0);
-      stream_setstate(s, context, base, !has_source ? 4 : insert_state | (copied ? 0 : 2));
-      suffix(s, context, object);
-      if (has_target) {
-        qa_call_result r = virtual_call(s, context, target, 2, NULL, 0, true,
-                                        QA_STORAGE_INT32, NULL, 0);
-        qa_call_value_free(&r);
-      }
-      return qa_call_pointer(true, object);
+      const bool integer = state->kind == ST_INSERT_INT;
+      insert_body body;
+      memset(&body, 0, sizeof body);
+      body.s = s; body.context = context; body.args = args; body.count = count;
+      body.bits = state->number;
+      body.object = qa_guest_required_pointer(args, count, 0);
+      body.base = virtual_ios(s, body.object);
+      body.has_buffer = read_ptr(s, at(s, body.base, 72), &body.buffer);
+      if (!integer) body.has_source = qa_guest_pointer_argument(args, count, 1, &body.source);
+      if (body.has_buffer) buffer_lock(s, context, body.buffer, 1);
+      /* TS try/finally: the buffer is unlocked however the insertion ends. */
+      qa_caught_error caught;
+      const bool done = qa_try(integer ? insert_int_run : insert_buffer_run, &body, &caught);
+      free(body.fill_text);
+      if (body.has_buffer) buffer_lock(s, context, body.buffer, 2);
+      if (!done) qa_rethrow(&caught);
+      return qa_call_pointer(true, body.object);
     }
     default: break;
   }

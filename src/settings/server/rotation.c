@@ -1,6 +1,7 @@
 /* Port of src/settings/server/rotation.ts. GPL-2.0-or-later. */
 #include "qa/settings/server/rotation.h"
 
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include <ctype.h>
 #include <math.h>
@@ -66,11 +67,16 @@ qa_server_setting_collection qa_q2_rotation_settings(bool rerelease) {
 }
 
 char *qa_rotation_map_name(const char *value) {
-  /* String.trim, then strip a leading "maps/" and a trailing ".bsp". */
+  /* String.trim (JS white space: ASCII and U+00A0, U+FEFF, U+2000..., as UTF-8), then strip a
+   * leading "maps/" and a trailing ".bsp". */
   const char *start = value;
-  while (*start != '\0' && isspace((unsigned char)*start)) start++;
-  const char *end = start + strlen(start);
-  while (end > start && isspace((unsigned char)end[-1])) end--;
+  for (size_t space; (space = qa_js_white_space_length(start)) > 0;) start += space;
+  const char *end = start;
+  for (const char *at = start; *at != '\0';) {
+    size_t space = qa_js_white_space_length(at);
+    if (space == 0) end = ++at;
+    else at += space;
+  }
   size_t length = (size_t)(end - start);
   char *name = (char *)malloc(length + 1);
   if (name == NULL) return NULL;

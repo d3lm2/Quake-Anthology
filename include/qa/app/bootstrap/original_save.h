@@ -11,10 +11,15 @@
 #include "qa/app/bootstrap/options.h"
 #include "qa/content/catalog/index.h"
 #include "qa/contracts/session.h"
+#include "qa/persistence/q2_save_folder.h"
 /* TS { image, options }. */
 typedef struct qa_app_prepared_application_save {
   qa_save_image image;
   qa_app_options options;
+  /* TS folder?: the original files of a Quake II save folder, which become the working `current` folder once the
+   * load succeeds. Owned (released by qa_app_prepared_application_save_free). */
+  bool has_folder;
+  qa_q2_save_files folder;
 } qa_app_prepared_application_save;
 /* TS prepareApplicationSave(options, catalog, path, sourceProduct?). source_product NULL is TS undefined. The catalog
  * is borrowed (the content loader reads its digest cache). On return out->options is owned and out->image lives
@@ -23,6 +28,11 @@ typedef struct qa_app_prepared_application_save {
  * nothing is left to free (out stays zeroed, *out_backing NULL). */
 void qa_app_prepare_application_save_native(const qa_app_options *options, const qa_content_catalog *catalog, const char *path,
     const char *source_product, qa_app_prepared_application_save *out, void **out_backing);
+/* TS prepareApplicationSave(options, catalog, path, sourceProduct, nextFrame): next_frame (NULL = the TS default,
+ * a yield with nothing to do) is serviced while an original Quake II save's game module starts and is captured. */
+void qa_app_prepare_application_save_loading(const qa_app_options *options, const qa_content_catalog *catalog, const char *path,
+    const char *source_product, void (*next_frame)(void *ctx), void *next_frame_ctx,
+    qa_app_prepared_application_save *out, void **out_backing);
 /* Releases the options and the image's backing; backing NULL frees only the options. */
 void qa_app_prepared_application_save_free(qa_app_prepared_application_save *save, void *backing);
 #endif

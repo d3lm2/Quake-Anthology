@@ -1,6 +1,5 @@
 /* Port of src/formats/images/indexed.ts. GPL-2.0-or-later. */
 #include "qa/formats/images/indexed.h"
-#include "qa/formats/images/limits.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -11,8 +10,7 @@
 
 static int64_t dimensions(int64_t width, int64_t height, const char *source) {
   double count = (double)width * (double)height;
-  if (width <= 0 || height <= 0 || count > 2147483647.0 ||
-      !qa_image_size_allowed((double)width, (double)height)) {
+  if (width <= 0 || height <= 0 || count > 2147483647.0) {
     qa_binary_error(source, 0, "Invalid image dimensions %lldx%lld",
                     (long long)width, (long long)height);
   }
@@ -36,6 +34,21 @@ static int mip_level(qa_binary_reader *reader, int64_t width, int64_t height,
   out->pixels.length = (size_t)count;
   return 1;
 }
+
+/* A BinaryError caught by the caller (a map texture, a WAD lump, a download) must
+ * not leak the reader's source name or the levels decoded before it. */
+typedef struct decode_guard {
+  qa_binary_reader *reader;
+  void (*destroy)(void *out);
+  void *out;
+} decode_guard;
+static void decode_guard_release(void *arg) {
+  decode_guard *guard = (decode_guard *)arg;
+  if (guard->destroy != NULL) guard->destroy(guard->out);
+  qa_binary_reader_destroy(guard->reader);
+}
+static void miptex_release(void *out) { qa_q1_miptex_destroy((qa_q1_miptex *)out); }
+static void wal_release(void *out) { qa_wal_image_destroy((qa_wal_image *)out); }
 
 void qa_indexed_image_destroy(qa_indexed_image *image) {
   free(image->indices);
@@ -74,8 +87,11 @@ int qa_decode_q1_mip_texture(const uint8_t *bytes, size_t length,
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, name)) return 0;
   memset(out, 0, sizeof *out);
+  decode_guard guard_state = {&reader, miptex_release, out};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decode_guard_release, &guard_state);
   out->name = qa_binary_reader_fixed_byte_string(&reader, 16);
-  if (out->name == NULL) { qa_binary_reader_destroy(&reader); return 0; }
+  if (out->name == NULL) { qa_cleanup_pop(&guard); qa_binary_reader_destroy(&reader); return 0; }
   int64_t width = qa_binary_reader_u32(&reader);
   int64_t height = qa_binary_reader_u32(&reader);
   dimensions(width, height, name);
@@ -88,6 +104,7 @@ int qa_decode_q1_mip_texture(const uint8_t *bytes, size_t length,
   out->height = height;
   if (a == 0 && b == 0 && c == 0 && d == 0) {
     out->kind = QA_Q1_MIP_EXTERNAL;
+    qa_cleanup_pop(&guard);
     qa_binary_reader_destroy(&reader);
     return 1;
   }
@@ -96,6 +113,7 @@ int qa_decode_q1_mip_texture(const uint8_t *bytes, size_t length,
            mip_level(&reader, width / 2, height / 2, b, 40, &out->levels[1]) &&
            mip_level(&reader, width / 4, height / 4, c, 40, &out->levels[2]) &&
            mip_level(&reader, width / 8, height / 8, d, 40, &out->levels[3]);
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   if (!ok) { qa_q1_miptex_destroy(out); return 0; }
   return 1;
@@ -112,8 +130,11 @@ int qa_decode_wal(const uint8_t *bytes, size_t length, const char *source,
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, name)) return 0;
   memset(out, 0, sizeof *out);
+  decode_guard guard_state = {&reader, wal_release, out};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decode_guard_release, &guard_state);
   out->name = qa_binary_reader_fixed_byte_string(&reader, 32);
-  if (out->name == NULL) { qa_binary_reader_destroy(&reader); return 0; }
+  if (out->name == NULL) { qa_cleanup_pop(&guard); qa_binary_reader_destroy(&reader); return 0; }
   int64_t width = qa_binary_reader_u32(&reader);
   int64_t height = qa_binary_reader_u32(&reader);
   dimensions(width, height, name);
@@ -121,6 +142,7 @@ int qa_decode_wal(const uint8_t *bytes, size_t length, const char *source,
   int64_t c = qa_binary_reader_u32(&reader), d = qa_binary_reader_u32(&reader);
   out->animation = qa_binary_reader_fixed_byte_string(&reader, 32);
   if (out->animation == NULL) {
+    qa_cleanup_pop(&guard);
     qa_binary_reader_destroy(&reader);
     qa_wal_image_destroy(out);
     return 0;
@@ -137,6 +159,7 @@ int qa_decode_wal(const uint8_t *bytes, size_t length, const char *source,
                      &out->levels[2]) &&
            mip_level(&reader, wal_half(width, 3), wal_half(height, 3), d, 100,
                      &out->levels[3]);
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   if (!ok) { qa_wal_image_destroy(out); return 0; }
   return 1;
@@ -147,10 +170,14 @@ int qa_decode_qpic(const uint8_t *bytes, size_t length, const char *source,
   const char *name = source != NULL ? source : "<qpic>";
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, name)) return 0;
+  decode_guard guard_state = {&reader, NULL, NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decode_guard_release, &guard_state);
   int64_t width = qa_binary_reader_i32(&reader);
   int64_t height = qa_binary_reader_i32(&reader);
   int64_t count = dimensions(width, height, name);
   uint8_t *indices = qa_binary_reader_bytes(&reader, count);
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   if (indices == NULL && count != 0) return 0;
   out->width = width;
@@ -295,6 +322,9 @@ int qa_decode_lit(const uint8_t *bytes, size_t length, int has_expected,
   const char *name = source != NULL ? source : "<lit>";
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, name)) return 0;
+  decode_guard guard_state = {&reader, NULL, NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decode_guard_release, &guard_state);
   qa_binary_reader_expect_magic(&reader, "QLIT");
   if (qa_binary_reader_i32(&reader) != 1) {
     qa_binary_error(name, 4, "Only QLIT version 1 is supported");
@@ -305,6 +335,7 @@ int qa_decode_lit(const uint8_t *bytes, size_t length, int has_expected,
     qa_binary_error(name, 8, "QLIT sample count does not match lighting");
   }
   uint8_t *samples = qa_binary_reader_bytes(&reader, (int64_t)remaining);
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   if (samples == NULL && remaining != 0) return 0;
   out->samples = samples;

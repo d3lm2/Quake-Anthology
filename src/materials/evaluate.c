@@ -41,14 +41,14 @@ static qa_vec2 evaluate_tex_coords(qa_mat_shader_stage stage, qa_vec2 uv,
     result = uv;
   } else if (eq(stage.tc_gen.kind, "lightmap")) {
     if (context.lightmap == NULL)
-      qa_range_error("Lightmap tcGen requires lightmap coordinates");
+      qa_raise("Error", 0, 0, "Lightmap tcGen requires lightmap coordinates");
     result = *context.lightmap;
   } else if (eq(stage.tc_gen.kind, "vector")) {
     result.x = qa_dot3(position, stage.tc_gen.s);
     result.y = qa_dot3(position, stage.tc_gen.t);
   } else { /* environment */
     if (context.view_origin == NULL)
-      qa_range_error("Environment tcGen requires the view origin in model coordinates");
+      qa_raise("Error", 0, 0, "Environment tcGen requires the view origin in model coordinates");
     qa_vec3 viewer = qa_normalize_fast3(qa_sub3(*context.view_origin, position));
     double d = qa_dot3(normal, viewer);
     double ry = fr(fr(fr(normal.y * 2) * d) - viewer.y);
@@ -70,7 +70,7 @@ static qa_vec2 evaluate_tex_coords(qa_mat_shader_stage stage, qa_vec2 uv,
       result = (qa_vec2){s + fr(x - floor(x)), t + fr(y - floor(y))};
     } else if (eq(mod.kind, "entitytranslate")) {
       if (context.shader_tex_coord == NULL)
-        qa_range_error("entityTranslate requires entity shaderTexCoord");
+        qa_raise("Error", 0, 0, "entityTranslate requires entity shaderTexCoord");
       double x = fr(context.shader_tex_coord->x * time);
       double y = fr(context.shader_tex_coord->y * time);
       result = (qa_vec2){s + fr(x - floor(x)), t + fr(y - floor(y))};
@@ -138,8 +138,9 @@ static qa_texture_binding texture_binding(
   }
   double index = qa_animated_picture_index(time, playback.frequency,
                                            (double)playback.frame_count);
-  if ((size_t)index >= playback.frame_count)
-    qa_range_error("Animation frame is outside the registered image bundle");
+  /* frames[index]: a NaN, negative or fractional index is undefined. */
+  if (!(index >= 0 && index == trunc(index) && index < (double)playback.frame_count))
+    qa_raise("Error", 0, 0, "Animation frame is outside the registered image bundle");
   out.image = playback.frames[(size_t)index].image;
   return out;
 }
@@ -151,7 +152,7 @@ static qa_vec2 coordinates(const qa_mat_finished_iterator_stage *bundle,
   qa_vec2 input = vertex.tex_coord;
   switch (bundle->tc_gen) {
     case QA_MAT_TCGEN_BAD:
-      qa_range_error("Uninitialized source texture coordinates need retained tess storage");
+      qa_raise("Error", 0, 0, "Uninitialized source texture coordinates need retained tess storage");
     case QA_MAT_TCGEN_IDENTITY:
       input = (qa_vec2){0, 0};
       stage.tc_gen.kind = "texture";
@@ -163,13 +164,13 @@ static qa_vec2 coordinates(const qa_mat_finished_iterator_stage *bundle,
       break;
     case QA_MAT_TCGEN_FOG:
       if (context->fog == NULL)
-        qa_range_error("Fog texture coordinates require the current volume");
+        qa_raise("Error", 0, 0, "Fog texture coordinates require the current volume");
       input = context->fog->coordinates(context->fog->ctx, vertex.position);
       stage.tc_gen.kind = "texture";
       break;
     case QA_MAT_TCGEN_VECTOR:
       if (!eq(stage.tc_gen.kind, "vector"))
-        qa_range_error("Vector texture coordinates lost source projection vectors");
+        qa_raise("Error", 0, 0, "Vector texture coordinates lost source projection vectors");
       break;
     default: break;
   }
@@ -199,7 +200,7 @@ static void apply_change(qa_source_state_change change, void *ctx) {
     state->result.alpha_test = change.value;
   } else if (eq(change.kind, "polygon-mode")) {
     if (eq(change.value, "line"))
-      qa_range_error("Material polygon-line state requires explicit line geometry");
+      qa_raise("Error", 0, 0, "Material polygon-line state requires explicit line geometry");
   }
 }
 static qa_render_state retained_state(uint32_t bits, qa_render_state initial) {
@@ -249,11 +250,34 @@ static qa_batch_fog *make_fog(const char *effect, qa_vec3 color,
   return fog;
 }
 
+/* Everything an evaluation owns while it runs: a deformation, colour, coordinate, projection or
+ * lighting callback that raises (TS GC) releases all of it. */
+typedef struct evaluate_guard {
+  qa_material_deform_state *state;
+  qa_material_vertex *owned_vertices;
+  double *owned_indices;
+  qa_vec4 *previous_colors, *first_positions;
+  qa_mat_material_iterator *owned_iterator;
+  qa_render_vertex *vertices; /* the pass being built */
+  struct batch_list *list;
+} evaluate_guard;
+static void evaluate_release(void *raw) {
+  evaluate_guard *guard = raw;
+  if (guard->state != NULL) qa_material_deform_state_destroy(guard->state);
+  free(guard->owned_vertices);
+  free(guard->owned_indices);
+  free(guard->previous_colors);
+  free(guard->first_positions);
+  if (guard->owned_iterator != NULL) qa_mat_material_iterator_destroy(guard->owned_iterator);
+  free(guard->vertices);
+  qa_mat_draw_batches_destroy(guard->list->batches, guard->list->count);
+}
+
 qa_draw_batch *qa_prepare_material_batches(
     const qa_mat_compiled_material *compiled, qa_material_geometry input,
     const qa_material_draw_context *context, size_t *out_count) {
   if (eq(compiled->finished.iterator.kind, "sky"))
-    qa_range_error("Sky materials require sky-box/cloud geometry preparation before ordinary stage evaluation");
+    qa_raise("Error", 0, 0, "Sky materials require sky-box/cloud geometry preparation before ordinary stage evaluation");
   return qa_evaluate_material_passes(compiled, input, context, out_count);
 }
 
@@ -268,6 +292,13 @@ qa_draw_batch *qa_evaluate_material_passes(
   qa_material_deform_state state;
   qa_material_deform_state_init(&state, input, context->refdef_time,
       context->render_text, context->render_text_count, definition.name);
+  struct batch_list list = {NULL, 0, 0};
+  evaluate_guard guard;
+  memset(&guard, 0, sizeof guard);
+  guard.state = &state;
+  guard.list = &list;
+  qa_cleanup guard_node;
+  qa_cleanup_push(&guard_node, evaluate_release, &guard);
   qa_deform_geometry geometry = qa_deform_geometry_apply(&state,
       definition.deforms, definition.deform_count, context->deform_view, time,
       context->noise, context->projection_shadow);
@@ -276,19 +307,23 @@ qa_draw_batch *qa_evaluate_material_passes(
   size_t vcount = geometry.vertex_count;
   qa_material_vertex *owned_vertices = malloc(
       (vcount > 0 ? vcount : 1) * sizeof *owned_vertices);
-  double *owned_indices = copy_indices(geometry);
+  guard.owned_vertices = owned_vertices;
   if (owned_vertices == NULL) qa_range_error("evaluate allocation failed");
+  double *owned_indices = copy_indices(geometry);
+  guard.owned_indices = owned_indices;
   if (vcount > 0)
     memcpy(owned_vertices, geometry.vertices, vcount * sizeof *owned_vertices);
   geometry.vertices = owned_vertices;
   geometry.indices = owned_indices;
   qa_material_deform_state_destroy(&state);
+  guard.state = NULL;
 
-  struct batch_list list = {NULL, 0, 0};
   qa_vec4 *previous_colors = calloc(vcount > 0 ? vcount : 1,
                                     sizeof *previous_colors);
   qa_vec4 *first_positions = malloc(
       (vcount > 0 ? vcount : 1) * sizeof *first_positions);
+  guard.previous_colors = previous_colors;
+  guard.first_positions = first_positions;
   if (previous_colors == NULL || first_positions == NULL)
     qa_range_error("evaluate allocation failed");
   bool have_first_positions = false;
@@ -324,6 +359,7 @@ qa_draw_batch *qa_evaluate_material_passes(
     owned_iterator = qa_source_material_iterator(iterator_input, profile);
     iterator = &owned_iterator;
     own_iterator = true;
+    guard.owned_iterator = &owned_iterator;
   }
 
   for (size_t pi = 0; pi < iterator->pass_count; pi++) {
@@ -345,6 +381,7 @@ qa_draw_batch *qa_evaluate_material_passes(
     qa_render_vertex *vertices = malloc(
         (vcount > 0 ? vcount : 1) * sizeof *vertices);
     if (vertices == NULL) qa_range_error("evaluate allocation failed");
+    guard.vertices = vertices;
     for (size_t vi = 0; vi < vcount; vi++) {
       qa_material_vertex vertex = geometry.vertices[vi];
       qa_stage_color_context color_ctx;
@@ -392,29 +429,33 @@ qa_draw_batch *qa_evaluate_material_passes(
       }
       batch->vertices = vertices;
       batch->vertex_count = vcount;
+      guard.vertices = NULL;
     } else {
       if (!second->active)
-        qa_range_error("Collapsed stage lost its second registered texture");
+        qa_raise("Error", 0, 0, "Collapsed stage lost its second registered texture");
       qa_texture_binding second_texture = texture_binding(second, time);
       qa_multitexture_vertex *paired = malloc(
           (vcount > 0 ? vcount : 1) * sizeof *paired);
       if (paired == NULL) qa_range_error("evaluate allocation failed");
+      batch->pair_vertices = paired; /* owned by the batch from here (the guard frees it) */
       for (size_t vi = 0; vi < vcount; vi++) {
         paired[vi].vertex = vertices[vi];
         paired[vi].tex_coord2 = coordinates(second, geometry.vertices[vi],
                                              time, context);
       }
-      free(vertices);
-      batch->lighting.kind = "vertex";
-      batch->texturing_is_pair = true;
       batch->pair_vertices = paired;
       batch->pair_vertex_count = vcount;
+      free(vertices);
+      guard.vertices = NULL;
+      batch->lighting.kind = "vertex";
+      batch->texturing_is_pair = true;
       batch->second_texture.binding = second_texture;
       batch->second_texture.environment =
           eq(iterator->multitexture_env, "add") ? "add" : "modulate";
     }
   }
   if (own_iterator) qa_mat_material_iterator_destroy(&owned_iterator);
+  guard.owned_iterator = NULL;
 
   if (context->dynamic_light_batches != NULL &&
       qa_receives_projected_dlights(compiled)) {
@@ -453,6 +494,7 @@ qa_draw_batch *qa_evaluate_material_passes(
     qa_render_vertex *vertices = malloc(
         (vcount > 0 ? vcount : 1) * sizeof *vertices);
     if (vertices == NULL) qa_range_error("evaluate allocation failed");
+    batch->vertices = vertices; /* the guard frees it with the batch if a callback raises */
     for (size_t vi = 0; vi < vcount; vi++) {
       vertices[vi].position = context->project.project(
           context->project.ctx, geometry.vertices[vi].position);
@@ -486,6 +528,7 @@ qa_draw_batch *qa_evaluate_material_passes(
       qa_render_vertex *vertices = malloc(
           (vcount > 0 ? vcount : 1) * sizeof *vertices);
       if (vertices == NULL) qa_range_error("evaluate allocation failed");
+      batch->vertices = vertices; /* the guard frees it with the batch if a callback raises */
       for (size_t vi = 0; vi < vcount; vi++) {
         vertices[vi].position = context->project.project(
             context->project.ctx, geometry.vertices[vi].position);
@@ -497,6 +540,7 @@ qa_draw_batch *qa_evaluate_material_passes(
     }
   }
 
+  qa_cleanup_pop(&guard_node);
   free(previous_colors);
   free(first_positions);
   free(owned_vertices);

@@ -5,6 +5,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#include "qa/foundation/support.h"
 #include <string.h>
 
 typedef struct chunk_range {
@@ -35,13 +37,42 @@ static void four_cc(qa_binary_reader *reader, char out[5]) {
   out[4] = '\0';
 }
 
+/* JSON.stringify(String.fromCharCode(...four bytes)): each byte is a Latin-1
+ * code unit (two UTF-8 bytes past 0x7f) and control units are escaped, NUL
+ * included. `out` holds at least 4 * 6 + 3 bytes. */
+static void json_four_cc(const uint8_t bytes[4], char out[32]) {
+  size_t at = 0;
+  out[at++] = '"';
+  for (int i = 0; i < 4; i++) {
+    uint8_t b = bytes[i];
+    if (b == '"' || b == '\\') {
+      out[at++] = '\\';
+      out[at++] = (char)b;
+    } else if (b == '\b' || b == '\f' || b == '\n' || b == '\r' || b == '\t') {
+      out[at++] = '\\';
+      out[at++] = b == '\b' ? 'b' : b == '\f' ? 'f' : b == '\n' ? 'n' : b == '\r' ? 'r' : 't';
+    } else if (b < 0x20) {
+      at += (size_t)snprintf(out + at, 32 - at, "\\u%04x", b);
+    } else if (b >= 0x80) {
+      out[at++] = (char)(0xc0 | (b >> 6));
+      out[at++] = (char)(0x80 | (b & 0x3f));
+    } else {
+      out[at++] = (char)b;
+    }
+  }
+  out[at++] = '"';
+  out[at] = '\0';
+}
+
 static void expect_four_cc(qa_binary_reader *reader, const char *expected) {
   size_t offset = qa_binary_reader_offset(reader);
-  char actual[5];
-  four_cc(reader, actual);
-  if (strcmp(actual, expected) != 0)
-    reject(reader->source, (int64_t)offset,
-           "expected \"%s\", got \"%s\"", expected, actual);
+  uint8_t actual[4];
+  for (int i = 0; i < 4; i++) actual[i] = qa_binary_reader_u8(reader);
+  if (memcmp(actual, expected, 4) != 0) {
+    char quoted[32];
+    json_four_cc(actual, quoted);
+    reject(reader->source, (int64_t)offset, "expected \"%s\", got %s", expected, quoted);
+  }
 }
 
 static bool matches_four_cc(qa_binary_reader *reader, int64_t offset,
@@ -93,8 +124,13 @@ static bool pcm_samples(qa_binary_reader *reader, int64_t data_offset,
     samples = malloc((size_t)sample_count * sizeof *samples);
     if (samples == NULL) return false;
   }
+  /* A data chunk that claims more samples than the file holds raises a
+   * BinaryError partway: the sample buffer must not leak when it is caught. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, samples);
   for (int64_t i = 0; i < sample_count; i++)
     samples[i] = (int16_t)pcm_sample(reader, data_offset, bytes_per_sample, i);
+  qa_cleanup_pop(&guard);
   *out = samples;
   return true;
 }
@@ -110,6 +146,11 @@ void qa_decoded_wav_dispose(qa_decoded_wav *sound) {
   qa_pcm_sound_dispose(&sound->pcm);
 }
 
+static void info_release(void *info) {
+  qa_binary_reader_destroy(&((qa_wav_info *)info)->reader);
+  ((qa_wav_info *)info)->source = NULL;
+}
+
 bool qa_read_wav_info(qa_wav_info *info, uint8_t *bytes, size_t byte_length,
                       int64_t length, const char *source,
                       qa_wav_print_fn print_fn, void *print_ctx) {
@@ -118,6 +159,10 @@ bool qa_read_wav_info(qa_wav_info *info, uint8_t *bytes, size_t byte_length,
     return false;
   info->source = info->reader.source;
   const char *src = info->reader.source;
+  /* TS returns no info when GetWavinfo throws: a caught raise must not leave
+   * the reader's source allocated behind the caller's back. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, info_release, info);
   if (length < 0 || length > (int64_t)info->reader.length)
     reject(src, 0, "WAV file length %lld exceeds its physical allocation",
            (long long)length);
@@ -125,12 +170,14 @@ bool qa_read_wav_info(qa_wav_info *info, uint8_t *bytes, size_t byte_length,
   if (!find_chunk(&info->reader, 0, length, "RIFF", &riff) ||
       !matches_four_cc(&info->reader, riff.offset, "WAVE")) {
     print_fn("Missing RIFF/WAVE chunks\n", print_ctx);
+    qa_cleanup_pop(&guard);
     return true;
   }
   int64_t chunk_start = riff.offset + 4;
   chunk_range format;
   if (!find_chunk(&info->reader, chunk_start, length, "fmt ", &format)) {
     print_fn("Missing fmt chunk\n", print_ctx);
+    qa_cleanup_pop(&guard);
     return true;
   }
   qa_binary_reader_seek(&info->reader, format.offset);
@@ -142,17 +189,20 @@ bool qa_read_wav_info(qa_wav_info *info, uint8_t *bytes, size_t byte_length,
       (int64_t)(qa_binary_reader_i16(&info->reader) / 8);
   if (encoding != 1) {
     print_fn("Microsoft PCM format only\n", print_ctx);
+    qa_cleanup_pop(&guard);
     return true;
   }
   chunk_range data;
   if (!find_chunk(&info->reader, chunk_start, length, "data", &data)) {
     print_fn("Missing data chunk\n", print_ctx);
+    qa_cleanup_pop(&guard);
     return true;
   }
   if (info->source_bytes_per_sample == 0)
     reject(src, data.offset - 4, "WAV sample count divides by zero source width");
   info->frame_count = data.length / info->source_bytes_per_sample;
   info->data_offset = data.offset;
+  qa_cleanup_pop(&guard);
   return true;
 }
 
@@ -209,10 +259,11 @@ static void parse_format(qa_binary_reader *reader, const char *source,
   if (block_align != expected_align)
     reject(source, chunk_offset + 12,
            "WAV block alignment %u does not match %u", block_align, expected_align);
-  uint32_t expected_rate = sample_rate * block_align;
+  /* TS sampleRate * blockAlign is a double product: it does not wrap at 2^32. */
+  uint64_t expected_rate = (uint64_t)sample_rate * block_align;
   if (byte_rate != expected_rate)
-    reject(source, chunk_offset + 8, "WAV byte rate %u does not match %u",
-           byte_rate, expected_rate);
+    reject(source, chunk_offset + 8, "WAV byte rate %u does not match %llu",
+           byte_rate, (unsigned long long)expected_rate);
   out->sample_rate = sample_rate;
   out->channels = (int)channels;
   out->bytes_per_sample = bytes_per_sample;
@@ -256,6 +307,18 @@ static int64_t parse_sampler_loop(qa_binary_reader *reader, const char *source,
   return (int64_t)start;
 }
 
+typedef struct pcm_scan {
+  qa_binary_reader *reader, *section;
+  int16_t **samples;
+} pcm_scan;
+static void pcm_scan_release(void *arg) {
+  pcm_scan *scan = (pcm_scan *)arg;
+  qa_binary_reader_destroy(scan->section);
+  qa_binary_reader_destroy(scan->reader);
+  free(*scan->samples);
+  *scan->samples = NULL;
+}
+
 static bool decode_pcm(const uint8_t *bytes, size_t length, const char *source,
                        bool source_signed_chunks, bool read_loops,
                        qa_decoded_wav *out) {
@@ -267,6 +330,14 @@ static bool decode_pcm(const uint8_t *bytes, size_t length, const char *source,
     return false;
   const char *src = reader.source;
   bool ok = false;
+  /* A malformed file raises a BinaryError mid-scan: the reader, an open chunk
+   * section and the samples go with it (TS leaves them to the GC). */
+  qa_binary_reader section;
+  memset(&section, 0, sizeof section);
+  int16_t *samples = NULL;
+  pcm_scan scan = {&reader, &section, &samples};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, pcm_scan_release, &scan);
   if (reader.length < 12) reject(src, 0, "truncated RIFF/WAVE header");
   expect_four_cc(&reader, "RIFF");
   uint32_t riff_size = qa_binary_reader_u32(&reader);
@@ -291,35 +362,35 @@ static bool decode_pcm(const uint8_t *bytes, size_t length, const char *source,
     uint32_t chunk_length = qa_binary_reader_u32(&reader);
     if (source_signed_chunks && chunk_length > 0x7fffffffu) break;
     int64_t chunk_offset = (int64_t)qa_binary_reader_offset(&reader);
-    if ((uint64_t)chunk_offset > riff_end - chunk_length) {
+    /* TS compares in doubles: a chunk longer than the RIFF extent makes the
+     * right side negative (unsigned arithmetic wrapped it to a huge bound). */
+    if (chunk_offset > (int64_t)riff_end - (int64_t)chunk_length) {
       if (source_signed_chunks && have_format && have_data &&
-          strcmp(chunk_id, "LIST") == 0 && riff_end - (uint64_t)chunk_offset >= 4 &&
+          memcmp(chunk_id, "LIST", 4) == 0 && riff_end - (uint64_t)chunk_offset >= 4 &&
           matches_four_cc(&reader, chunk_offset, "INFO"))
         break;
-      reject(src, header_offset + 4, "WAV chunk \"%s\" exceeds RIFF bounds",
-             chunk_id);
+      char quoted[32];
+      json_four_cc((const uint8_t *)chunk_id, quoted);
+      reject(src, header_offset + 4, "WAV chunk %s exceeds RIFF bounds", quoted);
     }
     uint64_t chunk_end = (uint64_t)chunk_offset + chunk_length;
     uint64_t next = chunk_end < riff_end ? chunk_end + (chunk_length & 1) : chunk_end;
-    if (strcmp(chunk_id, "fmt ") == 0 && !have_format) {
-      qa_binary_reader section;
+    if (memcmp(chunk_id, "fmt ", 4) == 0 && !have_format) {
       if (!qa_binary_reader_section(&reader, chunk_offset, chunk_length, &section))
         goto done;
       parse_format(&section, src, chunk_offset, &format);
       qa_binary_reader_destroy(&section);
       have_format = true;
-    } else if (strcmp(chunk_id, "data") == 0 && !have_data) {
+    } else if (memcmp(chunk_id, "data", 4) == 0 && !have_data) {
       data.offset = chunk_offset;
       data.length = chunk_length;
       have_data = true;
-    } else if (read_loops && strcmp(chunk_id, "cue ") == 0 && !has_cue) {
-      qa_binary_reader section;
+    } else if (read_loops && memcmp(chunk_id, "cue ", 4) == 0 && !has_cue) {
       if (!qa_binary_reader_section(&reader, chunk_offset, chunk_length, &section))
         goto done;
       cue_loop = parse_cue_loop(&section, src, chunk_offset, &has_cue);
       qa_binary_reader_destroy(&section);
-    } else if (read_loops && strcmp(chunk_id, "smpl") == 0 && !has_sampler) {
-      qa_binary_reader section;
+    } else if (read_loops && memcmp(chunk_id, "smpl", 4) == 0 && !has_sampler) {
       if (!qa_binary_reader_section(&reader, chunk_offset, chunk_length, &section))
         goto done;
       sampler_loop =
@@ -339,7 +410,6 @@ static bool decode_pcm(const uint8_t *bytes, size_t length, const char *source,
   int64_t sample_count = frame_count * format.channels;
   bool has_loop = has_cue || has_sampler;
   int64_t loop_start = has_cue ? cue_loop : sampler_loop;
-  int16_t *samples = NULL;
   if (format.bytes_per_sample == 3) {
     if (sample_count > 0) {
       samples = malloc((size_t)sample_count * sizeof *samples);
@@ -354,7 +424,6 @@ static bool decode_pcm(const uint8_t *bytes, size_t length, const char *source,
     goto done;
   }
   if (has_loop && loop_start >= frame_count) {
-    free(samples);
     reject(src, data.offset, "WAV loop start %lld is outside %lld frames",
            (long long)loop_start, (long long)frame_count);
   }
@@ -366,9 +435,11 @@ static bool decode_pcm(const uint8_t *bytes, size_t length, const char *source,
   out->pcm.sample_count = (size_t)sample_count;
   out->pcm.frame_count = frame_count;
   out->pcm.loop_start = has_loop ? loop_start : -1;
+  samples = NULL;
   ok = true;
 done:
-  qa_binary_reader_destroy(&reader);
+  qa_cleanup_pop(&guard);
+  pcm_scan_release(&scan);
   return ok;
 }
 
@@ -382,6 +453,16 @@ bool qa_decode_q3_wav(const uint8_t *bytes, size_t length, const char *source,
   return decode_pcm(bytes, length, source, true, false, out);
 }
 
+typedef struct quake_scan {
+  qa_binary_reader *reader;
+  qa_decoded_wav *out;
+} quake_scan;
+static void quake_scan_release(void *arg) {
+  quake_scan *scan = (quake_scan *)arg;
+  qa_binary_reader_destroy(scan->reader);
+  qa_decoded_wav_dispose(scan->out);
+}
+
 bool qa_decode_quake_wav(const uint8_t *bytes, size_t length,
                          const char *source, qa_decoded_wav *out) {
   if (!decode_pcm(bytes, length, source, true, true, out)) return false;
@@ -393,6 +474,11 @@ bool qa_decode_quake_wav(const uint8_t *bytes, size_t length,
     return false;
   }
   const char *src = reader.source;
+  /* TS throws out of the LIST scan (a read past the file, a bad loop end):
+   * the decoded PCM and the reader go with the raise. */
+  quake_scan scan = {&reader, out};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, quake_scan_release, &scan);
   bool cue_seen = false, has_loop_end = false;
   int64_t loop_end = 0;
   qa_binary_reader_seek(&reader, 12);
@@ -408,14 +494,16 @@ bool qa_decode_quake_wav(const uint8_t *bytes, size_t length,
     uint32_t chunk_length = qa_binary_reader_u32(&reader);
     int64_t start = (int64_t)qa_binary_reader_offset(&reader);
     if (chunk_length > 0x7fffffffu) break;
-    if ((uint64_t)start > riff_end - chunk_length &&
-        strcmp(name, "LIST") == 0 && riff_end - (uint64_t)start >= 4 &&
+    /* Signed, as the TS doubles: a long chunk must not wrap the bound. */
+    if (start > (int64_t)riff_end - (int64_t)chunk_length &&
+        memcmp(name, "LIST", 4) == 0 && (int64_t)riff_end - start >= 4 &&
         matches_four_cc(&reader, start, "INFO"))
       break;
-    if (strcmp(name, "cue ") == 0) cue_seen = true;
-    if (cue_seen && strcmp(name, "LIST") == 0 && chunk_length >= 24) {
+    if (memcmp(name, "cue ", 4) == 0) cue_seen = true;
+    if (cue_seen && memcmp(name, "LIST", 4) == 0 && chunk_length >= 24) {
       qa_binary_reader list;
       if (!qa_binary_reader_section(&reader, start, chunk_length, &list)) {
+        qa_cleanup_pop(&guard);
         qa_binary_reader_destroy(&reader);
         qa_decoded_wav_dispose(out);
         return false;
@@ -423,7 +511,7 @@ bool qa_decode_quake_wav(const uint8_t *bytes, size_t length,
       qa_binary_reader_seek(&list, 20);
       char mark[5];
       four_cc(&list, mark);
-      if (strcmp(mark, "mark") == 0) {
+      if (memcmp(mark, "mark", 4) == 0) {
         qa_binary_reader_seek(&list, 16);
         loop_end = out->pcm.loop_start + (int64_t)qa_binary_reader_u32(&list);
         has_loop_end = true;
@@ -437,10 +525,13 @@ bool qa_decode_quake_wav(const uint8_t *bytes, size_t length,
                           (int64_t)(next < riff_end ? next : riff_end));
   }
   int64_t end_offset = (int64_t)qa_binary_reader_offset(&reader);
+  /* Raised while the reader (whose name `src` is) is still alive; the guard
+   * releases it and the PCM after the message is formatted. */
+  if (has_loop_end && (loop_end <= out->pcm.loop_start || loop_end > out->pcm.frame_count))
+    qa_binary_error(src, end_offset, "Sound Forge loop end outside WAV frames");
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   if (!has_loop_end) return true;
-  if (loop_end <= out->pcm.loop_start || loop_end > out->pcm.frame_count)
-    qa_binary_error(src, end_offset, "Sound Forge loop end outside WAV frames");
   out->pcm.frame_count = loop_end;
   out->pcm.sample_count = (size_t)(loop_end * out->pcm.channels);
   return true;
@@ -503,7 +594,7 @@ static bool valid_format(const uint8_t *bytes, uint64_t offset,
   if (bits != 8 && bits != 16 && bits != 24) return false;
   int bytes_per_sample = bits == 8 ? 1 : bits == 16 ? 2 : 3;
   if (block_align != channels * (uint32_t)bytes_per_sample) return false;
-  if (byte_rate != sample_rate * block_align) return false;
+  if (byte_rate != (uint64_t)sample_rate * block_align) return false;
   out->sample_rate = sample_rate;
   out->channels = (int)channels;
   out->bytes_per_sample = bytes_per_sample;

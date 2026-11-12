@@ -52,7 +52,7 @@ void qa_app_sim_simulation_events_append(qa_app_sim_simulation_events *events,
     if (payload.kind == QA_SIM_EVENT_SOUND || (payload.kind == QA_SIM_EVENT_MESSAGE
         && (payload.event.kind == QA_NETWORK_EVENT_SOUND || payload.event.kind == QA_NETWORK_EVENT_Q1_PARTICLE
             || payload.event.kind == QA_NETWORK_EVENT_Q2_MUZZLE_FLASH))) return;
-    qa_range_error("Simulation event capacity exhausted (%d undrained events); publish output before admitting more",
+    qa_raise("Error", 0, 0, "Simulation event capacity exhausted (%d undrained events); publish output before admitting more",
         QA_APP_SIM_SIMULATION_EVENT_CAPACITY);
   }
   qa_simulation_event event; memset(&event, 0, sizeof event);
@@ -114,7 +114,7 @@ size_t qa_app_sim_simulation_events_drain(qa_app_sim_simulation_events *events,
 void qa_app_sim_simulation_events_assert_output_consumed(qa_app_sim_simulation_events *events) {
   if (events->options.assert_super_output_consumed)
     events->options.assert_super_output_consumed(events->options.ctx);
-  if (events->emitted_count != 0) qa_range_error("Save requires consumed source output");
+  if (events->emitted_count != 0) qa_raise("Error", 0, 0, "Save requires consumed source output");
 }
 double qa_app_sim_simulation_events_capture_sequence(const qa_app_sim_simulation_events *events) { return events->sequence; }
 void qa_app_sim_simulation_events_restore(qa_app_sim_simulation_events *events, const qa_save_reader *reader) {
@@ -130,10 +130,17 @@ static void sound_event(qa_app_sim_simulation_events *e, qa_content_id content, 
   qa_resource_id resource = NULL;
   bool found = e->options.resource_for(e->options.ctx, content, path, &resource);
   if (!found) {
-    char prefixed[1024];
-    int written = snprintf(prefixed, sizeof prefixed, "sound/%s", path);
-    if (written < 0 || (size_t)written >= sizeof prefixed) return;
+    /* `sound/${path}`: no length limit. */
+    size_t length = strlen(path);
+    char *prefixed = malloc(length + 7);
+    if (prefixed == NULL) qa_range_error("Out of memory");
+    memcpy(prefixed, "sound/", 6);
+    memcpy(prefixed + 6, path, length + 1);
+    qa_cleanup cleanup;
+    qa_cleanup_push(&cleanup, free, prefixed);
     found = e->options.resource_for(e->options.ctx, content, prefixed, &resource);
+    qa_cleanup_pop(&cleanup);
+    free(prefixed);
   }
   if (!found) return;
   qa_simulation_event_payload payload; memset(&payload, 0, sizeof payload);

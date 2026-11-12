@@ -9,20 +9,26 @@
 #include "qa/core/binary/index.h"
 #include "qa/formats/images/mip.h"
 
+static void free_pointer(void *slot) { free(*(void **)slot); }
+
 static int sub_blocks(qa_binary_reader *reader, uint8_t **out, size_t *out_length) {
   uint8_t *buffer = NULL;
   size_t total = 0;
+  /* A truncated block raises from the reader: the bytes gathered so far must go. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_pointer, &buffer);
   for (int count = qa_binary_reader_u8(reader); count != 0;
        count = qa_binary_reader_u8(reader)) {
     uint8_t *block = qa_binary_reader_bytes(reader, count);
-    if (block == NULL) { free(buffer); return 0; }
+    if (block == NULL) { qa_cleanup_pop(&guard); free(buffer); return 0; }
     uint8_t *grown = (uint8_t *)realloc(buffer, total + (size_t)count);
-    if (grown == NULL) { free(block); free(buffer); return 0; }
+    if (grown == NULL) { qa_cleanup_pop(&guard); free(block); free(buffer); return 0; }
     buffer = grown;
     memcpy(buffer + total, block, (size_t)count);
     free(block);
     total += (size_t)count;
   }
+  qa_cleanup_pop(&guard);
   *out = buffer;
   *out_length = total;
   return 1;
@@ -53,11 +59,12 @@ static int lzw(const uint8_t *data, size_t data_length, int64_t minimum,
   while (written < count) {
     if (bit + size > (int64_t)data_length * 8) {
       free(output);
-      qa_binary_error(source, bit >> 3, "Truncated GIF LZW data");
+      qa_binary_error(source, (int64_t)((uint32_t)bit >> 3), "Truncated GIF LZW data");
     }
     int code = 0;
+    /* TS bits.getUint8(bit >>> 3): the bit index wraps at 2^32. */
     for (int i = 0; i < size; i++, bit++) {
-      code |= ((data[bit >> 3] >> (bit & 7)) & 1) << i;
+      code |= ((data[(uint32_t)bit >> 3] >> (bit & 7)) & 1) << i;
     }
     if (code == clear) {
       for (int i = 0; i < clear; i++) {
@@ -84,11 +91,11 @@ static int lzw(const uint8_t *data, size_t data_length, int64_t minimum,
       entry_first = first[previous];
     } else {
       free(output);
-      qa_binary_error(source, bit >> 3, "Invalid GIF LZW code");
+      qa_binary_error(source, (int64_t)((uint32_t)bit >> 3), "Invalid GIF LZW code");
     }
     if (entry_length > count - written) {
       free(output);
-      qa_binary_error(source, bit >> 3, "Invalid GIF LZW code");
+      qa_binary_error(source, (int64_t)((uint32_t)bit >> 3), "Invalid GIF LZW code");
     }
     int sp = 0;
     if (kwkwk) stack[sp++] = (uint8_t)entry_first;
@@ -108,7 +115,7 @@ static int lzw(const uint8_t *data, size_t data_length, int64_t minimum,
   }
   if (written != count) {
     free(output);
-    qa_binary_error(source, bit >> 3, "Incomplete GIF image");
+    qa_binary_error(source, (int64_t)((uint32_t)bit >> 3), "Incomplete GIF image");
   }
   *out = output;
   return 1;
@@ -128,6 +135,11 @@ void qa_gif_image_destroy(qa_gif_image *image) {
   image->global_palette_length = 0;
 }
 
+static void frame_release(void *arg) {
+  void **owned = (void **)arg;
+  for (int i = 0; i < 6; i++) free(owned[i]);
+}
+
 static int gif_frame(qa_binary_reader *reader, const char *name, int64_t width,
                      int64_t height, const uint8_t *global_palette,
                      size_t global_palette_length, uint8_t *canvas,
@@ -145,38 +157,50 @@ static int gif_frame(qa_binary_reader *reader, const char *name, int64_t width,
   }
   const uint8_t *palette = global_palette;
   size_t palette_length = global_palette_length;
-  uint8_t *local_palette = NULL;
+  uint8_t *local_palette = NULL, *compressed = NULL, *decoded = NULL, *indices = NULL;
+  uint8_t *previous = NULL;
+  int64_t *rows = NULL;
+  /* A BinaryError from the frame body must not leak its working buffers. */
+  void *owned[6] = {0};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, frame_release, owned);
+#define GIF_FRAME_TRACK()                                                       \
+  (owned[0] = local_palette, owned[1] = compressed, owned[2] = decoded,         \
+   owned[3] = indices, owned[4] = previous, owned[5] = rows)
   if ((flags & 128) != 0) {
     palette_length = (size_t)(2 << (flags & 7)) * 3;
     local_palette = qa_binary_reader_bytes(reader, (int64_t)palette_length);
-    if (local_palette == NULL) return 0;
+    if (local_palette == NULL) { qa_cleanup_pop(&guard); return 0; }
     palette = local_palette;
+    GIF_FRAME_TRACK();
   }
   if (palette == NULL) {
     qa_binary_error(name, (int64_t)qa_binary_reader_offset(reader),
                     "GIF frame has no palette");
   }
   int64_t minimum = qa_binary_reader_u8(reader);
-  uint8_t *compressed = NULL;
   size_t compressed_length = 0;
   if (!sub_blocks(reader, &compressed, &compressed_length)) {
+    qa_cleanup_pop(&guard);
     free(local_palette);
     return 0;
   }
-  uint8_t *decoded = NULL;
+  GIF_FRAME_TRACK();
   int ok = lzw(compressed, compressed_length, minimum, frame_width * frame_height,
                name, &decoded);
   free(compressed);
-  if (!ok) { free(local_palette); return 0; }
-  int64_t *rows = (int64_t *)malloc((size_t)frame_height * sizeof(int64_t));
-  uint8_t *indices =
-      (uint8_t *)malloc((size_t)(frame_width * frame_height));
-  uint8_t *previous = NULL;
+  compressed = NULL;
+  GIF_FRAME_TRACK();
+  if (!ok) { qa_cleanup_pop(&guard); free(local_palette); return 0; }
+  rows = (int64_t *)malloc((size_t)frame_height * sizeof(int64_t));
+  indices = (uint8_t *)malloc((size_t)(frame_width * frame_height));
   if (disposal == 3) {
     previous = (uint8_t *)malloc(canvas_length);
     if (previous != NULL) memcpy(previous, canvas, canvas_length);
   }
+  GIF_FRAME_TRACK();
   if (rows == NULL || indices == NULL || (disposal == 3 && previous == NULL)) {
+    qa_cleanup_pop(&guard);
     free(rows);
     free(indices);
     free(previous);
@@ -215,14 +239,16 @@ static int gif_frame(qa_binary_reader *reader, const char *name, int64_t width,
   }
   free(rows);
   free(decoded);
+  rows = NULL;
+  decoded = NULL;
+  GIF_FRAME_TRACK();
+#undef GIF_FRAME_TRACK
   *retained_bytes += (double)canvas_length;
   if (*frame_count >= QA_MAX_ANIMATION_FRAMES || *retained_bytes > QA_MAX_ANIMATION_BYTES) {
-    free(indices);
-    free(previous);
-    free(local_palette);
     qa_binary_error(name, (int64_t)qa_binary_reader_offset(reader),
                     "GIF exceeds the frame or decoded size limit");
   }
+  qa_cleanup_pop(&guard);
   if (*frame_count == *frame_capacity) {
     size_t capacity = *frame_capacity == 0 ? 4 : *frame_capacity * 2;
     qa_gif_frame *grown =
@@ -366,7 +392,12 @@ int qa_decode_gif(const uint8_t *bytes, size_t length, const char *source,
         if (application == NULL) { oom = 1; break; }
         uint8_t *payload = NULL;
         size_t payload_length = 0;
-        if (!sub_blocks(&reader, &payload, &payload_length)) {
+        /* A truncated payload raises: the application name must not leak. */
+        qa_cleanup application_guard;
+        qa_cleanup_push(&application_guard, free_pointer, &application);
+        int read_ok = sub_blocks(&reader, &payload, &payload_length);
+        qa_cleanup_pop(&application_guard);
+        if (!read_ok) {
           free(application);
           oom = 1;
           break;

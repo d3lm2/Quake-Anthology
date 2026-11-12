@@ -10,7 +10,7 @@
 void qa_qvm_cgame_init_module(qa_qvm_cgame *cgame, qa_seat_id seat,
                               const qa_qvm_module_options *options, qa_qvm_cgame_lifetime lifetime) {
   if (strcmp(options->artifact->role, "cgame") != 0)
-    qa_range_error("QvmCgame requires a cgame artifact");
+    qa_raise("Error", 0, 0, "QvmCgame requires a cgame artifact");
   cgame->seat = seat;
   cgame->lifetime = lifetime;
   cgame->phase_kind = QA_QVM_CGAME_CREATED;
@@ -30,17 +30,24 @@ bool qa_qvm_cgame_get_supports_input_events(const qa_qvm_cgame *cgame) {
   return cgame->api.version >= 4;
 }
 
+/* TS `throw state.dropped`: the error leaves as the object it is. */
+static void raise_dropped(const qa_qvm_cgame_lifetime_state *state) {
+  if (state->dropped == NULL) return;
+  qa_raise(state->dropped_name != NULL ? state->dropped_name : "Error", state->dropped_code, state->dropped_detail,
+           "%s", state->dropped);
+}
+
 static void check_current(qa_qvm_cgame *cgame, qa_qvm_cgame_export command) {
   cgame->lifetime.assert_current_operation(cgame->lifetime.ctx);
-  if (cgame->phase_kind == QA_QVM_CGAME_RETIRED) qa_range_error("Cgame module has been retired");
+  if (cgame->phase_kind == QA_QVM_CGAME_RETIRED) qa_raise("Error", 0, 0, "Cgame module has been retired");
   if (command == QA_QVM_CGAME_EXPORT_CG_SHUTDOWN ||
       command == QA_QVM_CGAME_EXPORT_CG_CONSOLE_COMMAND)
     return;
-  if (cgame->phase_kind == QA_QVM_CGAME_CREATED) qa_range_error("Cgame module has not initialized");
+  if (cgame->phase_kind == QA_QVM_CGAME_CREATED) qa_raise("Error", 0, 0, "Cgame module has not initialized");
   qa_qvm_cgame_lifetime_state state = cgame->lifetime.current(cgame->lifetime.ctx);
-  if (state.dropped != NULL) qa_range_error("%s", state.dropped);
+  raise_dropped(&state);
   if (state.generation != cgame->phase_generation)
-    qa_range_error("Cgame module belongs to a stale engine gamestate");
+    qa_raise("Error", 0, 0, "Cgame module belongs to a stale engine gamestate");
 }
 
 typedef struct validate_ctx {
@@ -59,7 +66,7 @@ static double call_command(qa_qvm_cgame *cgame, qa_qvm_cgame_export command, con
   qa_qvm_abi_profile profile = qa_qvm_module_get_abi_profile(&cgame->module);
   bool modern = profile != NULL && strcmp(profile, "q3-modern") == 0;
   if (!modern && command > QA_QVM_CGAME_EXPORT_CG_LAST_ATTACKER)
-    qa_range_error("Legacy cgame does not export %d", (int)command);
+    qa_raise("Error", 0, 0, "Legacy cgame does not export %d", (int)command);
   int32_t words[16];
   words[0] = command;
   for (size_t i = 0; i < value_count; i++) words[i + 1] = qa_int32(values[i]);
@@ -70,28 +77,45 @@ static double call_command(qa_qvm_cgame *cgame, qa_qvm_cgame_export command, con
   return result;
 }
 
+typedef struct init_job {
+  qa_qvm_cgame *cgame;
+  double server_message_number, server_command_sequence, client_number, generation;
+} init_job;
+
+static void init_body(void *ctx) {
+  init_job *job = ctx;
+  qa_qvm_cgame *cgame = job->cgame;
+  double values[] = {job->server_message_number, job->server_command_sequence, job->client_number};
+  (void)call_command(cgame, QA_QVM_CGAME_EXPORT_CG_INIT, values, 3);
+  if (cgame->lifetime.current(cgame->lifetime.ctx).server_message_number != job->server_message_number)
+    qa_raise("Error", 0, 0, "Engine server message parsing must serialize behind CG_Init");
+  cgame->lifetime.prime(cgame->lifetime.ctx, job->generation);
+  cgame->phase_kind = QA_QVM_CGAME_INITIALIZED;
+  cgame->phase_generation = job->generation;
+}
+
 void qa_qvm_cgame_init(qa_qvm_cgame *cgame, double server_message_number,
                        double server_command_sequence, double client_number) {
   cgame->lifetime.assert_current_operation(cgame->lifetime.ctx);
   if (cgame->phase_kind == QA_QVM_CGAME_RETIRED || cgame->phase_kind == QA_QVM_CGAME_INITIALIZING)
-    qa_range_error("Cgame cannot initialize in its current lifecycle");
+    qa_raise("Error", 0, 0, "Cgame cannot initialize in its current lifecycle");
   qa_qvm_cgame_lifetime_state state = cgame->lifetime.current(cgame->lifetime.ctx);
-  if (state.dropped != NULL) qa_range_error("%s", state.dropped);
-  if (state.generation == 0) qa_range_error("CG_Init requires a live engine gamestate");
+  raise_dropped(&state);
+  if (state.generation == 0) qa_raise("Error", 0, 0, "CG_Init requires a live engine gamestate");
   if (state.server_message_number != server_message_number)
-    qa_range_error("CG_Init message differs from the active engine message");
+    qa_raise("Error", 0, 0, "CG_Init message differs from the active engine message");
   cgame->phase_kind = QA_QVM_CGAME_INITIALIZING;
   cgame->phase_generation = state.generation;
   cgame->lifetime.begin_loading(cgame->lifetime.ctx);
-  double values[] = {server_message_number, server_command_sequence, client_number};
-  (void)call_command(cgame, QA_QVM_CGAME_EXPORT_CG_INIT, values, 3);
-  if (cgame->lifetime.current(cgame->lifetime.ctx).server_message_number != server_message_number) {
+  /* TS try { CG_Init; the message check; prime } catch (error) { this.retire(); throw error }:
+   * a guest error inside CG_Init, a stale lifetime or a failed prime retires the
+   * module instead of leaving it initializing and callable. */
+  init_job job = {cgame, server_message_number, server_command_sequence, client_number, state.generation};
+  qa_caught_error caught;
+  if (!qa_try(init_body, &job, &caught)) {
     qa_qvm_cgame_retire(cgame);
-    qa_range_error("Engine server message parsing must serialize behind CG_Init");
+    qa_rethrow(&caught);
   }
-  cgame->lifetime.prime(cgame->lifetime.ctx, state.generation);
-  cgame->phase_kind = QA_QVM_CGAME_INITIALIZED;
-  cgame->phase_generation = state.generation;
 }
 
 void qa_qvm_cgame_shutdown(qa_qvm_cgame *cgame) {

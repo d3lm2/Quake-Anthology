@@ -4,14 +4,9 @@
 #include "qa/core/md4.h"
 #include "qa/foundation/support.h"
 #include <ctype.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/prctl.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 void qa_prepared_navigation_destroy(qa_prepared_navigation *prepared) {
   if (!prepared) return;
@@ -46,27 +41,28 @@ static const char *provenance_content(const qa_resolved_resource_reference *refe
     return reference->provenance.loose_mount->identity.content;
   return NULL;
 }
-/* TS try { parse } catch { continue }: probe the aborting parser in a
- * child; parse again in-process only when the probe succeeded. */
-static bool probe_parse(bool is_aas, uint8_t *bytes, size_t length, const char *path, int64_t checksum) {
-  pid_t pid = fork();
-  if (pid < 0) return true; /* no fork: fall back to direct (aborting) parse */
-  if (pid == 0) {
-    (void)prctl(PR_SET_DUMPABLE, 0);
-    FILE *null_file = fopen("/dev/null", "w");
-    if (null_file) { (void)dup2(fileno(null_file), STDERR_FILENO); }
-    if (is_aas) {
-      qa_aas_asset asset;
-      if (!qa_parse_aas(&asset, bytes, length, path, true, checksum)) _exit(2);
-    } else {
-      qa_kex_navigation_asset asset;
-      if (!qa_parse_kex_navigation(&asset, bytes, length, path)) _exit(2);
-    }
-    _exit(0);
-  }
-  int status = 0;
-  if (waitpid(pid, &status, 0) < 0) return true;
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+/* TS try { parse } catch { continue }: any raise counts as an absent asset. */
+typedef struct parse_job {
+  bool is_aas;
+  uint8_t *bytes;
+  size_t length;
+  const char *path;
+  int64_t checksum;
+  qa_aas_asset *aas;
+  qa_kex_navigation_asset *kex;
+  bool parsed;
+} parse_job;
+static void parse_candidate(void *ctx) {
+  parse_job *job = ctx;
+  job->parsed = job->is_aas ? qa_parse_aas(job->aas, job->bytes, job->length, job->path, true, job->checksum)
+                            : qa_parse_kex_navigation(job->kex, job->bytes, job->length, job->path);
+}
+static char *join3(const char *a, const char *b, const char *c) {
+  size_t x = strlen(a), y = strlen(b), z = strlen(c);
+  char *out = malloc(x + y + z + 1);
+  if (!out) return NULL;
+  memcpy(out, a, x); memcpy(out + x, b, y); memcpy(out + x + y, c, z + 1);
+  return out;
 }
 bool qa_preload_navigation(qa_prepared_navigation *out, qa_navigation_map_identity map,
                            qa_content_mounted *resources, const uint8_t *map_bytes, size_t map_byte_length,
@@ -93,17 +89,18 @@ bool qa_preload_navigation(qa_prepared_navigation *out, qa_navigation_map_identi
     }
   }
   if (invalid) { free(copy); qa_range_error("Invalid navigation map resource path"); }
-  char first_path[1024], second_path[1024];
-  const char *paths[2];
+  char *first_path, *second_path;
   if (map.format == QA_DECODED_WORLD_Q3) {
-    snprintf(first_path, sizeof first_path, "maps/%s.aas", copy);
-    snprintf(second_path, sizeof second_path, "bots/navigation/%s.nav", copy);
+    first_path = join3("maps/", copy, ".aas");
+    second_path = join3("bots/navigation/", copy, ".nav");
   } else {
-    snprintf(first_path, sizeof first_path, "bots/navigation/%s.nav", copy);
-    snprintf(second_path, sizeof second_path, "maps/%s.aas", copy);
+    first_path = join3("bots/navigation/", copy, ".nav");
+    second_path = join3("maps/", copy, ".aas");
   }
   free(copy);
-  paths[0] = first_path; paths[1] = second_path;
+  if (!first_path || !second_path) { free(first_path); free(second_path); return false; }
+  const char *paths[2] = {first_path, second_path};
+  bool result = true;
   for (int i = 0; i < 2; i++) {
     const char *path = paths[i];
     qa_content_opened_resource opened;
@@ -115,27 +112,26 @@ bool qa_preload_navigation(qa_prepared_navigation *out, qa_navigation_map_identi
       if (!content || !navigation_content || strcmp(content, navigation_content)) { free(opened.bytes); continue; }
     }
     int64_t checksum = (int64_t)(int32_t)qa_block_checksum(map_bytes, map_byte_length);
-    if (!probe_parse(is_aas, opened.bytes, opened.byte_length, path, checksum)) { free(opened.bytes); continue; }
-    if (is_aas) {
-      qa_aas_asset *asset = malloc(sizeof *asset);
-      if (!asset) { free(opened.bytes); return false; }
-      if (!qa_parse_aas(asset, opened.bytes, opened.byte_length, path, true, checksum)) {
-        free(asset); free(opened.bytes); return false;
-      }
-      out->aas = asset;
-    } else {
-      qa_kex_navigation_asset *asset = malloc(sizeof *asset);
-      if (!asset) { free(opened.bytes); return false; }
-      if (!qa_parse_kex_navigation(asset, opened.bytes, opened.byte_length, path)) {
-        free(asset); free(opened.bytes); return false;
-      }
-      out->kex = asset;
+    parse_job job = {is_aas, opened.bytes, opened.byte_length, path, checksum, NULL, NULL, false};
+    if (is_aas) job.aas = malloc(sizeof *job.aas);
+    else job.kex = malloc(sizeof *job.kex);
+    if (!job.aas && !job.kex) { free(opened.bytes); result = false; break; }
+    qa_caught_error caught;
+    if (!qa_try(parse_candidate, &job, &caught)) {
+      /* The parser freed its partial tables on the raise. */
+      free(job.aas); free(job.kex); free(opened.bytes);
+      continue;
     }
+    if (!job.parsed) { free(job.aas); free(job.kex); free(opened.bytes); result = false; break; }
+    out->aas = job.aas;
+    out->kex = job.kex;
     out->resource = opened.reference;
     free(opened.bytes);
-    return true;
+    break;
   }
-  return true;
+  free(first_path);
+  free(second_path);
+  return result;
 }
 typedef struct asset_job {
   qa_loaded_navigation *out;
@@ -161,7 +157,7 @@ bool qa_load_prepared_navigation(qa_loaded_navigation *out, qa_navigation_constr
   bool digest_eq = map.digest && prepared->map.digest && !strcmp(map.digest, prepared->map.digest);
   bool name_eq = map.name && prepared->map.name && !strcmp(map.name, prepared->map.name);
   if (map.format != options.geometry.kind || !digest_eq || !name_eq || map.format != prepared->map.format)
-    qa_range_error("Navigation map identity and prepared geometry disagree");
+    qa_raise("TypeError", 0, 0, "Navigation map identity and prepared geometry disagree");
   if (prepared->aas || prepared->kex) {
     asset_job job = {out, map, prepared, options, false};
     qa_caught_error caught;
@@ -170,8 +166,11 @@ bool qa_load_prepared_navigation(qa_loaded_navigation *out, qa_navigation_constr
       out->resource = prepared->resource;
       return true;
     }
-    /* A supplied asset whose graph cannot be built counts as absent, like one that fails to parse. The
-       partially built graph of the raise is abandoned with the frames that held it. */
+    /* A supplied asset whose graph cannot be built counts as absent, like one that fails to parse.
+       navigationFromAsset frees its own lists on a raise; a runtime that raised leaves a whole graph
+       and a partial runtime, both safe to destroy. */
+    qa_navigation_runtime_destroy(&out->runtime);
+    qa_navigation_graph_destroy(&out->graph);
     memset(out, 0, sizeof *out);
   }
   if (!qa_construct_navigation(&out->graph, options)) return false;
@@ -184,7 +183,7 @@ bool qa_load_prepared_navigation(qa_loaded_navigation *out, qa_navigation_constr
 }
 bool qa_load_navigation(qa_loaded_navigation *out, qa_navigation_load_options options) {
   if (options.construction.map.format != options.construction.geometry.kind)
-    qa_range_error("Navigation map identity and decoded geometry disagree");
+    qa_raise("TypeError", 0, 0, "Navigation map identity and decoded geometry disagree");
   qa_prepared_navigation prepared;
   if (!qa_preload_navigation(&prepared, options.construction.map, options.resources,
                              options.map_bytes, options.map_byte_length,

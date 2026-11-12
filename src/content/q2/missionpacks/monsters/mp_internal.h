@@ -7,6 +7,7 @@
 
 #include "qa/content/q2/missionpacks/monsters/types.h"
 #include "qa/core/math.h"
+#include "qa/foundation/js.h"
 
 static inline qa_vec3 q2mpm_v3(double x, double y, double z) { qa_vec3 v = {x, y, z}; return v; }
 static inline qa_vec3 q2mpm_zero(void) { return q2mpm_v3(0, 0, 0); }
@@ -75,10 +76,11 @@ static inline const char *q2mpm_at_s(const char *const *values, size_t count, do
 static inline qa_actor_id q2mpm_at_a(const qa_actor_id *values, size_t count, double index) {
   return values[qa_q2m_record_at(count, index)];
 }
-/* JS bitwise ops on doubles go through int32. */
-static inline double q2mpm_or(double value, int32_t bits) { return (double)((int32_t)value | bits); }
-static inline double q2mpm_and(double value, int32_t bits) { return (double)((int32_t)value & bits); }
-static inline bool q2mpm_has(double value, int32_t bits) { return ((int32_t)value & bits) != 0; }
+/* JS bitwise ops on doubles go through ToInt32 (a C cast of a value at or above 2^31, such as an
+ * unsigned effects word or flags carrying 2^32, is undefined and gives INT32_MIN on x86). */
+static inline double q2mpm_or(double value, int32_t bits) { return (double)(qa_js_to_int32(value) | bits); }
+static inline double q2mpm_and(double value, int32_t bits) { return (double)(qa_js_to_int32(value) & bits); }
+static inline bool q2mpm_has(double value, int32_t bits) { return (qa_js_to_int32(value) & bits) != 0; }
 
 /* Merged callback table for TS {...base.callbacks, ...extra}: extra
  * entries replace same-named base entries. Allocated in the module arena. */

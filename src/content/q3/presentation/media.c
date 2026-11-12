@@ -22,7 +22,7 @@ typedef qa_q3_pres_client_media_host host_t;
 bool qa_q3_pres_client_media_init(media_t *media, qa_q3_base_product product,
     qa_q3_pres_client_game_static_state *static_state, qa_q3_pres_renderer_resources resources,
     qa_q3_pres_client_sound_bank sound_bank, qa_q3_pres_client_weapon_media_registry_view weapon_registry) {
-  if (product != static_state->product) qa_range_error("Client media product differs from cgs");
+  if (product != static_state->product) qa_raise("Error", 0, 0, "Client media product differs from cgs");
   memset(media, 0, sizeof *media);
   media->product = product;
   media->static_state = static_state;
@@ -165,7 +165,7 @@ qa_q3_pres_player_media qa_q3_pres_client_media_players(media_t *media) {
 }
 qa_q3_pres_mission_player_media qa_q3_pres_client_media_mission_players(media_t *media) {
   if (media->product != QA_Q3_BASE_PRODUCT_MISSIONPACK) {
-    qa_range_error("Mission player media requested in baseq3");
+    qa_raise("Error", 0, 0, "Mission player media requested in baseq3");
   }
   const qa_q3_pres_client_media_graphics *g = &media->graphics;
   qa_q3_pres_mission_player_media mission;
@@ -326,7 +326,7 @@ qa_q3_pres_weapon_presentation_media qa_q3_pres_client_media_weapons(media_t *me
 
 static void validate(media_t *media, host_t *host) {
   if (media->static_state != host->static_state || media->product != host->state->product) {
-    qa_range_error("Client media registration requires its canonical cgame state");
+    qa_raise("Error", 0, 0, "Client media registration requires its canonical cgame state");
   }
 }
 static bool build_script(host_t *host) { return host->settings(host->ctx).build_script; }
@@ -352,7 +352,7 @@ bool qa_q3_pres_register_item_sounds(media_t *media, double number) {
     while (offset < length && sounds[offset] != ' ') offset++;
     size_t len = offset - start;
     if (len >= 64 || len < 5) {
-      qa_range_error("PrecacheItem: %s has bad precache string", STR(item->class_name));
+      qa_raise("Error", 0, 0, "PrecacheItem: %s has bad precache string", STR(item->class_name));
     }
     char name[64];
     memcpy(name, sounds + start, len);
@@ -644,7 +644,6 @@ bool qa_q3_pres_register_client_graphics(media_t *media, host_t *host,
       qa_q3_pres_scene_model ignored;                                                                  \
       if (!media->resources.register_model(media->resources.ctx, (path), &ignored)) return false;      \
     } while (0)
-host->state->refdef = qa_q3_pres_create_refdef();
   {
     static const char *const number_names[] = {"zero", "one", "two", "three", "four", "five",
                                                "six", "seven", "eight", "nine", "minus"};

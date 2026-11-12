@@ -9,14 +9,14 @@
 enum { MASK_SPECTATOR = 1 | 0x10000, VOTE_FLAGS = 0x4000 | 0x80000, EF_TALK = 0x1000, EF_FIRING = 0x100 };
 
 static qa_q3_game_client *client_of(qa_q3_game_entity *entity) {
-  if (entity->client == NULL) qa_range_error("Client policy requires a client entity");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "Client policy requires a client entity");
   return entity->client;
 }
 
 static double client_number(qa_q3_ta_client_policy_context *context, qa_q3_game_client *client) {
   for (int index = 0; index < QA_Q3_MAX_CLIENTS; index++)
     if (context->pool->clients[index] == client) return index;
-  qa_range_error("Client policy received a client outside its entity pool");
+  qa_raise("Error", 0, 0, "Client policy received a client outside its entity pool");
 }
 
 void qa_q3_ta_spectator_think(qa_q3_ta_client_policy_context *context, qa_q3_game_entity *entity,
@@ -73,7 +73,9 @@ bool qa_q3_ta_client_inactivity_timer(qa_q3_ta_client_policy_context *context, q
     client->inactivity_warning = false;
   } else if (command->forwardmove != 0 || command->rightmove != 0 || command->upmove != 0 ||
       (qa_js_to_int32(command->buttons) & QA_Q3_BUTTON_ATTACK) != 0) {
-    client->inactivity_time = qa_js_to_int32((context->time + (double)(int32_t)(qa_js_to_int32(context->inactivity_seconds) * 1000)));
+    /* Math.imul wraps; a signed C product of a large g_inactivity is undefined. */
+    client->inactivity_time = qa_js_to_int32(
+        context->time + (double)qa_js_to_int32((double)((uint32_t)qa_js_to_int32(context->inactivity_seconds) * 1000u)));
     client->inactivity_warning = false;
   } else if (!client->pers.local_client) {
     if (context->time > client->inactivity_time) {

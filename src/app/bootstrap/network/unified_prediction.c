@@ -55,7 +55,9 @@ static qa_save_value *write_bounds(qa_bounds bounds) {
   return out;
 }
 static qa_bounds read_bounds(const qa_save_reader *reader) {
-  qa_bounds out = {vec_field(reader, "min"), vec_field(reader, "max")};
+  qa_bounds out; /* TS reads min, then max */
+  out.min = vec_field(reader, "min");
+  out.max = vec_field(reader, "max");
   return out;
 }
 static void read_triple(const qa_save_reader *reader, double out[3]) {

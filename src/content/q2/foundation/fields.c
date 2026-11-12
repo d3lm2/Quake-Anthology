@@ -21,23 +21,32 @@ double qa_q2_integer_field(const qa_q2_spawn_fields *f, const char *key, double 
   const char *v = qa_q2_spawn_get(f, key);
   return v == NULL ? fallback : (double)qa_native_atoi(v);
 }
+static bool vector_space(unsigned char c) {
+  return (c >= 0x09 && c <= 0x0d) || c == 0x20 || c == 0xa0;
+}
 qa_vec3 qa_q2_vector_field(const qa_q2_spawn_fields *f, const char *key) {
   const char *raw = qa_q2_spawn_get(f, key);
   if (raw == NULL) raw = "";
-  /* TS: trim().split(/\s+/) then atof of first three (missing -> "0"). */
+  /* TS: trim().split(/\s+/) then atof of first three (missing -> "0"). The
+   * value is a byte string (one character per byte), so JS white space is
+   * TAB, LF, VT, FF, CR, space and U+00A0; C isspace lacks the last. */
   double out[3] = {0, 0, 0};
   const char *p = raw;
   int i = 0;
   while (i < 3) {
-    while (*p && isspace((unsigned char)*p)) p++;
+    while (*p && vector_space((unsigned char)*p)) p++;
     if (!*p) break;
     const char *start = p;
-    while (*p && !isspace((unsigned char)*p)) p++;
+    while (*p && !vector_space((unsigned char)*p)) p++;
     size_t n = (size_t)(p - start);
     char buf[128];
-    if (n >= sizeof buf) n = sizeof buf - 1;
-    memcpy(buf, start, n); buf[n] = '\0';
-    out[i++] = qa_native_atof(buf);
+    /* A rerelease value holds up to 511 bytes: a longer component is copied
+     * whole, not cut at the stack buffer. */
+    char *token = n < sizeof buf ? buf : malloc(n + 1);
+    if (!token) qa_range_error("out of memory");
+    memcpy(token, start, n); token[n] = '\0';
+    out[i++] = qa_native_atof(token);
+    if (token != buf) free(token);
   }
   return (qa_vec3){out[0], out[1], out[2]};
 }
@@ -135,9 +144,9 @@ fail:
 }
 
 bool qa_q2_parse_entities(const char *source, qa_q2_edition edition, qa_q2_spawn_fields **out, size_t *out_count) {
-  char message[512];
+  char message[640]; /* the longest text: a 511-byte rerelease key after "missing value for " */
   qa_q2_parse_status status = qa_q2_parse_entities_checked(source, edition, out, out_count, message, sizeof message);
-  if (status == QA_Q2_PARSE_MALFORMED) qa_range_error("%s", message);
+  if (status == QA_Q2_PARSE_MALFORMED) qa_raise("Error", 0, 0, "%s", message);
   return status == QA_Q2_PARSE_OK;
 }
 

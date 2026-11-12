@@ -14,11 +14,11 @@
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/network/q2/message.h"
+#include "qa/core/math.h"
 
 #define CONFIGSTRINGS 2080
 static const double resource_bases[3] = {32, 288, 544};
 static const char *const resource_kinds[3] = {"model", "sound", "image"};
-static const qa_vec3 zero = {0, 0, 0};
 
 typedef struct body_binding { struct qa_app_sim_classic_guest_services *services; qa_raw_entity_view record; qa_owned_actor actor; qa_actor_id ground; struct body_binding *next; } body_binding;
 typedef struct motion_entry { qa_actor_id actor; qa_compat_q2_native_input_motion projection; bool has_body; qa_body_state body; qa_actor_id ground; } motion_entry;
@@ -153,7 +153,7 @@ static void unicast(services_t *s, bool has_entity, qa_guest_address entity, boo
   if (!has_entity) return;
   qa_raw_entity_view record = qa_compat_q2_classic_edicts_from_pointer(edicts(s), entity);
   if (!accepts_client(s, record.slot)) return;
-  qa_app_sim_classic_guest_audience audience = {true, record.slot, zero, NULL};
+  qa_app_sim_classic_guest_audience audience = {true, record.slot, qa_zero_vec3, NULL};
   enqueue(s, audience, reliable);
 }
 const qa_app_sim_classic_guest_message *qa_app_sim_classic_guest_services_drain_messages(services_t *s, size_t *out_count) {
@@ -175,7 +175,7 @@ void qa_app_sim_classic_guest_services_set_configstring(services_t *s, double in
   if (index == 1) { qa_q2_presentation_event event; memset(&event, 0, sizeof event); event.kind = "music"; event.track = text; s->options.engine->emit(s->options.engine->ctx, event); }
   if (!s->loading) {
     qa_q2_sz_clear(&s->buffer); qa_q2_msg_write_byte(&s->buffer, 13); qa_q2_msg_write_short(&s->buffer, index); qa_q2_msg_write_string(&s->buffer, text);
-    multicast(s, zero, 3);
+    multicast(s, qa_zero_vec3, 3);
   }
 }
 double qa_app_sim_classic_guest_services_resource_index(services_t *s, const char *kind, const char *name) {
@@ -188,16 +188,30 @@ double qa_app_sim_classic_guest_services_resource_index(services_t *s, const cha
 }
 
 /* --- bodies --- */
+/* While a level file loads, the game module links each edict before it points `client` back at its own client array,
+ * so the pointer is the one the saving process wrote. That address means nothing here and may be unmapped; the player
+ * has no velocity to read until the module has connected it. TS wraps host.edicts.clientPrefix(slot) and turns a
+ * GuestMemoryFault of reason "unmapped" into null; here the record read is the edicts' and the borrow goes through
+ * the memory's borrow_mapped (a memory without one borrows plainly). */
+static const uint8_t *linkable_client_prefix(services_t *s, double slot) {
+  const qa_compat_q2_memory *memory = s->memory;
+  if (memory->borrow_mapped == NULL) return qa_compat_q2_classic_edicts_client_prefix(edicts(s), slot);
+  qa_raw_entity_view record = qa_compat_q2_classic_edicts_at(edicts(s), slot);
+  qa_guest_address client;
+  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, record.address, 84), &client)) return NULL;
+  uint8_t *prefix = NULL;
+  return memory->borrow_mapped(memory->ctx, client, QA_COMPAT_Q2_CLASSIC_CLIENT_PREFIX_BYTES, &prefix) ? prefix : NULL;
+}
 static qa_body_state body(services_t *s, qa_raw_entity_view record, qa_actor_id *ground) {
   qa_actor_id cached_actor; bool has_cached = current_actor(record, &cached_actor);
   if (has_cached) { motion_entry *cached = motion_of(s, cached_actor); if (cached != NULL && cached->has_body) return cached->body; }
   const uint8_t *view = record.bytes.bytes;
-  const uint8_t *client = record.slot > 0 && record.slot <= s->options.max_clients ? qa_compat_q2_classic_edicts_client_prefix(edicts(s), record.slot) : NULL;
+  const uint8_t *client = record.slot > 0 && record.slot <= s->options.max_clients ? linkable_client_prefix(s, record.slot) : NULL;
   qa_actor_id actor; bool has_actor = current_actor(record, &actor);
   qa_vec3 pending; bool has_pending = has_actor && s->has_velocity && s->velocity.read(s->velocity.ctx, actor, &pending);
   motion_entry *motion = has_actor ? motion_of(s, actor) : NULL;
   qa_compat_q2_native_input_motion_state moved; if (motion != NULL) moved = motion->projection.read(motion->projection.ctx);
-  qa_vec3 velocity = motion != NULL ? moved.velocity : has_pending ? pending : client == NULL ? zero
+  qa_vec3 velocity = motion != NULL ? moved.velocity : has_pending ? pending : client == NULL ? qa_zero_vec3
     : (qa_vec3){qa_compat_q2_view_i16(client, 10) * 0.125, qa_compat_q2_view_i16(client, 12) * 0.125, qa_compat_q2_view_i16(client, 14) * 0.125};
   /* Clients ground on the world while their pmove state says so; the guest's private groundentity is outside the public edict prefix. */
   bool grounded = client != NULL && (client[16] & 4) != 0;
@@ -311,7 +325,7 @@ static void engine_print(void *ctx, const char *destination, bool has_entity, qa
   qa_q2_msg_write_byte(&packet, center ? 15 : 10);
   if (!center) qa_q2_msg_write_byte(&packet, level);
   qa_q2_msg_write_string(&packet, text);
-  qa_app_sim_classic_guest_audience audience = {false, 0, zero, "all"};
+  qa_app_sim_classic_guest_audience audience = {false, 0, qa_zero_vec3, "all"};
   if (!broadcast) { audience.unicast = true; audience.scope = NULL; audience.slot = slot; }
   admit_message(s, audience, true, packet.data, (size_t)packet.cursize);
   if (broadcast) s->options.print.print(s->options.print.ctx, text);
@@ -363,7 +377,10 @@ static void engine_message(void *ctx, const char *operation, const qa_guest_call
   else if (strcmp(operation, "WriteString") == 0) {
     bool has = qa_compat_q2_classic_pointer(values, count, 0, &address);
     char *text = has ? qa_compat_q2_read_classic_string(s->memory, true, address, 65536) : dup_text("");
-    qa_q2_msg_write_string(&s->buffer, text); free(text);
+    /* A string the 1400-byte buffer cannot hold raises (SZ_GetSpace); the text is released either way. */
+    qa_cleanup node; qa_cleanup_push(&node, free, text);
+    qa_q2_msg_write_string(&s->buffer, text);
+    qa_cleanup_pop(&node); free(text);
   } else if (strcmp(operation, "WritePosition") == 0) {
     tuple(qa_compat_q2_read_classic_vector(s->memory, qa_compat_q2_classic_required_pointer(values, count, 0)), wire); qa_q2_msg_write_pos(&s->buffer, wire);
   } else if (strcmp(operation, "WriteDir") == 0) {
@@ -687,6 +704,7 @@ void qa_app_sim_classic_guest_services_forward_monster_proxy_damage(services_t *
   qa_q2_foundation_host *engine = s->options.engine;
   size_t count = s->proxy_count; proxy_entry *snapshot = calloc(count == 0 ? 1 : count, sizeof *snapshot); if (snapshot == NULL) qa_range_error("Out of memory");
   if (count != 0) memcpy(snapshot, s->proxies, count * sizeof *snapshot);
+  qa_cleanup snapshot_node; qa_cleanup_push(&snapshot_node, free, snapshot);
   for (size_t i = 0; i < count; i++) {
     qa_actor_id actor = snapshot[i].actor; proxy_entry *entry = proxy_of(s, actor);
     if (entry == NULL) entry = &snapshot[i];
@@ -695,7 +713,7 @@ void qa_app_sim_classic_guest_services_forward_monster_proxy_damage(services_t *
       bool completed = qa_try(run_free_proxy, &f, &caught);
       remove_proxy(s, actor);
       set_proxy_actor(s, f.view.slot, false, actor);
-      if (!completed) { free(snapshot); qa_rethrow(&caught); }
+      if (!completed) qa_rethrow(&caught);
       continue;
     }
     double health = qa_compat_q2_classic_combat_bindings_proxy_health(s->combat, entry->view);
@@ -727,6 +745,7 @@ void qa_app_sim_classic_guest_services_forward_monster_proxy_damage(services_t *
     qa_combat_state_result after = qa_gameplay_authority_read(engine->combat, actor);
     entry = proxy_of(s, actor); if (entry != NULL && after.has_value) entry->health = after.value.health;
   }
+  qa_cleanup_pop(&snapshot_node);
   free(snapshot);
 }
 void qa_app_sim_classic_guest_services_publish_entities(services_t *s) {
@@ -735,6 +754,7 @@ void qa_app_sim_classic_guest_services_publish_entities(services_t *s) {
   const qa_owned_actor *owned = qa_session_actor_registry_owned_by(actors, qa_compat_q2_classic_guest_host_get_options(host)->provider, &count);
   qa_owned_actor *copy = calloc(count == 0 ? 1 : count, sizeof *copy); if (copy == NULL) qa_range_error("Out of memory");
   if (count != 0) memcpy(copy, owned, count * sizeof *copy);
+  qa_cleanup copy_node; qa_cleanup_push(&copy_node, free, copy);
   for (size_t i = 0; i < count; i++) {
     qa_actor_id actor = copy[i].id;
     /* Shared actors admitted under the map provider without a guest edict (selected TS monsters) publish through their own sources. */
@@ -758,5 +778,6 @@ void qa_app_sim_classic_guest_services_publish_entities(services_t *s) {
       s->options.engine->emit(s->options.engine->ctx, event);
     }
   }
+  qa_cleanup_pop(&copy_node);
   free(copy);
 }

@@ -8,7 +8,9 @@
 
 #include "qa/foundation/support.h"
 
-static void plain_error(const char *message) { qa_range_error("%s", message); }
+/* TS `throw new Error(...)` and `throw new TypeError(...)`. */
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
 
 void qa_capture_abi_processor_state(qa_abi_processor_snapshot *out, qa_guest_processor_state *state) {
   out->architecture = state->architecture;
@@ -21,7 +23,7 @@ void qa_capture_abi_processor_state(qa_abi_processor_snapshot *out, qa_guest_pro
 }
 void qa_restore_abi_processor_state(qa_guest_processor_state *state, const qa_abi_processor_snapshot *snapshot) {
   if (state->architecture != snapshot->architecture)
-    plain_error("ABI processor snapshot architecture differs");
+    type_error("ABI processor snapshot architecture differs");
   qa_integer_register_file_restore(&state->registers, snapshot->registers, snapshot->registers_len);
   state->instruction_pointer = snapshot->instruction_pointer;
   qa_processor_flags_set_value(&state->flags, snapshot->flags);
@@ -48,6 +50,9 @@ typedef struct inline_region {
   qa_guest_call_runner *runner;
   qa_guest_entry_handle remove; /* callback-table bind_entry handle */
   void *accepts_ctx_holder; /* owned accepts closure state */
+  /* The callback the table entry points at lives as long as the entry does (TS keeps the object). */
+  qa_guest_host_callback callback;
+  char callback_id[40];
   struct inline_region *next;
 } inline_region;
 
@@ -78,7 +83,7 @@ struct qa_guest_call_runner {
 bool qa_guest_call_runner_init(qa_guest_call_runner *runner, qa_guest_call_runner_options options) {
   memset(runner, 0, sizeof *runner);
   if (&options.callbacks->memory->base != options.cpu->memory)
-    plain_error("Callback table and CPU use different guest memory");
+    type_error("Callback table and CPU use different guest memory");
   runner->options = options;
   qa_memory_check(options.cpu->memory, options.return_address, 1, QA_ACCESS_EXECUTE);
   return true;
@@ -124,10 +129,17 @@ static void stopped(qa_guest_call_runner *runner, qa_guest_execution_stop stop) 
   qa_raise("GuestCallStopped", 0, 0, "Guest call stopped: %s", qa_guest_execution_stop_kind_name(stop.kind));
 }
 /* invokeSteps' `finally { this.#active.pop(); }` when a raise leaves the call. */
-typedef struct active_pop { qa_guest_call_runner *runner; active_call *active, *enclosing; } active_pop;
+typedef struct active_pop {
+  qa_guest_call_runner *runner;
+  active_call *active, *enclosing;
+  bool linked;                 /* pushed on the runner's call stack */
+  qa_abi_value_layout *layouts; /* inferred layouts, until the plan is built */
+} active_pop;
 static void pop_active(void *arg) {
   active_pop *pop = arg;
-  if (pop->runner->top != pop->active) return;
+  free(pop->layouts);
+  if (!pop->linked) { free(pop->active); return; } /* raised before the call was entered */
+  if (pop->runner->top != pop->active) return;      /* already unwound (and freed) by the host */
   pop->runner->top = pop->enclosing; pop->runner->depth--;
   free(pop->active);
 }
@@ -141,6 +153,33 @@ static inline_region *find_region(qa_guest_call_runner *runner, uint64_t entry) 
 static void run_steps(qa_guest_call_runner *runner, active_call *active,
                       qa_guest_core_address return_address, int64_t slice);
 static void intercept_region(qa_guest_call_runner *runner, inline_region *region, active_call *active);
+
+typedef struct dispatch_scope {
+  qa_guest_call_runner *runner;
+  active_call *active;
+  const qa_guest_core_call_context *previous;
+  bool installed;
+  qa_call_value *arguments; size_t argument_count; /* the fixed arguments */
+  qa_call_value *full; size_t full_count;          /* fixed and variadic, when there are variadic ones */
+  qa_abi_value_layout *extra;
+  qa_call_result result;
+  bool has_result;
+} dispatch_scope;
+static void dispatch_release(void *arg) {
+  dispatch_scope *dispatch = arg;
+  if (dispatch->installed) {
+    /* The frame that raised may already be popped and freed; touch it only while it is still the top. */
+    if (dispatch->runner->top == dispatch->active) dispatch->active->dispatch_context = NULL;
+    dispatch->runner->callback_context = dispatch->previous;
+  }
+  for (size_t i = 0; i < dispatch->argument_count; i++) qa_call_value_free(&dispatch->arguments[i]);
+  free(dispatch->arguments);
+  for (size_t i = 0; i < dispatch->full_count; i++) qa_call_value_free(&dispatch->full[i]);
+  free(dispatch->full);
+  free(dispatch->extra);
+  if (dispatch->has_result) qa_call_value_free(&dispatch->result);
+  memset(dispatch, 0, sizeof *dispatch);
+}
 
 static void run_steps(qa_guest_call_runner *runner, active_call *active,
                       qa_guest_core_address return_address, int64_t slice) {
@@ -195,7 +234,7 @@ static void run_steps(qa_guest_call_runner *runner, active_call *active,
     }
     const qa_guest_host_callback *callback = qa_guest_callback_table_resolve(callbacks, stop.address);
     if (callback == NULL)
-      qa_range_error("Unknown guest callback at 0x%llx", (unsigned long long)stop.address.byte_offset);
+      qa_raise("Error", 0, 0, "Unknown guest callback at 0x%llx", (unsigned long long)stop.address.byte_offset);
     qa_x86_abi_adapter callback_adapter;
     qa_x86_abi_adapter_init(&callback_adapter, callback->signature.abi);
     qa_guest_core_call_context callback_context = active->context;
@@ -204,49 +243,56 @@ static void run_steps(qa_guest_call_runner *runner, active_call *active,
     callback_context.callback_module = cpu->module;
     callback_context.callback_address = stop.address;
     callback_context.callback_abi = callback->signature.abi;
-    qa_call_value *fixed = NULL; size_t fixed_count = 0;
-    if (!qa_x86_abi_adapter_arguments(&callback_adapter, cpu, &callback->signature, NULL, 0, &fixed, &fixed_count))
+    /* The dispatch owns its argument values, and restores the runner's callback context however it ends
+     * (TS: collector, and `finally { this.#callbackContext = previousContext; }`). */
+    dispatch_scope dispatch;
+    memset(&dispatch, 0, sizeof dispatch);
+    dispatch.runner = runner;
+    dispatch.active = active;
+    dispatch.previous = runner->callback_context;
+    qa_cleanup dispatch_node;
+    qa_cleanup_push(&dispatch_node, dispatch_release, &dispatch);
+    if (!qa_x86_abi_adapter_arguments(&callback_adapter, cpu, &callback->signature, NULL, 0, &dispatch.arguments,
+                                      &dispatch.argument_count))
       qa_range_error("ABI argument allocation failed");
-    if (callback->signature.variadic && runner->options.variadic_layouts == NULL) {
-      for (size_t i = 0; i < fixed_count; i++) qa_call_value_free(&fixed[i]);
-      free(fixed);
-      plain_error("Variadic host callback requires a layout resolver");
-    }
-    qa_call_value *arguments_ = fixed; size_t argument_count = fixed_count;
+    if (callback->signature.variadic && runner->options.variadic_layouts == NULL)
+      type_error("Variadic host callback requires a layout resolver");
     if (callback->signature.variadic) {
-      qa_abi_value_layout *extra = NULL; size_t extra_count = 0;
-      if (!runner->options.variadic_layouts(runner->options.variadic_ctx, callback, fixed, fixed_count,
-                                             &callback_context, &extra, &extra_count))
+      size_t extra_count = 0;
+      if (!runner->options.variadic_layouts(runner->options.variadic_ctx, callback, dispatch.arguments,
+                                             dispatch.argument_count, &callback_context, &dispatch.extra, &extra_count))
         qa_range_error("ABI argument allocation failed");
       if (extra_count > 0) {
-        qa_call_value *full = NULL; size_t full_count = 0;
         if (!qa_x86_abi_adapter_arguments(&callback_adapter, cpu, &callback->signature,
-                                          extra, extra_count, &full, &full_count))
+                                          dispatch.extra, extra_count, &dispatch.full, &dispatch.full_count))
           qa_range_error("ABI argument allocation failed");
-        for (size_t i = 0; i < fixed_count; i++) qa_call_value_free(&fixed[i]);
-        free(fixed);
-        arguments_ = full; argument_count = full_count;
       }
-      free(extra);
+      free(dispatch.extra);
+      dispatch.extra = NULL;
     }
+    const qa_call_value *arguments_ = dispatch.full != NULL ? dispatch.full : dispatch.arguments;
+    const size_t argument_count = dispatch.full != NULL ? dispatch.full_count : dispatch.argument_count;
     slice_remaining--;
     for (active_call *frame = runner->top; frame != NULL; frame = frame->next) {
       frame->remaining -= 1;
       if (frame->remaining < 0) frame->remaining = 0;
     }
-    const qa_guest_core_call_context *previous = runner->callback_context;
     runner->callback_context = &callback_context;
     active->dispatch_context = &callback_context;
-    qa_call_result result = qa_guest_callback_table_invoke(callbacks, stop.address, &callback_context,
-                                              arguments_, argument_count);
+    dispatch.installed = true;
+    dispatch.result = qa_guest_callback_table_invoke(callbacks, stop.address, &callback_context,
+                                                     arguments_, argument_count);
+    dispatch.has_result = true;
     active->dispatch_context = NULL;
-    runner->callback_context = previous;
-    for (size_t i = 0; i < argument_count; i++) qa_call_value_free(&arguments_[i]);
-    free(arguments_);
-    qa_x86_abi_adapter_leave(&callback_adapter, cpu, &callback->signature, &result);
-    qa_call_value_free(&result);
+    runner->callback_context = dispatch.previous;
+    dispatch.installed = false;
+    qa_x86_abi_adapter_leave(&callback_adapter, cpu, &callback->signature, &dispatch.result);
+    qa_cleanup_pop(&dispatch_node);
+    dispatch_release(&dispatch);
   }
 }
+
+static void release_result(void *arg) { qa_call_value_free((qa_call_result *)arg); }
 
 static qa_call_result invoke_steps(qa_guest_call_runner *runner, const qa_guest_call_request *request,
                                    int64_t slice) {
@@ -258,7 +304,7 @@ static qa_call_result invoke_steps(qa_guest_call_runner *runner, const qa_guest_
              memory_module->id != NULL ? memory_module->id : "") != 0
       || strcmp(request->context.module.digest != NULL ? request->context.module.digest : "",
                 memory_module->digest != NULL ? memory_module->digest : "") != 0)
-    plain_error("Call context belongs to a different guest module");
+    type_error("Call context belongs to a different guest module");
   active_call *enclosing = runner->top;
   active_call *active = (active_call *)malloc(sizeof(active_call));
   if (active == NULL) qa_range_error("ABI argument allocation failed");
@@ -268,6 +314,8 @@ static qa_call_result invoke_steps(qa_guest_call_runner *runner, const qa_guest_
       : (request->instruction_budget < enclosing->remaining ? request->instruction_budget : enclosing->remaining);
   active->dispatch_context = NULL;
   active->next = enclosing;
+  active_pop pop = {runner, active, enclosing, false, NULL};
+  qa_cleanup pop_node; qa_cleanup_push(&pop_node, pop_active, &pop);
   uint64_t caller_instruction = cpu->state->instruction_pointer;
   bool have_saved = enclosing != NULL;
   qa_abi_processor_snapshot saved; memset(&saved, 0, sizeof saved);
@@ -286,6 +334,7 @@ static qa_call_result invoke_steps(qa_guest_call_runner *runner, const qa_guest_
   if (request->argument_count != request->signature.parameter_count) {
     layouts_storage = (qa_abi_value_layout *)malloc(sizeof(qa_abi_value_layout) * (request->argument_count == 0 ? 1 : request->argument_count));
     if (layouts_storage == NULL) qa_range_error("ABI argument allocation failed");
+    pop.layouts = layouts_storage;
     for (size_t i = 0; i < request->argument_count; i++)
       layouts_storage[i] = i < request->signature.parameter_count ? request->signature.parameters[i]
           : qa_inferred_layout(&request->arguments[i], request->signature.variadic);
@@ -294,27 +343,30 @@ static qa_call_result invoke_steps(qa_guest_call_runner *runner, const qa_guest_
   qa_abi_call_plan plan;
   if (!qa_plan_guest_call(&plan, &request->signature, layouts, layout_count))
     qa_range_error("ABI argument allocation failed");
+  /* Only the callee's stack cleanup is needed after the call: the plan does not outlive a stopped call. */
+  const int64_t callee_pop_bytes = plan.callee_pop_bytes;
+  qa_abi_call_plan_free(&plan);
+  pop.layouts = NULL;
   free(layouts_storage);
   runner->top = active; runner->depth++;
-  active_pop pop = {runner, active, enclosing};
-  qa_cleanup pop_node; qa_cleanup_push(&pop_node, pop_active, &pop);
+  pop.linked = true;
+  /* TS `try { ... } finally { this.#active.pop(); }`: the frame is popped however the call ends, the result
+   * read and the processor restore included. */
   run_steps(runner, active, return_address, slice);
-  qa_cleanup_pop(&pop_node);
   uint64_t final_stack = qa_integer_register_file_read(&cpu->state->registers, QA_REG_RSP, width, false);
-  if (final_stack != entry_stack + (uint64_t)(cpu->memory->pointer_bytes + plan.callee_pop_bytes)) {
-    qa_abi_call_plan_free(&plan);
-    runner->top = enclosing; runner->depth--;
-    free(active);
+  if (final_stack != entry_stack + (uint64_t)(cpu->memory->pointer_bytes + callee_pop_bytes))
     plain_error("Guest returned with incorrect ABI stack cleanup");
-  }
-  qa_abi_call_plan_free(&plan);
   qa_call_result result = qa_x86_abi_adapter_return_value(&adapter, cpu, &request->signature);
+  qa_cleanup result_node;
+  qa_cleanup_push(&result_node, release_result, &result);
   if (have_saved) qa_restore_abi_processor_state(cpu->state, &saved);
   else {
     qa_integer_register_file_write(&cpu->state->registers, QA_REG_RSP, width, caller_stack, false);
     cpu->state->instruction_pointer = caller_instruction;
     runner->has_entry_state = false;
   }
+  qa_cleanup_pop(&result_node);
+  qa_cleanup_pop(&pop_node);
   runner->top = enclosing; runner->depth--;
   free(active);
   return result;
@@ -372,6 +424,11 @@ static qa_call_result inline_invoke(void *ctx, const qa_guest_core_call_context 
   return qa_call_void(); /* unreachable: plain_error aborts */
 }
 
+static void free_pending(void *arg) {
+  void **pending = arg;
+  for (int i = 0; i < 3; i++) free(pending[i]);
+}
+
 qa_guest_inline_region_handle *qa_guest_call_runner_bind_inline_region(
     qa_guest_call_runner *runner, qa_guest_core_address entry, qa_guest_core_address join,
     qa_guest_native_abi abi,
@@ -385,24 +442,26 @@ qa_guest_inline_region_handle *qa_guest_call_runner_bind_inline_region(
   inline_region *region = (inline_region *)calloc(1, sizeof(inline_region));
   accepts_state *state = (accepts_state *)malloc(sizeof(accepts_state));
   qa_guest_inline_region_handle *handle = (qa_guest_inline_region_handle *)malloc(sizeof *handle);
-  if (region == NULL || state == NULL || handle == NULL) qa_range_error("ABI argument allocation failed");
+  if (region == NULL || state == NULL || handle == NULL) {
+    free(region); free(state); free(handle);
+    qa_range_error("ABI argument allocation failed");
+  }
   region->entry = entry; region->join = join;
   region->intercept = intercept; region->intercept_ctx = intercept_ctx;
   region->runner = runner; region->accepts_ctx_holder = state;
   state->runner = runner; state->region = region; state->accepts = accepts; state->accepts_ctx = accepts_ctx;
-  char id_buffer[40];
-  (void)snprintf(id_buffer, sizeof id_buffer, "inline:%llu", (unsigned long long)entry.byte_offset);
-  char *id_copy = (char *)malloc(strlen(id_buffer) + 1);
-  if (id_copy == NULL) qa_range_error("ABI argument allocation failed");
-  strcpy(id_copy, id_buffer);
-  qa_guest_host_callback callback; memset(&callback, 0, sizeof callback);
-  callback.id = id_copy;
-  callback.signature.abi = abi;
-  callback.signature.result_is_void = true;
-  callback.invoke = inline_invoke;
-  region->remove = qa_guest_callback_table_bind_entry(runner->options.callbacks, entry, &callback,
+  /* The table entry keeps the callback and its id for as long as it exists, so both live in the region. */
+  (void)snprintf(region->callback_id, sizeof region->callback_id, "inline:%llu", (unsigned long long)entry.byte_offset);
+  region->callback.id = region->callback_id;
+  region->callback.signature.abi = abi;
+  region->callback.signature.result_is_void = true;
+  region->callback.invoke = inline_invoke;
+  void *pending[3] = {region, state, handle};
+  qa_cleanup pending_node;
+  qa_cleanup_push(&pending_node, free_pending, pending); /* an occupied entry raises */
+  region->remove = qa_guest_callback_table_bind_entry(runner->options.callbacks, entry, &region->callback,
                                                       region_accepts, state);
-  free(id_copy);
+  qa_cleanup_pop(&pending_node);
   region->next = runner->regions; runner->regions = region;
   handle->region = region;
   return handle;
@@ -436,14 +495,6 @@ void qa_guest_call_runner_recover(qa_guest_call_runner *runner) {
   qa_restore_abi_processor_state(runner->options.cpu->state, &runner->entry_state);
   runner->has_entry_state = false;
 }
-/* TS chargeBytes: host services that touch many bytes pay one budget unit per
- * 64 of them, so a loop of bulk calls cannot outlast its budget. */
-void qa_guest_call_runner_charge_bytes(qa_guest_call_runner *runner, size_t byte_length) {
-  const int64_t units = (int64_t)(byte_length / 64u);
-  if (units <= 0) return;
-  for (active_call *frame = runner->top; frame != NULL; frame = frame->next)
-    frame->remaining = frame->remaining - units < 0 ? 0 : frame->remaining - units;
-}
 void qa_guest_call_runner_unwind(qa_guest_call_runner *runner, int64_t depth) {
   if (depth < 0) depth = 0;
   while ((int64_t)runner->depth > depth && runner->top != NULL) {
@@ -465,9 +516,20 @@ typedef struct continuation_state {
   uint64_t stack;
   int width;
   bool open, consumed;
+  bool execute;            /* the use in progress */
+  bool failed;             /* TS `failed`/`failure`: a use that threw, even if the interceptor swallowed it */
+  qa_caught_error failure;
 } continuation_state;
 
-static void continuation_use(continuation_state *state, bool execute) {
+/* TS `finally { region.executing.pop(); }`. */
+static void executing_pop(void *arg) {
+  inline_region *region = arg;
+  if (region->executing_count > 0) region->executing_count--;
+}
+
+static void continuation_run(void *arg) {
+  continuation_state *state = arg;
+  const bool execute = state->execute;
   qa_guest_call_runner *runner = state->runner;
   qa_guest_cpu *cpu = runner->options.cpu;
   uint64_t stack = qa_integer_register_file_read(&cpu->state->registers, QA_REG_RSP, state->width, false);
@@ -486,7 +548,10 @@ static void continuation_use(continuation_state *state, bool execute) {
     region->executing[region->executing_count].call = state->active;
     region->executing[region->executing_count].stack = state->stack;
     region->executing_count++;
+    qa_cleanup executing_node;
+    qa_cleanup_push(&executing_node, executing_pop, region);
     run_steps(runner, state->active, region->join, QA_MAX_SAFE_INTEGER);
+    qa_cleanup_pop(&executing_node);
     region->executing_count--;
     uint64_t after = qa_integer_register_file_read(&cpu->state->registers, QA_REG_RSP, state->width, false);
     if (runner->top != state->active || after != state->stack)
@@ -495,8 +560,19 @@ static void continuation_use(continuation_state *state, bool execute) {
     cpu->state->instruction_pointer = state->region->join.byte_offset;
   }
 }
+/* TS `use`: `try { ... } catch (error) { failed = true; failure = error; throw error; }`. */
+static void continuation_use(continuation_state *state, bool execute) {
+  state->execute = execute;
+  qa_caught_error caught;
+  if (qa_try(continuation_run, state, &caught)) return;
+  state->failed = true;
+  state->failure = caught;
+  qa_rethrow(&caught);
+}
 static void continuation_execute(void *ctx) { continuation_use((continuation_state *)ctx, true); }
 static void continuation_skip(void *ctx) { continuation_use((continuation_state *)ctx, false); }
+
+static void continuation_close(void *arg) { ((continuation_state *)arg)->open = false; }
 
 static void intercept_region(qa_guest_call_runner *runner, inline_region *region, active_call *active) {
   qa_guest_cpu *cpu = runner->options.cpu;
@@ -507,8 +583,12 @@ static void intercept_region(qa_guest_call_runner *runner, inline_region *region
   state.open = true;
   qa_guest_inline_continuation continuation;
   continuation.ctx = &state; continuation.execute = continuation_execute; continuation.skip = continuation_skip;
+  qa_cleanup open_node;
+  qa_cleanup_push(&open_node, continuation_close, &state); /* TS `finally { open = false; }` */
   region->intercept(region->intercept_ctx, &continuation);
+  qa_cleanup_pop(&open_node);
   state.open = false;
+  if (state.failed) qa_rethrow(&state.failure); /* the interceptor swallowed a failed use */
   uint64_t stack = qa_integer_register_file_read(&cpu->state->registers, QA_REG_RSP, width, false);
   if (!state.consumed || runner->top != active || stack != state.stack
       || cpu->state->instruction_pointer != region->join.byte_offset)

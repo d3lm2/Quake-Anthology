@@ -41,7 +41,7 @@ static qa_q2_trace trace_fn(void *ctx, qa_q2_vec3 start, qa_q2_vec3 mins, qa_q2_
   }
   qa_bounds bounds = {vector_of(mins), vector_of(maxs)};
   qa_trace_result result = env->host.trace(env->host.ctx, vector_of(start), vector_of(end), bounds);
-  if (result.kind == NULL || strcmp(result.kind, "q2") != 0) qa_range_error("Rerelease sliding requires Q2 trace fields");
+  if (result.kind == NULL || strcmp(result.kind, "q2") != 0) qa_raise("Error", 0, 0, "Rerelease sliding requires Q2 trace fields");
   qa_q2_trace out; memset(&out, 0, sizeof out);
   out.allsolid = result.all_solid; out.startsolid = result.start_solid; out.fraction = result.fraction;
   source_vector(out.endpos, result.end);
@@ -85,7 +85,7 @@ void qa_app_sim_q2_rerelease_fly_move_run(qa_app_sim_q2_rerelease_fly_move *move
     qa_q2_trace contact = touch.traces[i];
     if (!qa_session_actor_registry_is_live(host.actors, actor.id)) return;
     qa_trace_result original = contact.source;
-    if (original.kind == NULL || strcmp(original.kind, "q2") != 0) qa_range_error("Rerelease contact lost its source trace");
+    if (original.kind == NULL || strcmp(original.kind, "q2") != 0) qa_raise("Error", 0, 0, "Rerelease contact lost its source trace");
     qa_bsp_plane selected = scene_plane(contact.plane);
     qa_trace_result result = original;
     result.source_plane = selected;

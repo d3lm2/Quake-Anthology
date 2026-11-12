@@ -4,73 +4,17 @@
 
 #include <errno.h>
 #include <limits.h>
-#include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "qa/content/archive/types.h"
+#include "qa/foundation/node_path.h"
 #include "qa/foundation/support.h"
 
-static noreturn void fs_error(const char *path) {
-  fprintf(stderr, "Error: %s: %s\n", path, strerror(errno));
-  abort();
-}
-
-/* node path resolve() for the simple joined shapes used here:
- * absolute normalization of "." and ".." segments, lexically. */
-static char *resolve_joined(const char *first, const char *second) {
-  char joined[PATH_MAX * 2];
-  if (second[0] == '/') {
-    (void)snprintf(joined, sizeof joined, "%s", second);
-  } else if (first[0] == '/') {
-    (void)snprintf(joined, sizeof joined, "%s/%s", first, second);
-  } else {
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof cwd) == NULL) fs_error(".");
-    (void)snprintf(joined, sizeof joined, "%s/%s/%s", cwd, first, second);
-  }
-  /* Normalize lexically into a fresh buffer. */
-  size_t length = strlen(joined);
-  char *copy = (char *)malloc(length + 1);
-  if (copy == NULL) return NULL;
-  memcpy(copy, joined, length + 1);
-  char **parts = (char **)malloc((length / 2 + 2) * sizeof *parts);
-  if (parts == NULL) { free(copy); return NULL; }
-  size_t count = 0;
-  char *cursor = copy;
-  while (*cursor != '\0') {
-    while (*cursor == '/') cursor++;
-    if (*cursor == '\0') break;
-    char *start = cursor;
-    while (*cursor != '\0' && *cursor != '/') cursor++;
-    size_t part_length = (size_t)(cursor - start);
-    if (part_length == 1 && start[0] == '.') continue;
-    if (part_length == 2 && start[0] == '.' && start[1] == '.') {
-      if (count > 0) count--;
-      continue;
-    }
-    if (*cursor == '/') *cursor++ = '\0';
-    parts[count++] = start;
-  }
-  char *out = (char *)malloc(length + 2);
-  if (out == NULL) { free(parts); free(copy); return NULL; }
-  size_t at = 0;
-  if (count == 0) out[at++] = '/';
-  for (size_t i = 0; i < count; i++) {
-    out[at++] = '/';
-    size_t part_length = strlen(parts[i]);
-    memcpy(out + at, parts[i], part_length);
-    at += part_length;
-  }
-  out[at] = '\0';
-  free(parts);
-  free(copy);
-  return out;
-}
-
-/* node path relative(from, to) for absolute paths. */
+/* TS `within === ".." || within.startsWith("../") || isAbsolute(within)` for
+ * path.relative(root, source) over two canonical absolute paths. */
 static bool within_root(const char *root, const char *path) {
   size_t root_length = strlen(root);
   if (strcmp(root, "/") == 0) return true;
@@ -88,20 +32,36 @@ bool qa_open_loose_entry(const char *root_path, const char *member_path,
     free(path);
     qa_range_error("Expected a loose file path");
   }
+  /* realpathSync failures are plain fs Errors a TS caller may catch. */
   char *root = realpath(root_path, NULL);
-  if (root == NULL) { free(path); fs_error(root_path); }
-  char *resolved = resolve_joined(root, path);
-  if (resolved == NULL) { free(path); free(root); return false; }
+  if (root == NULL) {
+    int saved = errno;
+    free(path);
+    qa_content_fs_error(saved, "lstat", root_path);
+  }
+  char *resolved = qa_node_path_resolve2(root, path);
   char *source = realpath(resolved, NULL);
+  if (source == NULL) {
+    int saved = errno;
+    free(path); free(root);
+    qa_cleanup node;
+    qa_cleanup_push(&node, free, resolved);
+    qa_content_fs_error(saved, "lstat", resolved);
+  }
   free(resolved);
-  if (source == NULL) { free(path); free(root); fs_error(member_path); }
   if (!within_root(root, source)) {
     free(path); free(root); free(source);
     qa_range_error("Loose entry escapes root: %s", member_path);
   }
   free(root);
   qa_archive_source storage;
-  if (!qa_file_source_init(&storage, source)) {
+  qa_cleanup path_node, source_node;
+  qa_cleanup_push(&path_node, free, path);
+  qa_cleanup_push(&source_node, free, source);
+  bool opened = qa_file_source_init(&storage, source);
+  qa_cleanup_pop(&source_node);
+  qa_cleanup_pop(&path_node);
+  if (!opened) {
     free(path); free(source);
     return false;
   }
@@ -129,11 +89,19 @@ void qa_loose_entry_destroy(qa_loose_entry_handle *entry) {
   entry->source = NULL;
 }
 
+static void destroy_entry(void *arg) {
+  qa_loose_entry_destroy((qa_loose_entry_handle *)arg);
+}
+
 uint8_t *qa_read_loose_entry(const char *root_path, const char *member_path,
                              size_t *out_length) {
   qa_loose_entry_handle entry;
   if (!qa_open_loose_entry(root_path, member_path, &entry)) return NULL;
+  /* TS try/finally: the entry is closed when the read throws. */
+  qa_cleanup node;
+  qa_cleanup_push(&node, destroy_entry, &entry);
   uint8_t *bytes = qa_loose_entry_read(&entry, out_length);
+  qa_cleanup_pop(&node);
   qa_loose_entry_destroy(&entry);
   return bytes;
 }

@@ -121,7 +121,7 @@ void qa_compat_qc_mod_environment_initialize_globals(E *e, qa_compat_qc_machine 
   }
 }
 bool qa_compat_qc_mod_environment_client(E *e, qa_actor_id actor, qa_q1_visibility_client *out) {
-  if (!e->clients) qa_range_error("Mod client field requires destination client semantics");
+  if (!e->clients) qa_raise("Error", 0, 0, "Mod client field requires destination client semantics");
   for (int64_t slot = 1; slot <= (int64_t)e->clients->maximum; slot++) {
     qa_q1_visibility_client c = e->clients->at(e->clients->ctx, slot);
     if (c.has_actor && actor_eq(c.actor, actor)) { *out = c; return true; }

@@ -184,7 +184,8 @@ static qa_movement_state resumed(qa_q1_movement_context *context, qa_movement_st
 
 double qa_q1_context_view_height(const qa_q1_movement_context *context) {
   if (context->input.environment.pose != NULL) return context->input.environment.pose->view_height;
-  return context->options.has_view_height ? context->options.view_height : 22;
+  if (!context->options.has_view_height) return 22;
+  return context->options.view_height_ref != NULL ? *context->options.view_height_ref : context->options.view_height;
 }
 
 void qa_q1_context_project_client_mode(qa_q1_movement_context *context) { context->mode_projected = true; }

@@ -11,7 +11,8 @@
 /* Mirror of TS QuakeCLocalMessages surface used here. */
 typedef struct qa_compat_qc_local_messages {
   void *ctx;
-  /* actor NULL unless TS third argument present (set-view). */
+  /* actor NULL unless TS third argument present (set-view); a present
+   * argument that is TS null is an all-zero actor (token NULL). */
   void (*receive)(void *ctx, const qa_netquake_message *messages, size_t count, const qa_actor_id *target, const qa_actor_id *actor);
 } qa_compat_qc_local_messages;
 /* Mirror of TS QuakeCLocalMessageHost (fields used on QW paths). */

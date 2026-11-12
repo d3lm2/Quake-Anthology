@@ -48,16 +48,16 @@ void qa_qvm_validate_mod_protection(const qa_qvm_mod_callback_declaration *decla
     for (size_t i = 0; i < id_count; i++) if (strcmp(ids[i], definition->id) == 0) seen_id = true;
     if (declaration->clients == NULL || seen_channel || seen_id || definition->id[0] == '\0' ||
         channel_count >= 8 || id_count >= 64)
-      qa_range_error("QVM protection requires unique channels and rules with source client admission");
+      qa_raise("Error", 0, 0, "QVM protection requires unique channels and rules with source client admission");
     channels[channel_count++] = definition->channel;
     ids[id_count++] = definition->id;
     if (strcmp(definition->absorb.returns, "void") == 0)
-      qa_range_error("QVM protection requires original source savings");
+      qa_raise("Error", 0, 0, "QVM protection requires original source savings");
     double masks[] = {definition->flags.no_armor, definition->flags.no_power_armor,
                       definition->flags.no_regular_armor, definition->flags.energy, definition->flags.radius};
     for (int i = 0; i < 5; i++) {
       if (!isfinite(masks[i]) || masks[i] != trunc(masks[i]) || masks[i] < 0 || masks[i] > 2147483647.0)
-        qa_range_error("Invalid QVM protection flag mask");
+        qa_raise("Error", 0, 0, "Invalid QVM protection flag mask");
     }
     const qa_qvm_mod_protection_scalar *storage[2];
     size_t storage_count = definition_fields(definition, storage);
@@ -74,7 +74,7 @@ void qa_qvm_validate_mod_protection(const qa_qvm_mod_callback_declaration *decla
           field->offset < -9007199254740991.0 || field->offset > 9007199254740991.0 || field->offset < 0 ||
           (int64_t)field->offset % 4 != 0 || field->offset + 4 > record->stride || seen_key ||
           occupied_count >= 64)
-        qa_range_error("Invalid QVM protection source storage");
+        qa_raise("Error", 0, 0, "Invalid QVM protection source storage");
       occupied_records[occupied_count] = field->record;
       occupied_offsets[occupied_count++] = field->offset;
       for (size_t f = 0; f < record->field_count; f++) {
@@ -88,24 +88,25 @@ void qa_qvm_validate_mod_protection(const qa_qvm_mod_callback_declaration *decla
         else width = 4;
         if (value->offset < field->offset + 4 && field->offset < value->offset + width &&
             strcmp(value->binding, "private") != 0 && strcmp(value->binding, "constant") != 0)
-          qa_range_error("QVM protection storage overlaps a shared or linked source field");
+          qa_raise("Error", 0, 0, "QVM protection storage overlaps a shared or linked source field");
       }
     }
     if (definition->has_selection) {
       const qa_qvm_mod_protection_selection *selection = &definition->selection;
       if (selection->has_mask && (!isfinite(selection->mask) || selection->mask != trunc(selection->mask) ||
                                   selection->mask < 0 || selection->mask > 2147483647.0))
-        qa_range_error("Invalid QVM protection selection mask");
+        qa_raise("Error", 0, 0, "Invalid QVM protection selection mask");
       for (size_t i = 0; i < selection->value_count; i++) {
         double entry_value = selection->values[i].value;
         bool seen_value = false;
         for (size_t j = 0; j < i; j++) if (selection->values[j].value == entry_value) seen_value = true;
         if (!isfinite(entry_value) || seen_value ||
             (selection->has_mask && (entry_value != trunc(entry_value) ||
-                (qa_int32(entry_value) & qa_int32(selection->mask)) != qa_int32(entry_value))))
-          qa_range_error("Invalid QVM protection selection");
+                /* TS (value & mask) !== value: the int32 result against the number itself. */
+                (double)(qa_int32(entry_value) & qa_int32(selection->mask)) != entry_value)))
+          qa_raise("Error", 0, 0, "Invalid QVM protection selection");
       }
-      if (selection->value_count == 0) qa_range_error("Empty QVM protection selection");
+      if (selection->value_count == 0) qa_raise("Error", 0, 0, "Empty QVM protection selection");
     }
   }
 }
@@ -125,6 +126,7 @@ typedef struct actor_entry {
 typedef struct stage {
   qa_actor_id actor;
   size_t watch_id;
+  bool watching; /* TS stage.stop is a no-op until observeWrites returned */
   bool stopped;
   uint64_t generation; /* identity across stages-array realloc */
 } stage;
@@ -145,7 +147,7 @@ static entry *require_entry(qa_qvm_mod_protection_runtime *protection, qa_actor_
       !qa_same_client(current, found->value.client) ||
       !protection->services->clients->actor(protection->services->clients->ctx, found->value.client, &resolved) ||
       !qa_same_actor(resolved, actor))
-    qa_range_error("QVM protection client is no longer live");
+    qa_raise("Error", 0, 0, "QVM protection client is no longer live");
   return &found->value;
 }
 
@@ -154,7 +156,7 @@ static int64_t address_of(qa_qvm_mod_protection_runtime *protection, qa_actor_id
   protection->operations->current(protection->operations->ctx);
   (void)require_entry(protection, actor);
   if (!protection->operations->eligible(protection->operations->ctx, actor))
-    qa_range_error("QVM protection requires admitted source client storage");
+    qa_raise("Error", 0, 0, "QVM protection requires admitted source client storage");
   return protection->operations->pointer(protection->operations->ctx, actor, field->record) +
          (int64_t)field->offset;
 }
@@ -171,7 +173,7 @@ static double scalar(qa_qvm_mod_protection_runtime *protection, qa_actor_id acto
 static double count_of(qa_qvm_mod_protection_runtime *protection, qa_actor_id actor,
                        const qa_qvm_mod_protection_scalar *field) {
   double value = scalar(protection, actor, field);
-  if (!isfinite(value) || value < 0) qa_range_error("Invalid QVM protection count");
+  if (!isfinite(value) || value < 0) qa_raise("Error", 0, 0, "Invalid QVM protection count");
   return value;
 }
 
@@ -183,12 +185,12 @@ static const qa_qvm_mod_protection_selection_value *selected(
   double value = !selection->has_mask ? source : (double)(qa_int32(source) & qa_int32(selection->mask));
   for (size_t i = 0; i < selection->value_count; i++)
     if (selection->values[i].value == value) return &selection->values[i];
-  qa_range_error("QVM protection source selection is undeclared");
+  qa_raise("Error", 0, 0, "QVM protection source selection is undeclared");
 }
 
 static qa_regular_armor_state regular_state(qa_qvm_mod_protection_runtime *protection, qa_actor_id actor) {
   if (strcmp(protection->definition->channel, "regular") != 0)
-    qa_range_error("QVM protection does not own regular armor");
+    qa_raise("Error", 0, 0, "QVM protection does not own regular armor");
   qa_regular_armor_state result;
   memset(&result, 0, sizeof result);
   result.kind = QA_REGULAR_ARMOR_SOURCE;
@@ -201,7 +203,7 @@ static qa_regular_armor_state regular_state(qa_qvm_mod_protection_runtime *prote
 
 static qa_powered_protection_state powered_state(qa_qvm_mod_protection_runtime *protection, qa_actor_id actor) {
   if (strcmp(protection->definition->channel, "powered") != 0)
-    qa_range_error("QVM protection does not own powered armor");
+    qa_raise("Error", 0, 0, "QVM protection does not own powered armor");
   const char *kind = selected(protection, actor, &protection->definition->selection)->selected_kind;
   qa_powered_protection_state result;
   result.kind = kind;
@@ -213,7 +215,7 @@ static void validate_count(const qa_qvm_mod_protection_scalar *field, double cou
   if (!isfinite(count) || count < 0 ||
       (strcmp(field->encoding, "int32") == 0 && (count != trunc(count) || count > 2147483647.0)) ||
       (strcmp(field->encoding, "float32") == 0 && !isfinite((double)(float)count)))
-    qa_range_error("Protection count is not representable by its QVM source storage");
+    qa_raise("Error", 0, 0, "Protection count is not representable by its QVM source storage");
 }
 
 static void validate_regular(qa_qvm_mod_protection_runtime *protection, qa_actor_id actor, qa_regular_armor_state next) {
@@ -222,14 +224,14 @@ static void validate_regular(qa_qvm_mod_protection_runtime *protection, qa_actor
                    (current.item != NULL && next.item != NULL && strcmp(current.item, next.item) == 0);
   if (strcmp(protection->definition->channel, "regular") != 0 || next.kind != QA_REGULAR_ARMOR_SOURCE ||
       current.kind != QA_REGULAR_ARMOR_SOURCE || !same_item)
-    qa_range_error("QVM regular armor selection requires its original source operation");
+    qa_raise("Error", 0, 0, "QVM regular armor selection requires its original source operation");
   validate_count(&protection->definition->storage_points, next.points);
 }
 
 static void validate_powered(qa_qvm_mod_protection_runtime *protection, qa_actor_id actor, qa_powered_protection_state next) {
   qa_powered_protection_state current = powered_state(protection, actor);
   if (strcmp(protection->definition->channel, "powered") != 0 || strcmp(current.kind, next.kind) != 0)
-    qa_range_error("QVM powered armor selection requires its original source operation");
+    qa_raise("Error", 0, 0, "QVM powered armor selection requires its original source operation");
   if (strcmp(next.kind, "none") != 0) validate_count(&protection->definition->storage_cells, next.cells);
 }
 
@@ -258,7 +260,7 @@ static qa_armor_stage_result run_absorb(void *ctx) {
 static qa_armor_stage_result absorb(qa_qvm_mod_protection_runtime *protection, qa_actor_id actor,
                                     qa_armor_stage_input input, qa_protection_observer observer) {
   if (!qa_same_actor(input.request.target, actor))
-    qa_range_error("QVM protection target differs from its source owner");
+    qa_raise("Error", 0, 0, "QVM protection target differs from its source owner");
   (void)require_entry(protection, actor);
   const qa_mod_qc_protection_flags *masks = &protection->definition->flags;
   double scale = input.flags.has_regular_protection_scale ? input.flags.regular_protection_scale : 1;
@@ -278,7 +280,7 @@ static qa_armor_stage_result absorb(qa_qvm_mod_protection_runtime *protection, q
           strcmp(value->value.name, "regular-protection-scale") == 0)
         lowered = true;
     }
-    if (!lowered) qa_range_error("QVM regular protection scale has no declared source lowering");
+    if (!lowered) qa_raise("Error", 0, 0, "QVM regular protection scale has no declared source lowering");
   }
   int32_t lowered = (input.flags.no_armor ? (int32_t)masks->no_armor : 0) |
                     (input.flags.no_power_armor ? (int32_t)masks->no_power_armor : 0) |
@@ -328,7 +330,7 @@ static void binding_write_regular(void *ctx, qa_regular_armor_state next) {
   binding_state *state = ctx;
   validate_regular(state->protection, state->actor, next);
   if (strcmp(state->protection->definition->channel, "regular") != 0 || next.kind != QA_REGULAR_ARMOR_SOURCE)
-    qa_range_error("Missing QVM regular source storage");
+    qa_raise("Error", 0, 0, "Missing QVM regular source storage");
   write_scalar(state->protection, state->actor, &state->protection->definition->storage_points, next.points);
 }
 static qa_powered_protection_state binding_read_powered(void *ctx) {
@@ -343,7 +345,7 @@ static void binding_write_powered(void *ctx, qa_powered_protection_state next) {
   binding_state *state = ctx;
   validate_powered(state->protection, state->actor, next);
   if (strcmp(state->protection->definition->channel, "powered") != 0)
-    qa_range_error("Missing QVM powered source storage");
+    qa_raise("Error", 0, 0, "Missing QVM powered source storage");
   if (strcmp(next.kind, "none") != 0)
     write_scalar(state->protection, state->actor, &state->protection->definition->storage_cells, next.cells);
 }
@@ -400,7 +402,7 @@ bool qa_qvm_mod_protection_runtime_get_is_active(const qa_qvm_mod_protection_run
 }
 
 void qa_qvm_mod_protection_reserve(qa_qvm_mod_protection_runtime *protection) {
-  if (protection->services->clients == NULL) qa_range_error("QVM protection requires canonical clients");
+  if (protection->services->clients == NULL) qa_raise("Error", 0, 0, "QVM protection requires canonical clients");
   size_t capacity = 64;
   qa_actor_id *clients = malloc(capacity * sizeof *clients);
   if (clients == NULL) qa_range_error("QVM memory allocation failed");
@@ -410,7 +412,10 @@ void qa_qvm_mod_protection_reserve(qa_qvm_mod_protection_runtime *protection) {
     if (clients == NULL) qa_range_error("QVM memory allocation failed");
     count = client_actors(protection->services, clients, count);
   }
+  qa_cleanup clients_cleanup;
+  qa_cleanup_push(&clients_cleanup, free, clients);
   for (size_t i = 0; i < count; i++) qa_qvm_mod_protection_reserve_actor(protection, clients[i]);
+  qa_cleanup_pop(&clients_cleanup);
   free(clients);
 }
 
@@ -428,7 +433,7 @@ void qa_qvm_mod_protection_reserve_actor(qa_qvm_mod_protection_runtime *protecti
       !qa_session_actor_registry_resolve_owned(protection->services->actors, actor, &owned) ||
       !protection->services->clients->actor(protection->services->clients->ctx, client, &resolved) ||
       !qa_same_actor(resolved, actor))
-    qa_range_error("QVM protection requires a live canonical client");
+    qa_raise("Error", 0, 0, "QVM protection requires a live canonical client");
   qa_protection_binding claim = claim_of(protection);
   qa_protection_channel channel =
       strcmp(protection->definition->channel, "regular") == 0 ? QA_PROTECTION_REGULAR : QA_PROTECTION_POWERED;
@@ -447,6 +452,19 @@ void qa_qvm_mod_protection_reserve_actor(qa_qvm_mod_protection_runtime *protecti
   created->value.binding_state = NULL;
 }
 
+typedef struct bind_scratch {
+  void *state;
+  void *pickup_ptrs;
+  void *flat;
+} bind_scratch;
+
+static void free_bind_scratch(void *arg) {
+  bind_scratch *scratch = arg;
+  free(scratch->state);
+  free(scratch->pickup_ptrs);
+  free(scratch->flat);
+}
+
 void qa_qvm_mod_protection_bind_actor(qa_qvm_mod_protection_runtime *protection, qa_actor_id actor) {
   if (!protection->active || !protection->operations->eligible(protection->operations->ctx, actor)) return;
   entry *found = require_entry(protection, actor);
@@ -455,6 +473,10 @@ void qa_qvm_mod_protection_bind_actor(qa_qvm_mod_protection_runtime *protection,
   if (state == NULL) qa_range_error("QVM memory allocation failed");
   state->protection = protection;
   state->actor = actor;
+  /* The state read, the pickup rules and the bind itself can all be refused. */
+  bind_scratch scratch = {state, NULL, NULL};
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, free_bind_scratch, &scratch);
   qa_protection_binding binding = claim_of(protection);
   binding.channel = strcmp(protection->definition->channel, "regular") == 0
       ? QA_PROTECTION_REGULAR : QA_PROTECTION_POWERED;
@@ -477,6 +499,8 @@ void qa_qvm_mod_protection_bind_actor(qa_qvm_mod_protection_runtime *protection,
     size_t pickup_count = protection->operations->pickups(protection->operations->ctx, actor, channel, NULL, 0);
     pickup_ptrs = malloc((pickup_count == 0 ? 1 : pickup_count) * sizeof *pickup_ptrs);
     flat = malloc((pickup_count == 0 ? 1 : pickup_count) * sizeof *flat);
+    scratch.pickup_ptrs = pickup_ptrs;
+    scratch.flat = flat;
     if (pickup_ptrs == NULL || flat == NULL) qa_range_error("QVM memory allocation failed");
     pickup_count = protection->operations->pickups(protection->operations->ctx, actor, channel,
                                                     pickup_ptrs, pickup_count);
@@ -490,10 +514,11 @@ void qa_qvm_mod_protection_bind_actor(qa_qvm_mod_protection_runtime *protection,
   converted.inventory_items = NULL;
   converted.inventory_item_count = 0;
   (void)reservation.bind(reservation.ctx, converted);
-  free(pickup_ptrs);
-  free(flat);
   /* Re-find: reservation.bind may reenter and realloc the entries. */
   found = require_entry(protection, actor);
+  qa_cleanup_pop(&scratch_cleanup);
+  free(pickup_ptrs);
+  free(flat);
   found->bound = true;
   found->binding_state = state;
 }
@@ -512,7 +537,10 @@ void qa_qvm_mod_protection_sync(qa_qvm_mod_protection_runtime *protection) {
   if (actors == NULL) qa_range_error("QVM memory allocation failed");
   actor_entry *entries = protection->entries;
   for (size_t i = 0; i < count; i++) actors[i] = entries[i].actor;
+  qa_cleanup actors_cleanup;
+  qa_cleanup_push(&actors_cleanup, free, actors);
   for (size_t i = 0; i < count; i++) qa_qvm_mod_protection_bind_actor(protection, actors[i]);
+  qa_cleanup_pop(&actors_cleanup);
   free(actors);
 }
 
@@ -594,7 +622,9 @@ static void stage_finish(void *ctx) {
   stage *stages = component->stages;
   for (size_t i = 0; i < component->stage_count; i++) {
     if (stages[i].generation != finish->generation) continue;
-    qa_qvm_memory_writes_unobserve(&finish->protection->memory->writes, stages[i].watch_id);
+    /* TS stage.stop(): removing the watch a second time does nothing. */
+    if (stages[i].watching && !stages[i].stopped)
+      qa_qvm_memory_writes_unobserve(&finish->protection->memory->writes, stages[i].watch_id);
     memmove(&stages[i], &stages[i + 1], (component->stage_count - i - 1) * sizeof *stages);
     component->stage_count--;
     return;
@@ -646,31 +676,46 @@ qa_armor_stage_result qa_qvm_mod_protection_observe(qa_qvm_mod_protection_runtim
   stage *created = &((stage *)component->stages)[component->stage_count++];
   created->actor = actor;
   created->stopped = false;
+  created->watching = false;
   created->generation = ++component->stage_generation_counter;
   uint64_t generation = created->generation;
   state.stage_generation = generation;
-  created->watch_id = qa_qvm_memory_observe_writes(protection->memory, ranges, range_count,
-                                                    observe_write, &state, NULL, NULL);
+  /* TS try { watch; execute; require } finally { stop; leave the stage list }. */
   stage_finish_ctx finish = {protection, generation};
   qa_cleanup guard;
   qa_cleanup_push(&guard, stage_finish, &finish);
+  size_t watch_id = qa_qvm_memory_observe_writes(protection->memory, ranges, range_count,
+                                                  observe_write, &state, NULL, NULL);
+  {
+    stage *stages = component->stages;
+    for (size_t i = 0; i < component->stage_count; i++)
+      if (stages[i].generation == generation) {
+        stages[i].watch_id = watch_id;
+        stages[i].watching = true;
+      }
+  }
   qa_armor_stage_result result = execute(execute_ctx);
-  qa_cleanup_pop(&guard);
   if (find_entry(protection, actor) != NULL && qa_session_actor_registry_is_live(protection->services->actors, actor))
     (void)require_entry(protection, actor);
+  qa_cleanup_pop(&guard);
   stage_finish(&finish);
   return result;
 }
 
 void qa_qvm_mod_protection_assert_idle(qa_qvm_mod_protection_runtime *protection) {
   if (protection->component->stage_count != 0)
-    qa_range_error("Cannot save or restore during QVM protection execution");
+    qa_raise("Error", 0, 0, "Cannot save or restore during QVM protection execution");
+}
+
+static void close_reservation(void *ctx) {
+  qa_protection_reservation *reservation = ctx;
+  reservation->close(reservation->ctx);
 }
 
 void qa_qvm_mod_protection_release(qa_qvm_mod_protection_runtime *protection, qa_actor_id actor) {
   stage *stages = protection->component->stages;
   for (size_t i = 0; i < protection->component->stage_count; i++) {
-    if (qa_same_actor(stages[i].actor, actor) && !stages[i].stopped) {
+    if (qa_same_actor(stages[i].actor, actor) && !stages[i].stopped && stages[i].watching) {
       stages[i].stopped = true;
       qa_qvm_memory_writes_unobserve(&protection->memory->writes, stages[i].watch_id);
     }
@@ -681,7 +726,8 @@ void qa_qvm_mod_protection_release(qa_qvm_mod_protection_runtime *protection, qa
     /* TS: try { reservation.close(); } finally { entries.delete(actor); }: the
      * entry stays readable while the reservation closes. */
     qa_protection_reservation reservation = entries[i].value.reservation;
-    reservation.close(reservation.ctx);
+    qa_caught_error failure;
+    bool ok = qa_try(close_reservation, &reservation, &failure);
     entries = protection->entries;
     for (size_t j = 0; j < protection->entry_count; j++) {
       if (!qa_same_actor(entries[j].actor, actor)) continue;
@@ -690,15 +736,30 @@ void qa_qvm_mod_protection_release(qa_qvm_mod_protection_runtime *protection, qa
       protection->entry_count--;
       break;
     }
+    if (!ok) qa_rethrow(&failure);
     return;
   }
 }
 
+typedef struct release_job {
+  qa_qvm_mod_protection_runtime *protection;
+  qa_actor_id actor;
+} release_job;
+
+static void release_body(void *ctx) {
+  release_job *job = ctx;
+  qa_qvm_mod_protection_release(job->protection, job->actor);
+}
+
 void qa_qvm_mod_protection_close(qa_qvm_mod_protection_runtime *protection) {
   protection->active = false;
+  /* TS releases every client, then reports the failures together. */
+  bool failed = false;
   while (protection->entry_count != 0) {
     actor_entry *entries = protection->entries;
-    qa_actor_id actor = entries[0].actor;
-    qa_qvm_mod_protection_release(protection, actor);
+    release_job job = {protection, entries[0].actor};
+    qa_caught_error failure;
+    if (!qa_try(release_body, &job, &failure)) failed = true;
   }
+  if (failed) qa_raise("AggregateError", 0, 0, "QVM protection cleanup failed");
 }

@@ -1,21 +1,34 @@
 /* Port of src/content/q3/base/game/rankings.ts. GPL-2.0-or-later. */
 #include "qa/content/q3/base/game/rankings.h"
+#include <math.h>
 #include <stddef.h>
+#include <string.h>
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 static bool qa_q3_ranking_reports_warmup_check(qa_q3_ranking_reports *r) { return r->warmup ? r->warmup(r->ctx) : true; }
-void qa_q3_ranking_reports_init(qa_q3_ranking_reports *r) { r->ctx=NULL; r->sink=NULL; r->warmup=NULL; r->attached=false; r->grapple_death=23; }
-/* TS `case this.grappleDeath:` (23 base, 28 missionpack): no C case label can name a runtime value, so the
-   switch key maps a grappleDeath match to RANK_GRAPPLE_CASE and leaves any other value (including a literal
-   23 under missionpack) to the remaining cases, none of which name 23, 28 or RANK_GRAPPLE_CASE. */
+/* TS field initializers: sink null, warmup () => true, grappleDeath 23, lastHit "". */
+void qa_q3_ranking_reports_init(qa_q3_ranking_reports *r) { memset(r, 0, sizeof *r); r->grapple_death=23; }
+/* A JS `switch` compares with ===: a fractional, NaN or out-of-int32 value matches no integer case label.
+   RANK_NO_CASE and RANK_GRAPPLE_CASE are values no case label below names. */
+#define RANK_NO_CASE (-0x3fffffff)
 #define RANK_GRAPPLE_CASE (-0x40000000)
-static int grapple_case(const qa_q3_ranking_reports *r, double mod) {
-  if (mod == r->grapple_death) return RANK_GRAPPLE_CASE;
-  int key = qa_js_to_int32(mod);
-  return key == RANK_GRAPPLE_CASE ? 0x3fffffff : key;
+static int rank_case(double v) {
+  int key = qa_js_to_int32(v);
+  return (double)key == v && key != RANK_GRAPPLE_CASE ? key : RANK_NO_CASE;
 }
+/* TS `case this.grappleDeath:` (23 base, 28 missionpack) sits after the labels 1..13 in each switch that
+   has it, so those win; a grappleDeath match then maps to RANK_GRAPPLE_CASE and any other value
+   (including a literal 23 under missionpack) falls to default. */
+static int grapple_case(const qa_q3_ranking_reports *r, double mod) {
+  int key = rank_case(mod);
+  if (key >= 1 && key <= 13) return key;
+  if (mod == r->grapple_death) return RANK_GRAPPLE_CASE;
+  return key;
+}
+/* TS compares `${frame}:${self}:${attacker}:${means_of_death}` strings: NaN equals NaN, -0 equals 0. */
+static bool same_hit_number(double a, double b) { return a == b || (isnan(a) && isnan(b)); }
 void qa_q3_ranking_reports_attach(qa_q3_ranking_reports *r, void *ctx, void (*sink)(void*,qa_q3_ranking_report), bool (*warmup)(void*)) {
-  if (r->attached) qa_range_error("Ranking report owner already attached");
+  if (r->attached) qa_raise("Error", 0, 0, "Ranking report owner already attached");
   r->ctx=ctx; r->sink=sink; r->warmup=warmup; r->attached=true;
 }
 void qa_q3_ranking_reports_detach(qa_q3_ranking_reports *r) { r->sink=NULL; r->warmup=NULL; r->attached=false; }
@@ -36,7 +49,7 @@ void qa_q3_ranking_reports_fire_weapon(qa_q3_ranking_reports *r, double self, do
   
   qa_q3_ranking_reports_integer(r,  self, -1, 1111020002, 1, true);
   
-  switch (qa_js_to_int32(weapon))
+  switch (rank_case(weapon))
   {
   case 2:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111020202, 1, true);
@@ -74,7 +87,7 @@ void qa_q3_ranking_reports_pickup_weapon(qa_q3_ranking_reports *r, double self, 
   if (qa_q3_ranking_reports_warmup_check(r)) return;
   
   qa_q3_ranking_reports_integer(r,  self, -1, 1111020009, 1, true);
-  switch (qa_js_to_int32(weapon))
+  switch (rank_case(weapon))
   {
   case 1:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111020109, 1, true);
@@ -117,7 +130,7 @@ void qa_q3_ranking_reports_pickup_ammo(qa_q3_ranking_reports *r, double self, do
   qa_q3_ranking_reports_integer(r,  self, -1, 1111030000, 1, true);
   qa_q3_ranking_reports_integer(r,  self, -1, 1111030001, quantity, true);
   
-  switch (qa_js_to_int32(weapon))
+  switch (rank_case(weapon))
   {
   case 2:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111030100, 1, true);
@@ -162,7 +175,7 @@ void qa_q3_ranking_reports_pickup_health(qa_q3_ranking_reports *r, double self, 
   qa_q3_ranking_reports_integer(r,  self, -1, 1111040000, 1, true);
   qa_q3_ranking_reports_integer(r,  self, -1, 1111040001, quantity, true);
 
-  switch (qa_js_to_int32(quantity))
+  switch (rank_case(quantity))
   {
   case 5:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111040100, 1, true);
@@ -187,7 +200,7 @@ void qa_q3_ranking_reports_pickup_armor(qa_q3_ranking_reports *r, double self, d
   qa_q3_ranking_reports_integer(r,  self, -1, 1111050000, 1, true);
   qa_q3_ranking_reports_integer(r,  self, -1, 1111050001, quantity, true);
 
-  switch (qa_js_to_int32(quantity))
+  switch (rank_case(quantity))
   {
   case 5:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111050100, 1, true);
@@ -215,7 +228,7 @@ void qa_q3_ranking_reports_pickup_powerup(qa_q3_ranking_reports *r, double self,
 
   qa_q3_ranking_reports_integer(r,  self, -1, 1111060000, 1, true);
   
-  switch (qa_js_to_int32(powerup))
+  switch (rank_case(powerup))
   {
   case 1:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111060100, 1, true);
@@ -243,7 +256,7 @@ void qa_q3_ranking_reports_pickup_powerup(qa_q3_ranking_reports *r, double self,
 void qa_q3_ranking_reports_pickup_holdable(qa_q3_ranking_reports *r, double self, double holdable) {
   if (qa_q3_ranking_reports_warmup_check(r)) return;
   
-  switch (qa_js_to_int32(holdable))
+  switch (rank_case(holdable))
   {
   case 2:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111070000, 1, true);
@@ -259,7 +272,7 @@ void qa_q3_ranking_reports_pickup_holdable(qa_q3_ranking_reports *r, double self
 void qa_q3_ranking_reports_use_holdable(qa_q3_ranking_reports *r, double self, double holdable) {
   if (qa_q3_ranking_reports_warmup_check(r)) return;
   
-  switch (qa_js_to_int32(holdable))
+  switch (rank_case(holdable))
   {
   case 2:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111070001, 1, true);
@@ -275,7 +288,7 @@ void qa_q3_ranking_reports_use_holdable(qa_q3_ranking_reports *r, double self, d
 void qa_q3_ranking_reports_reward(qa_q3_ranking_reports *r, double self, double award) {
   if (qa_q3_ranking_reports_warmup_check(r)) return;
   
-  switch (qa_js_to_int32(award))
+  switch (rank_case(award))
   {
   case 0x8000:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111090000, 1, true);
@@ -309,7 +322,7 @@ void qa_q3_ranking_reports_damage(qa_q3_ranking_reports *r, double self, double 
 
   if (qa_q3_ranking_reports_warmup_check(r)) return;
   
-  bool new_hit = !(r->last_hit_frame==frame && r->last_hit_self==self && r->last_hit_attacker==attacker && r->last_hit_mod==means_of_death && r->has_last_hit); r->has_last_hit=true; r->last_hit_frame=frame; r->last_hit_self=self; r->last_hit_attacker=attacker; r->last_hit_mod=means_of_death;
+  bool new_hit = !(r->has_last_hit && same_hit_number(r->last_hit_frame, frame) && same_hit_number(r->last_hit_self, self) && same_hit_number(r->last_hit_attacker, attacker) && same_hit_number(r->last_hit_mod, means_of_death)); r->has_last_hit=true; r->last_hit_frame=frame; r->last_hit_self=self; r->last_hit_attacker=attacker; r->last_hit_mod=means_of_death;
 
   
   if( (attacker != 1022) && (attacker != self) && 
@@ -320,7 +333,7 @@ void qa_q3_ranking_reports_damage(qa_q3_ranking_reports *r, double self, double 
   }
 
   
-  switch (qa_js_to_int32(means_of_death))
+  switch (rank_case(means_of_death))
   {
   case 14:
   case 15:
@@ -336,7 +349,7 @@ void qa_q3_ranking_reports_damage(qa_q3_ranking_reports *r, double self, double 
   }
 
   
-  switch (qa_js_to_int32(means_of_death))
+  switch (rank_case(means_of_death))
   {
   case 5:
   case 7:
@@ -549,7 +562,7 @@ void qa_q3_ranking_reports_player_die(qa_q3_ranking_reports *r, double self, dou
     
     qa_q3_ranking_reports_integer(r,  p1, p2, 1111080000, 1, true);
 
-    switch (qa_js_to_int32(means_of_death))
+    switch (rank_case(means_of_death))
     {
     case 14:
       qa_q3_ranking_reports_integer(r,  p1, p2, 1111080100, 1, true);
@@ -681,7 +694,7 @@ void qa_q3_ranking_reports_player_die(qa_q3_ranking_reports *r, double self, dou
 void qa_q3_ranking_reports_weapon_time(qa_q3_ranking_reports *r, double self, double weapon, double time) {
     if (time <= 0 || qa_q3_ranking_reports_warmup_check(r)) return;
     qa_q3_ranking_reports_integer(r, self, -1, 1111020010, time, true);
-  switch (qa_js_to_int32(weapon))
+  switch (rank_case(weapon))
   {
   case 1:
     qa_q3_ranking_reports_integer(r,  self, -1, 1111020110, time, true);

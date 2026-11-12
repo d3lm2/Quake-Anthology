@@ -1622,7 +1622,7 @@ static void restore_persistent(restore_ctx *r, const qa_save_reader *value) {
     qa_save_reader tx = field(&event, "text");
     const char *text = qa_save_reader_string(&tx);
     qa_save_reader tr = field(&event, "track");
-    finale.kind = "finale"; snprintf(finale.text, sizeof finale.text, "%s", text);
+    finale.kind = "finale"; finale.text = text; /* the event copy below owns it */
     finale.track = qa_save_reader_integer_min(&tr, 0);
     source.q1_level = &finale;
   } else if (eq(family, "q1") && eq(kind, "finale")) {

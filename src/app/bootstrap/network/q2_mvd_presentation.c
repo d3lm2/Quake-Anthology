@@ -18,7 +18,7 @@ struct qa_app_q2_mvd_visibility_state {
   uint8_t *applied_bits; size_t applied_length;
 };
 static const qa_q2_world_geometry *q2_geometry(qa_shared_scene_queries *scene, const char *message) {
-  if (scene->geometry.kind != QA_DECODED_WORLD_Q2) qa_range_error("%s", message);
+  if (scene->geometry.kind != QA_DECODED_WORLD_Q2) qa_raise("Error", 0, 0, "%s", message);
   return scene->geometry.as.q2;
 }
 static qa_vec3 player_origin(const qa_app_q2_mvd_visibility_state *s, const qa_q2_wire_player *player) {
@@ -61,7 +61,7 @@ static bool vis_visible(void *ctx, double leaf, bool is_pvs, const qa_q2_wire_pl
   qa_shared_scene_queries *scene = scene_with_portals(s, bits, length);
   const qa_q2_world_geometry *geometry = q2_geometry(scene, "MVD visibility requires the admitted Q2 BSP");
   if (leaf != trunc(leaf) || leaf < 0 || leaf >= (double)geometry->leaf_count)
-    qa_range_error("MVD multicast leaf is outside the admitted BSP");
+    qa_raise("Error", 0, 0, "MVD multicast leaf is outside the admitted BSP");
   double viewer = qa_shared_point_leaf(scene, player_origin(s, player));
   double cluster = qa_shared_leaf_cluster(scene, viewer);
   return cluster != -1
@@ -71,17 +71,18 @@ static bool vis_visible(void *ctx, double leaf, bool is_pvs, const qa_q2_wire_pl
 static qa_vec3 view_origin(const qa_app_q2_mvd_visibility_state *s, const qa_q2_wire_player *player) {
   qa_vec3 point = player_origin(s, player);
   point.x += player->viewoffset[0]; point.y += player->viewoffset[1];
-  point.z += player->viewoffset[2] + (s->host.profile.rerelease ? player->pmove.viewheight : 0);
+  /* TS point.z + viewoffset[2] + (rerelease ? viewheight : 0): left to right. */
+  point.z = point.z + player->viewoffset[2];
+  point.z = point.z + (s->host.profile.rerelease ? player->pmove.viewheight : 0);
   return point;
 }
 static bool inline_model_index(const char *path, double *out) {
   if (!path || path[0] != '*' || !path[1]) return false;
-  double value = 0;
-  for (const char *p = path + 1; *p; p++) {
+  for (const char *p = path + 1; *p; p++)
     if (*p < '0' || *p > '9') return false;
-    value = value * 10 + (*p - '0');
-  }
-  *out = value; return true;
+  /* Number(path.slice(1)): the correctly rounded value of the digits. */
+  *out = strtod(path + 1, NULL);
+  return true;
 }
 static qa_bounds entity_bounds(qa_app_q2_mvd_visibility_state *s, const qa_q2_wire_entity *entity) {
   const char *path = s->host.model_path(s->host.ctx, entity->modelindex);
@@ -110,7 +111,7 @@ static bool admitted(mask_ctx *m, double target) {
 }
 static bool visit_node(mask_ctx *m, double node) {
   if (node < 0 || node != trunc(node) || node >= (double)m->geometry->node_count)
-    qa_range_error("MVD entity topnode is outside the BSP");
+    qa_raise("Error", 0, 0, "MVD entity topnode is outside the BSP");
   const qa_bsp_node *branch = &m->geometry->nodes[(size_t)node];
   for (int i = 0; i < 2; i++) {
     qa_bsp_child child = branch->children[i];
@@ -126,7 +127,7 @@ static bool in_mask(mask_ctx *m) {
       if (admitted(m, m->clusters[i])) return true;
     return false;
   }
-  if (!m->linked.has_topnode) qa_range_error("MVD overflow entity has no BSP topnode");
+  if (!m->linked.has_topnode) qa_raise("Error", 0, 0, "MVD overflow entity has no BSP topnode");
   return visit_node(m, m->linked.topnode);
 }
 static size_t vis_entities(void *ctx, qa_q2_wire_entity *entities, size_t count,
@@ -226,7 +227,7 @@ static void vis_sound_origin(void *ctx, const qa_q2_wire_entity *entity, float o
   if (entity->solid != 31) { out[0] = (float)x; out[1] = (float)y; out[2] = (float)z; return; }
   const char *path = s->host.model_path(s->host.ctx, entity->modelindex);
   double index;
-  if (!inline_model_index(path, &index)) qa_range_error("MVD brush sound has no inline model");
+  if (!inline_model_index(path, &index)) qa_raise("Error", 0, 0, "MVD brush sound has no inline model");
   qa_bounds bounds = qa_shared_model_bounds(s->host.scene(s->host.ctx), index);
   out[0] = (float)(x + (bounds.min.x + bounds.max.x) / 2);
   out[1] = (float)(y + (bounds.min.y + bounds.max.y) / 2);

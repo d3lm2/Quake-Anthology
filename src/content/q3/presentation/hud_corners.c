@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/content/q3/base/game/format.h"
 #include "qa/content/q3/base/shared/items.h"
 #include "qa/core/info_string.h"
 #include "qa/core/numeric.h"
@@ -23,6 +24,18 @@ static const qa_q3_powerup POWERUPS[16] = {QA_Q3_PW_NONE, QA_Q3_PW_QUAD, QA_Q3_P
     QA_Q3_PW_INVIS, QA_Q3_PW_REGEN, QA_Q3_PW_FLIGHT, QA_Q3_PW_REDFLAG, QA_Q3_PW_BLUEFLAG, QA_Q3_PW_NEUTRALFLAG,
     QA_Q3_PW_SCOUT, QA_Q3_PW_GUARD, QA_Q3_PW_DOUBLER, QA_Q3_PW_AMMOREGEN, QA_Q3_PW_INVULNERABILITY,
     QA_Q3_PW_NUM_POWERUPS};
+/* TS gameFormat: the QVM's own integer formatting (its INT_MIN digits included) and its byte limit. */
+static void game_text(char *out, size_t size, const char *format, const qa_q3_game_format_arg *args, size_t count,
+                      double max_bytes) {
+  char *text = qa_q3_game_format(format, args, count, max_bytes);
+  if (text == NULL) qa_range_error("out of memory");
+  snprintf(out, size, "%s", text);
+  free(text);
+}
+static void game_number(char *out, size_t size, const char *format, double value, double max_bytes) {
+  qa_q3_game_format_arg args[1] = {qa_q3_game_format_number(value)};
+  game_text(out, size, format, args, 1, max_bytes);
+}
 static double integer_division(double numerator, double denominator) {
   return (double)qa_int32(trunc(numerator / denominator));
 }
@@ -48,20 +61,20 @@ static qa_q3_pres_client_draw_tools *tools_of(qa_q3_pres_client_hud_corners *cor
   return corners->icons->tools;
 }
 static qa_q3_base_source_player_state *active_player_state(qa_q3_pres_client_hud_corners *corners) {
-  if (!corners->state->snap) qa_range_error("HUD corners require a current snapshot");
+  if (!corners->state->snap) qa_raise("Error", 0, 0, "HUD corners require a current snapshot");
   return &corners->state->snap->player_state;
 }
 static void require_base(qa_q3_pres_client_hud_corners *corners, const char *source_name) {
   if (corners->state->product == QA_Q3_BASE_PRODUCT_MISSIONPACK)
-    qa_range_error("%s is not compiled in missionpack", source_name);
+    qa_raise("Error", 0, 0, "%s is not compiled in missionpack", source_name);
 }
 void qa_q3_pres_client_hud_corners_init(qa_q3_pres_client_hud_corners *corners,
     qa_q3_pres_client_game_state *state, qa_q3_pres_client_game_static_state *static_state,
     qa_q3_pres_client_draw_icons *icons, qa_q3_pres_hud_corners_host host) {
-  if (icons->state != state) qa_range_error("HUD corners and icons must share client state");
+  if (icons->state != state) qa_raise("Error", 0, 0, "HUD corners and icons must share client state");
   if (icons->media.static_state != static_state)
-    qa_range_error("HUD corners and media must share static state");
-  if (state->product != static_state->product) qa_range_error("HUD corner products differ");
+    qa_raise("Error", 0, 0, "HUD corners and media must share static state");
+  if (state->product != static_state->product) qa_raise("Error", 0, 0, "HUD corner products differ");
   memset(corners, 0, sizeof *corners);
   corners->state = state;
   corners->static_state = static_state;
@@ -71,7 +84,7 @@ void qa_q3_pres_client_hud_corners_init(qa_q3_pres_client_hud_corners *corners,
 void qa_q3_pres_client_hud_corners_draw_field(qa_q3_pres_client_hud_corners *corners, double x, double y,
                                               double width, double value) {
   if (corners->state->product == QA_Q3_BASE_PRODUCT_MISSIONPACK)
-    qa_range_error("CG_DrawField is not compiled in missionpack");
+    qa_raise("Error", 0, 0, "CG_DrawField is not compiled in missionpack");
   if (width < 1) return;
   if (width > 5) width = 5;
   int32_t v = qa_int32(value);
@@ -80,7 +93,7 @@ void qa_q3_pres_client_hud_corners_draw_field(qa_q3_pres_client_hud_corners *cor
   else if (width == 3) v = v < -99 ? -99 : v > 999 ? 999 : v;
   else if (width == 4) v = v < -999 ? -999 : v > 9999 ? 9999 : v;
   char text[32];
-  snprintf(text, sizeof text, "%lld", (long long)v);
+  game_number(text, sizeof text, "%i", v, 16);
   double length = qa_js_min((double)strlen(text), width);
   double draw_x = x + 2 + CHAR_WIDTH * (width - length);
   for (int index = 0; index < qa_js_to_int32(length); index++) {
@@ -95,7 +108,7 @@ void qa_q3_pres_client_hud_corners_draw_field(qa_q3_pres_client_hud_corners *cor
 }
 static double draw_attacker(qa_q3_pres_client_hud_corners *corners, double y) {
   qa_q3_pres_client_game_state *state = corners->state;
-  if (!state->snap) qa_range_error("CG_DrawAttacker requires a current snapshot");
+  if (!state->snap) qa_raise("Error", 0, 0, "CG_DrawAttacker requires a current snapshot");
   qa_q3_base_source_player_state *predicted = &state->predicted_player_state;
   const qa_q3_base_stat_schema *schema = qa_q3_base_stat_schema_for(state->product);
   if (qa_q3_base_player_state_slots_get(&predicted->stats, schema->health) <= 0 || state->attacker_time == 0)
@@ -119,11 +132,12 @@ static double draw_attacker(qa_q3_pres_client_hud_corners *corners, double y) {
   return f32(y + BIGCHAR_HEIGHT + 2);
 }
 static double draw_snapshot_value(qa_q3_pres_client_hud_corners *corners, double y) {
-  if (!corners->state->snap) qa_range_error("CG_DrawSnapshot requires a current snapshot");
+  if (!corners->state->snap) qa_raise("Error", 0, 0, "CG_DrawSnapshot requires a current snapshot");
   char text[96];
-  snprintf(text, sizeof text, "time:%lld snap:%lld cmd:%lld",
-           (long long)corners->state->snap->server_time, (long long)qa_int32(corners->state->latest_snapshot_num),
-           (long long)qa_int32(corners->static_state->server_command_sequence));
+  qa_q3_game_format_arg args[3] = {qa_q3_game_format_number(qa_int32((double)corners->state->snap->server_time)),
+                                   qa_q3_game_format_number(qa_int32(corners->state->latest_snapshot_num)),
+                                   qa_q3_game_format_number(qa_int32(corners->static_state->server_command_sequence))};
+  game_text(text, sizeof text, "time:%i snap:%i cmd:%i", args, 3, 32000);
   double width = qa_q3_pres_draw_strlen(text) * BIGCHAR_WIDTH;
   qa_q3_pres_client_draw_tools_draw_big_string(tools_of(corners), 635 - width, trunc(y + 2), text, 1);
   return f32(y + BIGCHAR_HEIGHT + 4);
@@ -140,7 +154,7 @@ static double draw_fps(qa_q3_pres_client_hud_corners *corners, double y) {
     if (total == 0) total = 1;
     double fps = integer_division(1000 * FPS_FRAMES, total);
     char text[32];
-    snprintf(text, sizeof text, "%lldfps", (long long)qa_int32(fps));
+    game_number(text, sizeof text, "%ifps", fps, 32000);
     qa_q3_pres_client_draw_tools_draw_big_string(tools_of(corners),
         635 - qa_q3_pres_draw_strlen(text) * BIGCHAR_WIDTH, trunc(y + 2), text, 1);
   }
@@ -154,8 +168,9 @@ static double draw_timer(qa_q3_pres_client_hud_corners *corners, double y) {
   double tens = integer_division(seconds, 10);
   seconds = (double)qa_int32(seconds - tens * 10);
   char text[48];
-  snprintf(text, sizeof text, "%lld:%lld%lld", (long long)qa_int32(minutes), (long long)qa_int32(tens),
-           (long long)qa_int32(seconds));
+  qa_q3_game_format_arg args[3] = {qa_q3_game_format_number(minutes), qa_q3_game_format_number(tens),
+                                   qa_q3_game_format_number(seconds)};
+  game_text(text, sizeof text, "%i:%i%i", args, 3, 32000);
   qa_q3_pres_client_draw_tools_draw_big_string(tools_of(corners),
       635 - qa_q3_pres_draw_strlen(text) * BIGCHAR_WIDTH, trunc(y + 2), text, 1);
   return f32(y + BIGCHAR_HEIGHT + 4);
@@ -223,8 +238,9 @@ static double draw_team_overlay(qa_q3_pres_client_hud_corners *corners, double y
     }
     xx = x + TINYCHAR_WIDTH * 3 + TINYCHAR_WIDTH * player_width + TINYCHAR_WIDTH * location_width;
     char health_text[32];
-    snprintf(health_text, sizeof health_text, "%3lld %3lld", (long long)qa_int32(client->health),
-             (long long)qa_int32(client->armor));
+    qa_q3_game_format_arg health_args[2] = {qa_q3_game_format_number(qa_int32(client->health)),
+                                            qa_q3_game_format_number(qa_int32(client->armor))};
+    game_text(health_text, sizeof health_text, "%3i %3i", health_args, 2, 16); /* TS limit 16: at most 15 bytes */
     tiny_text(corners, xx, y, health_text, qa_q3_pres_get_color_for_health(client->health, client->armor), 0);
     xx += TINYCHAR_WIDTH * 3;
     const qa_q3_pres_scene_shader *weapon_icon = corners->host.weapon_icon
@@ -251,7 +267,7 @@ static double draw_team_overlay(qa_q3_pres_client_hud_corners *corners, double y
 static double draw_free_score(qa_q3_pres_client_hud_corners *corners, double x, double y, double score,
                               bool selected, bool first) {
   char text[32];
-  snprintf(text, sizeof text, "%2lld", (long long)qa_int32(score));
+  game_number(text, sizeof text, "%2i", qa_int32(score), 32000);
   double width = qa_q3_pres_draw_strlen(text) * BIGCHAR_WIDTH + 8;
   x -= width;
   qa_vec4 color = selected ? (first ? (qa_vec4){0, 0, 1, f32(0.33)} : (qa_vec4){1, 0, 0, f32(0.33)})
@@ -273,7 +289,7 @@ static double draw_scores(qa_q3_pres_client_hud_corners *corners, double y) {
   const qa_q3_pres_client_media_graphics *g = corners->host.graphics;
   if (cgs->game_type >= QA_Q3_BASE_GT_TEAM) {
     char text[32];
-    snprintf(text, sizeof text, "%2lld", (long long)score2);
+    game_number(text, sizeof text, "%2i", score2, 32000);
     double width = qa_q3_pres_draw_strlen(text) * BIGCHAR_WIDTH + 8;
     x -= width;
     qa_rect blue_rect = {x, y - 4, width, BIGCHAR_HEIGHT + 8};
@@ -292,7 +308,7 @@ static double draw_scores(qa_q3_pres_client_hud_corners *corners, double y) {
                                               g->blue_flag_shader[(size_t)cgs->blueflag]);
       }
     }
-    snprintf(text, sizeof text, "%2lld", (long long)score1);
+    game_number(text, sizeof text, "%2i", score1, 32000);
     width = qa_q3_pres_draw_strlen(text) * BIGCHAR_WIDTH + 8;
     x -= width;
     qa_rect red_rect = {x, y - 4, width, BIGCHAR_HEIGHT + 8};
@@ -313,7 +329,7 @@ static double draw_scores(qa_q3_pres_client_hud_corners *corners, double y) {
     }
     double limit = cgs->game_type >= QA_Q3_BASE_GT_CTF ? cgs->capturelimit : cgs->fraglimit;
     if (limit != 0) {
-      snprintf(text, sizeof text, "%2lld", (long long)qa_int32(limit));
+      game_number(text, sizeof text, "%2i", qa_int32(limit), 32000);
       double limit_width = qa_q3_pres_draw_strlen(text) * BIGCHAR_WIDTH + 8;
       x -= limit_width;
       qa_q3_pres_client_draw_tools_draw_big_string(tools_of(corners), x + 4, trunc(y), text, 1);
@@ -329,7 +345,7 @@ static double draw_scores(qa_q3_pres_client_hud_corners *corners, double y) {
       x = draw_free_score(corners, x, y, score1, !spectator && score == score1, true);
     if (cgs->fraglimit != 0) {
       char text[32];
-      snprintf(text, sizeof text, "%2lld", (long long)qa_int32(cgs->fraglimit));
+      game_number(text, sizeof text, "%2i", qa_int32(cgs->fraglimit), 32000);
       double width = qa_q3_pres_draw_strlen(text) * BIGCHAR_WIDTH + 8;
       x -= width;
       qa_q3_pres_client_draw_tools_draw_big_string(tools_of(corners), x + 4, trunc(y), text, 1);
@@ -408,7 +424,7 @@ static double draw_pickup_item(qa_q3_pres_client_hud_corners *corners, double y)
   const qa_q3_base_item_definition *item = qa_q3_base_item_at(corners->state->product, value);
   const qa_q3_pres_scene_shader *icon = NULL;
   if (!corners->host.pickup_visual || !corners->host.pickup_visual(corners->host.ctx, value, &icon))
-    qa_range_error("Pickup item has no cgame visual slot");
+    qa_raise("Error", 0, 0, "Pickup item has no cgame visual slot");
   qa_draw2d_set_color(&tools_of(corners)->draw, &fade);
   qa_rect rect = {8, y, ICON_SIZE, ICON_SIZE};
   qa_q3_pres_client_draw_tools_draw_pic(tools_of(corners), rect, icon);

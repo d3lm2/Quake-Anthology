@@ -187,7 +187,8 @@ static void attack_fn(void *ctx, qa_q2m_context *c) {
   qa_q2mpm_rogue_state *own = qa_q2mpm_state_get(bundle->source, entity);
   bool blocked = own->blocked;
   own->blocked = false;
-  if (!qa_q2bm_alive_enemy(c)) return;
+  qa_body_state enemy_body; /* TS `enemyBody(context) === null`: a dead enemy that still has a body is attacked */
+  if (!qa_q2m_enemy_body(c, &enemy_body)) return;
   bool ready = q2mpm_now(game) >= state->attack_finished;
   if (bundle->services.bad_area(bundle->services.ctx, entity->actor.id)) {
     q2mpm_set_move(c, q2mpm_rnd(game) < 0.75 || !ready ? "widow2_move_attack_pre_beam" : "widow2_move_attack_disrupt");
@@ -264,13 +265,14 @@ static void die_fn(void *ctx, qa_q2m_context *c, qa_death_reaction reaction) {
   state->can_take_damage = false;
   q2mpm_set_damageable(game, entity, false);
   entity->count = 0;
-  qa_body_state enemy;
-  qa_vec3 point = qa_q2m_enemy_body(c, &enemy) ? enemy.origin : q2mpm_body(game, entity).origin;
   for (size_t i = 0; i < qa_q2_game_entity_count(game); i++) {
     qa_q2_entity *child = qa_q2_game_entity_at(game, i);
-    if (strcmp(child->classname, "monster_stalker") == 0 && qa_q2m_health(game, &child->actor.id) > 0)
-      (void)q2mpm_damage(game, child->actor.id, entity, &entity->actor.id,
-                         qa_q2m_health(game, &child->actor.id) + 1, 0, q2mpm_zero(), point, q2mpm_zero(), 0, false, 8);
+    if (strcmp(child->classname, "monster_stalker") == 0 && qa_q2m_health(game, &child->actor.id) > 0) {
+      double amount = qa_q2m_health(game, &child->actor.id) + 1;
+      qa_body_state enemy; /* read for each child, as the TS argument is */
+      qa_vec3 point = qa_q2m_enemy_body(c, &enemy) ? enemy.origin : q2mpm_body(game, entity).origin;
+      (void)q2mpm_damage(game, child->actor.id, entity, &entity->actor.id, amount, 0, q2mpm_zero(), point, q2mpm_zero(), 0, true, 8);
+    }
   }
   qa_q2mpm_widow_clear_powerups(c, bundle->source);
   q2mpm_set_move(c, "widow2_move_death");
@@ -348,7 +350,7 @@ static void tongue_fn(void *ctx, qa_q2m_context *c) {
   beam.start = start; beam.end = enemy.origin;
   game->host->emit(game->host->ctx, beam);
   (void)q2mpm_damage(game, entity->enemy, entity, &entity->actor.id, 2, 0, qa_sub3_double(start, enemy.origin),
-                     enemy.origin, q2mpm_zero(), 0, false, 8);
+                     enemy.origin, q2mpm_zero(), 0, true, 8); /* TS flags 8 (no knockback) */
 }
 static void crunch_fn(void *ctx, qa_q2m_context *c) {
   widow2_bundle *bundle = ctx;
@@ -358,7 +360,7 @@ static void crunch_fn(void *ctx, qa_q2m_context *c) {
   qa_body_state enemy;
   bool has = qa_q2m_enemy_body(c, &enemy);
   double kick = c->entity->frame != qa_q2mpm_rogue_widow2_frames_value.tongs07 ? 0
-      : (!has || enemy.ground == NULL) ? 250 : 500;
+      : (has && enemy.ground == NULL) ? 250 : 500; /* TS `enemy?.ground === null`: no body is undefined, so 500 */
   (void)c->weapons.fire_hit(c->weapons.ctx, c->entity, c->game, q2mpm_v3(150, 0, 4),
                             20 + floor(q2mpm_rnd(c->game) * 6), kick);
 }

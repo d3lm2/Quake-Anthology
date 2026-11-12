@@ -2,12 +2,16 @@
 #include "qa/media/source.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include "qa/content/archive/types.h"
 #include "qa/core/binary/index.h"
 #include "qa/foundation/support.h"
 
@@ -81,52 +85,48 @@ qa_media_input *qa_media_bytes(const uint8_t *bytes, size_t length,
 }
 
 typedef struct file_ctx {
-  FILE *file;
+  int descriptor;
 } file_ctx;
 
+/* TS readSync(descriptor, destination, 0, length, offset): a positioned
+ * read; a failure is Bun's `<CODE>: <description>, read` Error. */
 static int64_t file_read_at(void *raw, int64_t offset, uint8_t *destination,
                             size_t length) {
   file_ctx *ctx = (file_ctx *)raw;
   if (length == 0) return 0;
-  if (fseek(ctx->file, (long)offset, SEEK_SET) != 0) {
-    media_error("%s", strerror(errno));
-  }
-  size_t count = fread(destination, 1, length, ctx->file);
-  if (count < length && ferror(ctx->file)) {
-    media_error("%s", strerror(errno));
-  }
+  ssize_t count;
+  do {
+    count = pread(ctx->descriptor, destination, length, (off_t)offset);
+  } while (count < 0 && errno == EINTR);
+  if (count < 0) qa_content_fs_error(errno, "read", NULL);
   return (int64_t)count;
 }
 
 static void file_close_ctx(void *raw) {
   file_ctx *ctx = (file_ctx *)raw;
-  fclose(ctx->file);
+  close(ctx->descriptor);
   free(ctx);
 }
 
+/* TS openMediaFile: openSync(path, "r") then fstatSync(descriptor).size,
+ * closing the descriptor when fstat fails. */
 qa_media_input *qa_open_media_file(const char *path) {
-  FILE *file = fopen(path, "rb");
-  if (file == NULL) media_error("%s", strerror(errno));
-  if (fseek(file, 0, SEEK_END) != 0) {
+  int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0) qa_content_fs_error(errno, "open", path);
+  struct stat status;
+  if (fstat(descriptor, &status) != 0) {
     int error = errno;
-    fclose(file);
-    media_error("%s", strerror(error));
-  }
-  long size = ftell(file);
-  if (size < 0) {
-    int error = errno;
-    fclose(file);
-    media_error("%s", strerror(error));
+    close(descriptor);
+    qa_content_fs_error(error, "fstat", NULL);
   }
   file_ctx *ctx = (file_ctx *)malloc(sizeof *ctx);
   if (ctx == NULL) {
-    fclose(file);
+    close(descriptor);
     return NULL;
   }
-  ctx->file = file;
-  qa_media_input *input =
-      qa_media_input_create(ctx, path, (int64_t)size, file_read_at,
-                            file_close_ctx);
+  ctx->descriptor = descriptor;
+  qa_media_input *input = qa_media_input_create(
+      ctx, path, (int64_t)status.st_size, file_read_at, file_close_ctx);
   if (input == NULL) file_close_ctx(ctx);
   return input;
 }
@@ -158,16 +158,19 @@ uint8_t *qa_read_media(qa_media_input *input, int64_t offset, int64_t length) {
   if (length == 0) return NULL;
   uint8_t *bytes = (uint8_t *)malloc((size_t)length);
   if (bytes == NULL) return NULL;
+  /* A closed input or a failed file read raises from readAt. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, bytes);
   int64_t count = 0;
   while (count < length) {
     int64_t read = qa_media_input_read_at(
         input, offset + count, bytes + (size_t)count,
         (size_t)(length - count));
     if (read <= 0 || read > length - count) {
-      free(bytes);
       qa_binary_error(input->source, offset + count, "short media read");
     }
     count += read;
   }
+  qa_cleanup_pop(&guard);
   return bytes;
 }

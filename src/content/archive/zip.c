@@ -1,6 +1,7 @@
 /* Port of src/content/archive/zip.ts. GPL-2.0-or-later. */
 #include "qa/content/archive/zip.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
@@ -57,6 +58,24 @@ qa_zip_directory qa_read_zip_tail(const uint8_t *tail, size_t tail_length,
                    "ZIP end-of-central-directory record not found");
 }
 
+/* Entries built so far, released when a malformed record raises. */
+typedef struct partial_entries {
+  qa_archive_entry *entries;
+  size_t count;
+  qa_binary_reader *reader;
+  char *raw_path;
+} partial_entries;
+static void partial_entries_release(void *arg) {
+  partial_entries *partial = (partial_entries *)arg;
+  for (size_t i = 0; i < partial->count; i++) {
+    free(partial->entries[i].path);
+    free(partial->entries[i].raw_path);
+  }
+  free(partial->entries);
+  free(partial->raw_path);
+  qa_binary_reader_destroy(partial->reader);
+}
+
 /* TS byteString: one char per byte. */
 static char *byte_string(const uint8_t *bytes, size_t length) {
   char *out = (char *)malloc(length + 1);
@@ -74,7 +93,13 @@ bool qa_read_zip_directory(const uint8_t *bytes, size_t length,
   reader_or_oom(&reader, bytes, length, source);
   qa_archive_entry *entries = NULL;
   size_t count = 0, capacity = 0;
+  partial_entries partial = {NULL, 0, &reader, NULL};
+  qa_cleanup partial_node;
+  qa_cleanup_push(&partial_node, partial_entries_release, &partial);
   for (int64_t index = 0; index < directory.entry_count; index++) {
+    partial.entries = entries;
+    partial.count = count;
+    partial.raw_path = NULL;
     size_t offset = qa_binary_reader_offset(&reader);
     const uint8_t *header =
         qa_binary_reader_data_view(&reader, (int64_t)offset, 46);
@@ -116,7 +141,9 @@ bool qa_read_zip_directory(const uint8_t *bytes, size_t length,
     char *raw_path = byte_string(name_bytes, name_length);
     free(name_bytes);
     if (raw_path == NULL) goto oom;
+    partial.raw_path = raw_path;
     qa_binary_reader_skip(&reader, (int64_t)extra_length + comment_length);
+    partial.raw_path = NULL;
     bool unsafe = has_nul;
     char *path = has_nul ? NULL : qa_try_normalize_entry_path(raw_path, &unsafe);
     if (path == NULL && !unsafe) { free(raw_path); goto oom; }
@@ -146,15 +173,19 @@ bool qa_read_zip_directory(const uint8_t *bytes, size_t length,
     entry->is_directory = path_length > 0 && path[path_length - 1] == '/';
     count++;
   }
+  partial.entries = entries;
+  partial.count = count;
   if (qa_binary_reader_remaining(&reader) != 0)
     qa_archive_error(source,
                      directory.offset + (int64_t)qa_binary_reader_offset(&reader),
                      "central directory size disagrees with entry count");
+  qa_cleanup_pop(&partial_node);
   qa_binary_reader_destroy(&reader);
   *out_entries = entries;
   *out_count = count;
   return true;
 oom:
+  qa_cleanup_pop(&partial_node);
   for (size_t i = 0; i < count; i++) {
     free(entries[i].path);
     free(entries[i].raw_path);
@@ -222,12 +253,82 @@ int64_t qa_zip_data_offset(const uint8_t *variable, size_t variable_length,
   return data_offset;
 }
 
+/* node:zlib inflateRawSync(compressed, { maxOutputLength }) as Bun runs it
+ * (lib/zlib.js processChunkSync over ZlibContext): inflate with Z_FINISH into
+ * 16 KiB output chunks. After each call a data error throws the zlib message;
+ * Z_OK or Z_BUF_ERROR with output space left is "unexpected end of file"; then
+ * the bytes read so far are counted, and more than maxOutputLength throws
+ * RangeError "Cannot create a Buffer larger than N bytes". A full chunk asks
+ * for another call. The TS catch turns each of those into ArchiveError
+ * "DEFLATE failed: <message>". */
+#define QA_ZLIB_CHUNK 16384u
+static uint8_t *inflate_raw(const uint8_t *compressed, size_t compressed_length,
+                            size_t max_output, const char *source,
+                            int64_t data_offset, size_t *out_length) {
+  z_stream stream;
+  memset(&stream, 0, sizeof stream);
+  int status = inflateInit2(&stream, -MAX_WBITS);
+  if (status != Z_OK)
+    qa_archive_error(source, data_offset, "DEFLATE failed: %s",
+                     stream.msg != NULL ? stream.msg : "Zlib error");
+  uint8_t *output = NULL;
+  size_t length = 0, capacity = 0;
+  size_t in_offset = 0;
+  for (;;) {
+    if (capacity - length < QA_ZLIB_CHUNK) {
+      size_t next = capacity == 0 ? QA_ZLIB_CHUNK : capacity * 2;
+      while (next - length < QA_ZLIB_CHUNK) next *= 2;
+      uint8_t *grown = (uint8_t *)realloc(output, next);
+      if (grown == NULL) {
+        free(output);
+        (void)inflateEnd(&stream);
+        qa_range_error("out of memory");
+      }
+      output = grown;
+      capacity = next;
+    }
+    /* zlib counts input in uInt; feed what is left, at most UINT_MAX. */
+    size_t in_left = compressed_length - in_offset;
+    uInt in_now = in_left > (size_t)0xffffffffu ? 0xffffffffu : (uInt)in_left;
+    stream.next_in = (Bytef *)(const void *)(compressed + in_offset);
+    stream.avail_in = in_now;
+    stream.next_out = output + length;
+    stream.avail_out = QA_ZLIB_CHUNK;
+    status = inflate(&stream, Z_FINISH);
+    in_offset += in_now - stream.avail_in;
+    const char *failure = NULL;
+    if (status == Z_OK || status == Z_BUF_ERROR) {
+      if (stream.avail_out != 0) failure = stream.msg != NULL ? stream.msg : "unexpected end of file";
+    } else if (status == Z_NEED_DICT) {
+      failure = stream.msg != NULL ? stream.msg : "Missing dictionary";
+    } else if (status != Z_STREAM_END) {
+      failure = stream.msg != NULL ? stream.msg : "Zlib error";
+    }
+    if (failure != NULL) {
+      char message[256];
+      (void)snprintf(message, sizeof message, "%s", failure);
+      (void)inflateEnd(&stream);
+      free(output);
+      qa_archive_error(source, data_offset, "DEFLATE failed: %s", message);
+    }
+    length += QA_ZLIB_CHUNK - stream.avail_out;
+    if (length > max_output) {
+      (void)inflateEnd(&stream);
+      free(output);
+      qa_archive_error(source, data_offset,
+                       "DEFLATE failed: Cannot create a Buffer larger than %zu bytes",
+                       max_output);
+    }
+    if (stream.avail_out != 0) break;
+  }
+  (void)inflateEnd(&stream);
+  *out_length = length;
+  return output;
+}
+
 uint8_t *qa_decode_zip_entry(const uint8_t *compressed, size_t compressed_length,
                              const char *source, int64_t data_offset,
                              const qa_archive_entry *entry, size_t *out_length) {
-  if (entry->byte_length > QA_MAX_ZIP_ENTRY_BYTES)
-    qa_archive_error(source, data_offset, "entry size %lld exceeds the %d-byte limit",
-                     (long long)entry->byte_length, QA_MAX_ZIP_ENTRY_BYTES);
   uint8_t *output = NULL;
   size_t output_length = 0;
   if (entry->compression_method == 0) {
@@ -239,37 +340,9 @@ uint8_t *qa_decode_zip_entry(const uint8_t *compressed, size_t compressed_length
     }
   } else {
     /* TS inflateRawSync with maxOutputLength max(1, byteLength). */
-    size_t capacity =
-        entry->byte_length > 1 ? (size_t)entry->byte_length : 1;
-    output = (uint8_t *)malloc(capacity);
-    if (output == NULL) return NULL;
-    z_stream stream;
-    memset(&stream, 0, sizeof stream);
-    stream.next_in = (Bytef *)(const void *)compressed;
-    stream.avail_in = (uInt)compressed_length;
-    stream.next_out = output;
-    stream.avail_out = (uInt)capacity;
-    int status = inflateInit2(&stream, -MAX_WBITS);
-    if (status != Z_OK) {
-      const char *message = stream.msg != NULL ? stream.msg : "inflate init";
-      free(output);
-      qa_archive_error(source, data_offset, "DEFLATE failed: %s", message);
-    }
-    status = inflate(&stream, Z_FINISH);
-    output_length = (size_t)stream.total_out;
-    const char *message = stream.msg;
-    (void)inflateEnd(&stream);
-    if (status != Z_STREAM_END && status != Z_OK && status != Z_BUF_ERROR) {
-      free(output);
-      qa_archive_error(source, data_offset, "DEFLATE failed: %s",
-                       message != NULL ? message : "invalid deflate stream");
-    }
-    if (status == Z_BUF_ERROR && output_length == capacity &&
-        entry->byte_length > 0 && compressed_length > 0) {
-      /* Output filled the cap without ending: either exactly full
-       * (checked by size below) or truncated input. Node throws on
-       * truncated input; a full-size mismatch is caught below. */
-    }
+    size_t max_output = entry->byte_length > 1 ? (size_t)entry->byte_length : 1;
+    output = inflate_raw(compressed, compressed_length, max_output, source,
+                         data_offset, &output_length);
   }
   if ((int64_t)output_length != entry->byte_length) {
     free(output);
@@ -278,10 +351,15 @@ uint8_t *qa_decode_zip_entry(const uint8_t *compressed, size_t compressed_length
                      (long long)entry->byte_length);
   }
   uLong crc = crc32(0L, Z_NULL, 0);
+  /* crc32 takes a uInt length; entries are below 4 GiB. */
   if (output_length > 0) crc = crc32(crc, output, (uInt)output_length);
   if ((uint32_t)crc != entry->crc32) {
     free(output);
     qa_archive_error(source, data_offset, "entry CRC32 mismatch");
+  }
+  if (output_length == 0) {
+    free(output);
+    output = NULL;
   }
   if (out_length != NULL) *out_length = output_length;
   return output;

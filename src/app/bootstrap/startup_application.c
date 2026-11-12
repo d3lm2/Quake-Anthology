@@ -3,6 +3,8 @@
  * lobbyJoinOptions and the public getters. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "startup_application_internal.h"
+#include "qa/foundation/caught_message.h"
+#include "qa/formats/text_decoder.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,16 +39,28 @@ void qa_startup_set_text(char **slot, const char *text) {
   free(*slot);
   *slot = copy;
 }
+const char *qa_startup_keep_text(char **slot, const char *text) {
+  qa_startup_set_text(slot, text);
+  return *slot;
+}
 static bool eq(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 /* TS performance.now(). */
 double qa_startup_now(void) { return qa_app_performance_now(); }
 void qa_startup_printf(qa_startup_application *app, const char *format, ...) {
-  va_list args;
+  va_list args, measure;
   va_start(args, format);
-  char text[4096];
-  vsnprintf(text, sizeof text, format, args);
+  va_copy(measure, args);
+  int length = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  char *text = length >= 0 ? malloc((size_t)length + 1) : NULL;
+  if (text == NULL) { va_end(args); qa_range_error("Out of memory"); }
+  vsnprintf(text, (size_t)length + 1, format, args);
   va_end(args);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, text);
   qa_startup_application_print(app, text);
+  qa_cleanup_pop(&guard);
+  free(text);
 }
 void qa_startup_push_release(qa_startup_application *app, void (*run)(qa_startup_application *app, void *ctx), void *ctx) {
   void *grown = realloc(app->release_source_commands, (app->release_source_command_count + 1) * sizeof *app->release_source_commands);
@@ -173,7 +187,7 @@ static void join_options_body(void *ctx) {
 }
 static const char *lobby_join(void *ctx, const qa_lobby *lobby) {
   qa_startup_application *app = ctx;
-  static char message[sizeof ((qa_caught_error *)0)->message];
+  static char *message; /* the whole caught message, valid until the next failed join */
   join_call call;
   memset(&call, 0, sizeof call);
   call.app = app; call.lobby = lobby;
@@ -183,8 +197,7 @@ static const char *lobby_join(void *ctx, const qa_lobby *lobby) {
   if (!joined) {
     if (call.has_recipe) qa_executable_recipe_free(&call.recipe);
     if (call.tree != NULL) qa_save_value_free(call.tree);
-    snprintf(message, sizeof message, "%s", caught.message);
-    return message;
+    return qa_startup_keep_text(&message, qa_caught_message(&caught));
   }
   const char *error = qa_startup_stage_lobby_launch(app, &call.action);
   qa_app_startup_action_clear(&call.action);
@@ -227,28 +240,64 @@ static void preferences_changed(void *ctx) {
   if (app->closed) return;
   persist_call call = {app};
   qa_caught_error caught;
-  if (!qa_try(persist_body, &call, &caught)) qa_startup_printf(app, "Could not save controls: %s\n", caught.message);
+  if (!qa_try(persist_body, &call, &caught)) qa_startup_printf(app, "Could not save controls: %s\n", qa_caught_message(&caught));
 }
 /* this.saves = new StartupSaves(model.catalog, saveDirectory, host.externalSaveDirectories ??
- * nightdiveAddonDirectories().map(root => root.root)); the directories are kept for saves.externalDirectories. */
+ * nightdiveAddonDirectories().map(root => root.root)): each construction (open and every add-on change) looks the
+ * Nightdive directories up again. The directories are kept for saves.externalDirectories. */
 static void open_saves(qa_startup_application *app) {
-  if (app->external_directories == NULL) {
-    const char *const *directories = app->host.base.external_save_directories;
-    size_t count = app->host.base.external_save_directory_count;
-    qa_nightdive_addon_root *roots = NULL;
-    size_t root_count = 0;
-    if (!app->host.base.has_external_save_directories) {
-      if (!qa_nightdive_addon_directories(NULL, &roots, &root_count)) qa_range_error("Out of memory");
-      count = root_count;
-    }
-    app->external_directories = calloc(count + 1, sizeof *app->external_directories);
-    if (app->external_directories == NULL) qa_range_error("Out of memory");
-    for (size_t i = 0; i < count; i++) app->external_directories[i] = qa_startup_dup(roots != NULL ? roots[i].root : directories[i]);
-    app->external_directory_count = count;
-    qa_nightdive_addon_roots_free(roots, root_count);
+  const char *const *directories = app->host.base.external_save_directories;
+  size_t count = app->host.base.external_save_directory_count;
+  qa_nightdive_addon_root *roots = NULL;
+  size_t root_count = 0;
+  if (!app->host.base.has_external_save_directories) {
+    if (!qa_nightdive_addon_directories(NULL, &roots, &root_count)) qa_range_error("Out of memory");
+    count = root_count;
   }
-  qa_app_startup_saves *saves = qa_app_startup_saves_create(qa_app_startup_selection_catalog(app->model), app->save_directory,
-      (const char *const *)app->external_directories, app->external_directory_count);
+  char **found = calloc(count + 1, sizeof *found);
+  if (found == NULL) { qa_nightdive_addon_roots_free(roots, root_count); qa_range_error("Out of memory"); }
+  for (size_t i = 0; i < count; i++) {
+    const char *text = roots != NULL ? roots[i].root : directories[i];
+    found[i] = text != NULL ? strdup(text) : NULL;
+    if (found[i] == NULL) {
+      for (size_t j = 0; j < i; j++) free(found[j]);
+      free(found);
+      qa_nightdive_addon_roots_free(roots, root_count);
+      qa_range_error("Out of memory");
+    }
+  }
+  qa_nightdive_addon_roots_free(roots, root_count);
+  bool same = app->external_directories != NULL && app->external_directory_count == count;
+  for (size_t i = 0; same && i < count; i++) same = strcmp(app->external_directories[i], found[i]) == 0;
+  if (same) {
+    for (size_t i = 0; i < count; i++) free(found[i]);
+    free(found);
+  } else {
+    if (app->external_directories != NULL) {
+      struct qa_startup_directory_list *retired = malloc(sizeof *retired);
+      if (retired == NULL) {
+        for (size_t i = 0; i < count; i++) free(found[i]);
+        free(found);
+        qa_range_error("Out of memory");
+      }
+      retired->items = app->external_directories;
+      retired->count = app->external_directory_count;
+      retired->next = app->retired_external;
+      app->retired_external = retired;
+    }
+    app->external_directories = found;
+    app->external_directory_count = count;
+  }
+  /* nativeSaveFolders(model.catalog, model.options.nativeConfigRoot) */
+  qa_app_options model_options;
+  qa_app_startup_selection_options(app->model, &model_options);
+  size_t native_count = 0;
+  qa_app_native_save_folder *native_folders = qa_app_native_save_folders(qa_app_startup_selection_catalog(app->model),
+      model_options.native_config_root, &native_count);
+  qa_app_options_destroy(&model_options);
+  qa_app_startup_saves *saves = qa_app_startup_saves_create_native(qa_app_startup_selection_catalog(app->model), app->save_directory,
+      (const char *const *)app->external_directories, app->external_directory_count, native_folders, native_count);
+  qa_app_native_save_folders_free(native_folders, native_count);
   if (saves == NULL) qa_range_error("Out of memory");
   if (app->saves != NULL) qa_app_startup_saves_destroy(app->saves);
   app->saves = saves;
@@ -320,6 +369,7 @@ qa_startup_application *qa_startup_application_create(qa_app_startup_selection_m
     qa_startup_application_host host, const char *save_directory, const char *entry) {
   qa_startup_application *app = calloc(1, sizeof *app);
   if (app == NULL) qa_range_error("Out of memory");
+  qa_startup_console_log_init(app);
   app->host = host;
   app->model = model;
   app->entry = entry != NULL && strcmp(entry, "run") == 0 ? "run" : "menu";
@@ -401,11 +451,10 @@ const char *qa_startup_clipboard(qa_startup_application *app) {
   free(app->clipboard_text);
   app->clipboard_text = NULL;
   if (bytes == NULL) return NULL;
-  app->clipboard_text = malloc(length + 1);
-  if (app->clipboard_text == NULL) { free(bytes); qa_range_error("Out of memory"); }
-  memcpy(app->clipboard_text, bytes, length);
-  app->clipboard_text[length] = '\0';
+  /* new TextDecoder().decode(bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD. */
+  app->clipboard_text = qa_text_decoder_decode(bytes, length, NULL);
   free(bytes);
+  if (app->clipboard_text == NULL) qa_range_error("Out of memory");
   return app->clipboard_text;
 }
 
@@ -415,8 +464,48 @@ static qa_seat_console *client_console(qa_app_client_bootstrap *client, const st
     if (client->consoles[i].seat == seat) return client->consoles[i].console;
   return NULL;
 }
+/* consoleLog: the front end's own console output, kept as the selected game would keep it. */
+static double console_log_mode(void *ctx) {
+  qa_startup_application *app = ctx;
+  qa_app_options options;
+  qa_app_startup_selection_options(app->model, &options);
+  bool console_debug = options.console_debug;
+  qa_app_options_destroy(&options);
+  /* consoleLogMode(this.client?.prepared.source ?? null, this.model.options.consoleDebug) */
+  qa_app_prepared_startup *prepared = app->client != NULL ? app->client->prepared : NULL;
+  return qa_app_console_log_mode(prepared != NULL ? qa_app_prepared_startup_source(prepared) : NULL, console_debug);
+}
+static char *console_log_root(void *ctx) {
+  qa_startup_application *app = ctx;
+  qa_app_options options;
+  qa_app_startup_selection_options(app->model, &options);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, (void (*)(void *))qa_app_options_destroy, &options);
+  const qa_content_catalog *catalog = qa_app_startup_selection_catalog(app->model);
+  const qa_catalog_discovered_product *product = qa_content_catalog_product(catalog, options.product);
+  const char *components[1] = {product->id};
+  qa_app_stock_native *native = qa_app_stock_native_config(catalog, product->id, components, 1, options.native_config_root, false, NULL);
+  char *root;
+  if (native != NULL) root = qa_startup_dup(native->layout.directory);
+  else if (product->user_content != NULL) root = qa_startup_dup(product->user_content->root);
+  else {
+    char *base = options.user_content_root != NULL ? qa_startup_dup(options.user_content_root) : qa_default_user_content_root();
+    if (base == NULL) qa_range_error("Out of memory");
+    root = qa_user_product_directory(base, product->expectation.content_directory);
+    free(base);
+  }
+  qa_app_stock_native_destroy(native);
+  qa_cleanup_pop(&guard);
+  qa_app_options_destroy(&options);
+  if (root == NULL) qa_range_error("Out of memory");
+  return root;
+}
+void qa_startup_console_log_init(qa_startup_application *app) {
+  qa_app_console_log_init(&app->console_log, console_log_mode, console_log_root, app);
+}
 void qa_startup_application_print(qa_startup_application *app, const char *text) {
   host_print(app, text);
+  qa_app_console_log_write(&app->console_log, text);
   qa_app_client_bootstrap *client = app->client;
   if (client != NULL && client->platform.kind == QA_APP_CLIENT_INPUT_MENU && client->local_count > 0) {
     qa_seat_console *console = client_console(client, client->locals[0].seat);
@@ -546,7 +635,7 @@ bool qa_startup_application_route_command(qa_startup_application *app, const cha
     memset(&call, 0, sizeof call);
     call.args = args; call.count = arg_count; call.username = username; call.password = password;
     qa_caught_error caught;
-    if (!qa_try(gtv_parse_body, &call, &caught)) qa_startup_printf(app, "%s\n", caught.message);
+    if (!qa_try(gtv_parse_body, &call, &caught)) qa_startup_printf(app, "%s\n", qa_caught_message(&caught));
     else if (!call.parsed) qa_startup_application_print(app, "Usage: mvdconnect [-u user] [-p password] [-n name] <address[:port]>\n");
     else {
       qa_app_startup_action *action = stage(app, QA_APP_STARTUP_ACTION_GTV);
@@ -569,7 +658,7 @@ bool qa_startup_application_route_command(qa_startup_application *app, const cha
     call.args = args; call.count = arg_count;
     call.current = same && app->gtv_source != NULL ? &current : NULL;
     qa_caught_error caught;
-    if (!qa_try(gtv_disconnect_body, &call, &caught)) qa_startup_printf(app, "%s\n", caught.message);
+    if (!qa_try(gtv_disconnect_body, &call, &caught)) qa_startup_printf(app, "%s\n", qa_caught_message(&caught));
     else if (call.matches) { stage(app, QA_APP_STARTUP_ACTION_FRONTEND); note_world_action(prepared); }
     else qa_startup_application_print(app, "Usage: mvdisconnect [-a|--all] [conn_id]\n");
     return true;
@@ -617,7 +706,7 @@ bool qa_startup_application_route_command(qa_startup_application *app, const cha
       memset(&call, 0, sizeof call);
       call.argument = args[0];
       qa_caught_error caught;
-      if (!qa_try(map_body, &call, &caught)) qa_startup_printf(app, "%s\n", caught.message);
+      if (!qa_try(map_body, &call, &caught)) qa_startup_printf(app, "%s\n", qa_caught_message(&caught));
       else if (prepared != NULL && qa_command_buffer_dialect(qa_app_prepared_startup_commands(prepared)) == QA_COMMAND_DIALECT_Q3) {
         qa_cvar_registry *cvars = qa_app_prepared_startup_source(prepared);
         qa_cvar_read found;
@@ -665,7 +754,7 @@ bool qa_startup_application_route_command(qa_startup_application *app, const cha
     call.args = args; call.count = arg_count; call.directory = qa_app_startup_saves_directory(app->saves); call.source = source;
     call.allow_any = options->allow_load_paths;
     qa_caught_error caught;
-    if (!qa_try(load_body, &call, &caught)) qa_startup_printf(app, "%s\n", caught.message);
+    if (!qa_try(load_body, &call, &caught)) qa_startup_printf(app, "%s\n", qa_caught_message(&caught));
     else {
       qa_app_startup_action *action = stage(app, QA_APP_STARTUP_ACTION_LOAD);
       action->path = call.path;

@@ -12,9 +12,9 @@
 
 static qa_movement_result step(qa_movement_input input, qa_navigation_prediction *prediction) {
   if (!input.execution || strcmp(input.execution, "prediction"))
-    qa_range_error("Navigation must use noncommitting movement prediction");
+    qa_raise("TypeError", 0, 0, "Navigation must use noncommitting movement prediction");
   if (!input.kind || !prediction->provider.kind || strcmp(prediction->provider.kind, input.kind))
-    qa_range_error("Navigation movement input/provider disagree");
+    qa_raise("TypeError", 0, 0, "Navigation movement input/provider disagree");
   return prediction->provider.move(prediction->provider.ctx, input, prediction->services);
 }
 static qa_vec3 result_origin(const qa_movement_result *r) {
@@ -44,7 +44,7 @@ void qa_movement_route_admission_init(qa_movement_route_admission *a, qa_navigat
 qa_traversal_admission qa_movement_route_admission_admit(qa_movement_route_admission *a, qa_traversal_request request) {
   static char reason_buf[256]; /* TS allocates per call; admission reason borrowed until next admit. */
   qa_traversal_admission adm; memset(&adm, 0, sizeof adm);
-  if (a->failed) qa_range_error("Discard a failed navigation prediction before trying another route");
+  if (a->failed) qa_raise("Error", 0, 0, "Discard a failed navigation prediction before trying another route");
   if (!a->has_prediction) {
     if (!a->driver.begin(a->driver.ctx, request, a->profile, &a->prediction)) {
       snprintf(reason_buf, sizeof reason_buf, "selected movement cannot predict %s", qa_travel_mode_name(request.mode));
@@ -56,7 +56,7 @@ qa_traversal_admission qa_movement_route_admission_admit(qa_movement_route_admis
   const char *mk = a->profile.movement.kind, *pk = prediction->provider.kind;
   const char *mid = a->profile.movement.id, *pid = prediction->provider.id;
   if (!mk || !pk || strcmp(pk, mk) || (mid == NULL) != (pid == NULL) || (mid && pid && strcmp(mid, pid)))
-    qa_range_error("Navigation predictor is not the selected movement provider");
+    qa_raise("TypeError", 0, 0, "Navigation predictor is not the selected movement provider");
   double seconds = 0;
   size_t traj_cap = 16, traj_n = 0;
   qa_vec3 *trajectory = malloc(traj_cap * sizeof *trajectory);
@@ -68,11 +68,14 @@ qa_traversal_admission qa_movement_route_admission_admit(qa_movement_route_admis
     if (!input.profile.kind || !mk || strcmp(input.profile.kind, mk)
         || (input.profile.id == NULL) != (mid == NULL)
         || (input.profile.id && mid && strcmp(input.profile.id, mid)))
-      qa_range_error("Navigation prediction changed the selected movement profile");
+      { free(trajectory); qa_raise("TypeError", 0, 0, "Navigation prediction changed the selected movement profile"); }
     double elapsed = input.frame.elapsed.kind == QA_SOURCE_TIME_MILLISECONDS
                          ? input.frame.elapsed.value / 1000 : input.frame.elapsed.value;
-    if (!isfinite(elapsed) || elapsed <= 0) qa_range_error("Navigation prediction must advance source time");
+    if (!isfinite(elapsed) || elapsed <= 0) { free(trajectory); qa_range_error("Navigation prediction must advance source time"); }
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, trajectory);
     qa_movement_result result = step(input, prediction);
+    qa_cleanup_pop(&guard);
     if (result.status && !strcmp(result.status, "actor-removed")) {
       a->failed = true; free(trajectory);
       adm.reason = "movement removed the predicted actor"; return adm;

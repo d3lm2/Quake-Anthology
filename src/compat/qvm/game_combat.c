@@ -60,13 +60,13 @@ double qa_qvm_source_damage_flags(qa_qvm_damage_flags masks, qa_damage_request r
 
 void qa_qvm_validate_combat_positions(const double *positions, size_t position_count, double words) {
   if (!is_integer(words) || words < (double)position_count || words > QA_QVM_MAX_PRIVATE_ARGUMENT_WORDS)
-    qa_range_error("Source combat call exceeds the QVM OP_ARG capacity or omits required arguments");
+    qa_raise("Error", 0, 0, "Source combat call exceeds the QVM OP_ARG capacity or omits required arguments");
   for (size_t i = 0; i < position_count; i++) {
     for (size_t j = i + 1; j < position_count; j++)
       if (positions[i] == positions[j])
-        qa_range_error("Source combat argument positions must cover each declared role exactly once within the original call");
+        qa_raise("Error", 0, 0, "Source combat argument positions must cover each declared role exactly once within the original call");
     if (!is_integer(positions[i]) || positions[i] < 0 || positions[i] >= words)
-      qa_range_error("Source combat argument positions must cover each declared role exactly once within the original call");
+      qa_raise("Error", 0, 0, "Source combat argument positions must cover each declared role exactly once within the original call");
   }
 }
 
@@ -76,19 +76,22 @@ void qa_qvm_validate_combat_call(qa_qvm_combat_call call, double data_bytes) {
   if (positions == NULL) qa_range_error("out of memory");
   for (size_t i = 0; i < call.role_count; i++) positions[i] = call.roles[i].index;
   for (size_t i = 0; i < call.extra_count; i++) positions[call.role_count + i] = call.extras[i].index;
+  qa_cleanup positions_cleanup;
+  qa_cleanup_push(&positions_cleanup, free, positions);
   qa_qvm_validate_combat_positions(positions, count, (double)count);
+  qa_cleanup_pop(&positions_cleanup);
   free(positions);
   for (size_t i = 0; i < call.extra_count; i++) {
     const qa_qvm_combat_extra *extra = &call.extras[i];
     if (strcmp(extra->kind, "float32") == 0) {
       if (!isfinite(extra->value) || !isfinite((double)qa_float32(extra->value)))
-        qa_range_error("Source combat extra requires a finite binary32 value");
+        qa_raise("Error", 0, 0, "Source combat extra requires a finite binary32 value");
     } else if (strcmp(extra->kind, "address") == 0) {
       if (!is_integer(extra->value) || extra->value < 0 || extra->value >= data_bytes)
-        qa_range_error("Source combat extra address is outside its artifact data");
+        qa_raise("Error", 0, 0, "Source combat extra address is outside its artifact data");
     } else if (!is_integer(extra->value) || extra->value < -2147483648.0 ||
                extra->value > 2147483647.0) {
-      qa_range_error("Source combat extra requires a signed integer word");
+      qa_raise("Error", 0, 0, "Source combat extra requires a signed integer word");
     }
   }
 }
@@ -109,21 +112,21 @@ bool qa_qvm_game_combat_init(qa_qvm_game_combat *combat, qa_qvm_game *game,
       !same_text(expected->artifact_path, actual->artifact_path) ||
       !same_text(artifact->module.digest, actual->digest) ||
       !same_text(artifact->module.id, actual->id) || !same_text(definition.abi_profile, profile))
-    qa_range_error("Source combat declaration differs from its executable");
+    qa_raise("Error", 0, 0, "Source combat declaration differs from its executable");
   double offsets[] = {definition.field_inuse, definition.field_health, definition.field_takedamage,
                       definition.field_parent};
   for (size_t i = 0; i < 4; i++)
-    if (!is_integer(offsets[i]) || (int64_t)offsets[i] % 4 != 0 ||
+    if (!is_integer(offsets[i]) || fmod(offsets[i], 4) != 0 ||
         offsets[i] < qa_qvm_shared_entity_bytes(definition.abi_profile) ||
         offsets[i] + 4 > definition.entity_stride)
-      qa_range_error("Source combat field is outside its declared entity record");
+      qa_raise("Error", 0, 0, "Source combat field is outside its declared entity record");
   double entries[] = {definition.callback_allocate, definition.callback_free,
                       definition.callback_damage};
   for (size_t i = 0; i < 3; i++) {
     bool entry_ok = is_integer(entries[i]) && entries[i] >= 0 &&
                     entries[i] < (double)artifact->image.instruction_count &&
                     artifact->image.instructions[(size_t)entries[i]].opcode == QA_QVM_OP_ENTER;
-    if (!entry_ok) qa_range_error("Source combat callback is not a function entry");
+    if (!entry_ok) qa_raise("Error", 0, 0, "Source combat callback is not a function entry");
   }
   const qa_qvm_image *image = &artifact->image;
   qa_qvm_validate_combat_call(definition.damage_call,
@@ -131,16 +134,18 @@ bool qa_qvm_game_combat_init(qa_qvm_game_combat *combat, qa_qvm_game *game,
   combat->game = game;
   combat->definition = definition;
   combat->argument_count = qa_qvm_combat_word_count(definition.damage_call);
+  combat->arguments = NULL;
+  /* The scratch refusal comes before the allocation it would otherwise strand. */
+  int64_t data_total = image->data_length + image->literal_length + image->bss_length;
+  combat->scratch = (data_total + 15) / 16 * 16;
+  if (combat->scratch + 24 > image->allocated_data_length - 65536)
+    qa_raise("Error", 0, 0, "Source combat requires scratch outside source data and stack");
   combat->arguments = malloc((combat->argument_count == 0 ? 1 : combat->argument_count) * sizeof(double));
   if (combat->arguments == NULL) return false;
   const qa_qvm_combat_role_value zeros[] = {{"target", 0}, {"inflictor", 0}, {"attacker", 0},
                                             {"direction", 0}, {"point", 0}, {"amount", 0},
                                             {"flags", 0}, {"method", 0}};
   qa_qvm_combat_words(definition.damage_call, zeros, 8, combat->arguments);
-  int64_t data_total = image->data_length + image->literal_length + image->bss_length;
-  combat->scratch = (data_total + 15) / 16 * 16;
-  if (combat->scratch + 24 > image->allocated_data_length - 65536)
-    qa_range_error("Source combat requires scratch outside source data and stack");
   return true;
 }
 
@@ -153,7 +158,7 @@ void qa_qvm_game_combat_destroy(qa_qvm_game_combat *combat) {
 static void entity_view(qa_qvm_game_combat *combat, double slot, qa_qvm_writable_view *out) {
   if (qa_qvm_game_data_get_entity_stride_bytes(&combat->game->data) != combat->definition.entity_stride ||
       qa_qvm_game_data_get_client_stride_bytes(&combat->game->data) != combat->definition.client_stride)
-    qa_range_error("Source combat declaration differs from located records");
+    qa_raise("Error", 0, 0, "Source combat declaration differs from located records");
   qa_qvm_game_data_entity_bytes(&combat->game->data, slot, out);
 }
 
@@ -183,29 +188,80 @@ static double role_index(qa_qvm_combat_call call, const char *role) {
   return -1;
 }
 
-typedef struct damage_finally {
+typedef struct damage_job {
   qa_qvm_game_combat *combat;
-  qa_qvm_memory *memory;
+  const qa_qvm_game_damage *hit;
+  const qa_qvm_damage_invoke *invoke;
   bool has_temporary;
   int32_t temporary;
   double *words;
   int32_t *call_words;
-  uint8_t saved[24];
-} damage_finally;
+} damage_job;
 
-/* TS finally: free the temporary inflictor, then restore the scratch bytes. */
-static void damage_finish(void *ctx) {
-  damage_finally *finally = ctx;
-  free(finally->words);
-  free(finally->call_words);
-  finally->words = NULL;
-  finally->call_words = NULL;
-  if (finally->has_temporary) {
-    int32_t free_words[] = {finally->temporary};
-    (void)qa_qvm_module_call(&finally->combat->game->module, free_words, 1,
-                             (int64_t)finally->combat->definition.callback_free);
+/* TS try block. */
+static void damage_body(void *ctx) {
+  damage_job *job = ctx;
+  qa_qvm_game_combat *combat = job->combat;
+  const qa_qvm_game_damage *hit = job->hit;
+  double attacker = hit->has_attacker ? entity_pointer(combat, hit->attacker) : 0;
+  double inflictor = 0;
+  if (hit->inflictor_kind == QA_QVM_INFLICTOR_ENTITY) {
+    inflictor = entity_pointer(combat, hit->inflictor_slot);
+  } else if (hit->inflictor_kind == QA_QVM_INFLICTOR_FOREIGN) {
+    int32_t temporary = qa_qvm_module_call(&combat->game->module, NULL, 0,
+                                           (int64_t)combat->definition.callback_allocate);
+    job->has_temporary = true;
+    job->temporary = temporary;
+    double slot = qa_qvm_game_data_number_from_pointer(&combat->game->data, temporary);
+    qa_qvm_shared_entity *entity = qa_qvm_game_data_entity(&combat->game->data, slot);
+    qa_qvm_writable_view view;
+    entity_view(combat, slot, &view);
+    qa_qvm_writable_view_set_int32(&view, (int64_t)combat->definition.field_parent,
+                                   qa_int32(attacker), true);
+    qa_qvm_shared_entity_set_current_origin(entity, hit->inflictor_body.origin);
+    qa_qvm_shared_entity_set_current_angles(entity, hit->inflictor_body.angles);
+    qa_qvm_shared_entity_set_mins(entity, hit->inflictor_body.bounds.min);
+    qa_qvm_shared_entity_set_maxs(entity, hit->inflictor_body.bounds.max);
+    /* entity.s.pos with base/delta replaced (entity-record.ts surface). */
+    qa_qvmx_view state_view = entity->s.view;
+    qa_qvm_entity_state borrowed = qa_qvm_borrow_entity_state(state_view, entity->profile);
+    qa_qvm_trajectory pos = qa_qvm_entity_state_get_pos(&borrowed);
+    pos.base = hit->inflictor_body.origin;
+    pos.delta = hit->inflictor_body.velocity;
+    qa_qvm_entity_state_set_pos(&borrowed, pos);
+    inflictor = temporary;
   }
-  qa_qvm_memory_write_bytes(finally->memory, finally->combat->scratch, finally->saved, 24);
+  double *words = malloc((combat->argument_count == 0 ? 1 : combat->argument_count) * sizeof(double));
+  if (words == NULL) qa_range_error("out of memory");
+  job->words = words;
+  memcpy(words, combat->arguments, combat->argument_count * sizeof(double));
+  qa_qvm_combat_call call = combat->definition.damage_call;
+  words[(size_t)role_index(call, "target")] = entity_pointer(combat, hit->target);
+  words[(size_t)role_index(call, "inflictor")] = inflictor;
+  words[(size_t)role_index(call, "attacker")] = attacker;
+  words[(size_t)role_index(call, "direction")] = (double)combat->scratch;
+  words[(size_t)role_index(call, "point")] = (double)combat->scratch + 12;
+  words[(size_t)role_index(call, "amount")] = hit->amount;
+  words[(size_t)role_index(call, "flags")] = hit->flags;
+  words[(size_t)role_index(call, "method")] = hit->method;
+  if (job->invoke != NULL) {
+    job->invoke->call(job->invoke->ctx, words, combat->argument_count);
+  } else {
+    int32_t *call_words = malloc((combat->argument_count == 0 ? 1 : combat->argument_count) * sizeof(int32_t));
+    if (call_words == NULL) qa_range_error("out of memory");
+    job->call_words = call_words;
+    for (size_t i = 0; i < combat->argument_count; i++) call_words[i] = qa_int32(words[i]);
+    (void)qa_qvm_module_call(&combat->game->module, call_words, combat->argument_count,
+                             (int64_t)combat->definition.callback_damage);
+  }
+}
+
+/* TS inner try: free the temporary inflictor. */
+static void damage_release(void *ctx) {
+  damage_job *job = ctx;
+  int32_t free_words[] = {job->temporary};
+  (void)qa_qvm_module_call(&job->combat->game->module, free_words, 1,
+                           (int64_t)job->combat->definition.callback_free);
 }
 
 void qa_qvm_game_combat_damage(qa_qvm_game_combat *combat, qa_qvm_game_damage hit,
@@ -228,63 +284,16 @@ void qa_qvm_game_combat_damage(qa_qvm_game_combat *combat, qa_qvm_game_damage hi
   qa_qvm_writable_view_set_float32(&scratch, 12, qa_float32(hit.point.x), true);
   qa_qvm_writable_view_set_float32(&scratch, 16, qa_float32(hit.point.y), true);
   qa_qvm_writable_view_set_float32(&scratch, 20, qa_float32(hit.point.z), true);
-  /* TS try { ... } finally { free the temporary; restore the scratch }. */
-  damage_finally finally = {combat, memory, false, 0, NULL, NULL, {0}};
-  memcpy(finally.saved, saved, 24);
-  qa_cleanup guard;
-  qa_cleanup_push(&guard, damage_finish, &finally);
-  int32_t temporary = 0;
-  double attacker = hit.has_attacker ? entity_pointer(combat, hit.attacker) : 0;
-  double inflictor = 0;
-  if (hit.inflictor_kind == QA_QVM_INFLICTOR_ENTITY) {
-    inflictor = entity_pointer(combat, hit.inflictor_slot);
-  } else if (hit.inflictor_kind == QA_QVM_INFLICTOR_FOREIGN) {
-    temporary = qa_qvm_module_call(&combat->game->module, NULL, 0,
-                                   (int64_t)combat->definition.callback_allocate);
-    finally.has_temporary = true;
-    finally.temporary = temporary;
-    double slot = qa_qvm_game_data_number_from_pointer(&combat->game->data, temporary);
-    qa_qvm_shared_entity *entity = qa_qvm_game_data_entity(&combat->game->data, slot);
-    qa_qvm_writable_view view;
-    entity_view(combat, slot, &view);
-    qa_qvm_writable_view_set_int32(&view, (int64_t)combat->definition.field_parent,
-                                   qa_int32(attacker), true);
-    qa_qvm_shared_entity_set_current_origin(entity, hit.inflictor_body.origin);
-    qa_qvm_shared_entity_set_current_angles(entity, hit.inflictor_body.angles);
-    qa_qvm_shared_entity_set_mins(entity, hit.inflictor_body.bounds.min);
-    qa_qvm_shared_entity_set_maxs(entity, hit.inflictor_body.bounds.max);
-    /* entity.s.pos with base/delta replaced (entity-record.ts surface). */
-    qa_qvmx_view state_view = entity->s.view;
-    qa_qvm_entity_state borrowed = qa_qvm_borrow_entity_state(state_view, entity->profile);
-    qa_qvm_trajectory pos = qa_qvm_entity_state_get_pos(&borrowed);
-    pos.base = hit.inflictor_body.origin;
-    pos.delta = hit.inflictor_body.velocity;
-    qa_qvm_entity_state_set_pos(&borrowed, pos);
-    inflictor = temporary;
-  }
-  double *words = malloc((combat->argument_count == 0 ? 1 : combat->argument_count) * sizeof(double));
-  if (words == NULL) qa_range_error("out of memory");
-  finally.words = words;
-  memcpy(words, combat->arguments, combat->argument_count * sizeof(double));
-  qa_qvm_combat_call call = combat->definition.damage_call;
-  words[(size_t)role_index(call, "target")] = entity_pointer(combat, hit.target);
-  words[(size_t)role_index(call, "inflictor")] = inflictor;
-  words[(size_t)role_index(call, "attacker")] = attacker;
-  words[(size_t)role_index(call, "direction")] = (double)combat->scratch;
-  words[(size_t)role_index(call, "point")] = (double)combat->scratch + 12;
-  words[(size_t)role_index(call, "amount")] = hit.amount;
-  words[(size_t)role_index(call, "flags")] = hit.flags;
-  words[(size_t)role_index(call, "method")] = hit.method;
-  if (invoke != NULL) {
-    invoke->call(invoke->ctx, words, combat->argument_count);
-  } else {
-    int32_t *call_words = malloc((combat->argument_count == 0 ? 1 : combat->argument_count) * sizeof(int32_t));
-    if (call_words == NULL) qa_range_error("out of memory");
-    finally.call_words = call_words;
-    for (size_t i = 0; i < combat->argument_count; i++) call_words[i] = qa_int32(words[i]);
-    (void)qa_qvm_module_call(&combat->game->module, call_words, combat->argument_count,
-                             (int64_t)combat->definition.callback_damage);
-  }
-  qa_cleanup_pop(&guard);
-  damage_finish(&finally);
+  /* TS try { ... } finally { try { free the temporary } finally { restore the
+   * scratch } }: the scratch is restored whatever raised, a failing free
+   * replaces the damage error, and nothing raises while another raise unwinds. */
+  damage_job job = {combat, &hit, invoke, false, 0, NULL, NULL};
+  qa_caught_error failure, release_failure;
+  bool ok = qa_try(damage_body, &job, &failure);
+  free(job.words);
+  free(job.call_words);
+  bool released = !job.has_temporary || qa_try(damage_release, &job, &release_failure);
+  qa_qvm_memory_write_bytes(memory, combat->scratch, saved, 24);
+  if (!released) qa_rethrow(&release_failure);
+  if (!ok) qa_rethrow(&failure);
 }

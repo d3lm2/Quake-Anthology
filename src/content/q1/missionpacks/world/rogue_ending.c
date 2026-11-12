@@ -36,7 +36,10 @@ static qa_q1_actor *machine(qa_q1_services *game) {
 static void remove_stuff(qa_q1_services *game) {
   size_t count;
   qa_q1_actor **entities = qa_q1mp_entities(game, &count);
+  qa_cleanup entities_node; /* a removal runs release callbacks, which can raise */
+  qa_cleanup_push(&entities_node, free, entities);
   for (size_t i = 0; i < count; i++) if (qa_q1mp_streq(entities[i]->classname, "ltrail_start")) qa_q1_remove(game, entities[i]);
+  qa_cleanup_pop(&entities_node);
   free(entities);
   entities = qa_q1mp_entities(game, &count);
   qa_q1_actor *core = NULL;

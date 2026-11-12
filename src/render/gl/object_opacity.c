@@ -35,12 +35,12 @@ static oimpl *O(qa_gl_object_opacity *o) { return (oimpl *)o->impl; }
 static int32_t integer1(oimpl *p, uint32_t name) { int32_t v = 0; p->gl->glGetIntegerv(name, &v); return v; }
 static int32_t uniform_of(oimpl *p, const char *name) {
   int32_t location = p->shaders.glGetUniformLocation(p->program, name);
-  if (location < 0) qa_range_error("OpenGL opacity uniform missing: %s", name);
+  if (location < 0) qa_raise("Error", 0, 0, "OpenGL opacity uniform missing: %s", name);
   return location;
 }
 static void check_status(oimpl *p) {
   uint32_t status = p->fbo.glCheckFramebufferStatus(0x8d40);
-  if (status != 0x8cd5) qa_range_error("OpenGL opacity framebuffer incomplete: 0x%x", status);
+  if (status != 0x8cd5) qa_raise("Error", 0, 0, "OpenGL opacity framebuffer incomplete: 0x%x", status);
 }
 static void allocate_texture(oimpl *p, uint32_t name, int32_t internal, uint32_t format, uint32_t type, int32_t width, int32_t height) {
   qa_gl *gl = p->gl;
@@ -49,15 +49,11 @@ static void allocate_texture(oimpl *p, uint32_t name, int32_t internal, uint32_t
   gl->glTexParameteri(0xde1, 0x2802, 0x812f); gl->glTexParameteri(0xde1, 0x2803, 0x812f);
   p->fbo.glTexImage2D(0xde1, 0, internal, width, height, 0, format, type, NULL);
 }
-static void allocate(oimpl *p, double width, double height) {
-  qa_gl *gl = p->gl;
-  int32_t component = 0;
-  p->fbo.glGetFramebufferAttachmentParameteriv(0x8ca9, integer1(p, 0x8ca6) == 0 ? 0x1801 : 0x8d00, 0x8211, &component);
-  bool floating = component == 0x1406;
-  if (p->has_dimensions && p->dim_width == width && p->dim_height == height && p->dim_floating == floating) return;
-  int32_t active = integer1(p, 0x84e0); gl->glActiveTexture(0x84c0);
-  int32_t previous = integer1(p, 0x8069);
-  int32_t w = (int32_t)width, h = (int32_t)height;
+typedef struct allocate_scope { oimpl *p; double width, height; bool floating; } allocate_scope;
+/* The TS try block of allocate(). */
+static void allocate_body(void *ctx) {
+  allocate_scope *s = (allocate_scope *)ctx; oimpl *p = s->p; qa_gl *gl = p->gl; bool floating = s->floating;
+  int32_t w = (int32_t)s->width, h = (int32_t)s->height;
   for (int i = 0; i < 2; i++)
     allocate_texture(p, p->colors[i], p->precision.alpha_bits > 0 ? 0x8058 : p->precision.color_bits <= 16 ? 0x8d62 : 0x8051, 0x1908, 0x1401, w, h);
   bool stencil = p->precision.stencil_bits > 0;
@@ -70,28 +66,50 @@ static void allocate(oimpl *p, double width, double height) {
     if (index == 1) p->fbo.glFramebufferTexture2D(0x8d40, stencil ? 0x821a : 0x8d00, 0xde1, p->depth[0], 0);
     gl->glDrawBuffer(0x8ce0); p->fbo.glReadBuffer(0x8ce0); check_status(p);
   }
-  p->has_dimensions = true; p->dim_width = width; p->dim_height = height; p->dim_floating = floating;
+  p->has_dimensions = true; p->dim_width = s->width; p->dim_height = s->height; p->dim_floating = floating;
+}
+static void allocate(oimpl *p, double width, double height) {
+  qa_gl *gl = p->gl;
+  int32_t component = 0;
+  p->fbo.glGetFramebufferAttachmentParameteriv(0x8ca9, integer1(p, 0x8ca6) == 0 ? 0x1801 : 0x8d00, 0x8211, &component);
+  bool floating = component == 0x1406;
+  if (p->has_dimensions && p->dim_width == width && p->dim_height == height && p->dim_floating == floating) return;
+  int32_t active = integer1(p, 0x84e0); gl->glActiveTexture(0x84c0);
+  int32_t previous = integer1(p, 0x8069);
+  allocate_scope scope = {p, width, height, floating};
+  qa_caught_error caught; /* rethrown unchanged after the TS finally */
+  bool ok = qa_try(allocate_body, &scope, &caught);
   gl->glBindTexture(0xde1, (uint32_t)previous); gl->glActiveTexture((uint32_t)active);
+  if (!ok) qa_rethrow(&caught);
 }
 
+static void init_body(void *ctx) {
+  oimpl *p = (oimpl *)ctx; qa_gl *gl = p->gl;
+  p->fbo.glGenFramebuffers(2, p->targets);
+  gl->glGenTextures(2, p->colors); gl->glGenTextures(1, p->depth);
+  if (p->targets[0] == 0 || p->targets[1] == 0 || p->colors[0] == 0 || p->colors[1] == 0 || p->depth[0] == 0)
+    qa_raise("Error", 0, 0, "OpenGL opacity allocation failed");
+  p->program = qa_gl_compile_program(&p->shaders, VERTEX, FRAGMENT);
+  p->backdrop_uniform = uniform_of(p, "backdrop");
+  p->result_uniform = uniform_of(p, "result");
+  p->opacity_uniform = uniform_of(p, "opacity");
+}
 bool qa_gl_object_opacity_init(qa_gl_object_opacity *o, const qa_gl_context *context, qa_gl *gl, qa_gl_precision precision) {
   oimpl *p = (oimpl *)calloc(1, sizeof *p); if (p == NULL) return false;
   p->gl = gl; p->precision = precision;
   if (!qa_load_gl_framebuffers(context, &p->fbo)) { free(p); return false; }
   if (!qa_load_gl_programs(context, &p->shaders)) { qa_gl_framebuffers_close(&p->fbo); free(p); return false; }
-  o->impl = p;
-  p->fbo.glGenFramebuffers(2, p->targets);
-  gl->glGenTextures(2, p->colors); gl->glGenTextures(1, p->depth);
-  if (p->targets[0] == 0 || p->targets[1] == 0 || p->colors[0] == 0 || p->colors[1] == 0 || p->depth[0] == 0) {
+  /* TS constructor catch: delete what was created, close both libraries, rethrow. */
+  qa_caught_error caught;
+  if (!qa_try(init_body, p, &caught)) {
+    if (p->program != 0) p->shaders.glDeleteProgram(p->program);
     p->fbo.glDeleteFramebuffers(2, p->targets);
     gl->glDeleteTextures(2, p->colors); gl->glDeleteTextures(1, p->depth);
     qa_gl_programs_close(&p->shaders); qa_gl_framebuffers_close(&p->fbo);
-    qa_range_error("OpenGL opacity allocation failed");
+    free(p);
+    qa_rethrow(&caught);
   }
-  p->program = qa_gl_compile_program(&p->shaders, VERTEX, FRAGMENT);
-  p->backdrop_uniform = uniform_of(p, "backdrop");
-  p->result_uniform = uniform_of(p, "result");
-  p->opacity_uniform = uniform_of(p, "opacity");
+  o->impl = p;
   return true;
 }
 
@@ -103,6 +121,28 @@ bool qa_gl_object_opacity_bind(qa_gl_object_opacity *o) {
   return true;
 }
 
+typedef struct composite_scope { oimpl *p; double opacity, width, height; const int32_t *viewport, *scissor; bool clipped; const uint32_t *names; } composite_scope;
+/* The TS try block of composite(). */
+static void composite_body(void *ctx) {
+  composite_scope *s = (composite_scope *)ctx; oimpl *p = s->p; qa_gl *gl = p->gl; qa_gl_programs *shader = &p->shaders;
+  const int32_t *viewport = s->viewport, *scissor = s->scissor; bool clipped = s->clipped; double width = s->width, height = s->height;
+  gl->glViewport(0, 0, (int32_t)width, (int32_t)height); gl->glDepthMask(0); gl->glColorMask(1, 1, 1, 1); gl->glPolygonMode(0x408, 0x1b02);
+  for (int i = 0; i < 9; i++) gl->glDisable(s->names[i]);
+  double x = qa_js_max(qa_js_max(0, viewport[0]), clipped ? scissor[0] : 0);
+  double y = qa_js_max(qa_js_max(0, viewport[1]), clipped ? scissor[1] : 0);
+  double right = qa_js_min(qa_js_min(width, (double)viewport[0] + viewport[2]), clipped ? (double)scissor[0] + scissor[2] : width);
+  double top = qa_js_min(qa_js_min(height, (double)viewport[1] + viewport[3]), clipped ? (double)scissor[1] + scissor[3] : height);
+  gl->glEnable(0xc11); gl->glScissor((int32_t)x, (int32_t)y, (int32_t)qa_js_max(0, right - x), (int32_t)qa_js_max(0, top - y));
+  shader->glUseProgram(p->program); shader->glUniform1i(p->backdrop_uniform, 0); shader->glUniform1i(p->result_uniform, 1); shader->glUniform1f(p->opacity_uniform, (float)s->opacity);
+  gl->glBindTexture(0xde1, p->colors[1]); gl->glActiveTexture(0x84c0); gl->glBindTexture(0xde1, p->colors[0]);
+  gl->glBegin(7);
+  gl->glVertex4f(-1, -1, 0, 1);
+  gl->glVertex4f(1, -1, 0, 1);
+  gl->glVertex4f(1, 1, 0, 1);
+  gl->glVertex4f(-1, 1, 0, 1); gl->glEnd();
+  uint32_t error = gl->glGetError();
+  if (error != 0) qa_raise("Error", 0, 0, "OpenGL opacity composite failed: 0x%x", error);
+}
 static void composite(oimpl *p, double opacity, double width, double height, const int32_t viewport[4], const int32_t scissor[4], bool clipped) {
   qa_gl *gl = p->gl; qa_gl_programs *shader = &p->shaders;
   /* Snapshot after child uploads: old names may have been released while drawing. */
@@ -115,60 +155,65 @@ static void composite(oimpl *p, double opacity, double width, double height, con
   for (int i = 0; i < 9; i++) enabled[i] = gl->glIsEnabled(names[i]) != 0;
   gl->glActiveTexture(0x84c0); int32_t texture0 = integer1(p, 0x8069);
   gl->glActiveTexture(0x84c1); int32_t texture1 = integer1(p, 0x8069);
-  gl->glViewport(0, 0, (int32_t)width, (int32_t)height); gl->glDepthMask(0); gl->glColorMask(1, 1, 1, 1); gl->glPolygonMode(0x408, 0x1b02);
-  for (int i = 0; i < 9; i++) gl->glDisable(names[i]);
-  double x = qa_js_max(qa_js_max(0, viewport[0]), clipped ? scissor[0] : 0);
-  double y = qa_js_max(qa_js_max(0, viewport[1]), clipped ? scissor[1] : 0);
-  double right = qa_js_min(qa_js_min(width, (double)viewport[0] + viewport[2]), clipped ? (double)scissor[0] + scissor[2] : width);
-  double top = qa_js_min(qa_js_min(height, (double)viewport[1] + viewport[3]), clipped ? (double)scissor[1] + scissor[3] : height);
-  gl->glEnable(0xc11); gl->glScissor((int32_t)x, (int32_t)y, (int32_t)qa_js_max(0, right - x), (int32_t)qa_js_max(0, top - y));
-  shader->glUseProgram(p->program); shader->glUniform1i(p->backdrop_uniform, 0); shader->glUniform1i(p->result_uniform, 1); shader->glUniform1f(p->opacity_uniform, (float)opacity);
-  gl->glBindTexture(0xde1, p->colors[1]); gl->glActiveTexture(0x84c0); gl->glBindTexture(0xde1, p->colors[0]);
-  gl->glBegin(7);
-  gl->glVertex4f(-1, -1, 0, 1);
-  gl->glVertex4f(1, -1, 0, 1);
-  gl->glVertex4f(1, 1, 0, 1);
-  gl->glVertex4f(-1, 1, 0, 1); gl->glEnd();
-  uint32_t error = gl->glGetError();
-  if (error != 0) qa_range_error("OpenGL opacity composite failed: 0x%x", error);
+  composite_scope scope = {p, opacity, width, height, viewport, scissor, clipped, names};
+  qa_caught_error caught; /* rethrown unchanged after the TS finally */
+  bool ok = qa_try(composite_body, &scope, &caught);
   gl->glBindTexture(0xde1, (uint32_t)texture0); gl->glActiveTexture(0x84c1); gl->glBindTexture(0xde1, (uint32_t)texture1); gl->glActiveTexture((uint32_t)active);
   shader->glUseProgram((uint32_t)program); gl->glDepthMask((uint8_t)depth_mask); gl->glColorMask((uint8_t)color_mask[0], (uint8_t)color_mask[1], (uint8_t)color_mask[2], (uint8_t)color_mask[3]);
   gl->glPolygonMode(0x404, (uint32_t)modes[0]); gl->glPolygonMode(0x405, (uint32_t)modes[1]);
   gl->glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
   for (int i = 0; i < 9; i++) { if (enabled[i]) gl->glEnable(names[i]); else gl->glDisable(names[i]); }
+  if (!ok) qa_rethrow(&caught);
 }
 
+typedef struct opacity_draw_scope {
+  qa_gl_object_opacity *o; double value, width, height; qa_gl_opacity_draw_fn draw; void *ctx;
+  uint32_t destination, draw_buffer; const int32_t *viewport, *scissor; bool clipped;
+} opacity_draw_scope;
+static void child_body(void *ctx) { opacity_draw_scope *s = (opacity_draw_scope *)ctx; s->draw(s->ctx); }
+/* The TS outer try block of draw(). */
+static void draw_body(void *ctx) {
+  opacity_draw_scope *s = (opacity_draw_scope *)ctx; oimpl *p = O(s->o); qa_gl *gl = p->gl; qa_gl_framebuffers *fbo = &p->fbo;
+  allocate(p, s->width, s->height);
+  gl->glDisable(0xc11);
+  int32_t w = (int32_t)s->width, h = (int32_t)s->height;
+  for (int index = 0; index < 2; index++) {
+    fbo->glBindFramebuffer(0x8ca8, s->destination); fbo->glReadBuffer(s->draw_buffer);
+    fbo->glBindFramebuffer(0x8ca9, p->targets[index]); gl->glDrawBuffer(0x8ce0);
+    fbo->glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
+      0x4000u | (index == 0 ? 0u : 0x100u | (p->precision.stencil_bits > 0 ? 0x400u : 0u)), 0x2600);
+  }
+  uint32_t copy_error = gl->glGetError();
+  if (copy_error != 0) qa_raise("Error", 0, 0, "OpenGL opacity backdrop copy failed: 0x%x", copy_error);
+  if (s->clipped) gl->glEnable(0xc11);
+  p->active = true; (void)qa_gl_object_opacity_bind(s->o);
+  /* try { draw() } finally { this.active = false } */
+  qa_caught_error caught;
+  bool ok = qa_try(child_body, s, &caught);
+  p->active = false;
+  if (!ok) qa_rethrow(&caught);
+  fbo->glBindFramebuffer(0x8ca9, s->destination); gl->glDrawBuffer(s->draw_buffer);
+  composite(p, s->value, s->width, s->height, s->viewport, s->scissor, s->clipped);
+}
 void qa_gl_object_opacity_draw(qa_gl_object_opacity *o, double value, double width, double height, qa_gl_opacity_draw_fn draw, void *ctx) {
   oimpl *p = O(o);
-  if (p->active) qa_range_error("Nested OpenGL object opacity is unsupported");
+  if (p->active) qa_raise("Error", 0, 0, "Nested OpenGL object opacity is unsupported");
   qa_gl *gl = p->gl; qa_gl_framebuffers *fbo = &p->fbo;
   uint32_t destination = (uint32_t)integer1(p, 0x8ca6), read_target = (uint32_t)integer1(p, 0x8caa);
   uint32_t draw_buffer = (uint32_t)integer1(p, 0xc01), read_buffer = (uint32_t)integer1(p, 0xc02);
   int32_t viewport[4] = {0, 0, 0, 0}, scissor[4] = {0, 0, 0, 0};
   gl->glGetIntegerv(0xba2, viewport); gl->glGetIntegerv(0xc10, scissor);
   bool clipped = gl->glIsEnabled(0xc11) != 0;
-  if (integer1(p, 0x80a9) != 0) qa_range_error("Object opacity requires a single-sample framebuffer");
-  allocate(p, width, height);
-  gl->glDisable(0xc11);
-  int32_t w = (int32_t)width, h = (int32_t)height;
-  for (int index = 0; index < 2; index++) {
-    fbo->glBindFramebuffer(0x8ca8, destination); fbo->glReadBuffer(draw_buffer);
-    fbo->glBindFramebuffer(0x8ca9, p->targets[index]); gl->glDrawBuffer(0x8ce0);
-    fbo->glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
-      0x4000u | (index == 0 ? 0u : 0x100u | (p->precision.stencil_bits > 0 ? 0x400u : 0u)), 0x2600);
-  }
-  uint32_t copy_error = gl->glGetError();
-  if (copy_error != 0) qa_range_error("OpenGL opacity backdrop copy failed: 0x%x", copy_error);
-  if (clipped) gl->glEnable(0xc11);
-  p->active = true; (void)qa_gl_object_opacity_bind(o);
-  draw(ctx);
+  if (integer1(p, 0x80a9) != 0) qa_raise("Error", 0, 0, "Object opacity requires a single-sample framebuffer");
+  opacity_draw_scope scope = {o, value, width, height, draw, ctx, destination, draw_buffer, viewport, scissor, clipped};
+  qa_caught_error caught; /* rethrown unchanged after the TS finally */
+  bool ok = qa_try(draw_body, &scope, &caught);
   p->active = false;
-  fbo->glBindFramebuffer(0x8ca9, destination); gl->glDrawBuffer(draw_buffer);
-  composite(p, value, width, height, viewport, scissor, clipped);
   fbo->glBindFramebuffer(0x8ca9, destination); gl->glDrawBuffer(draw_buffer);
   fbo->glBindFramebuffer(0x8ca8, read_target); fbo->glReadBuffer(read_buffer);
   gl->glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
   if (clipped) gl->glEnable(0xc11); else gl->glDisable(0xc11);
+  if (!ok) qa_rethrow(&caught);
 }
 
 void qa_gl_object_opacity_close(qa_gl_object_opacity *o) {

@@ -20,7 +20,7 @@ struct qa_compat_q2_native_primary_weapons {
   qa_compat_q2_native_primary_weapon_hooks hooks;
   qa_compat_q2_native_weapon_dispatcher *dispatcher;
   qa_compat_q2_native_entry *spawn;
-  uint64_t delay_region, damage_region;
+  uint64_t delay_region, damage_region; bool has_delay_region, has_damage_region; /* bound so far */
   actor_map delay_flags, damage_factors;
   bool has_delay_result; qa_guest_address delay_result;
   bool closed;
@@ -52,7 +52,7 @@ static bool current(const qa_compat_q2_native_primary_weapons *s, qa_actor_id ac
 }
 static qa_raw_entity_view record_of(const qa_compat_q2_native_primary_weapons *s, qa_actor_id actor) {
   qa_raw_entity_view record; qa_actor_id owner;
-  if (!s->host.record_for(s->host.ctx, actor, &record) || !s->host.actor(s->host.ctx, record, &owner) || !qa_same_actor(owner, actor)) qa_range_error("Native weapon owner was retired");
+  if (!s->host.record_for(s->host.ctx, actor, &record) || !s->host.actor(s->host.ctx, record, &owner) || !qa_same_actor(owner, actor)) qa_raise("Error", 0, 0, "Native weapon owner was retired");
   return record;
 }
 static qa_guest_address address_of(const qa_compat_q2_native_primary_weapons *s, qa_actor_id actor, const char *record, double offset) {
@@ -60,9 +60,9 @@ static qa_guest_address address_of(const qa_compat_q2_native_primary_weapons *s,
   qa_compat_q2_memory *memory = s->host.memory;
   if (strcmp(record, "image") == 0) return at(s, offset);
   if (strcmp(record, "entity") == 0) return qa_compat_q2_mem_offset(memory, entity.address, (int64_t)offset);
-  if (strcmp(record, "client") != 0) qa_range_error("Native primary field has an unknown record");
+  if (strcmp(record, "client") != 0) qa_raise("Error", 0, 0, "Native primary field has an unknown record");
   qa_guest_address client;
-  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, entity.address, (int64_t)s->profile->entity_client), &client)) qa_range_error("Native weapon owner has no source client");
+  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, entity.address, (int64_t)s->profile->entity_client), &client)) qa_raise("Error", 0, 0, "Native weapon owner has no source client");
   memory->check(memory->ctx, client, s->profile->client_byte_length, "read");
   return qa_compat_q2_mem_offset(memory, client, (int64_t)offset);
 }
@@ -100,7 +100,7 @@ static void write_field(const qa_compat_q2_native_primary_weapons *s, qa_actor_i
   else {
     /* writeInt64/writeUint64(BigInt(value)): BigInt throws for a non-integer; the
      * 64-bit store keeps the low 64 bits (two's complement) of any integer. */
-    if (!isfinite(value) || value != trunc(value)) qa_range_error("The number %s cannot be converted to a BigInt because it is not an integer", QA_JS_NUMBER(value));
+    if (!isfinite(value) || value != trunc(value)) qa_range_error("Not an integer"); /* JavaScriptCore's BigInt(number) text */
     uint64_t magnitude = (uint64_t)fmod(fabs(value), 18446744073709551616.0);
     uint64_t bits = value < 0 ? (uint64_t)0 - magnitude : magnitude;
     if (strcmp(encoding, "int64") == 0) { int64_t signed_bits; memcpy(&signed_bits, &bits, sizeof bits); qa_compat_q2_mem_write_i64(memory, address, signed_bits); }
@@ -135,7 +135,7 @@ static bool any_row(const qa_compat_q2_native_primary_weapons *s, qa_actor_id ac
 /* --- Dispatcher operations. --- */
 static bool op_actor(void *v, const char *record, qa_guest_address address, qa_actor_id *out) {
   qa_compat_q2_native_primary_weapons *s = v;
-  if (strcmp(record, "entity") != 0) qa_range_error("Native primary dispatcher requires an entity argument");
+  if (strcmp(record, "entity") != 0) qa_raise("Error", 0, 0, "Native primary dispatcher requires an entity argument");
   return s->host.actor(s->host.ctx, s->host.record(s->host.ctx, address), out);
 }
 static bool op_current(void *v, qa_actor_id actor) { return current(v, actor); }
@@ -164,7 +164,7 @@ static void damage_region(void *v, qa_compat_q2_inline_continuation *continuatio
   continuation->execute(continuation->ctx);
   if (has && current(s, actor)) {
     double value = read_address(s, at(s, s->profile->damage_address), s->profile->damage_encoding);
-    if (value != trunc(value) || value < 0 || value >= (double)s->profile->damage_factor_count) qa_range_error("Original weapon damage flag has no declared source factor");
+    if (value != trunc(value) || value < 0 || value >= (double)s->profile->damage_factor_count) qa_raise("Error", 0, 0, "Original weapon damage flag has no declared source factor");
     map_set(&s->damage_factors, actor, s->profile->damage_factors[(size_t)value]);
   }
 }
@@ -172,29 +172,55 @@ static qa_guest_call_result spawn_invoke(void *v, qa_guest_address address, qa_c
   qa_compat_q2_native_primary_weapons *s = v;
   return s->host.invoke(s->host.ctx, address, signature, values, count);
 }
-qa_compat_q2_native_primary_weapons *qa_compat_q2_native_primary_weapons_create(qa_compat_q2_native_primary_weapon_host host, const qa_compat_q2_native_primary_weapon_profile *profile, qa_compat_q2_native_primary_weapon_hooks hooks) {
-  if (strcmp(host.memory->module.digest, profile->digest) != 0) qa_range_error("Native primary weapon profile does not identify this artifact");
-  qa_compat_q2_native_primary_weapons *s = calloc(1, sizeof *s);
-  if (s == NULL) qa_range_error("Native weapons out of memory");
-  s->host = host; s->profile = profile; s->hooks = hooks;
-  qa_compat_q2_memory *memory = host.memory; qa_compat_q2_runner *runner = host.runner;
-  if (strcmp(profile->delay_evaluate_kind, "source-animation") == 0) {
-    s->delay_result = memory->allocate(memory->ctx, 8, true, 8, "selected source weapon delay");
-    s->has_delay_result = true;
-  }
-  qa_compat_q2_native_weapon_host entry_host = {memory, runner, host.image, host.ctx, host.invoke, host.entry};
+static void dispatcher_body(void *v) {
+  qa_compat_q2_native_primary_weapons *s = v; const qa_compat_q2_native_primary_weapon_profile *profile = s->profile;
+  qa_compat_q2_memory *memory = s->host.memory;
+  qa_compat_q2_native_weapon_host entry_host = {memory, s->host.runner, s->host.image, s->host.ctx, s->host.invoke, s->host.entry};
   qa_compat_q2_native_weapon_operations operations;
   memset(&operations, 0, sizeof operations);
   operations.ctx = s; operations.actor = op_actor; operations.current = op_current; operations.selected = op_selected;
   operations.committed_input = op_committed; operations.read = op_read; operations.write = op_write; operations.completed = op_completed;
   s->dispatcher = qa_compat_q2_native_weapon_dispatcher_create(&profile->dispatcher, profile->decisions, profile->decision_count, profile->abi, entry_host, memory->module.id, operations);
-  char id[320];
-  snprintf(id, sizeof id, "%s:selected-spawn", memory->module.id);
+}
+static void bindings_body(void *v) {
+  qa_compat_q2_native_primary_weapons *s = v; const qa_compat_q2_native_primary_weapon_profile *profile = s->profile;
+  qa_compat_q2_memory *memory = s->host.memory; qa_compat_q2_runner *runner = s->host.runner;
+  /* `${host.memory.module.id}:selected-spawn` with no length limit; the entry binding copies the id. */
+  const char *module = memory->module.id != NULL ? memory->module.id : "";
+  size_t need = strlen(module) + sizeof ":selected-spawn";
+  char *id = malloc(need); if (id == NULL) qa_range_error("Native weapons out of memory");
+  snprintf(id, need, "%s:selected-spawn", module);
+  qa_cleanup node; qa_cleanup_push(&node, free, id);
   qa_compat_q2_guest_call_signature signature = {profile->abi, one_pointer, 1, true, {0}, false};
   s->spawn = qa_compat_q2_native_entry_bind(memory, runner, s, spawn_invoke, at(s, profile->spawn_entry), id, signature, s, spawn_execute, NULL, NULL);
+  qa_cleanup_pop(&node); free(id);
   s->delay_region = runner->bind_inline_region(runner->ctx, at(s, profile->delay_entry), at(s, profile->delay_join), profile->abi, s, delay_region);
-  if (strcmp(profile->damage_kind, "source-flag") == 0)
+  s->has_delay_region = true;
+  if (strcmp(profile->damage_kind, "source-flag") == 0) {
     s->damage_region = runner->bind_inline_region(runner->ctx, at(s, profile->damage_region_entry), at(s, profile->damage_region_join), profile->abi, s, damage_region);
+    s->has_damage_region = true;
+  }
+}
+qa_compat_q2_native_primary_weapons *qa_compat_q2_native_primary_weapons_create(qa_compat_q2_native_primary_weapon_host host, const qa_compat_q2_native_primary_weapon_profile *profile, qa_compat_q2_native_primary_weapon_hooks hooks) {
+  if (strcmp(host.memory->module.digest, profile->digest) != 0) qa_raise("Error", 0, 0, "Native primary weapon profile does not identify this artifact");
+  qa_compat_q2_native_primary_weapons *s = calloc(1, sizeof *s);
+  if (s == NULL) qa_range_error("Native weapons out of memory");
+  s->host = host; s->profile = profile; s->hooks = hooks;
+  qa_compat_q2_memory *memory = host.memory;
+  if (strcmp(profile->delay_evaluate_kind, "source-animation") == 0) {
+    qa_cleanup node; qa_cleanup_push(&node, free, s);
+    s->delay_result = memory->allocate(memory->ctx, 8, true, 8, "selected source weapon delay");
+    qa_cleanup_pop(&node);
+    s->has_delay_result = true;
+  }
+  qa_caught_error caught;
+  /* TS: a dispatcher that fails to build unmaps the delay result; a later bind that fails closes the service. */
+  if (!qa_try(dispatcher_body, s, &caught)) {
+    if (s->has_delay_result) memory->unmap(memory->ctx, s->delay_result, 8);
+    free(s);
+    qa_rethrow(&caught);
+  }
+  if (!qa_try(bindings_body, s, &caught)) { qa_compat_q2_native_primary_weapons_destroy(s); qa_rethrow(&caught); }
   return s;
 }
 const qa_compat_q2_native_primary_weapon_profile *qa_compat_q2_native_primary_weapons_profile(const qa_compat_q2_native_primary_weapons *s) { return s->profile; }
@@ -230,72 +256,87 @@ double qa_compat_q2_native_primary_weapons_damage_factor(qa_compat_q2_native_pri
   if (strcmp(p->damage_kind, "source-flag") == 0) {
     record_of(s, actor);
     double factor;
-    if (!map_get(&s->damage_factors, actor, &factor)) qa_range_error("Original weapon damage modifier has not run for this actor");
+    if (!map_get(&s->damage_factors, actor, &factor)) qa_raise("Error", 0, 0, "Original weapon damage modifier has not run for this actor");
     return factor;
   }
   qa_guest_value_layout result_layout = {.is_aggregate = false, .storage = p->damage_result};
   qa_compat_q2_guest_call_signature signature = {p->abi, one_pointer, 1, false, result_layout, false};
   qa_guest_call_value value = qa_compat_q2_call_pointer(true, record_of(s, actor).address);
   qa_guest_call_result result = s->host.invoke(s->host.ctx, at(s, p->damage_entry), signature, &value, 1);
-  if (result.kind != QA_GUEST_VALUE_UINT32 && result.kind != QA_GUEST_VALUE_INT32) qa_range_error("Original weapon damage helper returned the wrong ABI type");
+  if (result.kind != QA_GUEST_VALUE_UINT32 && result.kind != QA_GUEST_VALUE_INT32) qa_raise("Error", 0, 0, "Original weapon damage helper returned the wrong ABI type");
   return result.number_value;
 }
 static void skip_region(void *v, qa_compat_q2_inline_continuation *continuation) { (void)v; continuation->skip(continuation->ctx); }
-typedef struct { qa_compat_q2_native_primary_weapons *s; qa_compat_q2_guest_call_signature signature; const qa_guest_call_value *values; size_t count; double target; } invoke_scope;
-static void invoke_body(void *v) { invoke_scope *c = v; c->s->host.invoke(c->s->host.ctx, at(c->s, c->target), c->signature, c->values, c->count); }
+typedef struct { qa_compat_q2_native_primary_weapons *s; qa_actor_id actor; uint64_t *removals; size_t removal_count; } attack_scope;
+/* The TS try block of attackAnimation(): the skip regions are bound inside it. */
+static void attack_body(void *v) {
+  attack_scope *c = v; qa_compat_q2_native_primary_weapons *s = c->s;
+  const qa_compat_q2_native_primary_weapon_profile *p = s->profile; qa_compat_q2_runner *runner = s->host.runner;
+  for (size_t i = 0; i < p->attack_skip_count; i++) {
+    c->removals[i] = runner->bind_inline_region(runner->ctx, at(s, p->attack_skip[i].entry), at(s, p->attack_skip[i].join), p->abi, s, skip_region);
+    c->removal_count = i + 1;
+  }
+  static const qa_guest_value_layout parameters[8] = {
+    {.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "int32"}, {.is_aggregate = false, .storage = "int32"}, {.is_aggregate = false, .storage = "int32"},
+    {.is_aggregate = false, .storage = "int32"}, {.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "pointer"}};
+  qa_guest_address none = {0};
+  qa_guest_call_value values[8] = {qa_compat_q2_call_pointer(true, record_of(s, c->actor).address), qa_compat_q2_call_int32(0), qa_compat_q2_call_int32(0), qa_compat_q2_call_int32(0), qa_compat_q2_call_int32(0),
+                                   qa_compat_q2_call_pointer(false, none), qa_compat_q2_call_pointer(false, none), qa_compat_q2_call_pointer(false, none)};
+  qa_compat_q2_guest_call_signature signature = {p->abi, parameters, 8, true, {0}, false};
+  s->host.invoke(s->host.ctx, at(s, p->attack_animation_entry), signature, values, 8);
+}
 void qa_compat_q2_native_primary_weapons_attack_animation(qa_compat_q2_native_primary_weapons *s, qa_actor_id actor) {
   if (!qa_compat_q2_native_primary_weapons_available(s, actor)) return;
   const qa_compat_q2_native_primary_weapon_profile *p = s->profile; qa_compat_q2_runner *runner = s->host.runner;
   uint64_t *removals = calloc(p->attack_skip_count ? p->attack_skip_count : 1, sizeof *removals);
   if (removals == NULL) qa_range_error("Native weapons out of memory");
-  for (size_t i = 0; i < p->attack_skip_count; i++)
-    removals[i] = runner->bind_inline_region(runner->ctx, at(s, p->attack_skip[i].entry), at(s, p->attack_skip[i].join), p->abi, s, skip_region);
-  static const qa_guest_value_layout parameters[8] = {
-    {.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "int32"}, {.is_aggregate = false, .storage = "int32"}, {.is_aggregate = false, .storage = "int32"},
-    {.is_aggregate = false, .storage = "int32"}, {.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "pointer"}};
-  qa_guest_address none = {0};
-  qa_guest_call_value values[8] = {qa_compat_q2_call_pointer(true, record_of(s, actor).address), qa_compat_q2_call_int32(0), qa_compat_q2_call_int32(0), qa_compat_q2_call_int32(0), qa_compat_q2_call_int32(0),
-                                   qa_compat_q2_call_pointer(false, none), qa_compat_q2_call_pointer(false, none), qa_compat_q2_call_pointer(false, none)};
-  qa_compat_q2_guest_call_signature signature = {p->abi, parameters, 8, true, {0}, false};
-  invoke_scope scope = {s, signature, values, 8, p->attack_animation_entry};
+  qa_cleanup node; qa_cleanup_push(&node, free, removals);
+  attack_scope scope = {s, actor, removals, 0};
   qa_compat_q2_native_thrown thrown;
-  bool completed = qa_compat_q2_native_try(invoke_body, &scope, &thrown);
-  for (size_t i = p->attack_skip_count; i-- > 0;) runner->remove_inline_region(runner->ctx, removals[i]);
-  free(removals);
+  bool completed = qa_compat_q2_native_try(attack_body, &scope, &thrown);
+  for (size_t i = scope.removal_count; i-- > 0;) runner->remove_inline_region(runner->ctx, removals[i]);
+  qa_cleanup_pop(&node); free(removals);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
 }
 typedef struct { qa_native_item_field field; double value; } saved_value;
+typedef struct { qa_compat_q2_native_primary_weapons *s; qa_actor_id actor; double flag, milliseconds, delay; } delay_scope;
+/* The TS try block of weaponDelay(): the projection is written inside it. */
+static void delay_body(void *v) {
+  delay_scope *c = v; qa_compat_q2_native_primary_weapons *s = c->s; const qa_compat_q2_native_primary_weapon_profile *p = s->profile;
+  for (size_t i = 0; i < p->delay_projection_count; i++) write_field(s, c->actor, p->delay_projection[i].field, p->delay_projection[i].value);
+  write_field(s, c->actor, p->delay_flag, c->flag);
+  static const qa_guest_value_layout parameters[2] = {{.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "pointer"}};
+  qa_guest_call_value values[2] = {qa_compat_q2_call_pointer(true, s->delay_result), qa_compat_q2_call_pointer(true, record_of(s, c->actor).address)};
+  qa_compat_q2_guest_call_signature signature = {p->abi, parameters, 2, false, pointer_layout, false};
+  s->host.invoke(s->host.ctx, at(s, p->delay_anim_entry), signature, values, 2);
+  c->delay = c->milliseconds * (double)qa_compat_q2_mem_read_i64(s->host.memory, s->delay_result) / p->delay_baseline_ms;
+}
 double qa_compat_q2_native_primary_weapons_weapon_delay(qa_compat_q2_native_primary_weapons *s, qa_actor_id actor, double milliseconds) {
   const qa_compat_q2_native_primary_weapon_profile *p = s->profile;
   double flag;
-  if (!map_get(&s->delay_flags, actor, &flag)) qa_range_error("Original firing modifier has not run for this actor");
+  if (!map_get(&s->delay_flags, actor, &flag)) qa_raise("Error", 0, 0, "Original firing modifier has not run for this actor");
   if (strcmp(p->delay_evaluate_kind, "source-flag") == 0) {
-    if (flag != trunc(flag) || flag < 0 || flag >= (double)p->delay_factor_count) qa_range_error("Original firing flag has no declared source factor");
+    if (flag != trunc(flag) || flag < 0 || flag >= (double)p->delay_factor_count) qa_raise("Error", 0, 0, "Original firing flag has no declared source factor");
     return milliseconds * p->delay_factors[(size_t)flag];
   }
-  if (!s->has_delay_result) qa_range_error("Original animation delay result storage is unavailable");
+  if (!s->has_delay_result) qa_raise("Error", 0, 0, "Original animation delay result storage is unavailable");
   size_t field_count = p->delay_projection_count + p->delay_write_count + 1;
   saved_value *saved = calloc(field_count, sizeof *saved);
   if (saved == NULL) qa_range_error("Native weapons out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, free, saved);
   size_t used = 0;
   for (size_t i = 0; i < p->delay_projection_count; i++) saved[used++].field = p->delay_projection[i].field;
   for (size_t i = 0; i < p->delay_write_count; i++) saved[used++].field = p->delay_writes[i];
   saved[used++].field = p->delay_flag;
   for (size_t i = 0; i < used; i++) saved[i].value = read_field(s, actor, saved[i].field);
-  for (size_t i = 0; i < p->delay_projection_count; i++) write_field(s, actor, p->delay_projection[i].field, p->delay_projection[i].value);
-  write_field(s, actor, p->delay_flag, flag);
-  static const qa_guest_value_layout parameters[2] = {{.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "pointer"}};
-  qa_guest_call_value values[2] = {qa_compat_q2_call_pointer(true, s->delay_result), qa_compat_q2_call_pointer(true, record_of(s, actor).address)};
-  qa_compat_q2_guest_call_signature signature = {p->abi, parameters, 2, false, pointer_layout, false};
-  invoke_scope scope = {s, signature, values, 2, p->delay_anim_entry};
+  delay_scope scope = {s, actor, flag, milliseconds, 0};
   qa_compat_q2_native_thrown thrown;
-  bool completed = qa_compat_q2_native_try(invoke_body, &scope, &thrown);
-  double delay = 0;
-  if (completed) delay = milliseconds * (double)qa_compat_q2_mem_read_i64(s->host.memory, s->delay_result) / p->delay_baseline_ms;
+  bool completed = qa_compat_q2_native_try(delay_body, &scope, &thrown);
+  /* TS finally: the borrowed fields go back while the actor is still current. */
   if (current(s, actor)) for (size_t i = 0; i < used; i++) write_field(s, actor, saved[i].field, saved[i].value);
-  free(saved);
+  qa_cleanup_pop(&node); free(saved);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
-  return delay;
+  return scope.delay;
 }
 bool qa_compat_q2_native_primary_weapons_available(qa_compat_q2_native_primary_weapons *s, qa_actor_id actor) { return current(s, actor) && all_match(s, actor, s->profile->active, s->profile->active_count); }
 bool qa_compat_q2_native_primary_weapons_continuing(qa_compat_q2_native_primary_weapons *s, qa_actor_id actor) { return current(s, actor) && any_row(s, actor, s->profile->continuations, s->profile->continuation_count); }
@@ -304,10 +345,13 @@ void qa_compat_q2_native_primary_weapons_release(qa_compat_q2_native_primary_wea
 void qa_compat_q2_native_primary_weapons_close(qa_compat_q2_native_primary_weapons *s) {
   if (s->closed) return;
   s->closed = true;
+  /* removals.runReverse(): the stack is emptied, then whatever was bound is removed, newest first. */
   qa_compat_q2_runner *runner = s->host.runner;
-  if (strcmp(s->profile->damage_kind, "source-flag") == 0) runner->remove_inline_region(runner->ctx, s->damage_region);
-  runner->remove_inline_region(runner->ctx, s->delay_region);
-  qa_compat_q2_native_entry_close(s->spawn);
+  bool damage = s->has_damage_region, delay = s->has_delay_region; qa_compat_q2_native_entry *spawn = s->spawn;
+  s->has_damage_region = false; s->has_delay_region = false; s->spawn = NULL;
+  if (damage) runner->remove_inline_region(runner->ctx, s->damage_region);
+  if (delay) runner->remove_inline_region(runner->ctx, s->delay_region);
+  if (spawn != NULL) qa_compat_q2_native_entry_close(spawn);
   qa_compat_q2_native_weapon_dispatcher_close(s->dispatcher);
   s->damage_factors.count = 0; s->delay_flags.count = 0;
   if (s->has_delay_result) s->host.memory->unmap(s->host.memory->ctx, s->delay_result, 8);

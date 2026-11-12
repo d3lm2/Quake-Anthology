@@ -29,13 +29,13 @@ bool qa_qvm_qualify_body_calls(const qa_qvm_image *image, qa_qvm_scene_body body
   for (int i = 0; i < 3; i++)
     bad_argument = bad_argument || !is_integer(arguments[i]) || arguments[i] < 0 ||
                    arguments[i] >= QA_QVM_MAX_PRIVATE_ARGUMENT_WORDS;
-  if (bad_argument) qa_range_error("Source body arguments differ from the original refEntity ABI");
+  if (bad_argument) qa_raise("Error", 0, 0, "Source body arguments differ from the original refEntity ABI");
   bool entries_ok =
       is_integer(player.entry) && player.entry >= 0 && player.entry < (double)image->instruction_count &&
       image->instructions[(size_t)player.entry].opcode == QA_QVM_OP_ENTER &&
       is_integer(mesh.entry) && mesh.entry >= 0 && mesh.entry < (double)image->instruction_count &&
       image->instructions[(size_t)mesh.entry].opcode == QA_QVM_OP_ENTER;
-  if (!entries_ok) qa_range_error("Source body scope requires original function entries");
+  if (!entries_ok) qa_raise("Error", 0, 0, "Source body scope requires original function entries");
   int64_t end = (int64_t)player.entry + 1;
   while (end < (int64_t)image->instruction_count &&
          image->instructions[end].opcode != QA_QVM_OP_ENTER)
@@ -65,7 +65,7 @@ bool qa_qvm_qualify_body_calls(const qa_qvm_image *image, qa_qvm_scene_body body
           !valid_call(image, player.entry, (double)end, mesh.entry, (int64_t)row.call) ||
           duplicate) {
         free(entries);
-        qa_range_error("Source body part does not name a distinct original player-to-mesh call");
+        qa_raise("Error", 0, 0, "Source body part does not name a distinct original player-to-mesh call");
       }
       if (count == capacity) {
         capacity *= 2;
@@ -80,7 +80,7 @@ bool qa_qvm_qualify_body_calls(const qa_qvm_image *image, qa_qvm_scene_body body
   }
   if (count == 0) {
     free(entries);
-    qa_range_error("Source body scope has no qualified original mesh calls");
+    qa_raise("Error", 0, 0, "Source body scope has no qualified original mesh calls");
   }
   out->entries = entries;
   out->count = count;

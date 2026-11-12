@@ -266,12 +266,16 @@ static void lan_join(qa_kex_lan_transport *lan, qa_kex_lan_peer *peer,
       for (size_t i = 0; i < lan->peer_count; i++) {
         if (&lan->peers[i] == peer) self_index = i;
       }
+      /* A channel send can raise (a full reliable queue); the buffer is released then. */
+      qa_cleanup added_node;
+      qa_cleanup_push(&added_node, free_arg, added_bytes);
       for (size_t i = 0; i < lan->peer_count; i++) {
         if (i != self_index && lan->peers[i].player_count != 0) {
           (void)qa_kex_channel_send(lan->peers[i].channel, 253, added_bytes, added_len, 3,
                                     lan->clock);
         }
       }
+      qa_cleanup_pop(&added_node);
       free(added_bytes);
       peer = &lan->peers[self_index];
     }
@@ -286,7 +290,10 @@ static void lan_join(qa_kex_lan_transport *lan, qa_kex_lan_peer *peer,
     }
     size_t response_len = 0;
     uint8_t *response_bytes = qa_kex_packet_writer_finish(&response, &response_len);
+    qa_cleanup response_node;
+    qa_cleanup_push(&response_node, free_arg, response_bytes);
     (void)qa_kex_channel_send(peer->channel, 128, response_bytes, response_len, 0, lan->clock);
+    qa_cleanup_pop(&response_node);
     free(response_bytes);
     for (size_t i = 0; i < lan->attribute_count; i++) {
       size_t needed = strlen(lan->attributes[i].key) + strlen(lan->attributes[i].value) + 2;
@@ -297,7 +304,10 @@ static void lan_join(qa_kex_lan_transport *lan, qa_kex_lan_peer *peer,
       size_t text_len = 0;
       uint8_t *encoded = qa_kex_text_bytes(text, &text_len);
       free(text);
+      qa_cleanup encoded_node;
+      qa_cleanup_push(&encoded_node, free_arg, encoded);
       (void)qa_kex_channel_send(peer->channel, 255, encoded, text_len, 3, lan->clock);
+      qa_cleanup_pop(&encoded_node);
       free(encoded);
     }
     return;
@@ -370,12 +380,15 @@ static void player_message(qa_kex_lan_transport *lan, qa_kex_lan_peer *peer,
     free(attribute);
     size_t out_len = 0;
     uint8_t *out_bytes = qa_kex_packet_writer_finish(&output, &out_len);
+    qa_cleanup out_node;
+    qa_cleanup_push(&out_node, free_arg, out_bytes);
     for (size_t i = 0; i < lan->peer_count; i++) {
       if (lan->peers[i].player_count != 0) {
         (void)qa_kex_channel_send(lan->peers[i].channel, 253, out_bytes, out_len, 3,
                                   lan->clock);
       }
     }
+    qa_cleanup_pop(&out_node);
     free(out_bytes);
     return;
   }
@@ -440,6 +453,8 @@ static void lan_remove(qa_kex_lan_transport *lan, qa_kex_lan_peer *peer) {
     free(leaving);
     return;
   }
+  qa_cleanup leaving_node;
+  qa_cleanup_push(&leaving_node, free_arg, leaving);
   for (size_t i = 0; i < leaving_count; i++) {
     long index = player_index_of(lan, leaving[i]);
     if (index < 0) continue;
@@ -453,14 +468,18 @@ static void lan_remove(qa_kex_lan_transport *lan, qa_kex_lan_peer *peer) {
     (void)qa_kex_packet_writer_integer(&writer, (uint64_t)index);
     size_t bytes_len = 0;
     uint8_t *bytes = qa_kex_packet_writer_finish(&writer, &bytes_len);
+    qa_cleanup bytes_node;
+    qa_cleanup_push(&bytes_node, free_arg, bytes);
     for (size_t t = 0; t < lan->peer_count; t++) {
       if (lan->peers[t].player_count != 0) {
         (void)qa_kex_channel_send(lan->peers[t].channel, 253, bytes, bytes_len, 3,
                                   lan->clock);
       }
     }
+    qa_cleanup_pop(&bytes_node);
     free(bytes);
   }
+  qa_cleanup_pop(&leaving_node);
   free(leaving);
 }
 
@@ -850,12 +869,15 @@ void qa_kex_lan_set_attribute(qa_kex_lan_transport *lan, const char *key,
   size_t encoded_len = 0;
   uint8_t *encoded = qa_kex_text_bytes(text, &encoded_len);
   free(text);
+  qa_cleanup encoded_node;
+  qa_cleanup_push(&encoded_node, free_arg, encoded);
   for (size_t i = 0; i < lan->peer_count; i++) {
     if (lan->peers[i].player_count != 0) {
       (void)qa_kex_channel_send(lan->peers[i].channel, 255, encoded, encoded_len, 3,
                                 lan->clock);
     }
   }
+  qa_cleanup_pop(&encoded_node);
   free(encoded);
 }
 

@@ -53,7 +53,7 @@ static qa_bot_memory_allocation *cell(qa_aas_bsp_entities *e, uint32_t pointer) 
 }
 static uint32_t pointer_at(qa_aas_bsp_entities *e, uint32_t pair, size_t offset) {
   qa_bot_memory_allocation *allocation = cell(e, pair);
-  if (offset + 4 > allocation->length) qa_range_error("Offset is outside the bounds of the DataView");
+  if (offset + 4 > allocation->length) qa_range_error("Out of bounds access"); /* TS DataView.getUint32 */
   return lib_u32(allocation->bytes + offset);
 }
 static void set_pointer(qa_aas_bsp_entities *e, uint32_t pair, size_t offset, uint32_t pointer) {
@@ -99,15 +99,13 @@ static void print_location(qa_aas_bsp_entities *e, qa_ui_script_lexer *lexer, co
 static qa_ui_script_token *read_token(qa_aas_bsp_entities *e, qa_ui_script_lexer *lexer) {
   qa_ui_script_fail_env *env = qa_ui_script_lexer_fail_env(lexer);
   qa_ui_script_catch block;
-  block.prev = env->top;
-  env->top = &block;
+  qa_ui_script_catch_enter(env, &block);
   qa_ui_script_token *token = NULL;
   if (setjmp(block.buf) == 0) {
     bool read = qa_ui_script_lexer_next(lexer, &token);
-    env->top = block.prev;
+    qa_ui_script_catch_leave(&block);
     return read ? token : NULL;
   }
-  env->top = block.prev;
   size_t count = 0;
   const qa_ui_script_diagnostic *issues = qa_ui_script_lexer_diagnostics(lexer, &count);
   for (size_t i = 0; i < count; i++) {
@@ -391,6 +389,7 @@ qa_save_value *qa_aas_bsp_entities_checkpoint(qa_aas_bsp_entities *e, qa_bot_mem
   lib_set(object, "allocations", allocations);
   return object;
 }
+static void free_slot(void *arg) { free(*(void **)arg); }
 void qa_aas_bsp_entities_restore(qa_aas_bsp_entities *e, const qa_save_value *value,
                                  qa_bot_memory_restored *memory) {
   qa_save_reader reader, entity_text, entities, allocations;
@@ -399,8 +398,23 @@ void qa_aas_bsp_entities_restore(qa_aas_bsp_entities *e, const qa_save_value *va
   bool loaded = lib_read_bool(&reader, "loaded");
   double next = lib_int_min(&reader, "nextAllocation", 1);
   lib_field(&reader, "entityText", &entity_text);
+  /* TS reads the whole image (a SaveFormatError for any malformed cell) before it validates. */
+  if (!qa_save_reader_is_null(&entity_text)) (void)qa_save_reader_integer_min(&entity_text, 0);
   lib_field(&reader, "entities", &entities);
+  for (size_t i = 0, listed = qa_save_reader_list_count(&entities); i < listed; i++) {
+    qa_save_reader entry;
+    lib_item(&entities, i, &entry);
+    (void)qa_save_reader_integer_min(&entry, 0);
+    qa_save_reader_destroy(&entry);
+  }
   lib_field(&reader, "allocations", &allocations);
+  for (size_t i = 0, listed = qa_save_reader_list_count(&allocations); i < listed; i++) {
+    qa_save_reader entry;
+    lib_item(&allocations, i, &entry);
+    (void)lib_int_min(&entry, "pointer", 1);
+    (void)lib_int_min(&entry, "allocation", 0);
+    qa_save_reader_destroy(&entry);
+  }
   bool any = false;
   for (size_t i = 0; i < e->allocation_capacity && !any; i++) any = e->allocations[i].live;
   if (e->is_loaded || any || count < 0 || count > QA_BSP_MAX_ENTITIES ||
@@ -431,8 +445,12 @@ void qa_aas_bsp_entities_restore(qa_aas_bsp_entities *e, const qa_save_value *va
     lib_item(&entities, index, &entry);
     double pair = qa_save_reader_integer_min(&entry, 0);
     qa_save_reader_destroy(&entry);
+    /* TS keeps the saved number: one past the pointer-cell range identifies no allocation. */
+    if (pair > 4294967295.0) qa_range_error("BSP epair pointer does not identify an owned allocation");
     size_t seen_count = 0, seen_capacity = 0;
     uint32_t *seen = NULL;
+    qa_cleanup seen_cleanup; /* a bad epair list raises with the list held */
+    qa_cleanup_push(&seen_cleanup, free_slot, &seen);
     for (uint32_t pointer = (uint32_t)pair; pointer != 0; pointer = pointer_at(e, pointer, 8)) {
       for (size_t i = 0; i < seen_count; i++)
         if (seen[i] == pointer) qa_ui_script_plain_error("Invalid saved BSP epair list");
@@ -448,6 +466,7 @@ void qa_aas_bsp_entities_restore(qa_aas_bsp_entities *e, const qa_save_value *va
           qa_ui_script_plain_error("Saved BSP epair string is unterminated");
       }
     }
+    qa_cleanup_pop(&seen_cleanup);
     free(seen);
     e->pairs[index] = (uint32_t)pair;
   }

@@ -13,7 +13,6 @@
 static bool starts(const char *a, const char *prefix) { return a != NULL && strncmp(a, prefix, strlen(prefix)) == 0; }
 static noreturn void fail(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
 
-static void put_u32(uint8_t out[4], uint32_t v) { out[0] = (uint8_t)v; out[1] = (uint8_t)(v >> 8); out[2] = (uint8_t)(v >> 16); out[3] = (uint8_t)(v >> 24); }
 /* TS BotAssetFiles.provenance(): the bots library digest (it skips paths recorded unread). */
 void qa_app_sim_bot_asset_provenance(const qa_bot_asset_files *files, char out[65]) { qa_bot_asset_files_provenance(files, out); }
 static const uint8_t *view_read(void *ctx, const char *path, size_t *out_length) {

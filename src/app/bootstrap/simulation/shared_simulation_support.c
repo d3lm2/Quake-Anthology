@@ -4,6 +4,8 @@
  * from the method files so it links on its own. GPL-2.0-or-later. */
 #include "shared_simulation_internal.h"
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qa/foundation/js.h"
@@ -98,9 +100,6 @@ void qa_ss_map_clear(qa_ss_map *map) {
 }
 
 /* ---- TS free helpers ---- */
-qa_vec3 qa_ss_add(qa_vec3 a, qa_vec3 b) {
-  return (qa_vec3){(float)(a.x + b.x), (float)(a.y + b.y), (float)(a.z + b.z)};
-}
 qa_vec3 qa_ss_subtract(qa_vec3 a, qa_vec3 b) { return (qa_vec3){a.x - b.x, a.y - b.y, a.z - b.z}; }
 double qa_ss_seconds(qa_source_time time) {
   return time.kind == QA_SOURCE_TIME_SECONDS ? time.value : time.value / 1000;
@@ -167,4 +166,21 @@ qa_mod_client_unsubscribe qa_app_shared_sim_subscribe_listener(qa_app_shared_sim
   if (!entry) qa_range_error("Out of memory");
   *entry = (ss_listener_unsubscribe){sim, listener, ctx};
   return (qa_mod_client_unsubscribe){entry, qa_app_shared_sim_unsubscribe_listener};
+}
+
+/* A plain TS Error whose message is formatted whole (TS messages have no length limit); qa_raise keeps any length. The
+ * text lives in a per-thread buffer until the next failure, since qa_raise copies it before unwinding. */
+noreturn void qa_ss_raise_error(const char *format, va_list args) {
+  static __thread char *text; static __thread size_t capacity;
+  va_list measure; va_copy(measure, args);
+  int needed = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  if (needed < 0) qa_raise("Error", 0, 0, "%s", format);
+  if ((size_t)needed + 1 > capacity) {
+    char *grown = realloc(text, (size_t)needed + 1);
+    if (grown == NULL) qa_range_error("Out of memory");
+    text = grown; capacity = (size_t)needed + 1;
+  }
+  vsnprintf(text, capacity, format, args);
+  qa_raise("Error", 0, 0, "%s", text);
 }

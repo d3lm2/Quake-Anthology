@@ -92,7 +92,7 @@ static int32_t proceed(qa_qvm_module_function_call *call) {
 
 static int32_t call_word(const qa_qvm_module_function_call *call, int64_t byte_offset) {
   if (byte_offset < 0 || byte_offset > (int64_t)call->words_length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   const uint8_t *p = call->words + byte_offset;
   uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
                   ((uint32_t)p[3] << 24);
@@ -112,7 +112,7 @@ static void entity_view(qa_qvm_primary_pickups *p, double slot, qa_qvm_writable_
   qa_qvm_game_data *data = &p->options.game->data;
   if (qa_qvm_game_data_get_entity_stride_bytes(data) != p->options.profile.entity_stride ||
       qa_qvm_game_data_get_client_stride_bytes(data) != p->options.profile.client_stride)
-    qa_range_error("Original pickup source records differ from their profile");
+    qa_raise("Error", 0, 0, "Original pickup source records differ from their profile");
   qa_qvm_game_data_entity_bytes(data, slot, out);
 }
 
@@ -190,7 +190,7 @@ static _Noreturn void cancel_with(pickup_frame *frame,
                                   void *ctx) {
   cancel_job job = {cancel_function, ctx, frame->cancellation};
   qa_caught_error caught;
-  if (qa_try(cancel_body, &job, &caught)) qa_range_error("QVM function scope cancelled");
+  if (qa_try(cancel_body, &job, &caught)) qa_raise("Error", 0, 0, "QVM function scope cancelled");
   frame->cancelled = true;
   snprintf(frame->cancelled_error, sizeof frame->cancelled_error, "%s", caught.message);
   qa_rethrow(&caught);
@@ -229,9 +229,17 @@ typedef struct projection {
   bool active;
 } projection;
 
+/* TS new DataView(bytes.buffer, bytes.byteOffset + address, 4): the
+ * constructor's own refusals for an address outside the allocation. */
+static void projection_bounds(qa_qvm_memory *memory, int64_t address) {
+  if (address < 0) qa_range_error("byteOffset cannot be negative");
+  if (address > (int64_t)memory->length)
+    qa_range_error("byteOffset exceeds source ArrayBuffer byteLength");
+  if (address > (int64_t)memory->length - 4) qa_range_error("Length out of range of buffer");
+}
+
 static int32_t raw_read(qa_qvm_memory *memory, int64_t address) {
-  if (address < 0 || address > (int64_t)memory->length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+  projection_bounds(memory, address);
   const uint8_t *bytes = memory->bytes + address;
   uint32_t bits = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) | ((uint32_t)bytes[2] << 16) |
                   ((uint32_t)bytes[3] << 24);
@@ -239,14 +247,22 @@ static int32_t raw_read(qa_qvm_memory *memory, int64_t address) {
 }
 
 static void raw_write(qa_qvm_memory *memory, int64_t address, int32_t value) {
-  if (address < 0 || address > (int64_t)memory->length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+  projection_bounds(memory, address);
   uint8_t *bytes = memory->bytes + address;
   uint32_t bits = (uint32_t)value;
   bytes[0] = (uint8_t)bits;
   bytes[1] = (uint8_t)(bits >> 8);
   bytes[2] = (uint8_t)(bits >> 16);
   bytes[3] = (uint8_t)(bits >> 24);
+}
+
+static void projection_free(void *arg) {
+  projection *proj = arg;
+  proj->active = false;
+  free(proj->addresses);
+  free(proj->before);
+  proj->addresses = NULL;
+  proj->before = NULL;
 }
 
 static void project_begin(qa_qvm_primary_pickups *p, const qa_qvm_inventory_word *writes, size_t count,
@@ -257,12 +273,33 @@ static void project_begin(qa_qvm_primary_pickups *p, const qa_qvm_inventory_word
   out->active = true;
   out->addresses = malloc((count == 0 ? 1 : count) * sizeof *out->addresses);
   out->before = malloc((count == 0 ? 1 : count) * sizeof *out->before);
+  /* The addresses derive from guest pointers: a refused one strands nothing. */
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, projection_free, out);
   if (out->addresses == NULL || out->before == NULL) qa_range_error("out of memory");
+  /* TS builds every view first, then reads every word, then writes. */
   for (size_t i = 0; i < count; i++) {
     out->addresses[i] = (int64_t)writes[i].address;
-    out->before[i] = raw_read(out->memory, out->addresses[i]);
+    projection_bounds(out->memory, out->addresses[i]);
   }
+  for (size_t i = 0; i < count; i++) out->before[i] = raw_read(out->memory, out->addresses[i]);
   for (size_t i = 0; i < count; i++) raw_write(out->memory, out->addresses[i], qa_int32(writes[i].value));
+  qa_cleanup_pop(&refused);
+}
+
+static void free_words(void *arg) { qa_qvm_inventory_words_destroy(arg); }
+
+/* project() over words the supply projection allocated: they are released
+ * whether or not the projection is admitted. */
+static void project_words(qa_qvm_primary_pickups *p, qa_qvm_inventory_words *writes, bool owned,
+                          projection *out) {
+  qa_cleanup words_cleanup;
+  if (owned) qa_cleanup_push(&words_cleanup, free_words, writes);
+  project_begin(p, writes->entries, writes->count, out);
+  if (owned) {
+    qa_cleanup_pop(&words_cleanup);
+    qa_qvm_inventory_words_destroy(writes);
+  }
 }
 
 static void project_restore(projection *proj) {
@@ -276,7 +313,7 @@ static void project_restore(projection *proj) {
 }
 
 static void take(qa_qvm_primary_pickups *p, pickup_frame *frame, qa_qvm_module_function_call *call) {
-  if (frame->granted) qa_range_error("Original pickup source caller attempted a second grant");
+  if (frame->granted) qa_raise("Error", 0, 0, "Original pickup source caller attempted a second grant");
   frame->granted = true;
   uint64_t sequence = frame->sequence;
   bool accepted = frame->selection.kind == QA_SOURCE_PICKUP_REPLACEMENT &&
@@ -295,6 +332,17 @@ typedef struct region_run_ctx {
   projection *restore;
 } region_run_ctx;
 
+typedef struct supply_scope {
+  qa_qvm_primary_pickups *pickups;
+  uint64_t frame_sequence;
+} supply_scope;
+
+static void clear_supply(void *arg) {
+  supply_scope *scope = arg;
+  pickup_frame *frame = frame_by_sequence(scope->pickups, scope->frame_sequence);
+  if (frame != NULL) frame->has_supply = false;
+}
+
 static const char *grant_region_run(void *ctx, void *control_ctx) {
   region_run_ctx *run = ctx;
   /* The module binding's control_ctx is the interpreter's region control. */
@@ -303,14 +351,14 @@ static const char *grant_region_run(void *ctx, void *control_ctx) {
   pickup_frame *frame = frame_by_sequence(p, run->frame_sequence);
   const qa_qvm_pickup_grant *grant = run->grant;
   project_restore(run->restore);
-  if (frame == NULL) qa_range_error("QVM function scope cancelled");
+  if (frame == NULL) qa_raise("Error", 0, 0, "QVM function scope cancelled");
   if (!frame_live(p, frame)) cancel_control(p, frame, control);
   if (p->options.has_supply) {
     qa_item_id ammo = NULL;
     bool has_ammo = p->options.supply_ammo(p->options.supply_ctx, frame->item_record, &ammo);
     double amount = control->local_word(control->ctx, grant->region_quantity);
     if (!grant->has_weapon && !has_ammo)
-      qa_range_error("Original ammo pickup has no admitted source counter");
+      qa_raise("Error", 0, 0, "Original ammo pickup has no admitted source counter");
     frame->has_supply = true;
     frame->supply_has_quantity = grant->has_weapon;
     if (!grant->has_weapon && has_ammo) {
@@ -331,9 +379,13 @@ static const char *grant_region_run(void *ctx, void *control_ctx) {
       }
     }
   }
+  /* TS try { take(); return "skip"; } finally { frame.supply = null; }. */
+  supply_scope scope = {p, run->frame_sequence};
+  qa_cleanup held;
+  qa_cleanup_push(&held, clear_supply, &scope);
   take(p, frame, run->call);
-  frame = frame_by_sequence(p, run->frame_sequence);
-  if (frame != NULL) frame->has_supply = false;
+  qa_cleanup_pop(&held);
+  clear_supply(&scope);
   return "skip";
 }
 
@@ -352,9 +404,11 @@ static int32_t grant_hook(void *ctx, qa_qvm_module_function_call *call) {
     pickup_frame *frame = frame_by_sequence(p, evaluation->frame_sequence);
     if (frame == NULL || frame->grant != grant || !frame_live(p, frame) ||
         call_word(call, 0) != frame->item_pointer || call_word(call, 4) != frame->recipient_pointer)
-      qa_range_error("Original pickup evaluation lost its source caller");
+      qa_raise("Error", 0, 0, "Original pickup evaluation lost its source caller");
     evaluation->entered = true;
-    return call->evaluate_region(call->call_ctx, &evaluation->region, NULL, 0);
+    /* A copy: the evaluation runs guest code, and a nested quantity may grow the stack. */
+    qa_qvm_region_evaluation region = evaluation->region;
+    return call->evaluate_region(call->call_ctx, &region, NULL, 0);
   }
   pickup_frame *frame = top_frame(p);
   if (frame == NULL || frame->grant != grant || !from_sites(p, call, grant->calls, grant->call_count) ||
@@ -365,7 +419,7 @@ static int32_t grant_hook(void *ctx, qa_qvm_module_function_call *call) {
   if (!grant->is_region) {
     take(p, frame, call);
     if (!p->grant_return_has[gc->grant_index])
-      qa_range_error("Missing original pickup lifecycle return");
+      qa_raise("Error", 0, 0, "Missing original pickup lifecycle return");
     return (int32_t)p->grant_returns[gc->grant_index];
   }
   qa_qvm_inventory_words writes = {NULL, 0};
@@ -375,7 +429,7 @@ static int32_t grant_hook(void *ctx, qa_qvm_module_function_call *call) {
     bool owned = p->options.supply_owns(p->options.supply_ctx, frame->recipient, frame->offer.item);
     if (grant->weapon_storage_inventory) {
       if (p->options.supply_project == NULL)
-        qa_range_error("Original pickup requires its declared inventory projection");
+        qa_raise("Error", 0, 0, "Original pickup requires its declared inventory projection");
       p->options.supply_project(p->options.supply_ctx, frame->recipient, frame->offer.item,
                                 owned ? 1 : 0, &writes);
       has_writes = true;
@@ -384,7 +438,8 @@ static int32_t grant_hook(void *ctx, qa_qvm_module_function_call *call) {
       qa_qvm_writable_view view;
       qa_qvm_memory_data_view(p->options.game->module.memory, address, 4, &view);
       int32_t before = qa_qvm_writable_view_get_int32(&view, 0, true);
-      int32_t mask = (int32_t)(1u << (uint32_t)qa_int32(frame->item_record->tag));
+      /* TS 1 << tag: the count is the tag's low five bits (the tag is a guest word). */
+      int32_t mask = (int32_t)(1u << ((uint32_t)qa_int32(frame->item_record->tag) & 31u));
       single_write = (qa_qvm_inventory_word){(double)address,
                                              (double)(owned ? before | mask : before & ~mask)};
       writes.entries = &single_write;
@@ -392,8 +447,7 @@ static int32_t grant_hook(void *ctx, qa_qvm_module_function_call *call) {
     }
   }
   projection restore;
-  project_begin(p, writes.entries, writes.count, &restore);
-  if (has_writes) qa_qvm_inventory_words_destroy(&writes);
+  project_words(p, &writes, has_writes, &restore);
   region_run_ctx run = {p, call, frame->sequence, grant, &restore};
   qa_qvm_module_region_binding binding = {(int64_t)grant->region_entry, (int64_t)grant->region_join, &run,
                                     grant_region_run, NULL};
@@ -531,7 +585,7 @@ static int32_t execute_run(void *ctx, qa_source_pickup_selection selection) {
     }
   if (selection.kind == QA_SOURCE_PICKUP_BLOCKED || selection.kind == QA_SOURCE_PICKUP_STALE) return 0;
   if (selection.kind == QA_SOURCE_PICKUP_REPLACEMENT && grant == NULL)
-    qa_range_error("Original pickup replacement has no qualified grant boundary");
+    qa_raise("Error", 0, 0, "Original pickup replacement has no qualified grant boundary");
   pickup_frame frame;
   memset(&frame, 0, sizeof frame);
   frame.sequence = ++p->next_sequence;
@@ -577,6 +631,23 @@ static int32_t execute_run(void *ctx, qa_source_pickup_selection selection) {
   return 0;
 }
 
+static char *copy_text(const char *text) {
+  if (text == NULL) return NULL;
+  size_t length = strlen(text) + 1;
+  char *copy = malloc(length);
+  if (copy == NULL) qa_range_error("out of memory");
+  memcpy(copy, text, length);
+  return copy;
+}
+
+static void free_held_record(void *arg) {
+  qa_qvm_catalog_record *record = arg;
+  free(record->class_name);
+  free(record->pickup_name);
+  record->class_name = NULL;
+  record->pickup_name = NULL;
+}
+
 static int32_t touch_hook(void *ctx, qa_qvm_module_function_call *call) {
   qa_qvm_primary_pickups *p = ctx;
   if (p->closed) return proceed(call);
@@ -601,11 +672,11 @@ static int32_t touch_hook(void *ctx, qa_qvm_module_function_call *call) {
         break;
       }
   if (item_record == NULL || qa_int32(item_record->index) != entity_i32(p, item_slot, 160))
-    qa_range_error("Original pickup has an undeclared source item descriptor");
+    qa_raise("Error", 0, 0, "Original pickup has an undeclared source item descriptor");
   qa_owned_actor item, actor;
   bool has_item = p->options.actor(p->options.ctx, item_slot, &item);
   bool has_actor = p->options.actor(p->options.ctx, recipient_slot, &actor);
-  if (!has_item || !has_actor) qa_range_error("Original pickup requires live canonical source actors");
+  if (!has_item || !has_actor) qa_raise("Error", 0, 0, "Original pickup requires live canonical source actors");
   qa_qvm_pickup_resolved_item resolved = p->options.resolve_item(p->options.ctx, item_record);
   int32_t count = entity_i32(p, item_slot, (int64_t)profile->field_count);
   bool objective = false;
@@ -623,10 +694,21 @@ static int32_t touch_hook(void *ctx, qa_qvm_module_function_call *call) {
                    qa_int32(profile->dropped_flag)) != 0;
   offer.time = p->options.time(p->options.ctx);
   offer.grant = objective ? "map-coupled" : NULL;
-  execute_ctx execute = {p, call, offer, call->cancellation_scope(call->call_ctx), item, actor,
+  qa_qvm_cancellation_scope cancellation = call->cancellation_scope(call->call_ctx);
+  /* TS frames keep the record object alive. A live catalog rebuilds its
+   * records when the guest writes its item table, so the frame holds a copy. */
+  qa_qvm_catalog_record held = *item_record;
+  held.class_name = copy_text(item_record->class_name);
+  held.pickup_name = copy_text(item_record->pickup_name);
+  qa_cleanup held_cleanup;
+  qa_cleanup_push(&held_cleanup, free_held_record, &held);
+  execute_ctx execute = {p, call, offer, cancellation, item, actor,
                          item_slot, recipient_slot, item_pointer, player_pointer, recipient_pointer,
-                         item_record};
-  return p->options.run_source(p->options.ctx, offer, execute_run, &execute);
+                         &held};
+  int32_t result = p->options.run_source(p->options.ctx, offer, execute_run, &execute);
+  qa_cleanup_pop(&held_cleanup);
+  free_held_record(&held);
+  return result;
 }
 
 void qa_qvm_primary_pickups_supply(qa_qvm_pickup_supply *supply, qa_qvm_primary_pickups *p,
@@ -635,7 +717,7 @@ void qa_qvm_primary_pickups_supply(qa_qvm_pickup_supply *supply, qa_qvm_primary_
   if (frame == NULL || !frame->granted || !frame->has_supply ||
       !item_id_equal(frame->offer.item, offer.item) || !actor_id_equal(frame->item.id, offer.pickup) ||
       !actor_id_equal(frame->recipient.id, offer.recipient) || !frame_live(p, frame))
-    qa_range_error("Selected QVM supply requires its held original grant");
+    qa_raise("Error", 0, 0, "Selected QVM supply requires its held original grant");
   memset(supply, 0, sizeof *supply);
   supply->offer = frame->supply_offer;
   supply->ammo_grant = frame->supply_ammo;
@@ -663,11 +745,11 @@ double qa_qvm_pickup_supply_quantity(qa_qvm_pickup_supply *supply, double count)
   pickup_frame *top = top_frame(p);
   if (frame == NULL || top == NULL || top->sequence != frame->sequence || !frame->has_supply ||
       !frame_live(p, frame))
-    qa_range_error("Original pickup quantity has expired");
+    qa_raise("Error", 0, 0, "Original pickup quantity has expired");
   const qa_qvm_pickup_grant *grant = frame->grant;
   double word = trunc(count);
   if (!isfinite(count) || word < -2147483648.0 || word > 2147483647.0)
-    qa_range_error("Original QVM pickup counter exceeds its int32 ABI");
+    qa_raise("Error", 0, 0, "Original QVM pickup counter exceeds its int32 ABI");
   qa_item_id ammo = NULL;
   bool has_ammo = p->options.has_supply &&
                   p->options.supply_ammo(p->options.supply_ctx, frame->item_record, &ammo);
@@ -676,7 +758,7 @@ double qa_qvm_pickup_supply_quantity(qa_qvm_pickup_supply *supply, double count)
   qa_qvm_inventory_word single_write;
   if (grant->weapon_storage_inventory) {
     if (p->options.supply_project == NULL)
-      qa_range_error("Original pickup requires its declared inventory projection");
+      qa_raise("Error", 0, 0, "Original pickup requires its declared inventory projection");
     if (has_ammo) {
       p->options.supply_project(p->options.supply_ctx, frame->recipient, ammo, word, &writes);
       has_writes = true;
@@ -690,8 +772,7 @@ double qa_qvm_pickup_supply_quantity(qa_qvm_pickup_supply *supply, double count)
     writes.count = 1;
   }
   projection restore;
-  project_begin(p, writes.entries, writes.count, &restore);
-  if (has_writes) qa_qvm_inventory_words_destroy(&writes);
+  project_words(p, &writes, has_writes, &restore);
   p->evaluating_stack = grow(p->evaluating_stack, &p->evaluating_capacity, p->evaluating_count,
                              sizeof *p->evaluating_stack);
   p->evaluating_stack[p->evaluating_count++] =
@@ -715,7 +796,7 @@ static const qa_qvm_instruction *instruction_at(const qa_qvm_image *image, doubl
 static void require_entry(const qa_qvm_image *image, double index) {
   const qa_qvm_instruction *instruction = instruction_at(image, index);
   if (instruction == NULL || instruction->opcode != QA_QVM_OP_ENTER)
-    qa_range_error("Original pickup requires a source function entry");
+    qa_raise("Error", 0, 0, "Original pickup requires a source function entry");
 }
 
 static void require_calls(qa_qvm_primary_pickups *p, const qa_qvm_image *image, double target,
@@ -726,7 +807,7 @@ static void require_calls(qa_qvm_primary_pickups *p, const qa_qvm_image *image, 
     const qa_qvm_instruction *previous = instruction_at(image, indices[i] - 1);
     if (instruction == NULL || instruction->opcode != QA_QVM_OP_CALL || previous == NULL ||
         previous->opcode != QA_QVM_OP_CONST || (double)previous->operand != target)
-      qa_range_error("Original pickup call site differs from its qualified target");
+      qa_raise("Error", 0, 0, "Original pickup call site differs from its qualified target");
     if (p->return_count == p->return_capacity) {
       size_t capacity = p->return_capacity == 0 ? 16 : p->return_capacity * 2;
       p->return_sites = realloc(p->return_sites, capacity * sizeof *p->return_sites);
@@ -738,19 +819,6 @@ static void require_calls(qa_qvm_primary_pickups *p, const qa_qvm_image *image, 
     p->return_pcs[p->return_count] = instruction->byte_offset + 1;
     p->return_count++;
   }
-}
-
-static qa_qvm_instruction *region_instructions(const qa_qvm_image *image) {
-  qa_qvm_instruction *list =
-      malloc((image->instruction_count == 0 ? 1 : image->instruction_count) * sizeof *list);
-  if (list == NULL) qa_range_error("out of memory");
-  for (size_t i = 0; i < image->instruction_count; i++) {
-    list[i].opcode = (int32_t)image->instructions[i].opcode;
-    list[i].operand_width = image->instructions[i].operand_width;
-    list[i].operand = image->instructions[i].operand;
-    list[i].byte_offset = image->instructions[i].byte_offset;
-  }
-  return list;
 }
 
 static size_t bind_hook(qa_qvm_primary_pickups *p, double index, qa_qvm_function_hook_fn hook,
@@ -766,6 +834,8 @@ static size_t bind_hook(qa_qvm_primary_pickups *p, double index, qa_qvm_function
   return id;
 }
 
+static void destroy_on_raise(void *arg) { qa_qvm_primary_pickups_destroy(arg); }
+
 qa_qvm_primary_pickups *qa_qvm_primary_pickups_create(qa_qvm_primary_pickups_options options) {
   qa_qvm_game *game = options.game;
   const qa_resolved_qvm_artifact *artifact = options.artifact;
@@ -777,13 +847,13 @@ qa_qvm_primary_pickups *qa_qvm_primary_pickups_create(qa_qvm_primary_pickups_opt
       !same_text(profile->module.revision, module->revision) ||
       !same_text(profile->module.artifact_path, module->artifact_path) ||
       !same_text(profile->abi_profile, qa_qvm_module_get_abi_profile(&game->module)))
-    qa_range_error("Original pickup profile differs from its QVM executable");
+    qa_raise("Error", 0, 0, "Original pickup profile differs from its QVM executable");
   double fields[6] = {profile->field_inuse, profile->field_client, profile->field_health,
                       profile->field_item, profile->field_count, profile->field_flags};
   for (size_t i = 0; i < 6; i++)
-    if (!is_integer(fields[i]) || fields[i] < 0 || (int64_t)fields[i] % 4 != 0 ||
+    if (!is_integer(fields[i]) || fields[i] < 0 || fmod(fields[i], 4) != 0 ||
         fields[i] + 4 > profile->entity_stride)
-      qa_range_error("Original pickup field is outside its entity record");
+      qa_raise("Error", 0, 0, "Original pickup field is outside its entity record");
   qa_qvm_primary_pickups *p = calloc(1, sizeof *p);
   if (p == NULL) return NULL;
   p->options = options;
@@ -795,19 +865,21 @@ qa_qvm_primary_pickups *qa_qvm_primary_pickups_create(qa_qvm_primary_pickups_opt
     free(p);
     return NULL;
   }
+  /* TS: a refused profile goes to the GC, and a failed hook closes what was bound. */
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, destroy_on_raise, p);
   require_entry(image, profile->touch);
   require_entry(image, profile->free_entry);
   require_calls(p, image, profile->gate_entry, profile->gate_calls, profile->gate_call_count);
   require_calls(p, image, profile->targets_entry, profile->targets_calls, profile->targets_call_count);
-  qa_qvm_instruction *list = NULL;
+  const qa_qvm_instruction *list = image->instructions; /* read in place: a refusal raises */
   for (size_t g = 0; g < profile->grant_count; g++) {
     const qa_qvm_pickup_grant *grant = &profile->grants[g];
     for (size_t j = 0; j < g; j++)
       if (profile->grants[j].item_type == grant->item_type)
-        qa_range_error("Original pickup has duplicate grant types");
+        qa_raise("Error", 0, 0, "Original pickup has duplicate grant types");
     require_calls(p, image, grant->entry, grant->calls, grant->call_count);
     if (grant->is_region) {
-      if (list == NULL) list = region_instructions(image);
       (void)qa_qvm_qualify_region(list, image->instruction_count, (int64_t)grant->entry,
                                    (int64_t)grant->region_entry, (int64_t)grant->region_join);
       if (grant->has_weapon)
@@ -818,7 +890,7 @@ qa_qvm_primary_pickups *qa_qvm_primary_pickups_create(qa_qvm_primary_pickups_opt
       const qa_qvm_instruction *leave = instruction_at(image, grant->accepted_return + 1);
       if (value == NULL || value->opcode != QA_QVM_OP_CONST || leave == NULL ||
           leave->opcode != QA_QVM_OP_LEAVE || value->operand == 0)
-        qa_range_error("Original pickup lifecycle return is not a qualified source constant");
+        qa_raise("Error", 0, 0, "Original pickup lifecycle return is not a qualified source constant");
       double owner = grant->accepted_return;
       while (owner >= 0) {
         const qa_qvm_instruction *candidate = instruction_at(image, owner);
@@ -826,17 +898,17 @@ qa_qvm_primary_pickups *qa_qvm_primary_pickups_create(qa_qvm_primary_pickups_opt
         owner--;
       }
       if (owner != grant->entry)
-        qa_range_error("Original pickup lifecycle return belongs to another source function");
+        qa_raise("Error", 0, 0, "Original pickup lifecycle return belongs to another source function");
       p->grant_returns[g] = (double)value->operand;
       p->grant_return_has[g] = true;
     }
   }
-  free(list);
   if (profile->items.has_source && same_text(profile->items.source, "live") && !options.has_catalog)
-    qa_range_error("Live original pickups require their source catalog owner");
+    qa_raise("Error", 0, 0, "Live original pickups require their source catalog owner");
   if (!options.has_catalog) {
     if (!qa_qvm_read_item_records(image->initialized_data, image->initialized_length, profile->items,
                                   NULL, 0, NULL, &p->items)) {
+      qa_cleanup_pop(&refused);
       qa_qvm_primary_pickups_destroy(p);
       return NULL;
     }
@@ -855,6 +927,7 @@ qa_qvm_primary_pickups *qa_qvm_primary_pickups_create(qa_qvm_primary_pickups_opt
   }
   bind_hook(p, profile->targets_entry, targets_hook, p);
   if (options.own_free_hook) bind_hook(p, profile->free_entry, free_hook, p);
+  qa_cleanup_pop(&refused);
   return p;
 }
 
@@ -865,7 +938,7 @@ void qa_qvm_primary_pickups_close(qa_qvm_primary_pickups *p) {
 }
 
 void qa_qvm_primary_pickups_assert_idle(const qa_qvm_primary_pickups *p) {
-  if (p->frame_count != 0) qa_range_error("Cannot save during original QVM pickup execution");
+  if (p->frame_count != 0) qa_raise("Error", 0, 0, "Cannot save during original QVM pickup execution");
 }
 
 void qa_qvm_primary_pickups_destroy(qa_qvm_primary_pickups *p) {

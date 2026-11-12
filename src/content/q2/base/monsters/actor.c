@@ -5,8 +5,10 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "base_internal.h"
+#include "../diagnostic.h"
 #include "qa/content/q2/base/monsters/tables/actor.h"
 #include "qa/content/q2/foundation/monsters/ai.h"
 #include "qa/content/q2/foundation/monsters/gibs.h"
@@ -179,9 +181,7 @@ static void actor_use_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services *g
     entity->has_goal = false; state->has_move_target = false;
   }
   if (target == NULL || strcmp(target->classname ? target->classname : "", "target_actor") != 0) {
-    char message[256];
-    snprintf(message, sizeof message, "misc_actor has bad target %s", entity->target ? entity->target : "");
-    game->host->diagnostic(game->host->ctx, message);
+    q2b_diagnosticf(game, "misc_actor has bad target %s", entity->target ? entity->target : "");
     entity->target = "";
     state->pause_time = 100000000;
     stand_fn(NULL, context);
@@ -215,14 +215,19 @@ static void target_actor_touch_fn(void *ctx, qa_q2_entity *self, qa_q2_game_serv
   if (strcmp(self->message ? self->message : "", "") != 0) {
     size_t count = 0;
     const qa_actor_id *players = services->host->players(services->host->ctx, &count);
+    /* `${actorName}: ${self.message}\n` with the authored message at any length. */
+    const char *name = qa_q2bm_actor_name(actor, services);
+    size_t text_size = strlen(name) + strlen(self->message) + 4;
+    char *text = malloc(text_size);
+    if (!text) qa_raise("Error", 0, 0, "target_actor message allocation failed");
+    snprintf(text, text_size, "%s: %s\n", name, self->message);
     for (size_t i = 0; i < count; i++) {
-      char text[512];
-      snprintf(text, sizeof text, "%s: %s\n", qa_q2bm_actor_name(actor, services), self->message);
       qa_q2_presentation_event event;
       memset(&event, 0, sizeof event);
       event.kind = "print"; event.has_actor = true; event.actor = players[i]; event.level = "chat"; event.text = text;
       services->host->emit(services->host->ctx, event);
     }
+    free(text);
   }
   uint32_t flags = qa_js_to_uint32(self->spawnflags);
   if ((flags & 1u) != 0) {

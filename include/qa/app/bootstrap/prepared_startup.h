@@ -23,6 +23,11 @@
 #include "qa/settings/config.h"
 /* TS allowSeatConfigurationCommand. */
 bool qa_app_allow_seat_configuration_command(qa_command_context source);
+/* A command buffer's readScript over a synchronous read that raises: runs body(ctx), which stores the read text (NULL
+ * for TS undefined) in *text. A raise becomes a FAILED result carrying the error's class and message, as TS's rejected
+ * read promise settles the exec as failed; "Startup script reader is missing" (a synchronous TS throw) is raised
+ * again. */
+qa_script_read_result qa_app_script_read_settle(void (*body)(void *ctx), void *ctx, char **text);
 typedef struct qa_app_prepared_startup_host {
   void *ctx;
   /* World-lifecycle hooks mirrored on the host; borrowed errors. */
@@ -122,6 +127,10 @@ typedef struct qa_app_prepared_configuration_continuation {
 } qa_app_prepared_configuration_continuation;
 void qa_app_prepared_startup_adopt_configuration_continuation(qa_app_prepared_startup *startup,
     qa_app_prepared_configuration_continuation continuation);
+/* C-only (TS GC): an owner freed while its continuation is still adopted takes it back, so the startup never
+ * advances freed state. The command buffer's preparation finishes as the continuation's completion would finish
+ * it. False when no adopted continuation has that ctx. */
+bool qa_app_prepared_startup_retract_configuration_continuation(qa_app_prepared_startup *startup, void *ctx);
 /* TS validateOwners / adopt owners argument. */
 typedef struct qa_app_prepared_owners {
   qa_cvar_registry *source, *movement, *fallback;

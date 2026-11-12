@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+static void writer_cleanup(void *w) { qa_q3_message_writer_destroy(w); }
 int64_t qa_q3_command_hash(const char *text, int64_t max_length) {
   if (max_length < 0) qa_range_error("Invalid command hash length");
   int32_t hash = 0;
@@ -12,7 +13,8 @@ int64_t qa_q3_command_hash(const char *text, int64_t max_length) {
   for (int64_t i = 0; i < max_length && i < (int64_t)n; i++) {
     int32_t byte = (int8_t)(unsigned char)text[i]; /* (byte<<24)>>24 */
     if (byte == 0) break;
-    hash = (int32_t)((uint32_t)hash + (uint32_t)(byte * (int32_t)(119 + i)));
+    /* Math.imul(byte, 119 + i): the low 32 bits of the product, never a signed overflow. */
+    hash = (int32_t)((uint32_t)hash + (uint32_t)byte * (uint32_t)(119 + i));
   }
   return (int32_t)((uint32_t)hash ^ (uint32_t)(hash >> 10) ^ (uint32_t)(hash >> 20));
 }
@@ -30,6 +32,10 @@ bool qa_q3_begin_client_message(const qa_q3_client_header *header, const qa_q3_r
     qa_range_error("Client acknowledgements must be nonnegative int32 values");
   if (!qa_q3_message_writer_init(out, QA_Q3_MESSAGE_BITSTREAM, QA_Q3_MAX_MESSAGE_LENGTH, source_state)) return false;
   qa_q3_message_writer *w = *out;
+  /* A later command's sequence check raises after earlier ones were written; the writer is not
+   * the caller's until this returns. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, writer_cleanup, w);
   qa_q3_message_writer_write_long(w, header->server_id);
   qa_q3_message_writer_write_long(w, header->message_acknowledge);
   qa_q3_message_writer_write_long(w, header->reliable_acknowledge);
@@ -43,6 +49,7 @@ bool qa_q3_begin_client_message(const qa_q3_client_header *header, const qa_q3_r
     qa_q3_message_writer_write_string(w, commands[i].text);
     has_prev = true; prev = seq;
   }
+  qa_cleanup_pop(&guard);
   return true;
 }
 void qa_q3_write_client_movement(qa_q3_message_writer *w, const qa_q3_client_movement *movement,
@@ -67,8 +74,11 @@ bool qa_q3_encode_client_message(const qa_q3_client_message *message, const qa_q
                                  qa_q3_source_message_state *source_state, uint8_t **out, size_t *out_len) {
   qa_q3_message_writer *w = NULL;
   if (!qa_q3_begin_client_message(&message->header, message->commands, message->command_count, source_state, &w)) return false;
+  qa_cleanup guard; /* movement count, key callback and MAX_MSGLEN raise */
+  qa_cleanup_push(&guard, writer_cleanup, w);
   if (message->movement) qa_q3_write_client_movement(w, message->movement, &message->header, context);
   bool ok = qa_q3_finish_client_message(w, out, out_len);
+  qa_cleanup_pop(&guard);
   qa_q3_message_writer_destroy(w);
   return ok;
 }

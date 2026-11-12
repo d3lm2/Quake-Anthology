@@ -7,6 +7,7 @@
  * per-member status: docs/application_layout.md. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "application_internal.h"
+#include "qa/core/commands/text.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,17 @@ static void keep_record(qa_application *app, void *record, void (*release)(void 
   app->seat_records[app->seat_record_count++].release = release;
 }
 static void keep_text(qa_application *app, char *text) { keep_record(app, text, NULL); }
+/* The application owns its recording host (application_services.c writes it in place and frees it). A replaced
+ * one stays with the retired world's closures (TS GC): it becomes a kept record. */
+static void retire_recording_host(qa_application *app) {
+  if (app->recording_host != NULL) keep_record(app, app->recording_host, NULL);
+  app->recording_host = NULL;
+}
+static qa_application_native_server_host *replace_recording_host(qa_application *app) {
+  retire_recording_host(app);
+  app->recording_host = checked(calloc(1, sizeof *app->recording_host));
+  return app->recording_host;
+}
 /* TS `${error}` / String(error) of an Error. */
 static void error_text(const qa_caught_error *error, char *out, size_t capacity) {
   (void)snprintf(out, capacity, "%s: %s", error->name, error->message);
@@ -80,6 +92,7 @@ static qa_app_options options_dup(const qa_app_options *options) {
   copy.server_profile_path = dup_text(options->server_profile_path);
   copy.corpus_root = dup_text(options->corpus_root);
   copy.user_content_root = dup_text(options->user_content_root);
+  copy.native_config_root = dup_text(options->native_config_root);
   if (options->addon_content_root_count != 0) {
     copy.addon_content_roots = checked(calloc(options->addon_content_root_count, sizeof *copy.addon_content_roots));
     for (size_t i = 0; i < options->addon_content_root_count; i++) {
@@ -138,6 +151,7 @@ typedef struct qa_application_world_replacement {
   qa_app_capture *capture;
   qa_app_world_seat_presentation **presentations; size_t presentation_count, presentation_capacity;
   qa_seat_id *native_q2_seats; qa_application_native_q2_seat_client *native_q2; size_t native_q2_count, native_q2_capacity;
+  bool native_userinfo_adopted; /* the staged graphical copied the native rows and owns their userinfo */
   qa_app_application_q3_client **clients; size_t client_count, client_capacity;
   bool committed;         /* the session published the new world; rollback is no longer possible */
   bool native_committed;  /* the previous native or guest source was already torn down */
@@ -448,8 +462,14 @@ static void stage_candidate_inputs(qa_application *app, qa_application_world_tra
 static void stage_candidate_commands(qa_application *app, qa_application_world_transition *tx);
 static void stage_native_map_travel(qa_application *app, qa_application_world_transition *tx);
 /* The variables of a CvarRegistry save state ({ variables: ({ name, value, latchedValue } | null)[] }); strings
- * borrow the state tree; a null entry has name NULL. The rows are kept with the application. */
+ * are console-text copies of the tree's UTF-8; a null entry has name NULL. The rows are kept with the application. */
 typedef struct guest_variable { const char *name, *value, *latched_value; } guest_variable;
+static const char *guest_variable_text(qa_application *app, const char *utf8) {
+  char *bytes = NULL;
+  if (!qa_command_text_from_utf8(utf8, &bytes)) qa_raise("Error", 0, 0, "cvar text requires byte characters");
+  keep_text(app, bytes);
+  return bytes;
+}
 static guest_variable *guest_variables(qa_application *app, const qa_save_value *state, size_t *out_count) {
   qa_save_reader reader, variables;
   if (!qa_save_reader_init(&reader, state, "cvars") || !qa_save_reader_field(&reader, "variables", &variables)) qa_range_error("Out of memory");
@@ -462,9 +482,11 @@ static guest_variable *guest_variables(qa_application *app, const qa_save_value 
     if (!qa_save_reader_is_null(&item)) {
       if (!qa_save_reader_field(&item, "name", &name) || !qa_save_reader_field(&item, "value", &value)
           || !qa_save_reader_field(&item, "latchedValue", &latched)) qa_range_error("Out of memory");
-      rows[i].name = qa_save_reader_string(&name);
-      rows[i].value = qa_save_reader_string(&value);
-      rows[i].latched_value = qa_save_reader_is_null(&latched) ? NULL : qa_save_reader_string(&latched);
+      /* The checkpoint tree holds the UTF-8 of the TS strings (core/cvars/index.c); registries and the q3Cvars rows
+       * hold console text, one byte per character. The converted copies are kept with the application. */
+      rows[i].name = guest_variable_text(app, qa_save_reader_string(&name));
+      rows[i].value = guest_variable_text(app, qa_save_reader_string(&value));
+      rows[i].latched_value = qa_save_reader_is_null(&latched) ? NULL : guest_variable_text(app, qa_save_reader_string(&latched));
       qa_save_reader_destroy(&name); qa_save_reader_destroy(&value); qa_save_reader_destroy(&latched);
     }
     qa_save_reader_destroy(&item);
@@ -531,6 +553,8 @@ static void prepare_body(void *ctx) {
   }
   if (tx->has_post_publication_error) qa_rethrow(&tx->post_publication_error);
 }
+/* A reliable command the Q3 guest queued before the network published the destination. */
+typedef struct guest_network_command { double slot; char *text; } guest_network_command;
 /* The transaction outlives this call: closures the new world keeps hold it (TS GC). */
 static void transition_release(void *record) {
   qa_application_world_transition *tx = record;
@@ -548,7 +572,14 @@ static void transition_release(void *record) {
   if (tx->preset != NULL) { qa_app_application_preset_result_free(tx->preset); free(tx->preset); }
   if (tx->launch != NULL) { qa_resolve_launch_result_free(tx->launch); free(tx->launch); }
   free(tx->guest_rejected_clients);
-  if (tx->has_guest_network_commands) qa_event_ring_destroy(&tx->guest_network_commands);
+  if (tx->has_guest_network_commands) {
+    /* Commands a rollback left queued own their text (guest_send_server_command). */
+    size_t count = 0;
+    guest_network_command *pending = qa_event_ring_drain_all(&tx->guest_network_commands, &count);
+    for (size_t i = 0; i < count; i++) free(pending[i].text);
+    free(pending);
+    qa_event_ring_destroy(&tx->guest_network_commands);
+  }
   free(tx->carried_slots); free(tx->carried_commands); free(tx->carried_present);
   free(tx->next_client_cvar_seats); free(tx->next_client_cvars);
   free(tx->clients);
@@ -558,7 +589,11 @@ static void transition_release(void *record) {
   free(tx->replacement_presentations);
   free(tx->retirement_errors);
   if (tx->has_staged) {
-    free(tx->staged->presentations); free(tx->staged->native_q2_seats); free(tx->staged->native_q2); free(tx->staged->clients);
+    free(tx->staged->presentations); free(tx->staged->clients);
+    /* A graphical built from the staged rows holds its own copy of them and owns their userinfo (graphical_release). */
+    if (!tx->staged->native_userinfo_adopted)
+      for (size_t i = 0; i < tx->staged->native_q2_count; i++) free(tx->staged->native_q2[i].userinfo);
+    free(tx->staged->native_q2_seats); free(tx->staged->native_q2);
     free(tx->staged);
   }
 }
@@ -607,6 +642,19 @@ static void rules_body(void *ctx) {
   t->rules = qa_app_resolve_startup_rules(t->options, t->source, t->capacity, NULL, 0, false);
 }
 static void content_close_body(void *ctx) { qa_app_loaded_content_close(ctx); }
+/* The other world's source archive, loaded for a travel that changes the source owner. */
+typedef struct source_archive_load {
+  qa_application_world_transition *tx; qa_application *app; const qa_app_options *options; qa_app_loaded_content *content;
+} source_archive_load;
+static void source_archive_load_body(void *ctx) {
+  source_archive_load *load = ctx;
+  qa_config_store store = qa_application_source_config(load->options, load->content);
+  const qa_executable_recipe *recipe = qa_app_loaded_content_recipe(load->content);
+  const char *owner[3] = { "source", recipe->map.entities.content, recipe->map.entities.provider };
+  load->tx->source_archive = qa_app_load_cvar_archive(&store, owner, 3, qa_application_source_dialect(load->app, load->content),
+      &load->tx->source_archive_count);
+  qa_config_store_destroy(&store);
+}
 /* TS nextFrame default: async () => { await Bun.sleep(0); } (one turn of an event loop the C port does not have). */
 static void default_next_frame(void *ctx) {
   (void)ctx; /* the default closure captures nothing */
@@ -714,11 +762,9 @@ static void plan_world_replacement(qa_application *app, const qa_application_wor
    * product, so it still discovers. */
   qa_q3_application_product current_product;
   bool same_catalog = !qa_app_loaded_content_q3_product(app->loaded_content, &current_product) && !options->has_remote_content;
-  qa_app_content_host host;
-  memset(&host, 0, sizeof host);
-  qa_app_loaded_content *content = qa_app_load_application_content_native(host, options_dup(options), recipe, true, NULL,
+  qa_app_loaded_content *content = qa_app_load_application_content_native(options_dup(options), recipe, true, NULL,
       same_catalog ? catalog : NULL, NULL);
-  if (content == NULL) qa_raise("Error", 0, 0, "Destination content preparation has no concrete loader");
+  if (content == NULL) qa_range_error("Out of memory");
   tx->content = content;
   qa_q3_application_product product;
   if (qa_app_loaded_content_q3_product(content, &product)) { options->has_q3_product = true; options->q3_product = product; }
@@ -790,8 +836,20 @@ static void plan_world_replacement(qa_application *app, const qa_application_wor
   qa_app_application_world world = qa_app_loaded_content_world(content);
   if (save == NULL && strcmp(world.kind, "q1-bsp") == 0 && qa_app_loaded_content_prepared_quakec(content) == NULL && q1 != NULL)
     tx->q1_cvars_source = q1->q1_cvars;
-  qa_cvar_registry *source = qa_application_source_cvars(app, NULL);
-  if (source != NULL) tx->source_archive = qa_cvar_registry_archive_entries(source, NULL, NULL, &tx->source_archive_count);
+  if (tx->same_source_owner || save != NULL) {
+    /* sameSourceOwner || save !== undefined ? (this.sourceCvars()?.archiveEntries() ?? []) */
+    qa_cvar_registry *source = qa_application_source_cvars(app, NULL);
+    if (source != NULL) tx->source_archive = qa_cvar_registry_archive_entries(source, NULL, NULL, &tx->source_archive_count);
+  } else {
+    /* : await loadCvarArchive(Application.sourceConfig(options, content), ["source", ...], this.sourceDialect(content)) */
+    source_archive_load load = { tx, app, options, content };
+    qa_caught_error caught;
+    if (!qa_try(source_archive_load_body, &load, &caught)) {
+      qa_caught_error close_error;
+      if (!qa_try(content_close_body, content, &close_error)) qa_raise("AggregateError", 0, 2, "World preparation failed");
+      qa_rethrow(&caught);
+    }
+  }
   qa_cvar_registry *q2 = qa_app_shared_sim_q2_server_cvars(app->world_simulation);
   if (q2 != NULL) {
     tx->q2_snapshots = qa_cvar_registry_snapshots(q2, 0, &tx->q2_snapshot_count);
@@ -806,7 +864,6 @@ static void plan_world_replacement(qa_application *app, const qa_application_wor
 }
 
 /* ================= initializeWorldTransition and the candidate guest output ================= */
-typedef struct guest_network_command { double slot; char *text; } guest_network_command;
 static void guest_configstring(void *ctx, double index, const char *value) {
   qa_application_world_transition *tx = ctx;
   if (!tx->guest_network_published) return;
@@ -1191,6 +1248,7 @@ static void stage_guest_map_shutdown(qa_application *app, qa_application_world_t
   /* tx.q3Cvars = guestTransition.cvars.variables (latched ?? value), without mapname and sv_mapname. */
   size_t count = 0;
   guest_variable *rows = guest_variables(app, staged->guest_transition.cvars, &count);
+  free(tx->q3_cvars); /* the planned rows (their strings stay with q3_snapshots) */
   tx->q3_cvars = checked(calloc(count + 1, sizeof *tx->q3_cvars));
   tx->q3_cvar_count = 0;
   for (size_t i = 0; i < count; i++) {
@@ -1222,9 +1280,8 @@ static void simulation_request_release(void *record) {
   if (request->mod_files != NULL) qa_mod_user_files_destroy(request->mod_files);
 }
 /* prepareRereleaseNavigation: simulation => createApplicationBotNavigation({ content, simulation }). */
-static const void *prepare_rerelease_navigation(void *ctx, qa_app_sim_shared_simulation *opaque) {
+static const void *prepare_rerelease_navigation(void *ctx, qa_app_shared_simulation *simulation) {
   simulation_request_record *request = ctx;
-  qa_app_shared_simulation *simulation = (qa_app_shared_simulation *)(void *)opaque;
   request->navigation_content = qa_application_navigation_content(request->tx->content);
   request->navigation_simulation = qa_app_shared_sim_navigation_simulation(simulation, qa_app_loaded_content_recipe(request->tx->content));
   qa_app_sim_application_bot_navigation *navigation =
@@ -1800,10 +1857,10 @@ static void stage_bots(qa_application *app, qa_application_world_transition *tx)
     setup.clients = tx->bot_clients;
     setup.client_count = tx->bot_client_count;
     setup.restart = tx->initial_source_milliseconds != 0;
-    /* commands: { insert: text => guestCommands().insert(text) }: the candidate buffer, which publication makes the
-     * source buffer. */
-    setup.has_commands = true;
-    setup.commands = tx->candidate_commands;
+    /* commands: { insert: text => guestCommands().insert(text) }: resolved at each insert, the candidate buffer until
+     * publication and the source buffer after it. */
+    setup.commands_fn = guest_commands_buffer;
+    setup.commands_ctx = tx;
     staged->bots = qa_application_create_bots(app, tx->content, next, &setup);
   }
   /* Bot settings live in the source registry, whose travel archive only carries archived variables; carry the
@@ -1815,16 +1872,17 @@ static void stage_bots(qa_application *app, qa_application_world_transition *tx)
     for (size_t i = 0; i < count; i++) {
       if (strncmp(snapshots[i].name, "bot_", 4) != 0) continue;
       const char *value = snapshots[i].latched_value != NULL ? snapshots[i].latched_value : snapshots[i].value;
-      if (!cvar_exists(configuration, snapshots[i].name))
-        (void)qa_cvar_registry_register(configuration, snapshots[i].name, value, 0, NULL);
-      else qa_application_cvar_set(configuration, snapshots[i].name, value, true);
+      if (!cvar_exists(configuration, snapshots[i].name)) {
+        qa_cvar_snapshot registered; /* register fills its snapshot: it takes no NULL */
+        if (qa_cvar_registry_register(configuration, snapshots[i].name, value, 0, &registered)) qa_cvar_read_free(&registered);
+      } else qa_application_cvar_set(configuration, snapshots[i].name, value, true);
     }
     for (size_t i = 0; i < count; i++) qa_cvar_read_free(&snapshots[i]);
     free(snapshots);
   } else if (tx->decoded_bots != NULL && staged->saved_clients != NULL) {
     memset(&setup, 0, sizeof setup);
-    setup.has_commands = true;
-    setup.commands = tx->candidate_commands;
+    setup.commands_fn = guest_commands_buffer;
+    setup.commands_ctx = tx;
     setup.restore = tx->decoded_bots;
     setup.resolve_client = saved_bot_client;
     setup.resolve_ctx = staged->saved_clients;
@@ -1862,6 +1920,10 @@ static void graphical_release(void *record) {
   qa_application_graphical *graphical = record;
   free(graphical->presentations);
   free(graphical->q3_seats); free(graphical->q3);
+  /* This graphical's copy of the staged native seat rows (a later local player change reallocates it,
+   * application_dispatch.c) and each seat's published userinfo. */
+  for (size_t i = 0; i < graphical->native_q2_count; i++) free(graphical->native_q2[i].userinfo);
+  free(graphical->native_q2_seats); free(graphical->native_q2);
   qa_app_rerelease_presentation_destroy(graphical->rerelease); /* the graphical owner holds the world's rerelease presentation */
 }
 static void stage_graphical(qa_application *app, qa_application_world_transition *tx) {
@@ -1929,9 +1991,6 @@ static void stage_graphical(qa_application *app, qa_application_world_transition
   qa_app_sim_presentation_access *access = checked(malloc(sizeof *access));
   keep_record(app, access, NULL);
   *access = qa_app_shared_sim_presentation_access(next);
-  qa_app_input_command_owner owner;
-  memset(&owner, 0, sizeof owner);
-  owner.scripts = staged->scripts;
   qa_app_input_open_args args;
   memset(&args, 0, sizeof args);
   args.window = qa_app_application_input_window(previous->input);
@@ -1940,9 +1999,10 @@ static void stage_graphical(qa_application *app, qa_application_world_transition
   args.dialect = qa_app_movement_dialect(tx->options, qa_app_shared_sim_recipe(next));
   args.simulation = access;
   args.actions = actions->commands;
+  args.actions.scripts = staged->scripts; /* { ...this.inputActions(...), scripts: staged.scripts } */
   args.now = performance_now; args.now_ctx = NULL;
   args.settings = &app->input_config;
-  args.owner = &owner;
+  args.owner = NULL; /* TS passes undefined: the input owns its commands */
   args.previous = previous->input;
   qa_app_application_input *input = qa_app_application_input_open(&args);
   staged->input = input;
@@ -1986,7 +2046,7 @@ static void stage_graphical(qa_application *app, qa_application_world_transition
   keep_record(app, seats, NULL);
   for (size_t i = 0; i < player_count; i++) { seats[i].seat = qa_session_seat_id(players[i].seat); seats[i].actor = players[i].actor; }
   qa_app_rerelease_presentation *rerelease = qa_app_rerelease_presentation_create(staged->assets, seats, player_count,
-      qa_app_application_input_shared_settings(input));
+      qa_app_application_input_shared_settings_view(input));
   qa_application_graphical *graphical = checked(calloc(1, sizeof *graphical));
   keep_record(app, graphical, graphical_release);
   size_t input_locals = qa_app_application_input_local_count(input);
@@ -2048,9 +2108,17 @@ static void stage_graphical(qa_application *app, qa_application_world_transition
   graphical->art = staged->art;
   graphical->assets = staged->assets;
   graphical->rerelease = rerelease;
-  graphical->native_q2_seats = staged->native_q2_seats;
-  graphical->native_q2 = staged->native_q2;
-  graphical->native_q2_count = staged->native_q2_count;
+  /* The graphical keeps its own copy of the native rows: the staged ones stay for a rollback, and a later local player
+   * change reallocates the graphical's in place. Each row's userinfo passes to the graphical. */
+  size_t native_count = staged->native_q2_count;
+  graphical->native_q2_seats = checked(calloc(native_count + 1, sizeof *graphical->native_q2_seats));
+  graphical->native_q2 = checked(calloc(native_count + 1, sizeof *graphical->native_q2));
+  if (native_count != 0) {
+    memcpy(graphical->native_q2_seats, staged->native_q2_seats, native_count * sizeof *graphical->native_q2_seats);
+    memcpy(graphical->native_q2, staged->native_q2, native_count * sizeof *graphical->native_q2);
+  }
+  graphical->native_q2_count = native_count;
+  staged->native_userinfo_adopted = true;
   qa_application_create_presentation_services(app, staged->assets, audio, input, next, tx->content, shared_renderer,
       qa_application_staged_clock(app, staged, destination), graphical);
   staged->graphical = graphical;
@@ -2347,6 +2415,8 @@ static void headless_adopt(void *ctx) {
 static void headless_release(void *record) {
   headless_record *headless = record;
   if (headless->owners.read_ctx != NULL) qa_application_startup_script_reader_free(headless->owners.read_ctx);
+  /* The prepared startup borrows the adopted routing (prepared_startup.h); its creator frees it. */
+  if (headless->routing != NULL) qa_app_console_routing_destroy(headless->routing);
 }
 static void stage_headless_adoption(qa_application *app, qa_application_world_transition *tx) {
   qa_application_world_replacement *staged = SLOT(tx, staged);
@@ -2444,8 +2514,11 @@ static void stage_commit(qa_application *app, qa_application_world_transition *t
   memset(rule, '-', 60); rule[60] = '\n'; rule[61] = '\0';
   qa_application_write_game_log(app, before->simulation, rule);
   app->world_simulation = next;
-  /* The previous graph stays with the retired world's closures (TS GC). */
-  keep_record(app, app->debug_graph, NULL);
+  /* The previous graph stays with the retired world's closures (TS GC). A graph an earlier replacement installed
+   * is already one of the kept records (initialize_world_transition). */
+  bool kept = false;
+  for (size_t i = 0; i < app->seat_record_count && !kept; i++) kept = app->seat_records[i].record == app->debug_graph;
+  if (!kept) keep_record(app, app->debug_graph, NULL);
   app->debug_graph = candidate_graph;
   app->loaded_content = tx->content;
   /* TS get captureMap reads this.content: the published lifetime row follows the new content. */
@@ -2468,14 +2541,12 @@ static void stage_commit(qa_application *app, qa_application_world_transition *t
     qa_application_printf(app, "Demo recording stopped at world change: %s\n", tx->recording_transition_error.message);
   }
   if (app->network == NULL && !app->local_recording_active && !qa_app_shared_sim_q2_native(app->world_simulation, NULL, NULL))
-    app->recording_host = NULL;
+    retire_recording_host(app);
   if (tx->has_next_network_host && app->network == NULL) {
     if (tx->next_network_host.kind == QA_APPLICATION_NETWORK_QW) app->native_world_count++;
-    qa_application_native_server_host *host = checked(calloc(1, sizeof *host));
-    keep_record(app, host, NULL);
+    qa_application_native_server_host *host = replace_recording_host(app);
     if (staged->local_guest == NULL) *host = tx->next_network_host;
     else { host->kind = QA_APPLICATION_NETWORK_Q3; host->q3 = staged->local_guest->authority; }
-    app->recording_host = host;
     if (host->kind == QA_APPLICATION_NETWORK_Q3 && staged->local_guest == NULL) {
       qa_cvar_registry *cvars = qa_application_source_cvars(app, NULL);
       if (cvars == NULL || !cvar_exists(cvars, "sv_serverid")) qa_raise("Error", 0, 0, "Q3 recording replacement has no published epoch");
@@ -2499,6 +2570,7 @@ static void stage_commit(qa_application *app, qa_application_world_transition *t
     qa_event_ring_reset(&app->round_presentation_events);
   }
   app->local_snapshot_server_bit = 0;
+  for (size_t i = 0; i < app->client_input_count; i++) qa_application_deferred_input_release(&app->client_inputs[i]);
   app->client_input_count = 0;
   qa_app_unhandled_effects_free(app->unhandled_effects, app->unhandled_effect_count);
   app->unhandled_effects = NULL;
@@ -2664,10 +2736,8 @@ static void finish_publication(qa_application *app, qa_application_world_transit
     } else {
       if (app->network->kind != QA_APPLICATION_NETWORK_Q3 || tx->next_network_host.kind != QA_APPLICATION_NETWORK_Q3)
         qa_raise("Error", 0, 0, "Guest map publication requires the Q3 network owner");
-      qa_application_native_server_host *host = checked(calloc(1, sizeof *host));
-      keep_record(app, host, NULL);
+      qa_application_native_server_host *host = replace_recording_host(app);
       *host = tx->next_network_host;
-      app->recording_host = host;
       qa_app_q3_server_network_change_world(app->network->q3, host->q3.host, tx->guest_rejected_clients, tx->guest_rejected_client_count);
       tx->guest_network_published = true;
       size_t count = 0;

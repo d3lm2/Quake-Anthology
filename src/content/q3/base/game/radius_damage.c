@@ -17,7 +17,7 @@ bool qa_q3_can_damage(qa_q3_base_actor_spatial_queries spatial, qa_actor_id acto
   if (center.fraction == 1 || (center.hit_kind == QA_Q3_BASE_HIT_ACTOR && qa_same_actor(center.hit_actor, actor))) return true;
   static const double off[4][2] = {{15, 15}, {15, -15}, {-15, 15}, {-15, -15}};
   for (int i = 0; i < 4; i++) {
-    qa_vec3 end = {midpoint.x + off[i][0], midpoint.y + off[i][1], midpoint.z};
+    qa_vec3 end = qa_math_vec3(midpoint.x + off[i][0], midpoint.y + off[i][1], midpoint.z); /* TS vec3(): binary32 */
     if (do_trace(spatial, origin, end).fraction == 1) return true;
   }
   return false;
@@ -36,8 +36,8 @@ bool qa_q3_radius_damage(qa_q3_radius_host host, qa_vec3 origin, double amount, 
   for (size_t i = 0; i < n; i++) {
     qa_actor_id actor = candidates[i]; if (ignore && qa_same_actor(actor, *ignore)) continue;
     qa_q3_radius_target target; if (!host.target(host.ctx, actor, &target)) continue;
-    qa_vec3 d = {axis_dist(origin.x, target.bounds.min.x, target.bounds.max.x),
-      axis_dist(origin.y, target.bounds.min.y, target.bounds.max.y), axis_dist(origin.z, target.bounds.min.z, target.bounds.max.z)};
+    qa_vec3 d = qa_math_vec3(axis_dist(origin.x, target.bounds.min.x, target.bounds.max.x),
+      axis_dist(origin.y, target.bounds.min.y, target.bounds.max.y), axis_dist(origin.z, target.bounds.min.z, target.bounds.max.z)); /* TS vec3(): binary32 */
     double distance = qa_length3(d); if (distance >= radius) continue;
     double points = (float)(amount * (float)(1 - (float)(distance / radius)));
     if (!qa_q3_can_damage(host.spatial, actor, target.bounds, origin)) continue;

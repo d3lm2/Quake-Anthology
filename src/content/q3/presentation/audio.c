@@ -84,10 +84,11 @@ qa_sound_bank *qa_q3_pres_presentation_sound_bank_bank(qa_q3_pres_presentation_s
 const qa_sound_asset *qa_q3_pres_presentation_sound_bank_zero_sound(qa_q3_pres_presentation_sound_bank *b) {
   return b->zero_sound;
 }
+static void end_operation(void *arg) { ((qa_q3_pres_presentation_sound_bank *)arg)->operations--; }
 bool qa_q3_pres_presentation_sound_bank_register_sound(qa_q3_pres_presentation_sound_bank *b,
     const char *path, bool compressed, qa_pcm_sound **out) {
   *out = NULL;
-  if (path == NULL) qa_range_error("S_RegisterSound dereferences NULL name at strlen");
+  if (path == NULL) qa_raise("Error", 0, 0, "S_RegisterSound dereferences NULL name at strlen");
   if (path[0] == '\0' || path[0] == '*') return true;
   entry *prior = find_request(b, path);
   if (prior) {
@@ -95,8 +96,11 @@ bool qa_q3_pres_presentation_sound_bank_register_sound(qa_q3_pres_presentation_s
     return true;
   }
   b->operations++;
+  qa_cleanup operations_node; /* TS try/finally: a throw out of the bank still ends the operation */
+  qa_cleanup_push(&operations_node, end_operation, b);
   const qa_sound_asset *sound = NULL;
   bool ok = qa_sound_bank_register(b->bank, path, QA_SOUND_FAMILY_Q3, &sound);
+  qa_cleanup_pop(&operations_node);
   b->operations--;
   if (!ok) return false;
   entry *created = NULL;
@@ -124,7 +128,7 @@ double qa_q3_pres_presentation_sound_bank_index_for_sound(qa_q3_pres_presentatio
   if (!sound || (b->zero_sound && sound == (qa_pcm_sound *)&b->zero_sound->pcm)) return 0;
   for (size_t i = 0; i < b->registered_count; i++)
     if (pcm_of(b->registered[i]) == sound) return (double)i + 1;
-  qa_range_error("PCM does not belong to this cgame sound bank");
+  qa_raise("Error", 0, 0, "PCM does not belong to this cgame sound bank");
 }
 const qa_sound_asset *qa_q3_pres_presentation_sound_bank_asset(qa_q3_pres_presentation_sound_bank *b, qa_pcm_sound *sound) {
   double index = qa_q3_pres_presentation_sound_bank_index_for_sound(b, sound);
@@ -140,10 +144,7 @@ qa_pcm_sound *qa_q3_pres_presentation_sound_bank_sound_at_index(qa_q3_pres_prese
   const qa_sound_asset *sound = NULL;
   if (index == trunc(index) && index >= 1 && index <= (double)b->registered_count)
     sound = b->registered[(size_t)index - 1];
-  if (!sound) {
-    if (index == trunc(index)) qa_range_error("Q3 sound handle %lld is not registered", (long long)index);
-    qa_range_error("Q3 sound handle %s is not registered", QA_JS_NUMBER(index));
-  }
+  if (!sound) qa_range_error("Q3 sound handle %s is not registered", QA_JS_NUMBER(index));
   return (qa_pcm_sound *)&sound->pcm;
 }
 void qa_q3_pres_presentation_sound_bank_sound_for_index(qa_q3_pres_presentation_sound_bank *b, double index,
@@ -162,7 +163,7 @@ const qa_q3_pres_sound_registration *qa_q3_pres_presentation_sound_bank_registra
   return (const qa_q3_pres_sound_registration *)b->requests;
 }
 qa_save_value *qa_q3_pres_presentation_sound_bank_capture_checkpoint(qa_q3_pres_presentation_sound_bank *b) {
-  if (b->operations != 0) qa_range_error("Cannot checkpoint pending sound registration");
+  if (b->operations != 0) qa_raise("Error", 0, 0, "Cannot checkpoint pending sound registration");
   qa_save_value *list = qa_save_value_array();
   if (!list) return NULL;
   for (size_t i = 0; i < b->request_count; i++) {
@@ -189,10 +190,25 @@ qa_save_value *qa_q3_pres_presentation_sound_bank_capture_checkpoint(qa_q3_pres_
 }
 bool qa_q3_pres_presentation_sound_bank_restore_checkpoint(qa_q3_pres_presentation_sound_bank *b,
                                                            const qa_save_value *value) {
-  if (b->operations != 0 || b->request_count != 0) qa_range_error("Sound restore requires an empty owner");
+  if (b->operations != 0 || b->request_count != 0) qa_raise("Error", 0, 0, "Sound restore requires an empty owner");
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, "client-sounds")) return false;
   size_t count = qa_save_reader_list_count(&reader);
+  /* TS decodes every row (r.list(...)) before it registers the first sound, so a malformed
+   * later row raises with nothing registered. Decode them all here; the loop below reads the
+   * same rows again and registers. */
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader item, field;
+    if (!qa_save_reader_item(&reader, i, &item)) { qa_save_reader_destroy(&reader); return false; }
+    if (!qa_save_reader_field(&item, "path", &field)) { qa_save_reader_destroy(&reader); return false; }
+    (void)qa_save_reader_string(&field);
+    if (!qa_save_reader_field(&item, "compressed", &field)) { qa_save_reader_destroy(&reader); return false; }
+    (void)qa_save_reader_boolean(&field);
+    if (!qa_save_reader_field(&item, "handle", &field)) { qa_save_reader_destroy(&reader); return false; }
+    (void)qa_save_reader_integer_min(&field, 0);
+    if (!qa_save_reader_field(&item, "resource", &field)) { qa_save_reader_destroy(&reader); return false; }
+    if (!qa_save_reader_is_null(&field)) (void)qa_save_reader_string(&field);
+  }
   for (size_t i = 0; i < count; i++) {
     qa_save_reader item, field;
     if (!qa_save_reader_item(&reader, i, &item)) { qa_save_reader_destroy(&reader); return false; }

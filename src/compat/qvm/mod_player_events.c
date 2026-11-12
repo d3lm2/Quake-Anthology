@@ -158,7 +158,7 @@ typedef struct entry {
 
 static int64_t ordinal(qa_qvm_mod_player_events *events) {
   if (events->next_order >= 9007199254740991LL)
-    qa_range_error("Player event publication sequence exhausted");
+    qa_raise("Error", 0, 0, "Player event publication sequence exhausted");
   return events->next_order++;
 }
 
@@ -253,7 +253,7 @@ void qa_qvm_mod_player_events_track(qa_qvm_mod_player_events *events, qa_actor_i
                           qa_qvm_player_state_bytes(events->operations.abi_profile), &view);
   int32_t sequence = qa_qvm_writable_view_get_int32(&view, 108, true);
   if (saved != NULL && saved->observed_sequence != sequence)
-    qa_range_error("Player event cursor differs from restored source sequence");
+    qa_raise("Error", 0, 0, "Player event cursor differs from restored source sequence");
   if (events->entry_count == events->entry_capacity) {
     events->entry_capacity = events->entry_capacity == 0 ? 8 : events->entry_capacity * 2;
     events->entries = realloc(events->entries, events->entry_capacity * sizeof(entry));
@@ -300,13 +300,45 @@ static int compare_pending(const void *left, const void *right) {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/* TS loadI32LE(memory.bytes, offset). */
+static bool raw_word_is(const qa_qvm_memory *memory, int64_t offset, int32_t expected) {
+  if (offset < 0 || offset > (int64_t)memory->length - 4) return false;
+  const uint8_t *p = memory->bytes + offset;
+  uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                  ((uint32_t)p[3] << 24);
+  return (int32_t)bits == expected;
+}
+
+typedef struct pending_list {
+  pending *list;
+} pending_list;
+
+static void free_pending(void *arg) {
+  pending_list *holder = arg;
+  free(holder->list);
+  holder->list = NULL;
+}
+
 void qa_qvm_mod_player_events_publish(qa_qvm_mod_player_events *events) {
   pending *list = NULL;
   size_t count = 0;
+  /* The origin, clock and emit services are host code: a raise from one of
+   * them releases the pending events. */
+  pending_list holder = {NULL};
+  qa_cleanup pending_cleanup;
+  qa_cleanup_push(&pending_cleanup, free_pending, &holder);
   entry *entries = events->entries;
   for (size_t e = 0; e < events->entry_count; e++) {
     entry *current = &entries[e];
     if (!events->operations.live(events->operations.ctx, current->actor)) continue;
+    /* TS: an untouched record is recognised from its three event words and is
+     * not decoded (a record the guest left undecodable is then not refused). */
+    if (!current->cursor.has_external_order && current->cursor.predictable_count == 0 &&
+        current->cursor.observed_sequence == current->cursor.sequence &&
+        raw_word_is(events->operations.memory, current->address + 108, current->cursor.sequence) &&
+        raw_word_is(events->operations.memory, current->address + 128, current->cursor.external) &&
+        raw_word_is(events->operations.memory, current->address + 136, current->cursor.external_time))
+      continue;
     double storage[64];
     qa_q3_player_state ps;
     memset(&ps, 0, sizeof ps);
@@ -335,8 +367,9 @@ void qa_qvm_mod_player_events_publish(qa_qvm_mod_player_events *events) {
       base.origin = origin;
       base.time = time;
       if (external) {
-        list = realloc(list, (count + 1) * sizeof *list);
-        if (list == NULL) qa_range_error("QVM memory allocation failed");
+        pending *grown = realloc(list, (count + 1) * sizeof *list);
+        if (grown == NULL) qa_range_error("QVM memory allocation failed");
+        holder.list = list = grown;
         pending *next = &list[count++];
         memcpy(next->slots, storage, sizeof next->slots);
         next->event = base;
@@ -356,8 +389,9 @@ void qa_qvm_mod_player_events_publish(qa_qvm_mod_player_events *events) {
         int slot = sequence & 1;
         int32_t event_value = (int32_t)ps.events[slot];
         if (event_value != 0) {
-          list = realloc(list, (count + 1) * sizeof *list);
-          if (list == NULL) qa_range_error("QVM memory allocation failed");
+          pending *grown = realloc(list, (count + 1) * sizeof *list);
+          if (grown == NULL) qa_range_error("QVM memory allocation failed");
+          holder.list = list = grown;
           pending *next = &list[count++];
           memcpy(next->slots, storage, sizeof next->slots);
           next->event = base;
@@ -399,6 +433,7 @@ void qa_qvm_mod_player_events_publish(qa_qvm_mod_player_events *events) {
     if (tracked && events->operations.live(events->operations.ctx, list[i].event.actor))
       events->operations.emit(events->operations.ctx, &list[i].event);
   }
+  qa_cleanup_pop(&pending_cleanup);
   free(list);
 }
 
@@ -455,7 +490,7 @@ void qa_qvm_mod_player_events_restore(qa_qvm_mod_player_events *events,
           break;
         }
       }
-      if (cursor == NULL) qa_range_error("Missing restored player event cursor");
+      if (cursor == NULL) qa_raise("Error", 0, 0, "Missing restored player event cursor");
     }
     qa_qvm_mod_player_events_track(events, players[i].actor, players[i].address, cursor);
   }

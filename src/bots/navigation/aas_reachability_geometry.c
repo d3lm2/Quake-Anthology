@@ -75,6 +75,17 @@ qa_aas_linked_reachability *qa_aas_at_head(qa_aas_reachability_context *context,
   return context->heads[index];
 }
 static int64_t abs64(int64_t v) { return v < 0 ? -v : v; }
+bool qa_aas_crossings_any_contents(const qa_aas_asset *world, qa_aas_area_crossing *crossings, size_t count, int64_t mask) {
+  /* crossings.some(c => (aasAt(settings, c.area).contents & mask) !== 0): stops at the first
+   * match, and an out-of-range area raises after the list is released. Frees `crossings`. */
+  for (size_t i = 0; i < count; i++) {
+    int64_t area = crossings[i].area;
+    if (area < 0 || area >= (int64_t)world->setting_count) { free(crossings); at_fail(area, world->setting_count); }
+    if ((world->settings[area].contents & mask) != 0) { free(crossings); return true; }
+  }
+  free(crossings);
+  return false;
+}
 
 double qa_aas_face_area(const qa_aas_asset *world, const qa_aas_face_rec *face) {
   int64_t first = qa_aas_at_i64(world->edge_indexes, world->edge_index_count, face->first_edge);
@@ -149,16 +160,17 @@ static qa_vec3 edge_projection(qa_vec3 point, qa_vec3 edge_start, qa_vec3 direct
   if (direction.x != 0) {
     float a = fr(direction.y / direction.x);
     float b = fr(edge_start.y - (double)fr((double)a * edge_start.x));
-    float x = fr((qa_dot3(point, direction) - (double)fr((double)fr((double)a * direction.x) + (double)fr((double)b * direction.y))) / direction.x);
+    /* f(f(dot3(point, direction) - f(f(a * dx) + f(b * dy))) / dx): the difference is staged too. */
+    float x = fr((double)fr(qa_dot3(point, direction) - (double)fr((double)fr((double)a * direction.x) + (double)fr((double)b * direction.y))) / direction.x);
     flat = v3f(x, fr((double)fr((double)a * (double)x) + (double)b), 0);
   } else flat = v3f(edge_start.x, point.y, 0);
-  return with_z(flat, fr((plane->distance - qa_dot3(plane->normal, flat)) / plane->normal.z));
+  return with_z(flat, fr((double)fr(plane->distance - qa_dot3(plane->normal, flat)) / plane->normal.z));
 }
 typedef struct { qa_aas_closest_edge_state *state; double best; } ClosestUpdate;
 static void closest_update(ClosestUpdate *u, qa_vec3 start, qa_vec3 end, bool allow_range) {
   double current = qa_length3(qa_sub3(end, start));
   if (allow_range && current > u->best - 0.5 && current < u->best + 0.5) {
-    if (!u->state->has_range) qa_range_error("AAS_ClosestEdgePoints reads an uninitialized closest-point range");
+    if (!u->state->has_range) qa_raise("Error", 0, 0, "AAS_ClosestEdgePoints reads an uninitialized closest-point range");
     qa_aas_closest_edge_range range = u->state->range;
     double first_start = qa_length3(qa_sub3(start, range.start1));
     double second_start = qa_length3(qa_sub3(start, range.start2));
@@ -348,7 +360,8 @@ bool qa_aas_reachability_geometry_step_barrier_water_jump_walk_off_ledge(qa_aas_
           const qa_aas_edge_rec *edge2 = qa_aas_at_edge(world, abs64(qa_aas_at_i64(world->edge_indexes, world->edge_index_count, face2->first_edge + l)));
           qa_vec3 v3v = qa_aas_at_vertex(world, edge2->vertices[0]), v4v = qa_aas_at_vertex(world, edge2->vertices[1]);
           float diff1 = fr(qa_dot3(normal, v3v) - dist), diff2 = fr(qa_dot3(normal, v4v) - dist);
-          if (diff1 < -0.1f || diff1 > 0.1f || diff2 < -0.1f || diff2 > 0.1f) continue;
+          /* The float differences compare against the double 0.1 (a float 0.1f is outside it). */
+          if (diff1 < -0.1 || diff1 > 0.1 || diff2 < -0.1 || diff2 > 0.1) continue;
           qa_vec3 ort = qa_cross3(UP, normal);
           double ort_dot = qa_dot3(ort, ort);
           qa_vec3 a1 = v1, a2 = v2, a3 = v3v, a4 = v4v;
@@ -464,11 +477,7 @@ bool qa_aas_reachability_geometry_step_barrier_water_jump_walk_off_ledge(qa_aas_
       qa_aas_reachability_world_point_area(g->context->world, with_z(trace.end, trace.end.z + 1)) != to) return false;
   size_t crossing_count = 0;
   qa_aas_area_crossing *crossings = qa_aas_spatial_trace_areas(spatial, start, end, 10, &crossing_count);
-  bool blocked = false;
-  for (size_t i = 0; i < crossing_count; i++)
-    if ((qa_aas_at_setting(world, crossings[i].area)->contents & 8) != 0) blocked = true;
-  free(crossings);
-  if (blocked) return false;
+  if (qa_aas_crossings_any_contents(world, crossings, crossing_count, 8)) return false;
   qa_aas_linked_reachability *reach = qa_aas_reachability_context_allocate(g->context);
   if (!reach) return false;
   qa_aas_link_set_area(reach, to); qa_aas_link_set_face(reach, 0); qa_aas_link_set_edge(reach, ground.edge);
@@ -518,7 +527,7 @@ bool qa_aas_reachability_geometry_jump(qa_aas_reachability_geometry *g, int64_t 
     }
   }
   if (!(best_distance > 4 && best_distance < (double)maximum_distance)) return false;
-  if (!state.has_range) qa_range_error("AAS_Reachability_Jump reads uninitialized closest edge points");
+  if (!state.has_range) qa_raise("Error", 0, 0, "AAS_Reachability_Jump reads uninitialized closest edge points");
   qa_vec3 best_start = qa_scale3(qa_add3(state.range.start1, state.range.start2), 0.5);
   qa_vec3 best_end = qa_scale3(qa_add3(state.range.end1, state.range.end2), 0.5);
   double speed;
@@ -699,7 +708,7 @@ bool qa_aas_reachability_geometry_ladder(qa_aas_reachability_geometry *g, int64_
     if (point.z < (has_lowest ? lowest_point.z : 99999)) { has_lowest = true; lowest_point = point; lowest_edge = edge_number; }
   }
   plane1 = qa_aas_at_plane(world, best_face1->plane);
-  if (!has_lowest) qa_range_error("AAS_Reachability_Ladder reads an uninitialized lowest point");
+  if (!has_lowest) qa_raise("Error", 0, 0, "AAS_Reachability_Ladder reads an uninitialized lowest point");
   qa_vec3 offset = ma(lowest_point, 5, plane1->normal);
   qa_vec3 start = with_z(offset, offset.z + 5), end = with_z(offset, offset.z - 100);
   qa_aas_trace trace = qa_aas_spatial_trace_client_bbox(spatial, start, end, 2, -1);
@@ -792,11 +801,7 @@ void qa_aas_reachability_geometry_walk_off_ledge(qa_aas_reachability_geometry *g
               (qa_aas_at_setting(world, destination)->contents & 6) != 0) break;
           size_t crossing_count = 0;
           qa_aas_area_crossing *crossings = qa_aas_spatial_trace_areas(spatial, midpoint, test_end, 10, &crossing_count);
-          bool blocked = false;
-          for (size_t ci = 0; ci < crossing_count; ci++)
-            if ((qa_aas_at_setting(world, crossings[ci].area)->contents & 8) != 0) blocked = true;
-          free(crossings);
-          if (blocked) break;
+          if (qa_aas_crossings_any_contents(world, crossings, crossing_count, 8)) break;
           float distance = fr(midpoint.z - trace.end.z);
           if (settings->max_fall_height != 0 && fabs((double)distance) > (double)settings->max_fall_height) break;
           qa_aas_linked_reachability *reach = qa_aas_reachability_context_allocate(g->context);

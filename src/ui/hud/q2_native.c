@@ -1,5 +1,6 @@
 /* Port of src/ui/hud/q2-native.ts. GPL-2.0-or-later. */
 #include "qa/ui/hud/q2_native.h"
+#include "qa/foundation/caught_message.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -9,6 +10,7 @@
 
 #include "qa/core/common_parse.h"
 #include "qa/core/game_numeric.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/ui/hud/q2_rerelease_layout.h"
@@ -257,7 +259,7 @@ typedef struct client_row {
 static client_row client_info(classic_state *s, double index) {
   const char *max_text = config_get(s->frame, s->config.max_clients);
   double max = qa_input_js_parse_number(max_text != NULL ? max_text : "256");
-  double limit = max > 1 ? max : 1;
+  double limit = qa_js_max(1, max); /* a NaN maxclients admits every index >= 0 */
   if (index < 0 || index >= limit) {
     char buffer[64], *text = js_number(index);
     (void)snprintf(buffer, sizeof buffer, "%s", text);
@@ -394,10 +396,14 @@ static bool classic_layout(const char *source,
     } else if (strcmp(token, "client") == 0) {
       s.x = trunc(width / 2) - 160 + parser_integer(&parser);
       s.y = trunc(height / 2) - 120 + parser_integer(&parser);
-      client_row row = client_info(&s, parser_integer(&parser));
+      /* The TS tokenizes the whole layout before running it, so a malformed
+         token raises before the clientinfo check; reading the integers first
+         also keeps the row from leaking when the tokenizer raises. */
+      int32_t client = parser_integer(&parser);
       int32_t score = parser_integer(&parser);
       int32_t ping = parser_integer(&parser);
       int32_t time = parser_integer(&parser);
+      client_row row = client_info(&s, client);
       op_text(&s, row.name, true, s.x + 32, s.y);
       op_text(&s, "Score: ", false, s.x + 32, s.y + 8);
       char *score_text = js_number(score);
@@ -415,9 +421,9 @@ static bool classic_layout(const char *source,
       s.x = trunc(width / 2) - 160 + parser_integer(&parser);
       s.y = trunc(height / 2) - 120 + parser_integer(&parser);
       int32_t index = parser_integer(&parser);
-      client_row row = client_info(&s, index);
       int32_t score = parser_integer(&parser);
       int32_t ping_raw = parser_integer(&parser);
+      client_row row = client_info(&s, index);
       int32_t ping = ping_raw < 999 ? ping_raw : 999;
       char *score_raw = js_number(score);
       char *score_text = pad_start(score_raw, 3, ' ');
@@ -492,7 +498,7 @@ static bool layout_into(const char *source, const qa_native_q2_hud_frame *frame,
   layout_call call = { source, frame, width, height, arsenal, environment, out, false };
   qa_caught_error caught;
   if (qa_try(layout_call_run, &call, &caught)) return call.ok;
-  if (strcmp(caught.name, "TextParseError") == 0) qa_raise("NativeQ2HudLayoutError", 0, 0, "%s", caught.message);
+  if (strcmp(caught.name, "TextParseError") == 0) qa_raise("NativeQ2HudLayoutError", 0, 0, "%s", qa_caught_message(&caught));
   qa_rethrow(&caught);
 }
 

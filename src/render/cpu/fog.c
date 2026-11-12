@@ -12,7 +12,7 @@ double qa_eye_depth_from_window_depth(qa_mat4 p,double wd,const double dr[2]){
 double qa_eye_depth_from_window_depth_default(qa_mat4 p,double wd){ const double dr[2]={0,1}; return qa_eye_depth_from_window_depth(p,wd,dr); }
 void qa_apply_q1_depth_fog(qa_cpu_framebuffer *frame,qa_rect vp,qa_mat4 proj,qa_q1_fog fog,double sky_fraction,const char *output,double clear_depth){
   if(!strcmp(output,"classic-indexed")||fog.density<=0)return;
-  if(proj.values[2]!=0||proj.values[6]!=0||proj.values[3]!=0||proj.values[7]!=0) qa_range_error("Q1 fog requires a projection whose depth is independent of eye X/Y");
+  if(proj.values[2]!=0||proj.values[6]!=0||proj.values[3]!=0||proj.values[7]!=0) qa_raise("Error", 0, 0, "Q1 fog requires a projection whose depth is independent of eye X/Y");
   double sky=qa_cpu_clamp01(sky_fraction),scaled_density=fog.density/64;
   double fog_red=fog.color.x,fog_green=fog.color.y,fog_blue=fog.color.z;
   /* Neighbouring pixels usually share a depth, so the exp and depth inversion run once per run of equal values. */
@@ -47,7 +47,7 @@ void qa_apply_q2_depth_fog(qa_cpu_framebuffer *frame,qa_q2_fog_operation op,doub
   int global=fog.density>0, height=fog.height.density>0&&fog.height.falloff>0, sky=op.sky_drawn&&fog.sky_factor>0;
   if(!global&&!height&&!sky)return;
   const double *pr=camera.projection.values;
-  if(pr[1]!=0||pr[2]!=0||pr[3]!=0||pr[4]!=0||pr[6]!=0||pr[7]!=0||pr[8]!=0||pr[9]!=0||pr[12]!=0||pr[13]!=0||pr[11]!=-1||pr[15]!=0||pr[0]==0||pr[5]==0) qa_range_error("Q2 fog requires the source symmetric perspective projection");
+  if(pr[1]!=0||pr[2]!=0||pr[3]!=0||pr[4]!=0||pr[6]!=0||pr[7]!=0||pr[8]!=0||pr[9]!=0||pr[12]!=0||pr[13]!=0||pr[11]!=-1||pr[15]!=0||pr[0]==0||pr[5]==0) qa_raise("Error", 0, 0, "Q2 fog requires the source symmetric perspective projection");
   qa_vec3 fwd=camera.axis.vectors[0],left=camera.axis.vectors[1],up=camera.axis.vectors[2],origin=camera.origin;
   double a=f32(-pr[10]),b=f32(-pr[14]),tanX=f32(1/pr[0]),tanY=f32(1/pr[5]);
   double density=f32(fog.density/64),threshold=f32(op.far_depth);

@@ -4,7 +4,7 @@
 
 qa_body_state qa_grapple_body(qa_actor_id a, qa_q2_game_services *g) {
   qa_body_state_result r = qa_shared_body_table_read(g->host->bodies, a);
-  if (!r.has_value) qa_range_error("Grapple owner requires an existing shared body");
+  if (!r.has_value) qa_raise("Error", 0, 0, "Grapple owner requires an existing shared body");
   return r.value;
 }
 void qa_grapple_velocity(qa_actor_id a, qa_q2_game_services *g, qa_vec3 v) {

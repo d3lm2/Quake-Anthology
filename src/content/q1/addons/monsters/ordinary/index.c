@@ -477,6 +477,8 @@ static double field_integer(const qa_save_reader *reader, const char *name) {
   return result;
 }
 static void q1_free_decoded_save(void *value) { qa_save_value_free(value); }
+/* A controller not yet in the map when its saved state raises (TS leaves it to the GC). */
+static void q1_free_unset_monster(void *monster) { qa_q1_base_monster_destroy(monster); }
 static void restore(void *ctx, const uint8_t *bytes, size_t length) {
   ordinary_store *store = ctx;
   qa_q1_services *game = store->context->game;
@@ -499,9 +501,12 @@ static void restore(void *ctx, const uint8_t *bytes, size_t length) {
                               ? qa_q1_get_entity(game, &actor.id) : NULL;
     if (entity == NULL) qa_save_reader_fail(&reader, "missing ordinary addon monster");
     qa_q1_base_monster *value = create_ordinary(store->context, entity);
+    qa_cleanup value_cleanup;
+    qa_cleanup_push(&value_cleanup, q1_free_unset_monster, value);
     must(qa_save_reader_field(&reader, "state", &state));
     qa_q1_base_monster_restore(value, &state);
     qa_save_reader_destroy(&state);
+    qa_cleanup_pop(&value_cleanup);
     store_set(store, entity->actor, value);
     qa_save_reader_destroy(&reader);
   }

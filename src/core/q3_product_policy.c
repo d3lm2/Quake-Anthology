@@ -3,8 +3,7 @@
 
 #include <string.h>
 
-/* CvarFlag.Init from cvars/index.ts (not yet ported). */
-#define QA_CVAR_FLAG_INIT 16
+#include "qa/core/cvars/index.h"
 
 const char *qa_q3_product_kind_name(qa_q3_product_kind kind) {
   switch (kind) {

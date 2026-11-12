@@ -252,7 +252,7 @@ static qa_mat_finished_iterator_stage finished_stage(const working_stage *stage)
 }
 
 /* Port of src/materials/material-iterator.ts sourceMaterialIterator
- * (TS owner module not yet ported; see header note). */
+ * (private copy; see header note). */
 static bool same_float_object_is(double a, double b) {
   float fa = (float)a, fb = (float)b;
   if (isnan(fa) && isnan(fb)) return true;
@@ -585,6 +585,11 @@ static qa_alpha_generator alpha_gen(const char *kind) {
 
 void qa_implicit_shader_input(qa_finish_implicit_shader_input input,
                               qa_finish_shader_input_result *out) {
+  /* TS throws its RangeError before anything is built. */
+  if (kind_is(input.kind, "lightmap") &&
+      (trunc(input.lightmap_index) != input.lightmap_index || input.lightmap_index < 0 ||
+       input.lightmap_index > 2147483647.0))
+    qa_range_error("Implicit lightmap index must be a non-negative int32");
   storage *st = storage_new();
   memset(out, 0, sizeof *out);
   out->_storage = st;
@@ -651,10 +656,7 @@ void qa_implicit_shader_input(qa_finish_implicit_shader_input input,
     images[1] = input.base_image;
     stage_count = 2;
   } else if (kind_is(input.kind, "lightmap")) {
-    if (trunc(input.lightmap_index) != input.lightmap_index ||
-        input.lightmap_index < 0 || input.lightmap_index > 2147483647.0)
-      qa_range_error("Implicit lightmap index must be a non-negative int32");
-    lightmap_index = input.lightmap_index;
+    lightmap_index = input.lightmap_index; /* validated above */
     qa_shader_map lightmap_map;
     memset(&lightmap_map, 0, sizeof lightmap_map);
     lightmap_map.kind = "lightmap";
@@ -670,6 +672,8 @@ void qa_implicit_shader_input(qa_finish_implicit_shader_input input,
     images[1] = input.base_image;
     stage_count = 2;
   } else {
+    storage_free(st);
+    memset(out, 0, sizeof *out);
     qa_range_error("unknown implicit shader kind '%s'", input.kind);
   }
   qa_mat_registered_stage *image_copy =

@@ -61,9 +61,9 @@ bool qa_app_q3_client_cvars_register(qa_app_q3_client_cvars *c, const char *name
     bool alias = canonical == NULL || strcmp(canonical, name) != 0;
     free(canonical);
     if (alias && ((qa_js_to_int32(effective)) & (QA_CVAR_FLAG_USER_INFO | QA_CVAR_FLAG_SERVER_INFO | QA_CVAR_FLAG_SYSTEM_INFO)) != 0)
-      qa_range_error("Cvar alias %s requires an explicit protocol info-key mapping", name);
+      qa_raise("Error", 0, 0, "Cvar alias %s requires an explicit protocol info-key mapping", name);
     if (!qa_cvar_registry_get(owner, name, out))
-      qa_range_error("Unknown guest cvars require a Q3 seat owner");
+      qa_raise("Error", 0, 0, "Unknown guest cvars require a Q3 seat owner");
     return true;
   }
   return qa_cvar_registry_register(owner, name, value, has_flags ? flags : 0, out);
@@ -72,7 +72,7 @@ double qa_app_q3_client_cvars_bind_vm(qa_app_q3_client_cvars *c, const char *nam
   qa_cvar_registry *owner = owner_of(c, name);
   qa_cvar_snapshot registered;
   if (!qa_app_q3_client_cvars_register(c, name, value, true, flags, &registered))
-    qa_range_error("VM cvar registration failed");
+    qa_raise("Error", 0, 0, "VM cvar registration failed");
   for (size_t i = 0; i < c->handle_count; i++) {
     if (c->options.current(c->options.ctx, c->handles[i].owner) == owner
         && strcmp(c->handles[i].name, registered.name) == 0) {
@@ -148,7 +148,8 @@ char *qa_app_q3_client_cvars_info_string(qa_app_q3_client_cvars *c, double flags
         : value->flags & (QA_CVAR_FLAG_USER_INFO | QA_CVAR_FLAG_SERVER_INFO);
       bool q2_private = (dialect == QA_COMMAND_DIALECT_Q2_CLASSIC || dialect == QA_COMMAND_DIALECT_Q2_RERELEASE)
         && (value->flags & QA_Q2_CVAR_FLAG_PRIVATE) != 0;
-      if (owner_of(c, value->name) != owner || (projected & (int64_t)flags) == 0 || q2_private) continue;
+      /* (projectedFlags & flags): ToInt32 of both; a NaN or huge `flags` is not cast to int64 */
+      if (owner_of(c, value->name) != owner || (qa_js_to_int32((double)projected) & qa_js_to_int32(flags)) == 0 || q2_private) continue;
       qa_info_options options = {QA_COMMAND_DIALECT_Q3, (int64_t)max_len,
         (qa_js_to_int32(flags) & QA_CVAR_FLAG_USER_INFO) != 0 ? QA_CVAR_INFO_CLIENT_USERINFO : QA_CVAR_INFO_SERVER_INFO,
         false, print_bridge, c};

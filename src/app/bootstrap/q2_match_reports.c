@@ -26,7 +26,7 @@ void qa_app_prepare_q2_match_reports(const qa_app_q2_match_simulation *simulatio
   if ((!simulation->has_q2_source(simulation->ctx) && !simulation->has_q2_native(simulation->ctx))
       || strcmp(simulation->mode, "deathmatch") != 0) return;
   qa_cvar_registry *cvars = simulation->q2_server_cvars(simulation->ctx);
-  if (cvars == NULL) qa_range_error("Q2 match reporting has no source cvars");
+  if (cvars == NULL) qa_raise("Error", 0, 0, "Q2 match reporting has no source cvars");
   qa_cvar_snapshot snap;
   /* Q2CvarFlag.ReadOnly. */
   if (qa_cvar_registry_register(cvars, round_identity, "", QA_Q2_CVAR_FLAG_READ_ONLY, &snap)) qa_cvar_read_free(&snap);
@@ -50,7 +50,7 @@ bool qa_app_q2_match_completed(const qa_app_q2_match_simulation *simulation,
     if (strcmp(module.id, producer->id) != 0 || strcmp(module.digest, producer->digest) != 0
         || strcmp(module.revision, producer->revision) != 0
         || strcmp(module.artifact_path, producer->artifact_path) != 0)
-      qa_range_error("Native match transition belongs to another module");
+      qa_raise("Error", 0, 0, "Native match transition belongs to another module");
     return true;
   }
   if (!native || strcmp(simulation->native_edition(simulation->ctx), "rerelease") != 0) return false;
@@ -93,7 +93,7 @@ qa_app_q2_match_report_rows qa_app_q2_match_reports(const qa_app_q2_match_simula
   char *identity = cvars != NULL ? qa_cvar_registry_variable_string(cvars, round_identity) : NULL;
   if (identity == NULL || identity[0] == '\0') {
     free(identity);
-    qa_range_error("Q2 match reporting was not prepared");
+    qa_raise("Error", 0, 0, "Q2 match reporting was not prepared");
   }
   const char *map = simulation->map_path;
   rows.items = calloc(local_count == 0 ? 1 : local_count, sizeof *rows.items);
@@ -111,11 +111,13 @@ qa_app_q2_match_report_rows qa_app_q2_match_reports(const qa_app_q2_match_simula
       char participant[64];
       snprintf(participant, sizeof participant, "local-seat:%lld", (long long)locals[i].seat.index);
       event->participant = format_text(&rows, "%s", participant);
-      char event_text[512];
-      if ((fabs(started) < 9.2e18 && started == trunc(started)))
-        snprintf(event_text, sizeof event_text, "match:%s:%s", identity, QA_JS_NUMBER(started));
-      else snprintf(event_text, sizeof event_text, "match:%s:%s", identity, QA_JS_NUMBER(started));
-      event->event = format_text(&rows, "%s", event_text);
+      char started_text[64];
+      snprintf(started_text, sizeof started_text, "%s", QA_JS_NUMBER(started));
+      size_t size = strlen(identity) + strlen(started_text) + 8;
+      char *event_text = malloc(size);
+      if (event_text == NULL) qa_range_error("Out of memory");
+      snprintf(event_text, size, "match:%s:%s", identity, started_text);
+      event->event = track(&rows, event_text);
       event->map = map;
       event->score = score;
     }

@@ -1,5 +1,6 @@
 /* Port of src/content/mods/qvm-callbacks.ts. GPL-2.0-or-later. */
 #include "qa/content/mods/qvm_callbacks.h"
+#include "qa/content/json_text.h"
 #include "qa/content/mods/declaration.h"
 
 #include <stdlib.h>
@@ -394,14 +395,16 @@ static qa_qvm_mod_protection read_protection(const qa_save_reader *r) {
   static const char *const channels[] = {"regular", "powered"};
   qa_qvm_mod_protection prot;
   memset(&prot, 0, sizeof prot);
-  prot.id = fns(r, "id");
   {
+    /* TS binds admission, flags and storage (a non-record reader fails here),
+     * reads the admission, and only then the id. */
     qa_save_reader admission = field(r, "admission");
     prot.admission.kind = fchoice(&admission, "kind", admission_kinds, 3);
     if (strcmp(prot.admission.kind, "replace-primary") == 0)
       prot.admission.owner = fns(&admission, "owner");
     qa_save_reader_destroy(&admission);
   }
+  prot.id = fns(r, "id");
   {
     qa_save_reader f = field(r, "absorb");
     prot.absorb = read_source_call(&f);
@@ -1010,7 +1013,7 @@ qa_qvm_mod_callback_declaration *qa_read_qvm_mod_declaration(
 
 qa_qvm_mod_callback_declaration *qa_read_qvm_mod_callbacks(const uint8_t *bytes,
     size_t length) {
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (value == NULL) return NULL;
   qa_cleanup cleanup;
   qa_cleanup_push(&cleanup, qa_mod_declaration_free_parsed_value, value);

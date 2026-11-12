@@ -44,11 +44,14 @@ static void read_server_data(qa_q2_protocol_codec *self,
                              qa_q2_server_data_result *out) {
   qa_q2_sizebuf *m = self->net_message;
   memset(out, 0, sizeof *out);
+  /* MSG_ReadString stops at 2047 characters; the result owns copies (set last, so a raise
+   * part way leaves nothing to free). */
+  char gamedir[2048], levelname[2048];
   out->servercount = (double)qa_q2_msg_read_long(m);
   out->attractloop = qa_q2_msg_read_byte(m) != 0;
-  qa_q2_msg_read_string(m, out->gamedir, sizeof out->gamedir);
+  qa_q2_msg_read_string(m, gamedir, sizeof gamedir);
   out->clientnum = (double)qa_q2_msg_read_short(m);
-  qa_q2_msg_read_string(m, out->levelname, sizeof out->levelname);
+  qa_q2_msg_read_string(m, levelname, sizeof levelname);
   (void)qa_q2_msg_read_byte(m);
   out->has_r1q2_version = true;
   out->r1q2_version = (double)qa_q2_msg_read_short(m);
@@ -56,6 +59,7 @@ static void read_server_data(qa_q2_protocol_codec *self,
   out->has_r1q2_strafejump_hack = true;
   out->r1q2_strafejump_hack = qa_q2_msg_read_byte(m) != 0;
   out->server_state = 0;
+  qa_q2_server_data_result_set_strings(out, gamedir, levelname);
 }
 
 static void write_delta_entity(qa_q2_protocol_codec *self, qa_q2_sizebuf *msg,

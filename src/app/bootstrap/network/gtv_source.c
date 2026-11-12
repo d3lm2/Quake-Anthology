@@ -25,7 +25,7 @@ static void receive_event(void *ctx, const qa_q2_gtv_event *event) {
     return;
   }
   if (event->kind != QA_Q2_GTV_EVENT_DATA) return;
-  if (s->has_pending) qa_range_error("GTV DATA dispatch overlapped its consumer");
+  if (s->has_pending) qa_raise("Error", 0, 0, "GTV DATA dispatch overlapped its consumer");
   if (!s->has_header) {
     qa_q2_mvd_header header;
     if (!qa_q2_read_mvd_header(event->bytes, event->bytes_length, &header))
@@ -95,7 +95,7 @@ void qa_app_gtv_remote_source_destroy(qa_app_gtv_remote_source *source) {
   free(source->pending); free(source->failure); free(source);
 }
 const qa_q2_mvd_header *qa_app_gtv_remote_source_header(qa_app_gtv_remote_source *source) {
-  if (!source->has_header) qa_range_error("GTV source has no admitted header");
+  if (!source->has_header) qa_raise("Error", 0, 0, "GTV source has no admitted header");
   return &source->header;
 }
 const char *qa_app_gtv_remote_source_phase(qa_app_gtv_remote_source *source) {
@@ -109,7 +109,7 @@ bool qa_app_gtv_remote_source_time(qa_app_gtv_remote_source *source, double *out
 void qa_app_gtv_remote_source_bind(qa_app_gtv_remote_source *source,
     qa_app_q2_client_host host, qa_app_q2_mvd_presentation presentation) {
   if (source->ended || source->receiver || !source->has_header)
-    qa_range_error("GTV presentation admission is not available");
+    qa_raise("Error", 0, 0, "GTV presentation admission is not available");
   qa_app_q2_receiver_source demo = {0};
   demo.is_demo = true;
   source->receiver = qa_app_q2_client_receiver_create(host, demo);
@@ -141,6 +141,8 @@ static void gtv_record(void *ctx, qa_q2_server_record *record) {
       source->presentation.select_view(source->presentation.ctx,
           qa_q2_mvd_playback_get_selected_player(&source->decoder));
     qa_app_q2_client_receiver_receive_records(source->receiver, record, 1, 0);
+    /* TS `if (this.ended) return` leaves the for-of: the generator decodes no more. */
+    if (source->ended) qa_q2_mvd_playback_stop(&source->decoder);
   }
   qa_cleanup_pop(&node);
   record_release(record);
@@ -159,8 +161,8 @@ void qa_app_gtv_remote_source_poll(qa_app_gtv_remote_source *source) {
   if (source->connection_live && !source->has_pending)
     qa_q2_gtv_connection_poll(&source->connection, 0);
   if (source->ended || !source->has_pending) return;
-  if (source->polling) qa_range_error("GTV source poll is already in progress");
-  if (!source->receiver) qa_range_error("GTV source has no presentation owner");
+  if (source->polling) qa_raise("Error", 0, 0, "GTV source poll is already in progress");
+  if (!source->receiver) qa_raise("Error", 0, 0, "GTV source has no presentation owner");
   uint8_t *pending = source->pending;
   size_t length = source->pending_length;
   /* The poll owns the bytes now; close() must not free them under the decoder. */
@@ -180,7 +182,7 @@ void qa_app_gtv_remote_source_poll(qa_app_gtv_remote_source *source) {
   }
 }
 void qa_app_gtv_remote_source_select_player(qa_app_gtv_remote_source *source, double clientnum) {
-  if (!source->receiver || source->ended) qa_range_error("GTV source has no active viewer");
+  if (!source->receiver || source->ended) qa_raise("Error", 0, 0, "GTV source has no active viewer");
   qa_q2_mvd_playback_select_player(&source->decoder, clientnum);
 }
 static void source_close(qa_app_gtv_remote_source *s) {

@@ -6,7 +6,6 @@
 static void wvec(uint8_t *v, size_t o, qa_vec3 x) { qa_compat_q2_view_set_f32(v, o, x.x); qa_compat_q2_view_set_f32(v, o + 4, x.y); qa_compat_q2_view_set_f32(v, o + 8, x.z); }
 static qa_vec3 rvec(const uint8_t *v, size_t o) { return (qa_vec3){qa_compat_q2_view_f32(v, o), qa_compat_q2_view_f32(v, o + 4), qa_compat_q2_view_f32(v, o + 8)}; }
 static qa_vec4 rcolor(const uint8_t *v, size_t o) { qa_vec3 x = rvec(v, o); return (qa_vec4){x.x, x.y, x.z, qa_compat_q2_view_f32(v, o + 12)}; }
-static void wcolor(uint8_t *v, size_t o, qa_vec4 x) { wvec(v, o, (qa_vec3){x.x, x.y, x.z}); qa_compat_q2_view_set_f32(v, o + 12, x.w); }
 void qa_compat_q2_write_rerelease_movement_state(uint8_t *view, qa_q2_rerelease_movement_state value) {
   qa_compat_q2_view_set_i32(view, 0, qa_js_to_int32(value.type)); wvec(view, 4, value.origin); wvec(view, 16, value.velocity);
   qa_compat_q2_view_set_u16(view, 28, qa_js_to_uint32(value.flags)); qa_compat_q2_view_set_u16(view, 30, qa_js_to_uint32(value.time_milliseconds));
@@ -19,7 +18,7 @@ qa_q2_rerelease_movement_state qa_compat_q2_read_rerelease_movement_state(const 
   s.gravity = qa_compat_q2_view_i16(view, 32); s.delta_angles = rvec(view, 36); s.view_height = (int8_t)view[48];
   return s;
 }
-qa_q2_rerelease_player_state qa_compat_q2_read_rerelease_player_state(const qa_compat_q2_memory *memory, qa_guest_address address) {
+qa_q2_rerelease_player_state qa_compat_q2_read_rerelease_player_state_into(const qa_compat_q2_memory *memory, qa_guest_address address, double *stats) {
   qa_compat_q2_rerelease_layouts_ensure();
   const uint8_t *view = memory->borrow(memory->ctx, address, qa_compat_q2_rerelease_player_state_layout.byte_length);
   qa_q2_rerelease_player_state s; memset(&s, 0, sizeof s);
@@ -30,10 +29,17 @@ qa_q2_rerelease_player_state qa_compat_q2_read_rerelease_player_state(const qa_c
   s.view.gun_frame = qa_compat_q2_view_i32(view, 120); s.gun_rate = qa_compat_q2_view_i32(view, 124);
   s.screen_blend = rcolor(view, 128); s.damage_blend = rcolor(view, 144);
   s.view.fov = qa_compat_q2_view_f32(view, 160); s.view.render_flags = view[164];
-  static double stats_scratch[64];
-  for (size_t i = 0; i < 64; i++) stats_scratch[i] = qa_compat_q2_view_i16(view, 166 + i * 2);
-  s.view.stats.values = stats_scratch; s.view.stats.count = 64; s.team_id = view[294];
+  for (size_t i = 0; i < 64; i++) stats[i] = qa_compat_q2_view_i16(view, 166 + i * 2);
+  s.view.stats.values = stats; s.view.stats.count = 64; s.team_id = view[294];
   return s;
+}
+qa_q2_rerelease_player_state qa_compat_q2_read_rerelease_player_state(const qa_compat_q2_memory *memory, qa_guest_address address) {
+  /* TS returns a new stats array with every state. The contract type (qa_q2_player_view in contracts/protocol.h,
+   * shared with network/q2 and the application) borrows its stats as a qa_double_view, so the state cannot own
+   * them. A caller that keeps a state uses the _into form with its own 64 numbers; this form takes the next of 256
+   * buffers, so states read one after another do not share an array, and one kept across 256 later reads would. */
+  static _Thread_local double stats_ring[256][64]; static _Thread_local unsigned stats_next;
+  return qa_compat_q2_read_rerelease_player_state_into(memory, address, stats_ring[stats_next++ % 256]);
 }
 void qa_compat_q2_write_rerelease_user_command(uint8_t *view, qa_q2_rerelease_user_command value) {
   view[0] = qa_js_to_uint8(value.milliseconds); view[1] = qa_js_to_uint8(value.buttons); wvec(view, 4, value.angles);

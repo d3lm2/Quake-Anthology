@@ -62,4 +62,18 @@ typedef struct qa_cleanup {
 void qa_cleanup_push(qa_cleanup *node, void (*fn)(void *arg), void *arg);
 void qa_cleanup_pop(qa_cleanup *node);
 
+/*
+ * For a second non-local exit that must leave this one consistent (the legacy
+ * script failure channel, which has its own setjmp frames). A mark records the
+ * catch and cleanup stacks where such a frame is entered; unwinding to it runs
+ * and drops every cleanup pushed since, newest first, and forgets every qa_try
+ * entered since, exactly as a raise caught at that point would.
+ */
+typedef struct qa_unwind_mark {
+  qa_cleanup *cleanups;
+  void *catches;
+} qa_unwind_mark;
+qa_unwind_mark qa_unwind_mark_take(void);
+void qa_unwind_to(qa_unwind_mark mark);
+
 #endif

@@ -86,7 +86,7 @@ bool qa_fm_deathmatch(const qa_app_shared_simulation *sim) { return qa_ss_is(sim
 qa_owned_actor qa_fm_spawn_trigger(qa_app_shared_simulation *sim, const char *definition, qa_vec3 origin, qa_bounds bounds,
     void (*touch)(void *ctx, qa_touch_contact contact)) {
   qa_owned_actor actor = qa_session_actor_registry_allocate(sim->actors, sim->recipe.match.provider, definition);
-  qa_body_state body = {origin, qa_ss_zero, qa_ss_zero, bounds, NULL};
+  qa_body_state body = {origin, qa_zero_vec3, qa_zero_vec3, bounds, NULL};
   qa_shared_body_table_create_body(qa_fm_bodies(sim), actor, body);
   qa_app_sim_shared_solid solid; memset(&solid, 0, sizeof solid);
   solid.solid = "trigger"; solid.family = qa_fm_family_name(sim->recipe.map.entities.provider);
@@ -111,11 +111,14 @@ bool qa_fm_entity_origin(const qa_q3_entity *entity, qa_vec3 *out) {
     const char *start = cursor;
     while (*cursor && qa_js_white_space_length(cursor) == 0) cursor++;
     size_t length = (size_t)(cursor - start);
-    char part[128];
-    if (length >= sizeof part) return false;
-    memcpy(part, start, length); part[length] = '\0';
     if (count == 3) return false;
+    /* Number(part) over the whole part: TS has no length limit (a long zero-padded number is still finite). */
+    char small[128];
+    char *part = length < sizeof small ? small : malloc(length + 1);
+    if (part == NULL) qa_range_error("Out of memory");
+    memcpy(part, start, length); part[length] = '\0';
     parts[count++] = qa_js_string_to_number(part);
+    if (part != small) free(part);
     if (!*cursor) break;
     while (*cursor && qa_js_white_space_length(cursor) != 0) cursor += qa_js_white_space_length(cursor);
     /* A trailing separator still yields a final empty part (TS split). */
@@ -187,4 +190,12 @@ void qa_fm_assign_teams(qa_app_shared_simulation *sim, qa_ss_map *teams, const q
       qa_gameplay_authority_set_traits(sim->combat, owned, changes);
     }
   }
+}
+/* host.combat.damageOperation.register({ provider, id, order: 0, kind: "transform", transform }) */
+void qa_fm_register_transform(qa_app_shared_simulation *sim, const char *provider, const char *id,
+    void (*transform)(void *ctx, const void *request, void *out_request)) {
+  qa_mod_operation_registration registration; memset(&registration, 0, sizeof registration);
+  registration.identity = (qa_mod_registration_identity){provider, id, 0};
+  registration.kind = QA_MOD_TRANSFORM; registration.ctx = sim; registration.transform = transform;
+  if (qa_mod_operation_register(qa_gameplay_authority_damage_operation(sim->combat), registration) < 0) qa_range_error("Out of memory");
 }

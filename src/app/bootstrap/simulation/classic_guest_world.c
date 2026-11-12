@@ -1,6 +1,7 @@
 /* Port of src/app/bootstrap/simulation/classic-guest-world.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/simulation/classic_guest_world.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qa/compat/q2/classic/records.h"
@@ -41,8 +42,36 @@ static double budget_of(world_t *w) { return qa_compat_q2_classic_guest_host_get
 static const qa_app_sim_classic_guest_services_options *service_options(world_t *w) { return qa_app_sim_classic_guest_services_options_of(w->shared->services); }
 static void require_ownership(const world_t *w) { if (w->phase == TRANSFERRED) fail("Native world ownership was transferred"); }
 
-/* TS fitClassicUserinfo(text, 512): the NUL-terminated prefix, at most 511 characters. */
-static char *fit_userinfo(const char *text) { size_t n = strlen(text); if (n > 511) n = 511; char *out = malloc(n + 1); if (out == NULL) qa_range_error("Out of memory"); memcpy(out, text, n); out[n] = '\0'; return out; }
+/* TS fitClassicUserinfo(text, 512): the NUL-terminated prefix cut to 511 UTF-16 units, then every unit above U+00FF
+ * (each half of a surrogate pair too) replaced by "?". Text here is the UTF-8 of the TS string; a malformed sequence
+ * reads as one U+FFFD. */
+static char *fit_userinfo(const char *text) {
+  size_t length = strlen(text), units = 0, o = 0;
+  char *out = malloc(length * 2 + 1); /* a kept character is at most 2 bytes ("?" or U+0080..U+00FF) */
+  if (out == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < length && units < 511;) {
+    const unsigned char *b = (const unsigned char *)text + i;
+    uint32_t cp = 0xfffd; size_t n = 1;
+    if (b[0] < 0x80) cp = b[0];
+    else if ((b[0] & 0xe0) == 0xc0 && b[0] >= 0xc2 && (b[1] & 0xc0) == 0x80) { cp = ((uint32_t)(b[0] & 0x1f) << 6) | (b[1] & 0x3f); n = 2; }
+    else if ((b[0] & 0xf0) == 0xe0 && (b[1] & 0xc0) == 0x80 && (b[2] & 0xc0) == 0x80) {
+      uint32_t v = ((uint32_t)(b[0] & 0x0f) << 12) | ((uint32_t)(b[1] & 0x3f) << 6) | (b[2] & 0x3f);
+      if (v >= 0x800) { cp = v; n = 3; }
+    } else if ((b[0] & 0xf8) == 0xf0 && (b[1] & 0xc0) == 0x80 && (b[2] & 0xc0) == 0x80 && (b[3] & 0xc0) == 0x80) {
+      uint32_t v = ((uint32_t)(b[0] & 0x07) << 18) | ((uint32_t)(b[1] & 0x3f) << 12) | ((uint32_t)(b[2] & 0x3f) << 6) | (b[3] & 0x3f);
+      if (v >= 0x10000 && v <= 0x10ffff) { cp = v; n = 4; }
+    }
+    i += n;
+    size_t cp_units = cp >= 0x10000 ? 2 : 1;
+    for (size_t u = 0; u < cp_units && units < 511; u++, units++) {
+      if (cp < 0x80) out[o++] = (char)cp;
+      else if (cp <= 0xff) { out[o++] = (char)(0xc0 | (cp >> 6)); out[o++] = (char)(0x80 | (cp & 0x3f)); }
+      else out[o++] = '?';
+    }
+  }
+  out[o] = '\0';
+  return out;
+}
 
 /* --- clients (TS Map insertion order) --- */
 static qa_app_sim_classic_guest_client *find_client(world_t *w, double slot) {
@@ -150,16 +179,31 @@ static void build_services(void *ctx, qa_compat_q2_memory *memory, qa_compat_q2_
   if (b->shared->services == NULL) qa_range_error("Out of memory");
   *out = qa_app_sim_classic_guest_services_engine(b->shared->services);
 }
+/* A refused create releases what it built: the services the source's callback made and the source (TS drops both). */
+static void create_release(void *arg) {
+  retained *shared = arg;
+  if (shared->source != NULL) qa_app_sim_classic_guest_source_destroy(shared->source);
+  if (shared->services != NULL) qa_app_sim_classic_guest_services_destroy(shared->services);
+  free(shared);
+}
+static void bind_created(void *arg) {
+  retained *shared = arg;
+  if (shared->services == NULL) fail("Native services were not constructed");
+  qa_guest_address image = qa_app_sim_classic_guest_source_image_base(shared->source);
+  qa_app_sim_classic_guest_services_bind_host(shared->services, qa_app_sim_classic_guest_source_host(shared->source), &image);
+}
 world_t *qa_app_sim_classic_guest_world_create(const qa_app_sim_classic_guest_world_options *options) {
   retained *shared = calloc(1, sizeof *shared); if (shared == NULL) qa_range_error("Out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, create_release, shared);
   services_build build = {options, shared};
   qa_app_sim_classic_guest_source_options source; memset(&source, 0, sizeof source);
   source.capabilities = options->capabilities; source.has_instruction_budget = options->has_instruction_budget; source.instruction_budget = options->instruction_budget;
   source.services_ctx = &build; source.services = build_services;
   shared->source = qa_app_sim_classic_guest_source_create(options->prepared, &source);
-  if (shared->services == NULL) { qa_app_sim_classic_guest_source_discard(shared->source); fail("Native services were not constructed"); }
-  qa_guest_address image = qa_app_sim_classic_guest_source_image_base(shared->source);
-  qa_app_sim_classic_guest_services_bind_host(shared->services, qa_app_sim_classic_guest_source_host(shared->source), &image);
+  /* try { getAdapter(); services.bindHost(...) } catch (error) { source.discard(); throw error; } */
+  qa_caught_error caught;
+  if (!qa_try(bind_created, shared, &caught)) { qa_app_sim_classic_guest_source_discard(shared->source); qa_rethrow(&caught); }
+  qa_cleanup_pop(&node);
   return new_world(shared);
 }
 static void release_shared(retained *r) {
@@ -294,8 +338,14 @@ static world_t *travel(world_t *w, qa_app_sim_classic_guest_map map, const qa_ap
   for (size_t i = 0; i < t.client_count; i++) free(t.clients[i].userinfo);
   free(t.clients);
   if (!completed) {
-    qa_app_sim_classic_guest_world_close(next); next->phase = CLOSED; clear_clients(next);
+    /* catch (error) { try { next.close() } catch (cleanup) { throw AggregateError([error, cleanup], ...) }
+     * finally { next closed, no clients } throw error }. The candidate is released either way: nothing holds it. */
+    qa_caught_error cleanup;
+    bool closed = qa_try((void (*)(void *))qa_app_sim_classic_guest_world_close, next, &cleanup);
+    next->phase = CLOSED; clear_clients(next);
+    qa_app_sim_classic_guest_world_destroy(next);
     qa_cleanup_pop(&scope.node); w->busy = false;
+    if (!closed) qa_raise("AggregateError", 0, 0, "Native map travel and retained module cleanup failed");
     qa_rethrow(&caught);
   }
   /* TS operation's finishInputRetirements runs on the transferred world, which has none. */
@@ -471,7 +521,9 @@ static void restore_original(world_t *w, const char *game_path, const char *leve
   }
   size_t drained; (void)qa_app_sim_classic_guest_services_drain_messages(w->shared->services, &drained);
   restore_server_state(restore_ctx);
-  if (next_frame == NULL) qa_compat_q2_classic_guest_host_save(host, "ReadLevel", level_path, false);
+  /* level_path NULL is the TS null: the save never wrote the current level, which stays as freshly spawned. */
+  if (level_path == NULL) { /* nothing to read */ }
+  else if (next_frame == NULL) qa_compat_q2_classic_guest_host_save(host, "ReadLevel", level_path, false);
   else qa_compat_q2_classic_guest_host_save_loading(host, "ReadLevel", level_path, next_frame, next_ctx);
   qa_app_sim_classic_guest_services_complete_spawn(w->shared->services); w->phase = RUNNING;
   end_operation(&scope);

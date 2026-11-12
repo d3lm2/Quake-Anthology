@@ -29,8 +29,16 @@ static char *xstrdup(const char *text) {
   strcpy(copy, text);
   return copy;
 }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
+/* A host buffer held across guest reads that can fault: freed by the raise. */
+typedef struct held { void *items[2]; qa_cleanup node; } held;
+static void held_release(void *arg) { held *h = arg; free(h->items[0]); free(h->items[1]); }
+static void hold(held *h, void *first, void *second) {
+  h->items[0] = first; h->items[1] = second;
+  qa_cleanup_push(&h->node, held_release, h);
+}
+static void release(held *h) { qa_cleanup_pop(&h->node); held_release(h); }
 static qa_guest_core_address off(const qa_mapped_guest_memory *m, qa_guest_core_address a, int64_t d) {
   return qa_memory_offset(m, a, d);
 }
@@ -129,7 +137,10 @@ static qa_call_result execute_exit(crt_ctx *crt, const qa_guest_core_call_contex
   bool has_begin = qa_read_pointer(memory, table, &begin);
   bool has_end = qa_read_pointer(memory, off(memory, table, width), &end);
   if (has_begin && has_end) {
-    for (uint64_t at = end.byte_offset - (uint64_t)width; ; at -= (uint64_t)width) {
+    /* TS `for (at = end - width; at >= begin; at -= width)`: no slot at all when end - width < begin. */
+    for (uint64_t at = end.byte_offset - (uint64_t)width;
+         end.byte_offset >= (uint64_t)width && end.byte_offset - (uint64_t)width >= begin.byte_offset;
+         at -= (uint64_t)width) {
       qa_guest_core_address slot = {0};
       if (!qa_memory_pointer(memory, at, &slot)) plain_error("Null onexit slot");
       qa_guest_core_address callback = {0};
@@ -141,7 +152,7 @@ static qa_call_result execute_exit(crt_ctx *crt, const qa_guest_core_call_contex
                                                   QA_STORAGE_INT32, NULL, 0, false);
         qa_call_value_free(&result);
       }
-      if (at <= begin.byte_offset) break;
+      if (at < begin.byte_offset + (uint64_t)width) break; /* the next slot would precede begin */
     }
     (void)qa_windows_free(host, true, begin, 0);
   }
@@ -170,13 +181,14 @@ static int qsort_compare(qsort_ctx *q, size_t left, size_t right) {
 }
 static void qsort_swap(qsort_ctx *q, size_t left, size_t right) {
   qa_mapped_guest_memory *memory = q->crt->host->memory;
-  uint8_t *value = xmalloc(q->size);
-  uint8_t *other = xmalloc(q->size);
+  held buffers;
+  hold(&buffers, xmalloc(q->size), xmalloc(q->size));
+  uint8_t *value = buffers.items[0], *other = buffers.items[1];
   qa_memory_copy(memory, qsort_at(q, left), value, q->size);
   qa_memory_copy(memory, qsort_at(q, right), other, q->size);
   qa_memory_write(memory, qsort_at(q, left), other, q->size);
   qa_memory_write(memory, qsort_at(q, right), value, q->size);
-  free(value); free(other);
+  release(&buffers);
 }
 /* TS ucrtQuickSort (misc/qsort.cpp): median-of-three quicksort that hands runs
  * of at most eight elements to a selection sort, so the order of equal keys
@@ -187,6 +199,9 @@ void qa_ucrt_quick_sort(int64_t length, int (*compare)(void *ctx, int64_t left, 
   if (length < 2) return;
   int64_t *low_stack = NULL, *high_stack = NULL;
   size_t stack_count = 0, stack_cap = 0;
+  /* The comparator is guest code: a stop or a fault leaves through a raise. */
+  held stacks;
+  hold(&stacks, NULL, NULL);
   int64_t low = 0, high = length - 1;
   for (;;) {
     const int64_t size = high - low + 1;
@@ -233,8 +248,8 @@ void qa_ucrt_quick_sort(int64_t length, int (*compare)(void *ctx, int64_t left, 
         if (low < higuy) {
           if (stack_count == stack_cap) {
             stack_cap = stack_cap == 0 ? 16 : stack_cap * 2;
-            low_stack = xrealloc(low_stack, stack_cap * sizeof *low_stack);
-            high_stack = xrealloc(high_stack, stack_cap * sizeof *high_stack);
+            stacks.items[0] = low_stack = xrealloc(low_stack, stack_cap * sizeof *low_stack);
+            stacks.items[1] = high_stack = xrealloc(high_stack, stack_cap * sizeof *high_stack);
           }
           low_stack[stack_count] = low; high_stack[stack_count] = higuy; stack_count++;
         }
@@ -243,8 +258,8 @@ void qa_ucrt_quick_sort(int64_t length, int (*compare)(void *ctx, int64_t left, 
         if (loguy < high) {
           if (stack_count == stack_cap) {
             stack_cap = stack_cap == 0 ? 16 : stack_cap * 2;
-            low_stack = xrealloc(low_stack, stack_cap * sizeof *low_stack);
-            high_stack = xrealloc(high_stack, stack_cap * sizeof *high_stack);
+            stacks.items[0] = low_stack = xrealloc(low_stack, stack_cap * sizeof *low_stack);
+            stacks.items[1] = high_stack = xrealloc(high_stack, stack_cap * sizeof *high_stack);
           }
           low_stack[stack_count] = loguy; high_stack[stack_count] = high; stack_count++;
         }
@@ -257,8 +272,7 @@ void qa_ucrt_quick_sort(int64_t length, int (*compare)(void *ctx, int64_t left, 
     low = low_stack[stack_count];
     high = high_stack[stack_count];
   }
-  free(low_stack);
-  free(high_stack);
+  release(&stacks);
 }
 
 static int qsort_compare_at(void *ctx, int64_t left, int64_t right) { return qsort_compare(ctx, (size_t)left, (size_t)right); }
@@ -280,16 +294,15 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
       return qa_call_int64((int64_t)trunc(now_milliseconds(host)) * 10000);
     case C_MALLOC: {
       const size_t size = qa_guest_count(args, count, 0);
-      qa_windows_charge_bytes(host, size);
       qa_guest_core_address out = {0};
       bool has = qa_windows_allocate(host, size, 0, &out);
       return qa_call_pointer(has, out);
     }
     case C_CALLOC: {
-      int64_t a = qa_guest_integer(args, count, 0);
-      int64_t b = qa_guest_integer(args, count, 1);
-      bool too_big = a > 0 && b > 0 && (a > 0x10000000 / b || a * b > 0x10000000);
-      qa_windows_charge_bytes(host, too_big ? 0x10000000u : (size_t)(a * b));
+      /* size_t operands multiplied as TS BigInts: unsigned, and never wrapping. */
+      uint64_t a = qa_guest_integer_u64(args, count, 0);
+      uint64_t b = qa_guest_integer_u64(args, count, 1);
+      bool too_big = a != 0 && b != 0 && (a > 0x10000000u / b || a * b > 0x10000000u);
       if (too_big) return qa_call_pointer(false, none);
       qa_guest_core_address out = {0};
       bool has = qa_windows_allocate(host, (size_t)(a * b), 0, &out);
@@ -307,7 +320,6 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
       size_t size = qa_guest_count(args, count, 2);
       qa_guest_core_address destination = {0};
       bool has_destination = qa_guest_pointer_argument(args, count, 0, &destination);
-      qa_windows_charge_bytes(host, size);
       if (size > 0)
         qa_move_bytes(memory, host->memory_ext, qa_guest_required_pointer(args, count, 0),
                       qa_guest_required_pointer(args, count, 1), size);
@@ -317,7 +329,6 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
       size_t size = qa_guest_count(args, count, 2);
       qa_guest_core_address destination = {0};
       bool has_destination = qa_guest_pointer_argument(args, count, 0, &destination);
-      qa_windows_charge_bytes(host, size);
       if (size > 0)
         qa_fill_bytes(memory, host->memory_ext, qa_guest_required_pointer(args, count, 0), size,
                       (int)(qa_guest_integer(args, count, 1) & 255));
@@ -325,36 +336,37 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
     }
     case C_MEMCMP: {
       size_t size = qa_guest_count(args, count, 2);
-      qa_windows_charge_bytes(host, size);
       if (size == 0) return qa_call_int32(0);
-      uint8_t *left = xmalloc(size), *right = xmalloc(size);
+      held buffers;
+      hold(&buffers, xmalloc(size), xmalloc(size));
+      uint8_t *left = buffers.items[0], *right = buffers.items[1];
       qa_memory_copy(memory, qa_guest_required_pointer(args, count, 0), left, size);
       qa_memory_copy(memory, qa_guest_required_pointer(args, count, 1), right, size);
       int result = 0;
       for (size_t i = 0; i < size; i++)
         if (left[i] != right[i]) { result = left[i] - right[i]; break; }
-      free(left); free(right);
+      release(&buffers);
       return qa_call_int32(result);
     }
     case C_MEMCHR: {
       size_t size = qa_guest_count(args, count, 2);
-      qa_windows_charge_bytes(host, size);
       if (size == 0) return qa_call_pointer(false, none);
       qa_guest_core_address address = qa_guest_required_pointer(args, count, 0);
-      uint8_t *bytes = xmalloc(size);
+      held buffers;
+      hold(&buffers, xmalloc(size), NULL);
+      uint8_t *bytes = buffers.items[0];
       qa_memory_copy(memory, address, bytes, size);
       uint8_t needle = (uint8_t)(qa_guest_integer(args, count, 1) & 255);
       int64_t index = -1;
       for (size_t i = 0; i < size; i++)
         if (bytes[i] == needle) { index = (int64_t)i; break; }
-      free(bytes);
+      release(&buffers);
       return index < 0 ? qa_call_pointer(false, none)
                        : qa_call_pointer(true, off(memory, address, index));
     }
     case C_STRLEN: {
       size_t value = qa_string_length(memory, host->memory_ext,
                                       qa_guest_required_pointer(args, count, 0), 1048576);
-      qa_windows_charge_bytes(host, value);
       return host->pointer_storage == QA_STORAGE_UINT64 ? qa_call_uint64(value)
                                                         : qa_call_uint32((uint32_t)value);
     }
@@ -366,15 +378,16 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
         const size_t first_length = qa_string_length(memory, host->memory_ext, left, 1048576);
         const size_t second_length = qa_string_length(memory, host->memory_ext, right, 1048576);
         const size_t shared = first_length < second_length ? first_length : second_length;
-        qa_windows_charge_bytes(host, shared);
         /* The terminator is compared too, so one byte beyond the shorter string is read. */
-        uint8_t *first = xmalloc(shared + 1), *second = xmalloc(shared + 1);
+        held buffers;
+        hold(&buffers, xmalloc(shared + 1), xmalloc(shared + 1));
+        uint8_t *first = buffers.items[0], *second = buffers.items[1];
         qa_memory_copy(memory, left, first, shared + 1);
         qa_memory_copy(memory, right, second, shared + 1);
         int result = 0;
         for (size_t i = 0; i <= shared; i++)
           if (first[i] != second[i]) { result = (int)first[i] - (int)second[i]; break; }
-        free(first); free(second);
+        release(&buffers);
         return qa_call_int32(result);
       }
       size_t maximum = qa_guest_count(args, count, 2);
@@ -388,9 +401,9 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
     }
     case C_STRCHR: {
       qa_guest_core_address address = qa_guest_required_pointer(args, count, 0);
+      uint8_t needle = (uint8_t)(qa_guest_integer(args, count, 1) & 255); /* TS reads the string first; neither raises here */
       char *text = read_str(crt, address);
       size_t length = strlen(text);
-      uint8_t needle = (uint8_t)(qa_guest_integer(args, count, 1) & 255);
       int64_t index = -1;
       for (size_t i = 0; i <= length; i++)
         if ((uint8_t)text[i] == needle) { index = (int64_t)i; break; }
@@ -400,11 +413,13 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
     }
     case C_STRSTR: {
       qa_guest_core_address address = qa_guest_required_pointer(args, count, 0);
-      char *text = read_str(crt, address);
-      char *needle = read_str(crt, qa_guest_required_pointer(args, count, 1));
+      held strings;
+      hold(&strings, read_str(crt, address), NULL);
+      strings.items[1] = read_str(crt, qa_guest_required_pointer(args, count, 1));
+      const char *text = strings.items[0], *needle = strings.items[1];
       const char *found = strstr(text, needle);
       int64_t index = found != NULL ? found - text : -1;
-      free(text); free(needle);
+      release(&strings);
       return index < 0 ? qa_call_pointer(false, none)
                        : qa_call_pointer(true, off(memory, address, index));
     }
@@ -527,7 +542,7 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
       double a = real(args, count, 0);
       int value;
       if (strcmp(state->name, "_dsign") == 0)
-        value = signbit(a) ? 0x8000 : 0;
+        value = a < 0 || (a == 0 && signbit(a)) ? 0x8000 : 0; /* TS: a < 0 || Object.is(a, -0); never a NaN */
       else
         value = a != a ? 2 : !isfinite(a) ? 1 : a == 0 ? 0
             : fabs(a) < (strcmp(state->name, "_fdclass") == 0 ? 0x1p-126 : 0x1p-1022) ? -2 : -1;
@@ -538,14 +553,16 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
       qa_guest_core_address source = qa_guest_required_pointer(args, count, 0);
       qa_guest_core_address end = {0};
       bool has_end = qa_guest_pointer_argument(args, count, 1, &end);
-      char *text = read_str(crt, source);
+      held text_hold;
+      hold(&text_hold, read_str(crt, source), NULL);
+      char *text = text_hold.items[0];
       size_t length = strlen(text);
       int base = (int)qa_guest_integer(args, count, 2);
       size_t index = 0;
       if (base != 0 && (base < 2 || base > 36)) {
         qa_write_unsigned(memory, crt->errno_address, 4, 22);
         if (has_end) qa_write_pointer(memory, end, true, source);
-        free(text);
+        release(&text_hold);
         return qa_call_uint32(0);
       }
       /* TS regex /[ \t\n\r\f\v]/ for this skip. */
@@ -575,15 +592,14 @@ static qa_call_result crt_impl(void *ctx, const qa_guest_core_call_context *cont
       }
       if (index == first) {
         if (has_end) qa_write_pointer(memory, end, true, source);
-        free(text);
+        release(&text_hold);
         return qa_call_uint32(0);
       }
+      /* TS: errno before the end pointer. */
+      if (overflowed) qa_write_unsigned(memory, crt->errno_address, 4, 34);
       if (has_end) qa_write_pointer(memory, end, true, off(memory, source, (int64_t)index));
-      free(text);
-      if (overflowed) {
-        qa_write_unsigned(memory, crt->errno_address, 4, 34);
-        return qa_call_uint32(0xffffffffu);
-      }
+      release(&text_hold);
+      if (overflowed) return qa_call_uint32(0xffffffffu);
       return qa_call_uint32((uint32_t)(negative ? 0 - value : value));
     }
     case C_ATOI: {

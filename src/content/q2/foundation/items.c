@@ -75,17 +75,16 @@ static const item REST[] = {
   {.kind = "maximum-health", .classname = "item_ancient_head", .model = "models/items/c_head/tris.md2", .icon = "i_fixme", .name = "Ancient Head", .sound = "items/pkup.wav", .rotate = true, .respawn = 60, .increase = 2},
 };
 
-/* Retained id strings per catalog classname (leaked-by-design registry). */
+/* TS id(item) = `q2:${classname}`: one process-lifetime copy per classname
+ * from the shared string table (no fixed table size, safe across threads). */
 static const char *retained_id(const char *classname) {
-  static char *cache[512];
-  static size_t cache_n;
-  for (size_t i = 0; i < cache_n; i++) if (strcmp(cache[i] + 3, classname) == 0) return cache[i];
-  if (cache_n >= 512) qa_range_error("out of memory");
+  char stack[160];
   size_t len = strlen(classname) + 4;
-  char *id = malloc(len);
-  if (!id) qa_range_error("out of memory");
-  snprintf(id, len, "q2:%s", classname);
-  cache[cache_n++] = id;
+  char *text = len <= sizeof stack ? stack : malloc(len);
+  if (!text) qa_range_error("out of memory");
+  snprintf(text, len, "q2:%s", classname);
+  const char *id = qa_q2_intern(text);
+  if (text != stack) free(text);
   return id;
 }
 #define ID(it) retained_id((it)->classname)
@@ -98,7 +97,10 @@ static bool stays_coop(const item *it) {
   return false;
 }
 
-typedef struct pickup_state { qa_q2_entity *e; const item *it; bool targets_used, retained; bool has_expires; double expires_at; } pickup_state;
+/* TS WeakMap<Q2Entity, PickupState>: the entry dies with its entity. A C entity
+ * is freed at release and its address reused, so an entry also records the
+ * actor id; a pointer match with another id is a dead entity's entry. */
+typedef struct pickup_state { qa_q2_entity *e; const item *it; bool targets_used, retained; bool has_expires; double expires_at; qa_actor_id actor; } pickup_state;
 typedef struct power_state { qa_actor_id id; qa_q2_player_powerups v; } power_state;
 
 struct qa_q2_item_module {
@@ -123,7 +125,8 @@ struct qa_q2_item_module {
   qa_q2_item_pickup_checkpoint *cp_pickups;
   qa_q2_item_power_checkpoint *cp_powers;
   qa_saved_actor_id *cp_bindings;
-  struct cell_ctx { qa_q2_game_services *g; qa_owned_actor actor; } *cell_ctxs; size_t cell_count, cell_cap;
+  /* One allocation per binding: the combat authority keeps the pointer. */
+  struct cell_ctx { qa_q2_game_services *g; qa_owned_actor actor; } **cell_ctxs; size_t cell_count, cell_cap;
 };
 
 static void *xrealloc(void *p, size_t n) { void *q = realloc(p, n); if (!q) qa_range_error("out of memory"); return q; }
@@ -147,18 +150,33 @@ static bool is_foreign(qa_q2_item_module *m, const char *classname) {
   for (size_t i = 0; i < m->foreign_count; i++) if (strcmp(m->foreign[i], classname) == 0) return true;
   return false;
 }
+/* `e` must be a live entity (its actor id is read). */
 static pickup_state *find_pickup(qa_q2_item_module *m, qa_q2_entity *e) {
-  for (size_t i = 0; i < m->pickup_count; i++) if (m->pickups[i].e == e) return &m->pickups[i];
+  for (size_t i = 0; i < m->pickup_count; i++) {
+    if (m->pickups[i].e != e) continue;
+    if (qa_same_actor(m->pickups[i].actor, e->actor.id)) return &m->pickups[i];
+    memmove(&m->pickups[i], &m->pickups[i + 1], (m->pickup_count - i - 1) * sizeof *m->pickups);
+    m->pickup_count--;
+    return NULL;
+  }
   return NULL;
 }
 static pickup_state *pickup_of(qa_q2_item_module *m, qa_q2_entity *e) {
   pickup_state *p = find_pickup(m, e);
-  if (!p) qa_range_error("Q2 item callback has no pickup state");
+  if (!p) qa_raise("Error", 0, 0, "Q2 item callback has no pickup state");
   return p;
 }
-static void set_pickup(qa_q2_item_module *m, qa_q2_entity *e, pickup_state v) {
+static void set_pickup(qa_q2_item_module *m, qa_q2_game_services *g, qa_q2_entity *e, pickup_state v) {
+  v.e = e; v.actor = e->actor.id;
   pickup_state *p = find_pickup(m, e);
   if (p) { *p = v; return; }
+  if (m->pickup_count == m->pickup_cap) {
+    /* Entries of released entities are dropped before the table grows. */
+    size_t kept = 0;
+    for (size_t i = 0; i < m->pickup_count; i++)
+      if (qa_session_actor_registry_is_live(g->host->actors, m->pickups[i].actor)) m->pickups[kept++] = m->pickups[i];
+    m->pickup_count = kept;
+  }
   if (m->pickup_count == m->pickup_cap) { m->pickup_cap = m->pickup_cap ? m->pickup_cap * 2 : 16; m->pickups = xrealloc(m->pickups, m->pickup_cap * sizeof *m->pickups); }
   m->pickups[m->pickup_count++] = v;
 }
@@ -330,11 +348,7 @@ static void remove_powerups_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g,
 }
 
 void qa_q2_item_module_register(qa_q2_item_module *m, qa_q2_item_definition it) {
-  if (catalog_get(m, it.classname)) {
-    static _Thread_local char buf[512];
-    snprintf(buf, sizeof buf, "Q2 item already registered: %s", it.classname);
-    qa_range_error("%s", buf);
-  }
+  if (catalog_get(m, it.classname)) qa_raise("Error", 0, 0, "Q2 item already registered: %s", it.classname);
   catalog_set(m, it);
 }
 const char *qa_q2_item_module_item_name(qa_q2_item_module *m, const char *classname) {
@@ -402,12 +416,8 @@ void qa_q2_item_module_restore(qa_q2_item_module *m, qa_q2_game_services *g, qa_
     qa_owned_actor actor = qa_q2_restore_actor(g, cp.pickups[i].actor);
     qa_q2_entity *e = g->entity(g->ctx, &actor.id);
     const item *it = catalog_get(m, cp.pickups[i].classname);
-    if (!e || !it) {
-      static _Thread_local char buf[512];
-      snprintf(buf, sizeof buf, "Q2 item checkpoint cannot resolve %s", cp.pickups[i].classname);
-      qa_range_error("%s", buf);
-    }
-    set_pickup(m, e, (pickup_state){e, it, cp.pickups[i].targets_used, cp.pickups[i].retained, cp.pickups[i].has_expires_at, cp.pickups[i].expires_at});
+    if (!e || !it) qa_raise("Error", 0, 0, "Q2 item checkpoint cannot resolve %s", cp.pickups[i].classname);
+    set_pickup(m, g, e, (pickup_state){e, it, cp.pickups[i].targets_used, cp.pickups[i].retained, cp.pickups[i].has_expires_at, cp.pickups[i].expires_at, e->actor.id});
   }
   for (size_t i = 0; i < cp.power_count; i++) {
     qa_owned_actor actor = qa_q2_restore_actor(g, cp.powers[i].actor);
@@ -451,55 +461,82 @@ static bool instanced_coop(qa_q2_item_module *m, qa_q2_game_services *g) {
   return m->has_policy && m->policy.instanced_coop && m->policy.instanced_coop(m->policy.ctx, g);
 }
 
+/* Item ids collected from admission previews (TS arrays: no fixed size). */
+typedef struct id_list { qa_item_id *v; size_t n, cap; } id_list;
+static void id_list_push(id_list *list, qa_item_id value) {
+  if (list->n == list->cap) { list->cap = list->cap ? list->cap * 2 : 8; list->v = xrealloc(list->v, list->cap * sizeof *list->v); }
+  list->v[list->n++] = value;
+}
+
+typedef struct start_items_scope {
+  qa_q2_game_services *g;
+  const item **items; qa_q2_start_item *grants; size_t count;
+  id_list dests;
+  bool has_temporary; qa_actor_id temporary;
+} start_items_scope;
+/* TS finally { if (isLive(temporary.actor.id)) game.remove(temporary) }. The
+ * grant may already have released (and freed) the temporary entity. */
+static void start_items_remove_temporary(start_items_scope *scope) {
+  if (!scope->has_temporary) return;
+  scope->has_temporary = false;
+  qa_q2_game_services *g = scope->g;
+  if (!qa_session_actor_registry_is_live(g->host->actors, scope->temporary)) return;
+  qa_q2_entity *temporary = g->entity(g->ctx, &scope->temporary);
+  if (temporary) g->remove(g->ctx, temporary);
+}
+static void start_items_cleanup(void *arg) {
+  start_items_scope *scope = arg;
+  start_items_remove_temporary(scope);
+  free(scope->dests.v); scope->dests.v = NULL;
+  free(scope->items); scope->items = NULL;
+  qa_q2_start_items_free(scope->grants, scope->count); scope->grants = NULL;
+}
+
 void qa_q2_item_module_give_start_items(qa_q2_item_module *m, qa_owned_actor player, qa_q2_game_services *g, const char *expression) {
-  size_t count = 0;
-  qa_q2_start_item *grants = qa_q2_parse_start_items(expression, &count);
-  const item **items = malloc((count ? count : 1) * sizeof *items);
-  if (!items) qa_range_error("out of memory");
+  start_items_scope scope = {.g = g};
+  scope.grants = qa_q2_parse_start_items(expression, &scope.count);
+  size_t count = scope.count;
+  qa_q2_start_item *grants = scope.grants;
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, start_items_cleanup, &scope);
+  const item **items = scope.items = xrealloc(NULL, (count ? count : 1) * sizeof *items);
   for (size_t i = 0; i < count; i++) {
     /* TS lowercases the classname for catalog lookup */
     const item *found = NULL;
     for (size_t j = 0; j < m->catalog_count; j++) if (ieq2(m->catalog[j].classname, grants[i].classname)) { found = &m->catalog[j]; break; }
-    if (!found || (found->console_give && strcmp(found->console_give, "inventory-only") == 0)) {
-      static _Thread_local char buf[512];
-      snprintf(buf, sizeof buf, "Invalid Q2 starting item: %s", grants[i].classname);
-      free(items); qa_q2_start_items_free(grants, count);
-      qa_range_error("%s", buf);
-    }
+    if (!found || (found->console_give && strcmp(found->console_give, "inventory-only") == 0))
+      qa_raise("Error", 0, 0, "Invalid Q2 starting item: %s", grants[i].classname);
     items[i] = found;
   }
   for (size_t i = 0; i < count; i++) {
     const item *it = items[i];
     double cnt = grants[i].count;
     if (cnt == 0) {
-      qa_item_id dests[16];
-      size_t dn = 0;
-      dests[dn++] = ID(it);
+      id_list *dests = &scope.dests;
+      dests->n = 0;
       if (m->admission && strcmp(it->kind, "ammo") == 0 && m->admission->maps(m->admission->ctx, "ammo", ID(it))) {
         qa_pickup_supply_offer offer = {0};
         offer.kind = QA_PICKUP_SUPPLY_AMMO; offer.grant = (qa_pickup_ammo_grant){ID(it), 0};
         qa_pickup_supply_preview pv = m->admission->preview(m->admission->ctx, player.id, offer);
-        dn = 0;
-        for (size_t j = 0; j < pv.ammo_count && dn < 16; j++) dests[dn++] = pv.ammo[j].item;
+        for (size_t j = 0; j < pv.ammo_count; j++) id_list_push(dests, pv.ammo[j].item);
         if (it->weapon_ammo) {
           qa_pickup_supply_offer woffer = {0};
           woffer.kind = QA_PICKUP_SUPPLY_WEAPON; woffer.item = ID(it);
           qa_pickup_supply_preview wpv = m->admission->preview(m->admission->ctx, player.id, woffer);
-          for (size_t j = 0; j < wpv.weapon_count && dn < 16; j++) dests[dn++] = wpv.weapons[j].item;
+          for (size_t j = 0; j < wpv.weapon_count; j++) id_list_push(dests, wpv.weapons[j].item);
         }
       } else if (m->admission && strcmp(it->kind, "weapon") == 0 && m->admission->maps(m->admission->ctx, "weapons", ID(it)) && strcmp(ID(it), "q2:weapon_blaster") != 0) {
         qa_pickup_supply_offer woffer = {0};
         woffer.kind = QA_PICKUP_SUPPLY_WEAPON; woffer.item = ID(it);
         qa_pickup_supply_preview wpv = m->admission->preview(m->admission->ctx, player.id, woffer);
-        dn = 0;
-        for (size_t j = 0; j < wpv.weapon_count && dn < 16; j++) dests[dn++] = wpv.weapons[j].item;
-      }
-      for (size_t j = 0; j < dn; j++) {
+        for (size_t j = 0; j < wpv.weapon_count; j++) id_list_push(dests, wpv.weapons[j].item);
+      } else id_list_push(dests, ID(it));
+      for (size_t j = 0; j < dests->n; j++) {
         bool dup = false;
-        for (size_t k = 0; k < j; k++) if (strcmp(dests[k], dests[j]) == 0) dup = true;
+        for (size_t k = 0; k < j; k++) if (strcmp(dests->v[k], dests->v[j]) == 0) dup = true;
         if (dup) continue;
         qa_inventory_entry entry;
-        if (entry_of(g, player.id, dests[j], &entry)) {
+        if (entry_of(g, player.id, dests->v[j], &entry)) {
           entry.count = 0;
           qa_shared_inventory_table_configure(g->host->inventory, player, entry, NULL, NULL);
         }
@@ -507,33 +544,35 @@ void qa_q2_item_module_give_start_items(qa_q2_item_module *m, qa_owned_actor pla
       continue;
     }
     qa_q2_entity *temporary = g->create(g->ctx, it->classname, NULL, 0);
+    scope.temporary = temporary->actor.id; scope.has_temporary = true;
     temporary->count = cnt;
     temporary->spawnflags = (double)(qa_js_to_int32(temporary->spawnflags) | 0x10000);
-    set_pickup(m, temporary, (pickup_state){temporary, it, false, false, false, 0});
+    set_pickup(m, g, temporary, (pickup_state){temporary, it, false, false, false, 0, temporary->actor.id});
     if (grant(m, temporary, g, player, it)) finish_grant(m, temporary, g, player, it);
-    if (qa_session_actor_registry_is_live(g->host->actors, temporary->actor.id)) g->remove(g->ctx, temporary);
+    start_items_remove_temporary(&scope);
   }
-  free(items);
-  qa_q2_start_items_free(grants, count);
+  qa_cleanup_pop(&cleanup);
+  start_items_cleanup(&scope);
 }
 
 void qa_q2_item_module_give_ammo_count(qa_q2_item_module *m, qa_owned_actor player, qa_q2_game_services *g, qa_item_id item_id, const double *count) {
   qa_q2_inventory_item found;
   if (!qa_q2_item_module_lookup(m, item_id, &found) || strcmp(found.kind, "ammo") != 0)
-    qa_range_error("Console ammo grant requires a source ammo item");
+    qa_raise("Error", 0, 0, "Console ammo grant requires a source ammo item");
   bool mapped = m->admission && m->admission->maps(m->admission->ctx, "ammo", found.id);
-  qa_item_id dests[16];
-  size_t dn = 0;
+  id_list list = {0};
   if (mapped) {
     qa_pickup_supply_offer offer = {0};
     offer.kind = QA_PICKUP_SUPPLY_AMMO; offer.grant = (qa_pickup_ammo_grant){found.id, 0};
     qa_pickup_supply_preview pv = m->admission->preview(m->admission->ctx, player.id, offer);
-    for (size_t i = 0; i < pv.ammo_count && dn < 16; i++) dests[dn++] = pv.ammo[i].item;
-  } else dests[dn++] = found.id;
+    for (size_t i = 0; i < pv.ammo_count; i++) id_list_push(&list, pv.ammo[i].item);
+  } else id_list_push(&list, found.id);
+  qa_item_id *dests = list.v;
+  size_t dn = list.n;
   for (size_t i = 0; i < dn; i++) {
     qa_inventory_entry entry;
     bool has = entry_of(g, player.id, dests[i], &entry) != NULL;
-    if (mapped && !has) qa_range_error("Console ammo destination was not admitted");
+    if (mapped && !has) { free(dests); qa_raise("Error", 0, 0, "Console ammo destination was not admitted"); }
     double next = count ? *count : (has ? entry.count : 0) + found.quantity;
     if (mapped && has) {
       entry.count = (entry.has_count_policy && strcmp(entry.count_policy.kind, "source-counter") == 0) ? next : qa_js_max(0, next);
@@ -544,6 +583,7 @@ void qa_q2_item_module_give_ammo_count(qa_q2_item_module *m, qa_owned_actor play
       qa_shared_inventory_table_configure(g->host->inventory, player, ne, NULL, NULL);
     }
   }
+  free(dests);
 }
 
 void qa_q2_item_module_clear_powerups(qa_q2_item_module *m, qa_actor_id player) {
@@ -553,7 +593,7 @@ void qa_q2_item_module_clear_powerups(qa_q2_item_module *m, qa_actor_id player) 
 
 static qa_q2_entity *drop_source(qa_q2_item_module *m, qa_owned_actor actor, qa_q2_game_services *g, const item *it, qa_q2_drop_options options, double count) {
   qa_body_state_result body = qa_shared_body_table_read(g->host->bodies, actor.id);
-  if (!body.has_value) qa_range_error("Item drop owner has no shared body");
+  if (!body.has_value) qa_raise("Error", 0, 0, "Item drop owner has no shared body");
   qa_q2_entity *dropped = g->create(g->ctx, it->classname, NULL, 0);
   dropped->model = it->model;
   dropped->has_owner = true; dropped->owner = actor.id;
@@ -561,7 +601,7 @@ static qa_q2_entity *drop_source(qa_q2_item_module *m, qa_owned_actor actor, qa_
   dropped->effects = it->rotate ? 1 : 0;
   dropped->render_flags = 512 | 0x8000;
   dropped->count = count;
-  set_pickup(m, dropped, (pickup_state){dropped, it, false, false, options.has_expires_at, options.expires_at});
+  set_pickup(m, g, dropped, (pickup_state){dropped, it, false, false, options.has_expires_at, options.expires_at, dropped->actor.id});
   qa_q2_player_view_result view = g->host->player_view_state(g->host->ctx, actor.id);
   qa_vec3 angles = view.has_value ? view.value.view_angles : body.value.angles;
   qa_vec3 mang = angles;
@@ -637,15 +677,16 @@ static double cell_read(void *ctx) {
 static void cell_write(void *ctx, double count) {
   struct cell_ctx *c = ctx;
   qa_inventory_entry entry;
-  if (!entry_of(c->g, c->actor.id, "q2:ammo_cells", &entry)) qa_range_error("Q2 power armor requires its admitted cell inventory");
+  if (!entry_of(c->g, c->actor.id, "q2:ammo_cells", &entry)) qa_raise("Error", 0, 0, "Q2 power armor requires its admitted cell inventory");
   entry.count = count;
   qa_shared_inventory_table_configure(c->g->host->inventory, c->actor, entry, NULL, NULL);
 }
 static void bind_power_armor(qa_q2_item_module *m, qa_owned_actor actor, qa_q2_game_services *g) {
   for (size_t i = 0; i < m->binding_count; i++) if (qa_same_actor(m->bindings[i], actor.id)) return;
   if (m->cell_count == m->cell_cap) { m->cell_cap = m->cell_cap ? m->cell_cap * 2 : 8; m->cell_ctxs = xrealloc(m->cell_ctxs, m->cell_cap * sizeof *m->cell_ctxs); }
-  m->cell_ctxs[m->cell_count] = (struct cell_ctx){g, actor};
-  struct cell_ctx *ctx = &m->cell_ctxs[m->cell_count++];
+  struct cell_ctx *ctx = xrealloc(NULL, sizeof *ctx);
+  *ctx = (struct cell_ctx){g, actor};
+  m->cell_ctxs[m->cell_count++] = ctx;
   qa_power_armor_cell_binding binding = {.ctx = ctx, .read = cell_read, .write = cell_write};
   qa_gameplay_authority_bind_power_armor_cells(g->host->combat, actor, binding);
   if (m->binding_count == m->binding_cap) { m->binding_cap = m->binding_cap ? m->binding_cap * 2 : 8; m->bindings = xrealloc(m->bindings, m->binding_cap * sizeof *m->bindings); }
@@ -699,7 +740,7 @@ bool qa_q2_item_module_spawn_item(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_g
     g->remove(g->ctx, e);
     return true;
   }
-  set_pickup(m, e, (pickup_state){e, it, false, false, false, 0});
+  set_pickup(m, g, e, (pickup_state){e, it, false, false, false, 0, e->actor.id});
   if (g->options.mode == QA_Q2_MODE_COOP && (strcmp(it->classname, "key_power_cube") == 0 || (g->options.edition == QA_Q2_EDITION_RERELEASE && strcmp(it->classname, "key_explosive_charges") == 0)))
     /* spawnflags |= 1 << (8 + powerCubeCount++): JS masks the shift count to 5 bits, so
      * the 25th cube wraps to bit 1; a C int shift by 32 or more is undefined. */
@@ -727,7 +768,7 @@ static double ammo_quantity(qa_q2_entity *e, qa_q2_game_services *g, const item 
   if (it->weapon_ammo && !it->infinite_ammo_is_null && (qa_js_to_int32(qa_q2_options_deathmatch_flags(&g->options)) & 8192) != 0 &&
       !qa_q2_no_infinite_ammo(&g->options, ID(it)))
     return it->has_infinite_ammo_quantity ? it->infinite_ammo_quantity : 1000;
-  return e->count != 0 ? e->count : it->quantity;
+  return e->count != 0 && !isnan(e->count) ? e->count : it->quantity; /* TS count || quantity */
 }
 static size_t weapon_ammo(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g, const item *it, qa_pickup_ammo_grant *out) {
   if ((qa_js_to_int32(e->spawnflags) & 0x10000) != 0 || !it->ammo) return 0;
@@ -761,7 +802,6 @@ bool qa_q2_item_module_observe_supply(qa_q2_item_module *m, qa_q2_game_services 
   if (!e || !p) return false;
   const item *it = p->it;
   qa_pickup_supply_offer offer = {0};
-  static _Thread_local qa_pickup_ammo_grant grants[1];
   if (strcmp(it->kind, "ammo") == 0) {
     const char * item2 = ID(it);
     double amount = ammo_quantity(e, g, it);
@@ -771,11 +811,13 @@ bool qa_q2_item_module_observe_supply(qa_q2_item_module *m, qa_q2_game_services 
   } else if (strcmp(it->kind, "weapon") == 0) {
     offer.kind = QA_PICKUP_SUPPLY_WEAPON;
     offer.item = ID(it);
-    offer.ammo_count = weapon_ammo(m, e, g, it, grants);
-    offer.ammo = grants;
+    /* TS weaponAmmo() returns a fresh array (of at most one grant) per call. It is stored in this observation's own
+     * `grant` member, which a weapon offer does not otherwise use, so a later call cannot rewrite it. */
+    offer.ammo_count = weapon_ammo(m, e, g, it, &offer.grant);
   } else return false;
   out->actor = pickup_actor;
   out->offer = offer;
+  if (offer.kind == QA_PICKUP_SUPPLY_WEAPON) out->offer.ammo = &out->offer.grant;
   if (!e->visible || strcmp(e->solid, "trigger") != 0) {
     if (qa_q2_spawn_has(&e->spawn, "team") || m->hooks.random_respawn) { out->availability_kind = "inactive"; return true; }
     if (e->think.fn == respawn_fn && e->think.ctx == m && e->has_next_think) {
@@ -821,7 +863,7 @@ bool qa_q2_item_module_preview_supply(qa_q2_item_module *m, qa_q2_game_services 
   else ammo[ammo_n++] = offer.grant;
   for (size_t i = 0; i < ammo_n; i++) {
     const item *descriptor = strncmp(ammo[i].item, "q2:", 3) == 0 ? catalog_get(m, ammo[i].item + 3) : NULL;
-    if (!descriptor || strcmp(descriptor->kind, "ammo") != 0) { free(inventory); qa_range_error("Weapon grant has no source ammo descriptor"); }
+    if (!descriptor || strcmp(descriptor->kind, "ammo") != 0) { free(inventory); qa_raise("Error", 0, 0, "Weapon grant has no source ammo descriptor"); }
     bool exists = false;
     for (size_t j = 0; j < inv_count; j++) if (strcmp(inventory[j].item, ammo[i].item) == 0) exists = true;
     if (!exists) inventory[inv_count++] = (qa_inventory_entry){.item = ammo[i].item, .count = 0, .capacity = descriptor->capacity};
@@ -847,14 +889,10 @@ bool qa_q2_item_module_preview_supply(qa_q2_item_module *m, qa_q2_game_services 
 
 void qa_q2_item_module_replace_item(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g, const char *descriptor) {
   const item *it = catalog_get(m, descriptor);
-  if (!it) {
-    static _Thread_local char buf[512];
-    snprintf(buf, sizeof buf, "Q2 replacement item is not registered: %s", descriptor);
-    qa_range_error("%s", buf);
-  }
+  if (!it) qa_raise("Error", 0, 0, "Q2 replacement item is not registered: %s", descriptor);
   pickup_state state = *pickup_of(m, e);
   state.it = it;
-  set_pickup(m, e, state);
+  set_pickup(m, g, e, state);
   e->classname = it->classname;
   e->model = it->model;
   e->effects = it->rotate ? 1 : 0;
@@ -864,21 +902,32 @@ void qa_q2_item_module_replace_item(qa_q2_item_module *m, qa_q2_entity *e, qa_q2
 static void respawn_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_item_module *m = c;
   const char *team = qa_q2_spawn_get(&e->spawn, "team");
-  qa_q2_entity *candidates[64];
-  size_t cn = 0;
-  if (!team) candidates[cn++] = e;
+  /* TS candidates array: every member of the item team, however many. */
+  qa_q2_entity **candidates = NULL;
+  size_t cn = 0, ccap = 0;
+  if (!team) { candidates = xrealloc(NULL, sizeof *candidates); candidates[cn++] = e; }
   else {
-    for (qa_q2_entity *member = e->has_team_master ? g->entity(g->ctx, &e->team_master) : NULL; member && cn < 64;
-         member = member->has_chain ? g->entity(g->ctx, &member->chain) : NULL)
+    for (qa_q2_entity *member = e->has_team_master ? g->entity(g->ctx, &e->team_master) : NULL; member;
+         member = member->has_chain ? g->entity(g->ctx, &member->chain) : NULL) {
+      if (cn == ccap) { ccap = ccap ? ccap * 2 : 16; candidates = xrealloc(candidates, ccap * sizeof *candidates); }
       candidates[cn++] = member;
+    }
   }
-  size_t idx = cn ? (size_t)floor(g->host->random(g->host->ctx) * (double)cn) : 0;
-  qa_q2_entity *selected = cn && idx < cn ? candidates[idx] : e;
+  /* candidates[Math.floor(random() * length)] ?? entity: the random number is
+   * drawn even when the team has no member. */
+  double pick = floor(g->host->random(g->host->ctx) * (double)cn);
+  qa_q2_entity *selected = pick >= 0 && pick < (double)cn ? candidates[(size_t)pick] : e;
+  free(candidates);
+  /* The hook may release the entity it was given; its id is read first. */
+  qa_actor_id selected_id = selected->actor.id;
   if (g->options.edition == QA_Q2_EDITION_CLASSIC && m->hooks.random_respawn) {
     qa_q2_entity *replacement = m->hooks.random_respawn(m->hooks.ctx, selected, g);
-    if (replacement && replacement != selected) { g->remove(g->ctx, selected); selected = replacement; }
+    if (replacement && replacement != selected) {
+      if (qa_session_actor_registry_is_live(g->host->actors, selected_id)) g->remove(g->ctx, selected);
+      selected = replacement; selected_id = replacement->actor.id;
+    }
   }
-  if (!qa_session_actor_registry_is_live(g->host->actors, selected->actor.id)) return;
+  if (!qa_session_actor_registry_is_live(g->host->actors, selected_id)) return;
   selected->visible = true;
   g->solid(g->ctx, selected, "trigger");
   g->show(g->ctx, selected);
@@ -905,7 +954,7 @@ static void drop_floor_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_trace_request tr = {.start = origin, .end = qa_q2_add(origin, (qa_vec3){0, 0, -128}), .bounds = &bounds, .ignore = &e->actor.id, .mask = 3};
   qa_trace_result trace = g->host->trace(g->host->ctx, tr);
   if (trace.start_solid) {
-    static _Thread_local char buf[512];
+    static _Thread_local char buf[640];
     snprintf(buf, sizeof buf, "Q2 %s starts solid", e->classname);
     g->host->diagnostic(g->host->ctx, buf);
     g->remove(g->ctx, e);
@@ -939,14 +988,21 @@ static void drop_floor_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   g->show(g->ctx, e);
 }
 
+/* TS closures of touch(): `entity`, `state`, `owner`. The entity can be
+ * released (and freed) by any callback in between, so the context keeps its
+ * actor id and looks the pickup state up again while the entity is live. */
 typedef struct touch_ctx {
   qa_q2_item_module *m; qa_q2_entity *e; qa_q2_game_services *g;
-  qa_actor_id player; qa_owned_actor owner; pickup_state *state; const item *it; bool original_ran;
+  qa_actor_id player; qa_owned_actor owner; qa_actor_id entity_id; const item *it; bool original_ran;
 } touch_ctx;
 static bool touch_live(touch_ctx *t) {
   qa_owned_actor cur;
-  return t->g->entity(t->g->ctx, &t->e->actor.id) == t->e &&
+  return t->g->entity(t->g->ctx, &t->entity_id) == t->e &&
          qa_session_actor_registry_resolve_owned(t->g->host->actors, t->player, &cur) && qa_same_owned_actor(cur, t->owner);
+}
+/* The live entity's pickup state; NULL once the entity is gone (TS then writes a state nobody reads). */
+static pickup_state *touch_state(touch_ctx *t) {
+  return t->g->entity(t->g->ctx, &t->entity_id) == t->e ? find_pickup(t->m, t->e) : NULL;
 }
 static bool touch_eligible(void *c) {
   touch_ctx *t = c;
@@ -956,7 +1012,8 @@ static bool touch_eligible(void *c) {
 static bool touch_original(void *c) {
   touch_ctx *t = c;
   t->original_ran = true;
-  t->state->retained = false;
+  pickup_state *state = touch_state(t);
+  if (state) state->retained = false;
   return grant(t->m, t->e, t->g, t->owner, t->it);
 }
 static void touch_complete(void *c, bool taken) {
@@ -966,7 +1023,7 @@ static void touch_complete(void *c, bool taken) {
   qa_q2_entity *e = t->e;
   if (!touch_live(t)) return;
   if (taken) {
-    if (!t->original_ran) t->state->retained = false;
+    if (!t->original_ran) { pickup_state *state = touch_state(t); if (state) state->retained = false; }
     finish_grant(m, e, g, t->owner, t->it);
     if (!touch_live(t)) return;
     qa_q2_presentation_event ev = {0};
@@ -991,18 +1048,18 @@ static void touch_complete(void *c, bool taken) {
   }
   if (m->has_policy && m->policy.before_targets) m->policy.before_targets(m->policy.ctx, e, g, t->player, taken);
   if (!touch_live(t)) return;
-  if (!t->state->targets_used) {
+  pickup_state *state = touch_state(t);
+  if (state && !state->targets_used) {
     qa_q2_game_use_targets_entity(g, e, &t->player, false);
-    /* state pointer may be stale after callbacks reallocating pickups */
-    pickup_state *fresh = find_pickup(m, e);
-    if (fresh) fresh->targets_used = true;
-    t->state = fresh ? fresh : t->state;
+    /* The targets may have released the entity or grown the pickup table. */
+    state = touch_state(t);
+    if (state) state->targets_used = true;
   }
   if (!touch_live(t)) return;
   if (m->has_policy && m->policy.after_pickup) m->policy.after_pickup(m->policy.ctx, e, g, t->player, taken);
   if (!taken || !touch_live(t)) return;
   bool stays = g->options.mode == QA_Q2_MODE_COOP && stays_coop(t->it);
-  pickup_state *fresh = find_pickup(m, e);
+  pickup_state *fresh = touch_state(t);
   bool retained = fresh ? fresh->retained : true;
   if ((!stays || is_dropped(e)) && !retained &&
       !(m->has_policy && m->policy.keep_after_pickup && m->policy.keep_after_pickup(m->policy.ctx, e, g, t->player)) && touch_live(t))
@@ -1017,7 +1074,7 @@ void qa_q2_item_module_touch(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_s
   const item *it = state->it;
   qa_owned_actor owner;
   if (!qa_session_actor_registry_resolve_owned(g->host->actors, player, &owner)) return;
-  touch_ctx t = {m, e, g, player, owner, state, it, false};
+  touch_ctx t = {m, e, g, player, owner, e->actor.id, it, false};
   if (!g->host->original_pickups) {
     if (touch_eligible(&t)) touch_complete(&t, touch_original(&t));
     return;
@@ -1106,7 +1163,7 @@ static bool grant(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g,
     ensure_entry(m, player, g, ID(it), 32767);
     if (g->options.mode == QA_Q2_MODE_COOP) {
       if (strcmp(it->classname, "key_power_cube") == 0 || (g->options.edition == QA_Q2_EDITION_RERELEASE && strcmp(it->classname, "key_explosive_charges") == 0)) {
-        if (!pe) qa_range_error("Q2 cooperative key pickup requires admitted source player fields");
+        if (!pe) qa_raise("Error", 0, 0, "Q2 cooperative key pickup requires admitted source player fields");
         int32_t cubes = (qa_js_to_int32(e->spawnflags) & 0xff00) >> 8; /* TS (spawnflags & 0xff00) >> 8 */
         if ((qa_js_to_int32(pe->power_cubes) & cubes) != 0) return false;
         pe->power_cubes = (double)(qa_js_to_int32(pe->power_cubes) | cubes);
@@ -1123,7 +1180,7 @@ static bool grant(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g,
           : strcmp(ammo->classname, "ammo_slugs") == 0 ? (it->full ? 100 : 75) : (it->full ? 100 : ammo->capacity);
       ensure_entry(m, player, g, ID(ammo), ammo->capacity);
       qa_inventory_entry entry;
-      if (!entry_of(g, player.id, ID(ammo), &entry)) qa_range_error("Q2 ammo pack has no admitted ammo inventory");
+      if (!entry_of(g, player.id, ID(ammo), &entry)) qa_raise("Error", 0, 0, "Q2 ammo pack has no admitted ammo inventory");
       entry.capacity = qa_js_max(entry.capacity, capacity);
       qa_shared_inventory_table_configure(g->host->inventory, player, entry, NULL, NULL);
       if (it->full || strcmp(ammo->classname, "ammo_bullets") == 0 || strcmp(ammo->classname, "ammo_shells") == 0)
@@ -1161,7 +1218,7 @@ static bool grant(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g,
     if (!admission) {
       for (size_t i = 0; i < gn; i++) {
         const item *ammo = strncmp(grants[i].item, "q2:", 3) == 0 ? catalog_get(m, grants[i].item + 3) : NULL;
-        if (!ammo || strcmp(ammo->kind, "ammo") != 0) qa_range_error("Weapon grant has no source ammo descriptor");
+        if (!ammo || strcmp(ammo->kind, "ammo") != 0) qa_raise("Error", 0, 0, "Weapon grant has no source ammo descriptor");
         ensure_entry(m, player, g, grants[i].item, ammo->capacity);
         qa_shared_inventory_table_give(g->host->inventory, player, grants[i].item, grants[i].amount);
       }
@@ -1174,7 +1231,7 @@ static bool grant(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g,
   }
   if (strcmp(kind, "health") == 0) {
     if (!it->ignore_maximum && current.value.health >= maximum) return false;
-    double amount = e->count != 0 ? e->count : it->amount;
+    double amount = e->count != 0 && !isnan(e->count) ? e->count : it->amount; /* TS count || amount */
     qa_gameplay_authority_set_health(g->host->combat, player, it->ignore_maximum ? current.value.health + amount : qa_js_min(maximum, current.value.health + amount));
     return true;
   }
@@ -1348,7 +1405,9 @@ void qa_q2_item_module_destroy(qa_q2_item_module *m) {
   free(m->bindings); free(m->list_scratch); free(m->winv_scratch);
   if (m->path_bufs) for (size_t i = 0; i < m->path_cap; i++) free(m->path_bufs[i]);
   free(m->path_scratch); free(m->path_bufs);
-  free(m->cp_pickups); free(m->cp_powers); free(m->cp_bindings); free(m->cell_ctxs);
+  free(m->cp_pickups); free(m->cp_powers); free(m->cp_bindings);
+  for (size_t i = 0; i < m->cell_count; i++) free(m->cell_ctxs[i]);
+  free(m->cell_ctxs);
   free(m);
 }
 qa_q2_spawn_module qa_q2_item_module_as_spawn(qa_q2_item_module *m) {

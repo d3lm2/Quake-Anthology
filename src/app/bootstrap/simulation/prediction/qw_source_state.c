@@ -20,8 +20,8 @@ qa_movement_profile qa_app_qw_prediction_profile(qa_movement_profile base, qa_ap
 qa_app_movement_prediction_snapshot qa_app_qw_prediction_snapshot(qa_app_movement_prediction_snapshot base,
     qa_qw_player_state player, qa_app_qw_prediction_status status,
     const qa_app_movement_prediction_snapshot *acknowledged, double sequence, double command_time_milliseconds) {
-  if (status.spectator != 0) qa_range_error("The native QW graphical player slice does not admit spectators");
-  if (base.state.kind != QA_MOVEMENT_STATE_QW) qa_range_error("QW prediction requires a QW snapshot");
+  if (status.spectator != 0) qa_raise("Error", 0, 0, "The native QW graphical player slice does not admit spectators");
+  if (base.state.kind != QA_MOVEMENT_STATE_QW) qa_raise("Error", 0, 0, "QW prediction requires a QW snapshot");
   qa_qw_movement_state continuation = acknowledged && acknowledged->state.kind == QA_MOVEMENT_STATE_QW
       ? acknowledged->state.as.qw : base.state.as.qw;
   double view_height = ((qa_js_to_int32(player.flags)) & 1024) != 0 ? 8 : ((qa_js_to_int32(player.flags)) & 512) != 0 ? -16 : 22;
@@ -62,7 +62,7 @@ struct qa_app_quakeworld_prediction {
 
 static qa_app_movement_prediction_snapshot client_continuation(qa_app_quakeworld_prediction *prediction,
     qa_app_movement_prediction_snapshot player, qa_qw_user_command command) {
-  if (player.state.kind != QA_MOVEMENT_STATE_QW) qa_range_error("QW replay changed movement family");
+  if (player.state.kind != QA_MOVEMENT_STATE_QW) qa_raise("Error", 0, 0, "QW replay changed movement family");
   player.view_height = prediction->view_height;
   player.view_offset = (qa_vec3){0, 0, prediction->view_height};
   player.state.as.qw.old_buttons = command.buttons;
@@ -100,9 +100,9 @@ static void predict(qa_app_quakeworld_prediction *prediction) {
 qa_app_quakeworld_prediction *qa_app_quakeworld_prediction_create(qa_app_movement_prediction_options options,
     qa_app_movement_prediction_snapshot initial, qa_app_qw_move_variables variables) {
   if (!options.probe.profile.kind || (strcmp(options.probe.profile.kind, "q1-netquake") != 0 && strcmp(options.probe.profile.kind, "q1-quakeworld") != 0))
-    qa_range_error("QW prediction requires Q1 movement parameters");
+    qa_raise("Error", 0, 0, "QW prediction requires Q1 movement parameters");
   if (initial.state.kind != QA_MOVEMENT_STATE_QW || initial.state.as.qw.spectator != 0)
-    qa_range_error("QW prediction requires an admitted native player");
+    qa_raise("Error", 0, 0, "QW prediction requires an admitted native player");
   qa_app_quakeworld_prediction *prediction = calloc(1, sizeof *prediction);
   if (!prediction) return NULL;
   prediction->profile = qa_app_qw_prediction_profile(options.probe.profile, variables);
@@ -143,7 +143,9 @@ void qa_app_quakeworld_prediction_sent(qa_app_quakeworld_prediction *prediction,
 }
 void qa_app_quakeworld_prediction_acknowledged(qa_app_quakeworld_prediction *prediction, double sequence, double now) {
   (void)now;
-  if (!(isfinite(sequence) && sequence == trunc(sequence))) qa_range_error("QW acknowledgement needs an integer channel sequence");
+  /* Number.isSafeInteger(sequence) */
+  if (!(isfinite(sequence) && sequence == trunc(sequence) && fabs(sequence) <= 9007199254740991.0))
+    qa_range_error("QW acknowledgement needs an integer channel sequence");
   if (sequence > prediction->acknowledged_sequence) prediction->acknowledged_sequence = sequence;
 }
 void qa_app_quakeworld_prediction_receive(qa_app_quakeworld_prediction *prediction,
@@ -156,7 +158,8 @@ void qa_app_quakeworld_prediction_receive(qa_app_quakeworld_prediction *predicti
       acknowledged && acknowledged->has_player ? &acknowledged->player : NULL,
       prediction->acknowledged_sequence, acknowledged ? acknowledged->time_milliseconds : base.command_time_milliseconds);
   prediction->profile = qa_app_qw_prediction_profile(prediction->profile, variables);
-  /* TS getter profile: update the inner prediction's borrowed options copy. */
+  /* The inner prediction reads `get profile() { return owner.profile }`: later replays use the new variables. */
+  qa_app_selected_movement_prediction_set_profile(prediction->prediction, prediction->profile);
   prediction->view_height = snapshot.view_height;
   qa_app_selected_movement_prediction_receive(prediction->prediction, snapshot);
   qa_app_movement_prediction_snapshot_destroy(&snapshot);

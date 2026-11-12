@@ -8,12 +8,25 @@
 #include "qa/foundation/support.h"
 #include "qa/persistence/save_image.h"
 #include "qa/persistence/shared.h"
-#define MAX_LOCAL 64
+/* TS Map<OwnedActor, Vec3>: insertion-ordered, no size limit. */
 struct qa_app_sim_q1_player_punch {
   qa_app_sim_q1_punch_actors actors;
   bool (*source)(void *ctx, qa_actor_id actor, qa_app_sim_q1_punch_owner *out); void *source_ctx;
-  qa_owned_actor keys[MAX_LOCAL]; qa_vec3 values[MAX_LOCAL]; size_t count;
+  qa_owned_actor *keys; qa_vec3 *values; size_t count, capacity;
 };
+static void append_local(qa_app_sim_q1_player_punch *p, qa_owned_actor actor, qa_vec3 angles) {
+  if (p->count == p->capacity) {
+    size_t capacity = p->capacity ? p->capacity * 2 : 16;
+    qa_owned_actor *keys = realloc(p->keys, capacity * sizeof *keys);
+    if (keys == NULL) qa_range_error("Out of memory");
+    p->keys = keys;
+    qa_vec3 *values = realloc(p->values, capacity * sizeof *values);
+    if (values == NULL) qa_range_error("Out of memory");
+    p->values = values;
+    p->capacity = capacity;
+  }
+  p->keys[p->count] = actor; p->values[p->count++] = angles;
+}
 static bool same_owned(qa_owned_actor a, qa_owned_actor b) {
   return qa_same_actor(a.id, b.id) && a.owner == b.owner;
 }
@@ -30,7 +43,7 @@ typedef struct owner_ref { qa_owned_actor actor; bool has_source; qa_app_sim_q1_
 static owner_ref resolve(qa_app_sim_q1_player_punch *p, qa_actor_id actor) {
   owner_ref out; memset(&out, 0, sizeof out);
   if (!p->actors.resolve_owned(p->actors.ctx, actor, &out.actor))
-    qa_range_error("Q1 punch references a retired actor");
+    qa_raise("Error", 0, 0, "Q1 punch references a retired actor");
   out.has_source = p->source(p->source_ctx, out.actor.id, &out.source);
   int at = find_local(p, out.actor);
   if (out.has_source && at >= 0) { out.source.write(out.source.ctx, p->values[at]); delete_local(p, (size_t)at); }
@@ -43,7 +56,10 @@ qa_app_sim_q1_player_punch *qa_app_sim_q1_player_punch_create(qa_app_sim_q1_punc
   p->actors = actors; p->source = source; p->source_ctx = source_ctx;
   return p;
 }
-void qa_app_sim_q1_player_punch_destroy(qa_app_sim_q1_player_punch *punch) { free(punch); }
+void qa_app_sim_q1_player_punch_destroy(qa_app_sim_q1_player_punch *punch) {
+  if (punch == NULL) return;
+  free(punch->keys); free(punch->values); free(punch);
+}
 void qa_app_sim_q1_player_punch_release(qa_app_sim_q1_player_punch *punch, qa_owned_actor actor) {
   int at = find_local(punch, actor); if (at >= 0) delete_local(punch, (size_t)at);
 }
@@ -59,10 +75,7 @@ void qa_app_sim_q1_player_punch_write(qa_app_sim_q1_player_punch *punch, qa_acto
   if (o.has_source) { o.source.write(o.source.ctx, angles); return; }
   int at = find_local(punch, o.actor);
   if (at >= 0) punch->values[at] = angles;
-  else {
-    if (punch->count >= MAX_LOCAL) qa_range_error("Out of memory");
-    punch->keys[punch->count] = o.actor; punch->values[punch->count++] = angles;
-  }
+  else append_local(punch, o.actor, angles);
 }
 qa_vec3 qa_app_sim_q1_player_punch_advance(qa_app_sim_q1_player_punch *punch, qa_actor_id actor, double elapsed, qa_numeric_operations numeric) {
   qa_vec3 current = qa_app_sim_q1_player_punch_read(punch, actor);
@@ -98,8 +111,7 @@ void qa_app_sim_q1_player_punch_restore(qa_app_sim_q1_player_punch *punch, const
       qa_save_reader_fail(&entry, "Saved Q1 punch has no unique fallback owner");
     if (!qa_save_reader_field(&entry, "angles", &vf)) qa_save_reader_fail(&entry, "out of memory");
     qa_vec3 angles = qa_read_vector(&vf); qa_save_reader_destroy(&vf);
-    if (punch->count >= MAX_LOCAL) qa_save_reader_fail(&entry, "out of memory");
-    punch->keys[punch->count] = actor; punch->values[punch->count++] = angles;
+    append_local(punch, actor, angles);
     qa_save_reader_destroy(&entry);
   }
 }

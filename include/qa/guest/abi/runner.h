@@ -95,7 +95,5 @@ void qa_guest_call_runner_unwind(qa_guest_call_runner *runner, int64_t depth);
 /* TS recover(): after a stopped outermost call, returns the processor to its
  * state at entry so shutdown does not run on the faulted stack. */
 void qa_guest_call_runner_recover(qa_guest_call_runner *runner);
-/* TS chargeBytes: one budget unit per 64 bytes from every active frame. */
-void qa_guest_call_runner_charge_bytes(qa_guest_call_runner *runner, size_t byte_length);
 
 #endif

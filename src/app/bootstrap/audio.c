@@ -29,6 +29,7 @@
 #include "qa/formats/q1_map/types.h"
 #include "qa/formats/q2_map.h"
 #include "qa/formats/q3_map/entities.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/event_ring.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
@@ -290,11 +291,29 @@ static void set_cvar_number(qa_cvar_registry *cvars, const char *name, double va
   if (qa_cvar_registry_set(cvars, name, text, false, &snapshot)) qa_cvar_read_free(&snapshot);
 }
 
-static void open_failure(qa_app_application_audio *audio, qa_sdl_audio_open_result result) {
-  (void)audio;
-  /* The engine port reports SdlAudioUnavailableError as a result code
-   * and keeps the platform's message to itself. */
-  plain_error(result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : "Audio output is unavailable");
+/* The message of the engine's failed open: SdlAudioUnavailableError's SDL text (an allocation failure inside the
+ * opening path, QA_SDL_AUDIO_OPEN_FAILED, has none). */
+static const char *open_message(qa_unified_audio *engine, qa_sdl_audio_open_result result) {
+  return result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : qa_unified_audio_open_error(engine);
+}
+/* engine.close(); throw error: the message is copied before the owner is destroyed. */
+static noreturn void open_failure(qa_app_application_audio *audio, qa_sdl_audio_open_result result) {
+  char text[QA_CAUGHT_MESSAGE_CAPACITY];
+  snprintf(text, sizeof text, "%s", open_message(audio->engine, result));
+  qa_app_application_audio_destroy(audio);
+  plain_error("%s", text);
+}
+/* engine.selectOutput throws what the open threw; the port returns it as a result. One failure is the C backend's own:
+ * SDL2's queue (the only backend ported) cannot report exact input frames at a resampled rate where TS's SDL3 stream
+ * can (the hermetic dummy driver hits it for every non-native rate), so the C cannot tell whether TS would throw; that
+ * selection keeps the restored previous output, as the port did before. */
+static void check_selection(qa_app_application_audio *audio, qa_sdl_audio_open_result result) {
+  if (result == QA_SDL_AUDIO_OPEN_OK) return;
+  const char *message = open_message(audio->engine, result);
+  if (result == QA_SDL_AUDIO_OPEN_UNAVAILABLE
+      && strcmp(message, "SDL audio driver cannot report exact queued input frames at this sample rate") == 0)
+    return;
+  plain_error("%s", message);
 }
 
 qa_app_application_audio *qa_app_application_audio_create(qa_app_loaded_content *content,
@@ -339,12 +358,12 @@ qa_app_application_audio *qa_app_application_audio_create(qa_app_loaded_content 
   const char *output_device = options.device_name;
   qa_sdl_audio_open_result result = qa_unified_audio_open_device(audio->engine, output_device, 0);
   if (result != QA_SDL_AUDIO_OPEN_OK) {
-    if (output_device == NULL) { qa_app_application_audio_destroy(audio); open_failure(NULL, result); }
+    if (output_device == NULL) open_failure(audio, result);
     char *text = xformat("Audio output %s unavailable: %s. Using system default.\n", output_device,
-                         result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : "Audio output is unavailable");
+                         open_message(audio->engine, result));
     print_text(audio, text); free(text);
     qa_sdl_audio_open_result fallback = qa_unified_audio_open_device(audio->engine, NULL, 0);
-    if (fallback != QA_SDL_AUDIO_OPEN_OK) { qa_app_application_audio_destroy(audio); open_failure(NULL, fallback); }
+    if (fallback != QA_SDL_AUDIO_OPEN_OK) open_failure(audio, fallback);
   }
   return audio;
 }
@@ -366,16 +385,25 @@ static char *selected_copy(const qa_app_application_audio *audio) {
 }
 void qa_app_application_audio_select_output_format(qa_app_application_audio *audio, qa_audio_output_format format) {
   char *selected = selected_copy(audio);
-  qa_unified_audio_select_output(audio->engine, selected, &format, false);
+  qa_cleanup guard; /* the format check and AggregateError raise inside selectOutput */
+  qa_cleanup_push(&guard, free, selected);
+  qa_sdl_audio_open_result result = qa_unified_audio_select_output(audio->engine, selected, &format, false);
+  qa_cleanup_pop(&guard);
   free(selected);
+  check_selection(audio, result);
   if (audio->output_cvars != NULL) qa_app_write_audio_output_cvars(audio->output_cvars, qa_app_application_audio_output_format(audio));
 }
 void qa_app_application_audio_restart_output(qa_app_application_audio *audio) {
-  char *selected = selected_copy(audio);
+  /* The selectedOutput getter has no effects, so the cvar read (which can raise) runs before the copy is taken. */
   qa_audio_output_format format = audio->output_cvars == NULL ? qa_app_application_audio_output_format(audio)
       : qa_app_read_audio_output_cvars(audio->output_cvars);
-  qa_unified_audio_select_output(audio->engine, selected, &format, true);
+  char *selected = selected_copy(audio);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, selected);
+  qa_sdl_audio_open_result result = qa_unified_audio_select_output(audio->engine, selected, &format, true);
+  qa_cleanup_pop(&guard);
   free(selected);
+  check_selection(audio, result);
 }
 const char *qa_app_application_audio_selected_output(const qa_app_application_audio *audio) {
   return qa_unified_audio_selected_output(audio->engine);
@@ -384,7 +412,7 @@ char **qa_app_application_audio_output_device_names(qa_app_application_audio *au
   return qa_unified_audio_output_device_names(audio->engine, out_count);
 }
 void qa_app_application_audio_select_output(qa_app_application_audio *audio, const char *device_name) {
-  qa_unified_audio_select_output(audio->engine, device_name, NULL, false);
+  check_selection(audio, qa_unified_audio_select_output(audio->engine, device_name, NULL, false));
 }
 void qa_app_application_audio_detach_output(qa_app_application_audio *audio) {
   qa_unified_audio_detach_output(audio->engine);
@@ -485,8 +513,9 @@ static void parse_environment_file(void *ctx) {
   size_t length = 0;
   parse->bytes = qa_content_mounted_read_reference(parse->mounts, parse->resource, &length);
   if (parse->bytes == NULL) qa_range_error("Out of memory");
-  parse->text = xmalloc(length + 1);
-  memcpy(parse->text, parse->bytes, length); parse->text[length] = '\0';
+  /* new TextDecoder().decode(bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD */
+  parse->text = qa_text_decoder_decode(parse->bytes, length, NULL);
+  if (parse->text == NULL) qa_range_error("Out of memory");
   if (!qa_parse_environments(parse->text, environment_warn, parse->audio, &parse->definitions, &parse->count))
     qa_range_error("Out of memory");
   qa_cleanup_pop(&cleanup);
@@ -722,9 +751,10 @@ static qa_q3_player_footsteps q3_footsteps(qa_app_application_audio *audio, qa_c
   if (!found) found = qa_content_mounted_open(mounts, "models/players/sarge/animation.cfg", NULL, NULL, &file);
   qa_q3_player_footsteps footsteps = QA_Q3_FOOTSTEPS_NORMAL;
   if (found) {
-    char *text = xmalloc(file.byte_length + 1);
-    memcpy(text, file.bytes, file.byte_length); text[file.byte_length] = '\0';
+    /* new TextDecoder().decode(file.bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD */
+    char *text = qa_text_decoder_decode(file.bytes, file.byte_length, NULL);
     free(file.bytes);
+    if (text == NULL) qa_range_error("Out of memory");
     footstep_parse parse = {text, file.reference != NULL ? file.reference->requested_path : NULL, QA_Q3_FOOTSTEPS_NORMAL};
     qa_caught_error caught;
     /* An unparsable authored config reports and falls back to default

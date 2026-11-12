@@ -149,14 +149,14 @@ static void world_words_restore(void *ctx, const uint8_t *bytes, size_t length) 
     qa_save_reader item, name, value;
     must(qa_save_reader_item(&root, i, &item));
     must(qa_save_reader_field(&item, "name", &name));
-    char *text = strdup(qa_save_reader_string(&name));
-    if (text == NULL) qa_range_error("out of memory");
+    /* Borrowed from the decoded tree, which outlives the set (the word table copies the name);
+     * a copy made here leaked when the value reader raised. */
+    const char *text = qa_save_reader_string(&name);
     qa_save_reader_destroy(&name);
     must(qa_save_reader_field(&item, "value", &value));
     const double number = qa_save_reader_number(&value);
     qa_save_reader_destroy(&value);
     qa_q1_source_world_word_set(game, text, number);
-    free(text);
     qa_save_reader_destroy(&item);
   }
   qa_save_reader_destroy(&root);

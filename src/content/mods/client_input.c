@@ -69,7 +69,7 @@ qa_mod_client_input_binding *qa_read_mod_client_input(
       if (strcmp(bindings[i].phase, "before") != 0 || read_output == NULL) {
         qa_save_reader_destroy(&entry);
         /* TS throws a plain Error here. */
-        qa_range_error("Input outputs require a declared before source adapter");
+        qa_raise("Error", 0, 0, "%s", "Input outputs require a declared before source adapter");
       }
       bindings[i].outputs = read_list(&entry, "outputs", read_output, output_ctx,
                                       output_elem_size, &bindings[i].output_count);

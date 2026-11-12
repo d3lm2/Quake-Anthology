@@ -17,7 +17,7 @@ static qa_vec3 multiply_add(qa_vec3 origin, double scale, qa_vec3 direction) {
 }
 void qa_q3_pres_view_runtime_init(qa_q3_pres_view_runtime *view, qa_q3_pres_client_game_state *state,
                                   qa_q3_pres_prediction_runtime *prediction, qa_q3_pres_view_host host) {
-  if (prediction->state != state) qa_range_error("View and prediction must share one client state");
+  if (prediction->state != state) qa_raise("Error", 0, 0, "View and prediction must share one client state");
   view->state = state;
   view->prediction = prediction;
   view->host = host;
@@ -28,7 +28,7 @@ static void offset_third_person(qa_q3_pres_view_runtime *view, qa_q3_pres_view_s
 static void offset_first_person(qa_q3_pres_view_runtime *view, qa_q3_pres_view_settings settings);
 bool qa_q3_pres_view_runtime_calculate_view_values(qa_q3_pres_view_runtime *view) {
   qa_q3_pres_client_game_state *state = view->state;
-  if (!state->snap) qa_range_error("CG_CalcViewValues requires a current snapshot");
+  if (!state->snap) qa_raise("Error", 0, 0, "CG_CalcViewValues requires a current snapshot");
   qa_q3_pres_view_settings settings = view->host.settings(view->host.ctx);
   qa_q3_base_source_player_state *ps = &state->predicted_player_state;
   state->refdef = qa_q3_pres_create_refdef();
@@ -36,8 +36,12 @@ bool qa_q3_pres_view_runtime_calculate_view_values(qa_q3_pres_view_runtime *view
   double size = state->snap->player_state.pm_type == QA_Q3_PM_INTERMISSION ? 100 : settings.view_size;
   if (size < 30) { view->host.set_view_size(view->host.ctx, 30); size = 30; }
   else if (size > 100) { view->host.set_view_size(view->host.ctx, 100); size = 100; }
-  refdef->width = (double)(qa_js_to_int32(trunc((double)((int32_t)((int64_t)settings.video_width * (int64_t)size)) / 100)) & ~1);
-  refdef->height = (double)(qa_js_to_int32(trunc((double)((int32_t)((int64_t)settings.video_height * (int64_t)size)) / 100)) & ~1);
+  /* Math.imul: both operands through ToInt32 (a NaN view size multiplies as 0), the product wrapped to int32. */
+  int32_t size_bits = qa_js_to_int32(size);
+  int32_t width_product = (int32_t)((uint32_t)qa_js_to_int32(settings.video_width) * (uint32_t)size_bits);
+  int32_t height_product = (int32_t)((uint32_t)qa_js_to_int32(settings.video_height) * (uint32_t)size_bits);
+  refdef->width = (double)(qa_js_to_int32(trunc((double)width_product / 100)) & ~1);
+  refdef->height = (double)(qa_js_to_int32(trunc((double)height_product / 100)) & ~1);
   refdef->x = qa_int32((settings.video_width - refdef->width) / 2);
   refdef->y = qa_int32((settings.video_height - refdef->height) / 2);
   if (refdef->width <= 0 || refdef->height <= 0) qa_range_error("Camera view requires a positive viewport");
@@ -73,7 +77,7 @@ bool qa_q3_pres_view_runtime_calculate_view_values(qa_q3_pres_view_runtime *view
   return calculate_fov(view, settings);
 }
 qa_q3_pres_refdef qa_q3_pres_view_runtime_finish_refdef(qa_q3_pres_view_runtime *view) {
-  if (!view->state->snap) qa_range_error("Finishing the view requires a current snapshot");
+  if (!view->state->snap) qa_raise("Error", 0, 0, "Finishing the view requires a current snapshot");
   view->state->refdef.time = view->state->time;
   memcpy(view->state->refdef.area_mask, view->state->snap->area_mask, 32);
   view->state->refdef.area_mask_length = 32;
@@ -128,7 +132,7 @@ static void offset_third_person(qa_q3_pres_view_runtime *view, qa_q3_pres_view_s
 }
 static void offset_first_person(qa_q3_pres_view_runtime *view, qa_q3_pres_view_settings settings) {
   qa_q3_pres_client_game_state *state = view->state;
-  if (!state->snap) qa_range_error("First-person offset requires a snapshot");
+  if (!state->snap) qa_raise("Error", 0, 0, "First-person offset requires a snapshot");
   if (state->snap->player_state.pm_type == QA_Q3_PM_INTERMISSION) return;
   qa_q3_pres_refdef *refdef = &state->refdef;
   qa_q3_base_source_player_state *ps = &state->predicted_player_state;

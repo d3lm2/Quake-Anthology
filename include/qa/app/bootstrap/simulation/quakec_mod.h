@@ -21,14 +21,6 @@ typedef struct qa_app_sim_prepare_quakec_mod_options {
   void *read_script_ctx;
   char *(*read_script)(void *ctx, const char *name); /* malloc'd or NULL */
 } qa_app_sim_prepare_quakec_mod_options;
-typedef struct qa_app_sim_quakec_mod_mounts {
-  void *ctx;
-  /* mounts.open: false when TS null; bytes malloc'd. */
-  bool (*open)(void *ctx, const char *path, uint8_t **out_bytes, size_t *out_length, const char **out_digest);
-  /* prepareQuakeCResources(program, mounts). */
-  qa_compat_qc_mod_media (*prepare_resources)(void *ctx, qa_compat_qc_program *program);
-} qa_app_sim_quakec_mod_mounts;
-qa_prepared_mod qa_app_sim_prepare_mounted_quakec_mod(qa_app_sim_prepare_quakec_mod_options options, qa_app_sim_quakec_mod_mounts mounts);
 /* TS prepareMountedQuakeCMod({ description, declaration, declarationDigest, mounts }) over
  * MountedContent: the program, prepareQuakeCResources and readScript come from mounts,
  * which must outlive the prepared mod (it owns the program bytes and resources).

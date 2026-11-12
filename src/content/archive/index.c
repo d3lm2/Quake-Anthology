@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js_case.h"
+#include "qa/foundation/node_path.h"
 #include "qa/foundation/support.h"
 
 static void free_entries(qa_archive_entry *entries, size_t count) {
@@ -60,26 +62,34 @@ static uint8_t *read_selected(qa_archive_handle *archive,
     return qa_archive_source_read(&archive->storage, entry->data_offset,
                                   entry->byte_length, out_length);
   size_t header_length = 0, variable_length = 0, compressed_length = 0;
+  /* Each buffer is released when the parser it feeds raises (malformed input). */
+  qa_cleanup node;
   uint8_t *header_bytes = qa_archive_source_read(
       &archive->storage, entry->local_header_offset, 30, &header_length);
   if (header_bytes == NULL && header_length != 0) return NULL;
+  qa_cleanup_push(&node, free, header_bytes);
   qa_zip_local_header header = qa_read_zip_local_header(
       header_bytes, header_length, archive->source, entry);
+  qa_cleanup_pop(&node);
   free(header_bytes);
   uint8_t *variable = qa_archive_source_read(
       &archive->storage, entry->local_header_offset + 30, header.byte_length,
       &variable_length);
   if (variable == NULL && variable_length != 0) return NULL;
+  qa_cleanup_push(&node, free, variable);
   int64_t offset = qa_zip_data_offset(variable, variable_length,
                                       header.name_length, archive->source,
                                       archive->central_offset, entry);
+  qa_cleanup_pop(&node);
   free(variable);
   uint8_t *compressed = qa_archive_source_read(
       &archive->storage, offset, entry->compressed_size, &compressed_length);
   if (compressed == NULL && compressed_length != 0) return NULL;
+  qa_cleanup_push(&node, free, compressed);
   uint8_t *decoded = qa_decode_zip_entry(compressed, compressed_length,
                                          archive->source, offset, entry,
                                          out_length);
+  qa_cleanup_pop(&node);
   free(compressed);
   return decoded;
 }
@@ -121,31 +131,19 @@ void qa_archive_destroy(qa_archive_handle *archive) {
   free(archive);
 }
 
-/* node path extname(source).toLowerCase(), approximated over bytes. */
+/* TS detectFormat: the PACK magic, then extname(source).toLowerCase(). */
 static qa_archive_format detect_format(const uint8_t *header, size_t header_length,
                                        const char *source) {
   if (header_length >= 4 && header[0] == 80 && header[1] == 65 &&
       header[2] == 67 && header[3] == 75)
     return QA_ARCHIVE_FORMAT_PAK;
-  const char *slash = strrchr(source, '/');
-  const char *base = slash != NULL ? slash + 1 : source;
-  const char *dot = strrchr(base, '.');
-  char extension[8] = "";
-  if (dot != NULL && dot != base) {
-    size_t length = strlen(dot);
-    if (length < sizeof extension) {
-      for (size_t i = 0; i < length; i++) {
-        char c = dot[i];
-        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-        extension[i] = c;
-      }
-      extension[length] = '\0';
-    }
-  }
-  if (strcmp(extension, ".pk3") == 0) return QA_ARCHIVE_FORMAT_PK3;
-  if (strcmp(extension, ".kpf") == 0) return QA_ARCHIVE_FORMAT_KPF;
-  if (strcmp(extension, ".pak") == 0) return QA_ARCHIVE_FORMAT_PAK;
-  return QA_ARCHIVE_FORMAT_ZIP;
+  char *extension = qa_node_path_extname(source);
+  qa_archive_format format = QA_ARCHIVE_FORMAT_ZIP;
+  if (qa_js_equals_ignore_case(extension, ".pk3")) format = QA_ARCHIVE_FORMAT_PK3;
+  else if (qa_js_equals_ignore_case(extension, ".kpf")) format = QA_ARCHIVE_FORMAT_KPF;
+  else if (qa_js_equals_ignore_case(extension, ".pak")) format = QA_ARCHIVE_FORMAT_PAK;
+  free(extension);
+  return format;
 }
 
 /* openArchiveSource's catch closes the retained source before rethrowing a

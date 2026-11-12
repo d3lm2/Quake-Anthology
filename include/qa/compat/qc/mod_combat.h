@@ -13,7 +13,8 @@
 #include "qa/contracts/execution.h"
 #include "qa/world/session/mods.h"
 void qa_compat_qc_validate_mod_combat(qa_compat_qc_program *program, qa_mod_qc_combat declaration);
-size_t qa_compat_qc_damage_inputs(qa_damage_request request, double seconds, qa_compat_qc_mod_input_entry *out, size_t capacity);
+/* TS qcDamageInputs. The entries' actor pointers borrow *request: the caller keeps it alive while it uses them. */
+size_t qa_compat_qc_damage_inputs(const qa_damage_request *request, double seconds, qa_compat_qc_mod_input_entry *out, size_t capacity);
 typedef struct qa_compat_qc_mod_combat_options {
   qa_compat_qc_program *program; qa_module_identity module;
   qa_mod_qc_combat *declaration; qa_mod_host_services *services;
@@ -36,7 +37,9 @@ typedef struct qa_compat_qc_mod_combat {
   size_t incoming_count, incoming_capacity;
   /* Authored-request provenance cells. Requests nest with the QC call
    * stack (limit 32), so the ring outlives every live request. */
-  struct qa_compat_qc_mod_combat_attack { qa_actor_id attacker, inflictor; char death_type[256]; } attacks[64]; size_t attack_next;
+  /* Authored attack provenance cells; death_type is the whole guest string (owned, replaced when the
+   * cell is reused, released by destroy). */
+  struct qa_compat_qc_mod_combat_attack { qa_actor_id attacker, inflictor; char *death_type; } attacks[64]; size_t attack_next;
   struct qa_compat_qc_mod_combat_bind { struct qa_compat_qc_mod_combat *c; qa_compat_qc_words *words; qa_owned_actor actor; const qa_q1_id1_program_binding *binding; qa_q1qc_empty_armor empty; } **bind_storage; size_t bind_count, bind_capacity;
   struct qa_compat_qc_mod_combat *self_ref;
 } qa_compat_qc_mod_combat;

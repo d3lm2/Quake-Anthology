@@ -58,7 +58,7 @@ static void validate_field(void *ctx, const qa_qvm_item_field *field, const char
       (int64_t)field->offset % 4 != 0 || field->offset + 4 > record->stride ||
       (strcmp(usage, "view") != 0 && previous != NULL &&
        !(strcmp(usage, "capacity") == 0 && strcmp(previous, "capacity") == 0)))
-    qa_range_error("Invalid QVM item source field");
+    qa_raise("Error", 0, 0, "Invalid QVM item source field");
   if (strcmp(usage, "view") != 0) {
     if (state->count == state->capacity) {
       state->capacity = state->capacity == 0 ? 16 : state->capacity * 2;
@@ -83,8 +83,18 @@ static void validate_field(void *ctx, const qa_qvm_item_field *field, const char
     else length = 4;
     if (value->offset < field->offset + 4 && field->offset < value->offset + length &&
         strcmp(value->binding, "private") != 0 && strcmp(value->binding, "constant") != 0)
-      qa_range_error("QVM item field overlaps another canonical source projection");
+      qa_raise("Error", 0, 0, "QVM item field overlaps another canonical source projection");
   }
+}
+
+static void free_validate_state(void *arg) {
+  validate_state *state = arg;
+  free(state->key_records);
+  free(state->key_offsets);
+  free(state->usages);
+  state->key_records = NULL;
+  state->key_offsets = NULL;
+  state->usages = NULL;
 }
 
 static const qa_qvm_instruction *insn(const qa_qvm_instruction *instructions, size_t count, int64_t index) {
@@ -102,13 +112,18 @@ void qa_qvm_validate_mod_items(const qa_qvm_mod_items *items, const qa_qvm_mod_c
                                const qa_qvm_instruction *instructions, size_t instruction_count,
                                int64_t initialized_data_length, int64_t bss_length) {
   if (declaration->clients == NULL || items->definition_count == 0)
-    qa_range_error("QVM items require source client admission");
+    qa_raise("Error", 0, 0, "QVM items require source client admission");
   for (size_t i = 0; i < items->definition_count; i++)
     for (size_t j = i + 1; j < items->definition_count; j++)
       if (strcmp(items->definitions[i].item, items->definitions[j].item) == 0)
-        qa_range_error("Duplicate QVM source item definition");
+        qa_raise("Error", 0, 0, "Duplicate QVM source item definition");
   validate_state state = {declaration, NULL, NULL, NULL, 0, 0};
+  /* A refused declaration raises from any of the checks below. */
+  qa_cleanup state_cleanup;
+  qa_cleanup_push(&state_cleanup, free_validate_state, &state);
   qa_item_id *ids = xmalloc(items->definition_count * sizeof *ids);
+  qa_cleanup ids_cleanup;
+  qa_cleanup_push(&ids_cleanup, free, ids);
   for (size_t i = 0; i < items->definition_count; i++) ids[i] = items->definitions[i].item;
   qa_qvm_image image;
   memset(&image, 0, sizeof image);
@@ -119,12 +134,13 @@ void qa_qvm_validate_mod_items(const qa_qvm_mod_items *items, const qa_qvm_mod_c
   qa_qvm_item_field_validator validator = {&state, validate_field_validator};
   qa_qvm_validate_item_storage(items->storage, items->storage_count, ids, items->definition_count,
                                &image, validator);
+  qa_cleanup_pop(&ids_cleanup);
   free(ids);
   size_t weapon_count = 0;
   for (size_t i = 0; i < items->definition_count; i++)
     if (items->definitions[i].is_weapon) weapon_count++;
   if ((weapon_count == 0) != (items->weapons == NULL))
-    qa_range_error("QVM weapon items require an original source consumer");
+    qa_raise("Error", 0, 0, "QVM weapon items require an original source consumer");
   if (items->weapons != NULL) {
     const qa_qvm_weapon_stage *stage = &items->weapons->stage;
     qa_qvm_validate_weapon_stage(stage, instructions, instruction_count);
@@ -137,38 +153,39 @@ void qa_qvm_validate_mod_items(const qa_qvm_mod_items *items, const qa_qvm_mod_c
         bool found = false;
         for (size_t i = 0; i < declaration->clients->records.count; i++)
           if (strcmp(declaration->clients->records.values[i], records[p]) == 0) found = true;
-        if (!found) qa_range_error("QVM weapon pointer is not an admitted client record");
+        if (!found) qa_raise("Error", 0, 0, "QVM weapon pointer is not an admitted client record");
       }
       const qa_qvm_mod_input_pointer *source = pointers[p];
       if (!source->is_global
               ? source->index != trunc(source->index) || source->index < 0 || source->index >= QVM_MAX_PRIVATE_ARGUMENT_WORDS
               : source->address != trunc(source->address) || source->address < 0 ||
-                    (int64_t)source->address % 4 != 0 || source->address + 4 > (double)(initialized_data_length + bss_length))
-        qa_range_error("QVM weapon pointer exceeds its original call ABI");
+                    fmod(source->address, 4) != 0 || source->address + 4 > (double)(initialized_data_length + bss_length))
+        qa_raise("Error", 0, 0, "QVM weapon pointer exceeds its original call ABI");
       for (size_t i = 0; i < source->indirections.count; i++) {
         double value = source->indirections.values[i];
         if (!isfinite(value) || value != trunc(value) || value < -9007199254740991.0 ||
             value > 9007199254740991.0 || value < 0 || (int64_t)value % 4 != 0)
-          qa_range_error("QVM weapon pointer is not aligned source storage");
+          qa_raise("Error", 0, 0, "QVM weapon pointer is not aligned source storage");
       }
+      /* TS Number.isSafeInteger: an integer past 2^53 is refused too. */
       if (!isfinite(source->offset) || source->offset != trunc(source->offset) || source->offset < 0 ||
-          (int64_t)source->offset % 4 != 0)
-        qa_range_error("QVM weapon pointer is not aligned source storage");
+          source->offset > 9007199254740991.0 || (int64_t)source->offset % 4 != 0)
+        qa_raise("Error", 0, 0, "QVM weapon pointer is not aligned source storage");
     }
     const qa_qvm_weapon_projection *projection = &stage->continuation.projection;
     if (!isfinite(projection->byte_length) || projection->byte_length != trunc(projection->byte_length) ||
         projection->byte_length < -9007199254740991.0 || projection->byte_length > 9007199254740991.0 ||
         projection->byte_length < 12 || (int64_t)projection->byte_length % 4 != 0)
-      qa_range_error("QVM weapon movement projection lacks its caller layout");
+      qa_raise("Error", 0, 0, "QVM weapon movement projection lacks its caller layout");
     double bounds[] = {projection->minimum, projection->maximum};
     for (int i = 0; i < 2; i++) {
       if (!isfinite(bounds[i]) || bounds[i] != trunc(bounds[i]) || bounds[i] < -9007199254740991.0 ||
           bounds[i] > 9007199254740991.0 || bounds[i] < 0 || (int64_t)bounds[i] % 4 != 0 ||
           bounds[i] + 12 > projection->byte_length)
-        qa_range_error("QVM weapon bounds exceed their original caller storage");
+        qa_raise("Error", 0, 0, "QVM weapon bounds exceed their original caller storage");
     }
     if (fabs(projection->minimum - projection->maximum) < 12)
-      qa_range_error("QVM weapon caller bounds overlap");
+      qa_raise("Error", 0, 0, "QVM weapon caller bounds overlap");
     double entry = items->weapons->input.entry;
     size_t input_matches = 0;
     const qa_mod_client_input_binding *matched = NULL;
@@ -183,7 +200,7 @@ void qa_qvm_validate_mod_items(const qa_qvm_mod_items *items, const qa_qvm_mod_c
     const qa_qvm_instruction *instruction = insn(instructions, instruction_count, (int64_t)entry);
     if (instruction == NULL || instruction->opcode != QA_QVMY_OP_ENTER || input_matches != 1 ||
         matched == NULL || strcmp(matched->scope, "movement-slice") != 0 || strcmp(matched->phase, "after") != 0)
-      qa_range_error("QVM weapon input requires one declared original callback after authoritative movement");
+      qa_raise("Error", 0, 0, "QVM weapon input requires one declared original callback after authoritative movement");
     validate_field(&state, &stage->selection.field, "view");
     validate_field(&state, &items->weapons->input.clock, "view");
     validate_field(&state, &projection->view_height, "view");
@@ -196,7 +213,7 @@ void qa_qvm_validate_mod_items(const qa_qvm_mod_items *items, const qa_qvm_mod_c
         if (!integer_word(tests[t][i].value) ||
             (tests[t][i].has_mask && (!isfinite(tests[t][i].mask) || tests[t][i].mask != trunc(tests[t][i].mask) ||
                                       tests[t][i].mask < 0 || tests[t][i].mask > 2147483647.0)))
-          qa_range_error("Invalid QVM weapon source state predicate");
+          qa_raise("Error", 0, 0, "Invalid QVM weapon source state predicate");
       }
     }
     bool selection_differs = stage->selection.value_count != weapon_count;
@@ -213,18 +230,17 @@ void qa_qvm_validate_mod_items(const qa_qvm_mod_items *items, const qa_qvm_mod_c
       if (!integer_word(stage->selection.values[i].value) || stage->selection.values[i].value < 1 || !is_weapon)
         selection_differs = true;
     }
-    if (selection_differs) qa_range_error("QVM weapon selection differs from its admitted definitions");
+    if (selection_differs) qa_raise("Error", 0, 0, "QVM weapon selection differs from its admitted definitions");
     for (size_t i = 0; i < items->definition_count; i++) {
       if (!items->definitions[i].is_weapon || items->definitions[i].weapon.ammo == NULL) continue;
       bool found = false;
       for (size_t j = 0; j < items->definition_count; j++)
         if (strcmp(items->definitions[j].item, items->definitions[i].weapon.ammo) == 0) found = true;
-      if (!found) qa_range_error("QVM weapon ammo lacks its source storage");
+      if (!found) qa_raise("Error", 0, 0, "QVM weapon ammo lacks its source storage");
     }
   }
-  free(state.key_records);
-  free(state.key_offsets);
-  free(state.usages);
+  qa_cleanup_pop(&state_cleanup);
+  free_validate_state(&state);
 }
 
 typedef struct request {
@@ -367,7 +383,7 @@ static void write_storage(qa_qvm_mod_items_runtime *items, qa_actor_id actor, qa
   item_entry *current = find_entry(items, actor);
   const qa_qvm_item_storage *storage = storage_for(items, entry.item);
   if (current == NULL || !entry_current(items, current) || storage == NULL)
-    qa_range_error("QVM item storage is no longer admitted");
+    qa_raise("Error", 0, 0, "QVM item storage is no longer admitted");
   storage_access state = {items, actor, NULL};
   qa_qvm_item_storage_access access = {&state, access_read, access_global, access_write};
   qa_qvm_write_item_storage(&items->image->image, *storage, entry, access);
@@ -396,7 +412,7 @@ static void lease_invoke(void *ctx, qa_item_id item, qa_source_item_action actio
                                                   : state->items->definition->definitions[i].action_drop;
   }
   if (current == NULL || !entry_current(state->items, current) || call == NULL)
-    qa_range_error("Source item action is no longer admitted");
+    qa_raise("Error", 0, 0, "Source item action is no longer admitted");
   (void)state->items->operations->invoke(state->items->operations->ctx, state->actor, call);
 }
 
@@ -457,27 +473,32 @@ typedef struct pending_changes {
 typedef struct observe_state {
   qa_qvm_mod_items_runtime *items;
   qa_actor_id actor;
+  /* TS watches: each storage's addresses as they stood at admission. */
+  int64_t *watch_addresses; /* owned, grouped by storage */
+  size_t *watch_counts;     /* owned, one per storage */
   pending_changes *pending; /* owned */
   size_t pending_count;
   size_t pending_capacity;
 } observe_state;
 
+static void free_pending_changes(void *arg) {
+  pending_changes *changes = arg;
+  free(changes->changes);
+  changes->changes = NULL;
+}
+static void free_inventory_entries(void *arg) { qa_qvm_inventory_entries_destroy(arg); }
+
 static void observe_publish(void *ctx, const qa_qvm_committed_write *event) {
   observe_state *state = ctx;
   qa_qvm_mod_items_runtime *items = state->items;
   pending_changes changes = {event, NULL, 0, 0};
-  for (size_t s = 0; s < items->definition->storage_count; s++) {
+  /* The reads below can be refused (a retired pointer, an undeclared pickup store). */
+  qa_cleanup changes_cleanup;
+  qa_cleanup_push(&changes_cleanup, free_pending_changes, &changes);
+  const int64_t *addresses = state->watch_addresses;
+  for (size_t s = 0; s < items->definition->storage_count; s++, addresses += state->watch_counts[s - 1]) {
     const qa_qvm_item_storage *storage = &items->definition->storage[s];
-    size_t address_capacity = 2 + (strcmp(storage->kind, "counter") == 0 ? storage->capacity.override_count : 0);
-    int64_t *addresses = xmalloc(address_capacity * sizeof *addresses);
-    size_t address_count = 0;
-    addresses[address_count++] = address_of(items, state->actor, &storage->field);
-    if (strcmp(storage->kind, "counter") == 0 && strcmp(storage->capacity.kind, "field") == 0)
-      addresses[address_count++] = address_of(items, state->actor, &storage->capacity.field);
-    if (strcmp(storage->kind, "counter") == 0 && strcmp(storage->capacity.kind, "source") == 0) {
-      for (size_t o = 0; o < storage->capacity.override_count; o++)
-        addresses[address_count++] = (int64_t)storage->capacity.overrides[o].address;
-    }
+    size_t address_count = state->watch_counts[s];
     bool touched = false;
     for (size_t a = 0; a < address_count; a++) {
       for (size_t r = 0; r < event->range_count; r++) {
@@ -486,10 +507,12 @@ static void observe_publish(void *ctx, const qa_qvm_committed_write *event) {
           touched = true;
       }
     }
-    free(addresses);
     if (!touched) continue;
     qa_qvm_inventory_entries before = read_storage(items, state->actor, storage, event);
+    qa_cleanup before_cleanup, after_cleanup;
+    qa_cleanup_push(&before_cleanup, free_inventory_entries, &before);
     qa_qvm_inventory_entries after = read_storage(items, state->actor, storage, NULL);
+    qa_cleanup_push(&after_cleanup, free_inventory_entries, &after);
     for (size_t i = 0; i < after.count; i++) {
       const qa_inventory_entry *previous = NULL;
       for (size_t j = 0; j < before.count && previous == NULL; j++)
@@ -508,7 +531,7 @@ static void observe_publish(void *ctx, const qa_qvm_committed_write *event) {
                 (previous->capacity == after.entries[i].capacity || strcmp(write->fields, "count") != 0))
               allowed = true;
           }
-          if (!allowed) qa_range_error("Original pickup changed an undeclared QVM source item");
+          if (!allowed) qa_raise("Error", 0, 0, "Original pickup changed an undeclared QVM source item");
         }
         if (changes.count == changes.capacity) {
           changes.capacity = changes.capacity == 0 ? 8 : changes.capacity * 2;
@@ -520,15 +543,29 @@ static void observe_publish(void *ctx, const qa_qvm_committed_write *event) {
         changes.count++;
       }
     }
+    qa_cleanup_pop(&after_cleanup);
+    qa_cleanup_pop(&before_cleanup);
     qa_qvm_inventory_entries_destroy(&before);
     qa_qvm_inventory_entries_destroy(&after);
   }
+  qa_cleanup_pop(&changes_cleanup);
   if (state->pending_count == state->pending_capacity) {
     state->pending_capacity = state->pending_capacity == 0 ? 4 : state->pending_capacity * 2;
     state->pending = realloc(state->pending, state->pending_capacity * sizeof *state->pending);
     if (state->pending == NULL) qa_range_error("QVM memory allocation failed");
   }
   state->pending[state->pending_count++] = changes;
+}
+
+typedef struct stored_job {
+  struct item_entry *entry;
+  const qa_source_item_store *changes;
+  size_t count;
+} stored_job;
+
+static void stored_body(void *ctx) {
+  stored_job *job = ctx;
+  job->entry->lease.stored(job->entry->lease.ctx, job->changes, job->count);
 }
 
 static void observe_after(void *ctx, const qa_qvm_committed_write *event) {
@@ -547,11 +584,19 @@ static void observe_after(void *ctx, const qa_qvm_committed_write *event) {
   qa_actor_id actor = state->actor;
   item_entry *entry = find_entry(items, actor);
   if (found && changes.count != 0 && entry != NULL && entry_current(items, entry)) {
-    /* The lease aborts on retirement (inventory.c), so TS's SourceItemRetired
-     * catch has no throw to see; the post-store currency check stands. */
+    /* TS: try { lease.stored(changes) } catch (error) { a SourceItemRetired
+     * for this lease cancels the retired weapon input; throw error }. The
+     * shared inventory raises SourceItemRetired on retirement
+     * (world/gameplay/inventory.c qa_retired). */
     qa_cleanup guard;
     qa_cleanup_push(&guard, free, changes.changes);
-    entry->lease.stored(entry->lease.ctx, changes.changes, changes.count);
+    stored_job job = {entry, changes.changes, changes.count};
+    qa_caught_error failure;
+    if (!qa_try(stored_body, &job, &failure)) {
+      if (strcmp(failure.name, "SourceItemRetired") == 0 && items->weapons != NULL)
+        qa_qvm_mod_weapon_stage_cancel_retired(items->weapons, actor);
+      qa_rethrow(&failure);
+    }
     qa_cleanup_pop(&guard);
     if (!entry_current(items, entry) && items->weapons != NULL)
       qa_qvm_mod_weapon_stage_cancel_retired(items->weapons, actor);
@@ -563,6 +608,8 @@ static void observe_state_free(observe_state *state) {
   if (state == NULL) return;
   for (size_t i = 0; i < state->pending_count; i++) free(state->pending[i].changes);
   free(state->pending);
+  free(state->watch_addresses);
+  free(state->watch_counts);
   free(state);
 }
 
@@ -641,7 +688,7 @@ static bool binding_accepts(qa_qvm_mod_items_runtime *items, item_entry *entry, 
 }
 
 static qa_source_weapon_request binding_request(qa_qvm_mod_items_runtime *items, item_entry *entry, qa_item_id item) {
-  if (!entry_current(items, entry)) qa_range_error("QVM source weapon request lost its actor");
+  if (!entry_current(items, entry)) qa_raise("Error", 0, 0, "QVM source weapon request lost its actor");
   bool accepted = item == NULL ? qa_qvm_mod_weapon_stage_active(items->weapons, entry->actor.id) != NULL &&
                                       qa_qvm_mod_weapon_stage_settled(items->weapons, entry->actor.id)
                                 : binding_accepts(items, entry, item);
@@ -672,7 +719,7 @@ static bool handoff_select(void *ctx, qa_item_id item) {
 }
 static void handoff_holster(void *ctx) {
   binding_state *state = ctx;
-  if (!entry_current(state->items, state->entry)) qa_range_error("QVM source weapon retired while holstering");
+  if (!entry_current(state->items, state->entry)) qa_raise("Error", 0, 0, "QVM source weapon retired while holstering");
 }
 static bool handoff_is_holstered(void *ctx) {
   binding_state *state = ctx;
@@ -689,7 +736,7 @@ static qa_source_weapon_request handoff_restore(void *ctx, double id, qa_item_id
   if (!entry_current(state->items, state->entry) || saved == NULL || saved->id != (int64_t)id ||
       !((saved->item == NULL && item == NULL) ||
         (saved->item != NULL && item != NULL && strcmp(saved->item, item) == 0)))
-    qa_range_error("Saved QVM weapon request differs from its original source owner");
+    qa_raise("Error", 0, 0, "Saved QVM weapon request differs from its original source owner");
   return make_capability(state->items, state->entry, saved);
 }
 static bool binding_current(void *ctx) {
@@ -699,7 +746,7 @@ static bool binding_current(void *ctx) {
 static qa_source_weapon_presentation binding_read(void *ctx) {
   binding_state *state = ctx;
   if (!entry_current(state->items, state->entry))
-    qa_range_error("QVM weapon presentation lost its original actor");
+    qa_raise("Error", 0, 0, "QVM weapon presentation lost its original actor");
   qa_actor_id actor = state->entry->actor.id;
   qa_item_id active = qa_qvm_mod_weapon_stage_active(state->items->weapons, actor);
   qa_item_id pending = NULL;
@@ -720,7 +767,7 @@ static qa_source_weapon_presentation binding_read(void *ctx) {
 }
 
 static qa_source_weapon_binding make_binding(qa_qvm_mod_items_runtime *items, item_entry *entry) {
-  if (items->weapons == NULL) qa_range_error("QVM weapon stage is absent");
+  if (items->weapons == NULL) qa_raise("Error", 0, 0, "QVM weapon stage is absent");
   binding_state *state = retain(items, sizeof *state);
   state->items = items;
   state->entry = entry;
@@ -807,7 +854,7 @@ static qa_qvm_posture weapon_posture(void *ctx, qa_actor_id actor) {
     view = items->services->clients->player_view(items->services->clients->ctx, client);
   }
   if (!has_view)
-    qa_range_error("QVM weapon input requires the actual authoritative posture");
+    qa_raise("Error", 0, 0, "QVM weapon input requires the actual authoritative posture");
   /* TS keeps the number; the stage stores it with setInt32 (ToInt32). */
   qa_qvm_posture result = {body.body.bounds, qa_int32(view.view_offset.z),
                            items->operations->ground(items->operations->ctx, actor)};
@@ -906,15 +953,42 @@ void qa_qvm_mod_items_runtime_destroy(qa_qvm_mod_items_runtime *items) {
   memset(items, 0, sizeof *items);
 }
 
+static void free_unadmitted_entry(void *arg) {
+  item_entry *entry = arg;
+  free(entry->addresses);
+  observe_state_free(entry->observe_state);
+  lease_state_free(entry->lease_state);
+  free(entry);
+}
+
+typedef struct release_scope {
+  qa_qvm_mod_items_runtime *items;
+  qa_actor_id actor;
+} release_scope;
+
+static void release_body(void *ctx) {
+  release_scope *scope = ctx;
+  qa_qvm_mod_items_release(scope->items, scope->actor);
+}
+
+/* Nothing raises while the raise that brought us here unwinds. */
+static void release_on_raise(void *arg) {
+  qa_caught_error ignored;
+  (void)qa_try(release_body, arg, &ignored);
+}
+
 void qa_qvm_mod_items_admit(qa_qvm_mod_items_runtime *items, qa_actor_id actor) {
   if (find_entry(items, actor) != NULL) return;
   qa_owned_actor owner;
   if (!qa_session_actor_registry_resolve_owned(items->services->actors, actor, &owner) ||
       !items->operations->live(items->operations->ctx, actor))
-    qa_range_error("QVM source items require the current admitted client");
+    qa_raise("Error", 0, 0, "QVM source items require the current admitted client");
   item_entry *entry = xmalloc(sizeof *entry);
   memset(entry, 0, sizeof *entry);
   entry->actor = owner;
+  /* Until the entry is on the list, a refusal releases what it holds. */
+  qa_cleanup unadmitted;
+  qa_cleanup_push(&unadmitted, free_unadmitted_entry, entry);
   for (size_t s = 0; s < items->definition->storage_count; s++) {
     const qa_qvm_item_storage *storage = &items->definition->storage[s];
     const qa_qvm_item_field *fields_to_add[2] = {&storage->field, NULL};
@@ -943,6 +1017,8 @@ void qa_qvm_mod_items_admit(qa_qvm_mod_items_runtime *items, qa_actor_id actor) 
   lease_state *lease = xmalloc(sizeof *lease);
   lease->items = items;
   lease->actor = actor;
+  lease->entries = NULL;
+  lease->entry_capacity = 0;
   entry->lease_state = lease;
   qa_inventory_item_binding binding;
   memset(&binding, 0, sizeof binding);
@@ -964,10 +1040,20 @@ void qa_qvm_mod_items_admit(qa_qvm_mod_items_runtime *items, qa_actor_id actor) 
     if (strcmp(storage->kind, "counter") == 0 && strcmp(storage->capacity.kind, "source") == 0)
       range_capacity += storage->capacity.override_count;
   }
+  observe_state *observe = xmalloc(sizeof *observe);
+  memset(observe, 0, sizeof *observe);
+  entry->observe_state = observe;
+  observe->items = items;
+  observe->actor = actor;
+  observe->watch_addresses = xmalloc(range_capacity * sizeof *observe->watch_addresses);
+  observe->watch_counts = xmalloc(items->definition->storage_count * sizeof *observe->watch_counts);
   qa_qvm_write_range *ranges = xmalloc(range_capacity * sizeof *ranges);
+  qa_cleanup ranges_cleanup;
+  qa_cleanup_push(&ranges_cleanup, free, ranges);
   size_t range_count = 0;
   for (size_t s = 0; s < items->definition->storage_count; s++) {
     const qa_qvm_item_storage *storage = &items->definition->storage[s];
+    size_t first = range_count;
     ranges[range_count++] = (qa_qvm_write_range){address_of(items, actor, &storage->field), 4};
     if (strcmp(storage->kind, "counter") == 0 && strcmp(storage->capacity.kind, "field") == 0)
       ranges[range_count++] = (qa_qvm_write_range){address_of(items, actor, &storage->capacity.field), 4};
@@ -975,16 +1061,12 @@ void qa_qvm_mod_items_admit(qa_qvm_mod_items_runtime *items, qa_actor_id actor) 
       for (size_t o = 0; o < storage->capacity.override_count; o++)
         ranges[range_count++] = (qa_qvm_write_range){(int64_t)storage->capacity.overrides[o].address, 4};
     }
+    observe->watch_counts[s] = range_count - first;
+    for (size_t r = first; r < range_count; r++) observe->watch_addresses[r] = ranges[r].byte_offset;
   }
-  observe_state *observe = xmalloc(sizeof *observe);
-  entry->observe_state = observe;
-  observe->items = items;
-  observe->actor = actor;
-  observe->pending = NULL;
-  observe->pending_count = 0;
-  observe->pending_capacity = 0;
   entry->watch_id = qa_qvm_memory_observe_writes(items->memory, ranges, range_count,
                                                   observe_publish, observe, observe_after, observe);
+  qa_cleanup_pop(&ranges_cleanup);
   free(ranges);
   entry->current_request = NULL;
   if (items->entry_count == items->entry_capacity) {
@@ -992,14 +1074,18 @@ void qa_qvm_mod_items_admit(qa_qvm_mod_items_runtime *items, qa_actor_id actor) 
     items->entries = realloc(items->entries, items->entry_capacity * sizeof(item_entry *));
     if (items->entries == NULL) qa_range_error("QVM memory allocation failed");
   }
+  qa_cleanup_pop(&unadmitted);
   entry_stack(items)[items->entry_count++] = entry;
   if (items->weapons != NULL) {
+    /* TS try { bind the weapon } catch { this.release(actor); throw }. */
+    release_scope scope = {items, actor};
+    qa_cleanup admitted;
+    qa_cleanup_push(&admitted, release_on_raise, &scope);
     qa_source_weapon_unbind remove;
-    if (items->services->weapons == NULL) {
-      qa_qvm_mod_items_release(items, actor);
-      qa_range_error("QVM source weapon service is unavailable");
-    }
+    if (items->services->weapons == NULL)
+      qa_raise("Error", 0, 0, "QVM source weapon service is unavailable");
     remove = items->services->weapons->bind(items->services->weapons->ctx, owner, make_binding(items, entry));
+    qa_cleanup_pop(&admitted);
     entry->has_remove_weapon = true;
     entry->remove_weapon = remove;
   }
@@ -1067,10 +1153,10 @@ int32_t qa_qvm_mod_items_apply(qa_qvm_mod_items_runtime *items, qa_mod_client_ap
   for (size_t i = 0; i < items->applied_count; i++)
     if (items->applied_invocations[i] == application->invocation) seen = true;
   if (strcmp(application->scope, "movement-slice") != 0 || seen)
-    qa_range_error("QVM weapon input must consume each actual movement slice exactly once");
+    qa_raise("Error", 0, 0, "QVM weapon input must consume each actual movement slice exactly once");
   item_entry *entry = find_entry(items, application->identity.actor);
   if (entry == NULL || !entry_current(items, entry))
-    qa_range_error("QVM weapon application lost its admitted actor");
+    qa_raise("Error", 0, 0, "QVM weapon application lost its admitted actor");
   if (items->applied_count == items->applied_capacity) {
     items->applied_capacity = items->applied_capacity == 0 ? 8 : items->applied_capacity * 2;
     items->applied_invocations = realloc(items->applied_invocations,
@@ -1082,7 +1168,7 @@ int32_t qa_qvm_mod_items_apply(qa_qvm_mod_items_runtime *items, qa_mod_client_ap
       ? application->frame.time.value * 1000 : application->frame.time.value;
   double elapsed = application->frame.elapsed.kind == QA_SOURCE_TIME_SECONDS
       ? application->frame.elapsed.value * 1000 : application->frame.elapsed.value;
-  if (!isfinite(end) || !isfinite(elapsed) || elapsed < 0) qa_range_error("Invalid applied source weapon clock");
+  if (!isfinite(end) || !isfinite(elapsed) || elapsed < 0) qa_raise("Error", 0, 0, "Invalid applied source weapon clock");
   qa_qvm_writable_view view;
   qa_qvm_memory_data_view(items->memory,
       address_of(items, entry->actor.id, &items->definition->weapons->input.clock), 4, &view);
@@ -1155,7 +1241,10 @@ void qa_qvm_mod_items_restore(qa_qvm_mod_items_runtime *items, const qa_save_val
   size_t count = qa_save_reader_list_count(&requests);
   int64_t *ids = xmalloc(count * sizeof *ids);
   size_t id_count = 0;
+  qa_cleanup ids_cleanup, actors_cleanup;
+  qa_cleanup_push(&ids_cleanup, free, ids);
   qa_actor_id *actors = xmalloc(count * sizeof *actors);
+  qa_cleanup_push(&actors_cleanup, free, actors);
   size_t actor_count = 0;
   for (size_t i = 0; i < count; i++) {
     qa_save_reader row = ritem(&requests, i);
@@ -1185,7 +1274,7 @@ void qa_qvm_mod_items_restore(qa_qvm_mod_items_runtime *items, const qa_save_val
     if (item != NULL) (void)selection_value(items, item, &found);
     if (entry == NULL || !entry_current(items, entry) || id > items->next_request || duplicate ||
         (item != NULL && !found))
-      qa_range_error("Saved QVM weapon request is not its current admitted owner");
+      qa_raise("Error", 0, 0, "Saved QVM weapon request is not its current admitted owner");
     ids[id_count++] = id;
     actors[actor_count++] = actor;
     request *restored = xmalloc(sizeof *restored);
@@ -1196,6 +1285,8 @@ void qa_qvm_mod_items_restore(qa_qvm_mod_items_runtime *items, const qa_save_val
     restored->attempted = false;
     replace_request(entry, restored);
   }
+  qa_cleanup_pop(&actors_cleanup);
+  qa_cleanup_pop(&ids_cleanup);
   free(ids);
   free(actors);
   qa_save_reader_destroy(&requests);
@@ -1210,6 +1301,15 @@ void qa_qvm_mod_items_clear(qa_qvm_mod_items_runtime *items) {
   }
 }
 
+static void remove_weapon_body(void *ctx) {
+  item_entry *entry = ctx;
+  entry->remove_weapon.invoke(entry->remove_weapon.ctx);
+}
+static void close_lease_body(void *ctx) {
+  item_entry *entry = ctx;
+  entry->lease.close(entry->lease.ctx);
+}
+
 void qa_qvm_mod_items_release(qa_qvm_mod_items_runtime *items, qa_actor_id actor) {
   item_entry **entries = entry_stack(items);
   for (size_t i = 0; i < items->entry_count; i++) {
@@ -1219,8 +1319,10 @@ void qa_qvm_mod_items_release(qa_qvm_mod_items_runtime *items, qa_actor_id actor
     items->entry_count--;
     replace_request(removed, NULL); /* TS entry.request = null */
     qa_qvm_memory_writes_unobserve(&items->memory->writes, removed->watch_id);
-    if (removed->has_remove_weapon) removed->remove_weapon.invoke(removed->remove_weapon.ctx);
-    removed->lease.close(removed->lease.ctx);
+    /* TS try { removeWeapon() } finally { lease.close() }. */
+    qa_caught_error failure, close_failure;
+    bool removed_ok = !removed->has_remove_weapon || qa_try(remove_weapon_body, removed, &failure);
+    bool closed_ok = qa_try(close_lease_body, removed, &close_failure);
     free(removed->addresses);
     removed->addresses = NULL;
     removed->address_count = 0;
@@ -1239,11 +1341,20 @@ void qa_qvm_mod_items_release(qa_qvm_mod_items_runtime *items, qa_actor_id actor
       if (items->retired_entries == NULL) qa_range_error("QVM memory allocation failed");
     }
     ((item_entry **)items->retired_entries)[items->retired_entry_count++] = removed;
+    if (!closed_ok) qa_rethrow(&close_failure);
+    if (!removed_ok) qa_rethrow(&failure);
     return;
   }
 }
 
 void qa_qvm_mod_items_close(qa_qvm_mod_items_runtime *items) {
   if (items->weapons != NULL) qa_qvm_mod_weapon_stage_close(items->weapons);
-  qa_qvm_mod_items_clear(items);
+  /* TS releases every entry, then reports the failures together. */
+  bool failed = false;
+  while (items->entry_count != 0) {
+    release_scope scope = {items, entry_stack(items)[0]->actor.id};
+    qa_caught_error failure;
+    if (!qa_try(release_body, &scope, &failure)) failed = true;
+  }
+  if (failed) qa_raise("AggregateError", 0, 0, "QVM source item release failed");
 }

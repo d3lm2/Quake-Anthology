@@ -30,7 +30,7 @@ static qa_q3_trace_result do_trace(void *ctx, qa_q3_trace_query query, qa_vec3 o
   q.pass_actor = NULL;
   qa_trace_result result = s->queries.trace(s->queries.ctx, q);
   if (result.kind == NULL || strcmp(result.kind, "q3") != 0)
-    qa_range_error("Shared map did not apply cgame Q3 collision policy");
+    qa_raise("Error", 0, 0, "Shared map did not apply cgame Q3 collision policy");
   qa_q3_trace_result out;
   out.fraction = result.fraction;
   out.end = result.end;
@@ -58,7 +58,7 @@ static double do_contents(void *ctx, qa_vec3 point, double model, bool has_model
   q.pass_actor = NULL;
   qa_point_contents_result result = s->queries.point_contents(s->queries.ctx, q);
   if (result.kind == NULL || strcmp(result.kind, "q3") != 0)
-    qa_range_error("Shared map did not apply cgame Q3 contents policy");
+    qa_raise("Error", 0, 0, "Shared map did not apply cgame Q3 contents policy");
   return result.contents;
 }
 static qa_q3_trace_result trace_plain(void *ctx, qa_q3_trace_query query) { return do_trace(ctx, query, zero_v, zero_v); }

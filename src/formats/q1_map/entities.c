@@ -21,6 +21,26 @@ static void *xrealloc(void *p, size_t size) {
   return next;
 }
 
+/* A Quake byte string is Latin-1 text in TS (fixedByteString): a byte past
+ * 0x7f is one code unit, two UTF-8 bytes in a message. Caller frees. */
+static char *latin1_text(const char *bytes) {
+  size_t length = 0;
+  for (const unsigned char *p = (const unsigned char *)bytes; *p != 0; p++) length += *p >= 0x80 ? 2 : 1;
+  char *text = malloc(length + 1);
+  if (text == NULL) qa_range_error("Out of memory");
+  size_t at = 0;
+  for (const unsigned char *p = (const unsigned char *)bytes; *p != 0; p++) {
+    if (*p < 0x80) {
+      text[at++] = (char)*p;
+    } else {
+      text[at++] = (char)(0xc0 | (*p >> 6));
+      text[at++] = (char)(0x80 | (*p & 0x3f));
+    }
+  }
+  text[at] = '\0';
+  return text;
+}
+
 /* Plain TS Error: prints the identical message under the Error name. */
 static noreturn void plain_error(const char *format, ...) {
   char message[1024];
@@ -87,47 +107,83 @@ static token_kind next_token(lexer *lex, char **out_value) {
   return TOKEN_TEXT;
 }
 
+/* What a malformed entity lump leaves half built when the parse raises: the
+ * entities so far, the one being read and its pending key. */
+typedef struct parse_state {
+  qa_q1_entity *entities;
+  size_t count;
+  qa_q1_entity entity;
+  char *key;
+} parse_state;
+static void parse_release(void *arg) {
+  parse_state *state = (parse_state *)arg;
+  free(state->key);
+  qa_q1_entities_destroy(state->entities, state->count);
+  for (size_t i = 0; i < state->entity.property_count; i++) {
+    free(state->entity.properties[i].key);
+    free(state->entity.properties[i].value);
+  }
+  free(state->entity.properties);
+}
+
 qa_q1_entity *qa_q1_parse_entities(const char *text, size_t *out_count) {
   lexer lex = {text, strlen(text), 0};
-  qa_q1_entity *entities = NULL;
-  size_t count = 0, capacity = 0;
+  parse_state state;
+  memset(&state, 0, sizeof state);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, parse_release, &state);
+#define entities state.entities
+#define count state.count
+  size_t capacity = 0;
   for (;;) {
     char *token_value = NULL;
     token_kind first = next_token(&lex, &token_value);
     free(token_value);
     if (first == TOKEN_NONE) break;
     if (first != TOKEN_OPEN) plain_error("Entity text:%zu: expected opening brace", lex.position);
-    qa_q1_entity entity = {NULL, 0};
+    state.entity.properties = NULL;
+    state.entity.property_count = 0;
     size_t property_capacity = 0;
     for (;;) {
-      char *key = NULL;
-      token_kind key_kind = next_token(&lex, &key);
-      if (key_kind == TOKEN_CLOSE) { free(key); break; }
+      token_kind key_kind = next_token(&lex, &state.key);
+      if (key_kind == TOKEN_CLOSE) { free(state.key); state.key = NULL; break; }
       if (key_kind != TOKEN_TEXT) {
-        free(key);
         plain_error("Entity text:%zu: expected key or closing brace", lex.position);
       }
       char *value = NULL;
       token_kind value_kind = next_token(&lex, &value);
       if (value_kind != TOKEN_TEXT) {
-        plain_error("Entity text:%zu: expected value for %s", lex.position, key);
+        free(value);
+        /* qa_raise directly: the key is file text of any length. */
+        char *key = latin1_text(state.key);
+        char message[QA_CAUGHT_MESSAGE_CAPACITY];
+        snprintf(message, sizeof message, "Entity text:%zu: expected value for %s", lex.position, key);
+        free(key);
+        qa_raise("Error", 0, 0, "%s", message);
       }
-      if (entity.property_count == property_capacity) {
+      if (state.entity.property_count == property_capacity) {
         property_capacity = property_capacity ? property_capacity * 2 : 8;
-        entity.properties = xrealloc(entity.properties, property_capacity * sizeof *entity.properties);
+        state.entity.properties =
+            xrealloc(state.entity.properties, property_capacity * sizeof *state.entity.properties);
       }
-      entity.properties[entity.property_count].key = key;
-      entity.properties[entity.property_count].value = value;
-      entity.property_count++;
+      state.entity.properties[state.entity.property_count].key = state.key;
+      state.entity.properties[state.entity.property_count].value = value;
+      state.entity.property_count++;
+      state.key = NULL;
     }
     if (count == capacity) {
       capacity = capacity ? capacity * 2 : 8;
       entities = xrealloc(entities, capacity * sizeof *entities);
     }
-    entities[count++] = entity;
+    entities[count++] = state.entity;
+    state.entity.properties = NULL;
+    state.entity.property_count = 0;
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return entities;
+#undef entities
+#undef count
 }
 
 void qa_q1_entities_destroy(qa_q1_entity *entities, size_t count) {

@@ -47,7 +47,7 @@ static int32_t proceed(qa_qvm_module_function_call *call) {
 
 static int32_t call_word(const qa_qvm_module_function_call *call, int64_t byte_offset) {
   if (byte_offset < 0 || byte_offset > (int64_t)call->words_length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   const uint8_t *p = call->words + byte_offset;
   uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
                   ((uint32_t)p[3] << 24);
@@ -90,7 +90,7 @@ static bool admit(qa_qvm_equipment_movement *m, qa_qvm_module_function_call *cal
   qa_qvm_equipment_motion equipment;
   if (!m->services.equipment(m->services.ctx, actor, &equipment)) return false;
   if (!isfinite(equipment.speed_multiplier) || equipment.speed_multiplier <= 0)
-    qa_range_error("Selected movement speed must be positive and finite");
+    qa_raise("Error", 0, 0, "Selected movement speed must be positive and finite");
   qa_qvm_writable_view speed;
   qa_qvm_memory_data_view(call->guest, (int64_t)player + 52, 4, &speed);
   double scaled = trunc((double)qa_float32((double)qa_qvm_writable_view_get_int32(&speed, 0, true) *
@@ -161,10 +161,17 @@ static int32_t slice(qa_qvm_equipment_movement *m, qa_qvm_module_function_call *
   return run(run_ctx);
 }
 
-/* TS catch: a cancelled scope pops its frame. */
+typedef struct movement_scope {
+  qa_qvm_equipment_movement *movement;
+  uint64_t sequence;
+} movement_scope;
+
+/* TS catch: a cancelled scope pops its frame when it is still the top one. */
 static void movement_unwind(void *ctx) {
-  qa_qvm_equipment_movement *m = ctx;
-  m->frame_count--;
+  movement_scope *scope = ctx;
+  qa_qvm_equipment_movement *m = scope->movement;
+  if (m->frame_count != 0 && m->frames[m->frame_count - 1].sequence == scope->sequence)
+    m->frame_count--;
 }
 
 int32_t qa_qvm_equipment_movement_movement(qa_qvm_equipment_movement *m,
@@ -184,15 +191,16 @@ int32_t qa_qvm_equipment_movement_movement(qa_qvm_equipment_movement *m,
     m->frame_capacity = capacity;
   }
   m->frames[m->frame_count++] = f;
-  uint64_t sequence = f.sequence;
+  movement_scope scope = {m, f.sequence};
   qa_cleanup guard;
-  qa_cleanup_push(&guard, movement_unwind, m);
+  qa_cleanup_push(&guard, movement_unwind, &scope);
   int32_t result = run(run_ctx);
   qa_cleanup_pop(&guard);
+  /* TS finish(): pop, then refuse a frame that is not this scope's. */
   frame *top = top_frame(m);
-  if (top == NULL || top->sequence != sequence)
-    qa_range_error("Selected movement scope completed out of order");
-  m->frame_count--;
+  bool same = top != NULL && top->sequence == scope.sequence;
+  if (m->frame_count != 0) m->frame_count--;
+  if (!same) qa_raise("Error", 0, 0, "Selected movement scope completed out of order");
   return result;
 }
 
@@ -333,11 +341,14 @@ static int32_t duck_hook(void *ctx, qa_qvm_module_function_call *call) {
 static int32_t body_finish(qa_qvm_equipment_movement *m, qa_qvm_module_function_call *call, frame *f,
                            const qa_movement_body_shape *body, int32_t previous_duck,
                            int32_t previous_height, int32_t result) {
+  size_t frame_index = (size_t)(f - m->frames);
   body->current_actor(body->ctx);
   qa_bounds source = {guest_vector(call, (int64_t)f->movement + (int64_t)m->profile.mins),
                       guest_vector(call, (int64_t)f->movement + (int64_t)m->profile.maxs)};
   const qa_bounds *requested = body->has_requested ? &body->requested : &source;
-  const qa_bounds *previous = f->has_accepted_bounds ? &f->accepted_bounds : &body->current;
+  /* A copy: the trace callback below is guest code and may grow the frame list. */
+  const qa_bounds previous_bounds = f->has_accepted_bounds ? f->accepted_bounds : body->current;
+  const qa_bounds *previous = &previous_bounds;
   bool expands = requested->min.x < previous->min.x || requested->min.y < previous->min.y ||
                  requested->min.z < previous->min.z || requested->max.x > previous->max.x ||
                  requested->max.y > previous->max.y || requested->max.z > previous->max.z;
@@ -366,6 +377,7 @@ static int32_t body_finish(qa_qvm_equipment_movement *m, qa_qvm_module_function_
   int32_t args[7] = {(int32_t)at, (int32_t)(at + 56), (int32_t)(at + 68), (int32_t)(at + 80),
                      (int32_t)(at + 56), guest_i32(call, (int64_t)f->player + 140), mask};
   (void)qa_qvm_module_invoke_source_callback(&m->game->module, call, callback, args, 7);
+  f = &m->frames[frame_index];
   qa_qvm_writable_view checked_view;
   qa_qvm_memory_data_view(call->guest, at, 56, &checked_view);
   const qa_bounds *accepted =
@@ -382,7 +394,7 @@ static int32_t body_shape(qa_qvm_equipment_movement *m, qa_qvm_module_function_c
   const qa_movement_body_shape *body = f->body;
   if (body == NULL || !m->profile.has_body_trace) {
     if (body != NULL && body->has_requested)
-      qa_range_error("Original QVM body shape requires an admitted trace callback layout");
+      qa_raise("Error", 0, 0, "Original QVM body shape requires an admitted trace callback layout");
     return proceed(call);
   }
   int32_t previous_duck = guest_i32(call, (int64_t)f->player + 12) & 1;
@@ -400,7 +412,7 @@ qa_qvm_equipment_movement *qa_qvm_equipment_movement_create(
   int64_t total = image->data_length + image->literal_length + image->bss_length;
   int64_t body_scratch = (int64_t)ceil((double)total / 16.0) * 16;
   if (profile.has_body_trace && body_scratch + 92 > image->allocated_data_length - 65536)
-    qa_range_error("Original body trace requires scratch outside source data and stack");
+    qa_raise("Error", 0, 0, "Original body trace requires scratch outside source data and stack");
   double entries[3] = {profile.move, profile.slice, profile.duck};
   for (size_t i = 0; i < 3; i++) {
     double entry = entries[i];
@@ -409,25 +421,15 @@ qa_qvm_equipment_movement *qa_qvm_equipment_movement_create(
             ? &image->instructions[(size_t)entry]
             : NULL;
     if (instruction == NULL || instruction->opcode != QA_QVM_OP_ENTER)
-      qa_range_error("Selected equipment movement requires an original function boundary");
+      qa_raise("Error", 0, 0, "Selected equipment movement requires an original function boundary");
   }
-  {
-    qa_qvm_instruction *list =
-        malloc((image->instruction_count == 0 ? 1 : image->instruction_count) * sizeof *list);
-    if (list == NULL) return NULL;
-    for (size_t i = 0; i < image->instruction_count; i++) {
-      list[i].opcode = (int32_t)image->instructions[i].opcode;
-      list[i].operand_width = image->instructions[i].operand_width;
-      list[i].operand = image->instructions[i].operand;
-      list[i].byte_offset = image->instructions[i].byte_offset;
-    }
-    (void)qa_qvm_qualify_region(list, image->instruction_count, (int64_t)profile.slice,
-                                 (int64_t)profile.locomotion_entry,
-                                 (int64_t)profile.locomotion_join);
-    free(list);
-  }
+  /* Read in place: a refused region raises, and a copy would be stranded. */
+  (void)qa_qvm_qualify_region(image->instructions, image->instruction_count, (int64_t)profile.slice,
+                               (int64_t)profile.locomotion_entry, (int64_t)profile.locomotion_join);
   qa_qvm_equipment_movement *m = calloc(1, sizeof *m);
   if (m == NULL) return NULL;
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, free, m);
   m->game = game;
   m->profile = profile;
   m->services = services;
@@ -438,6 +440,7 @@ qa_qvm_equipment_movement *qa_qvm_equipment_movement_create(
   reference.module = artifact->module;
   reference.instruction_index = profile.duck;
   m->removal = qa_qvm_module_bind_invocation(&game->module, &reference, duck_hook, m);
+  qa_cleanup_pop(&refused);
   m->has_removal = true;
   return m;
 }

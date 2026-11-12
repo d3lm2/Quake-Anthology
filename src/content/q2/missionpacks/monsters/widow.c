@@ -346,7 +346,9 @@ static void kick_fn(void *ctx, qa_q2m_context *c) {
   qa_body_state enemy;
   bool has_enemy = qa_q2m_enemy_body(c, &enemy);
   (void)c->weapons.fire_hit(c->weapons.ctx, c->entity, c->game, q2mpm_v3(100, 0, 4),
-                            50 + floor(q2mpm_rnd(c->game) * 6), !has_enemy || enemy.ground == NULL ? 250 : 500);
+                            50 + floor(q2mpm_rnd(c->game) * 6),
+                            /* TS `enemy?.ground === null`: no enemy body is undefined, not null, so the kick is 500. */
+                            has_enemy && enemy.ground == NULL ? 250 : 500);
 }
 static void spawn_out_start_fn(void *ctx, qa_q2m_context *c) {
   (void)ctx;

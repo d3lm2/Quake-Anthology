@@ -50,7 +50,9 @@ typedef struct q3_host {
   int64_t *clusters; size_t cluster_cap;
   qa_q3_visible_entities visible; bool has_visible;
   const void **snapshot_entities;
-  qa_actor_command **commands; size_t command_count;    /* input() results */
+  /* input()'s result: borrowed by the network, which copies it into its queue at once
+   * (TS hands the network a fresh ActorCommand it keeps until consumed). */
+  qa_actor_command input;
   qa_q3_download_read_file download;
   char *status;
 } q3_host;
@@ -751,11 +753,8 @@ static const void *host_input(void *ctx, qa_app_q3_player player, const void *co
     qa_app_q3_qvm_server_game_think(h->guest_source, player, base_command(command));
     return NULL;
   }
-  qa_actor_command *out = xmalloc(sizeof *out);
-  *out = input;
-  h->commands = xrealloc(h->commands, (h->command_count + 1) * sizeof *h->commands);
-  h->commands[h->command_count++] = out;
-  return out;
+  h->input = input;
+  return &h->input;
 }
 static void host_command(void *ctx, qa_app_q3_player player, const char *name, const char *const *args, size_t count) {
   q3_host *h = ctx;
@@ -1013,8 +1012,6 @@ void qa_app_sim_q3_application_server_authority_destroy(qa_app_sim_q3_server_aut
   free(h->clusters);
   if (h->has_visible) qa_q3_visible_entities_destroy(&h->visible);
   free(h->snapshot_entities);
-  for (size_t i = 0; i < h->command_count; i++) free(h->commands[i]);
-  free(h->commands);
   free(h->status);
   qa_app_q3_packages_destroy(h->packages);
   free(h);

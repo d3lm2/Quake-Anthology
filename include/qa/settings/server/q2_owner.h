@@ -56,6 +56,13 @@ bool qa_q2_rerelease_item_services(qa_cvar_registry *cvars, qa_q2_rerelease_item
 qa_q2mp_random_item_settings qa_q2_rerelease_random_items(void *ctx);
 bool qa_q2_rerelease_drop_quad_fire(void *ctx);
 
+/* TS applyQ2LatchedCvars (SV_ReadServerFile): each latched pair a save recorded
+ * is forced into the live registry, so a game module that registers the
+ * variable afterwards finds the saved value. A name the registry has not met
+ * yet is created without flags. names[i]/values[i] are the pairs in order. */
+void qa_apply_q2_latched_cvars(qa_cvar_registry *cvars, const char *const *names, const char *const *values,
+                               size_t count);
+
 /* TS bindQ2PlayerCvars / bindQ2ServerCvars state. Rule string fields point
  * into this storage after a pull. */
 typedef struct qa_q2_cvar_binding {

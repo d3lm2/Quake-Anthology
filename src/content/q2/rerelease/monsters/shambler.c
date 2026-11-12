@@ -3,6 +3,7 @@
 #include "qa/content/q2/rerelease/monsters/shambler.h"
 
 #include "qa/content/q2/base/monsters/common.h"
+#include "qa/content/q2/foundation/callbacks.h"
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/content/q2/foundation/monsters/ai.h"
 #include "qa/content/q2/foundation/monsters/gibs.h"
@@ -43,7 +44,8 @@ static void clear_beam(qa_q2m_context *c) {
 static void lightning_update(qa_q2m_context *c) {
   double frame = c->entity->frame - qa_q2rm_shambler_frames_value.magic01;
   if (frame >= 5) { clear_beam(c); return; }
-  if (frame < 0) return;
+  /* TS leftHand[frame] is undefined for a negative, fractional or NaN index. */
+  if (!(frame >= 0) || frame != floor(frame)) return;
   qa_q2_entity *beam = c->game->entity(c->game->ctx, c->entity->has_beam ? &c->entity->beam : NULL);
   if (!beam) return;
   qa_vec3 start = qa_q2m_project_flash_default(c, left_hand[(size_t)frame]);
@@ -136,6 +138,12 @@ static void save_loc_fn(void *ctx, qa_q2m_context *c) {
   q2rm_snd(c, "shambler/sboom.wav", 1);
   lightning_update(c);
 }
+/* TS freeBolt: hides the one-shot lightning beam and frees its entity. */
+static void free_bolt_fn(void *ctx, qa_q2_entity *bolt, qa_q2_game_services *game) {
+  (void)ctx;
+  emit_shambler_beam(game, bolt, q2rm_body(game, bolt).origin, bolt->pos2, false);
+  game->remove(game->ctx, bolt);
+}
 static void cast_fn(void *ctx, qa_q2m_context *c) {
   (void)ctx;
   qa_body_state enemy;
@@ -153,7 +161,23 @@ static void cast_fn(void *ctx, qa_q2m_context *c) {
   qa_vec3 end = qa_add3_double(start, qa_scale3_double(direction, 8192));
   qa_trace_result trace = q2rm_trace(game, start, end, NULL, &c->entity->actor.id,
                                      (double)((0x46004003u | 8u | 16u)));
-  emit_shambler_beam(c->game, c->entity, start, trace.end, true);
+  /* The C sends a one-shot TE_LIGHTNING; a short-lived beam entity gives the same single flash. */
+  const qa_q2_think free_bolt = {NULL, free_bolt_fn};
+  qa_q2_named_think named[1];
+  named[0].name = "shambler_bolt_free";
+  named[0].cb = free_bolt;
+  qa_q2_callback_definitions definitions;
+  memset(&definitions, 0, sizeof definitions);
+  definitions.think = named; definitions.think_count = 1;
+  qa_q2_source_callbacks_register(game->source_callbacks, definitions);
+  qa_q2_entity *bolt = game->create(game->ctx, "shambler_bolt", NULL, 0);
+  qa_q2_body_changes change;
+  memset(&change, 0, sizeof change);
+  change.has_origin = true; change.origin = start;
+  q2rm_move_body(game, bolt, change, false, false);
+  bolt->pos2 = trace.end;
+  emit_shambler_beam(game, bolt, start, trace.end, true);
+  game->schedule(game->ctx, bolt, 0.1, free_bolt);
   c->weapons.fire_bullet(c->weapons.ctx, c->entity, game, start, direction,
                          8 + floor(q2rm_rnd(game) * 4), 15, 0, 0, 45);
 }

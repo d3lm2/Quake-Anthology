@@ -2,8 +2,8 @@
  * Port of src/settings/server/lmctf.ts: LMCTF limit, rune and weapon
  * collections. Defaults and the rune table are from createLmctfRules
  * (timeLimitMinutes 0, fragLimit 0, runes 15, fastSwitch false) and
- * LMCTF_RUNES in src/content/q2/multiplayer/lmctf/types.ts (content
- * module not yet ported). Returned collections point at static
+ * LMCTF_RUNES in src/content/q2/multiplayer/lmctf/types.ts (copied
+ * here as literals). Returned collections point at static
  * definitions; do not free.
  * GPL-2.0-or-later.
  */

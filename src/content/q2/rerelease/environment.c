@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "qa/foundation/js.h"
+#include "qa/network/common/js_number.h"
 
 /* Q2CharacterContext services (TS context.game.host / body / sound). */
 static double env_now(qa_q2_character_context *c) { return c->game.now(c->game.host_ctx); }
@@ -58,13 +59,13 @@ void qa_q2_rerelease_world_effects(qa_q2_character_context *c, qa_q2rr_player_ex
     double health = env_health(c);
     if (st->air_finished < now && st->next_drown_time < now && health > 0) {
       st->next_drown_time = now + 1;
-      st->drown_damage = st->drown_damage + 2 < 15 ? st->drown_damage + 2 : 15;
+      st->drown_damage = qa_js_min(st->drown_damage + 2, 15);
       env_sound(c, health <= st->drown_damage ? "*drown1.wav" : (c->game.random(c->game.host_ctx) < 0.5 ? "*gurp2.wav" : "*gurp1.wav"), 2);
       st->pain_debounce = now;
       c->environment_damage(c->cb_ctx, st->drown_damage, 17, 2);
     } else if (st->air_finished <= now + 3 && st->next_drown_time < now) {
-      char path[32];
-      snprintf(path, sizeof path, "player/wade%lld.wav", (long long)(1 + (int64_t)trunc(now) % 3));
+      char path[64];
+      snprintf(path, sizeof path, "player/wade%s.wav", QA_JS_NUMBER(1 + fmod(trunc(now), 3)));
       env_sound(c, path, 2);
       st->next_drown_time = now + 1;
     }
@@ -94,19 +95,19 @@ void qa_q2_rerelease_falling_damage(qa_q2_character_context *c, qa_q2rr_player_e
   if (mv->water_level == 1) delta *= 0.5;
   if (delta < 1) return;
   st->bob_time = 0;
-  if (st->landmark_free_fall) { delta = delta < 30 ? delta : 30; st->landmark_free_fall = false; st->landmark_noise_time = now + 0.1; }
+  if (st->landmark_free_fall) { delta = qa_js_min(30, delta); st->landmark_free_fall = false; st->landmark_noise_time = now + 0.1; }
   if (delta < 15) {
     if (!extra->on_ladder) st->event = "q2:footstep";
     return;
   }
-  st->fall_value = delta * 0.5 < 40 ? delta * 0.5 : 40;
+  st->fall_value = qa_js_min(delta * 0.5, 40);
   st->fall_time = now + 0.3 + (0.1 - frame_seconds);
   if (delta > 30) {
     st->event = delta >= 55 ? "q2:fall-far" : "q2:fall";
     st->pain_debounce = now + frame_seconds;
     if (c->game.mode != QA_Q2_MODE_DEATHMATCH || !options.deathmatch_no_fall_damage) {
       double amt = trunc((delta - 30) / 2);
-      c->environment_damage(c->cb_ctx, amt > 1 ? amt : 1, 22, 0);
+      c->environment_damage(c->cb_ctx, qa_js_max(1, amt), 22, 0);
     }
   } else st->event = "q2:fall-short";
   if (env_health(c) != 0) env_noise(c);

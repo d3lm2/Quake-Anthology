@@ -4,6 +4,7 @@
  * list of owned file wrappers (released with the source); a checkpoint is owned
  * by the source until the next checkpoint or destroy. */
 #include "qa/app/bootstrap/simulation/q3/native_guest_source.h"
+#include "qa/foundation/caught_message.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +70,8 @@ void qa_app_prepare_q3_native(const qa_resolved_execution_module *execution, qa_
   if (bytes == NULL) fail("Selected native Q3 server artifact is unreadable");
   memset(out, 0, sizeof *out);
   out->owned_bytes = bytes;
+  /* A refused artifact (format, profile or API version) releases what was read for it. */
+  qa_cleanup prepared_node; qa_cleanup_push(&prepared_node, (void (*)(void *))qa_app_prepared_q3_native_destroy, out);
   qa_app_q3_native_profile_name profile = qa_app_q3_native_profile(bytes, length);
   const char *kind = execution->profile.kind != NULL ? execution->profile.kind : "";
   if (strcmp(profile, "q3-pe") == 0) {
@@ -87,13 +90,17 @@ void qa_app_prepare_q3_native(const qa_resolved_execution_module *execution, qa_
       reference->provenance.kind == QA_CONTENT_MOUNT_ARCHIVE && reference->provenance.archive_mount
           ? &reference->provenance.archive_mount->identity
           : reference->provenance.loose_mount ? &reference->provenance.loose_mount->identity : NULL;
-  char revision[512];
-  snprintf(revision, sizeof revision, "%s:%lld", identity ? identity->id : "", identity ? (long long)identity->generation : 0);
+  /* `${identity.id}:${identity.generation}`, whatever the mount id's length */
+  const char *mount_id = identity ? identity->id : "";
+  size_t revision_length = strlen(mount_id) + 32;
+  char *revision = malloc(revision_length);
+  if (revision == NULL) qa_range_error("Out of memory");
+  snprintf(revision, revision_length, "%s:%lld", mount_id, identity ? (long long)identity->generation : 0);
+  out->owned_strings[3] = revision;
   out->execution = execution;
   out->owned_strings[0] = xstrdup(execution->owner.provider);
   out->owned_strings[1] = xstrdup(reference->requested_path);
   out->owned_strings[2] = xstrdup(reference->digest);
-  out->owned_strings[3] = xstrdup(revision);
   out->image.bytes = bytes;
   out->image.length = length;
   out->image.profile = profile;
@@ -101,6 +108,7 @@ void qa_app_prepare_q3_native(const qa_resolved_execution_module *execution, qa_
   out->image.module.artifact_path = out->owned_strings[1];
   out->image.module.digest = out->owned_strings[2];
   out->image.module.revision = out->owned_strings[3];
+  qa_cleanup_pop(&prepared_node);
 }
 
 /* ---- the guest process ---- */
@@ -669,8 +677,7 @@ qa_app_q3_native_guest_source *qa_app_q3_native_guest_source_create(const qa_app
     if (!qa_try(release_memory_step, s, &cleanup)) released = false;
     if (released && !close_files(s, &cleanup)) released = false;
     destroy_source(s);
-    if (!released)
-      qa_raise("AggregateError", 0, 0, "Native Q3 guest construction and cleanup failed: %s; %s", error.message, cleanup.message);
+    if (!released) qa_raise("AggregateError", 0, 0, "Native Q3 guest construction and cleanup failed");
     qa_rethrow(&error);
   }
   record_baseline(s);
@@ -917,6 +924,10 @@ static const shape *find_shape(const shape *shapes, size_t count, uint64_t base,
     if (shapes[i].base == base && shapes[i].byte_length == byte_length && same_text(shapes[i].label, label)) return &shapes[i];
   return NULL;
 }
+typedef struct restore_scratch { qa_guest_mapping *current; shape *have, *wanted; bool *created; } restore_scratch;
+static void restore_scratch_free(void *arg) {
+  restore_scratch *r = arg; free(r->current); free(r->have); free(r->wanted); free(r->created); memset(r, 0, sizeof *r);
+}
 static void n_restore(qa_app_q3_game_engine *base, const qa_guest_checkpoint *checkpoint) {
   qa_app_q3_native_guest_source *s = self_of(base);
   if (checkpoint->kind != QA_GUEST_CHECKPOINT_NATIVE_GUEST) fail("Native Q3 restore requires a native-guest checkpoint");
@@ -927,17 +938,20 @@ static void n_restore(qa_app_q3_game_engine *base, const qa_guest_checkpoint *ch
       !same_text(saved->artifact_path, module->artifact_path) || !same_text(checkpoint->abi.kind, s->abi.kind) ||
       !same_text(checkpoint->runtime_state.module.digest, module->digest))
     fail("Native Q3 checkpoint belongs to a different module");
+  /* A refused layout (the checkpoint is save input) releases the scratch tables. */
+  restore_scratch scratch; memset(&scratch, 0, sizeof scratch);
+  qa_cleanup scratch_node; qa_cleanup_push(&scratch_node, restore_scratch_free, &scratch);
   size_t current_count = 0;
-  qa_guest_mapping *current = described_mappings(s, &current_count);
+  qa_guest_mapping *current = scratch.current = described_mappings(s, &current_count);
   /* A checkpoint without a heap image (version 1) records a process whose layout is the one startup produces. */
   const qa_native_guest_heap_image *image = checkpoint->heap;
-  shape *have = xcalloc(current_count, sizeof *have);
+  shape *have = scratch.have = xcalloc(current_count, sizeof *have);
   for (size_t i = 0; i < current_count; i++) {
     have[i].base = current[i].base; have[i].byte_length = current[i].byte_length;
     have[i].label = label_of(&current[i]); have[i].permissions = current[i].permissions;
   }
   size_t wanted_count = image == NULL ? current_count : image->layout_count;
-  shape *wanted = xcalloc(wanted_count, sizeof *wanted);
+  shape *wanted = scratch.wanted = xcalloc(wanted_count, sizeof *wanted);
   for (size_t i = 0; i < wanted_count; i++) {
     if (image == NULL) { wanted[i] = have[i]; continue; }
     const qa_guest_mapping_record *record = &image->layout[i];
@@ -956,7 +970,7 @@ static void n_restore(qa_app_q3_game_engine *base, const qa_guest_checkpoint *ch
   for (size_t i = 0; i < current_count; i++)
     if (find_shape(wanted, wanted_count, have[i].base, have[i].byte_length, have[i].label) == NULL)
       qa_sparse_unmap(&s->memory, address_at(s, have[i].base), have[i].byte_length);
-  bool *created = xcalloc(wanted_count, sizeof *created);
+  bool *created = scratch.created = xcalloc(wanted_count, sizeof *created);
   for (size_t i = 0; i < wanted_count; i++) {
     const shape *found = find_shape(have, current_count, wanted[i].base, wanted[i].byte_length, wanted[i].label);
     created[i] = found == NULL;
@@ -992,7 +1006,7 @@ static void n_restore(qa_app_q3_game_engine *base, const qa_guest_checkpoint *ch
     } else
       readable_copy(s, address, wanted[i].permissions, NULL, region->bytes.length, region->bytes.bytes);
   }
-  free(created); free(wanted); free(have); free(current);
+  qa_cleanup_pop(&scratch_node); restore_scratch_free(&scratch);
   if (image != NULL) {
     qa_sparse_restore_allocator(&s->memory, &image->allocator);
     if (s->windows) {
@@ -1029,10 +1043,10 @@ static void retire(qa_app_q3_native_guest_source *s) {
   bool failed = false;
   qa_guest_call_runner_recover(s->runner);
   s->phase = PHASE_CLOSED;
-  if (!qa_try(detach, s, &caught)) { failed = true; first = caught; }
-  if (!close_files(s, &caught) && !failed) { failed = true; first = caught; }
-  if (!qa_try(release_memory_step, s, &caught) && !failed) { failed = true; first = caught; }
-  if (failed) qa_raise("AggregateError", 0, 0, "Native Q3 guest retirement failed: %s", first.message);
+  if (!qa_try(detach, s, &caught)) { failed = true; qa_caught_copy(&first, &caught); }
+  if (!close_files(s, &caught) && !failed) { failed = true; qa_caught_copy(&first, &caught); }
+  if (!qa_try(release_memory_step, s, &caught) && !failed) { failed = true; qa_caught_copy(&first, &caught); }
+  if (failed) qa_raise("AggregateError", 0, 0, "Native Q3 guest retirement failed");
 }
 static void n_retire(qa_app_q3_game_engine *base) { retire(self_of(base)); }
 static void shutdown_step(void *arg) {
@@ -1045,9 +1059,9 @@ void qa_app_q3_native_guest_source_close(qa_app_q3_native_guest_source *s) {
   if (s->phase == PHASE_CLOSED) return;
   bool initialized = s->phase == PHASE_RUNNING, failed = false;
   qa_caught_error first, caught;
-  if (initialized && !qa_try(shutdown_step, s, &caught)) { failed = true; first = caught; }
-  if (!qa_try(retire_step, s, &caught) && !failed) { failed = true; first = caught; }
-  if (failed) qa_raise("AggregateError", 0, 0, "Native Q3 guest shutdown failed: %s", first.message);
+  if (initialized && !qa_try(shutdown_step, s, &caught)) { failed = true; qa_caught_copy(&first, &caught); }
+  if (!qa_try(retire_step, s, &caught) && !failed) { failed = true; qa_caught_copy(&first, &caught); }
+  if (failed) qa_raise("AggregateError", 0, 0, "Native Q3 guest shutdown failed");
 }
 static void n_destroy(qa_app_q3_game_engine *base) { destroy_source(self_of(base)); }
 

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include "qa/app/bootstrap/simulation/q3/server_state.h"
 #include "qa/app/bootstrap/simulation/q3/guest_records.h"
@@ -41,9 +42,7 @@
 #include "qa/app/bootstrap/simulation/player_jump.h"
 
 static noreturn void ss_fail(const char *format, ...) {
-  char message[1024];
-  va_list args; va_start(args, format); vsnprintf(message, sizeof message, format, args); va_end(args);
-  qa_raise("Error", 0, 0, "%s", message);
+  va_list args; va_start(args, format); qa_ss_raise_error(format, args);
 }
 static void *ss_grow(void *ptr, size_t *capacity, size_t need, size_t size) {
   if (need <= *capacity) return ptr;
@@ -231,7 +230,8 @@ void qa_app_shared_sim_notify_client_event(qa_app_shared_simulation *sim, const 
   }
 }
 /* ---- observeClientCommand (6557-6583) ---- */
-static double ss_word(double value, double delta) { return (double)((qa_js_to_int32(value) + qa_js_to_int32(delta)) & 65535); }
+/* (value + delta) & 65535: the JS sum, then ToInt32 (two int32 operands could overflow, and fractions round after the sum). */
+static double ss_word(double value, double delta) { return (double)(qa_js_to_int32(value + delta) & 65535); }
 void qa_app_shared_sim_observe_client_command(qa_app_shared_simulation *sim, const qa_actor_command *input) {
   qa_client_id client;
   bool has_client = qa_app_shared_sim_player_client(sim, input->actor, &client);
@@ -259,7 +259,7 @@ void qa_app_shared_sim_observe_client_command(qa_app_shared_simulation *sim, con
     for (int i = 0; i < 3; i++) shorts[i] = ss_word(command.as.q2.angle_shorts.values[i], delta[i]);
     qa_app_shared_sim_remember_mod_client_command(sim, &remembered);
   } else if (command.kind == QA_USER_COMMAND_Q2_RERELEASE && has_state && state.kind == QA_MOVEMENT_STATE_Q2_RERELEASE) {
-    remembered.command.as.q2_rerelease.angles = qa_ss_add(command.as.q2_rerelease.angles, state.as.q2_rerelease.delta_angles);
+    remembered.command.as.q2_rerelease.angles = qa_add3(command.as.q2_rerelease.angles, state.as.q2_rerelease.delta_angles);
     qa_app_shared_sim_remember_mod_client_command(sim, &remembered);
   } else if (command.kind == QA_USER_COMMAND_Q3) {
     double delta[3] = {0, 0, 0};
@@ -281,19 +281,23 @@ void qa_app_shared_sim_store_player_userinfo(qa_app_shared_simulation *sim, qa_a
 }
 /* ---- sourcePlayerName (6679) ---- */
 const char *qa_app_shared_sim_source_player_name(qa_app_shared_simulation *sim, qa_actor_id actor) {
-  static __thread char name[256];
+  static __thread char *name; /* scratch until the next call; whole (TS has no bound) */
   const char *userinfo = qa_app_shared_sim_source_player_userinfo(sim, actor);
   ss_info info = ss_q2_userinfo(userinfo ? userinfo : "");
   const char *found = ss_info_get(&info, "name");
-  snprintf(name, sizeof name, "%s", found ? found : "unconnected");
+  const char *text = found ? found : "unconnected";
+  char *copy = malloc(strlen(text) + 1);
+  if (copy == NULL) { ss_info_free(&info); qa_range_error("Out of memory"); }
+  strcpy(copy, text);
   ss_info_free(&info);
+  free(name); name = copy;
   return name;
 }
 /* ---- get q1Paused (6680) ---- */
 bool qa_app_shared_sim_q1_paused(qa_app_shared_simulation *sim) { return sim->q1_pause_state; }
 /* ---- toggleQ1Pause (6681-6691): actor NULL = TS null. ---- */
 const char *qa_app_shared_sim_toggle_q1_pause(qa_app_shared_simulation *sim, const qa_actor_id *actor) {
-  static __thread char message[320];
+  static __thread char *message; /* scratch until the next call */
   qa_cvar_registry *cvars = NULL;
   if (!sim->strategy->pause(sim, &cvars)) ss_fail("Pause requires a Quake source server");
   if (actor) {
@@ -307,7 +311,11 @@ const char *qa_app_shared_sim_toggle_q1_pause(qa_app_shared_simulation *sim, con
   if (actor && sim->strategy->pause_is_spectator(sim, *actor)) return "Spectators can not pause.\n";
   sim->q1_pause_state = !sim->q1_pause_state;
   const char *name = actor ? qa_app_shared_sim_source_player_name(sim, *actor) : "Server";
-  snprintf(message, sizeof message, "%s %s the game\n", name, sim->q1_pause_state ? "paused" : "unpaused");
+  const char *verb = sim->q1_pause_state ? "paused" : "unpaused";
+  char *text = malloc(strlen(name) + strlen(verb) + sizeof " " + sizeof " the game\n");
+  if (text == NULL) qa_range_error("Out of memory");
+  sprintf(text, "%s %s the game\n", name, verb);
+  free(message); message = text;
   return message;
 }
 /* ---- sourcePlayerUserinfo (6692-6706): NULL = TS null; scratch until the next call. ---- */
@@ -405,7 +413,7 @@ void qa_app_shared_sim_set_player_movement_link(qa_app_shared_simulation *sim, q
   }
   player->intermission = freeze;
   if (freeze) ss_set_traits(sim, player->actor, true, false, false, false);
-  qa_vec3 velocity = freeze ? qa_ss_zero : change.velocity;
+  qa_vec3 velocity = freeze ? qa_zero_vec3 : change.velocity;
   qa_body_state written = body;
   written.origin = change.origin; written.velocity = velocity; written.angles = change.angles; written.ground = NULL;
   qa_shared_body_table_write(ss_bodies(sim), player->actor, written);
@@ -431,7 +439,7 @@ void qa_app_shared_sim_set_player_movement_link(qa_app_shared_simulation *sim, q
     q2->origin = change.origin; q2->velocity = velocity;
     q2->flags = freeze ? state.as.q2_rerelease.flags
         : qa_js_bit_or(spawn ? 0 : qa_js_bit_and(state.as.q2_rerelease.flags, ~56), change.hold_milliseconds > 0 ? 32 : 0);
-    q2->time_milliseconds = freeze ? 0 : change.hold_milliseconds; q2->delta_angles = qa_ss_zero; q2->type = freeze ? 5 : 0;
+    q2->time_milliseconds = freeze ? 0 : change.hold_milliseconds; q2->delta_angles = qa_zero_vec3; q2->type = freeze ? 5 : 0;
   } else if (state.kind == QA_MOVEMENT_STATE_Q3) {
     qa_q3_movement_state *q3 = &next.as.q3;
     q3->origin = change.origin; q3->velocity = velocity; q3->view_angles = change.angles;
@@ -490,8 +498,8 @@ void qa_app_shared_sim_kill_box(qa_app_shared_simulation *sim, qa_owned_actor ac
     request.attack.inventory_provider = sim->recipe.inventory.provider; request.attack.movement_provider = sim->recipe.movement.provider;
     if (sim->strategy->telefrag_cause_q1(sim)) { request.attack.cause.kind = QA_ATTACK_CAUSE_Q1; request.attack.cause.death_type = "telefrag"; }
     else { request.attack.cause.kind = QA_ATTACK_CAUSE_Q2; request.attack.cause.means_of_death = 21; request.attack.cause.damage_flags = 32; }
-    request.target = candidate; request.amount = 100000; request.knockback = 0; request.direction = qa_ss_zero;
-    request.point = body.origin; request.normal = qa_ss_zero; request.delivery = "direct";
+    request.target = candidate; request.amount = 100000; request.knockback = 0; request.direction = qa_zero_vec3;
+    request.point = body.origin; request.normal = qa_zero_vec3; request.delivery = "direct";
     qa_gameplay_authority_apply(sim->combat, request, NULL, NULL);
   }
   qa_cleanup_pop(&cleanup); free(candidates);
@@ -507,21 +515,21 @@ void qa_app_shared_sim_control_player(qa_app_shared_simulation *sim, qa_actor_id
   qa_movement_state *state = &player->state;
   if (state->kind == QA_MOVEMENT_STATE_Q1) {
     qa_q1_movement_state *q1 = &state->as.q1;
-    q1->origin = origin; q1->velocity = qa_ss_zero; q1->angles = angles; q1->view_angles = angles; q1->move_type = 0;
+    q1->origin = origin; q1->velocity = qa_zero_vec3; q1->angles = angles; q1->view_angles = angles; q1->move_type = 0;
     memset(&q1->ground, 0, sizeof q1->ground); q1->ground.kind = QA_TRACE_HIT_NONE;
   } else if (state->kind == QA_MOVEMENT_STATE_Q2) {
     qa_q2_movement_state *q2 = &state->as.q2;
     q2->type = 4; q2->origin_eighths = (qa_integer_triple){{ss_trunc8(origin.x), ss_trunc8(origin.y), ss_trunc8(origin.z)}};
     q2->velocity_eighths = (qa_integer_triple){{0, 0, 0}};
   } else if (state->kind == QA_MOVEMENT_STATE_Q2_RERELEASE) {
-    state->as.q2_rerelease.type = 5; state->as.q2_rerelease.origin = origin; state->as.q2_rerelease.velocity = qa_ss_zero;
+    state->as.q2_rerelease.type = 5; state->as.q2_rerelease.origin = origin; state->as.q2_rerelease.velocity = qa_zero_vec3;
   } else if (state->kind == QA_MOVEMENT_STATE_Q3) {
     qa_q3_movement_state *q3 = &state->as.q3;
-    q3->movement_type = 4; q3->origin = origin; q3->velocity = qa_ss_zero; q3->view_angles = angles;
+    q3->movement_type = 4; q3->origin = origin; q3->velocity = qa_zero_vec3; q3->view_angles = angles;
     memset(&q3->ground, 0, sizeof q3->ground); q3->ground.kind = QA_TRACE_HIT_NONE;
-  } else { state->as.qw.origin = origin; state->as.qw.velocity = qa_ss_zero; state->as.qw.angles = angles; }
+  } else { state->as.qw.origin = origin; state->as.qw.velocity = qa_zero_vec3; state->as.qw.angles = angles; }
   qa_body_state written = body;
-  written.origin = origin; written.angles = angles; written.velocity = qa_ss_zero; written.ground = NULL;
+  written.origin = origin; written.angles = angles; written.velocity = qa_zero_vec3; written.ground = NULL;
   qa_shared_body_table_write(ss_bodies(sim), player->actor, written);
   ss_set_traits(sim, player->actor, true, false, false, false);
   qa_shared_body_table_link(ss_bodies(sim), player->actor, NULL);
@@ -586,7 +594,7 @@ void qa_app_shared_sim_assert_checkpoint_ready(qa_app_shared_simulation *sim) {
   if (sim->stepping || sim->checkpoint_in_progress || qa_event_ring_pending(&sim->transitions, &sim->transitions_cursor) != 0
       || sim->has_level_change) ss_fail("Save requires a completed frame without pending world travel");
   sim->strategy->require_loaded(sim, "The selected source world does not yet expose a complete saved-game checkpoint");
-  if (qa_app_shared_sim_foreign_tag(sim) || qa_app_shared_sim_foreign_lmctf(sim) || qa_app_shared_sim_foreign_deathball(sim))
+  if (qa_app_foreign_match_rules_blocks_checkpoint(sim))
     ss_fail("Saved games do not yet carry the runtime Tag, LMCTF or DeathBall match state");
   if (qa_event_ring_pending(&sim->quake_world_commands, &sim->quake_world_cursor) != 0 || sim->q3_commands.count != 0
       || sim->primary_command_blocks.count != 0) ss_fail("Save requires completed source commands");
@@ -728,11 +736,12 @@ void qa_app_shared_sim_restore_selected_travel(qa_app_shared_simulation *sim, qa
   if (sim->has_selected_arsenal) {
     const qa_ss_selected_arsenal_travel *carry = carried_player ? carried_player->selected_arsenal : NULL;
     if ((sim->strategy->as_q1(sim) != NULL) && qa_ss_is(sim->selected_arsenal.family, "q1")
-        && (qa_app_shared_sim_selected_q1_game(sim)->registered_weapon_count == 0 || carry == NULL))
-      qa_app_shared_sim_selected_arsenal_admit(sim, actor, 100, false);
-    else if (carry) qa_app_shared_sim_restore_selected_arsenal_travel(sim, actor, 100, carry);
-    else qa_app_shared_sim_selected_arsenal_admit(sim, actor, 100, false);
-    player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+        && (qa_app_shared_sim_selected_q1_game(sim)->registered_weapon_count == 0 || carry == NULL)) {
+      qa_arsenal_state admitted = qa_app_shared_sim_selected_arsenal_admit(sim, actor, 100, false);
+      free((void *)admitted.ammo); /* TS discards admit's read */
+    } else if (carry) qa_app_shared_sim_restore_selected_arsenal_travel(sim, actor, 100, carry);
+    else { qa_arsenal_state admitted = qa_app_shared_sim_selected_arsenal_admit(sim, actor, 100, false); free((void *)admitted.ammo); }
+    qa_app_shared_sim_assign_player_arsenal(sim, player);
   } else if (carried_player && carried_player->selected_arsenal)
     ss_fail("Campaign travel selected arsenal differs from the destination recipe");
   qa_app_shared_sim_sync_selected_q1_health_limit(sim, player->actor.id);
@@ -745,8 +754,8 @@ void qa_app_shared_sim_quake_c_client_spawned(qa_app_shared_simulation *sim, qa_
   if ((sim->strategy->as_quakec(sim) == NULL)) ss_fail("QC client spawn has no source owner");
   if (sim->has_selected_arsenal && qa_app_shared_sim_selected_arsenal_has(sim, actor.id)) {
     qa_app_shared_sim_selected_arsenal_remove(sim, actor.id);
-    player->arsenal = qa_app_shared_sim_selected_arsenal_admit(sim, actor,
-        qa_app_sim_quakec_source_client_equipment(sim->source.quakec, actor.id).max_health, false);
+    qa_app_shared_sim_store_player_arsenal(sim, player, qa_app_shared_sim_selected_arsenal_admit(sim, actor,
+        qa_app_sim_quakec_source_client_equipment(sim->source.quakec, actor.id).max_health, false));
   }
   qa_app_shared_sim_sync_selected_q1_health_limit(sim, actor.id);
   qa_app_shared_sim_apply_shared_travel_once(sim, actor, player->client);
@@ -913,7 +922,7 @@ static qa_q2_player_powerups ss_q2_powerups(void *ctx, qa_actor_id actor) {
 static bool ss_q2_weapon(void *ctx, qa_actor_id actor, qa_q2_character_weapon *out) {
   qa_app_sim_player_ui ui = qa_app_shared_sim_player_ui(((ss_q2_character_ctx *)ctx)->sim, actor);
   out->q2_name = NULL; out->ammo = ui.has_ammo ? ui.ammo_item : NULL;
-  out->kick_angles = qa_ss_zero; out->kick_origin = qa_ss_zero; out->loop_sound = "";
+  out->kick_angles = qa_zero_vec3; out->kick_origin = qa_zero_vec3; out->loop_sound = "";
   return true;
 }
 static void ss_q2_emit(void *ctx, qa_q2_presentation_event event) {
@@ -935,8 +944,8 @@ static void ss_q2_environment_damage(void *ctx, qa_owned_actor actor, double amo
   if (!qa_app_shared_sim_body(sim, actor.id, &body)) return;
   qa_actor_id world; bool has_world = qa_app_shared_sim_world_actor(sim, &world);
   qa_damage_request request; memset(&request, 0, sizeof request);
-  request.target = actor.id; request.amount = amount; request.knockback = 0; request.direction = qa_ss_zero;
-  request.point = body.origin; request.normal = qa_ss_zero; request.delivery = "direct";
+  request.target = actor.id; request.amount = amount; request.knockback = 0; request.direction = qa_zero_vec3;
+  request.point = body.origin; request.normal = qa_zero_vec3; request.delivery = "direct";
   request.attack.sequence = sim->attack_sequence++; request.attack.time = sim->source_frame.time;
   request.attack.attacker = has_world ? &world : NULL; request.attack.inflictor = has_world ? &world : NULL; request.attack.weapon = NULL;
   request.attack.weapon_provider = sim->weapon_provider.provider; request.attack.combat_provider = sim->recipe.combat.provider;
@@ -976,9 +985,17 @@ void qa_app_shared_sim_attach_q2_character(qa_app_shared_simulation *sim, qa_app
       ss_q2_died, ss_q2_request_respawn, ss_q2_motion, ss_q2_spawn_gib};
   /* `players/${appearance.provider.split("/").at(-1) ?? "male"}/tris.md2` */
   const char *appearance = player->character_appearance.provider, *slash = strrchr(appearance, '/');
-  char model[256]; snprintf(model, sizeof model, "players/%s/tris.md2", slash ? slash + 1 : appearance);
+  const char *name = slash ? slash + 1 : appearance;
+  size_t model_size = strlen("players/") + strlen(name) + strlen("/tris.md2") + 1;
+  char *model = malloc(model_size); /* whole (TS template string) */
+  if (!model) qa_range_error("Out of memory");
+  snprintf(model, model_size, "players/%s/tris.md2", name);
+  qa_cleanup model_cleanup; qa_cleanup_push(&model_cleanup, free, model);
+  const char *interned = qa_app_shared_sim_intern(sim, model);
+  qa_cleanup_pop(&model_cleanup);
+  free(model);
   qa_q2_character_options options; memset(&options, 0, sizeof options);
-  options.model = qa_app_shared_sim_intern(sim, model); options.skin = 0; options.slot = (double)player->client.slot;
+  options.model = interned; options.skin = 0; options.slot = (double)player->client.slot;
   options.mode = qa_ss_is(sim->options.mode, "deathmatch") ? QA_Q2_MODE_DEATHMATCH : qa_ss_is(sim->options.mode, "coop") ? QA_Q2_MODE_COOP : QA_Q2_MODE_SINGLEPLAYER;
   options.deathmatch_flags = 0; options.environment = false;
   options.has_edition = true; options.edition = strstr(content, ":rerelease:") ? QA_Q2_EDITION_RERELEASE : QA_Q2_EDITION_CLASSIC;
@@ -993,25 +1010,23 @@ void qa_app_shared_sim_attach_q2_character(qa_app_shared_simulation *sim, qa_app
 }
 
 /* ---- spawnCharacterGib (4675-4683): player NULL = TS undefined. ---- */
-typedef struct ss_gib_ctx { qa_app_shared_simulation *sim; } ss_gib_ctx;
+/* The gib's think context is the simulation itself (a per-gib record would grow the keep arena with every gib). */
 static void ss_release_self(void *ctx, qa_owned_actor self, qa_frame_context frame) {
   (void)frame; /* TS think: self => this.actors.release(self) */
-  qa_session_actor_registry_release(((ss_gib_ctx *)ctx)->sim->actors, self);
+  qa_session_actor_registry_release(((qa_app_shared_simulation *)ctx)->actors, self);
 }
 void qa_app_shared_sim_spawn_character_gib(qa_app_shared_simulation *sim, qa_q2_character_gib gib, qa_app_sim_movement_player *player) {
   qa_owned_actor actor = qa_session_actor_registry_allocate(sim->actors,
       player ? player->character_definition.provider : sim->recipe.character.definition.provider, "q2:character-gib");
   qa_body_state body; memset(&body, 0, sizeof body);
-  body.origin = gib.origin; body.velocity = gib.velocity; body.angles = qa_ss_zero; body.ground = NULL;
+  body.origin = gib.origin; body.velocity = gib.velocity; body.angles = qa_zero_vec3; body.ground = NULL;
   qa_shared_body_table_create_body(ss_bodies(sim), actor, body);
   qa_app_sim_shared_physics_set_solid(sim->physics, actor, ss_q2_solid("none"));
   qa_q2_motion motion; memset(&motion, 0, sizeof motion);
   motion.actor = actor; motion.velocity = gib.velocity; motion.angular_velocity = gib.angular_velocity; motion.kind = "toss";
   motion.gravity = 1; motion.gravity_vector = (qa_vec3){0, 0, -1}; motion.clip_mask = 3; motion.has_owner = false;
   qa_app_sim_shared_physics_set_motion(sim->physics, actor, motion);
-  ss_gib_ctx *ctx = qa_app_shared_sim_keep(sim, sizeof *ctx);
-  ctx->sim = sim;
-  qa_actor_callbacks callbacks = {ctx, ss_release_self, NULL, NULL, NULL, NULL};
+  qa_actor_callbacks callbacks = {sim, ss_release_self, NULL, NULL, NULL, NULL};
   qa_actor_callback_table_bind(sim->callbacks, actor, callbacks);
   qa_ss_detached_model model; memset(&model, 0, sizeof model);
   model.content = player ? player->character_definition.content : sim->recipe.character.definition.content;
@@ -1043,11 +1058,11 @@ void qa_app_shared_sim_place_q1_player(qa_app_shared_simulation *sim, qa_app_sim
   qa_comp_q1_source_composition_admit_travel(sim->source.q1_composition, player->actor, travel);
   if (sim->has_selected_arsenal) {
     qa_app_shared_sim_selected_arsenal_remove(sim, player->actor.id);
-    player->arsenal = qa_app_shared_sim_selected_arsenal_admit(sim, player->actor, 100, false);
+    qa_app_shared_sim_store_player_arsenal(sim, player, qa_app_shared_sim_selected_arsenal_admit(sim, player->actor, 100, false));
   }
   ss_set_traits(sim, player->actor, true, true, true, false);
   qa_q2_player_movement_change change; memset(&change, 0, sizeof change);
-  change.kind = "spawn"; change.origin = qa_ss_add(spot.origin, (qa_vec3){0, 0, 1}); change.velocity = qa_ss_zero;
+  change.kind = "spawn"; change.origin = qa_add3(spot.origin, (qa_vec3){0, 0, 1}); change.velocity = qa_zero_vec3;
   change.angles = spot.angles; change.command_angles = player->command_angles; change.hold_milliseconds = 0; change.spectator = false;
   qa_app_shared_sim_set_player_movement(sim, player->actor.id, change);
   if (sim->selected_q3_source) qa_app_q3_selected_source_respawn(sim->selected_q3_source, player->actor.id);
@@ -1072,12 +1087,12 @@ qa_app_sim_player_view qa_app_shared_sim_player_view(qa_app_shared_simulation *s
   if (has_output && output.view_offset && has_body
       && (!output.has_stance || output.stance || !qa_app_shared_sim_source_client_view(sim, actor).crouched)) {
     qa_vec3 offset = *output.view_offset;
-    qa_vec3 origin = qa_ss_add(body.origin, (qa_vec3){offset.x, offset.y, 0});
+    qa_vec3 origin = qa_add3(body.origin, (qa_vec3){offset.x, offset.y, 0});
     qa_vec3 delta = {origin.x - view.origin.x, origin.y - view.origin.y, origin.z + offset.z - view.origin.z - view.view_height};
     view.origin = origin; view.view_height = offset.z;
     view.has_client_view_offset_delta = true; view.client_view_offset_delta = delta;
   }
-  view.kick_angles = qa_ss_add(view.has_kick_angles ? view.kick_angles : qa_ss_zero, qa_app_sim_q1_player_punch_read(sim->q1_punch, actor));
+  view.kick_angles = qa_add3(view.has_kick_angles ? view.kick_angles : qa_zero_vec3, qa_app_sim_q1_player_punch_read(sim->q1_punch, actor));
   view.has_kick_angles = true;
   return view;
 }
@@ -1118,7 +1133,7 @@ bool qa_ss_quakec_override_view(qa_app_shared_simulation *sim, qa_actor_id actor
   if (intermission) return false;
   qa_vec3 offset = qa_app_sim_quakec_source_client_view_offset(sim->source.quakec, actor);
   *out = *view;
-  out->origin = qa_ss_add(view->origin, (qa_vec3){offset.x, offset.y, 0}); out->view_height = offset.z;
+  out->origin = qa_add3(view->origin, (qa_vec3){offset.x, offset.y, 0}); out->view_height = offset.z;
   if (health <= 0) out->angles.z = 80;
   return true;
 }
@@ -1144,7 +1159,7 @@ bool qa_app_shared_sim_source_player_view(qa_app_shared_simulation *sim, qa_acto
     return true;
   }
   if (player->has_cutscene) {
-    *out = ss_view_only(qa_ss_add(player->cutscene_origin, (qa_vec3){player->cutscene_view_offset.x, player->cutscene_view_offset.y, 0}),
+    *out = ss_view_only(qa_add3(player->cutscene_origin, (qa_vec3){player->cutscene_view_offset.x, player->cutscene_view_offset.y, 0}),
         player->cutscene_angles, player->cutscene_view_offset.z);
     out->has_field_of_view = true; out->field_of_view = sim->strategy->cutscene_fov(sim, source != NULL, source ? source->fov : 0);
     return true;
@@ -1155,13 +1170,13 @@ bool qa_app_shared_sim_source_player_view(qa_app_shared_simulation *sim, qa_acto
     if (q1 && !qa_ss_is(qa_q1_character_actor_life(*q1), "alive")) {
       qa_vec3 offset = qa_q1_character_actor_view_offset(*q1);
       *out = view;
-      out->origin = qa_ss_add(view.origin, (qa_vec3){offset.x, offset.y, 0}); out->view_height = offset.z; out->angles.z = 80;
+      out->origin = qa_add3(view.origin, (qa_vec3){offset.x, offset.y, 0}); out->view_height = offset.z; out->angles.z = 80;
       out->has_field_of_view = true; out->field_of_view = source_fov;
       if (sim->strategy->foreign_character_death(sim)) out->foreign_character_death = true;
       return true;
     }
     if (player->character == QA_GAME_FAMILY_Q3 && qa_ss_map_has(&sim->characters, &player->actor)) {
-      const qa_attack_provenance *attack = qa_ss_map_get(&sim->last_attack, &player->actor);
+      const qa_attack_provenance *attack = qa_app_shared_sim_last_attack(sim, player->actor);
       qa_body_state killer;
       bool has_killer = attack && attack->attacker && qa_app_shared_sim_body(sim, *attack->attacker, &killer);
       double yaw = !has_killer || qa_same_actor(*attack->attacker, actor) ? view.angles.y
@@ -1180,8 +1195,8 @@ bool qa_app_shared_sim_source_player_view(qa_app_shared_simulation *sim, qa_acto
   }
   qa_q2_character_actor **q2 = qa_ss_map_get(&sim->q2_characters, &player->actor);
   qa_app_sim_player_view result; memset(&result, 0, sizeof result);
-  result.origin = qa_ss_add(view.origin, (qa_vec3){source->offset.x, source->offset.y, 0});
-  result.angles = qa_ss_add(!player->intermission && health > 0 ? view.angles : source->angles, source->kick_angles);
+  result.origin = qa_add3(view.origin, (qa_vec3){source->offset.x, source->offset.y, 0});
+  result.angles = qa_add3(!player->intermission && health > 0 ? view.angles : source->angles, source->kick_angles);
   result.foreign_character_death = sim->strategy->foreign_character_death(sim) && q2 && (*q2)->state.dead && !player->intermission;
   result.has_field_of_view = true; result.field_of_view = source->fov;
   result.view_height = source->offset.z + (sim->strategy->rerelease_view_height(sim) && !player->intermission ? view.view_height : 0);
@@ -1335,18 +1350,29 @@ void qa_app_shared_sim_set_source_player_identity(qa_app_shared_simulation *sim,
   sim->strategy->set_identity(sim, actor, identity);
 }
 /* Q1Strategy.setIdentity / Q2Strategy.setIdentity */
+typedef struct q1_identity_scope { ss_info info; qa_comp_userinfo_entry *entries; } q1_identity_scope;
+static void q1_identity_scope_free(void *v) {
+  q1_identity_scope *scope = v;
+  free(scope->entries); scope->entries = NULL;
+  ss_info_free(&scope->info);
+}
 void qa_ss_q1_set_identity(qa_app_shared_simulation *sim, qa_actor_id actor, const qa_app_sim_player_identity *identity) {
   qa_ss_source_runtime *source = &sim->source;
   qa_comp_q1_source_clients *clients = &source->q1_composition->clients;
   qa_comp_q1_source_client *client = qa_comp_q1_source_clients_require(clients, actor);
-  ss_info info = {0};
-  for (size_t i = 0; i < client->userinfo_count; i++) ss_info_set(&info, client->userinfo[i].key, client->userinfo[i].value);
-  if (identity->name) ss_info_set(&info, "name", identity->name);
-  qa_comp_userinfo_entry *entries = calloc(info.count + 1, sizeof *entries);
-  if (!entries) qa_range_error("Out of memory");
-  for (size_t i = 0; i < info.count; i++) entries[i] = (qa_comp_userinfo_entry){info.items[i].name, info.items[i].value};
-  qa_comp_q1_source_clients_update(clients, actor, entries, info.count);
-  free(entries); ss_info_free(&info);
+  /* The copied userinfo is released when the client update raises (TS: garbage). */
+  q1_identity_scope scope = {{0}, NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, q1_identity_scope_free, &scope);
+  for (size_t i = 0; i < client->userinfo_count; i++) ss_info_set(&scope.info, client->userinfo[i].key, client->userinfo[i].value);
+  if (identity->name) ss_info_set(&scope.info, "name", identity->name);
+  scope.entries = calloc(scope.info.count + 1, sizeof *scope.entries);
+  if (!scope.entries) qa_range_error("Out of memory");
+  for (size_t i = 0; i < scope.info.count; i++)
+    scope.entries[i] = (qa_comp_userinfo_entry){scope.info.items[i].name, scope.info.items[i].value};
+  qa_comp_q1_source_clients_update(clients, actor, scope.entries, scope.info.count);
+  qa_cleanup_pop(&guard);
+  q1_identity_scope_free(&scope);
   if (identity->has_shirt || identity->has_pants) {
     client = qa_comp_q1_source_clients_require(clients, actor); /* TS reads client.shirt/pants after the update */
     qa_comp_q1_source_clients_colors(clients, actor, identity->has_shirt ? identity->shirt : (double)qa_comp_q1_source_client_shirt(client),
@@ -1511,7 +1537,10 @@ void qa_app_shared_sim_queue_quake_world_commands(qa_app_shared_simulation *sim,
   if (!group.commands) qa_range_error("Out of memory");
   memcpy(group.commands, commands, count * sizeof *group.commands); /* structuredClone */
   group.command_count = count;
+  /* A full ring refuses the group (a flooding remote client): the copied commands are freed with the refusal. */
+  qa_cleanup node; qa_cleanup_push(&node, free, group.commands);
   qa_event_ring_admit(&sim->quake_world_commands, &group);
+  qa_cleanup_pop(&node);
 }
 /* ---- queueQuakeWorldAction (5035-5040) ---- */
 void qa_app_shared_sim_queue_quake_world_action(qa_app_shared_simulation *sim, qa_client_id client, void (*action)(void *ctx), void *action_ctx) {
@@ -1531,7 +1560,7 @@ static qa_app_sim_movement_player *ss_player_for_client(qa_app_shared_simulation
   return NULL;
 }
 static void ss_refresh_quakec_player(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player) {
-  player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+  qa_app_shared_sim_assign_player_arsenal(sim, player);
   if (player->character == QA_GAME_FAMILY_Q1) player->animation = qa_app_sim_quakec_source_client_animation(sim->source.quakec, player->actor.id);
   player->state = qa_app_sim_movement_player_read_state(player);
   qa_app_shared_sim_sync_quake_c_client_view(sim, player);
@@ -1639,7 +1668,9 @@ typedef struct ss_player_host {
   qa_owned_actor actor;
   qa_app_sim_quakec_source *qc; /* source.kind "quakec" captured by TS */
   qa_app_sim_netquake_client_binding netquake;
-  qa_mod_client_application *applications[16]; size_t depth; /* sliceApplications / applicationParent */
+  /* Applications the player has open, innermost last: client-command ones (TS applicationParent) and movement slices
+   * (TS sliceApplications). A null entry is an application begin returned null for. */
+  qa_mod_client_application **applications; bool *slice; size_t depth, capacity; /* grown in the simulation's keep arena */
   qa_app_sim_movement_player *player;
   qa_fixed_movement_pose fixed_pose;
   qa_actor_id jump_pad; /* storage behind a read Q3 movement state's jumpPad */
@@ -1678,7 +1709,7 @@ static qa_user_command ss_encode_aim(void *ctx, qa_vec3 aim, qa_user_command cur
 }
 static bool ss_host_input_begin(void *ctx, qa_app_sim_movement_player *player, const char *scope, qa_user_command command,
     qa_frame_context frame, qa_movement_state state, const qa_arsenal_intent *arsenal,
-    qa_user_command *out_command, const qa_arsenal_intent **out_arsenal) {
+    qa_user_command *out_command, const qa_arsenal_intent **out_arsenal, bool *out_has_application) {
   ss_player_host *h = ctx;
   qa_mod_client_applications *owner = h->sim->mod_client_applications;
   if (!qa_mod_client_applications_active(owner)) return false;
@@ -1690,15 +1721,30 @@ static bool ss_host_input_begin(void *ctx, qa_app_sim_movement_player *player, c
   input.frame = frame;
   input.accepted = qa_ss_map_get(&h->sim->mod_client_commands, &player->actor.id);
   input.has_arsenal = arsenal != NULL; input.arsenal = arsenal;
-  if (h->depth > 0) { input.has_parent_invocation = true; input.parent_invocation = h->applications[h->depth - 1]->invocation; }
+  /* ...(this.applicationParent === null ? {} : { parentInvocation }): the innermost open client-command application. */
+  for (size_t i = h->depth; i-- > 0;)
+    if (!h->slice[i]) {
+      if (h->applications[i] != NULL) { input.has_parent_invocation = true; input.parent_invocation = h->applications[i]->invocation; }
+      break;
+    }
   ss_aim_ctx aim = {player};
+  if (h->depth == h->capacity) {
+    /* TS arrays have no bound: grow (the old blocks stay in the keep arena until the simulation is destroyed). */
+    size_t capacity = h->capacity == 0 ? 8 : h->capacity * 2;
+    qa_mod_client_application **applications = qa_app_shared_sim_keep(h->sim, capacity * sizeof *applications);
+    bool *slice = qa_app_shared_sim_keep(h->sim, capacity * sizeof *slice);
+    if (h->depth != 0) { memcpy(applications, h->applications, h->depth * sizeof *applications); memcpy(slice, h->slice, h->depth * sizeof *slice); }
+    h->applications = applications; h->slice = slice; h->capacity = capacity;
+  }
   qa_mod_client_application *application = qa_mod_client_applications_begin(owner, input, ss_encode_aim, &aim);
-  if (h->depth == sizeof h->applications / sizeof *h->applications) qa_range_error("Input application nesting exceeds its bound");
+  h->slice[h->depth] = strcmp(scope, "movement-slice") == 0;
   h->applications[h->depth++] = application;
   *out_command = application ? application->command : command;
   *out_arsenal = application ? (application->has_arsenal ? &application->arsenal : NULL) : arsenal;
+  if (out_has_application) *out_has_application = application != NULL;
   return true;
 }
+static bool ss_host_inputs_active(void *ctx) { return qa_mod_client_applications_active(((ss_player_host *)ctx)->sim->mod_client_applications); }
 static void ss_host_input_finish(void *ctx, bool failed) {
   ss_player_host *h = ctx;
   qa_mod_client_application *application = h->depth > 0 ? h->applications[--h->depth] : NULL;
@@ -1726,7 +1772,7 @@ static void ss_host_after_movement(void *ctx, qa_app_sim_movement_player *player
   qa_app_sim_quakec_source_mixed_client_post_think(h->qc, h->actor, player->ground, player->water_level, player->water_type,
       player->profile.kind, source_command == NULL ? "immediate" : "deferred");
   ss_host_project(h, before);
-  player->arsenal = qa_app_shared_sim_arsenal(h->sim, player);
+  qa_app_shared_sim_assign_player_arsenal(h->sim, player);
 }
 static bool ss_host_q2_config(void *ctx, qa_app_sim_q2_movement_config *out) { return qa_app_shared_sim_q2_movement_config(((ss_player_host *)ctx)->sim, out); }
 /* NetQuake binding of a native QuakeC source. */
@@ -1927,7 +1973,7 @@ qa_app_sim_movement_player *qa_app_shared_sim_create_player_with(qa_app_shared_s
   qa_app_sim_player_movement_host host; memset(&host, 0, sizeof host);
   host.ctx = h;
   host.client_outputs = ss_host_client_outputs;
-  host.input_applications_active = sim->mod_client_applications != NULL;
+  host.input_applications_active = sim->mod_client_applications != NULL ? ss_host_inputs_active : NULL;
   host.input_begin = ss_host_input_begin; host.input_finish = ss_host_input_finish;
   sim->strategy->movement_bindings(sim, actor, selected_clock, h, &host);
   host.actors = sim->actors; host.bodies = ss_bodies(sim); host.combat = sim->combat;
@@ -1968,7 +2014,7 @@ static void ss_q3c_emit(void *ctx, qa_q3_character_event event) {
 }
 static qa_q3_character_death_context ss_q3c_death(void *ctx, qa_owned_actor actor) {
   qa_app_shared_simulation *sim = ((ss_q3_character_ctx *)ctx)->sim;
-  const qa_attack_provenance *attack = qa_ss_map_get(&sim->last_attack, &actor);
+  const qa_attack_provenance *attack = qa_app_shared_sim_last_attack(sim, actor);
   qa_q3_character_death_context death = {true, false, false, 1022};
   death.suicide = attack && attack->cause.kind == QA_ATTACK_CAUSE_Q3 && attack->cause.means_of_death == 20;
   if (attack && attack->attacker) {
@@ -2038,7 +2084,7 @@ qa_owned_actor qa_app_shared_sim_prepare_q3_client(qa_app_shared_simulation *sim
   qa_owned_actor actor = qa_session_actor_registry_allocate_at_source(sim->actors, sim->recipe.map.entities.provider, client.slot, character.provider);
   qa_arsenal_state arsenal = qa_q3_spawn_loadout(sim->weapon_provider.provider, qa_app_q3_source_runtime_options(source)->product,
       qa_app_q3_source_runtime_game_type(source) == 3);
-  qa_app_sim_movement_player *player = qa_app_shared_sim_create_player_with(sim, actor, client, qa_ss_zero, qa_ss_zero, arsenal, &character, &appearance);
+  qa_app_sim_movement_player *player = qa_app_shared_sim_create_player_with(sim, actor, client, qa_zero_vec3, qa_zero_vec3, arsenal, &character, &appearance);
   player->owned_arsenal_ammo = arsenal.ammo; /* the spawn loadout's malloc'd ammo, freed when the player's next arsenal replaces it or with the player */
   qa_ss_map_set(&sim->player_states, &actor, &player);
   qa_body_state body; memset(&body, 0, sizeof body);
@@ -2127,7 +2173,7 @@ void qa_app_shared_sim_spawn_q1_player(qa_app_shared_simulation *sim, qa_owned_a
   qa_ss_optional_actor start = {true, selected->actor.id};
   qa_ss_map_set(&sim->character_starts, &actor, &start);
   qa_q2_player_movement_change change; memset(&change, 0, sizeof change);
-  change.kind = "spawn"; change.origin = qa_ss_add(spot.origin, (qa_vec3){0, 0, 1}); change.velocity = qa_ss_zero;
+  change.kind = "spawn"; change.origin = qa_add3(spot.origin, (qa_vec3){0, 0, 1}); change.velocity = qa_zero_vec3;
   change.angles = spot.angles; change.command_angles = player->command_angles; change.hold_milliseconds = 0; change.spectator = false;
   qa_app_shared_sim_set_player_movement(sim, actor.id, change);
   qa_app_shared_sim_kill_box(sim, actor); qa_shared_body_table_link(ss_bodies(sim), actor, NULL);
@@ -2152,7 +2198,7 @@ qa_app_sim_player_admission qa_app_shared_sim_admit_player_with(qa_app_shared_si
   qa_arsenal_state arsenal; memset(&arsenal, 0, sizeof arsenal);
   arsenal.provider = sim->weapon_provider.provider; arsenal.active_weapon = NULL; arsenal.ammo = NULL; arsenal.ammo_count = 0;
   arsenal.state = sim->strategy->initial_arsenal_state(sim);
-  qa_app_sim_movement_player *player = qa_app_shared_sim_create_player(sim, actor, client, qa_ss_zero, qa_ss_zero, arsenal);
+  qa_app_sim_movement_player *player = qa_app_shared_sim_create_player(sim, actor, client, qa_zero_vec3, qa_zero_vec3, arsenal);
   qa_ss_map_set(&sim->player_states, &actor, &player);
   qa_body_state body; memset(&body, 0, sizeof body);
   body.origin = qa_app_sim_movement_origin(player->state); body.bounds = player->bounds; body.ground = NULL;
@@ -2182,12 +2228,12 @@ qa_app_sim_player_admission qa_app_shared_sim_admit_player_with(qa_app_shared_si
   bool native_carry = sim->strategy->admit_carry(sim, actor, entity, carried_player);
   player->state = qa_app_sim_movement_player_read_state(player);
   qa_app_shared_sim_restore_selected_travel(sim, player, carried_player);
-  player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+  qa_app_shared_sim_assign_player_arsenal(sim, player);
   sim->strategy->enter_world(sim, actor, player, carried_player == NULL);
   /* Cross-program travel lands after the destination's own spawn so its loadout reset cannot discard the carried health and inventory. */
   if (!native_carry && carried_player) {
     qa_app_shared_sim_apply_shared_travel_carry(sim, actor, carried_player);
-    player->state = qa_app_sim_movement_player_read_state(player); player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+    player->state = qa_app_sim_movement_player_read_state(player); qa_app_shared_sim_assign_player_arsenal(sim, player);
     qa_q1_travel_state entry_carry;
     if (sim->strategy->capture_entry_carry(sim, actor, &entry_carry)) ss_set_entry_carry(sim, actor, entry_carry);
   }
@@ -2365,8 +2411,10 @@ qa_app_simulation_travel qa_app_shared_sim_capture_travel(qa_app_shared_simulati
   /* Native QuakeWorld travel carries its clients in the source record; shared movement players must not be duplicated alongside them. */
   if (qa_ss_is(travel.source_kind, "quakeworld")) return travel;
   size_t count = 0;
-  qa_client_id clients[256]; qa_actor_id actors[256];
-  if (!sim->strategy->travelers(sim, clients, actors, 256, &count)) for (size_t i = 0; i < sim->player_states.count && count < 256; i++) {
+  /* The strategy's travelers are its source clients (at most 64); otherwise every movement player, with no cap. */
+  size_t capacity = sim->player_states.count > 256 ? sim->player_states.count : 256;
+  qa_client_id *clients = ss_travel_alloc(capacity * sizeof *clients); qa_actor_id *actors = ss_travel_alloc(capacity * sizeof *actors);
+  if (!sim->strategy->travelers(sim, clients, actors, capacity, &count)) for (size_t i = 0; i < sim->player_states.count; i++) {
     qa_app_sim_movement_player *player = *(qa_app_sim_movement_player **)qa_ss_map_value_at(&sim->player_states, i);
     clients[count] = player->client; actors[count++] = player->actor.id;
   }
@@ -2440,7 +2488,7 @@ void qa_app_shared_sim_restore_campaign_travel(qa_app_shared_simulation *sim, co
     }
     qa_q2_players_put_in_server(product->players, entity, product->services, false, has_landmark ? &landmark : NULL);
     qa_app_shared_sim_restore_selected_travel(sim, player, carried);
-    player->arsenal = qa_app_shared_sim_arsenal(sim, player); player->state = qa_app_sim_movement_player_read_state(player);
+    qa_app_shared_sim_assign_player_arsenal(sim, player); player->state = qa_app_sim_movement_player_read_state(player);
     if (sim->hand_grenades) qa_app_sim_hand_grenade_runtime_admit(sim->hand_grenades, player->actor.id, carried->hand_grenades);
     ss_holster_into_slot(sim, player->actor.id, carried);
   }
@@ -2511,6 +2559,39 @@ static void ss_native_command_run(void *ctx) {
   if (qa_ss_is(c->sim->source.edition, "classic")) qa_app_sim_classic_guest_world_command(c->sim->source.classic_world, c->slot, c->argv, c->argc, c->args);
   else qa_app_sim_rerelease_guest_world_command(c->sim->source.rerelease_world, c->slot, c->argv, c->argc, c->args);
 }
+/* String.length of UTF-8 text: UTF-16 units (a four-byte sequence is two). */
+static size_t ss_utf16_units(const char *text) {
+  size_t units = 0;
+  for (const unsigned char *at = (const unsigned char *)text; *at; at++)
+    if ((*at & 0xC0) != 0x80) units += *at >= 0xF0 ? 2 : 1;
+  return units;
+}
+/* text.slice(0, units) in place over UTF-8: a surrogate pair cut in half keeps its high half (WTF-8, as the network's
+ * slice_utf16 does). The cut never grows the text (three bytes replace four). */
+static void ss_slice_utf16(char *text, size_t units) {
+  unsigned char *bytes = (unsigned char *)text;
+  size_t at = 0, used = 0;
+  while (bytes[at] != 0 && used < units) {
+    unsigned char lead = bytes[at];
+    size_t size = lead < 0x80 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 1;
+    for (size_t i = 1; i < size; i++) if (bytes[at + i] == 0) { size = i; break; }
+    if (size == 4) {
+      if (used + 2 > units) {
+        uint32_t code = ((uint32_t)(lead & 0x07) << 18) | ((uint32_t)(bytes[at + 1] & 0x3F) << 12)
+            | ((uint32_t)(bytes[at + 2] & 0x3F) << 6) | (uint32_t)(bytes[at + 3] & 0x3F);
+        uint32_t high = 0xD800 + ((code - 0x10000) >> 10);
+        bytes[at] = (unsigned char)(0xE0 | (high >> 12));
+        bytes[at + 1] = (unsigned char)(0x80 | ((high >> 6) & 0x3F));
+        bytes[at + 2] = (unsigned char)(0x80 | (high & 0x3F));
+        at += 3;
+        break;
+      }
+      used += 2;
+    } else used++;
+    at += size;
+  }
+  bytes[at] = 0;
+}
 /* args.join(separator), malloc'd. */
 static char *ss_join(const char *const *args, size_t count, const char *separator) {
   size_t length = 1;
@@ -2523,8 +2604,13 @@ static char *ss_join(const char *const *args, size_t count, const char *separato
 }
 /* args.join("").toLowerCase().replaceAll(" ", "") (ASCII lowering, see source_items.h). */
 static char *ss_requested(const char *const *args, size_t count) {
+  /* args.join("").toLowerCase().replaceAll(" ", ""): the result is only compared with ASCII ids and labels, and the one
+   * non-ASCII character whose lower case is ASCII is U+212A KELVIN SIGN ("k"); other text keeps its bytes. */
   char *joined = ss_join(args, count, ""), *out = joined;
-  for (const char *c = joined; *c; c++) if (*c != ' ') *out++ = (char)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c);
+  for (const char *c = joined; *c; c++) {
+    if ((unsigned char)c[0] == 0xE2 && (unsigned char)c[1] == 0x84 && (unsigned char)c[2] == 0xAA) { *out++ = 'k'; c += 2; continue; }
+    if (*c != ' ') *out++ = (char)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c);
+  }
   *out = '\0';
   return joined;
 }
@@ -2615,11 +2701,17 @@ void qa_app_shared_sim_player_command(qa_app_shared_simulation *sim, qa_actor_id
     for (size_t i = 0; i < ui.item_count; i++) if (qa_ss_is(ui.items[i].kind, "weapon") && ui.items[i].owned) owned[count++] = &ui.items[i];
     if (use) {
       for (size_t i = 0; i < count && !weapon; i++) {
-        char prefixed[256]; snprintf(prefixed, sizeof prefixed, "q1:weapon/%s", requested);
-        char label[256]; size_t n = 0;
-        for (const char *c = owned[i]->label; *c && n + 1 < sizeof label; c++) if (*c != ' ') label[n++] = (char)(*c >= 'A' && *c <= 'Z' ? *c + 32 : *c);
+        /* item.id === requested || item.id === `q1:weapon/${requested}` || item.label.toLowerCase().replaceAll(" ", "") === requested */
+        const char *id = owned[i]->id;
+        bool prefixed = id != NULL && strncmp(id, "q1:weapon/", 10) == 0 && strcmp(id + 10, requested) == 0;
+        char *label = qa_js_to_lower_case(owned[i]->label != NULL ? owned[i]->label : "");
+        if (label == NULL) qa_range_error("Out of memory");
+        size_t n = 0;
+        for (const char *c = label; *c; c++) if (*c != ' ') label[n++] = *c;
         label[n] = '\0';
-        if (qa_ss_is(owned[i]->id, requested) || qa_ss_is(owned[i]->id, prefixed) || qa_ss_is(label, requested)) weapon = owned[i];
+        bool labelled = strcmp(label, requested) == 0;
+        free(label);
+        if (qa_ss_is(id, requested) || prefixed || labelled) weapon = owned[i];
       }
     } else {
       long index = -1;
@@ -2708,13 +2800,15 @@ bool qa_ss_q1_pre_command(qa_app_shared_simulation *sim, qa_actor_id actor, cons
     if (arg_count == 0) return true;
     qa_comp_q1_source_clients *clients = &source->q1_composition->clients;
     qa_comp_q1_source_client *sender = qa_comp_q1_source_clients_require(clients, actor);
-    char prefix[300]; snprintf(prefix, sizeof prefix, "\x01%s: ", qa_comp_q1_source_client_name(sender));
+    const char *sender_name = qa_comp_q1_source_client_name(sender);
+    /* prefix = `\x01${sender.name}: ` */
     char *joined = ss_join(args, arg_count, " ");
-    size_t keep = (size_t)qa_js_max(0, 62 - (double)strlen(prefix));
-    if (strlen(joined) > keep) joined[keep] = '\0'; /* .slice(0, max(0, 62 - prefix.length)) (UTF-16 units: ASCII) */
-    char *text = malloc(strlen(prefix) + strlen(joined) + 2);
-    if (!text) qa_range_error("Out of memory");
-    sprintf(text, "%s%s\n", prefix, joined); free(joined);
+    /* .slice(0, Math.max(0, 62 - prefix.length)): prefix.length and the slice count UTF-16 units. */
+    double keep = qa_js_max(0, 62 - (double)(ss_utf16_units(sender_name) + 3));
+    ss_slice_utf16(joined, (size_t)keep);
+    char *text = malloc(strlen(sender_name) + strlen(joined) + 5);
+    if (!text) { free(joined); qa_range_error("Out of memory"); }
+    sprintf(text, "\x01%s: %s\n", sender_name, joined); free(joined);
     qa_cleanup cleanup; qa_cleanup_push(&cleanup, free, text);
     double sender_team = sender->team;
     for (size_t i = 0; i < clients->record_count; i++) {
@@ -2835,9 +2929,10 @@ void qa_ss_q2_after_command(qa_app_shared_simulation *sim, qa_actor_id actor, qa
   } else if (use) {
     size_t entry_count;
     const qa_inventory_entry *entries = qa_shared_inventory_table_entries(sim->inventory, actor, &entry_count);
-    char prefixed[256]; snprintf(prefixed, sizeof prefixed, "q2:item_%s", requested);
+    /* value.item === requested || value.item === `q2:item_${requested}` (the whole request, any length) */
     for (size_t i = 0; i < entry_count; i++)
-      if (qa_ss_is(entries[i].item, requested) || qa_ss_is(entries[i].item, prefixed)) {
+      if (qa_ss_is(entries[i].item, requested)
+          || (entries[i].item != NULL && strncmp(entries[i].item, "q2:item_", 8) == 0 && strcmp(entries[i].item + 8, requested) == 0)) {
         qa_item_id item = entries[i].item;
         qa_q2_item_module_use(product->items, player->actor, item, product->services, 30);
         break;
@@ -2929,7 +3024,7 @@ void qa_app_shared_sim_spawn_q3_player(qa_app_shared_simulation *sim, qa_q3_game
   player->bounds = player->standing_bounds; player->has_body_shape_base = false;
   player->view_height = player->character == QA_GAME_FAMILY_Q3 ? 26 : 22;
   qa_body_state body; memset(&body, 0, sizeof body);
-  body.origin = pose.origin; body.angles = pose.angles; body.velocity = qa_ss_zero; body.bounds = player->standing_bounds; body.ground = NULL;
+  body.origin = pose.origin; body.angles = pose.angles; body.velocity = qa_zero_vec3; body.bounds = player->standing_bounds; body.ground = NULL;
   if (player->character == QA_GAME_FAMILY_Q3) {
     qa_q3_character_actor **existing = qa_ss_map_get(&sim->characters, &player->actor);
     qa_q3_character_actor *character = existing ? *existing : NULL;
@@ -2968,14 +3063,14 @@ void qa_app_shared_sim_spawn_q3_player(qa_app_shared_simulation *sim, qa_q3_game
   }
   if (sim->has_selected_arsenal) {
     qa_app_shared_sim_selected_arsenal_remove(sim, player->actor.id);
-    player->arsenal = qa_app_shared_sim_selected_arsenal_admit(sim, player->actor, 100, false);
+    qa_app_shared_sim_store_player_arsenal(sim, player, qa_app_shared_sim_selected_arsenal_admit(sim, player->actor, 100, false));
   }
   if (sim->hand_grenades) qa_app_sim_hand_grenade_runtime_respawn(sim->hand_grenades, player->actor.id);
   if (sim->grapple) qa_app_sim_grapple_runtime_release(sim->grapple, player->actor.id);
   qa_app_shared_sim_admit_grapple(sim, player->actor.id);
   qa_app_shared_sim_apply_shared_travel_once(sim, player->actor, player->client);
   qa_q2_player_movement_change change; memset(&change, 0, sizeof change);
-  change.kind = "spawn"; change.origin = pose.origin; change.angles = pose.angles; change.velocity = qa_ss_zero;
+  change.kind = "spawn"; change.origin = pose.origin; change.angles = pose.angles; change.velocity = qa_zero_vec3;
   change.command_angles = player->command_angles; change.hold_milliseconds = 100; change.spectator = false;
   qa_app_shared_sim_set_player_movement_link(sim, player->actor.id, change, false);
   qa_q3_game_client *client = entity->client;
@@ -3003,7 +3098,7 @@ void qa_app_shared_sim_select_q3_spawn_weapon(qa_app_shared_simulation *sim, qa_
     if ((held & (1 << (int)candidate)) != 0) { weapon = candidate; break; }
   if (sim->has_selected_arsenal && qa_ss_is(sim->selected_arsenal.family, "q3")) {
     qa_app_q3_selected_arsenal_set_spawn_weapon(sim->selected_arsenal.q3, actor, weapon);
-    player->arsenal = qa_app_q3_selected_arsenal_read(sim->selected_arsenal.q3, actor);
+    qa_app_shared_sim_store_player_arsenal(sim, player, qa_app_q3_selected_arsenal_read(sim->selected_arsenal.q3, actor));
   } else if (player->arsenal.state.kind && qa_ss_is(player->arsenal.state.kind, "q3")) {
     const qa_q3_weapon_item *item = qa_q3_get_weapon_item(weapon);
     player->arsenal.active_weapon = item ? item->item : player->arsenal.active_weapon;
@@ -3043,7 +3138,7 @@ qa_q3_ta_client_movement_result qa_app_shared_sim_move_q3_client(qa_app_shared_s
   double elapsed = qa_js_max(0, qa_js_min(200, command.server_time - client->ps.command_time));
   const qa_actor_command *pending = qa_ss_map_get(&sim->q3_commands, &player->actor);
   qa_q3_base_user_command for_selection = command;
-  if (!qa_ss_is(player->profile.kind, "q3")) for_selection.angles = qa_ss_add(command.angles, client->ps.delta_angles);
+  if (!qa_ss_is(player->profile.kind, "q3")) for_selection.angles = qa_add3(command.angles, client->ps.delta_angles);
   qa_user_command converted = qa_app_sim_selected_q3_command(for_selection, player->profile, elapsed);
   qa_actor_command input; memset(&input, 0, sizeof input);
   /* The arsenal intent the command points to lives with the player host (TS object literal). */
@@ -3099,7 +3194,11 @@ qa_q3_ta_client_movement_result qa_app_shared_sim_move_q3_client(qa_app_shared_s
     step.actor = player->actor; step.command = input.command; step.frame = frame;
     step.arsenal = qa_app_shared_sim_arsenal(sim, player); step.animation = player->animation;
     step.environment = player->source_environment; step.gauntlet_hit = options.gauntlet_hit;
+    qa_cleanup release; qa_cleanup_push(&release, free, sim->has_selected_arsenal ? (void *)step.arsenal.ammo : NULL); /* freed if the step raises */
     qa_weapon_step_result weapon = qa_app_shared_sim_weapon_step(sim, step);
+    qa_cleanup_pop(&release);
+    /* A selected read is malloc'd and weaponStep's selected path never returns its input arsenal (its result is adopted). */
+    if (sim->has_selected_arsenal) free((void *)step.arsenal.ammo);
     player->arsenal = weapon.arsenal; player->animation = weapon.animation;
     for (size_t i = 0; i < weapon.effect_count; i++) {
       const qa_movement_effect *effect = &weapon.effects[i];

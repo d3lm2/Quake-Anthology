@@ -12,6 +12,7 @@
 #include "qa/movement/q3/constants.h"
 #include "qa/network/common/js_number.h"
 #include "qa/persistence/save_image.h"
+#include "qa/core/math.h"
 
 typedef struct id_entry { qa_actor_id actor; int64_t id; } id_entry;
 typedef struct text_entry { int64_t id; char *value; } text_entry;
@@ -160,10 +161,18 @@ bool qa_app_sim_shared_bot_world_actor_for_id(world_t *w, int64_t number, qa_act
   if (!found || !is_live(w, actor)) return false;
   *out = actor; return true;
 }
+/* Number(name.slice(1)) of an inline model name. TS keeps NaN or a fraction for a malformed
+ * "*<text>" and only ever compares the result with integer model numbers (`===`), so it matches
+ * none; INT64_MIN is the C value no model number equals. */
+static int64_t inline_model_number(const char *digits) {
+  double value = qa_js_string_to_number(digits);
+  if (!(value == trunc(value)) || fabs(value) > 9007199254740992.0) return INT64_MIN;
+  return (int64_t)value;
+}
 static int64_t model_index(void *ctx, const char *name) {
   world_t *w = ctx;
   if (name == NULL || name[0] == '\0') return 0;
-  if (name[0] == '*') return (int64_t)qa_js_string_to_number(name + 1);
+  if (name[0] == '*') return inline_model_number(name + 1);
   for (size_t i = 0; i < w->model_count; i++) if (strcmp(w->models[i].name, name) == 0) return w->models[i].id;
   int64_t index = (int64_t)w->simulation->world_model_count + (int64_t)w->model_count;
   w->models = grow(w->models, &w->model_capacity, w->model_count, sizeof *w->models);
@@ -404,8 +413,7 @@ static qa_bot_observed_entity_bots_a game_entity(void *ctx, int64_t number) {
     out.state.pos.base = body.value.origin; out.state.apos.base = movement->view_angles;
     out.state.ground_entity_num = qa_js_to_int32(ps->ground_entity_num);
   } else out.state.e_type = has_actor && brush(w, actor) ? QA_Q3_BASE_ET_MOVER : QA_Q3_BASE_ET_GENERAL;
-  qa_vec3 zero = {0, 0, 0};
-  out.state.origin = body.has_value ? body.value.origin : zero;
+  out.state.origin = body.has_value ? body.value.origin : qa_zero_vec3;
   out.state.modelindex = has_entity ? (int32_t)model_index(w, entity.model) : 0;
   out.state.frame = has_entity ? qa_js_to_int32(entity.frame) : 0;
   int64_t generation = 0;
@@ -415,12 +423,12 @@ static qa_bot_observed_entity_bots_a game_entity(void *ctx, int64_t number) {
   out.hidden = has_entity && entity.hidden;
   qa_actor_id bot_actor;
   out.bot = has_actor && w->options.actor(w->options.ctx, number, &bot_actor) && qa_same_actor(bot_actor, actor);
-  out.origin = body.has_value ? body.value.origin : zero;
-  out.angles = body.has_value ? body.value.angles : zero;
-  out.bounds = body.has_value ? body.value.bounds : (qa_bounds){zero, zero};
+  out.origin = body.has_value ? body.value.origin : qa_zero_vec3;
+  out.angles = body.has_value ? body.value.angles : qa_zero_vec3;
+  out.bounds = body.has_value ? body.value.bounds : (qa_bounds){qa_zero_vec3, qa_zero_vec3};
   out.contents = has_actor && brush(w, actor) ? 1 : !out.has_player ? 0 : 0x2000000;
   out.has_inline_model = has_entity && entity.model[0] == '*';
-  out.inline_model = out.has_inline_model ? (int64_t)qa_js_string_to_number(entity.model + 1) : 0;
+  out.inline_model = out.has_inline_model ? inline_model_number(entity.model + 1) : 0;
   free(w->classname); w->classname = has_entity && entity.classname != NULL ? xstrdup(entity.classname) : NULL;
   out.classname = w->classname;
   out.event_time = 0; out.has_activator_frame = false; out.proximity_trigger = false;
@@ -678,24 +686,44 @@ static void read_strings(const qa_save_reader *reader, const char *name, text_en
   size_t count = qa_save_reader_list_count(&list);
   text_entry *result = calloc(count != 0 ? count : 1, sizeof *result);
   if (result == NULL) qa_range_error("Out of memory");
+  /* The caller's cleanup owns the list from here: it frees the values counted so far. */
+  *out = result; *out_count = 0;
   size_t n = 0;
   for (size_t i = 0; i < count; i++) {
     ri(&list, i, &entry);
     rf(&entry, "id", &field); int64_t id = (int64_t)qa_save_reader_integer_min(&field, 0); qa_save_reader_destroy(&field);
     for (size_t j = 0; j < n; j++) if (result[j].id == id) qa_save_reader_fail(&entry, "duplicate string index");
-    rf(&entry, "value", &field); result[n].id = id; result[n].value = xstrdup(qa_save_reader_string(&field)); n++;
+    rf(&entry, "value", &field); result[n].id = id; result[n].value = xstrdup(qa_save_reader_string(&field)); *out_count = ++n;
     qa_save_reader_destroy(&field); qa_save_reader_destroy(&entry);
   }
   qa_save_reader_destroy(&list);
-  *out = result; *out_count = n;
+}
+/* What a restore reads before it is applied; a failed read releases it (TS leaves the world unchanged). */
+typedef struct restore_parts {
+  qa_q3_game_memory *memory; id_entry *ids; qa_saved_actor_id *seen; int64_t *free_ids; number_entry *generations;
+  int64_t *begun; text_entry *userinfos; size_t userinfo_count; text_entry *strings; size_t string_count;
+  model_entry *models; size_t model_count;
+} restore_parts;
+static void restore_parts_free(void *arg) {
+  restore_parts *parts = arg;
+  free(parts->memory); free(parts->ids); free(parts->seen); free(parts->free_ids); free(parts->generations); free(parts->begun);
+  for (size_t i = 0; i < parts->userinfo_count; i++) free(parts->userinfos[i].value);
+  for (size_t i = 0; i < parts->string_count; i++) free(parts->strings[i].value);
+  for (size_t i = 0; i < parts->model_count; i++) free(parts->models[i].name);
+  free(parts->userinfos); free(parts->strings); free(parts->models);
+  memset(parts, 0, sizeof *parts);
 }
 void qa_app_sim_shared_bot_world_restore_checkpoint(world_t *w, const qa_save_value *value,
     qa_app_sim_saved_actor_ref_fn actor_ref, void *actor_ctx) {
   qa_save_reader reader, field, list, entry, inner;
+  restore_parts parts;
+  memset(&parts, 0, sizeof parts);
+  qa_cleanup parts_cleanup;
+  qa_cleanup_push(&parts_cleanup, restore_parts_free, &parts);
   if (!qa_save_reader_init(&reader, value, "sharedBotWorld")) qa_range_error("Out of memory");
   rf(&reader, "version", &field); qa_save_reader_literal_number(&field, 1); qa_save_reader_destroy(&field);
   rf(&reader, "source", &field); qa_save_reader_literal_string(&field, w->q2 ? "q2" : "q1"); qa_save_reader_destroy(&field);
-  qa_q3_game_memory *restored_memory = calloc(1, sizeof *restored_memory);
+  qa_q3_game_memory *restored_memory = parts.memory = calloc(1, sizeof *restored_memory);
   if (restored_memory == NULL) qa_range_error("Out of memory");
   qa_q3_game_memory_init(restored_memory, w, memory_debug, memory_print);
   rf(&reader, "memory", &field); qa_q3_game_memory_restore_save_state(restored_memory, field.value); qa_save_reader_destroy(&field);
@@ -706,8 +734,8 @@ void qa_app_sim_shared_bot_world_restore_checkpoint(world_t *w, const qa_save_va
   /* actors */
   rf(&reader, "actors", &list);
   size_t actor_count = qa_save_reader_list_count(&list);
-  id_entry *restored = calloc(actor_count != 0 ? actor_count : 1, sizeof *restored);
-  qa_saved_actor_id *seen = calloc(actor_count != 0 ? actor_count : 1, sizeof *seen);
+  id_entry *restored = parts.ids = calloc(actor_count != 0 ? actor_count : 1, sizeof *restored);
+  qa_saved_actor_id *seen = parts.seen = calloc(actor_count != 0 ? actor_count : 1, sizeof *seen);
   if (restored == NULL || seen == NULL) qa_range_error("Out of memory");
   size_t restored_count = 0;
   for (size_t i = 0; i < actor_count; i++) {
@@ -721,11 +749,11 @@ void qa_app_sim_shared_bot_world_restore_checkpoint(world_t *w, const qa_save_va
     seen[restored_count] = saved; restored[restored_count].actor = resolved; restored[restored_count].id = id; restored_count++;
     qa_save_reader_destroy(&entry);
   }
-  qa_save_reader_destroy(&list); free(seen);
+  qa_save_reader_destroy(&list); free(seen); parts.seen = NULL;
   /* freeIds */
   rf(&reader, "freeIds", &list);
   size_t free_list_count = qa_save_reader_list_count(&list);
-  int64_t *restored_free = calloc(free_list_count != 0 ? free_list_count : 1, sizeof *restored_free);
+  int64_t *restored_free = parts.free_ids = calloc(free_list_count != 0 ? free_list_count : 1, sizeof *restored_free);
   if (restored_free == NULL) qa_range_error("Out of memory");
   size_t free_count = 0;
   for (size_t i = 0; i < free_list_count; i++) {
@@ -743,7 +771,8 @@ void qa_app_sim_shared_bot_world_restore_checkpoint(world_t *w, const qa_save_va
   /* generations */
   rf(&reader, "generations", &list);
   size_t generation_list_count = qa_save_reader_list_count(&list);
-  number_entry *restored_generations = calloc(generation_list_count != 0 ? generation_list_count : 1, sizeof *restored_generations);
+  number_entry *restored_generations = parts.generations =
+      calloc(generation_list_count != 0 ? generation_list_count : 1, sizeof *restored_generations);
   if (restored_generations == NULL) qa_range_error("Out of memory");
   size_t generation_count = 0;
   for (size_t i = 0; i < generation_list_count; i++) {
@@ -761,7 +790,7 @@ void qa_app_sim_shared_bot_world_restore_checkpoint(world_t *w, const qa_save_va
   /* begun */
   rf(&reader, "begun", &list);
   size_t begun_list_count = qa_save_reader_list_count(&list);
-  int64_t *restored_begun = calloc(begun_list_count != 0 ? begun_list_count : 1, sizeof *restored_begun);
+  int64_t *restored_begun = parts.begun = calloc(begun_list_count != 0 ? begun_list_count : 1, sizeof *restored_begun);
   if (restored_begun == NULL) qa_range_error("Out of memory");
   size_t begun_count = 0;
   for (size_t i = 0; i < begun_list_count; i++) {
@@ -776,12 +805,14 @@ void qa_app_sim_shared_bot_world_restore_checkpoint(world_t *w, const qa_save_va
   qa_save_reader_destroy(&list);
   text_entry *restored_userinfos, *restored_strings;
   size_t userinfo_count, string_count;
-  read_strings(&reader, "userinfos", &restored_userinfos, &userinfo_count);
-  read_strings(&reader, "strings", &restored_strings, &string_count);
+  read_strings(&reader, "userinfos", &parts.userinfos, &parts.userinfo_count);
+  restored_userinfos = parts.userinfos; userinfo_count = parts.userinfo_count;
+  read_strings(&reader, "strings", &parts.strings, &parts.string_count);
+  restored_strings = parts.strings; string_count = parts.string_count;
   /* models */
   rf(&reader, "models", &list);
   size_t model_list_count = qa_save_reader_list_count(&list);
-  model_entry *restored_models = calloc(model_list_count != 0 ? model_list_count : 1, sizeof *restored_models);
+  model_entry *restored_models = parts.models = calloc(model_list_count != 0 ? model_list_count : 1, sizeof *restored_models);
   if (restored_models == NULL) qa_range_error("Out of memory");
   size_t model_count = 0;
   for (size_t i = 0; i < model_list_count; i++) {
@@ -791,7 +822,7 @@ void qa_app_sim_shared_bot_world_restore_checkpoint(world_t *w, const qa_save_va
     bool invalid = name[0] == '\0' || name[0] == '*';
     for (size_t j = 0; j < model_count; j++) if (strcmp(restored_models[j].name, name) == 0 || restored_models[j].id == id) invalid = true;
     if (invalid) qa_save_reader_fail(&entry, "invalid or duplicate model index");
-    restored_models[model_count].name = xstrdup(name); restored_models[model_count].id = id; model_count++;
+    restored_models[model_count].name = xstrdup(name); restored_models[model_count].id = id; parts.model_count = ++model_count;
     qa_save_reader_destroy(&field); qa_save_reader_destroy(&entry);
   }
   for (size_t index = 0; index < model_count; index++) {
@@ -801,6 +832,7 @@ void qa_app_sim_shared_bot_world_restore_checkpoint(world_t *w, const qa_save_va
   }
   qa_save_reader_destroy(&list);
   qa_save_reader_destroy(&reader);
+  qa_cleanup_pop(&parts_cleanup); /* nothing below raises: the parts move into the world */
   /* apply: game.memory.restoreSaveState(restoredMemory.captureSaveState()) */
   memcpy(w->memory->pool, restored_memory->pool, sizeof w->memory->pool);
   w->memory->alloc_point = restored_memory->alloc_point;

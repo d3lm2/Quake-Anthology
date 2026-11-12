@@ -14,60 +14,51 @@ static bool eq(const char *a, const char *b) {
   return a != NULL && strcmp(a, b) == 0;
 }
 
+/* TS at(items, index): items[index], RangeError when it is undefined (a
+ * fractional, negative, NaN or too large index). */
+static size_t checked_at(double index, size_t length) {
+  if (!(index >= 0 && index == floor(index) && index < (double)length))
+    qa_range_error("fog index %s outside %zu", QA_JS_NUMBER(index), length);
+  return (size_t)index;
+}
+/* TS plane(side): at(planes, at(brushSides, firstSide + side).plane). */
+static qa_plane brush_plane(const qa_fog_brush_map *map, qa_fog_brush_entry brush, double side) {
+  size_t brush_side = checked_at(brush.first_side + side, map->brush_side_count);
+  return map->planes[checked_at(map->brush_sides[brush_side].plane, map->plane_count)];
+}
+
 qa_fog_volume qa_prepare_fog_volume(qa_fog_brush_map map, double index,
                                     qa_q3_material_fog parameters,
                                     double identity_light) {
-  /* items[index] is undefined for a fractional, negative or NaN index. */
-  if (!(index >= 0 && index == floor(index) && index < (double)map.fog_count))
-    qa_range_error("fog index %s outside %zu", QA_JS_NUMBER(index), map.fog_count);
-  qa_fog_brush_map_entry fog = map.fogs[(size_t)index];
-  if (!(fog.brush >= 0 && fog.brush == floor(fog.brush) && fog.brush < (double)map.brush_count))
-    qa_range_error("fog index %s outside %zu", QA_JS_NUMBER(fog.brush), map.brush_count);
-  qa_fog_brush_entry brush = map.brushes[(size_t)fog.brush];
+  qa_fog_brush_map_entry fog = map.fogs[checked_at(index, map.fog_count)];
+  qa_fog_brush_entry brush = map.brushes[checked_at(fog.brush, map.brush_count)];
   if (brush.side_count < 6)
-    qa_range_error("fog brush %s has fewer than six axial sides",
+    qa_raise("Error", 0, 0, "fog brush %s has fewer than six axial sides",
                    QA_JS_NUMBER(fog.brush));
-  qa_plane planes[8];
-  int side_total = fog.visible_side >= 0 && fog.visible_side >= 6
-      ? (int)fog.visible_side + 1 : 6;
-  /* visibleSide < 6 reuses an axial plane; fetch sides 0..max needed. */
-  qa_plane *fetched = planes;
-  qa_plane *heap = NULL;
-  if (side_total > 8) {
-    heap = malloc((size_t)side_total * sizeof *heap);
-    if (heap == NULL) qa_range_error("fog allocation failed");
-    fetched = heap;
-  }
-  for (int side = 0; side < side_total; side++) {
-    int64_t si = (int64_t)brush.first_side + side;
-    if (si < 0 || (size_t)si >= map.brush_side_count)
-      qa_range_error("fog index %lld outside %zu", (long long)si,
-                     map.brush_side_count);
-    int64_t pi = (int64_t)map.brush_sides[si].plane;
-    if (pi < 0 || (size_t)pi >= map.plane_count)
-      qa_range_error("fog index %lld outside %zu", (long long)pi,
-                     map.plane_count);
-    fetched[side] = map.planes[pi];
-  }
   qa_fog_volume out;
   memset(&out, 0, sizeof out);
-  out.bounds.min = (qa_vec3){-fetched[0].distance, -fetched[2].distance,
-                             -fetched[4].distance};
-  out.bounds.max = (qa_vec3){fetched[1].distance, fetched[3].distance,
-                             fetched[5].distance};
-  if (fog.visible_side >= 0) {
-    qa_plane outside = fetched[(int)fog.visible_side];
+  /* The TS object literal reads min x, y, z then max x, y, z: sides 0, 2, 4,
+     1, 3, 5, each lazily, so the first missing side names its own index. */
+  double min_x = -brush_plane(&map, brush, 0).distance;
+  double min_y = -brush_plane(&map, brush, 2).distance;
+  double min_z = -brush_plane(&map, brush, 4).distance;
+  double max_x = brush_plane(&map, brush, 1).distance;
+  double max_y = brush_plane(&map, brush, 3).distance;
+  double max_z = brush_plane(&map, brush, 5).distance;
+  out.bounds.min = (qa_vec3){min_x, min_y, min_z};
+  out.bounds.max = (qa_vec3){max_x, max_y, max_z};
+  if (!(fog.visible_side < 0)) {
+    qa_plane outside = brush_plane(&map, brush, fog.visible_side);
     out.has_surface = true;
     out.surface.normal = qa_sub3((qa_vec3){0, 0, 0}, outside.normal);
     out.surface.distance = -outside.distance;
   }
-  free(heap);
-  double depth = parameters.depth_for_opaque;
   out.color = (qa_vec4){
       (qa_mat_to_int32(fr(fr(parameters.color.x * identity_light) * 255)) & 255) / 255.0,
       (qa_mat_to_int32(fr(fr(parameters.color.y * identity_light) * 255)) & 255) / 255.0,
       (qa_mat_to_int32(fr(fr(parameters.color.z * identity_light) * 255)) & 255) / 255.0, 1};
-  out.tc_scale = fr(1.0 / fr((depth > 1 ? depth : 1) * 8));
+  /* Math.max(1, depthForOpaque): a NaN depth stays NaN. */
+  out.tc_scale = fr(1.0 / fr(qa_js_max(1, parameters.depth_for_opaque) * 8));
   return out;
 }
 

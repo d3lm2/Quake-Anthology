@@ -23,29 +23,36 @@
 #include "qa/input/support.h"
 #include "qa/persistence/value.h"
 static char *xdup_range(const char *s, size_t n) { char *r = qa_input_dup_range(s, n); if (!r) qa_range_error("Out of memory"); return r; }
+/* JS /\s/ over console text (one byte per UTF-16 unit, the cvar value TS reads): the ASCII white space and
+ * line terminators and U+00A0; every other JS white space character is above U+00FF. */
+static bool console_js_space(unsigned char byte) {
+  return byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r' || byte == '\v' || byte == '\f' || byte == 0xa0;
+}
 qa_app_weapon_behavior_request qa_app_read_weapon_behavior_request(const char *value) {
   const char *slash = strchr(value, '/');
   size_t len = strlen(value);
   bool has_space = false;
-  for (const char *p = value; *p; p++) if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f') has_space = true;
+  for (const char *p = value; *p; p++) if (console_js_space((unsigned char)*p)) has_space = true;
   if (slash == NULL || slash == value || (size_t)(slash - value) == len - 1 || has_space || strchr(slash + 1, ':') == NULL)
-    qa_range_error("Weapon behavior must be PRODUCT/DECLARED_ID");
+    qa_raise("Error", 0, 0, "%s", "Weapon behavior must be PRODUCT/DECLARED_ID");
   qa_app_weapon_behavior_request r = {xdup_range(value, (size_t)(slash - value)), NULL};
   r.id = qa_input_dup(slash + 1);
-  if (!r.id) qa_range_error("Out of memory");
+  if (!r.id) { free(r.product); qa_range_error("Out of memory"); }
   return r;
 }
 void qa_app_weapon_behavior_request_free(qa_app_weapon_behavior_request *r) { free(r->product); free(r->id); memset(r, 0, sizeof *r); }
+static void cvar_read_cleanup(void *found) { qa_cvar_read_free(found); }
 qa_app_options qa_app_configured_weapon_behavior_options(qa_app_options options, qa_cvar_registry *cvars) {
   if (options.has_weapon_behavior || options.mod_count != 0) return options;
   qa_cvar_read found; memset(&found, 0, sizeof found);
-  const char *value = "";
-  if (qa_cvar_registry_find(cvars, "qts_weaponBehavior", &found)) value = found.value;
-  if (value[0] == '\0') {
-    if (value != (const char *)"") qa_cvar_read_free(&found);
+  if (!qa_cvar_registry_find(cvars, "qts_weaponBehavior", &found) || found.value[0] == '\0') {
+    qa_cvar_read_free(&found);
     return options;
   }
-  qa_app_weapon_behavior_request request = qa_app_read_weapon_behavior_request(value);
+  qa_cleanup found_cleanup;
+  qa_cleanup_push(&found_cleanup, cvar_read_cleanup, &found);
+  qa_app_weapon_behavior_request request = qa_app_read_weapon_behavior_request(found.value);
+  qa_cleanup_pop(&found_cleanup);
   qa_cvar_read_free(&found);
   options.has_weapon_behavior = true;
   free(options.weapon_behavior_product); options.weapon_behavior_product = request.product;
@@ -62,55 +69,71 @@ qa_executable_recipe qa_app_select_weapon_behavior(qa_app_weapon_behavior_host h
     const qa_resolved_execution_module *module = &recipe.execution[i];
     /* role "server-game" */
     if (strcmp(module->role, "server-game") == 0 && module->kind != QA_EXECUTION_MODULE_TYPESCRIPT)
-      qa_range_error("Selected native or bytecode game has no shared projectile behavior hook; choose a TypeScript launcher provider");
+      qa_raise("Error", 0, 0, "%s", "Selected native or bytecode game has no shared projectile behavior hook; choose a TypeScript launcher provider");
   }
   size_t count = 0;
   qa_app_weapon_behavior_choice *choices = qa_app_weapon_behavior_choices(host, catalog, request.product, &count);
   const qa_resolved_weapon_behavior_selection *selected = NULL;
   const char *unavailable = NULL;
   for (size_t i = 0; i < count; i++) {
-    if (choices[i].selection != NULL && strcmp(choices[i].selection->definition->id, request.id) == 0) selected = choices[i].selection;
+    if (selected == NULL && choices[i].selection != NULL && strcmp(choices[i].selection->definition->id, request.id) == 0)
+      selected = choices[i].selection; /* TS find: the first match */
     if (unavailable == NULL && choices[i].unavailable != NULL) unavailable = choices[i].unavailable;
   }
   if (selected == NULL) {
     char *reason = unavailable ? qa_input_dup(unavailable) : NULL;
+    if (unavailable != NULL && reason == NULL) { host.choices_free(host.ctx, choices, count); qa_range_error("Out of memory"); }
     host.choices_free(host.ctx, choices, count);
-    qa_range_error("Weapon behavior %s/%s: %s", request.product, request.id, reason ? reason : "No such declared compatible behavior");
+    qa_cleanup reason_cleanup;
+    qa_cleanup_push(&reason_cleanup, free, reason);
+    qa_raise("Error", 0, 0, "Weapon behavior %s/%s: %s", request.product, request.id, reason ? reason : "No such declared compatible behavior");
   }
   *selection_storage = *selected;
   host.choices_free(host.ctx, choices, count);
   recipe.weapon_behaviors = selection_storage;
   recipe.weapon_behavior_count = 1;
+  /* { ...recipe, weaponBehaviors }: a key the recipe already has keeps its place. */
+  if (recipe.weapon_behaviors_key == QA_RECIPE_KEY_IF_ANY) recipe.weapon_behaviors_key = QA_RECIPE_KEY_LAST;
   return recipe;
+}
+typedef struct request_list { qa_app_weapon_behavior_request *items; size_t count; } request_list;
+static void request_list_free(void *ctx) {
+  request_list *list = ctx;
+  for (size_t i = 0; i < list->count; i++) qa_app_weapon_behavior_request_free(&list->items[i]);
+  free(list->items);
+  list->items = NULL;
+  list->count = 0;
 }
 qa_app_prepared_configured_recipe qa_app_prepare_configured_recipe(qa_app_weapon_behavior_host host, qa_content_catalog *catalog,
                                                                    const qa_app_options *options, qa_executable_recipe recipe) {
   size_t request_count = options->mod_count + (options->has_weapon_behavior ? 1 : 0);
   if (request_count == 0) { qa_app_prepared_configured_recipe r = {catalog, recipe}; return r; }
-  qa_app_weapon_behavior_request *requests = calloc(request_count, sizeof *requests);
-  if (!requests) qa_range_error("Out of memory");
+  request_list requests = {calloc(request_count, sizeof *requests.items), request_count};
+  if (!requests.items) qa_range_error("Out of memory");
+  qa_cleanup requests_cleanup;
+  qa_cleanup_push(&requests_cleanup, request_list_free, &requests);
   size_t at = 0;
   for (size_t i = 0; i < options->mod_count; i++) {
-    requests[at].product = qa_input_dup(options->mods[i].product);
-    requests[at].id = qa_input_dup(options->mods[i].id);
-    if (!requests[at].product || !requests[at].id) qa_range_error("Out of memory");
+    requests.items[at].product = qa_input_dup(options->mods[i].product);
+    requests.items[at].id = qa_input_dup(options->mods[i].id);
+    if (!requests.items[at].product || !requests.items[at].id) qa_range_error("Out of memory");
     at++;
   }
   if (options->has_weapon_behavior) {
-    requests[at].product = qa_input_dup(options->weapon_behavior_product);
-    requests[at].id = qa_input_dup(options->weapon_behavior_id);
-    if (!requests[at].product || !requests[at].id) qa_range_error("Out of memory");
+    requests.items[at].product = qa_input_dup(options->weapon_behavior_product);
+    requests.items[at].id = qa_input_dup(options->weapon_behavior_id);
+    if (!requests.items[at].product || !requests.items[at].id) qa_range_error("Out of memory");
     at++;
   }
   bool missing = false;
-  for (size_t i = 0; i < request_count; i++) if (!host.catalog_has_product(host.ctx, catalog, requests[i].product)) missing = true;
+  for (size_t i = 0; i < request_count && !missing; i++) if (!host.catalog_has_product(host.ctx, catalog, requests.items[i].product)) missing = true;
   if (missing) {
     qa_content_catalog *fresh = host.rediscover_with_mods(host.ctx, catalog);
     if (fresh != NULL) catalog = fresh;
   }
-  qa_executable_recipe prepared = host.apply_mods(host.ctx, catalog, recipe, requests, request_count);
-  for (size_t i = 0; i < request_count; i++) qa_app_weapon_behavior_request_free(&requests[i]);
-  free(requests);
+  qa_executable_recipe prepared = host.apply_mods(host.ctx, catalog, recipe, requests.items, request_count);
+  qa_cleanup_pop(&requests_cleanup);
+  request_list_free(&requests);
   qa_app_prepared_configured_recipe r = {catalog, prepared};
   return r;
 }
@@ -135,6 +158,7 @@ typedef struct native_backing {
   qa_resolved_weapon_behavior_selection *selections; size_t selection_count;
   qa_qvm_weapon_behavior_layout *layouts;
   char *module_id;
+  char *provider;
 } native_backing;
 static void *native_xcalloc(size_t count, size_t size) {
   void *ptr = calloc(count == 0 ? 1 : count, size);
@@ -201,6 +225,14 @@ static bool native_qvm_profile(void *ctx, const qa_save_value *declaration,
   out->definition = profile->definition;
   out->service_value = profile;
   return true;
+}
+/* The service values native_qvm_resolve / native_qvm_profile allocated, when a load drops them. */
+static void native_qvm_release(void *ctx, qa_catalog_qvm_artifact *artifact, qa_catalog_qvm_weapon_profile *profile) {
+  (void)ctx;
+  qa_qvm_weapon_profile *read = profile->service_value;
+  if (read != NULL) { qa_qvm_weapon_profile_free(read); free(read); }
+  qa_resolved_qvm_artifact *resolved = artifact->service_value;
+  if (resolved != NULL) { qa_resolved_qvm_artifact_destroy(resolved); free(resolved); }
 }
 static bool native_read_declaration(void *ctx, const qa_save_value *value,
     const qa_module_identity *module, qa_native_weapon_behavior_declaration *out) {
@@ -302,19 +334,18 @@ static void native_catalog_view(native_backing *backing, const qa_compat_qc_prog
   backing->view.digest = program->digest;
 }
 /* TS choicesFromMounts(catalog, productId, mounts) over backing->mounted. */
-static qa_app_weapon_behavior_choice_list choices_from_mounts(qa_content_catalog *catalog, const char *product_id,
+static qa_app_weapon_behavior_choice_list choices_from_mounts_body(qa_content_catalog *catalog, const char *product_id,
     native_backing *backing) {
   const qa_catalog_discovered_product *product = qa_content_catalog_require(catalog, product_id);
   const char *title = product->expectation.title;
-  char *provider = native_format("weapon-behavior:%s", product->id, "", "");
+  char *provider = backing->provider = native_format("weapon-behavior:%s", product->id, "", "");
   /* Trim the two unused format args' effect: format has one %s. */
   qa_catalog_mounted_reader reader = {backing, native_reader_open, NULL};
   if (product->expectation.family == QA_GAME_FAMILY_Q3) {
-    qa_qvm_weapon_behavior_services services = {NULL, native_qvm_resolve, native_qvm_profile};
+    qa_qvm_weapon_behavior_services services = {NULL, native_qvm_resolve, native_qvm_profile, native_qvm_release};
     bool found = false;
     if (!qa_discover_qvm_weapon_behaviors(reader, services, provider, &backing->qvm, &found))
       qa_range_error("Out of memory");
-    free(provider);
     if (!found) return native_single(native_unavailable(product_id, title,
         "No authored qvm-weapon-behaviors.json declaration with exact artifact and source layout"), backing);
     if (backing->qvm.count == 0) return native_single(native_unavailable(product_id, title,
@@ -363,7 +394,6 @@ static qa_app_weapon_behavior_choice_list choices_from_mounts(qa_content_catalog
     bool found = false;
     if (!qa_discover_native_weapon_behaviors(reader, services, provider, &backing->native, &found))
       qa_range_error("Out of memory");
-    free(provider);
     if (!found) return native_single(native_unavailable(product_id, title,
         "No authored native-weapon-behaviors.json declaration or matching built-in native profile"), backing);
     if (backing->native.count == 0) return native_single(native_unavailable(product_id, title,
@@ -391,7 +421,6 @@ static qa_app_weapon_behavior_choice_list choices_from_mounts(qa_content_catalog
     }
     return list;
   }
-  free(provider);
   if (product->expectation.family != QA_GAME_FAMILY_Q1)
     return native_single(native_unavailable(product_id, title,
         "This provider has no supported declared or artifact-qualified trajectory adapter"), backing);
@@ -459,10 +488,24 @@ static qa_app_weapon_behavior_choice_list choices_from_mounts(qa_content_catalog
   }
   return list;
 }
+static void release_choices(void *ctx);
+/* A raise inside the body (an invalid declaration, document or program) releases the backing: TS drops it to the GC. */
+static qa_app_weapon_behavior_choice_list choices_from_mounts(qa_content_catalog *catalog, const char *product_id,
+    native_backing *backing) {
+  qa_app_weapon_behavior_choice_list owner = {NULL, 0, backing};
+  qa_cleanup owner_cleanup;
+  qa_cleanup_push(&owner_cleanup, release_choices, &owner);
+  qa_app_weapon_behavior_choice_list list = choices_from_mounts_body(catalog, product_id, backing);
+  qa_cleanup_pop(&owner_cleanup);
+  return list;
+}
 qa_app_weapon_behavior_choice_list qa_app_weapon_behavior_choices_native(qa_content_catalog *catalog,
     const char *product_id) {
   const qa_catalog_discovered_product *product = qa_content_catalog_require(catalog, product_id);
   native_backing *backing = native_xcalloc(1, sizeof *backing);
+  qa_app_weapon_behavior_choice_list owner = {NULL, 0, backing};
+  qa_cleanup owner_cleanup;
+  qa_cleanup_push(&owner_cleanup, release_choices, &owner);
   if (!qa_content_catalog_mounts_for(catalog, product->id, &backing->mounts)) qa_range_error("Out of memory");
   backing->order = native_xcalloc(backing->mounts.count + 1, sizeof *backing->order);
   for (size_t i = 0; i < backing->mounts.count; i++)
@@ -478,6 +521,7 @@ qa_app_weapon_behavior_choice_list qa_app_weapon_behavior_choices_native(qa_cont
   qa_open_mount_options mount_options = {0};
   backing->mounted = qa_open_mount_plan(&plan, &mount_options);
   if (!backing->mounted) qa_range_error("Out of memory");
+  qa_cleanup_pop(&owner_cleanup);
   return choices_from_mounts(catalog, product_id, backing);
 }
 void qa_app_weapon_behavior_choice_list_free(qa_app_weapon_behavior_choice_list *list) {
@@ -509,6 +553,7 @@ void qa_app_weapon_behavior_choice_list_free(qa_app_weapon_behavior_choice_list 
     free(backing->selections);
     free(backing->layouts);
     free(backing->module_id);
+    free(backing->provider);
     for (size_t i = 0; i < backing->buffer_count; i++) free(backing->buffers[i]);
     free(backing->buffers);
     if (backing->mounted && !backing->borrowed_mounted) qa_content_mounted_destroy(backing->mounted);
@@ -595,7 +640,7 @@ qa_app_prepared_weapon_behavior qa_app_prepare_application_weapon_behavior(qa_co
     qa_cleanup owner_cleanup;
     qa_cleanup_push(&owner_cleanup, release_choices, &owner);
     qa_catalog_mounted_reader reader = {entries, native_reader_open, NULL};
-    qa_qvm_weapon_behavior_services services = {NULL, native_qvm_resolve, native_qvm_profile};
+    qa_qvm_weapon_behavior_services services = {NULL, native_qvm_resolve, native_qvm_profile, native_qvm_release};
     bool found = false;
     if (!qa_discover_qvm_weapon_behaviors(reader, services, selection.source.provider, &entries->qvm, &found))
       qa_range_error("Out of memory");

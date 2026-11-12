@@ -458,7 +458,7 @@ static const qa_shader_definition *catalog_get(const shader_catalog *catalog, co
 typedef struct inspect_job { const char *text; const char *source; qa_shader_script_inspection result; } inspect_job;
 static void inspect_script(void *arg) {
   inspect_job *job = arg;
-  qa_inspect_shader_script(job->text, job->source, NULL, &job->result);
+  qa_inspect_shader_byte_script(job->text, job->source, NULL, &job->result); /* TS byteText */
 }
 static void free_name_list(void *arg) {
   string_list *list = arg;

@@ -25,8 +25,9 @@ static char *xstrdup(const char *text) {
   strcpy(copy, text);
   return copy;
 }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
+static void free_slot(void *slot) { free(*(void **)slot); }
 static qa_guest_core_address off(const qa_mapped_guest_memory *m, qa_guest_core_address a, int64_t d) {
   return qa_memory_offset(m, a, d);
 }
@@ -138,7 +139,11 @@ static symbol_entry *add_function(qa_system_v_guest_runtime *rt, const char *lib
                                   qa_system_v_implementation implementation,
                                   qa_system_v_support support) {
   char *key = make_key(library, name, version);
-  if (find_symbol(rt, key) != NULL) qa_range_error("Duplicate System V symbol %s", key);
+  if (find_symbol(rt, key) != NULL) {
+    qa_cleanup held;
+    qa_cleanup_push(&held, free_slot, &key);
+    qa_raise("Error", 0, 0, "Duplicate System V symbol %s", key);
+  }
   symbol_entry *entry = xmalloc(sizeof *entry);
   memset(entry, 0, sizeof *entry);
   entry->key = key;
@@ -173,6 +178,11 @@ typedef struct unavailable_state {
   char *library, *name, *detail; /* owned */
   const char *version;           /* borrowed literal or NULL */
 } unavailable_state;
+static void free_unavailable(void *resource) {
+  unavailable_state *state = resource;
+  free(state->library); free(state->name); free(state->detail); free(state);
+}
+static void host_own(void *ctx, void *resource, void (*release)(void *resource));
 static qa_call_result unavailable_impl(void *ctx, const qa_guest_core_call_context *context,
                                        const qa_call_value *args, size_t count) {
   unavailable_state *state = ctx;
@@ -205,7 +215,11 @@ static void host_data(void *ctx, const char *library, const char *name, const ch
   qa_system_v_guest_runtime *rt = ctx;
   qa_memory_check(rt->options.memory, address, byte_length, QA_ACCESS_READ);
   char *key = make_key(library, name, version);
-  if (find_symbol(rt, key) != NULL) qa_range_error("Duplicate System V data %s", key);
+  if (find_symbol(rt, key) != NULL) {
+    qa_cleanup held;
+    qa_cleanup_push(&held, free_slot, &key);
+    qa_raise("Error", 0, 0, "Duplicate System V data %s", key);
+  }
   symbol_entry *entry = xmalloc(sizeof *entry);
   memset(entry, 0, sizeof *entry);
   entry->key = key;
@@ -239,6 +253,7 @@ static qa_guest_core_address host_unavailable(void *ctx, const char *library, co
   unavailable_state *state = xmalloc(sizeof *state);
   state->library = xstrdup(library); state->name = xstrdup(name);
   state->detail = xstrdup(detail); state->version = NULL;
+  host_own(rt, state, free_unavailable);
   qa_system_v_implementation impl = {state, unavailable_impl};
   return add_function(rt, library, name, NULL, parameters, parameter_count, result_is_void,
                       result, impl, QA_SYSTEM_V_UNSUPPORTED_FUNCTION)->resolution.address;
@@ -322,6 +337,8 @@ static qa_call_result host_invoke(void *ctx, const qa_guest_core_call_context *c
                                   size_t argument_count) {
   qa_system_v_guest_runtime *rt = ctx;
   qa_abi_value_layout *layouts = xmalloc(parameter_count * sizeof *layouts);
+  qa_cleanup held;
+  qa_cleanup_push(&held, free_slot, &layouts);
   qa_guest_call_signature signature;
   qa_system_v_guest_runtime_signature(rt, parameters, parameter_count, result_is_void, result,
                                       layouts, &signature);
@@ -340,6 +357,7 @@ static qa_call_result host_invoke(void *ctx, const qa_guest_core_call_context *c
   request.instruction_budget = rt->budget;
   qa_call_result value = qa_guest_call_runner_invoke(
       qa_system_v_guest_runtime_runner(rt), &request);
+  qa_cleanup_pop(&held);
   free(layouts);
   return value;
 }
@@ -376,6 +394,12 @@ static void host_finalize_destructors(void *ctx, const qa_guest_core_call_contex
                                         QA_STORAGE_INT32, invoke_args, 1);
     qa_call_value_free(&result);
   }
+}
+typedef struct owned_resource { void *resource; void (*release)(void *resource); } owned_resource;
+static void host_own(void *ctx, void *resource, void (*release)(void *resource)) {
+  qa_system_v_guest_runtime *rt = ctx;
+  grow(&rt->owned, &rt->owned_cap, rt->owned_count, sizeof(owned_resource));
+  ((owned_resource *)rt->owned)[rt->owned_count++] = (owned_resource){resource, release};
 }
 static qa_guest_core_address host_tls_address(void *ctx, uint64_t module_id, int64_t offset) {
   return qa_system_v_guest_runtime_tls_address(ctx, module_id, offset);
@@ -475,6 +499,7 @@ qa_guest_import_resolution qa_system_v_guest_runtime_resolve(
       if (exported->symbol.is_ordinal) continue;
       if (strcmp(exported->symbol.name, name) != 0) continue;
       if (!streq_or_null(exported->symbol.version, version)) continue;
+      /* TS `exports.find(...)`: the first export of this name decides, forward or not. */
       if (!exported->is_forward) {
         qa_guest_import_resolution resolution;
         memset(&resolution, 0, sizeof resolution);
@@ -483,6 +508,7 @@ qa_guest_import_resolution qa_system_v_guest_runtime_resolve(
         resolution.module = image->image.module;
         return resolution;
       }
+      break;
     }
   }
   symbol_entry *provider = NULL;
@@ -544,6 +570,7 @@ qa_guest_import_resolution qa_system_v_guest_runtime_resolve(
   state->name = xstrdup(name);
   state->detail = xstrdup("no implementation for this exact symbol version");
   state->version = version;
+  host_own(runtime, state, free_unavailable);
   /* version borrows the import's string, as the TS closure captures it. */
   qa_system_v_implementation impl = {state, unavailable_impl};
   return add_function(runtime, import_->library, name, version, NULL, 0, true,
@@ -604,6 +631,11 @@ static bool tls_resolve_adapter(void *ctx, const qa_guest_import *import_,
   return false;
 }
 
+typedef struct load_call { qa_elf_guest_image *image; const qa_elf_load_options *options; } load_call;
+static void load_run(void *arg) {
+  load_call *call = arg;
+  (void)qa_load_elf(call->image, call->options);
+}
 void qa_system_v_guest_runtime_load(qa_system_v_guest_runtime *runtime,
                                     const qa_system_v_load_options *options,
                                     qa_elf_guest_image *out_image) {
@@ -614,9 +646,10 @@ void qa_system_v_guest_runtime_load(qa_system_v_guest_runtime *runtime,
   for (size_t i = 0; i < inspection.segment_count; i++)
     if (inspection.segments[i].type == 7) { segment = &inspection.segments[i]; break; }
   uint64_t module_id = (uint64_t)runtime->tls_count + 1;
-  if (module_id > 1024) qa_range_error("System V thread TLS module limit exceeded");
   size_t size = segment != NULL ? segment->memory_size : 0;
   uint64_t alignment = segment == NULL || segment->alignment == 0 ? 1 : segment->alignment;
+  qa_elf_inspection_full_free(&inspection); /* the checks below raise */
+  if (module_id > 1024) qa_range_error("System V thread TLS module limit exceeded");
   if (alignment > 4096)
     qa_range_error("System V static TLS alignment exceeds the thread allocation alignment");
   uint64_t next = (runtime->tls_used + size + alignment - 1) / alignment * alignment;
@@ -629,7 +662,6 @@ void qa_system_v_guest_runtime_load(qa_system_v_guest_runtime *runtime,
   tls.current.thread_pointer_offset = -(int64_t)next;
   tls.ctx = runtime;
   tls.resolve = tls_resolve_adapter;
-  qa_elf_inspection_full_free(&inspection);
   /* Relocation validates provider addresses. No guest code runs while
    * unresolved data reservations are readable (TS comment). */
   for (size_t i = 0; i < runtime->symbol_count; i++)
@@ -654,13 +686,17 @@ void qa_system_v_guest_runtime_load(qa_system_v_guest_runtime *runtime,
   load_options.resolve_symbol_size = symbol_size_adapter;
   load_options.unique_symbols = &runtime->unique_symbols;
   runtime->loading = true;
-  (void)qa_load_elf(out_image, &load_options);
+  load_call call = {out_image, &load_options};
+  qa_caught_error caught;
+  const bool loaded = qa_try(load_run, &call, &caught);
+  /* TS `finally`: loading ends and unresolved data reservations become inaccessible again. */
   runtime->loading = false;
   free((void *)dependencies);
   for (size_t i = 0; i < runtime->symbol_count; i++)
     if (SYMBOLS(runtime)[i]->support == QA_SYSTEM_V_UNSUPPORTED_DATA)
       qa_gmem_protect(runtime->options.memory_ext, SYMBOLS(runtime)[i]->resolution.address,
                       4096, QA_PERM_NONE);
+  if (!loaded) qa_rethrow(&caught);
   if (out_image->image.has_tls) {
     qa_mapped_guest_memory *m = runtime->options.memory;
     qa_memory_write(m, block, out_image->image.tls.initialized,
@@ -685,7 +721,7 @@ qa_guest_core_address qa_system_v_guest_runtime_tls_address(qa_system_v_guest_ru
                                                        uint64_t module_id, int64_t offset) {
   tls_block *block = NULL;
   for (size_t i = 0; i < runtime->tls_count; i++)
-    if (TLS_BLOCKS(runtime)[i].module_id == module_id) block = &TLS_BLOCKS(runtime)[i];
+    if (TLS_BLOCKS(runtime)[i].module_id == module_id) { block = &TLS_BLOCKS(runtime)[i]; break; }
   if (block == NULL || offset < 0 || (uint64_t)offset >= block->byte_length)
     qa_range_error("System V TLS index outside loaded module block");
   qa_mapped_guest_memory *m = runtime->options.memory;
@@ -728,6 +764,13 @@ static void run_initializer(qa_system_v_guest_runtime *rt, qa_elf_guest_image *i
   qa_call_value_free(&result);
   push_trace(rt, image, false, target);
 }
+typedef struct lifecycle_call {
+  qa_system_v_guest_runtime *runtime;
+  qa_elf_guest_image *image;
+  const qa_system_v_initialize_options *options;
+} lifecycle_call;
+static void initialize_run(void *arg);
+static void finalize_run(void *arg);
 void qa_system_v_guest_runtime_initialize(qa_system_v_guest_runtime *runtime,
                                           qa_elf_guest_image *image,
                                           const qa_system_v_initialize_options *options) {
@@ -735,10 +778,24 @@ void qa_system_v_guest_runtime_initialize(qa_system_v_guest_runtime *runtime,
   if (entry == NULL) plain_error("System V image is not loaded in this process");
   if (entry->state == QA_SV_INITIALIZED || entry->state == QA_SV_INITIALIZING) return;
   if (entry->state != QA_SV_LOADED)
-    qa_range_error("Cannot initialize System V image in state %s",
-                   qa_system_v_lifecycle_state_name(entry->state));
+    qa_raise("Error", 0, 0, "Cannot initialize System V image in state %s",
+             qa_system_v_lifecycle_state_name(entry->state));
   runtime->budget = options->instruction_budget;
   entry->state = QA_SV_INITIALIZING;
+  lifecycle_call call = {runtime, image, options};
+  qa_caught_error caught;
+  if (!qa_try(initialize_run, &call, &caught)) {
+    /* TS catch: the image is marked failed and the error rethrown. */
+    find_lifecycle(runtime, image)->state = QA_SV_FAILED;
+    qa_rethrow(&caught);
+  }
+  find_lifecycle(runtime, image)->state = QA_SV_INITIALIZED;
+}
+static void initialize_run(void *arg) {
+  lifecycle_call *call = arg;
+  qa_system_v_guest_runtime *runtime = call->runtime;
+  qa_elf_guest_image *image = call->image;
+  const qa_system_v_initialize_options *options = call->options;
   for (size_t i = 0; i < image->preinitializer_count; i++)
     run_initializer(runtime, image, image->preinitializers[i], &options->context);
   for (size_t i = 0; i < image->elf.needed_library_count; i++) {
@@ -753,8 +810,6 @@ void qa_system_v_guest_runtime_initialize(qa_system_v_guest_runtime *runtime,
   }
   for (size_t i = 0; i < image->image.initializer_count; i++)
     run_initializer(runtime, image, image->image.initializers[i], &options->context);
-  entry = find_lifecycle(runtime, image);
-  entry->state = QA_SV_INITIALIZED;
 }
 void qa_system_v_guest_runtime_finalize(qa_system_v_guest_runtime *runtime,
                                         qa_elf_guest_image *image,
@@ -765,6 +820,19 @@ void qa_system_v_guest_runtime_finalize(qa_system_v_guest_runtime *runtime,
     plain_error("Only an initialized System V image can finalize");
   runtime->budget = options->instruction_budget;
   entry->state = QA_SV_FINALIZING;
+  lifecycle_call call = {runtime, image, options};
+  qa_caught_error caught;
+  if (!qa_try(finalize_run, &call, &caught)) {
+    find_lifecycle(runtime, image)->state = QA_SV_FAILED;
+    qa_rethrow(&caught);
+  }
+  find_lifecycle(runtime, image)->state = QA_SV_FINALIZED;
+}
+static void finalize_run(void *arg) {
+  lifecycle_call *call = arg;
+  qa_system_v_guest_runtime *runtime = call->runtime;
+  qa_elf_guest_image *image = call->image;
+  const qa_system_v_initialize_options *options = call->options;
   for (size_t i = 0; i < image->image.finalizer_count; i++) {
     qa_call_result result = host_invoke(runtime, &options->context,
                                         image->image.finalizers[i], NULL, 0, true,
@@ -772,8 +840,6 @@ void qa_system_v_guest_runtime_finalize(qa_system_v_guest_runtime *runtime,
     qa_call_value_free(&result);
     push_trace(runtime, image, true, image->image.finalizers[i]);
   }
-  entry = find_lifecycle(runtime, image);
-  entry->state = QA_SV_FINALIZED;
 }
 
 static qa_guest_core_address make_strings(qa_system_v_guest_runtime *rt, const char *const *values,
@@ -823,6 +889,7 @@ void qa_system_v_guest_runtime_init(qa_system_v_guest_runtime *runtime,
   host->register_destructor = host_register_destructor;
   host->finalize_destructors = host_finalize_destructors;
   host->tls_address = host_tls_address;
+  host->own = host_own;
   qa_elf_unique_symbols_init(&runtime->unique_symbols);
   qa_guest_core_address tls_area = rt_allocate_ext(runtime, 0x11000, true, 4096, false,
                                               QA_PERM_READ_WRITE,
@@ -863,6 +930,11 @@ void qa_system_v_guest_runtime_destroy(qa_system_v_guest_runtime *runtime) {
     free(runtime->iostreams);
   }
   qa_elf_unique_symbols_free(&runtime->unique_symbols);
+  for (size_t i = runtime->owned_count; i-- > 0;) {
+    owned_resource *owned = &((owned_resource *)runtime->owned)[i];
+    owned->release(owned->resource);
+  }
+  free(runtime->owned);
   for (size_t i = 0; i < runtime->symbol_count; i++) {
     symbol_entry *entry = SYMBOLS(runtime)[i];
     free(entry->key); free(entry->library); free(entry->name); free(entry->version);

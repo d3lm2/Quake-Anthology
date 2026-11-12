@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/render/scene/textures.h"
 typedef struct picture_entry { char *id; qa_picture_asset asset; char *name; } picture_entry;
@@ -17,7 +18,6 @@ struct qa_app_q2_native_hud {
   qa_native_q2_hud_table table;
   qa_native_q2_hud_operations prepared;
   bool has_prepared;
-  bool cap_reported;
 };
 static char *dup_text(const char *text) {
   size_t len = strlen(text);
@@ -38,7 +38,6 @@ void qa_app_q2_native_hud_clear(qa_app_q2_native_hud *hud) {
   if (hud->has_prepared) { qa_native_q2_hud_operations_free(&hud->prepared); hud->has_prepared = false; }
   hud->has_environment = false;
   hud->revision++;
-  hud->cap_reported = false;
   free(hud->content); hud->content = NULL;
   for (size_t i = 0; i < hud->id_count; i++) { free(hud->ids[i].name); free(hud->ids[i].id); }
   hud->id_count = 0;
@@ -87,8 +86,6 @@ static void set_picture(qa_app_q2_native_hud *hud, const char *name, const char 
   entry->asset.image.name = entry->name;
   entry->asset.image.image = image;
 }
-/* Layout names come from the game module; past the cap further pictures are left undrawn (once reported). */
-#define MAXIMUM_PICTURES 512
 typedef struct ops_job {
   const qa_native_q2_hud_frame *frame; double width, height;
   qa_q2_hud_binding_fn binding; void *binding_ctx; const char *mode;
@@ -183,18 +180,8 @@ void qa_app_q2_native_hud_prepare(qa_app_q2_native_hud *hud, qa_content_id conte
     if ((op->kind == QA_Q2_HUD_OP_PICTURE || op->kind == QA_Q2_HUD_OP_SIZED_PICTURE) && !name_listed(names, name_count, op->name))
       names[name_count++] = op->name;
   }
-  size_t room = hud->id_count >= MAXIMUM_PICTURES ? 0 : MAXIMUM_PICTURES - hud->id_count;
-  size_t wanted = 0;
-  for (size_t i = 0; i < name_count; i++) if (id_for(hud, names[i]) == NULL) names[wanted++] = names[i];
-  if (wanted > room && !hud->cap_reported) {
-    hud->cap_reported = true;
-    char text[128];
-    snprintf(text, sizeof text, "Native HUD layout names more than %d pictures; the rest are not drawn.\n", MAXIMUM_PICTURES);
-    qa_app_application_assets_warn_once(assets, "q2-native-hud-cap", text);
-  }
-  if (wanted > room) wanted = room;
   qa_scene_texture_load_options options = {true, false, "clamp", "q2", NULL};
-  for (size_t i = 0; i < wanted; i++) {
+  for (size_t i = 0; i < name_count; i++) {
     const char *name = names[i];
     if (id_for(hud, name) != NULL) continue;
     size_t path_length = strlen(name) + 16;
@@ -223,6 +210,7 @@ void qa_app_q2_native_hud_prepare(qa_app_q2_native_hud *hud, qa_content_id conte
   free((void *)names);
   if (owned != NULL) { qa_cleanup_pop(&ops_guard); qa_native_q2_hud_operations_free(owned); }
 }
+static void free_commands(void *commands) { free(*(qa_ui_draw_command **)commands); }
 static void push_command(qa_ui_draw_command **out, size_t *count, size_t *capacity, qa_ui_draw_command command) {
   if (*count == *capacity) {
     *capacity = *capacity == 0 ? 16 : *capacity * 2;
@@ -244,6 +232,8 @@ size_t qa_app_q2_native_hud_commands(qa_app_q2_native_hud *hud, const qa_native_
   const char *font = id_for(hud, "conchars");
   qa_native_q2_hud_operations fresh = {0};
   const qa_native_q2_hud_operations *ops = &hud->prepared;
+  qa_cleanup commands_guard, fresh_guard;
+  qa_cleanup_push(&commands_guard, free_commands, &commands);
   if (!hud->has_prepared) {
     ops_job job = {frame, area.width / scale, area.height / scale, binding, binding_ctx, mode != NULL ? mode : "replace-status",
                    arsenal, hud->has_environment ? &hud->environment.environment : NULL, &fresh};
@@ -251,6 +241,7 @@ size_t qa_app_q2_native_hud_commands(qa_app_q2_native_hud *hud, const qa_native_
     (void)layout_operations(&job, &caught); /* a layout error draws no operations */
     ops = &fresh;
   }
+  qa_cleanup_push(&fresh_guard, ops_release, &fresh);
   for (size_t i = 0; i < ops->count; i++) {
     const qa_native_q2_hud_operation *op = &ops->operations[i];
     qa_ui_draw_command command = {0};
@@ -261,7 +252,7 @@ size_t qa_app_q2_native_hud_commands(qa_app_q2_native_hud *hud, const qa_native_
       command.color = op->color;
       push_command(&commands, &count, &capacity, command);
     } else if (op->kind == QA_Q2_HUD_OP_FONT_TEXT) {
-      if (!hud->has_environment) qa_range_error("Native HUD font was not prepared");
+      if (!hud->has_environment) qa_raise("Error", 0, 0, "Native HUD font was not prepared");
       command.kind = QA_UI_DRAW_TEXT;
       command.origin.x = area.x + op->x * scale; command.origin.y = area.y + op->y * scale;
       command.text = op->text;
@@ -271,8 +262,8 @@ size_t qa_app_q2_native_hud_commands(qa_app_q2_native_hud *hud, const qa_native_
       command.align = "left"; command.shadow = true;
       push_command(&commands, &count, &capacity, command);
     } else if (op->kind == QA_Q2_HUD_OP_ARSENAL_PICTURE) {
-      double width = 24 * (op->aspect < 1 ? op->aspect : 1);
-      double height = 24 / (op->aspect > 1 ? op->aspect : 1);
+      double width = 24 * qa_js_min(1, op->aspect);
+      double height = 24 / qa_js_max(1, op->aspect);
       command.kind = QA_UI_DRAW_IMAGE;
       command.resource = op->resource;
       command.rect.x = area.x + (op->x + (24 - width) / 2) * scale;
@@ -329,10 +320,12 @@ size_t qa_app_q2_native_hud_commands(qa_app_q2_native_hud *hud, const qa_native_
       }
     }
   }
-  if (!hud->has_prepared) qa_native_q2_hud_operations_free(&fresh);
+  qa_cleanup_pop(&fresh_guard);
+  qa_native_q2_hud_operations_free(&fresh); /* empty when the prepared operations were drawn */
   qa_ui_draw_command unclip = {0};
   unclip.kind = QA_UI_DRAW_CLIP; unclip.has_clip_rect = false;
   push_command(&commands, &count, &capacity, unclip);
+  qa_cleanup_pop(&commands_guard);
   *out = commands;
   return count;
 }

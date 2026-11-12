@@ -1,5 +1,6 @@
 /* Port of src/core/commands/index.ts. GPL-2.0-or-later. */
 #include "qa/core/commands/index.h"
+#include "qa/foundation/caught_message.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -12,6 +13,7 @@
 #include "qa/core/cvars/numbers.h"
 #include "qa/core/numeric.h"
 #include "qa/core/commands/deque.h"
+#include "qa/core/commands/text.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 
@@ -224,6 +226,7 @@ typedef struct command_chunk {
   qa_command_context event_source;
   qa_script_result_kind event_result;
   char *event_error;
+  const char *event_error_name; /* static text: the failed read's error class */
 } command_chunk;
 
 static void chunk_free_contents(command_chunk *chunk) {
@@ -242,6 +245,7 @@ static bool chunk_clone(const command_chunk *source, command_chunk *dest) {
   dest->direct = source->direct;
   dest->identity = source->identity;
   dest->event_result = source->event_result;
+  dest->event_error_name = source->event_error_name;
   dest->text = source->text != NULL ? dup_text(source->text) : NULL;
   dest->event_name = source->event_name != NULL ? dup_text(source->event_name) : NULL;
   dest->event_error = source->event_error != NULL ? dup_text(source->event_error) : NULL;
@@ -342,6 +346,8 @@ typedef struct script_read {
   bool has_text;
   char *text;
   char *error_message;
+  const char *error_name; /* static text */
+  bool text_utf8; /* text is a TS string held as UTF-8 (sourceCommandText at insertion) */
   void *poll_ctx;
   qa_script_read_result (*poll)(void *poll_ctx);
   void (*cancel_fn)(void *poll_ctx);
@@ -366,6 +372,8 @@ static void script_read_poll(script_read *read) {
   read->has_text = result.has_text;
   read->text = result.text;
   read->error_message = result.error_message;
+  read->error_name = result.error_name;
+  read->text_utf8 = result.text_utf8;
 }
 
 typedef struct program_tail program_tail;
@@ -1444,6 +1452,49 @@ void qa_command_buffer_insert(qa_command_buffer *b, const char *text,
   insert_for(b, text, context, -1, NULL, -1, dialect, identity);
   context_origin_free(&context);
 }
+/* sourceText(input) of a TS string held as UTF-8: sourceCommandText cuts at the first U+0000 (C0 80 in decoded
+ * text); a character above U+00FF drops the text with the RangeError's message (NULL). */
+static char *decoded_source_text(qa_command_buffer *b, const char *utf8) {
+  const char *nul = strstr(utf8, "\xc0\x80");
+  size_t length = nul == NULL ? strlen(utf8) : (size_t)(nul - utf8);
+  char *cut = (char *)malloc(length + 1);
+  if (cut == NULL) qa_range_error("Out of memory");
+  memcpy(cut, utf8, length);
+  cut[length] = '\0';
+  char *text = NULL;
+  bool converted = qa_command_text_from_utf8(cut, &text);
+  free(cut);
+  if (!converted) buffer_print(b, "Command text requires source bytes\n", NULL);
+  return converted ? text : NULL;
+}
+void qa_command_buffer_append_decoded(qa_command_buffer *b, const char *utf8,
+                                      const qa_command_context *source, int dialect) {
+  const uint64_t identity = source_identity(b, source);
+  qa_command_context context = input_context(b, source, true);
+  char *text = decoded_source_text(b, utf8);
+  if (text != NULL) {
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, text);
+    append_for(b, text, context, -1, -1, dialect, false, identity);
+    qa_cleanup_pop(&guard);
+    free(text);
+  }
+  context_origin_free(&context);
+}
+void qa_command_buffer_insert_decoded(qa_command_buffer *b, const char *utf8,
+                                      const qa_command_context *source, int dialect) {
+  const uint64_t identity = source_identity(b, source);
+  qa_command_context context = input_context(b, source, true);
+  char *text = decoded_source_text(b, utf8);
+  if (text != NULL) {
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, text);
+    insert_for(b, text, context, -1, NULL, -1, dialect, identity);
+    qa_cleanup_pop(&guard);
+    free(text);
+  }
+  context_origin_free(&context);
+}
 void qa_command_buffer_copy_to_defer(qa_command_buffer *b) {
   if (!qa_command_dialect_is_q2(execution_dialect(b)))
     qa_error("Deferred command buffers belong to Quake II");
@@ -1710,6 +1761,8 @@ static script_read *script_read_clone(script_read *read) {
   copy->has_text = read->has_text;
   copy->text = read->text != NULL ? dup_text(read->text) : NULL;
   copy->error_message = read->error_message != NULL ? dup_text(read->error_message) : NULL;
+  copy->error_name = read->error_name;
+  copy->text_utf8 = read->text_utf8;
   copy->poll_ctx = read->poll_ctx;
   copy->poll = read->poll;
   copy->cancel_fn = read->cancel_fn;
@@ -1994,6 +2047,7 @@ static void make_completion_chunk(command_chunk *out, const char *name,
   out->event_name = dup_text(name);
   out->event_result = result;
   out->event_error = error_message != NULL ? dup_text(error_message) : NULL;
+  out->event_error_name = NULL;
   qa_command_origin script_origin;
   memset(&script_origin, 0, sizeof script_origin);
   script_origin.kind = QA_COMMAND_ORIGIN_SCRIPT;
@@ -2001,8 +2055,32 @@ static void make_completion_chunk(command_chunk *out, const char *name,
   script_origin.caller = &caller.origin;
   out->event_source = copy_context(caller, &script_origin);
 }
+/* TS sourceCommandText over a script read as a TS string held as UTF-8 (U+0000 as C0 80 or a raw 0): the text is cut
+ * at the first U+0000, and a character above U+00FF throws RangeError "Command text requires source bytes" (insertScript
+ * does not catch it: the drain throws after the "execing" line). */
+static char *script_source_text(const char *utf8) {
+  const char *nul = strstr(utf8, "\xc0\x80");
+  size_t length = nul == NULL ? strlen(utf8) : (size_t)(nul - utf8);
+  char *cut = (char *)malloc(length + 1);
+  if (cut == NULL) qa_range_error("Out of memory");
+  memcpy(cut, utf8, length);
+  cut[length] = '\0';
+  char *text = NULL;
+  bool converted = qa_command_text_from_utf8(cut, &text);
+  free(cut);
+  if (!converted) qa_raise("RangeError", 0, 0, "Command text requires source bytes");
+  return text;
+}
+static void insert_script_text(qa_command_buffer *b, const char *filename, bool has_file,
+                          const char *file, bool file_utf8, qa_command_context caller,
+                          qa_command_dialect dialect, qa_command_text_mode text_mode);
 static void insert_script(qa_command_buffer *b, const char *filename, bool has_file,
                           const char *file, qa_command_context caller,
+                          qa_command_dialect dialect, qa_command_text_mode text_mode) {
+  insert_script_text(b, filename, has_file, file, false, caller, dialect, text_mode);
+}
+static void insert_script_text(qa_command_buffer *b, const char *filename, bool has_file,
+                          const char *file, bool file_utf8, qa_command_context caller,
                           qa_command_dialect dialect, qa_command_text_mode text_mode) {
   if (!has_file) {
     buffer_print_format(b, &caller, "couldn't exec %s\n", filename);
@@ -2013,7 +2091,7 @@ static void insert_script(qa_command_buffer *b, const char *filename, bool has_f
     return;
   }
   buffer_print_format(b, &caller, "execing %s\n", filename);
-  char *text = qa_source_command_text(file != NULL ? file : "");
+  char *text = file_utf8 ? script_source_text(file != NULL ? file : "") : qa_source_command_text(file != NULL ? file : "");
   if (text == NULL) return;
   text_buffer built = {NULL, 0, 0};
   (void)text_add(&built, text);
@@ -2068,11 +2146,21 @@ static void execute_script_command(qa_command_buffer *b, qa_command_invocation *
     free(filename);
     return;
   }
+  /* A synchronous reader that throws propagates out of exec (TS); the name must not leak. */
+  qa_cleanup read_guard;
+  qa_cleanup_push(&read_guard, free, filename);
   qa_script_read_result result = read_script(read_ctx, filename, command->source);
+  qa_cleanup_pop(&read_guard);
   if (result.kind == QA_SCRIPT_READ_READY) {
-    insert_script(b, filename, result.has_text, result.text, command->source,
+    /* A UTF-8 script with a character above U+00FF raises after the "execing" line. */
+    qa_cleanup name_guard, ready_guard;
+    qa_cleanup_push(&name_guard, free, filename);
+    qa_cleanup_push(&ready_guard, free, result.text);
+    insert_script_text(b, filename, result.has_text, result.text, result.text_utf8, command->source,
                   execution_dialect(b),
                   b->frame != NULL ? b->frame->text_mode : QA_COMMAND_TEXT_SOURCE);
+    qa_cleanup_pop(&ready_guard);
+    qa_cleanup_pop(&name_guard);
     free(result.text);
     free(result.error_message);
     free(filename);
@@ -2093,6 +2181,8 @@ static void execute_script_command(qa_command_buffer *b, qa_command_invocation *
   read->has_text = result.has_text;
   read->text = result.text;
   read->error_message = result.error_message;
+  read->error_name = result.error_name;
+  read->text_utf8 = result.text_utf8;
   read->poll_ctx = result.poll_ctx;
   read->poll = result.poll;
   read->cancel_fn = result.cancel;
@@ -2375,6 +2465,77 @@ static void dispatch_body_run(void *raw_job) {
   fallback_command(b, command);
 }
 
+/* TS LOCAL_FORMS.get(asciiFold(name)): false when the command has no local form. */
+static bool local_form_command(const char *name, qa_local_form_command *out) {
+  static const struct { const char *name; qa_local_form_command command; } forms[] = {
+    {"bind", QA_LOCAL_FORM_BIND}, {"unbind", QA_LOCAL_FORM_UNBIND}, {"set", QA_LOCAL_FORM_SET},
+    {"seta", QA_LOCAL_FORM_SET}, {"setu", QA_LOCAL_FORM_SET}, {"sets", QA_LOCAL_FORM_SET},
+  };
+  for (size_t i = 0; i < sizeof forms / sizeof forms[0]; i++) {
+    if (!folded_equal(name, forms[i].name)) continue;
+    *out = forms[i].command;
+    return true;
+  }
+  return false;
+}
+/* JS \s over a command line: command text is a byte string (one byte per TS character, all
+ * below U+0100), so the white space is TAB LF VT FF CR SP and byte 0xa0 (U+00A0). */
+static size_t byte_white_space(const char *text) {
+  unsigned char c = (unsigned char)*text;
+  return c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r' || c == ' ' || c == 0xa0;
+}
+/* The regex tail `-local\b\s*` (flag i) at `text`: its length, or 0 when it does not match. */
+static size_t local_flag_length(const char *text) {
+  static const char flag[] = "-local";
+  size_t at = 0;
+  for (; flag[at] != '\0'; at++) {
+    char c = text[at];
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (c != flag[at]) return 0;
+  }
+  unsigned char next = (unsigned char)text[at];
+  if ((next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_')
+    return 0;
+  for (size_t space; (space = byte_white_space(text + at)) > 0;) at += space;
+  return at;
+}
+static size_t white_space_run(const char *text) {
+  size_t at = 0;
+  for (size_t space; (space = byte_white_space(text + at)) > 0;) at += space;
+  return at;
+}
+/* TS argsText.replace(/^\s*-local\b\s*\/i, ""), in place. */
+static void strip_local_args(char *args_text) {
+  size_t lead = white_space_run(args_text);
+  size_t flag = local_flag_length(args_text + lead);
+  if (flag == 0) return;
+  memmove(args_text, args_text + lead + flag, strlen(args_text + lead + flag) + 1);
+}
+/* TS raw.replace(/^(\s*\S+\s+)-local\b\s*\/i, "$1"): a malloc'd copy of the line. */
+static char *strip_local_line(const char *raw) {
+  char *line = dup_text(raw);
+  if (line == NULL) return NULL;
+  size_t at = white_space_run(line);
+  size_t word = at;
+  while (line[word] != '\0' && byte_white_space(line + word) == 0) word++;
+  if (word == at) return line;
+  size_t gap = white_space_run(line + word);
+  if (gap == 0) return line;
+  size_t prefix = word + gap;
+  size_t flag = local_flag_length(line + prefix);
+  if (flag == 0) return line;
+  memmove(line + prefix, line + prefix + flag, strlen(line + prefix + flag) + 1);
+  return line;
+}
+typedef struct local_form_job {
+  qa_command_buffer *buffer;
+  qa_local_form form;
+} local_form_job;
+static void local_form_run(void *raw) {
+  local_form_job *job = (local_form_job *)raw;
+  job->buffer->options.local_form(job->buffer->options.local_form_ctx, &job->form);
+}
+
 static double dispatch(qa_command_buffer *b, const char *raw, qa_command_context source,
                        bool direct, qa_command_text_mode text_mode,
                        qa_command_dialect dialect, bool macro_expansion, uint64_t identity) {
@@ -2396,7 +2557,7 @@ static double dispatch(qa_command_buffer *b, const char *raw, qa_command_context
   if (!qa_try(dispatch_tokens_run, &tokens_job, &caught)) {
     free(tokens_job.expanded_owned);
     if (strcmp(caught.name, "RangeError") != 0) qa_rethrow(&caught);
-    buffer_print_format(b, NULL, "%s; command ignored\n", caught.message);
+    buffer_print_format(b, NULL, "%s; command ignored\n", qa_caught_message(&caught));
     set_buffer_tokens(b, NULL);
     return 0;
   }
@@ -2407,10 +2568,37 @@ static double dispatch(qa_command_buffer *b, const char *raw, qa_command_context
     return 0;
   }
   qa_command_tokens tokens = tokens_job.tokens;
+  /* TS local forms: the `-local` flag leaves the tokens and the line before anything else sees them. */
+  char *line_owned = NULL;
+  qa_local_form_command local_command = QA_LOCAL_FORM_BIND;
+  if (tokens.argc >= 2 && local_form_command(tokens.argv[0], &local_command) &&
+      folded_equal(tokens.argv[1], "-local")) {
+    free(tokens.argv[1]);
+    memmove(&tokens.argv[1], &tokens.argv[2], (tokens.argc - 2) * sizeof *tokens.argv);
+    tokens.argc--;
+    if (tokens.args_text != NULL) strip_local_args(tokens.args_text);
+    line_owned = strip_local_line(raw);
+    if (line_owned != NULL) raw = line_owned;
+    if (b->options.local_form != NULL) {
+      local_form_job job;
+      job.buffer = b;
+      job.form.command = local_command;
+      job.form.args = (const char *const *)(tokens.argv + 1);
+      job.form.arg_count = tokens.argc - 1;
+      job.form.source = source;
+      if (!qa_try(local_form_run, &job, &caught)) {
+        qa_command_tokens_destroy(&tokens);
+        free(expanded_owned);
+        free(line_owned);
+        qa_rethrow(&caught);
+      }
+    }
+  }
   set_buffer_tokens(b, &tokens);
   if (tokens.argc == 0) {
     qa_command_tokens_destroy(&tokens);
     free(expanded_owned);
+    free(line_owned);
     return 0;
   }
   const char *name = tokens.argv[0];
@@ -2441,13 +2629,14 @@ static double dispatch(qa_command_buffer *b, const char *raw, qa_command_context
   bool completed = qa_try(dispatch_body_run, &body, &caught);
   bool usage = !completed && strcmp(caught.name, QA_COMMAND_USAGE_ERROR) == 0;
   /* TS catch (inside the frame): a CommandUsageError prints its message and counts as dispatched. */
-  if (usage) buffer_print_format(b, NULL, "%s\n", caught.message);
+  if (usage) buffer_print_format(b, NULL, "%s\n", qa_caught_message(&caught));
   /* TS finally. */
   frame.active = false;
   b->frame = frame.parent;
   select_builtins(b, execution_dialect(b));
   qa_command_tokens_destroy(&tokens);
   free(expanded_owned);
+  free(line_owned);
   if (!completed && !usage) qa_rethrow(&caught);
   return 1;
 }
@@ -2543,10 +2732,14 @@ static double drain_loop(qa_command_buffer *b, bool reset_aliases,
         make_completion_chunk(&completion, script->name != NULL ? script->name : "",
                               script->source, QA_SCRIPT_FAILED, script->error_message,
                               script->dialect, script->text_mode);
+        completion.event_error_name = script->error_name;
         ring_prepend(&b->chunks, &completion, 1);
       } else {
-        insert_script(b, script->name != NULL ? script->name : "", script->has_text,
-                      script->text, script->source, script->dialect, script->text_mode);
+        qa_cleanup script_guard; /* sourceCommandText of a UTF-8 script can throw out of the drain */
+        qa_cleanup_push(&script_guard, (void (*)(void *))script_read_free, script);
+        insert_script_text(b, script->name != NULL ? script->name : "", script->has_text,
+                      script->text, script->text_utf8, script->source, script->dialect, script->text_mode);
+        qa_cleanup_pop(&script_guard);
       }
       script_read_free(script);
       continue;
@@ -2573,6 +2766,7 @@ static double drain_loop(qa_command_buffer *b, bool reset_aliases,
       event.result = chunk.event_result;
       event.error_message = chunk.event_error;
       chunk.event_error = NULL;
+      event.error_name = chunk.event_error_name;
       event.buffer = b;
       execution_frame frame;
       memset(&frame, 0, sizeof frame);
@@ -2619,8 +2813,14 @@ static double drain_loop(qa_command_buffer *b, bool reset_aliases,
     size_t consumed = offset == buffer_length ? offset : offset + 1;
     free(buffer);
     consume_chunks(b, consumed);
+    /* A handler that raises (a script's sourceCommandText, any TS throw) leaves the line and its source behind. */
+    qa_cleanup line_guard, source_guard;
+    qa_cleanup_push(&line_guard, free, line);
+    qa_cleanup_push(&source_guard, (void (*)(void *))context_origin_free, &source);
     double count = dispatch(b, line != NULL ? line : "", source, direct, text_mode,
                             dialect, true, identity);
+    qa_cleanup_pop(&source_guard);
+    qa_cleanup_pop(&line_guard);
     free(line);
     context_origin_free(&source);
     if (--budget <= 0) {
@@ -2739,8 +2939,14 @@ double qa_command_buffer_execute_now(qa_command_buffer *b, const char *text,
   bool direct = b->frame == NULL;
   qa_command_dialect use_dialect = dialect >= 0 ? (qa_command_dialect)dialect
                                                 : execution_dialect(b);
+  /* A handler that throws propagates out of executeNow; the copies must not leak. */
+  qa_cleanup value_node, context_node;
+  qa_cleanup_push(&value_node, free, value);
+  qa_cleanup_push(&context_node, (void (*)(void *))context_origin_free, &context);
   double result = dispatch(b, value, context, direct,
                            input_text_mode(b, context, direct), use_dialect, true, identity);
+  qa_cleanup_pop(&context_node);
+  qa_cleanup_pop(&value_node);
   context_origin_free(&context);
   free(value);
   return result;

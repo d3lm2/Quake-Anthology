@@ -1064,7 +1064,7 @@ qa_q1_actor *qa_comp_q1_source_composition_drop_inventory(comp_t *comp, qa_owned
   if (horde_has_manager(comp)) return NULL;
   if (comp->packs != NULL) return qa_q1mp_runtime_drop_backpack(comp->packs, actor);
   const qa_body_state_result body = qa_shared_body_table_read(game->host.bodies, actor.id);
-  if (!body.has_value) qa_range_error("Q1 death drop has no shared body");
+  if (!body.has_value) qa_raise("Error", 0, 0, "%s", "Q1 death drop has no shared body"); /* TS: new Error */
   qa_q1_backpack_contents contents;
   memset(&contents, 0, sizeof contents);
   contents.weapon = selected_base_weapon(comp, actor.id);

@@ -328,6 +328,8 @@ static void plasma_touch(void *ctx, qa_q1_services *game, qa_q1_actor *plasma, q
   int count = 0;
   size_t target_count = 0;
   qa_actor_id *targets = observations_reversed(game, &target_count);
+  qa_cleanup targets_node; /* plasma_damage runs damage callbacks, which can raise */
+  qa_cleanup_push(&targets_node, free, targets);
   for (size_t i = 0; i < target_count; i++) {
     const qa_actor_id target = targets[i];
     const qa_body_state_result body = qa_shared_body_table_read(game->host.bodies, target);
@@ -347,6 +349,7 @@ static void plasma_touch(void *ctx, qa_q1_services *game, qa_q1_actor *plasma, q
     plasma_damage(game, plasma, body.value.origin);
     if (++count == 5) break;
   }
+  qa_cleanup_pop(&targets_node);
   free(targets);
   qa_q1_remove(game, plasma);
 }

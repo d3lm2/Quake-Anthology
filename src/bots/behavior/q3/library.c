@@ -1,4 +1,5 @@
 /* See header. GPL-2.0-or-later. */
+#include "qa/foundation/support.h"
 #include "qa/bots/behavior/q3/library.h"
 #include "qa/network/common/js_number.h"
 #include "../library/library_internal.h"
@@ -301,10 +302,8 @@ void qa_bot_library_bots_a_destroy(qa_bot_library_bots_a *l) {
 }
 bool qa_bot_library_debug_build(const qa_bot_library_bots_a *l) { return l->options.debug; }
 double qa_bot_library_time_bots_a(const qa_bot_library_bots_a *l) { return l->log.time; }
-static void fail(const char *message) {
-  fprintf(stderr, "%s\n", message);
-  abort();
-}
+/* TS `throw new Error(message)`. */
+static noreturn void fail(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
 int64_t qa_bot_library_setup_bots_a(qa_bot_library_bots_a *l) {
   if (l->closed)
     fail("Bot behavior library is closed");

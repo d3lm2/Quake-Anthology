@@ -33,7 +33,7 @@ static qa_guest_address make_address(qa_qvm_guest_memory *guest, int64_t byte_of
 
 static size_t checked(qa_qvm_guest_memory *guest, qa_guest_address address, double byte_length) {
   if (address.address_space != (const void *)guest)
-    qa_range_error("QVM pointer belongs to another module instance");
+    qa_raise("Error", 0, 0, "QVM pointer belongs to another module instance");
   if (!is_safe_integer(byte_length) || byte_length < 0 || address.byte_offset < 0 ||
       address.byte_offset > (int64_t)guest->memory->length ||
       (int64_t)byte_length > (int64_t)guest->memory->length - address.byte_offset)

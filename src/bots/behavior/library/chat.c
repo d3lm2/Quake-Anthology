@@ -3,7 +3,6 @@
 #include "qa/foundation/support.h"
 #include <ctype.h>
 #include <math.h>
-#include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -835,7 +834,6 @@ typedef struct chat_scope {
   qa_chat_state *state; /* non-NULL: the load form of current() */
   int64_t handle;
   qa_chat_text_source name;
-  jmp_buf jump;
 } chat_scope;
 static bool scope_current(const chat_scope *scope) {
   const qa_bot_chat_library *l = scope->l;
@@ -845,10 +843,12 @@ static bool scope_current(const chat_scope *scope) {
     return l->states[scope->handle] == scope->state && scope->state->revision == scope->revision;
   return scope->revision == l->setup_revision;
 }
-/* TS chatSourceCallback's retirement throw. */
+/* TS chatSourceCallback's retirement throw. It goes through the port's one unwinding channel:
+ * these callbacks run inside the script reader, whose catch frames and cleanups a bare longjmp
+ * would leave registered on a dead stack. */
 static void scope_after_callback(chat_scope *scope) {
   if (!scope_current(scope))
-    longjmp(scope->jump, 1);
+    qa_raise("ChatSetupRetired", 0, 0, "%s", "");
 }
 static void scope_report(void *ctx, const qa_ui_script_diagnostic *issue) {
   chat_scope *scope = ctx;
@@ -918,32 +918,54 @@ static void load_value_destroy(load_value *value) {
   qa_stored_randoms_destroy(&value->randoms);
   release_cell_root(&value->cell);
 }
-static parse_outcome load_parse(chat_scope *scope, const char *path, load_kind kind,
-                                qa_chat_data_memory *storage, qa_chat_data_parser **parser,
-                                load_value *value) {
-  if (setjmp(scope->jump) != 0)
-    return PARSE_RETIRED;
-  *parser = make_parser(scope, path, storage);
-  if (*parser == NULL)
-    return PARSE_OK;
+typedef struct load_parse_call {
+  chat_scope *scope;
+  const char *path;
+  load_kind kind;
+  qa_chat_data_memory *storage;
+  qa_chat_data_parser **parser;
+  load_value *value;
+  parse_outcome outcome;
+} load_parse_call;
+static void load_parse_run(void *ctx) {
+  load_parse_call *call = ctx;
+  load_value *value = call->value;
+  *call->parser = make_parser(call->scope, call->path, call->storage);
+  if (*call->parser == NULL) {
+    call->outcome = PARSE_OK;
+    return;
+  }
   bool ok = false;
-  switch (kind) {
+  switch (call->kind) {
   case LOAD_SYNONYMS:
-    ok = qa_chat_data_parser_synonyms(*parser, &value->synonyms);
+    ok = qa_chat_data_parser_synonyms(*call->parser, &value->synonyms);
     break;
   case LOAD_RANDOMS:
-    ok = qa_chat_data_parser_randoms(*parser, &value->randoms);
+    ok = qa_chat_data_parser_randoms(*call->parser, &value->randoms);
     break;
   case LOAD_MATCHES:
-    ok = qa_chat_data_parser_match_templates(*parser, &value->cell);
+    ok = qa_chat_data_parser_match_templates(*call->parser, &value->cell);
     break;
   case LOAD_REPLIES:
-    ok = qa_chat_data_parser_reply_chats(*parser, &value->cell);
+    ok = qa_chat_data_parser_reply_chats(*call->parser, &value->cell);
     break;
   }
   if (ok && value->cell != NULL)
     qa_chat_graph_retain(value->cell->owner);
-  return ok ? PARSE_OK : PARSE_FAILED;
+  call->outcome = ok ? PARSE_OK : PARSE_FAILED;
+}
+/* TS try { parser(); parse() } catch: the retirement is the load's `return false`; whatever
+ * else a callback threw goes on up (`throw error.reason`). */
+static parse_outcome load_parse(chat_scope *scope, const char *path, load_kind kind,
+                                qa_chat_data_memory *storage, qa_chat_data_parser **parser,
+                                load_value *value) {
+  load_parse_call call = {scope, path, kind, storage, parser, value, PARSE_FAILED};
+  qa_caught_error caught;
+  if (qa_try(load_parse_run, &call, &caught))
+    return call.outcome;
+  if (strcmp(caught.name, "ChatSetupRetired") == 0)
+    return PARSE_RETIRED;
+  qa_rethrow(&caught);
 }
 /* Takes the value; allocation NULL is null. */
 static void load_publish(qa_bot_chat_library *l, load_kind kind, load_value *value,
@@ -1406,28 +1428,50 @@ typedef enum initial_outcome {
   INITIAL_RETIRED,
   INITIAL_NOT_CURRENT
 } initial_outcome;
+typedef struct initial_parse_call {
+  chat_scope *scope;
+  qa_chat_text_source path, source_name;
+  bool previously_found;
+  qa_chat_initial *chat;
+  qa_chat_data_memory *storage;
+  qa_chat_data_parser **parser;
+  char **path_text;
+  initial_outcome outcome;
+} initial_parse_call;
+static void load_initial_run(void *ctx) {
+  initial_parse_call *call = ctx;
+  *call->path_text = chat_text(call->path);
+  *call->parser = make_parser(call->scope, *call->path_text, call->storage);
+  if (!scope_current(call->scope)) {
+    call->outcome = INITIAL_NOT_CURRENT;
+    return;
+  }
+  if (*call->parser == NULL) {
+    call->outcome = INITIAL_OK;
+    return;
+  }
+  bool ok;
+  if (call->chat != NULL) {
+    ok = qa_chat_data_parser_initial_into(*call->parser, call->source_name, call->previously_found, call->chat);
+  } else {
+    qa_initial_chat snapshot;
+    ok = qa_chat_data_parser_initial(*call->parser, call->source_name, call->previously_found, &snapshot);
+    if (ok)
+      qa_initial_chat_destroy(&snapshot);
+  }
+  call->outcome = ok ? INITIAL_OK : INITIAL_FAILED;
+}
 static initial_outcome load_initial_parse(chat_scope *scope, qa_chat_text_source path,
                                           qa_chat_text_source source_name, bool previously_found,
                                           qa_chat_initial *chat, qa_chat_data_memory *storage,
                                           qa_chat_data_parser **parser, char **path_text) {
-  if (setjmp(scope->jump) != 0)
+  initial_parse_call call = {scope, path, source_name, previously_found, chat, storage, parser, path_text, INITIAL_FAILED};
+  qa_caught_error caught;
+  if (qa_try(load_initial_run, &call, &caught))
+    return call.outcome;
+  if (strcmp(caught.name, "ChatSetupRetired") == 0)
     return INITIAL_RETIRED;
-  *path_text = chat_text(path);
-  *parser = make_parser(scope, *path_text, storage);
-  if (!scope_current(scope))
-    return INITIAL_NOT_CURRENT;
-  if (*parser == NULL)
-    return INITIAL_OK;
-  bool ok;
-  if (chat != NULL) {
-    ok = qa_chat_data_parser_initial_into(*parser, source_name, previously_found, chat);
-  } else {
-    qa_initial_chat snapshot;
-    ok = qa_chat_data_parser_initial(*parser, source_name, previously_found, &snapshot);
-    if (ok)
-      qa_initial_chat_destroy(&snapshot);
-  }
-  return ok ? INITIAL_OK : INITIAL_FAILED;
+  qa_rethrow(&caught);
 }
 bool qa_bot_chat_library_load_chat_file(qa_bot_chat_library *l, int64_t handle,
                                         qa_chat_text_source path, qa_chat_text_source name) {
@@ -2430,7 +2474,7 @@ static size_t console_visit(const qa_bot_chat_library *l, uint32_t first) {
   size_t seen = 0;
   for (uint32_t cell = first; cell != 0; cell = cell_link(l, cell, CELL_NEXT)) {
     if (++seen > l->console_cell_count)
-      qa_range_error("Saved chat console list cycles");
+      qa_raise("Error", 0, 0, "Saved chat console list cycles");
     (void)cell_link(l, cell, CELL_PREV);
   }
   return seen;
@@ -2479,11 +2523,122 @@ static void restore_issues(qa_bot_chat_library *l, const qa_save_reader *reader)
   }
   qa_save_reader_destroy(&list);
 }
+static void read_nullable_integer(const qa_save_reader *reader, const char *name) {
+  qa_save_reader field;
+  field_of(reader, name, &field);
+  if (!qa_save_reader_is_null(&field))
+    (void)qa_save_reader_integer_min(&field, 0);
+  qa_save_reader_destroy(&field);
+}
+static void read_integer_list(const qa_save_reader *list) {
+  for (size_t i = 0, n = qa_save_reader_list_count(list); i < n; i++) {
+    qa_save_reader item;
+    item_of(list, i, &item);
+    (void)qa_save_reader_integer_min(&item, 0);
+    qa_save_reader_destroy(&item);
+  }
+}
+static void read_chat_image(const qa_save_reader *reader) {
+  static const char *const severities[] = {"info", "warning", "error", "fatal"};
+  qa_save_reader list, entry, field, location;
+  (void)field_integer(reader, "revision", 0);
+  field_of(reader, "issues", &list);
+  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
+    item_of(&list, i, &entry);
+    field_of(&entry, "severity", &field);
+    (void)qa_save_reader_choice_string(&field, severities, 4);
+    qa_save_reader_destroy(&field);
+    field_of(&entry, "code", &field);
+    (void)qa_save_reader_choice_string(&field, diagnostic_code_names, 14);
+    qa_save_reader_destroy(&field);
+    field_of(&entry, "source", &field);
+    (void)qa_save_reader_string(&field);
+    qa_save_reader_destroy(&field);
+    field_of(&entry, "message", &field);
+    (void)qa_save_reader_string(&field);
+    qa_save_reader_destroy(&field);
+    field_of(&entry, "location", &location);
+    if (!qa_save_reader_is_null(&location)) {
+      field_of(&location, "path", &field);
+      (void)qa_save_reader_string(&field);
+      qa_save_reader_destroy(&field);
+      field_of(&location, "line", &field);
+      (void)qa_save_reader_integer(&field);
+      qa_save_reader_destroy(&field);
+      field_of(&location, "column", &field);
+      (void)qa_save_reader_integer(&field);
+      qa_save_reader_destroy(&field);
+    }
+    qa_save_reader_destroy(&location);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  field_of(reader, "cache", &list);
+  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
+    item_of(&list, i, &entry);
+    if (!qa_save_reader_is_null(&entry))
+      (void)qa_save_reader_integer_min(&entry, 0);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  field_of(reader, "states", &list);
+  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
+    item_of(&list, i, &entry);
+    if (!qa_save_reader_is_null(&entry)) {
+      (void)field_integer(&entry, "allocation", 0);
+      (void)field_integer(&entry, "revision", 0);
+    }
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  field_of(reader, "synonyms", &list);
+  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
+    item_of(&list, i, &entry);
+    (void)qa_save_reader_list_count(&entry);
+    read_integer_list(&entry);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  field_of(reader, "randoms", &list);
+  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
+    item_of(&list, i, &entry);
+    (void)field_integer(&entry, "nameBytes", 0);
+    field_of(&entry, "messageBytes", &field);
+    (void)qa_save_reader_list_count(&field);
+    read_integer_list(&field);
+    qa_save_reader_destroy(&field);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  read_nullable_integer(reader, "synonymsAllocation");
+  read_nullable_integer(reader, "randomsAllocation");
+  field_of(reader, "matches", &field);
+  qa_save_reader_destroy(&field);
+  field_of(reader, "replies", &field);
+  qa_save_reader_destroy(&field);
+  read_nullable_integer(reader, "consoleMessageHeap");
+  (void)field_integer(reader, "freeConsoleMessages", 0);
+  field_of(reader, "consoleMessageCells", &list);
+  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
+    item_of(&list, i, &entry);
+    (void)field_integer(&entry, "pointer", 1);
+    (void)field_integer(&entry, "allocation", 0);
+    (void)field_integer(&entry, "offset", 0);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  field_of(reader, "initialChats", &list);
+  (void)qa_save_reader_list_count(&list);
+  qa_save_reader_destroy(&list);
+}
 void qa_bot_chat_library_restore(qa_bot_chat_library *l, const qa_save_value *value,
                                  qa_bot_memory_restored *restored) {
   qa_save_reader reader, list, entry;
   if (!qa_save_reader_init(&reader, value, "bot.chat"))
     qa_range_error("out of memory");
+  /* TS reads the whole image, cell by cell in this order, before it validates or changes
+   * anything: a malformed cell is a SaveFormatError naming the first one in this order. */
+  read_chat_image(&reader);
   double revision = field_integer(&reader, "revision", 0);
   bool any_state = false;
   for (size_t i = 0; i < 65; i++)
@@ -2498,7 +2653,7 @@ void qa_bot_chat_library_restore(qa_bot_chat_library *l, const qa_save_value *va
   }
   if (any_state || l->initial_chat_count != 0 || l->console_cell_count != 0 || state_count != 65 ||
       !first_state_null || revision > (double)QA_MAX_SAFE_INTEGER)
-    qa_range_error("Invalid bot chat restoration");
+    qa_raise("Error", 0, 0, "Invalid bot chat restoration");
   qa_save_reader chats;
   field_of(&reader, "initialChats", &chats);
   for (size_t i = 0, n = qa_save_reader_list_count(&chats); i < n; i++) {
@@ -2507,7 +2662,7 @@ void qa_bot_chat_library_restore(qa_bot_chat_library *l, const qa_save_value *va
     qa_save_reader_destroy(&entry);
     for (size_t j = 0; j < l->initial_chat_count; j++)
       if (qa_chat_initial_pointer(l->initial_chats[j]) == qa_chat_initial_pointer(chat))
-        qa_range_error("Duplicate saved initial chat pointer");
+        qa_raise("Error", 0, 0, "Duplicate saved initial chat pointer");
     l->initial_chats = xrealloc(l->initial_chats, (l->initial_chat_count + 1) * sizeof *l->initial_chats);
     l->initial_chats[l->initial_chat_count++] = chat;
   }
@@ -2524,12 +2679,12 @@ void qa_bot_chat_library_restore(qa_bot_chat_library *l, const qa_save_value *va
     qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(restored, (int64_t)reference);
     if (pointer < 1 || pointer > (double)UINT32_MAX || offset < 0 ||
         offset + CONSOLE_MESSAGE_BYTES > (double)allocation.length)
-      qa_range_error("Invalid saved chat console cell");
+      qa_raise("Error", 0, 0, "Invalid saved chat console cell");
     if ((uint32_t)pointer != l->console_cell_count + 1 || !sequential) {
       sequential = false;
       for (size_t j = 0; j < l->console_cell_count; j++)
         if (l->console_cells[j].pointer == (uint32_t)pointer)
-          qa_range_error("Invalid saved chat console cell");
+          qa_raise("Error", 0, 0, "Invalid saved chat console cell");
     }
     l->console_cells = xrealloc(l->console_cells, (l->console_cell_count + 1) * sizeof *l->console_cells);
     qa_chat_console_cell *cell = &l->console_cells[l->console_cell_count++];
@@ -2540,7 +2695,7 @@ void qa_bot_chat_library_restore(qa_bot_chat_library *l, const qa_save_value *va
   qa_save_reader_destroy(&cells);
   double free_pointer = field_integer(&reader, "freeConsoleMessages", 0);
   if (free_pointer != 0 && (free_pointer > (double)UINT32_MAX || console_lookup(l, (uint32_t)free_pointer) == NULL))
-    qa_range_error("Saved chat console pointer is missing");
+    qa_raise("Error", 0, 0, "Saved chat console pointer is missing");
   l->free_console_messages = (uint32_t)free_pointer;
   console_visit(l, l->free_console_messages);
   for (size_t index = 0; index < 65; index++) {
@@ -2554,12 +2709,12 @@ void qa_bot_chat_library_restore(qa_bot_chat_library *l, const qa_save_value *va
     qa_save_reader_destroy(&entry);
     qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(restored, (int64_t)reference);
     if (allocation.length != CHAT_STATE_BYTES || state_revision > (double)QA_MAX_SAFE_INTEGER)
-      qa_range_error("Invalid saved chat state allocation");
+      qa_raise("Error", 0, 0, "Invalid saved chat state allocation");
     qa_chat_state *state = xcalloc(1, sizeof *state);
     state->allocation = allocation;
     state->revision = (int64_t)state_revision;
     if ((int64_t)console_visit(l, state_console(l, state, STATE_FIRST)) != state_i32(state, STATE_COUNT))
-      qa_range_error("Saved chat console count mismatch");
+      qa_raise("Error", 0, 0, "Saved chat console count mismatch");
     (void)state_console(l, state, STATE_LAST);
     (void)state_chat(l, state);
     l->states[index] = state;
@@ -2581,7 +2736,7 @@ void qa_bot_chat_library_restore(qa_bot_chat_library *l, const qa_save_value *va
     qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(restored, (int64_t)qa_save_reader_integer_min(&entry, 0));
     qa_save_reader_destroy(&entry);
     if (allocation.length != CHAT_CACHE_BYTES)
-      qa_range_error("Saved chat cache allocation size mismatch");
+      qa_raise("Error", 0, 0, "Saved chat cache allocation size mismatch");
     qa_chat_cached *cached = xcalloc(1, sizeof *cached);
     cached->allocation = allocation;
     (void)cached_chat(l, cached);

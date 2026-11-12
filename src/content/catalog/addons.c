@@ -4,7 +4,12 @@
 #include <errno.h>
 #include <unistd.h>
 
+#include <strings.h>
+
 #include "catalog_internal.h"
+#include "qa/content/archive/types.h"
+#include "qa/foundation/js.h"
+#include "qa/foundation/node_path.h"
 
 const char *const qa_quaddicted_catalog_url =
     "https://www.quaddicted.com/api/v1/?q=%2Btags%3A%22game%3Dquake%22%20"
@@ -121,13 +126,166 @@ static bool is_sha256(const char *text) {
   return true;
 }
 
-static bool valid_quaddicted_url(const char *url, const char *sha256) {
-  char *prefix = qa_catalog_format(
-      "https://www.quaddicted.com/files/by-sha256/%.2s/%s/", sha256, sha256);
-  if (prefix == NULL) return false;
-  bool ok = qa_catalog_starts_with(url, prefix);
-  free(prefix);
-  return ok;
+/* `new URL(text)` for the fields the catalog reads (WHATWG URL parsing as
+ * Bun runs it): whether the text parses at all, and for an https URL its
+ * hostname, whether it carries credentials, its normalized pathname and its
+ * href. Other schemes only report that they parse. The host is percent-decoded
+ * and checked for forbidden code points; IDNA (UTS #46) of a non-ASCII host is
+ * not reproduced: such a host is reported as not matching. */
+typedef struct parsed_url {
+  bool https;
+  bool credentials;
+  char *hostname; /* owned, lower case */
+  char *pathname; /* owned */
+  char *href;     /* owned */
+} parsed_url;
+static void parsed_url_free(parsed_url *url) {
+  free(url->hostname); free(url->pathname); free(url->href);
+  memset(url, 0, sizeof *url);
+}
+static bool url_dot(const char *segment, size_t length) {
+  return (length == 1 && segment[0] == '.') ||
+         (length == 3 && strncasecmp(segment, "%2e", 3) == 0);
+}
+static bool url_dot_dot(const char *segment, size_t length) {
+  if (length == 2) return segment[0] == '.' && segment[1] == '.';
+  if (length == 4) return (segment[0] == '.' && strncasecmp(segment + 1, "%2e", 3) == 0) ||
+                          (strncasecmp(segment, "%2e", 3) == 0 && segment[3] == '.');
+  return length == 6 && strncasecmp(segment, "%2e%2e", 6) == 0;
+}
+static bool parse_url(const char *input, parsed_url *out) {
+  memset(out, 0, sizeof *out);
+  /* Leading and trailing C0 controls and spaces go; tabs and newlines go everywhere. */
+  size_t input_length = strlen(input);
+  char *text = (char *)malloc(input_length + 1);
+  if (text == NULL) qa_range_error("Out of memory");
+  size_t begin = 0, finish = input_length, length = 0;
+  while (begin < finish && (unsigned char)input[begin] <= 0x20) begin++;
+  while (finish > begin && (unsigned char)input[finish - 1] <= 0x20) finish--;
+  for (size_t i = begin; i < finish; i++)
+    if (input[i] != '\t' && input[i] != '\n' && input[i] != '\r') text[length++] = input[i];
+  text[length] = '\0';
+  size_t scheme_length = 0;
+  if (isalpha((unsigned char)text[0]) && (unsigned char)text[0] < 0x80)
+    for (scheme_length = 1; text[scheme_length] != '\0' && (unsigned char)text[scheme_length] < 0x80 &&
+                            (isalnum((unsigned char)text[scheme_length]) || text[scheme_length] == '+' ||
+                             text[scheme_length] == '-' || text[scheme_length] == '.'); scheme_length++) {}
+  if (scheme_length == 0 || text[scheme_length] != ':') { free(text); return false; }
+  char scheme[8] = "";
+  if (scheme_length < sizeof scheme)
+    for (size_t i = 0; i < scheme_length; i++) scheme[i] = (char)tolower((unsigned char)text[i]);
+  bool special = strcmp(scheme, "https") == 0 || strcmp(scheme, "http") == 0 ||
+                 strcmp(scheme, "ws") == 0 || strcmp(scheme, "wss") == 0 || strcmp(scheme, "ftp") == 0;
+  if (!special) { free(text); return true; }
+  const char *cursor = text + scheme_length + 1;
+  while (*cursor == '/' || *cursor == '\\') cursor++;
+  size_t authority_length = strcspn(cursor, "/\\?#");
+  const char *authority = cursor, *host = authority;
+  size_t host_length = authority_length;
+  for (size_t i = authority_length; i-- > 0;)
+    if (authority[i] == '@') {
+      out->credentials = i != 0 && !(i == 1 && authority[0] == ':');
+      host = authority + i + 1;
+      host_length = authority_length - i - 1;
+      break;
+    }
+  long port = -1;
+  for (size_t i = host_length; i-- > 0;) {
+    if (host[i] == ']') break;
+    if (host[i] != ':') continue;
+    port = 0;
+    bool digits = true, any = false;
+    for (size_t k = i + 1; k < host_length; k++) {
+      if (!isdigit((unsigned char)host[k])) { digits = false; break; }
+      any = true;
+      if (port <= 65535) port = port * 10 + (host[k] - '0');
+    }
+    if (!digits || port > 65535) { free(text); return false; }
+    if (!any) port = -1;
+    host_length = i;
+    break;
+  }
+  if (host_length == 0) { free(text); return false; }
+  /* The host parser percent-decodes first ("www.quaddicted%2ecom" is www.quaddicted.com), then
+   * rejects the forbidden domain code points; a "%" that is not an escape stays and is one. */
+  out->hostname = (char *)malloc(host_length + 1);
+  if (out->hostname == NULL) qa_range_error("Out of memory");
+  size_t decoded = 0;
+  bool bracketed = host[0] == '[';
+  for (size_t i = 0; i < host_length; i++) {
+    unsigned char c = (unsigned char)host[i];
+    if (!bracketed && c == '%' && i + 2 < host_length && isxdigit((unsigned char)host[i + 1]) && isxdigit((unsigned char)host[i + 2])) {
+      char pair[3] = {host[i + 1], host[i + 2], 0};
+      c = (unsigned char)strtol(pair, NULL, 16);
+      i += 2;
+    }
+    out->hostname[decoded++] = (char)c;
+  }
+  out->hostname[decoded] = '\0';
+  for (size_t i = 0; i < decoded && !bracketed; i++) {
+    unsigned char c = (unsigned char)out->hostname[i];
+    if (c <= 0x20 || c == 0x7f || strchr("#%/:<>?@[\\]^|", c) != NULL) {
+      free(out->hostname); out->hostname = NULL;
+      free(text); return false;
+    }
+  }
+  out->https = strcmp(scheme, "https") == 0;
+  /* ASCII lower-casing only. A host with a non-ASCII character is NOT converted: the WHATWG
+   * parser runs UTS #46 on it (mapping table, NFC, Punycode, validity checks), which needs the
+   * Unicode IDNA data this tree does not carry. Such a host therefore never equals
+   * "www.quaddicted.com" here (TS: a fullwidth or U+3002 spelling of it does), and one UTS #46
+   * rejects parses here where `new URL` throws. See docs/PORT_COMPLETION.md, Audits status. */
+  for (size_t i = 0; i < decoded; i++) out->hostname[i] = (char)tolower((unsigned char)out->hostname[i]);
+  /* Path: `\` is `/`; "." and ".." segments (also spelled %2e) fold. */
+  const char *path = authority + authority_length;
+  size_t path_length = strcspn(path, "?#");
+  char *pathname = (char *)malloc(path_length * 3 + 2);
+  if (pathname == NULL) qa_range_error("Out of memory");
+  size_t at = 0, i = path_length != 0 ? 1 : 0;
+  for (;;) {
+    size_t segment = i;
+    while (i < path_length && path[i] != '/' && path[i] != '\\') i++;
+    bool last = i >= path_length;
+    if (url_dot_dot(path + segment, i - segment)) {
+      while (at > 0 && pathname[at - 1] != '/') at--;
+      if (at > 0) at--;
+      if (last) pathname[at++] = '/';
+    } else if (url_dot(path + segment, i - segment)) {
+      if (last) pathname[at++] = '/';
+    } else {
+      pathname[at++] = '/';
+      for (size_t k = segment; k < i; k++) {
+        unsigned char c = (unsigned char)path[k];
+        if (c <= 0x20 || c >= 0x7f || strchr("\"<>`{}", c) != NULL)
+          at += (size_t)snprintf(pathname + at, 4, "%%%02X", c);
+        else pathname[at++] = (char)c;
+      }
+    }
+    if (last) break;
+    i++;
+  }
+  if (at == 0) pathname[at++] = '/';
+  pathname[at] = '\0';
+  out->pathname = pathname;
+  char port_text[16] = "";
+  int default_port = out->https || strcmp(scheme, "wss") == 0 ? 443 : strcmp(scheme, "ftp") == 0 ? 21 : 80;
+  if (port >= 0 && port != default_port) (void)snprintf(port_text, sizeof port_text, ":%ld", port);
+  out->href = qa_catalog_format("%s://%s%s%s%s", scheme, out->hostname, port_text, pathname, path + path_length);
+  free(text);
+  if (out->href == NULL) qa_range_error("Out of memory");
+  return true;
+}
+
+static bool ascii_alnum(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+/* Whether the character before `at` is JS white space (regex \s). */
+static bool space_before(const char *start, const char *at) {
+  for (size_t back = 1; back <= 3 && (size_t)(at - start) >= back; back++) {
+    size_t length = qa_js_white_space_length(at - back);
+    if (length == back) return true;
+  }
+  return false;
 }
 
 static char *first_tag(char **values, size_t count) {
@@ -208,13 +366,29 @@ static void parse_addon_row(void *raw) {
       state->urls = urls;
       state->url_count = url_count;
     }
+    /* TS maps every entry through `new URL` before the find: one that does
+     * not parse throws even when an earlier entry would have been chosen. */
     char *url = NULL;
+    char *wanted_path = qa_catalog_format("/files/by-sha256/%.2s/%s/", sha256, sha256);
+    if (wanted_path == NULL) { state->oom = true; return; }
     for (size_t i = 0; i < url_count; i++) {
-      if (strstr(urls[i], "://") == NULL)
+      parsed_url parsed;
+      if (!parse_url(urls[i], &parsed)) {
+        free(url);
+        qa_cleanup node;
+        qa_cleanup_push(&node, free, wanted_path);
         /* Bun's new URL TypeError text. */
         qa_raise("TypeError", 0, 0, "\"%s\" cannot be parsed as a URL.", urls[i]);
-      if (valid_quaddicted_url(urls[i], sha256)) { url = qa_catalog_dup(urls[i]); break; }
+      }
+      if (url == NULL && parsed.https && !parsed.credentials &&
+          strcmp(parsed.hostname, "www.quaddicted.com") == 0 &&
+          qa_catalog_starts_with(parsed.pathname, wanted_path)) {
+        url = parsed.href;
+        parsed.href = NULL;
+      }
+      parsed_url_free(&parsed);
     }
+    free(wanted_path);
     free_strings(urls, url_count);
     state->urls = NULL;
     state->url_count = 0;
@@ -233,31 +407,37 @@ static void parse_addon_row(void *raw) {
     free_strings(commands, command_count);
     package.game_directory = qa_catalog_dup("id1");
     if (commandline != NULL) {
+      /* /(?:^|\s)-game\s+([a-zA-Z0-9._+-]+)(?:\s|$)/: the first place the whole
+       * pattern matches; a candidate that fails does not end the search. */
       const char *cursor = commandline;
       while ((cursor = strstr(cursor, "-game")) != NULL) {
-        bool boundary = cursor == commandline || isspace((unsigned char)cursor[-1]);
+        bool boundary = cursor == commandline || space_before(commandline, cursor);
         const char *after = cursor + 5;
-        if (boundary && isspace((unsigned char)*after)) {
-          while (isspace((unsigned char)*after)) after++;
+        if (boundary && qa_js_white_space_length(after) != 0) {
+          while (qa_js_white_space_length(after) != 0) after += qa_js_white_space_length(after);
           const char *end = after;
-          while (*end != '\0' && (isalnum((unsigned char)*end) || *end == '.' ||
+          while (*end != '\0' && (ascii_alnum(*end) || *end == '.' ||
                  *end == '_' || *end == '+' || *end == '-')) end++;
-          if (end > after && (*end == '\0' || isspace((unsigned char)*end))) {
+          if (end > after && (*end == '\0' || qa_js_white_space_length(end) != 0)) {
             free(package.game_directory);
             package.game_directory = qa_catalog_format("%.*s", (int)(end - after), after);
+            break;
           }
-          break;
         }
         cursor += 5;
       }
+      /* /(?:^|\s)-(?:hipnotic|rogue|quoth)(?:\s|$)/ anywhere in the line. */
       const char *flags[] = {"-hipnotic", "-rogue", "-quoth"};
-      for (size_t i = 0; i < 3; i++) {
-        const char *hit = strstr(commandline, flags[i]);
-        if (hit != NULL && (hit == commandline || isspace((unsigned char)hit[-1]))) {
+      for (size_t i = 0; i < 3 && package.unavailable == NULL; i++) {
+        for (const char *hit = strstr(commandline, flags[i]); hit != NULL;
+             hit = strstr(hit + 1, flags[i])) {
+          if (hit != commandline && !space_before(commandline, hit)) continue;
           const char *end = hit + strlen(flags[i]);
-          if (*end == '\0' || isspace((unsigned char)*end))
+          if (*end == '\0' || qa_js_white_space_length(end) != 0) {
             package.unavailable = qa_catalog_dup(
                 "Requires a source gameplay option not yet supported by this installer");
+            break;
+          }
         }
       }
     }
@@ -464,35 +644,6 @@ char *qa_addon_install_path(const qa_addon_package *package,
   return joined;
 }
 
-/* localeCompare(..., numeric:true) approximation: digit runs
- * compare numerically (by value, then fewer leading zeros), other
- * bytes compare as unsigned bytes. */
-static int numeric_compare(const char *left, const char *right) {
-  size_t i = 0, j = 0;
-  while (left[i] != '\0' && right[j] != '\0') {
-    if (isdigit((unsigned char)left[i]) && isdigit((unsigned char)right[j])) {
-      size_t i_end = i, j_end = j;
-      while (isdigit((unsigned char)left[i_end])) i_end++;
-      while (isdigit((unsigned char)right[j_end])) j_end++;
-      size_t i_start = i, j_start = j;
-      while (i_start + 1 < i_end && left[i_start] == '0') i_start++;
-      while (j_start + 1 < j_end && right[j_start] == '0') j_start++;
-      size_t i_length = i_end - i_start, j_length = j_end - j_start;
-      if (i_length != j_length) return i_length < j_length ? -1 : 1;
-      int compared = memcmp(left + i_start, right + j_start, i_length);
-      if (compared != 0) return compared < 0 ? -1 : 1;
-      i = i_end; j = j_end;
-    } else {
-      if (left[i] != right[j])
-        return (unsigned char)left[i] < (unsigned char)right[j] ? -1 : 1;
-      i++; j++;
-    }
-  }
-  if (left[i] != '\0') return 1;
-  if (right[j] != '\0') return -1;
-  return 0;
-}
-
 typedef struct resolve_state {
   const qa_addon_package *catalog;
   size_t catalog_count;
@@ -561,9 +712,10 @@ static void visit_package(resolve_state *state, const qa_addon_package *item) {
             size_t vlength = strlen(provided_version);
             if (vlength > 0 && provided_version[vlength - 1] == '\'')
               provided_version[vlength - 1] = '\0';
-            if (strchr(provided_version, '\'') != NULL ||
-                strchr(provided_version, '=') != NULL) { free(provided_version); continue; }
-            int compared = numeric_compare(provided_version, version_text);
+            /* /^'?([^=']+)=([^']+)'?$/: the version is anything without a quote. */
+            if (provided_version[0] == '\0' || strchr(provided_version, '\'') != NULL ||
+                equals == provided) { free(provided_version); continue; }
+            int compared = qa_js_locale_compare_numeric(provided_version, version_text);
             free(provided_version);
             bool ok = strcmp(op, "=") == 0 ? compared == 0
                       : strcmp(op, ">=") == 0 ? compared >= 0
@@ -667,14 +819,15 @@ static char *read_file_bytes(const char *path, size_t *out_length) {
 bool qa_managed_addon_hidden(const char *root, const char *directory) {
   if (!managed_name(directory)) return false;
   qa_catalog_contained_check(directory);
-  char *path = qa_catalog_format("%s/.addons/removed/%s", root, directory);
-  if (path == NULL) return false;
+  const char *parts[4] = {root, ".addons", "removed", directory};
+  char *path = qa_node_path_join(parts, 4);
   int result = access(path, F_OK);
   int error = errno;
-  free(path);
-  if (result == 0) return true;
-  if (error == ENOENT) return false;
-  qa_catalog_error("%s", strerror(error));
+  if (result == 0) { free(path); return true; }
+  if (error == ENOENT) { free(path); return false; }
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, path);
+  qa_content_fs_error(error, "access", path); /* TS rethrows the fs Error */
 }
 
 void qa_nightdive_addon_list_free(qa_nightdive_addon_list *list) {
@@ -696,9 +849,13 @@ static bool valid_game_directory(const char *text) {
   return true;
 }
 
+/* text.trim() === "" (JS white space). */
 static bool blank(const char *text) {
-  for (size_t i = 0; text[i] != '\0'; i++)
-    if (!isspace((unsigned char)text[i])) return false;
+  while (*text != '\0') {
+    size_t length = qa_js_white_space_length(text);
+    if (length == 0) return false;
+    text += length;
+  }
   return true;
 }
 

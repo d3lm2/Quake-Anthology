@@ -150,15 +150,14 @@ static void composed_run(void *ctx, qa_q1qc_call_site call, qa_q1qc_function_exe
   qa_item_id weapon = call.function_index == layout->axe ? "q1:weapon/axe"
                       : call.function_index == layout->shotgun ? "q1:weapon/shotgun"
                                                                 : "q1:weapon/supershotgun";
+  /* TS reads the time (a missing global throws) before the push. */
+  double time = qa_q1qc_words_float(&vm->globals, qa_q1qc_machine_global_offset(vm, "time"));
   if (attacks->active_count == attacks->active_capacity) {
     attacks->active_capacity = attacks->active_capacity == 0 ? 4 : attacks->active_capacity * 2;
     attacks->active = xrealloc(attacks->active, attacks->active_capacity * sizeof *attacks->active);
   }
   attack_frame *frame = &attacks->active[attacks->active_count++];
-  *frame = (attack_frame){actor.id, reference, weapon,
-                          qa_q1qc_words_float(&vm->globals,
-                                              qa_q1qc_machine_global_offset(vm, "time")),
-                          NULL, 0, 0};
+  *frame = (attack_frame){actor.id, reference, weapon, time, NULL, 0, 0};
   /* TS pops in a finally, which also runs when execute throws. */
   qa_cleanup node;
   qa_cleanup_push(&node, pop_attack, attacks);

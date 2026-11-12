@@ -16,7 +16,9 @@ struct qa_lmctf_grapple_equipment {
   qa_lmctf_grapple_policy policy;
   void (*released)(void *, qa_actor_id);
   void *released_ctx;
-  state_entry *states; size_t count, cap;
+  /* TS Map<ActorId, state object>: each state is its own allocation, so a state
+   * handed to a caller stays put while other actors' states come and go. */
+  state_entry **states; size_t count, cap;
   struct release_ctx **bound; size_t bound_count, bound_cap; /* one owned binding per bound game */
   qa_q2_named_think thinks[1];
   qa_q2_named_touch touches[1];
@@ -26,20 +28,23 @@ struct qa_lmctf_grapple_equipment {
 
 static bool live(qa_q2_game_services *g, qa_actor_id id) { return qa_session_actor_registry_is_live(g->host->actors, id); }
 static qa_lmctf_grapple_state *find_state(qa_lmctf_grapple_equipment *e, qa_actor_id a) {
-  for (size_t i = 0; i < e->count; i++) if (qa_same_actor(e->states[i].id, a)) return &e->states[i].v;
+  for (size_t i = 0; i < e->count; i++) if (qa_same_actor(e->states[i]->id, a)) return &e->states[i]->v;
   return NULL;
 }
 qa_lmctf_grapple_state *qa_lmctf_grapple_state_of(qa_lmctf_grapple_equipment *e, qa_actor_id a) {
   qa_lmctf_grapple_state *s = find_state(e, a);
   if (s) return s;
   if (e->count == e->cap) { e->cap = e->cap ? e->cap * 2 : 8; e->states = realloc(e->states, e->cap * sizeof *e->states); if (!e->states) qa_range_error("out of memory"); }
-  e->states[e->count].id = a;
-  qa_lmctf_grapple_state_init(&e->states[e->count].v);
-  return &e->states[e->count++].v;
+  state_entry *entry = malloc(sizeof *entry);
+  if (!entry) qa_range_error("out of memory");
+  entry->id = a;
+  qa_lmctf_grapple_state_init(&entry->v);
+  e->states[e->count++] = entry;
+  return &entry->v;
 }
 static void delete_state(qa_lmctf_grapple_equipment *e, qa_actor_id a) {
   for (size_t i = 0; i < e->count; i++)
-    if (qa_same_actor(e->states[i].id, a)) { memmove(&e->states[i], &e->states[i + 1], (e->count - i - 1) * sizeof *e->states); e->count--; return; }
+    if (qa_same_actor(e->states[i]->id, a)) { free(e->states[i]); memmove(&e->states[i], &e->states[i + 1], (e->count - i - 1) * sizeof *e->states); e->count--; return; }
 }
 static void call_released(qa_lmctf_grapple_equipment *e, qa_actor_id a) {
   if (e->released) e->released(e->released_ctx, a);
@@ -59,8 +64,8 @@ static void on_release(void *c, qa_owned_actor actor) {
     if (hook && live(g, hook->actor.id)) { g->cancel(g->ctx, hook); g->remove(g->ctx, hook); }
   }
   for (size_t i = 0; i < e->count; i++) {
-    qa_lmctf_grapple_state *st = &e->states[i].v;
-    qa_actor_id owner = e->states[i].id;
+    qa_lmctf_grapple_state *st = &e->states[i]->v;
+    qa_actor_id owner = e->states[i]->id;
     if (!st->has_hook || !qa_same_actor(st->hook, actor.id)) continue;
     st->has_hook = false; st->hook_state = 0; st->hook_length = 0;
     if (live(g, owner)) call_released(e, owner);
@@ -287,6 +292,7 @@ void qa_lmctf_grapple_destroy(qa_lmctf_grapple_equipment *e) {
     qa_session_actor_registry_off_release(e->bound[i]->actors, e->bound[i]->subscription);
     free(e->bound[i]);
   }
+  for (size_t i = 0; i < e->count; i++) free(e->states[i]);
   free(e->states); free(e->bound);
   free(e);
 }
@@ -295,7 +301,11 @@ qa_q2_callback_definitions qa_lmctf_grapple_callbacks(qa_lmctf_grapple_equipment
 qa_lmctf_grapple_state *qa_lmctf_grapple_find_state(qa_lmctf_grapple_equipment *e, qa_actor_id a) { return find_state(e, a); }
 size_t qa_lmctf_grapple_state_count(const qa_lmctf_grapple_equipment *e) { return e->count; }
 qa_lmctf_grapple_state *qa_lmctf_grapple_state_at(qa_lmctf_grapple_equipment *e, size_t index, qa_actor_id *out_actor) {
-  *out_actor = e->states[index].id;
-  return &e->states[index].v;
+  *out_actor = e->states[index]->id;
+  return &e->states[index]->v;
 }
-void qa_lmctf_grapple_clear_states(qa_lmctf_grapple_equipment *e) { e->count = 0; }
+void qa_lmctf_grapple_delete_state(qa_lmctf_grapple_equipment *e, qa_actor_id a) { delete_state(e, a); }
+void qa_lmctf_grapple_clear_states(qa_lmctf_grapple_equipment *e) {
+  for (size_t i = 0; i < e->count; i++) free(e->states[i]);
+  e->count = 0;
+}

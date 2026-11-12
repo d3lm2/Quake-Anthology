@@ -229,14 +229,21 @@ const char *qa_q1qc_source_value_type(const qa_mod_callback_value *value) {
   if (strcmp(name, "item") == 0) return "string";
   return "float";
 }
+static bool same_number(double a, double b) {
+  if (isnan(a) && isnan(b)) return true;
+  if (a == 0 && b == 0) return signbit(a) == signbit(b);
+  return a == b;
+}
 static bool value_equal(const qa_mod_callback_value *a, const qa_mod_callback_value *b) {
   if (strcmp(a->kind, b->kind) != 0) return false;
   if (strcmp(a->kind, "input") == 0) return strcmp(a->name, b->name) == 0;
-  if (strcmp(a->kind, "float") == 0) return a->number_value == b->number_value;
+  /* isDeepStrictEqual compares numbers with Object.is. */
+  if (strcmp(a->kind, "float") == 0) return same_number(a->number_value, b->number_value);
   if (strcmp(a->kind, "string") == 0) return strcmp(a->string_value, b->string_value) == 0;
   if (strcmp(a->kind, "vector") == 0)
-    return a->vector_value.x == b->vector_value.x && a->vector_value.y == b->vector_value.y &&
-           a->vector_value.z == b->vector_value.z;
+    return same_number(a->vector_value.x, b->vector_value.x) &&
+           same_number(a->vector_value.y, b->vector_value.y) &&
+           same_number(a->vector_value.z, b->vector_value.z);
   return false;
 }
 bool qa_q1qc_source_call_equal(const qa_mod_source_call *a, const qa_mod_source_call *b) {
@@ -324,12 +331,20 @@ static void write_source_value(qa_q1qc_machine *machine, qa_q1qc_words *words, i
       qa_range_error("Mod callback vector exceeds binary32 range");
     qa_q1qc_words_set_vector(words, offset, vector);
   } else if (strcmp(value->kind, "string") == 0) {
-    char name[512];
-    (void)snprintf(name, sizeof name, "mod-value:%s", value->string_value);
-    size_t capacity = strlen(value->string_value) + 1;
+    /* TS `mod-value:${value}` is the engine string's key: never truncated. */
+    size_t length = strlen(value->string_value);
+    size_t capacity = length + 1;
     if (capacity < 128) capacity = 128;
     if (machine->strings_set_engine == NULL) qa_range_error("Missing QC engine string storage");
+    char *name = malloc(length + sizeof "mod-value:");
+    if (name == NULL) qa_range_error("out of memory");
+    memcpy(name, "mod-value:", sizeof "mod-value:" - 1);
+    memcpy(name + sizeof "mod-value:" - 1, value->string_value, length + 1);
+    qa_cleanup name_node;
+    qa_cleanup_push(&name_node, free, name);
     int64_t id = machine->strings_set_engine(machine->ctx, name, value->string_value, capacity);
+    qa_cleanup_pop(&name_node);
+    free(name);
     qa_q1qc_words_set_int(words, offset, id);
   } else if (strcmp(value->kind, "actor") == 0) {
     qa_q1qc_words_set_int(words, offset, reference(reference_ctx, value->actor_value));
@@ -352,53 +367,72 @@ static const qa_mod_runtime_value *resolve_input(const qa_mod_source_call *call,
   qa_range_error("Gameplay callback %s has no %s input", call->function, value->name);
 }
 typedef struct source_call_saved { size_t offset; uint8_t bytes[12]; size_t length; } source_call_saved;
-typedef struct source_call_restore {
+/* TS arrays (arguments, globals, saved words) have no fixed size. */
+typedef struct source_call_state {
   qa_q1qc_machine *machine;
+  qa_mod_runtime_value *args, *global_values;
+  const qa_q1qc_definition **definitions;
+  source_call_saved *saved;
+  size_t saved_count;
+  bool staged;
   uint8_t staging[108];
-  source_call_saved saved[32];
-  size_t count;
-} source_call_restore;
-static void restore_source_call(void *arg) {
-  source_call_restore *restore = arg;
-  memcpy(restore->machine->globals.bytes + 4, restore->staging, sizeof restore->staging);
-  for (size_t i = 0; i < restore->count; i++)
-    memcpy(restore->machine->globals.bytes + restore->saved[i].offset, restore->saved[i].bytes,
-           restore->saved[i].length);
+} source_call_state;
+static void *source_call_alloc(size_t count, size_t size) {
+  void *value = calloc(count != 0 ? count : 1, size);
+  if (value == NULL) qa_range_error("out of memory");
+  return value;
+}
+/* TS `finally` (restore the staging words and saved globals) plus the GC. */
+static void release_source_call(void *arg) {
+  source_call_state *state = arg;
+  if (state->staged) {
+    memcpy(state->machine->globals.bytes + 4, state->staging, sizeof state->staging);
+    for (size_t i = 0; i < state->saved_count; i++)
+      memcpy(state->machine->globals.bytes + state->saved[i].offset, state->saved[i].bytes,
+             state->saved[i].length);
+  }
+  free(state->args);
+  free(state->global_values);
+  free(state->definitions);
+  free(state->saved);
 }
 double qa_q1qc_with_source_call(qa_q1qc_machine *machine, const qa_mod_source_call *call,
                                 const qa_q1qc_source_input *inputs, size_t input_count,
                                 qa_q1qc_actor_reference_fn reference, void *reference_ctx,
                                 double (*execute)(void *ctx, int64_t argument_count), void *execute_ctx) {
-  qa_mod_runtime_value args[16];
-  qa_mod_runtime_value global_values[32];
-  qa_mod_runtime_value scratch;
-  if (call->argument_count > 16 || call->global_count > 32) qa_range_error("out of memory");
-  for (size_t i = 0; i < call->argument_count; i++)
-    args[i] = *resolve_input(call, &call->arguments[i], inputs, input_count, &scratch);
-  const qa_q1qc_definition *definitions[32];
-  for (size_t i = 0; i < call->global_count; i++) {
-    definitions[i] = qa_q1qc_global_by_name(machine->program, call->globals[i].name);
-    global_values[i] = *resolve_input(call, &call->globals[i].value, inputs, input_count, &scratch);
-  }
-  source_call_restore restore;
-  restore.machine = machine;
-  restore.count = call->global_count;
-  memcpy(restore.staging, machine->globals.bytes + 4, sizeof restore.staging);
-  for (size_t i = 0; i < call->global_count; i++) {
-    if (definitions[i] == NULL) qa_range_error("Missing validated callback global");
-    restore.saved[i].offset = (size_t)definitions[i]->offset * 4;
-    restore.saved[i].length = (strcmp(definitions[i]->type, "vector") == 0 ? 3 : 1) * 4;
-    memcpy(restore.saved[i].bytes, machine->globals.bytes + restore.saved[i].offset, restore.saved[i].length);
-  }
-  /* TS restores in a finally; a raise caught above this frame runs the same restore. */
+  source_call_state state;
+  memset(&state, 0, sizeof state);
+  state.machine = machine;
   qa_cleanup node;
-  qa_cleanup_push(&node, restore_source_call, &restore);
+  qa_cleanup_push(&node, release_source_call, &state);
+  state.args = source_call_alloc(call->argument_count, sizeof *state.args);
+  state.global_values = source_call_alloc(call->global_count, sizeof *state.global_values);
+  state.definitions = source_call_alloc(call->global_count, sizeof *state.definitions);
+  state.saved = source_call_alloc(call->global_count, sizeof *state.saved);
+  qa_mod_runtime_value scratch;
   for (size_t i = 0; i < call->argument_count; i++)
-    write_source_value(machine, &machine->globals, 4 + (int64_t)i * 3, &args[i], reference, reference_ctx);
+    state.args[i] = *resolve_input(call, &call->arguments[i], inputs, input_count, &scratch);
+  for (size_t i = 0; i < call->global_count; i++) {
+    state.definitions[i] = qa_q1qc_global_by_name(machine->program, call->globals[i].name);
+    state.global_values[i] = *resolve_input(call, &call->globals[i].value, inputs, input_count, &scratch);
+  }
+  memcpy(state.staging, machine->globals.bytes + 4, sizeof state.staging);
+  for (size_t i = 0; i < call->global_count; i++) {
+    if (state.definitions[i] == NULL) qa_range_error("Missing validated callback global");
+    state.saved[i].offset = (size_t)state.definitions[i]->offset * 4;
+    state.saved[i].length = (strcmp(state.definitions[i]->type, "vector") == 0 ? 3 : 1) * 4;
+    memcpy(state.saved[i].bytes, machine->globals.bytes + state.saved[i].offset, state.saved[i].length);
+  }
+  /* TS restores in a finally from here on; a raise caught above this frame runs the same restore. */
+  state.saved_count = call->global_count;
+  state.staged = true;
+  for (size_t i = 0; i < call->argument_count; i++)
+    write_source_value(machine, &machine->globals, 4 + (int64_t)i * 3, &state.args[i], reference, reference_ctx);
   for (size_t i = 0; i < call->global_count; i++)
-    write_source_value(machine, &machine->globals, definitions[i]->offset, &global_values[i], reference, reference_ctx);
+    write_source_value(machine, &machine->globals, state.definitions[i]->offset, &state.global_values[i],
+                       reference, reference_ctx);
   double result = execute(execute_ctx, (int64_t)call->argument_count);
   qa_cleanup_pop(&node);
-  restore_source_call(&restore);
+  release_source_call(&state);
   return result;
 }

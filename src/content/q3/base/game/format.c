@@ -8,13 +8,16 @@
 #include "qa/foundation/js.h"
 enum { BIG_BUFFER_BYTES = 32000, LADJUST = 0x04, ZEROPAD = 0x80 };
 qa_q3_game_format_arg qa_q3_game_format_number(double v) { qa_q3_game_format_arg a = {QA_Q3_FMT_NUMBER, v, NULL}; return a; }
-qa_q3_game_format_arg qa_q3_game_format_string(const char *v) { qa_q3_game_format_arg a = {QA_Q3_FMT_STRING, 0, v}; return a; }
+/* A NULL text is the C spelling of a TS "" (GameClient.pers.netname before the first userinfo, a
+ * missing argv): it formats as the empty string. TS null is qa_q3_game_format_null(). */
+qa_q3_game_format_arg qa_q3_game_format_string(const char *v) { qa_q3_game_format_arg a = {QA_Q3_FMT_STRING, 0, v != NULL ? v : ""}; return a; }
 qa_q3_game_format_arg qa_q3_game_format_null(void) { qa_q3_game_format_arg a = {QA_Q3_FMT_NULL, 0, NULL}; return a; }
 typedef struct { char *buf; size_t len, cap; } out_t;
 static void reserve(out_t *o, size_t bytes) {
   if (o->len + bytes >= BIG_BUFFER_BYTES) qa_range_error("game format exceeds the 32000-byte Com_sprintf buffer");
   if (o->len + bytes + 1 > o->cap) { size_t cap = o->cap ? o->cap * 2 : 256; while (cap < o->len + bytes + 1) cap *= 2; o->buf = realloc(o->buf, cap); if (!o->buf) qa_range_error("out of memory"); o->cap = cap; }
 }
+static void free_output(void *arg) { out_t *o = arg; free(o->buf); o->buf = NULL; o->len = o->cap = 0; }
 static void append_byte(out_t *o, int byte) { reserve(o, 1); o->buf[o->len++] = (char)(byte & 255); }
 static void append_bytes(out_t *o, const char *v, size_t n) { reserve(o, n); memcpy(o->buf + o->len, v, n); o->len += n; }
 static void append_rep(out_t *o, int byte, double count) {
@@ -27,12 +30,12 @@ static qa_q3_game_format_arg argument_at(const qa_q3_game_format_arg *args, size
   return args[index];
 }
 static double integer_argument(qa_q3_game_format_arg v, size_t index, char spec) {
-  if (v.kind != QA_Q3_FMT_NUMBER) qa_range_error("argument %zu for %%%c must be a number", index, spec);
+  if (v.kind != QA_Q3_FMT_NUMBER) qa_raise("TypeError", 0, 0, "argument %zu for %%%c must be a number", index, spec);
   if (v.number != trunc(v.number) || v.number != qa_int32(v.number)) qa_range_error("argument %zu for %%%c must be a signed 32-bit integer", index, spec);
   return v.number;
 }
 static double float_argument(qa_q3_game_format_arg v, size_t index) {
-  if (v.kind != QA_Q3_FMT_NUMBER) qa_range_error("argument %zu for %%f must be a number", index);
+  if (v.kind != QA_Q3_FMT_NUMBER) qa_raise("TypeError", 0, 0, "argument %zu for %%f must be a number", index);
   float stored = (float)v.number;
   if (!isfinite(stored) || fabs(stored) > 2147483647) qa_range_error("argument %zu for %%f is outside the source's safe int-cast range", index);
   return stored;
@@ -76,6 +79,8 @@ char *qa_q3_game_format(const char *format, const qa_q3_game_format_arg *args, s
   if (max_bytes != trunc(max_bytes) || max_bytes < 1 || max_bytes > 9007199254740991.0)
     qa_range_error("game format destination capacity must be a positive safe integer");
   out_t o = {NULL, 0, 0}; size_t flen = strlen(format), cursor = 0, arg_index = 0;
+  /* A format error raises; the partial output is released then (TS: garbage collected). */
+  qa_cleanup output_node; qa_cleanup_push(&output_node, free_output, &o);
   while (1) {
     int literal = format_byte(format, cursor, flen); if (literal < 0) break;
     if (literal != 37) { append_byte(&o, literal); cursor++; continue; }
@@ -90,11 +95,12 @@ char *qa_q3_game_format(const char *format, const qa_q3_game_format_arg *args, s
       qa_q3_game_format_arg argument = argument_at(args, arg_count, arg_index, (char)sb);
       if (sb == 100 || sb == 105) add_int(&o, integer_argument(argument, arg_index, (char)sb), width, flags);
       else if (sb == 102) add_float(&o, float_argument(argument, arg_index), width, precision);
-      else if (sb == 115) { if (argument.kind == QA_Q3_FMT_NUMBER) qa_range_error("argument %zu for %%s must be a string or null", arg_index); add_string(&o, argument.string, argument.kind == QA_Q3_FMT_NULL, width, precision); }
+      else if (sb == 115) { if (argument.kind == QA_Q3_FMT_NUMBER) qa_raise("TypeError", 0, 0, "argument %zu for %%s must be a string or null", arg_index); add_string(&o, argument.string, argument.kind == QA_Q3_FMT_NULL, width, precision); }
       else append_byte(&o, qa_js_to_int32(integer_argument(argument, arg_index, (char)sb)));
       arg_index++; break;
     }
   }
+  qa_cleanup_pop(&output_node);
   if (!o.buf) { o.buf = malloc(1); if (!o.buf) return NULL; }
   size_t visible = 0; while (visible < o.len && o.buf[visible]) visible++;
   size_t keep = visible < (size_t)(max_bytes - 1) ? visible : (size_t)(max_bytes - 1);

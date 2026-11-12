@@ -25,10 +25,11 @@ struct qa_compat_q3_native_import_slot {
 typedef qa_compat_q3_quakelive_game_imports I;
 typedef struct qa_compat_q3_native_import_slot Slot;
 
+/* TS class NativeQ3ServiceUnavailable (error.name) with its slot; NativeQ3GameError likewise. */
 noreturn void qa_compat_q3_native_service_unavailable(int64_t slot, const char *service) {
-  qa_range_error("Quake Live game import %lld (%s) is unavailable in the supplied engine host", (long long)slot, service);
+  qa_raise("NativeQ3ServiceUnavailable", (int)slot, 0, "Quake Live game import %lld (%s) is unavailable in the supplied engine host", (long long)slot, service);
 }
-noreturn void qa_compat_q3_native_game_error(const char *message) { qa_range_error("%s", message); }
+noreturn void qa_compat_q3_native_game_error(const char *message) { qa_raise("NativeQ3GameError", 0, 0, "%s", message); }
 
 typedef struct { I *imports; int64_t slot; char *name; } UnboundCtx;
 static qa_call_result unbound_invoke(void *ctx, const qa_guest_core_call_context *context, const qa_call_value *args, size_t count);
@@ -172,10 +173,11 @@ static qa_call_result svc_cvar_register(void *ctx, const qa_guest_core_call_cont
 }
 static qa_call_result svc_argv(void *ctx, const qa_guest_core_call_context *c, const qa_call_value *args, size_t n) {
   (void)c; I *imports = HOST(0);
+  qa_guest_core_address address = qa_guest_required_pointer(args, n, 1); /* TS evaluates the output pointer first */
   size_t count = 0; const char *const *argv = imports->host.command_arguments(imports->host.ctx, &count);
   int64_t index = qa_guest_integer(args, n, 0);
   const char *value = index >= 0 && (size_t)index < count ? argv[index] : "";
-  qa_compat_q3_quakelive_game_imports_write_string(imports, qa_guest_required_pointer(args, n, 1), value, (int64_t)qa_guest_integer(args, n, 2));
+  qa_compat_q3_quakelive_game_imports_write_string(imports, address, value, (int64_t)qa_guest_integer(args, n, 2));
   return qa_call_void();
 }
 static qa_call_result svc_argc(void *ctx, const qa_guest_core_call_context *c, const qa_call_value *args, size_t n) {
@@ -203,8 +205,11 @@ static qa_call_result svc_set_configstring(void *ctx, const qa_guest_core_call_c
 }
 static qa_call_result svc_get_configstring(void *ctx, const qa_guest_core_call_context *c, const qa_call_value *args, size_t n) {
   (void)c; I *imports = HOST(0);
-  qa_compat_q3_quakelive_game_imports_write_string(imports, qa_guest_required_pointer(args, n, 1),
-    imports->host.configstring_get(imports->host.ctx, (double)qa_guest_integer(args, n, 0)), (int64_t)qa_guest_integer(args, n, 2));
+  /* TS argument order: the output pointer, the configstring, the capacity. */
+  qa_guest_core_address address = qa_guest_required_pointer(args, n, 1);
+  const char *value = imports->host.configstring_get(imports->host.ctx, (double)qa_guest_integer(args, n, 0));
+  int64_t capacity = (int64_t)qa_guest_integer(args, n, 2);
+  qa_compat_q3_quakelive_game_imports_write_string(imports, address, value, capacity);
   return qa_call_void();
 }
 static qa_call_result svc_get_userinfo(void *ctx, const qa_guest_core_call_context *c, const qa_call_value *args, size_t n) {

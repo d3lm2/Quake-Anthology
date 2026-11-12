@@ -784,16 +784,20 @@ static void disown(qa_weight_config_store_bots_a *s, qa_weight_config_bots_a *c)
   }
 }
 static bool matches_filename(const qa_weight_config_bots_a *c, const char *filename) {
-  return strncmp((const char *)c->allocation.bytes + WEIGHT_FILENAME_OFFSET, filename,
+  /* TS reads `this.allocation.bytes`: a config freed while still cached (reloadCharacters turned
+   * on between its load and its free) throws "Bot memory allocation has been freed". */
+  return strncmp((const char *)qa_bot_memory_allocation_bytes(&c->allocation) + WEIGHT_FILENAME_OFFSET, filename,
                  WEIGHT_CONFIG_BYTES - WEIGHT_FILENAME_OFFSET) == 0 &&
          strlen(filename) < WEIGHT_CONFIG_BYTES - WEIGHT_FILENAME_OFFSET;
 }
 static qa_weight_config_bots_a *throw_error(qa_weight_config_error *error,
                                             qa_weight_config_error_kind kind, char *message) {
   if (error == NULL) {
-    fprintf(stderr, "%s: %s\n",
-            kind == QA_WEIGHT_CONFIG_ERROR_PARSE ? "WeightConfigError" : "WeightConfigLoadError", message);
-    abort();
+    /* Nothing takes the error by value: raise the TS class (uncaught, this prints and aborts). */
+    char text[QA_CAUGHT_MESSAGE_CAPACITY];
+    snprintf(text, sizeof text, "%s", message);
+    free(message);
+    qa_raise(kind == QA_WEIGHT_CONFIG_ERROR_PARSE ? "WeightConfigError" : "WeightConfigLoadError", 0, 0, "%s", text);
   }
   error->kind = kind;
   error->message = message;
@@ -1008,30 +1012,57 @@ qa_save_value *qa_weight_config_store_checkpoint(qa_weight_config_store_bots_a *
   lib_set(object, "cached", cached);
   return object;
 }
+typedef struct heap_image_entry {
+  double pointer, reference;
+  bool is_name;
+} heap_image_entry;
+/* Scratch storage of a restore, released on every way out (TS leaves it to the GC when a
+ * malformed image raises). */
+typedef struct restore_scratch {
+  void *items[4];
+} restore_scratch;
+static void restore_scratch_free(void *arg) {
+  restore_scratch *scratch = arg;
+  for (int i = 0; i < 4; i++) free(scratch->items[i]);
+  memset(scratch, 0, sizeof *scratch);
+}
 static void heap_restore(qa_weight_config_store_bots_a *s, const qa_save_value *value,
                          qa_bot_memory_restored *memory) {
   qa_save_reader reader, pointers;
   if (!qa_save_reader_init(&reader, value, "bot.weights.heap")) qa_range_error("out of memory");
+  restore_scratch scratch;
+  memset(&scratch, 0, sizeof scratch);
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, restore_scratch_free, &scratch);
+  /* TS reads the whole image (a SaveFormatError for any malformed cell) before it validates. */
   double next = lib_int_min(&reader, "nextPointer", 1);
   lib_field(&reader, "pointers", &pointers);
-  bool any = false;
-  for (size_t i = 0; i < s->heap_capacity && !any; i++) any = s->heap[i].kind != 0;
-  if (any || next < 1 || next > 4294967296.0) qa_ui_script_plain_error("Invalid fuzzy heap restoration");
   size_t count = qa_save_reader_list_count(&pointers);
+  heap_image_entry *image = scratch.items[0] = lib_alloc(count * sizeof *image);
   static const char *const kinds[] = {"name", "separator"};
   for (size_t i = 0; i < count; i++) {
     qa_save_reader entry, kind_reader;
     lib_item(&pointers, i, &entry);
-    double pointer = lib_int_min(&entry, "pointer", 1);
+    image[i].pointer = lib_int_min(&entry, "pointer", 1);
     lib_field(&entry, "kind", &kind_reader);
-    const char *kind = qa_save_reader_choice_string(&kind_reader, kinds, 2);
-    bool is_name = strcmp(kind, "name") == 0;
+    image[i].is_name = strcmp(qa_save_reader_choice_string(&kind_reader, kinds, 2), "name") == 0;
     qa_save_reader_destroy(&kind_reader);
-    double reference = lib_int_min(&entry, "allocation", 0);
+    image[i].reference = lib_int_min(&entry, "allocation", 0);
     qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&pointers);
+  qa_save_reader_destroy(&reader);
+  bool any = false;
+  for (size_t i = 0; i < s->heap_capacity && !any; i++) any = s->heap[i].kind != 0;
+  if (any || next < 1 || next > 4294967296.0) qa_ui_script_plain_error("Invalid fuzzy heap restoration");
+  for (size_t i = 0; i < count; i++) {
+    double pointer = image[i].pointer, reference = image[i].reference;
+    bool is_name = image[i].is_name;
     if (pointer < 1 || pointer >= next ||
         ((size_t)pointer < s->heap_capacity && s->heap[(size_t)pointer].kind != 0))
       qa_ui_script_plain_error("Invalid saved fuzzy pointer");
+    if (reference >= (double)memory->count)
+      (void)qa_bot_memory_restored_allocation(memory, -1); /* raises the TS invalid-reference error */
     qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
     if (is_name) {
       if (memchr(allocation.bytes, 0, allocation.length) == NULL)
@@ -1043,16 +1074,16 @@ static void heap_restore(qa_weight_config_store_bots_a *s, const qa_save_value *
   }
   s->next_pointer = (int64_t)next;
   /* Depth-first cycle check: 1 pending, 2 visited. */
-  uint8_t *marks = lib_alloc(s->heap_capacity + 1);
+  uint8_t *marks = scratch.items[1] = lib_alloc(s->heap_capacity + 1);
   sep_t *stack = NULL;
   size_t depth = 0, stack_capacity = 0;
-  uint8_t *stages = lib_alloc(s->heap_capacity + 1);
+  uint8_t *stages = scratch.items[2] = lib_alloc(s->heap_capacity + 1);
   for (size_t root = 0; root < s->heap_capacity; root++) {
     if (s->heap[root].kind != KIND_SEPARATOR || marks[root] != 0) continue;
     /* Iterative walk over (separator, stage) preserves the recursive visit's order. */
     if (stack_capacity < 2) {
       stack_capacity = 64;
-      stack = lib_realloc(stack, stack_capacity * sizeof *stack);
+      stack = scratch.items[3] = lib_realloc(stack, stack_capacity * sizeof *stack);
     }
     depth = 0;
     stack[depth++] = (sep_t)root;
@@ -1075,66 +1106,96 @@ static void heap_restore(qa_weight_config_store_bots_a *s, const qa_save_value *
       marks[following] = 1;
       if (depth == stack_capacity) {
         stack_capacity *= 2;
-        stack = lib_realloc(stack, stack_capacity * sizeof *stack);
+        stack = scratch.items[3] = lib_realloc(stack, stack_capacity * sizeof *stack);
       }
       stack[depth++] = following;
     }
   }
-  free(stages);
-  free(stack);
-  free(marks);
-  qa_save_reader_destroy(&pointers);
-  qa_save_reader_destroy(&reader);
+  qa_cleanup_pop(&scratch_cleanup);
+  restore_scratch_free(&scratch);
+}
+typedef struct config_image_entry {
+  double reference;
+  char *path;
+  lib_diagnostics reported;
+} config_image_entry;
+typedef struct config_image {
+  config_image_entry *entries;
+  size_t count;
+  double *positions;
+  qa_weight_config_bots_a **restored;
+} config_image;
+static void config_image_free(void *arg) {
+  config_image *image = arg;
+  for (size_t i = 0; i < image->count; i++) {
+    free(image->entries[i].path);
+    lib_diagnostics_destroy(&image->entries[i].reported);
+  }
+  free(image->entries);
+  free(image->positions);
+  free(image->restored);
+  memset(image, 0, sizeof *image);
 }
 void qa_weight_config_store_restore(qa_weight_config_store_bots_a *s, const qa_save_value *value,
                                     qa_bot_memory_restored *memory) {
   qa_save_reader reader, heap, configs, cached;
   if (!qa_save_reader_init(&reader, value, "bot.weights")) qa_range_error("out of memory");
+  config_image scratch;
+  memset(&scratch, 0, sizeof scratch);
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, config_image_free, &scratch);
+  /* TS reads the whole image (a SaveFormatError for any malformed cell) before it validates. */
   double generation = lib_int_min(&reader, "generation", 0);
   lib_field(&reader, "heap", &heap);
   lib_field(&reader, "configs", &configs);
+  size_t config_total = qa_save_reader_list_count(&configs);
+  config_image_entry *image = scratch.entries = lib_alloc(config_total * sizeof *image);
+  scratch.count = config_total;
+  for (size_t i = 0; i < config_total; i++) {
+    qa_save_reader entry;
+    lib_item(&configs, i, &entry);
+    image[i].reference = lib_int_min(&entry, "allocation", 0);
+    image[i].path = lib_read_string(&entry, "path");
+    lib_read_diagnostics(&entry, "reported", &image[i].reported);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&configs);
   lib_field(&reader, "cached", &cached);
   size_t cached_count = qa_save_reader_list_count(&cached);
+  double *positions = scratch.positions = lib_alloc(cached_count * sizeof *positions); /* -1 is TS null */
+  for (size_t index = 0; index < cached_count; index++) {
+    qa_save_reader entry;
+    lib_item(&cached, index, &entry);
+    positions[index] = qa_save_reader_is_null(&entry) ? -1 : qa_save_reader_integer_min(&entry, 0);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&cached);
   if (s->owned_count != 0 || s->cached_length != 0 || generation < 0 ||
       (int64_t)cached_count > s->max_cached_configs)
     qa_ui_script_plain_error("Invalid weight configuration restoration");
   heap_restore(s, heap.value, memory);
-  size_t config_total = qa_save_reader_list_count(&configs);
-  qa_weight_config_bots_a **restored = lib_alloc(config_total * sizeof *restored);
+  qa_save_reader_destroy(&heap);
+  qa_save_reader_destroy(&reader);
+  qa_weight_config_bots_a **restored = scratch.restored = lib_alloc(config_total * sizeof *restored);
   for (size_t i = 0; i < config_total; i++) {
-    qa_save_reader entry;
-    lib_item(&configs, i, &entry);
-    double reference = lib_int_min(&entry, "allocation", 0);
-    char *path = lib_read_string(&entry, "path");
-    qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
+    qa_bot_memory_allocation allocation =
+        qa_bot_memory_restored_allocation(memory, (int64_t)image[i].reference);
     if (allocation.length != WEIGHT_CONFIG_BYTES)
       qa_ui_script_plain_error("Saved weight configuration allocation size mismatch");
-    qa_weight_config_bots_a *config = config_create(s, path, allocation, NULL);
-    free(path);
-    lib_read_diagnostics(&entry, "reported", &config->reported);
-    qa_save_reader_destroy(&entry);
+    qa_weight_config_bots_a *config = config_create(s, image[i].path, allocation, NULL);
+    for (size_t d = 0; d < image[i].reported.count; d++)
+      lib_diagnostics_copy(&config->reported, &image[i].reported.items[d]);
     (void)qa_weight_config_max_inventory_index(config);
     restored[i] = config;
   }
-  for (size_t index = 0; index < cached_count; index++) {
-    qa_save_reader entry;
-    lib_item(&cached, index, &entry);
-    if (!qa_save_reader_is_null(&entry)) {
-      double position = qa_save_reader_integer_min(&entry, 0);
-      if (position >= (double)config_total)
-        qa_ui_script_plain_error("Saved weight cache reference is missing");
-      s->cached[index] = restored[(size_t)position];
-    } else {
-      s->cached[index] = NULL;
-    }
-    qa_save_reader_destroy(&entry);
-  }
+  for (size_t index = 0; index < cached_count; index++)
+    if (positions[index] >= (double)config_total)
+      qa_ui_script_plain_error("Saved weight cache reference is missing");
+  for (size_t index = 0; index < cached_count; index++)
+    s->cached[index] = positions[index] < 0 ? NULL : restored[(size_t)positions[index]];
   for (size_t i = 0; i < config_total; i++) own(s, restored[i]);
   s->cached_length = cached_count;
   s->generation = (int64_t)generation;
-  free(restored);
-  qa_save_reader_destroy(&heap);
-  qa_save_reader_destroy(&configs);
-  qa_save_reader_destroy(&cached);
-  qa_save_reader_destroy(&reader);
+  qa_cleanup_pop(&scratch_cleanup);
+  config_image_free(&scratch);
 }

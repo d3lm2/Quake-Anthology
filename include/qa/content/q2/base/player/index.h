@@ -27,12 +27,13 @@ typedef struct qa_q2_player_admission {
   const qa_q2_base_player_carry *carry;
 } qa_q2_player_admission;
 
-/** TS Q2ConnectionResult. userinfo is written to the caller's
- * buffer; reason is "" when allowed. */
+/** TS Q2ConnectionResult. userinfo has no length limit: it is owned by the
+ * players object and stays valid until the next connect on that object (or its
+ * destroy). reason is static text, "" when allowed. */
 typedef struct qa_q2_connection_result {
   bool allowed;
-  char userinfo[4096];
-  char reason[256];
+  const char *userinfo;
+  const char *reason;
 } qa_q2_connection_result;
 
 /** TS Q2Intermission union on kind. */
@@ -49,6 +50,9 @@ typedef struct qa_q2_intermission {
 /** TS q2Userinfo lookup: value for key or NULL when absent
  * (first occurrence wins, as in the TS Map build). */
 const char *qa_q2_userinfo_get(const char *source, const char *key, char *scratch, size_t scratch_size);
+/* The same lookup in place: the value is not NUL-terminated, its length is
+ * *out_length. NULL when absent. */
+const char *qa_q2_userinfo_find(const char *source, const char *key, size_t *out_length);
 
 typedef struct qa_q2_players qa_q2_players;
 
@@ -214,6 +218,11 @@ void qa_q2_players_client_animation(qa_q2_players *players, qa_q2_player_context
 bool qa_q2_players_super_spawn(qa_q2_players *players, qa_q2_entity *entity, qa_q2_game_services *game);
 qa_q2_callback_definitions qa_q2_players_super_callbacks(qa_q2_players *players);
 qa_q2_connection_result qa_q2_players_super_connect(qa_q2_players *players, qa_q2_game_services *game, const char *userinfo);
+/* The two TS connect() results, for an overriding connect: `{ allowed: true, userinfo }`
+ * and the refusal whose userinfo is [...info] without rejmsg plus the reason.
+ * reason must be static text. */
+qa_q2_connection_result qa_q2_players_connection_allowed(qa_q2_players *players, const char *userinfo);
+qa_q2_connection_result qa_q2_players_connection_refused(qa_q2_players *players, const char *userinfo, const char *reason);
 qa_q2_base_player_state *qa_q2_players_super_attach(qa_q2_players *players, qa_q2_entity *entity, qa_q2_game_services *game, qa_q2_player_admission admission);
 void qa_q2_players_super_userinfo_changed(qa_q2_players *players, qa_q2_entity *entity, qa_q2_game_services *game, const char *source);
 qa_q2_base_player_carry qa_q2_players_super_save_carry(qa_q2_players *players, qa_q2_entity *entity, qa_q2_game_services *game);

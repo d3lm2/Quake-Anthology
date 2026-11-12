@@ -214,7 +214,7 @@ static void ai_user_command(void *ctx, int64_t client, const qa_q3_base_user_com
   director_t *d = r->director;
   qa_owned_actor actor;
   if (!host_actor(r->host, client, &actor))
-    qa_range_error("Bot command has no admitted shared actor for client %lld", (long long)client);
+    qa_raise("Error", 0, 0, "Bot command has no admitted shared actor for client %lld", (long long)client);
   qa_source_bot_sequence *found = sequence_find(d, actor);
   int64_t sequence = found == NULL ? 0 : found->next;
   sequence_set(d, actor, sequence + 1);
@@ -348,7 +348,7 @@ static bool navigation_ready(director_t *d) {
 
 void qa_source_bot_director_begin_round_restart(qa_source_bot_director *d) {
   if (!d->loaded || d->closed || d->running || generated_pending(d) || d->round_phase != QA_SOURCE_BOT_ROUND_ACTIVE)
-    qa_range_error("Bot round restart requires a live idle director");
+    qa_raise("Error", 0, 0, "Bot round restart requires a live idle director");
   qa_game_ai_shutdown_bots_a(&d->round->ai, true);
   d->sequence_count = 0;
   d->round_phase = QA_SOURCE_BOT_ROUND_DETACHED;
@@ -359,11 +359,11 @@ bool qa_source_bot_director_bind_restarted_round(qa_source_bot_director *d,
                                                  qa_source_bot_navigation_fn navigation,
                                                  void *navigation_ctx) {
   if (d->closed || d->round_phase != QA_SOURCE_BOT_ROUND_DETACHED)
-    qa_range_error("Detach bot round before rebinding");
+    qa_raise("Error", 0, 0, "Detach bot round before rebinding");
   const qa_source_bot_game_bots_a *previous = d->options.host->game;
   if (host->game->options.product != previous->options.product ||
       host->game->max_clients(host->game->ctx) != previous->max_clients(previous->ctx))
-    qa_range_error("Bot fast restart must retain its product and client capacity");
+    qa_raise("Error", 0, 0, "Bot fast restart must retain its product and client capacity");
   d->options.host = host;
   d->options.navigation = navigation;
   d->options.navigation_ctx = navigation_ctx;
@@ -385,7 +385,7 @@ bool qa_source_bot_director_bind_restarted_round(qa_source_bot_director *d,
 
 void qa_source_bot_director_resume_round_bots(qa_source_bot_director *d) {
   if (d->closed || d->round_phase != QA_SOURCE_BOT_ROUND_BOUND)
-    qa_range_error("Bind bot round before resuming");
+    qa_raise("Error", 0, 0, "Bind bot round before resuming");
   d->round_phase = QA_SOURCE_BOT_ROUND_ACTIVE;
 }
 
@@ -396,7 +396,7 @@ static void set_or_abort(qa_save_value *object, const char *key, qa_save_value *
 
 qa_save_value *qa_source_bot_director_checkpoint_orchestration(qa_source_bot_director *d) {
   if (!d->loaded || d->closed || d->running || generated_pending(d) || d->round_phase != QA_SOURCE_BOT_ROUND_ACTIVE)
-    qa_range_error("Bot director checkpoint requires a completed frame in a live map");
+    qa_raise("Error", 0, 0, "Bot director checkpoint requires a completed frame in a live map");
   qa_save_value *object = qa_save_value_object(), *sequences = qa_save_value_array();
   if (object == NULL || sequences == NULL)
     qa_range_error("Out of memory capturing the bot director");
@@ -453,10 +453,12 @@ static qa_save_reader field(const qa_save_reader *reader, const char *name) {
   return out;
 }
 
+static void restored_cleanup(void *arg) { qa_bot_memory_restored_destroy(arg); }
+
 bool qa_source_bot_director_restore_save_state(qa_source_bot_director *d, const qa_save_value *value,
                                                const qa_source_bot_restore_hooks *hooks) {
   if (d->loaded || d->closed || !d->options.restoring)
-    qa_range_error("Bot director restoration requires an inert constructor");
+    qa_raise("Error", 0, 0, "Bot director restoration requires an inert constructor");
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, "bot.director"))
     qa_range_error("Out of memory reading the bot director checkpoint");
@@ -492,6 +494,9 @@ bool qa_source_bot_director_restore_save_state(qa_source_bot_director *d, const 
   }
   qa_save_reader memory_cell = field(&reader, "memory");
   qa_bot_memory_restored memory;
+  memset(&memory, 0, sizeof memory);
+  qa_cleanup memory_cleanup; /* a child restore that raises leaves the index behind otherwise */
+  qa_cleanup_push(&memory_cleanup, restored_cleanup, &memory);
   qa_bot_memory_restore(&d->library.memory, memory_cell.value, &memory);
   qa_save_reader_destroy(&memory_cell);
   qa_aas_bsp_entities_restore(&d->bsp_entities, bsp.value, &memory);
@@ -505,6 +510,7 @@ bool qa_source_bot_director_restore_save_state(qa_source_bot_director *d, const 
   cell = field(&reader, "catalog");
   qa_game_bot_catalog_restore_save_state(&d->round->catalog, cell.value);
   qa_save_reader_destroy(&cell);
+  qa_cleanup_pop(&memory_cleanup);
   qa_bot_memory_restored_destroy(&memory);
   d->loaded = true;
   cell = field(&reader, "orchestration");
@@ -519,7 +525,7 @@ bool qa_source_bot_director_restore_save_state(qa_source_bot_director *d, const 
 
 bool qa_source_bot_director_load(qa_source_bot_director *d, bool restart) {
   if (d->closed || d->loaded)
-    qa_range_error("Bot director map lifetime is already loaded or closed");
+    qa_raise("Error", 0, 0, "Bot director map lifetime is already loaded or closed");
   if (!navigation_ready(d))
     return fail(d, "Bot arena admission requires completed selected-movement navigation");
   qa_cvar_registry *cvars = d->options.host->game->options.cvars;
@@ -539,14 +545,20 @@ bool qa_source_bot_director_load(qa_source_bot_director *d, bool restart) {
   return true;
 }
 
+static void clear_running(void *arg) { ((director_t *)arg)->running = false; }
+
 const qa_actor_command *qa_source_bot_director_frame(qa_source_bot_director *d, double milliseconds,
                                                      size_t *out_count) {
   if (!d->loaded || d->closed || d->running || d->round_phase != QA_SOURCE_BOT_ROUND_ACTIVE)
-    qa_range_error("Bot commands require a live idle director");
+    qa_raise("Error", 0, 0, "Bot commands require a live idle director");
   if (generated_pending(d))
-    qa_range_error("Bot command output from the previous source frame was not drained");
+    qa_raise("Error", 0, 0, "Bot command output from the previous source frame was not drained");
   d->running = true;
+  /* TS try { ... } finally { this.running = false }: a frame that raises leaves the director idle. */
+  qa_cleanup running;
+  qa_cleanup_push(&running, clear_running, d);
   qa_game_ai_start_frame_bots_a(&d->round->ai, milliseconds);
+  qa_cleanup_pop(&running);
   size_t count = 0;
   qa_source_bot_generated_command *taken = qa_event_ring_take(&d->generated, &d->generated_cursor, &count);
   if (taken == NULL && count != 0)
@@ -613,8 +625,10 @@ bool qa_source_bot_director_restore_orchestration(qa_source_bot_director *d, con
   }
   qa_save_reader_destroy(&list);
   qa_save_reader_destroy(&reader);
-  if (!d->loaded || d->closed || generated_pending(d))
-    qa_range_error("Restore bot director orchestration only after its child owners are live");
+  if (!d->loaded || d->closed || generated_pending(d)) {
+    free(image);
+    qa_raise("Error", 0, 0, "Restore bot director orchestration only after its child owners are live");
+  }
   if (version != 1) {
     free(image);
     return fail(d, "Unsupported bot director orchestration version");

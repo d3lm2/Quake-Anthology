@@ -2,6 +2,7 @@
 #include "qa/compat/qvm/compatibility.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,12 +14,39 @@ static void reader_field(const qa_save_reader *reader, const char *name, qa_save
   if (!qa_save_reader_field(reader, name, out)) qa_range_error("out of memory");
 }
 
-/* TS path.toLowerCase(): Unicode lowering of UTF-8 paths. */
-static char *lower_copy(const char *text) {
-  char *copy = qa_js_to_lower_case(text);
-  if (copy == NULL) qa_range_error("out of memory");
-  return copy;
+/* Every block one parse allocates: a refused declaration (a TS throw) releases
+ * them before the error leaves. */
+typedef struct owned_blocks {
+  void **blocks;
+  size_t count, capacity;
+} owned_blocks;
+
+static void owned_free(void *arg) {
+  owned_blocks *owned = arg;
+  for (size_t i = 0; i < owned->count; i++) free(owned->blocks[i]);
+  free(owned->blocks);
+  owned->blocks = NULL;
+  owned->count = owned->capacity = 0;
 }
+
+static void *own(owned_blocks *owned, void *block) {
+  if (block == NULL) qa_range_error("out of memory");
+  if (owned->count == owned->capacity) {
+    size_t capacity = owned->capacity == 0 ? 16 : owned->capacity * 2;
+    void **grown = realloc(owned->blocks, capacity * sizeof *grown);
+    if (grown == NULL) {
+      free(block);
+      qa_range_error("out of memory");
+    }
+    owned->blocks = grown;
+    owned->capacity = capacity;
+  }
+  owned->blocks[owned->count++] = block;
+  return block;
+}
+
+/* TS path.toLowerCase(): Unicode lowering of UTF-8 paths. */
+static char *lower_copy(owned_blocks *owned, const char *text) { return own(owned, qa_js_to_lower_case(text)); }
 
 qa_qvm_compatibility_declaration qa_qvm_parse_compatibility_declaration(
     const qa_save_value *value, qa_qvm_module_path_digest module, qa_qvm_role role) {
@@ -30,11 +58,13 @@ qa_qvm_compatibility_declaration qa_qvm_parse_compatibility_declaration(
   qa_save_reader_destroy(&version);
   reader_field(&reader, "modules", &modules);
   size_t count = qa_save_reader_list_count(&modules);
-  qa_qvm_compatibility_declaration selected = {"q3-modern", NULL, NULL};
-  char **seen = calloc(count == 0 ? 1 : count, sizeof(char *));
-  if (seen == NULL) qa_range_error("out of memory");
+  qa_qvm_compatibility_declaration selected = {"q3-modern", NULL, NULL, "", ""};
+  owned_blocks owned = {NULL, 0, 0};
+  qa_cleanup held;
+  qa_cleanup_push(&held, owned_free, &owned);
+  char **seen = own(&owned, calloc(count == 0 ? 1 : count, sizeof(char *)));
   size_t seen_count = 0;
-  char *module_lower = lower_copy(module.artifact_path);
+  char *module_lower = lower_copy(&owned, module.artifact_path);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader entry, role_reader, path_reader, digest_reader, profile_reader;
     if (!qa_save_reader_item(&modules, i, &entry)) qa_range_error("out of memory");
@@ -44,13 +74,11 @@ qa_qvm_compatibility_declaration qa_qvm_parse_compatibility_declaration(
     qa_save_reader_destroy(&role_reader);
     reader_field(&entry, "artifactPath", &path_reader);
     const char *raw_path = qa_save_reader_string(&path_reader);
-    char *path = qa_normalize_resource_path(raw_path);
-    if (path == NULL) qa_range_error("out of memory");
+    char *path = own(&owned, qa_normalize_resource_path(raw_path));
     qa_save_reader_destroy(&path_reader);
-    char *path_lower = lower_copy(path);
+    char *path_lower = lower_copy(&owned, path);
     size_t key_length = strlen(selected_role) + 1 + strlen(path_lower) + 1;
-    char *key = malloc(key_length);
-    if (key == NULL) qa_range_error("out of memory");
+    char *key = own(&owned, malloc(key_length));
     strcpy(key, selected_role);
     strcat(key, "/");
     strcat(key, path_lower);
@@ -84,16 +112,17 @@ qa_qvm_compatibility_declaration qa_qvm_parse_compatibility_declaration(
       selected.profile = profile;
       selected.primary = has_primary ? primary.value : NULL;
       selected.equipment_presentation = has_equipment ? equipment.value : NULL;
+      /* TS keeps the SaveReader itself, path included. */
+      snprintf(selected.primary_path, sizeof selected.primary_path, "%s", has_primary ? primary.path : "");
+      snprintf(selected.equipment_presentation_path, sizeof selected.equipment_presentation_path, "%s",
+               has_equipment ? equipment.path : "");
     }
     qa_save_reader_destroy(&primary);
     qa_save_reader_destroy(&equipment);
-    free(path);
-    free(path_lower);
     qa_save_reader_destroy(&entry);
   }
-  free(module_lower);
-  for (size_t s = 0; s < seen_count; s++) free(seen[s]);
-  free(seen);
+  qa_cleanup_pop(&held);
+  owned_free(&owned);
   qa_save_reader_destroy(&modules);
   qa_save_reader_destroy(&reader);
   return selected;
@@ -107,9 +136,8 @@ qa_qvm_abi_profile qa_qvm_parse_compatibility(const qa_save_value *value,
 bool qa_qvm_read_compatibility_declaration(qa_content_mounted *mounts,
                                            qa_qvm_module_path_digest module, qa_qvm_role role,
                                            qa_qvm_compatibility_reading *out) {
+  memset(&out->declaration, 0, sizeof out->declaration);
   out->declaration.profile = "q3-modern";
-  out->declaration.primary = NULL;
-  out->declaration.equipment_presentation = NULL;
   out->resource = NULL;
   out->parsed = NULL;
   qa_content_opened_resource opened;

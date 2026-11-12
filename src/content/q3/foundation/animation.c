@@ -39,7 +39,7 @@ void qa_q3_set_lerp_frame_animation(qa_q3_animation_set config, qa_q3_lerp_frame
   if(print){ char b[64]; snprintf(b,sizeof b,"Anim: %d\n",idx); print(print_ctx,b); }
 }
 static const qa_q3_animation *current_animation(const qa_q3_lerp_frame *s){
-  if(!s->current_animation) qa_range_error("lerp frame has no current animation");
+  if(!s->current_animation) qa_raise("Error",0,0,"lerp frame has no current animation");
   return s->current_animation;
 }
 void qa_q3_run_lerp_frame(qa_q3_animation_set config, qa_q3_lerp_frame *state,
@@ -57,19 +57,21 @@ void qa_q3_run_lerp_frame(qa_q3_animation_set config, qa_q3_lerp_frame *state,
     if(input.time_ms<state->animation_time) state->frame_time=state->animation_time;
     else state->frame_time=(double)add32(state->old_frame_time,a->frame_lerp);
     int32_t diff=sub32(state->frame_time,state->animation_time);
-    int32_t frame_offset=qa_js_to_int32(trunc((double)diff/a->frame_lerp));
-    frame_offset=qa_qvm_float_to_int((float)((float)frame_offset*(float)input.speed_scale));
-    int32_t frame_count=qa_js_to_int32(a->num_frames);
-    if(a->flipflop) frame_count=(int32_t)((uint32_t)frame_count*2u);
+    /* TS keeps frameOffset and frameCount as numbers: `%` is fmod (a zero divisor
+     * gives NaN, which `| 0` turns into 0) and only the `| 0` sites wrap. */
+    double frame_offset=trunc((double)diff/a->frame_lerp);
+    frame_offset=(double)qa_qvm_float_to_int((float)((float)frame_offset*(float)input.speed_scale));
+    double frame_count=a->num_frames;
+    if(a->flipflop) frame_count=(double)(int32_t)((uint32_t)qa_js_to_int32(frame_count)*2u);
     if(frame_offset>=frame_count){
-      frame_offset=(int32_t)(frame_offset-frame_count);
-      if(a->loop_frames!=0){ frame_offset%=qa_js_to_int32(a->loop_frames); frame_offset=add32(frame_offset,(double)sub32(a->num_frames,a->loop_frames)); }
+      frame_offset=(double)qa_js_to_int32(frame_offset-frame_count);
+      if(a->loop_frames!=0){ frame_offset=fmod(frame_offset,a->loop_frames); frame_offset=(double)qa_js_to_int32(frame_offset+a->num_frames-a->loop_frames); }
       else { frame_offset=frame_count-1; state->frame_time=input.time_ms; }
     }
-    if(a->reversed) state->frame=(double)sub32((double)add32(a->first_frame,(double)sub32(a->num_frames,1)),(double)frame_offset);
-    else if(a->flipflop&&frame_offset>=qa_js_to_int32(a->num_frames))
-      state->frame=(double)sub32((double)add32(a->first_frame,(double)sub32(a->num_frames,1)),(double)(frame_offset%qa_js_to_int32(a->num_frames)));
-    else state->frame=(double)add32(a->first_frame,(double)frame_offset);
+    if(a->reversed) state->frame=(double)qa_js_to_int32(a->first_frame+a->num_frames-1-frame_offset);
+    else if(a->flipflop&&frame_offset>=a->num_frames)
+      state->frame=(double)qa_js_to_int32(a->first_frame+a->num_frames-1-fmod(frame_offset,a->num_frames));
+    else state->frame=(double)qa_js_to_int32(a->first_frame+frame_offset);
     if(input.time_ms>state->frame_time){ state->frame_time=input.time_ms; if(print) print(print_ctx,"Clamp lf->frameTime\n"); }
   }
   if(state->frame_time>(double)add32(input.time_ms,200)) state->frame_time=input.time_ms;

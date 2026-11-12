@@ -1,6 +1,7 @@
 /* Port of src/app/bootstrap/seat-hud-state.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/seat_hud_state.h"
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,6 +75,30 @@ static void clear_scratch(qa_app_seat_source_hud *h) {
   h->string_scratch_count = 0;
 }
 static bool same_actor(qa_actor_id a, qa_actor_id b) { return qa_same_actor(a, b); }
+/* A formatted line, whole (malloc'd). */
+static char *format_text(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  int length = vsnprintf(NULL, 0, format, args);
+  va_end(args);
+  if (length < 0) qa_range_error("Out of memory");
+  char *out = malloc((size_t)length + 1);
+  if (out == NULL) qa_range_error("Out of memory");
+  va_start(args, format);
+  vsnprintf(out, (size_t)length + 1, format, args);
+  va_end(args);
+  return out;
+}
+/* Keeps a presentation-scratch block (freed by the next presentation call). */
+static void keep_scratch(qa_app_seat_source_hud *h, void *block) {
+  if (h->string_scratch_count == h->string_scratch_cap) {
+    size_t cap = h->string_scratch_cap ? h->string_scratch_cap * 2 : 16;
+    char **next = realloc(h->string_scratch, cap * sizeof *next);
+    if (!next) { free(block); qa_range_error("Out of memory"); }
+    h->string_scratch = next; h->string_scratch_cap = cap;
+  }
+  h->string_scratch[h->string_scratch_count++] = block;
+}
 qa_app_seat_source_hud *qa_app_seat_source_hud_create(qa_actor_id actor,
     char *(*localize)(void *ctx, qa_content_id content, const char *text, const char *const *args, size_t arg_count), void *localize_ctx) {
   qa_app_seat_source_hud *h = calloc(1, sizeof *h);
@@ -154,7 +179,6 @@ static qa_vec3 normalize3(qa_vec3 v) {
   return r;
 }
 static void apply(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event *source) {
-  char buf[4096];
   if (strcmp(source->kind, "q2") == 0 && strcmp(source->q2->kind, "pickup") == 0 && same_actor(source->q2->player, h->actor)) {
     h->has_pickup = true;
     set_str(&h->pickup_name, source->q2->name);
@@ -189,9 +213,10 @@ static void apply(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event
       h->inventory_null = false;
       size_t cap = 0;
       for (size_t i = 0; i < source->q2_player->entry_count; i++) {
-        if (source->q2_player->entries[i].count <= 0) continue;
+        if (!(source->q2_player->entries[i].count > 0)) continue; /* filter(entry => entry.count > 0): NaN drops */
         const char *label = NULL;
-        for (size_t j = 0; j < source->q2_player->label_count; j++) if (strcmp(source->q2_player->labels[j].item, source->q2_player->entries[i].item) == 0) label = source->q2_player->labels[j].name;
+        for (size_t j = 0; j < source->q2_player->label_count && label == NULL; j++) /* labels.find: the first */
+          if (strcmp(source->q2_player->labels[j].item, source->q2_player->entries[i].item) == 0) label = source->q2_player->labels[j].name;
         char *fallback = NULL;
         if (label == NULL) {
           const char *item = source->q2_player->entries[i].item;
@@ -234,9 +259,9 @@ static void apply(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event
       char *score = qa_input_js_number(source->q2_player->rows[i].score);
       char *ping = qa_input_js_number(source->q2_player->rows[i].ping);
       char *minutes = qa_input_js_number(source->q2_player->rows[i].minutes);
-      snprintf(buf, sizeof buf, "%s  %s  %sms  %sm%s", score, source->q2_player->rows[i].name, ping, minutes, source->q2_player->rows[i].spectator ? "  Spectator" : "");
+      if (!score || !ping || !minutes) qa_range_error("Out of memory");
+      h->score_rows[i] = format_text("%s  %s  %sms  %sm%s", score, source->q2_player->rows[i].name, ping, minutes, source->q2_player->rows[i].spectator ? "  Spectator" : "");
       free(score); free(ping); free(minutes);
-      h->score_rows[i] = xdup(buf);
     }
     h->score_visible = true; h->help_visible = false; h->inventory_null = true;
   }
@@ -251,9 +276,12 @@ static void apply(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event
       double key = strcmp(event->kind, "poi") == 0 ? 1 : event->key;
       double now = source->seconds * 1000;
       long index = -1;
-      if (key != 0) for (size_t i = 0; i < h->poi_count; i++) if (h->pois[i].key == key) index = (long)i;
+      if (key != 0) for (size_t i = 0; i < h->poi_count && index < 0; i++) if (h->pois[i].key == key) index = (long)i;
       if (index < 0) for (size_t i = 0; i < h->poi_count; i++) if (h->pois[i].expires <= now) { index = (long)i; break; }
-      if (index < 0 && h->poi_count < 32) index = (long)h->poi_count++;
+      if (index < 0 && h->poi_count < 32) {
+        index = (long)h->poi_count++;
+        memset(&h->pois[index], 0, sizeof h->pois[index]); /* a fresh slot: nothing of a removed entry's to free */
+      }
       if (index < 0) {
         double oldest = HUGE_VAL;
         for (size_t i = 0; i < h->poi_count; i++) if (h->pois[i].key == 0 && h->pois[i].expires < oldest) { oldest = h->pois[i].expires; index = (long)i; }
@@ -277,6 +305,7 @@ static void apply(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event
         free(h->pois[i].content); free(h->pois[i].path);
         memmove(&h->pois[i], &h->pois[i + 1], (h->poi_count - i - 1) * sizeof(poi));
         h->poi_count--;
+        memset(&h->pois[h->poi_count], 0, sizeof h->pois[h->poi_count]); /* the vacated slot no longer owns its strings */
         break;
       }
     }
@@ -347,11 +376,12 @@ static void apply(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event
         qa_net_js_number(floor(fmod(level->time, 60)), secs + 1, sizeof secs - 1);
         const char *secs_text = secs + 1;
         if (strlen(secs_text) < 2) { secs[0] = '0'; secs_text = secs; }
-        snprintf(buf, sizeof buf, "%s: %s/%s kills  %s/%s secrets  %s:%s",
+        char minutes_text[48];
+        snprintf(minutes_text, sizeof minutes_text, "%s", QA_JS_NUMBER(minutes));
+        h->report_lines[i] = format_text("%s: %s/%s kills  %s/%s secrets  %s:%s",
                  level->name && level->name[0] ? level->name : level->map, killed, total_m, found, total_s,
-                 QA_JS_NUMBER(minutes), secs_text);
+                 minutes_text, secs_text);
         free(killed); free(total_m); free(found); free(total_s);
-        h->report_lines[i] = xdup(buf);
       }
       free(order);
       h->has_report = true;
@@ -374,8 +404,9 @@ static void apply(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event
           memset(slot, 0, sizeof *slot);
           slot->slot = event->slot;
           char *n = qa_input_js_number(event->slot);
-          snprintf(buf, sizeof buf, "boss:%s", n); free(n);
-          slot->id = xdup(buf);
+          if (!n) qa_range_error("Out of memory");
+          slot->id = format_text("boss:%s", n);
+          free(n);
         }
         set_str(&slot->label, event->name);
         slot->value = (qa_ui_hud_health_bar){slot->id, slot->label, event->fraction, 1, {0.8, 0.12, 0.08, 1}};
@@ -424,6 +455,7 @@ static void apply(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event
     }
   }
 }
+static void free_slot(void *slot) { free(*(char **)slot); }
 static bool needs_localize(const qa_app_sim_presentation_event *source) {
   return strcmp(source->kind, "q2-rerelease") == 0
       && (strcmp(source->q2_rerelease->kind, "healthbar") == 0 || strcmp(source->q2_rerelease->kind, "help-computer") == 0
@@ -475,37 +507,58 @@ static qa_resource_id load_optional(qa_app_seat_source_hud *h, qa_app_weapon_hud
   h->missing[h->missing_count++] = key;
   return NULL;
 }
+/* One taken pending event: localized fields first (TS awaits each localize in order), then apply. */
+static void prepare_one(qa_app_seat_source_hud *h, const qa_app_sim_presentation_event *owned) {
+  if (strcmp(owned->kind, "q2-rerelease") != 0 || h->localize == NULL) { apply(h, owned); return; }
+  /* TS apply({ ...source, event: { ...event, <localized fields> } }). */
+  qa_q2_rerelease_event event = *owned->q2_rerelease;
+  qa_app_sim_presentation_event localized = *owned;
+  localized.storage = NULL;
+  localized.q2_rerelease = &event;
+  char *texts[2] = {NULL, NULL};
+  qa_cleanup first_guard, second_guard;
+  qa_cleanup_push(&first_guard, free_slot, &texts[0]);
+  qa_cleanup_push(&second_guard, free_slot, &texts[1]);
+  if (strcmp(event.kind, "healthbar") == 0) {
+    event.name = texts[0] = h->localize(h->localize_ctx, owned->content, event.name, NULL, 0);
+    apply(h, &localized);
+  } else if (strcmp(event.kind, "help-computer") == 0) {
+    event.primary = texts[0] = h->localize(h->localize_ctx, owned->content, event.primary, NULL, 0);
+    event.secondary = texts[1] = h->localize(h->localize_ctx, owned->content, event.secondary, NULL, 0);
+    apply(h, &localized);
+  } else if (strcmp(event.kind, "mission-objective") == 0) {
+    event.text = texts[0] = h->localize(h->localize_ctx, owned->content, event.text, event.args, event.arg_count);
+    event.args = NULL; event.arg_count = 0;
+    apply(h, &localized);
+  } else apply(h, owned);
+  qa_cleanup_pop(&second_guard);
+  qa_cleanup_pop(&first_guard);
+  free(texts[0]); free(texts[1]);
+}
+/* pending.take(cursor) then retire: the whole batch leaves the ring first, so a raise drops the rest of it. */
+typedef struct taken_batch { qa_app_sim_presentation_event *items; size_t count, at; } taken_batch;
+static void release_batch(void *v) {
+  taken_batch *batch = v;
+  for (size_t i = batch->at; i < batch->count; i++) qa_app_sim_presentation_event_release(&batch->items[i]);
+  free(batch->items);
+}
 void qa_app_seat_source_hud_prepare(qa_app_seat_source_hud *h, qa_app_weapon_hud_assets *icons) {
-  while (h->pending_count > 0) {
-    qa_app_sim_presentation_event owned = h->pending[h->pending_head];
-    memset(&h->pending[h->pending_head], 0, sizeof owned);
+  taken_batch batch = {calloc(h->pending_count ? h->pending_count : 1, sizeof *batch.items), h->pending_count, 0};
+  if (!batch.items) qa_range_error("Out of memory");
+  for (size_t i = 0; i < batch.count; i++) {
+    batch.items[i] = h->pending[h->pending_head];
+    memset(&h->pending[h->pending_head], 0, sizeof *h->pending);
     h->pending_head = (h->pending_head + 1) % 8192;
-    h->pending_count--;
-    if (strcmp(owned.kind, "q2-rerelease") != 0 || h->localize == NULL) { apply(h, &owned); qa_app_sim_presentation_event_release(&owned); continue; }
-    /* TS apply({ ...source, event: { ...event, <localized fields> } }). */
-    qa_q2_rerelease_event event = *owned.q2_rerelease;
-    qa_app_sim_presentation_event localized = owned;
-    localized.storage = NULL;
-    localized.q2_rerelease = &event;
-    if (strcmp(event.kind, "healthbar") == 0) {
-      char *text = h->localize(h->localize_ctx, owned.content, event.name, NULL, 0);
-      event.name = text;
-      apply(h, &localized);
-      free(text);
-    } else if (strcmp(event.kind, "help-computer") == 0) {
-      char *primary = h->localize(h->localize_ctx, owned.content, event.primary, NULL, 0);
-      char *secondary = h->localize(h->localize_ctx, owned.content, event.secondary, NULL, 0);
-      event.primary = primary; event.secondary = secondary;
-      apply(h, &localized);
-      free(primary); free(secondary);
-    } else if (strcmp(event.kind, "mission-objective") == 0) {
-      char *text = h->localize(h->localize_ctx, owned.content, event.text, event.args, event.arg_count);
-      event.text = text; event.args = NULL; event.arg_count = 0;
-      apply(h, &localized);
-      free(text);
-    } else apply(h, &owned);
-    qa_app_sim_presentation_event_release(&owned);
   }
+  h->pending_count = 0;
+  qa_cleanup batch_guard;
+  qa_cleanup_push(&batch_guard, release_batch, &batch);
+  for (; batch.at < batch.count; batch.at++) {
+    prepare_one(h, &batch.items[batch.at]);
+    qa_app_sim_presentation_event_release(&batch.items[batch.at]);
+  }
+  qa_cleanup_pop(&batch_guard);
+  free(batch.items);
   for (size_t i = 0; i < h->poi_count; i++) {
     poi *entry = &h->pois[i];
     if (entry->image != NULL) continue;
@@ -565,8 +618,11 @@ qa_app_hud_presentation qa_app_seat_source_hud_presentation(qa_app_seat_source_h
   size_t prompt_count = 0;
   if (h->ctf) {
     char *red = qa_input_js_number(h->red), *blue = qa_input_js_number(h->blue);
-    snprintf(buf, sizeof buf, "Red %s - Blue %s", red, blue); free(red); free(blue);
-    prompts[prompt_count++] = (qa_ui_hud_prompt){scratch_str(h, buf), "", NULL};
+    if (!red || !blue) qa_range_error("Out of memory");
+    char *line = format_text("Red %s - Blue %s", red, blue);
+    free(red); free(blue);
+    keep_scratch(h, line);
+    prompts[prompt_count++] = (qa_ui_hud_prompt){line, "", NULL};
   }
   if (h->mission_visible && h->objective[0] != '\0') prompts[prompt_count++] = (qa_ui_hud_prompt){"New objective", "", NULL};
   if (h->ctf) {
@@ -595,6 +651,7 @@ qa_app_hud_presentation qa_app_seat_source_hud_presentation(qa_app_seat_source_h
     size_t *order = calloc(h->client_count, sizeof *order);
     score_storage = calloc(h->client_count, sizeof *score_storage);
     if (!order || !score_storage) qa_range_error("Out of memory");
+    keep_scratch(h, (void *)score_storage); /* help.lines points here until the next presentation call */
     for (size_t i = 0; i < h->client_count; i++) order[i] = i;
     for (size_t i = 1; i < h->client_count; i++) {
       size_t at = order[i]; size_t j = i;
@@ -604,11 +661,13 @@ qa_app_hud_presentation qa_app_seat_source_hud_presentation(qa_app_seat_source_h
     for (size_t i = 0; i < h->client_count; i++) {
       client_entry *client = &h->clients[order[i]];
       char *frags = qa_input_js_number(client->frags);
+      if (!frags) qa_range_error("Out of memory");
       char team[64] = "";
       if (client->team != 0) { char *t = qa_input_js_number(client->team); snprintf(team, sizeof team, "  Team %s", t); free(t); }
-      snprintf(buf, sizeof buf, "%s  %s%s%s", frags, client->name, team, client->observer ? "  Spectator" : "");
+      char *line = format_text("%s  %s%s%s", frags, client->name, team, client->observer ? "  Spectator" : "");
       free(frags);
-      score_storage[i] = scratch_str(h, buf);
+      keep_scratch(h, line);
+      score_storage[i] = line;
     }
     free(order);
     score_lines = score_storage;
@@ -688,8 +747,7 @@ qa_app_hud_presentation qa_app_seat_source_hud_presentation(qa_app_seat_source_h
       h->help_scratch.lines = kept;
       h->help_scratch.line_count = n;
       /* Leak the 2-entry array per presentation call is avoided by freeing next call: tracked in scratch strings as a block. */
-      if (h->string_scratch_count == h->string_scratch_cap) { h->string_scratch_cap = h->string_scratch_cap ? h->string_scratch_cap * 2 : 16; h->string_scratch = realloc(h->string_scratch, h->string_scratch_cap * sizeof *h->string_scratch); }
-      h->string_scratch[h->string_scratch_count++] = (char *)kept;
+      keep_scratch(h, (void *)kept);
     } else {
       size_t *help_order = calloc(h->help_count ? h->help_count : 1, sizeof *help_order);
       const char **lines = calloc(h->help_count ? h->help_count : 1, sizeof *lines);
@@ -703,11 +761,9 @@ qa_app_hud_presentation qa_app_seat_source_hud_presentation(qa_app_seat_source_h
       for (size_t i = 0; i < h->help_count; i++) lines[i] = h->help_text[help_order[i]].text;
       free(help_order);
       h->help_scratch = (qa_ui_hud_help){"Help computer", lines, h->help_count, NULL, 0};
-      if (h->string_scratch_count == h->string_scratch_cap) { h->string_scratch_cap = h->string_scratch_cap ? h->string_scratch_cap * 2 : 16; h->string_scratch = realloc(h->string_scratch, h->string_scratch_cap * sizeof *h->string_scratch); }
-      h->string_scratch[h->string_scratch_count++] = (char *)lines;
+      keep_scratch(h, (void *)lines);
     }
     out.help = &h->help_scratch;
   }
-  free((void *)score_storage);
   return out;
 }

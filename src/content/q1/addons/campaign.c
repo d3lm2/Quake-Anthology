@@ -6,6 +6,7 @@
 #include "qa/content/q1/addons/campaign.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "qa/content/q1/base/rules.h"
@@ -115,8 +116,7 @@ static void rule_begin(void *ctx, const char *map, const qa_actor_id *cause) {
 }
 
 static void finale_text(qa_q1_intermission_result *out, const char *text, double track) {
-  *out = (qa_q1_intermission_result){.kind = "finale", .track = track};
-  (void)snprintf(out->text, sizeof out->text, "%s", text);
+  *out = (qa_q1_intermission_result){.kind = "finale", .track = track, .text = text};
 }
 
 static int rule_finale(void *ctx, double stage, const char *next_map, qa_q1_intermission_result *out) {
@@ -125,7 +125,6 @@ static int rule_finale(void *ctx, double stage, const char *next_map, qa_q1_inte
   qa_q1_services *game = context->game;
   if (stage == 2) {
     const char *map = map_name(game), *text;
-    char held[4096];
     if (strcmp(map, "e1m7") == 0) text = qa_q1_base_registered(context->base) ? "$qc_finale_e1" : "$qc_finale_e1_shareware";
     else if (strcmp(map, "e2m6") == 0) text = "$qc_finale_e2";
     else if (strcmp(map, "e3m6") == 0) text = "$qc_finale_e3";
@@ -134,7 +133,13 @@ static int rule_finale(void *ctx, double stage, const char *next_map, qa_q1_inte
       /* game.world?.text("endtext") || game.world?.text("addon.intermissiontext") || "" */
       text = game->world != NULL ? qa_q1_actor_text(game->world, "endtext") : "";
       if (text[0] == '\0' && game->world != NULL) text = qa_q1_actor_text(game->world, "addon.intermissiontext");
-      (void)snprintf(held, sizeof held, "%s", text); /* the field is cleared below */
+      /* The field is cleared below: the context keeps the whole text until its next finale. */
+      size_t length = strlen(text);
+      char *held = malloc(length + 1);
+      if (held == NULL) qa_range_error("Out of memory");
+      memcpy(held, text, length + 1);
+      free(context->finale_text);
+      context->finale_text = held;
       text = held;
     }
     if (game->world != NULL) (void)qa_q1_actor_field_set(game->world, "addon.intermissiontext", "");
@@ -297,11 +302,22 @@ static void electrode_touch(void *ctx, qa_q1_services *game, qa_q1_actor *entity
   }
 }
 
+/* TS game.find(name): every entity with that targetname, as a snapshot array
+ * with no size limit. The caller frees it. */
+static qa_q1_actor **find_all(qa_q1_services *game, const char *name, size_t *count) {
+  size_t total = qa_q1_find(game, name, NULL, 0);
+  qa_q1_actor **found = malloc((total != 0 ? total : 1) * sizeof *found);
+  if (found == NULL) qa_range_error("out of memory");
+  *count = qa_q1_find(game, name, found, total);
+  return found;
+}
 static void egg_use(void *ctx, qa_q1_services *game, qa_q1_actor *entity, const qa_actor_id *other,
                     const qa_actor_id *activator) {
   (void)ctx; (void)other; (void)activator;
-  qa_q1_actor *targets[256];
-  size_t count = qa_q1_find(game, entity->target, targets, 256);
+  size_t count = 0;
+  qa_q1_actor **targets = find_all(game, entity->target, &count);
+  qa_cleanup targets_node; /* the callbacks below can raise */
+  qa_cleanup_push(&targets_node, free, targets);
   for (size_t i = 0; i < count; i++) {
     qa_q1_actor *target = targets[i];
     if (!same(target->classname, "func_door")) continue;
@@ -314,6 +330,8 @@ static void egg_use(void *ctx, qa_q1_services *game, qa_q1_actor *entity, const 
     (void)qa_q1_actor_field_set(target, "noise2", "doors/doormv1.wav");
     qa_q1_door_up(game, target);
   }
+  qa_cleanup_pop(&targets_node);
+  free(targets);
 }
 
 static void fix_pickup(void *ctx, qa_q1_services *game, qa_q1_actor *entity) {

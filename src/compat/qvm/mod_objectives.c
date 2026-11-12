@@ -10,7 +10,7 @@ static int64_t word(int64_t end, double address_value) {
       address_value < -9007199254740991.0 || address_value > 9007199254740991.0 ||
       (int64_t)address_value < 0 || (int64_t)address_value % 4 != 0 ||
       (int64_t)address_value + 4 > end)
-    qa_range_error("Objective address exceeds original QVM data or is not aligned");
+    qa_raise("Error", 0, 0, "Objective address exceeds original QVM data or is not aligned");
   return (int64_t)address_value;
 }
 
@@ -39,13 +39,13 @@ int64_t qa_qvm_resolve_objective_address(qa_qvm_memory *memory, int64_t end,
   int64_t pointer = read_word(memory, word(end, address->pointer.address));
   for (size_t i = 0; i < address->pointer.indirections.count; i++) {
     current(current_ctx);
-    if (pointer == 0) qa_range_error("Objective selector follows a null source pointer");
+    if (pointer == 0) qa_raise("Error", 0, 0, "Objective selector follows a null source pointer");
     /* TS adds the offset in double; word() validates the sum. */
     int64_t at = word(end, (double)word(end, (double)pointer) +
                                address->pointer.indirections.values[i]);
     pointer = read_word(memory, at);
   }
   current(current_ctx);
-  if (pointer == 0) qa_range_error("Objective selector follows a null source pointer");
+  if (pointer == 0) qa_raise("Error", 0, 0, "Objective selector follows a null source pointer");
   return word(end, (double)word(end, (double)pointer) + address->pointer.offset);
 }

@@ -21,8 +21,8 @@ typedef struct qa_q1qc_role_locations {
   qa_q1qc_damage_role_location *items; size_t count;
 } qa_q1qc_role_locations;
 /* TS QcDamageCallLayout (heap owned). declaration points at declaration_copy,
- * a shallow copy of the caller's call (its strings and arrays stay borrowed from
- * the compatibility declaration), so a call passed by value may go out of scope. */
+ * a deep copy of the caller's call (arrays and strings owned by the layout), so
+ * a layout cached for the process outlives the compatibility declaration. */
 typedef struct qa_q1qc_damage_call_layout {
   int64_t function_index;
   const char **parameters; size_t parameter_count;

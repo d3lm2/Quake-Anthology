@@ -218,7 +218,7 @@ void qa_ui_apply_window_mutation(const qa_ui_window_mutation *mutation) {
 typedef struct video_state {
   qa_sdl_window *(*current_window)(void *ctx);
   void *window_ctx;
-  qa_cvar_registry *registry;
+  qa_ui_setting_cvars cvars;
   void (*report)(void *ctx, const char *message);
   void *report_ctx;
   void (*mutate)(void *ctx, const qa_ui_window_mutation *mutation);
@@ -362,21 +362,21 @@ static bool always_enabled(void *v) {
 }
 static double brightness_read(void *v) {
   video_state *s = v;
-  return qa_cvar_registry_variable_value(s->registry, "r_gamma");
+  return qa_cvar_registry_variable_value(qa_ui_setting_cvars_get(&s->cvars), "r_gamma");
 }
 static void brightness_write(void *v, double value) {
   video_state *s = v;
   char buf[64];
   js_string(buf, sizeof buf, value);
-  cvar_set(s->registry, "r_gamma", buf);
+  cvar_set(qa_ui_setting_cvars_get(&s->cvars), "r_gamma", buf);
 }
 static bool brightness_reset_enabled(void *v) {
   video_state *s = v;
-  return qa_cvar_registry_variable_value(s->registry, "r_gamma") != 1;
+  return qa_cvar_registry_variable_value(qa_ui_setting_cvars_get(&s->cvars), "r_gamma") != 1;
 }
 static void brightness_reset(void *v) {
   video_state *s = v;
-  cvar_set(s->registry, "r_gamma", "1");
+  cvar_set(qa_ui_setting_cvars_get(&s->cvars), "r_gamma", "1");
 }
 static bool fullscreen_read(void *v) {
   video_state *s = v;
@@ -469,13 +469,13 @@ static void custom_apply(void *v) {
 static bool vsync_enabled(void *v) {
   video_state *s = v;
   return qa_sdl_window_backend(video_window(s)) == QA_SDL_BACKEND_GL
-      && s->registry != NULL;
+      && qa_ui_setting_cvars_present(&s->cvars);
 }
 static bool vsync_read(void *v) {
   video_state *s = v;
   return qa_sdl_window_backend(video_window(s)) == QA_SDL_BACKEND_GL
-      && (s->registry != NULL
-              ? qa_cvar_registry_variable_value(s->registry,
+      && (qa_ui_setting_cvars_present(&s->cvars)
+              ? qa_cvar_registry_variable_value(qa_ui_setting_cvars_get(&s->cvars),
                                                 "r_swapInterval")
               : 0)
              != 0;
@@ -483,8 +483,8 @@ static bool vsync_read(void *v) {
 static void vsync_write(void *v, bool value) {
   video_state *s = v;
   if (qa_sdl_window_backend(video_window(s)) == QA_SDL_BACKEND_GL
-      && s->registry != NULL)
-    cvar_set(s->registry, "r_swapInterval", value ? "1" : "0");
+      && qa_ui_setting_cvars_present(&s->cvars))
+    cvar_set(qa_ui_setting_cvars_get(&s->cvars), "r_swapInterval", value ? "1" : "0");
 }
 static void video_teardown(void *state) {
   video_state *s = state;
@@ -500,10 +500,20 @@ qa_ui_setting_bindings qa_ui_bind_native_video_settings(
     void (*report)(void *ctx, const char *message), void *report_ctx,
     void (*mutate)(void *ctx, const qa_ui_window_mutation *mutation),
     void *mutate_ctx) {
+  return qa_ui_bind_native_video_settings_view(
+      current_window, window_ctx, qa_ui_setting_cvars_of(registry), report,
+      report_ctx, mutate, mutate_ctx);
+}
+qa_ui_setting_bindings qa_ui_bind_native_video_settings_view(
+    qa_sdl_window *(*current_window)(void *ctx), void *window_ctx,
+    qa_ui_setting_cvars cvars,
+    void (*report)(void *ctx, const char *message), void *report_ctx,
+    void (*mutate)(void *ctx, const qa_ui_window_mutation *mutation),
+    void *mutate_ctx) {
   video_state *s = xcalloc_state(sizeof *s);
   s->current_window = current_window;
   s->window_ctx = window_ctx;
-  s->registry = registry;
+  s->cvars = cvars;
   s->report = report;
   s->report_ctx = report_ctx;
   s->mutate = mutate;
@@ -511,7 +521,7 @@ qa_ui_setting_bindings qa_ui_bind_native_video_settings(
   /* TS evaluates currentWindow() eagerly for the draft size text. */
   video_window(s);
   size_t at = 0;
-  if (registry != NULL) {
+  if (qa_ui_setting_cvars_present(&cvars)) {
     s->items[at] = binding_base("ui:video:brightness", "Brightness",
                                 "display", "slider", s);
     s->items[at].minimum = 0.5;
@@ -594,7 +604,7 @@ static void language_write(void *v, const char *value) {
    * the C select aborts for it (header contract); mirror by
    * reporting through failed here instead of aborting. */
   const qa_ui_language_choice *found = NULL;
-  for (size_t i = 0; i < s->available_count; i++)
+  for (size_t i = 0; found == NULL && i < s->available_count; i++)
     if (strcmp(s->available[i].id, value) == 0) found = &s->available[i];
   if (found == NULL) {
     char message[256];
@@ -667,11 +677,11 @@ void qa_ui_native_language_settings_destroy(
 const char *qa_ui_native_language_settings_select(
     qa_ui_native_language_settings *settings, const char *id) {
   const qa_ui_language_choice *found = NULL;
-  for (size_t i = 0; i < settings->available_count; i++)
+  for (size_t i = 0; found == NULL && i < settings->available_count; i++)
     if (strcmp(settings->available[i].id, id) == 0)
       found = &settings->available[i];
   if (found == NULL)
-    qa_range_error("Language is not installed: %s", id);
+    qa_raise("Error", 0, 0, "Language is not installed: %s", id);
   if (settings->loading) return NULL;
   settings->loading = true;
   qa_loc_load_tier primary, fallback;

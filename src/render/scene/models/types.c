@@ -8,7 +8,28 @@
 
 void qa_scene_model_group_destroy(qa_scene_model_group *group) {
   qa_mat_draw_batches_destroy(group->batches, group->batch_count);
+  free(group->shadow_positions);
+  free(group->shadow_indices);
+  for (size_t i = 0; i < group->owned_storage_count; i++) free(group->owned_storage[i]);
+  free(group->owned_storage);
   memset(group, 0, sizeof *group);
+}
+qa_scene_group qa_scene_model_shadow_volume_group(const qa_scene_model_group *group) {
+  qa_render_operation operation;
+  memset(&operation, 0, sizeof operation);
+  operation.kind = QA_RENDER_OP_SHADOW_VOLUME;
+  operation.positions = group->shadow_positions;
+  operation.position_count = group->shadow_position_count;
+  operation.indices.values = group->shadow_indices;
+  operation.indices.count = group->shadow_index_count;
+  operation.mirror = group->shadow_mirror;
+  operation.white_image = group->shadow_white_image;
+  if (group->kind != NULL && strcmp(group->kind, "source") == 0) {
+    qa_source_surface_order order = {group->source_view, group->source_entity,
+                                     group->surface, group->fog, group->dlight};
+    return qa_shadow_volume_group(group->source_material, &order, operation);
+  }
+  return qa_shadow_volume_group(group->source_material, NULL, operation);
 }
 void qa_scene_model_groups_destroy(qa_scene_model_group *groups, size_t count) {
   for (size_t i = 0; i < count; i++) qa_scene_model_group_destroy(&groups[i]);

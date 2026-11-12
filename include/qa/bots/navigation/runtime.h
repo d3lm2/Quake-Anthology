@@ -49,6 +49,7 @@ typedef struct qa_navigation_runtime {
   qa_navigation_id_seconds *admission_seconds; size_t admission_count, admission_cap;
   double world_revision; /* TS number */
   int64_t generation;
+  char *estimate_scope; /* TS #estimateScope: owned, NULL until computed */
 } qa_navigation_runtime;
 /* False only on OOM; duplicate/invalid graph identities abort (TS RangeError). */
 bool qa_navigation_runtime_init(qa_navigation_runtime *rt, const qa_navigation_graph *graph,

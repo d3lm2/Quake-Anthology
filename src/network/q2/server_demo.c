@@ -348,10 +348,14 @@ bool qa_q2_read_server_demo(const uint8_t *bytes, size_t length,
                                           options);
     scope.has_multicast = ok;
   }
-  if (ok) ok = qa_q2_read_demo(bytes, length, &scope.demo_records, &scope.demo_count);
   bool signon = false;
-  for (size_t r = 0; ok && r < scope.demo_count; r++) {
-    ok = read_one(&scope, &scope.demo_records[r], &signon);
+  /* The TS generator frames each record only after the previous one was decoded, so a damaged
+   * later record cannot hide a decode error in an earlier one. */
+  size_t cursor = 0;
+  qa_q2_demo_span span;
+  while (ok && qa_q2_demo_next(bytes, length, &cursor, &span)) {
+    qa_q2_demo_record source = {span.offset, (uint8_t *)(uintptr_t)span.bytes, span.length};
+    ok = read_one(&scope, &source, &signon);
     if (!ok) break;
     if (scope.count == scope.capacity) {
       size_t next = scope.capacity > 0 ? scope.capacity * 2 : 8;

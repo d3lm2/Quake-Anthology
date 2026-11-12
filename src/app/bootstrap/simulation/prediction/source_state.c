@@ -8,6 +8,23 @@
 #include "qa/foundation/support.h"
 #include "qa/movement/q3/constants.h"
 #include "qa/foundation/js.h"
+#include <pthread.h>
+
+/* Snapshots travel by value, so a restored Q3 jumpPad cannot point into one. TS keeps the ActorId object: here each
+ * distinct id gets one stable cell for the process (a jump pad per map entity and generation). */
+typedef struct actor_cell { qa_actor_id id; struct actor_cell *next; } actor_cell;
+static actor_cell *stable_actors;
+static pthread_mutex_t stable_actor_lock = PTHREAD_MUTEX_INITIALIZER;
+static const qa_actor_id *stable_actor(qa_actor_id id) {
+  pthread_mutex_lock(&stable_actor_lock);
+  for (actor_cell *cell = stable_actors; cell != NULL; cell = cell->next)
+    if (qa_same_actor(cell->id, id) && cell->id.token == id.token) { pthread_mutex_unlock(&stable_actor_lock); return &cell->id; }
+  actor_cell *cell = malloc(sizeof *cell);
+  if (cell == NULL) { pthread_mutex_unlock(&stable_actor_lock); qa_range_error("Out of memory"); }
+  cell->id = id; cell->next = stable_actors; stable_actors = cell;
+  pthread_mutex_unlock(&stable_actor_lock);
+  return &cell->id;
+}
 
 qa_trace_hit qa_app_prediction_source_hit(double number, qa_app_prediction_source_entities entities) {
   qa_trace_hit hit; memset(&hit, 0, sizeof hit);
@@ -62,9 +79,10 @@ qa_app_movement_prediction_snapshot qa_app_read_prediction_source_state(qa_app_m
   q3.movement_direction = ps->movement_dir; q3.grapple_point = ps->grapple_point; q3.flags = ps->e_flags;
   q3.view_angles = ps->viewangles; q3.view_height = ps->viewheight;
   q3.predictable_event_sequence = ps->event_sequence;
-  qa_actor_id jump_pad_storage; const qa_actor_id *jump_pad = NULL;
-  if (ps->jumppad_ent != 0 && entities.actor_at && entities.actor_at(entities.ctx, ps->jumppad_ent, &jump_pad_storage)) jump_pad = &jump_pad_storage;
-  (void)jump_pad; /* landed q3 state stores jump_pad pointer; set below via static slot */
+  /* jumpPad: ps.jumppadEnt === 0 ? null : entities.actorAt(ps.jumppadEnt) */
+  qa_actor_id jump_pad_value;
+  if (ps->jumppad_ent != 0 && entities.actor_at && entities.actor_at(entities.ctx, ps->jumppad_ent, &jump_pad_value))
+    q3.jump_pad = stable_actor(jump_pad_value);
   q3.movement_frame = ps->pmove_framecount; q3.jump_pad_frame = ps->jumppad_frame;
   bool arsenal_q3 = source.arsenal.state.kind && strcmp(source.arsenal.state.kind, "q3") == 0;
   if (arsenal_q3) {
@@ -74,7 +92,7 @@ qa_app_movement_prediction_snapshot qa_app_read_prediction_source_state(qa_app_m
     source.arsenal.state.state = ps->weapon_state; source.arsenal.state.time_milliseconds = ps->weapon_time;
     free((void *)source.arsenal.ammo);
     size_t count = 0;
-    qa_inventory_entry *ammo = malloc(26 * sizeof *ammo);
+    qa_inventory_entry *ammo = malloc(2 * QA_Q3_WEAPON_ITEM_COUNT * sizeof *ammo);
     if (!ammo) qa_range_error("Out of memory");
     for (size_t i = 0; i < QA_Q3_WEAPON_ITEM_COUNT; i++) {
       const qa_q3_weapon_item *item = &qa_q3_weapon_items[i];
@@ -172,10 +190,13 @@ void qa_app_write_prediction_source_state(qa_q3_base_player_state_record *ps,
     long long owned = 0;
     for (size_t i = 0; i < QA_Q3_WEAPON_ITEM_COUNT; i++) {
       const qa_q3_weapon_item *item = &qa_q3_weapon_items[i];
+      /* arsenal.ammo.find(entry => entry.item === ...): the first entry whose item text matches. */
       double item_count = 0, ammo_count = 0;
+      bool item_found = false, ammo_found = false;
       for (size_t j = 0; j < output.arsenal.ammo_count; j++) {
-        if (output.arsenal.ammo[j].item == item->item) item_count = output.arsenal.ammo[j].count;
-        if (item->ammo && output.arsenal.ammo[j].item == item->ammo) ammo_count = output.arsenal.ammo[j].count;
+        const char *entry_item = output.arsenal.ammo[j].item;
+        if (!item_found && entry_item && strcmp(entry_item, item->item) == 0) { item_count = output.arsenal.ammo[j].count; item_found = true; }
+        if (!ammo_found && item->ammo && entry_item && strcmp(entry_item, item->ammo) == 0) { ammo_count = output.arsenal.ammo[j].count; ammo_found = true; }
       }
       if (item_count > 0) owned |= 1LL << (long long)item->weapon;
       if (item->ammo) qa_q3_base_player_state_slots_set(&ps->ammo, item->weapon, ammo_count);

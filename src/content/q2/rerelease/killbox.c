@@ -2,6 +2,8 @@
 #include "qa/content/q2/rerelease/killbox.h"
 #include "qa/content/q2/foundation/fields.h"
 #include "rr_internal.h"
+#include "qa/foundation/support.h"
+#include <stdlib.h>
 #include <string.h>
 
 bool qa_q2_kill_rerelease_box(qa_q2_entity *e, qa_q2_game_services *g, qa_q2_rerelease_players *p, bool spawning, bool exact) {
@@ -9,8 +11,16 @@ bool qa_q2_kill_rerelease_box(qa_q2_entity *e, qa_q2_game_services *g, qa_q2_rer
   if (self && self->noclip) return true;
   qa_body_state body = rr_body_of(g, e);
   qa_vec3 mn = qa_q2_add(body.origin, body.bounds.min), mx = qa_q2_add(body.origin, body.bounds.max);
+  /* TS iterates the array observations() returned. The registry reuses one result
+   * buffer and the damage below can run another query (a death that spawns, a
+   * nested kill box), so the loop walks a copy. */
   size_t n = 0;
-  const qa_actor_observation *obs = qa_session_actor_registry_observations(g->host->actors, &n);
+  const qa_actor_observation *scratch = qa_session_actor_registry_observations(g->host->actors, &n);
+  qa_actor_observation *obs = n ? malloc(n * sizeof *obs) : NULL;
+  if (n && !obs) qa_range_error("Out of memory");
+  if (n) memcpy(obs, scratch, n * sizeof *obs);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, obs);
   for (size_t i = 0; i < n; i++) {
     qa_actor_id actor = obs[i].id;
     if (qa_same_actor(actor, e->actor.id)) continue;
@@ -35,5 +45,7 @@ bool qa_q2_kill_rerelease_box(qa_q2_entity *e, qa_q2_game_services *g, qa_q2_rer
     }
     g->damage(g->ctx, actor, e, e->actor.id, &e->actor.id, 100000, 0, QA_Q2_ZERO, body.origin, QA_Q2_ZERO, spawning ? 57 : 21, 32, NULL);
   }
+  qa_cleanup_pop(&guard);
+  free(obs);
   return true;
 }

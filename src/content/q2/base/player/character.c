@@ -80,7 +80,7 @@ void qa_q2_character_actor_restore(qa_q2_character_actor *character, qa_q2_base_
 
 static qa_body_state body_of(qa_q2_character_actor *character) {
   qa_body_state_result body = qa_shared_body_table_read(character->host.bodies, character->actor.id);
-  if (!body.has_value) qa_range_error("Q2 character actor has no shared body");
+  if (!body.has_value) qa_raise("Error", 0, 0, "Q2 character actor has no shared body");
   return body.value;
 }
 

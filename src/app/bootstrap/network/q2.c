@@ -101,8 +101,31 @@ typedef struct mvd_recording_owner {
 } mvd_recording_owner;
 typedef struct server_recording_owner {
   qa_app_q2_recording_sink sink; double generation;
-  const qa_q2_mvd_capture_config *configs; size_t config_count; void *token;
+  /* TS owner.configs = current.configStrings: an owned copy (configs_copy), as the capture it
+   * came from is released by the host's next capture. */
+  qa_q2_mvd_capture_config *configs; size_t config_count; void *token;
 } server_recording_owner;
+/* Entries then values in one block (free() releases it). */
+static qa_q2_mvd_capture_config *configs_copy(const qa_q2_mvd_capture_config *configs, size_t count) {
+  size_t size = count * sizeof *configs;
+  for (size_t i = 0; i < count; i++) size += strlen(configs[i].value ? configs[i].value : "") + 1;
+  qa_q2_mvd_capture_config *out = malloc(size ? size : 1);
+  if (!out) qa_range_error("out of memory");
+  char *text = (char *)(out + count);
+  for (size_t i = 0; i < count; i++) {
+    const char *value = configs[i].value ? configs[i].value : "";
+    size_t n = strlen(value) + 1;
+    memcpy(text, value, n);
+    out[i].index = configs[i].index;
+    out[i].value = text;
+    text += n;
+  }
+  return out;
+}
+static void server_owner_free(server_recording_owner *owner) {
+  free(owner->configs);
+  free(owner);
+}
 struct qa_app_q2_server_network {
   qa_app_q2_server_network_options options;
   qa_app_q2_server_host host;
@@ -114,18 +137,25 @@ struct qa_app_q2_server_network {
   bool ended;
   peer **peers; size_t peer_count, peer_cap;
   qa_q2_challenge_table challenges;
-  const void **pending; size_t pending_count, pending_cap;
+  /* TS pending: ActorCommand[]. Each accepted command is copied in, so the host's input()
+   * result is borrowed only for the call. */
+  qa_actor_command *pending; size_t pending_count, pending_cap;
   double server_generation;
   const void *mvd_output; const void *const *mvd_events; size_t mvd_event_count;
   bool has_mvd_frame;
-  const qa_q2_mvd_capture *mvd_seed;
+  /* TS mvdSeed: the seeded capture. A capture's storage is the host's until its next capture,
+   * so the seed is kept as the encoder primed with it (what attach would build from it). */
+  bool has_mvd_seed; qa_q2_mvd_encoder mvd_seed_encoder;
   bool has_mvd_tick; double mvd_tick;
   const qa_q2_mvd_emission **mvd_messages; size_t mvd_message_count, mvd_message_cap;
   mvd_recording_owner *mvd_owner;
   qa_q2_mvd_broadcast broadcast; bool broadcast_live, broadcast_init;
-  const qa_q2_mvd_capture *server_demo_seed;
+  /* TS serverDemoSeed: what attach reads of it (servercount, configStrings), owned. */
+  bool has_server_demo_seed; double server_demo_seed_servercount;
+  qa_q2_mvd_capture_config *server_demo_seed_configs; size_t server_demo_seed_config_count;
   server_recording_owner *server_owner;
-  const void **poll_result; size_t poll_result_cap;
+  /* poll()'s result: copies of the drained queue, valid until the next poll. */
+  const void **poll_result; qa_actor_command *poll_values; size_t poll_result_cap;
   /* Tokens of owners a failed append retired; kept so a later detach cannot match a new owner. */
   void **retired_tokens; size_t retired_count;
   qa_connectionless_gate gate;
@@ -190,7 +220,11 @@ static peer *find_peer(qa_app_q2_server_network *n, const char *key) {
   return NULL;
 }
 static void peer_game_state_clear(peer *p) {
-  if (p->has_game_state) free((void *)p->game_state.data);
+  if (p->has_game_state) {
+    qa_q2_server_data_result *data = (qa_q2_server_data_result *)p->game_state.data;
+    qa_q2_server_data_result_clear(data);
+    free(data);
+  }
   memset(&p->game_state, 0, sizeof p->game_state);
   p->has_game_state = false;
 }
@@ -247,7 +281,7 @@ static void drop_peer(qa_app_q2_server_network *n, peer *p, const char *reason) 
   }
   size_t kept = 0;
   for (size_t i = 0; i < n->pending_count; i++) {
-    const qa_actor_command *command = n->pending[i];
+    const qa_actor_command *command = &n->pending[i];
     bool drop = false;
     if (command->source.kind == QA_COMMAND_SOURCE_REMOTE_CLIENT) {
       if (client_equal(command->source.client, p->player.client)) drop = true;
@@ -269,13 +303,23 @@ static void reply_oob(qa_app_q2_server_network *n, const qa_net_address *remote,
   free(bytes);
 }
 static void accept_connection(qa_app_q2_server_network *n, const qa_net_address *remote) {
+  /* TS reads this.options.host.downloads (the host the network was created with); the C hosts
+   * free their downloads with the world, so the current host's is read. Both read the same
+   * sv_downloadserver cvar. */
   const qa_app_q2_downloads *downloads = n->host.downloads;
   char *url = downloads ? qa_app_q2_downloads_http_server((qa_app_q2_downloads *)downloads) : NULL;
-  char text[1024];
-  snprintf(text, sizeof text, "client_connect%s%s%s", is_kex(&n->host.protocol) ? " 2023" : "",
+  /* No bound on the advertised URL, as TS builds the text. */
+  size_t total = (url ? strlen(url) : 0) + 48;
+  char *text = malloc(total);
+  if (!text) { free(url); qa_range_error("out of memory"); }
+  snprintf(text, total, "client_connect%s%s%s", is_kex(&n->host.protocol) ? " 2023" : "",
       url ? " dlserver=" : "", url ? url : "");
   free(url);
+  qa_cleanup text_guard;
+  qa_cleanup_push(&text_guard, free, text);
   reply_oob(n, remote, text);
+  qa_cleanup_pop(&text_guard);
+  free(text);
 }
 static const qa_q2_server_data_result *state_data(const qa_app_q2_game_state *state) {
   return state->data;
@@ -301,8 +345,13 @@ static void new_client(qa_app_q2_server_network *n, peer *p) {
     for (size_t i = 0; i < p->split_count; i++)
       data.clientnums[i + 1] = p->splits[i].player.source_entity - 1;
   }
+  /* The peer keeps its own copy (gamedir and levelname included): the host's state may be
+   * replaced while the peer still signs on from it. */
   qa_q2_server_data_result *owned_data = xmalloc(sizeof *owned_data);
-  *owned_data = data;
+  qa_cleanup owned_guard;
+  qa_cleanup_push(&owned_guard, free, owned_data);
+  qa_q2_server_data_result_copy(owned_data, &data);
+  qa_cleanup_pop(&owned_guard);
   state.data = owned_data;
   peer_game_state_clear(p);
   p->game_state = state;
@@ -509,13 +558,14 @@ static void think_command(void *ctx, const qa_q2_wire_usercmd *command) {
   const void *input = think->n->host.input(value, value2,
       command, value4);
   if (input) {
-    if (think->n->pending_count == think->n->pending_cap) {
-      think->n->pending_cap = think->n->pending_cap ? think->n->pending_cap * 2 : 32;
-      think->n->pending = realloc(think->n->pending,
-          think->n->pending_cap * sizeof *think->n->pending);
-      if (!think->n->pending) qa_range_error("out of memory");
+    qa_app_q2_server_network *n = think->n;
+    if (n->pending_count == n->pending_cap) {
+      size_t cap = n->pending_cap ? n->pending_cap * 2 : 32;
+      qa_actor_command *grown = realloc(n->pending, cap * sizeof *n->pending);
+      if (!grown) qa_range_error("out of memory");
+      n->pending = grown; n->pending_cap = cap;
     }
-    think->n->pending[think->n->pending_count++] = input;
+    n->pending[n->pending_count++] = *(const qa_actor_command *)input;
   }
 }
 typedef struct client_records {
@@ -1009,12 +1059,15 @@ void qa_app_q2_server_network_destroy(qa_app_q2_server_network *network) {
   }
   if (network->server_owner) {
     free(network->server_owner->token);
-    free(network->server_owner);
+    server_owner_free(network->server_owner);
   }
+  if (network->has_mvd_seed) qa_q2_mvd_encoder_destroy(&network->mvd_seed_encoder);
+  free(network->server_demo_seed_configs);
   for (size_t i = 0; i < network->retired_count; i++) free(network->retired_tokens[i]);
   free(network->retired_tokens);
   free(network->pending);
   free(network->poll_result);
+  free(network->poll_values);
   free(network->mvd_messages);
   free(network);
 }
@@ -1036,6 +1089,16 @@ size_t qa_app_q2_server_network_clients(qa_app_q2_server_network *network,
   }
   return count;
 }
+static void server_demo_seed_clear(qa_app_q2_server_network *n) {
+  free(n->server_demo_seed_configs);
+  n->server_demo_seed_configs = NULL;
+  n->server_demo_seed_config_count = 0;
+  n->has_server_demo_seed = false;
+}
+static void mvd_seed_clear(qa_app_q2_server_network *n) {
+  if (n->has_mvd_seed) qa_q2_mvd_encoder_destroy(&n->mvd_seed_encoder);
+  n->has_mvd_seed = false;
+}
 void qa_app_q2_server_network_change_world(qa_app_q2_server_network *n,
     qa_app_q2_server_host host) {
   wire_supported(&host, "Native Q2 map transition is unavailable: ");
@@ -1044,14 +1107,14 @@ void qa_app_q2_server_network_change_world(qa_app_q2_server_network *n,
       || host.protocol.version != n->host.protocol.version)
     qa_raise("Error", 0, 0, "Native Q2 map transition cannot change protocol");
   if (n->server_owner) qa_raise("Error", 0, 0, "Finish serverrecord with serverstop before changing maps");
-  n->server_demo_seed = NULL;
+  server_demo_seed_clear(n);
   size_t count = n->peer_count;
   qa_app_q2_player *players = xmalloc(count * sizeof *players);
   for (size_t i = 0; i < count; i++)
     players[i] = host.carried_player(host.ctx, n->peers[i]->player.client);
   n->host = host;
   n->has_mvd_frame = false;
-  n->mvd_seed = NULL;
+  mvd_seed_clear(n);
   n->has_mvd_tick = false;
   n->mvd_message_count = 0;
   n->server_generation++;
@@ -1284,11 +1347,18 @@ const void *const *qa_app_q2_server_network_poll(qa_app_q2_server_network *n,
     i++;
   }
   if (n->poll_result_cap < n->pending_count) {
-    n->poll_result = realloc(n->poll_result, n->pending_count * sizeof *n->poll_result);
-    if (!n->poll_result) qa_range_error("out of memory");
+    const void **result = realloc(n->poll_result, n->pending_count * sizeof *n->poll_result);
+    if (!result) qa_range_error("out of memory");
+    n->poll_result = result;
+    qa_actor_command *values = realloc(n->poll_values, n->pending_count * sizeof *n->poll_values);
+    if (!values) qa_range_error("out of memory");
+    n->poll_values = values;
     n->poll_result_cap = n->pending_count;
   }
-  for (size_t i = 0; i < n->pending_count; i++) n->poll_result[i] = n->pending[i];
+  for (size_t i = 0; i < n->pending_count; i++) {
+    n->poll_values[i] = n->pending[i];
+    n->poll_result[i] = &n->poll_values[i];
+  }
   *out_count = n->pending_count;
   n->pending_count = 0;
   return n->poll_result;
@@ -1665,7 +1735,9 @@ void qa_app_q2_server_network_publish(qa_app_q2_server_network *n,
         multicast_count++;
       }
     }
-    n->server_owner->configs = current->config_strings;
+    qa_q2_mvd_capture_config *configs = configs_copy(current->config_strings, current->config_string_count);
+    free(n->server_owner->configs);
+    n->server_owner->configs = configs;
     n->server_owner->config_count = current->config_string_count;
     const qa_simulation_output *simulation = output;
     qa_q2_byte_span *spans = xmalloc(multicast_count * sizeof *spans);
@@ -1685,7 +1757,7 @@ void qa_app_q2_server_network_publish(qa_app_q2_server_network *n,
     free(frame_bytes);
     if (!written) {
       retire_token(n, n->server_owner->token);
-      free(n->server_owner);
+      server_owner_free(n->server_owner);
       n->server_owner = NULL;
       recording_failed(n, "Server recording failed: ", caught.message);
     }
@@ -1809,10 +1881,10 @@ void qa_app_q2_server_network_close(qa_app_q2_server_network *n) {
   server_recording_owner *server_owner = n->server_owner;
   bool broadcast = n->broadcast_live;
   n->server_owner = NULL;
-  n->server_demo_seed = NULL;
+  server_demo_seed_clear(n);
   n->mvd_owner = NULL;
   n->broadcast_live = false;
-  n->mvd_seed = NULL;
+  mvd_seed_clear(n);
   n->has_mvd_frame = false;
   n->mvd_output = NULL;
   n->has_mvd_tick = false;
@@ -1839,7 +1911,7 @@ void qa_app_q2_server_network_close(qa_app_q2_server_network *n) {
   }
   if (server_owner) {
     retire_token(n, server_owner->token);
-    free(server_owner);
+    server_owner_free(server_owner);
   }
   if (broadcast) close_step_run((close_step){n, NULL, NULL, 5}, &failures);
   if (failures != 0) qa_raise("AggregateError", 0, 0, "Q2 server shutdown failed");
@@ -1854,7 +1926,12 @@ void qa_app_q2_server_network_server_recording_seed(qa_app_q2_server_network *ne
   if (capture->revision != 2010)
     qa_raise("Error", 0, 0, "serverrecord requires classic Quake II; use mvdrecord for other source revisions");
   if (network->server_owner) qa_raise("Error", 0, 0, "Already doing a serverrecord");
-  network->server_demo_seed = capture;
+  qa_q2_mvd_capture_config *seed_configs = configs_copy(capture->config_strings, capture->config_string_count);
+  server_demo_seed_clear(network);
+  network->has_server_demo_seed = true;
+  network->server_demo_seed_servercount = capture->servercount;
+  network->server_demo_seed_configs = seed_configs;
+  network->server_demo_seed_config_count = capture->config_string_count;
   qa_q2_server_demo_state state = {0};
   state.servercount = capture->servercount;
   state.gamedir = (char *)capture->gamedir;
@@ -1877,18 +1954,19 @@ void qa_app_q2_server_network_server_recording_seed(qa_app_q2_server_network *ne
 }
 void *qa_app_q2_server_network_server_recording_attach(qa_app_q2_server_network *network,
     qa_app_q2_recording_sink sink) {
-  const qa_q2_mvd_capture *seed = network->server_demo_seed;
-  if (network->ended || !seed || network->server_owner
-      || seed->servercount != network->server_generation)
+  if (network->ended || !network->has_server_demo_seed || network->server_owner
+      || network->server_demo_seed_servercount != network->server_generation)
     qa_raise("Error", 0, 0, "Server recording requires a current unused seed");
   server_recording_owner *owner = calloc(1, sizeof *owner);
   if (!owner) qa_range_error("out of memory");
+  owner->token = malloc(1);
+  if (!owner->token) { free(owner); qa_range_error("out of memory"); }
   owner->sink = sink;
-  owner->generation = seed->servercount;
-  owner->configs = seed->config_strings;
-  owner->config_count = seed->config_string_count;
-  owner->token = xmalloc(1);
-  network->server_demo_seed = NULL;
+  owner->generation = network->server_demo_seed_servercount;
+  owner->configs = network->server_demo_seed_configs; /* the seed's copy moves to the owner */
+  owner->config_count = network->server_demo_seed_config_count;
+  network->server_demo_seed_configs = NULL;
+  server_demo_seed_clear(network);
   network->server_owner = owner;
   return owner->token;
 }
@@ -1896,7 +1974,7 @@ void qa_app_q2_server_network_server_recording_detach(qa_app_q2_server_network *
     void *token) {
   if (network->server_owner && network->server_owner->token == token) {
     free(network->server_owner->token);
-    free(network->server_owner);
+    server_owner_free(network->server_owner);
     network->server_owner = NULL;
   }
 }
@@ -1930,27 +2008,22 @@ void qa_app_q2_server_network_mvd_recording_seed(qa_app_q2_server_network *netwo
     out->lengths[i] = blocks[i].length;
   }
   free(blocks);
-  qa_q2_mvd_encoder_destroy(&encoder);
-  network->mvd_seed = capture;
+  /* The primed encoder is the seed attach adopts (TS attach primes a new one from the seed). */
+  mvd_seed_clear(network);
+  network->mvd_seed_encoder = encoder;
+  network->has_mvd_seed = true;
 }
 void *qa_app_q2_server_network_mvd_recording_attach(qa_app_q2_server_network *network,
     qa_app_q2_recording_sink sink) {
-  if (network->ended || network->mvd_owner || !network->mvd_seed)
+  if (network->ended || network->mvd_owner || !network->has_mvd_seed)
     qa_raise("Error", 0, 0, "MVD recording requires an unused server seed");
   mvd_recording_owner *owner = calloc(1, sizeof *owner);
   if (!owner) qa_range_error("out of memory");
+  owner->token = malloc(1);
+  if (!owner->token) { free(owner); qa_range_error("out of memory"); }
   owner->sink = sink;
-  qa_q2_mvd_encoder_init(&owner->encoder);
-  qa_q2_mvd_capture empty = *network->mvd_seed;
-  empty.messages = NULL;
-  empty.message_count = 0;
-  qa_q2_mvd_byte_block *blocks = NULL;
-  size_t count = 0;
-  if (!qa_q2_mvd_encoder_capture(&owner->encoder, &empty, &blocks, &count))
-    qa_range_error("out of memory");
-  qa_q2_mvd_byte_blocks_free(blocks, count);
-  network->mvd_seed = NULL;
-  owner->token = xmalloc(1);
+  owner->encoder = network->mvd_seed_encoder;
+  network->has_mvd_seed = false;
   network->mvd_owner = owner;
   if (!network->broadcast_live) {
     network->mvd_tick = mvd_time(network);
@@ -2052,9 +2125,12 @@ void qa_app_q2_client_network_command(qa_app_q2_client_network *n, const char *t
   if (!n->channel_live) qa_raise("Error", 0, 0, "Q2 client is not connected");
   qa_q2_client_event event = {0};
   event.kind = QA_Q2_CLIENT_COMMAND;
-  event.text = (char *)text;
+  /* The command is console text (one byte per UTF-16 unit); KEX writes TextEncoder's UTF-8 of the TS string. */
+  char *utf8 = host_kex(n) ? qa_command_text_to_utf8(text) : NULL;
+  event.text = utf8 != NULL ? utf8 : (char *)text;
   size_t length = 0;
   uint8_t *bytes = qa_q2_encode_client_control(&event, host_kex(n), &length);
+  free(utf8);
   if (!bytes) qa_range_error("out of memory");
   qa_q2_channel_queue_reliable(&n->channel, bytes, length);
   free(bytes);
@@ -2066,6 +2142,10 @@ void qa_app_q2_client_network_userinfo(qa_app_q2_client_network *n, const char *
   if (host_kex(n)) {
     seat = qa_q2_kex_client_userinfo(text);
     if (!seat) qa_range_error("out of memory");
+    /* KEX writes TextEncoder's UTF-8 of the TS string; the userinfo is console text. */
+    char *utf8 = qa_command_text_to_utf8(seat);
+    free(seat);
+    seat = utf8;
     value = seat;
   }
   qa_q2_client_event event = {0};

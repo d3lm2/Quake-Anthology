@@ -37,18 +37,27 @@ static int64_t opt_face(Opt *o, int64_t n) {
 }
 static int64_t *newmap(size_t n) { int64_t *m = malloc((n ? n : 1) * sizeof *m); if (m) for (size_t i = 0; i < n; i++) m[i] = -1; return m; }
 static void *duparr(const void *p, size_t n, size_t es) { if (!n) return NULL; void *q = malloc(n * es); if (q) memcpy(q, p, n * es); return q; }
+typedef struct { Opt *o; qa_aas_area_rec **areas; } OptGuard;
+static void opt_free(void *arg) {
+  OptGuard *g = arg;
+  free(g->o->verts); free(g->o->edges); free(g->o->faces); free(g->o->eidx); free(g->o->fidx);
+  free(g->o->vmap); free(g->o->emap); free(g->o->fmap); free(*g->areas);
+}
 bool qa_optimize_aas(qa_aas_asset *out, const qa_aas_asset *asset) {
   memset(out, 0, sizeof *out); Opt o; memset(&o, 0, sizeof o); o.asset = asset;
+  /* optimizeAas throws (RangeError) on an out-of-range index; the partial tables go with it. */
+  qa_aas_area_rec *areas = NULL; OptGuard guard_state = {&o, &areas}; qa_cleanup guard; qa_cleanup_push(&guard, opt_free, &guard_state);
   o.edges = grow(o.edges, &o.ec, sizeof *o.edges, &o.oom); o.edges[o.en++] = (qa_aas_edge_rec){{0, 0}};
   o.faces = grow(o.faces, &o.fc, sizeof *o.faces, &o.oom); o.faces[o.fn++] = (qa_aas_face_rec){0,0,0,0,0,0};
   o.vmap = newmap(asset->vertex_count); o.emap = newmap(asset->edge_count); o.fmap = newmap(asset->face_count);
-  if (!o.vmap || !o.emap || !o.fmap) return false;
-  qa_aas_area_rec *areas = malloc((asset->area_count ? asset->area_count : 1) * sizeof *areas); if (!areas && asset->area_count) return false;
+  if (!o.vmap || !o.emap || !o.fmap) { qa_cleanup_pop(&guard); opt_free(&guard_state); return false; }
+  areas = malloc((asset->area_count ? asset->area_count : 1) * sizeof *areas); if (!areas && asset->area_count) { qa_cleanup_pop(&guard); opt_free(&guard_state); return false; }
   for (size_t i = 0; i < asset->area_count; i++) { if (i == 0) { memset(&areas[i], 0, sizeof areas[i]); continue; } int64_t ff = (int64_t)o.fin;
     for (int64_t k = 0; k < asset->areas[i].face_count; k++) { int64_t fi = asset->areas[i].first_face + k; if (fi < 0 || fi >= (int64_t)asset->face_index_count) qa_range_error("AAS optimization index %lld", (long long)fi);
       int64_t m = opt_face(&o, asset->face_indexes[fi]); if (m != 0) { if (o.fin == o.fic) o.fidx = grow(o.fidx, &o.fic, sizeof *o.fidx, &o.oom); o.fidx[o.fin++] = m; } }
     areas[i] = asset->areas[i]; areas[i].first_face = ff; areas[i].face_count = (int64_t)o.fin - ff; }
-  if (o.oom) return false;
+  qa_cleanup_pop(&guard);
+  if (o.oom) { opt_free(&guard_state); return false; }
   qa_aas_reach_rec *reach = duparr(asset->reachability, asset->reachability_count, sizeof *reach);
   for (size_t i = 0; i < asset->reachability_count; i++) { int64_t t = reach[i].travel_type & 0xffffff; if (t == 11 || t == 18 || t == 19) continue;
     int64_t fa = reach[i].face < 0 ? -reach[i].face : reach[i].face, ea = reach[i].edge < 0 ? -reach[i].edge : reach[i].edge;

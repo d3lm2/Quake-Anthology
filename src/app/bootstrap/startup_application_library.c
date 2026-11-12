@@ -4,6 +4,8 @@
  * generation checks are kept as written. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "startup_application_internal.h"
+#include "qa/foundation/caught_message.h"
+#include "qa/foundation/js_case.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -123,7 +125,7 @@ static void server_profile_refresh(void *ctx) {
   profile_call call = {library, NULL, 0};
   qa_caught_error caught;
   if (!qa_try(profile_list_body, &call, &caught)) {
-    if (revision == library->generation) set_status(library, caught.message);
+    if (revision == library->generation) set_status(library, qa_caught_message(&caught));
     return;
   }
   if (revision != library->generation || library->app->closed) {
@@ -226,7 +228,8 @@ static const qa_ui_library_entry *movie_visible(void *ctx, size_t *out_count) {
   *out_count = library->visible_count;
   return library->visible;
 }
-static int compare_names(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+/* Array.prototype.sort's default order: UTF-16 code units. */
+static int compare_names(const void *a, const void *b) { return qa_js_compare_code_units(*(char *const *)a, *(char *const *)b); }
 static void free_names(char **names, size_t count) {
   for (size_t i = 0; i < count; i++) free(names[i]);
   free(names);
@@ -264,7 +267,7 @@ static void movie_refresh(void *ctx) {
   qa_caught_error caught;
   if (!qa_try(movie_list_body, &call, &caught)) {
     free_names(call.names, call.count);
-    if (request == library->generation && !app->closed) set_status(library, caught.message);
+    if (request == library->generation && !app->closed) set_status(library, qa_caught_message(&caught));
     return;
   }
   if (request != library->generation || app->closed || client->configuration_current.scripts != scripts) {
@@ -330,7 +333,13 @@ struct qa_app_demo_library *qa_startup_current_demo_library(qa_startup_applicati
   record->mounts.scripts = client->configuration_current.scripts;
   record->mounts.context = local_context(client, &client->locals[0]);
   qa_app_demo_library_mounts mounts = {&record->mounts, demo_list_files, demo_read};
-  record->library = qa_app_demo_library_create(qa_app_console_script_files_root(record->mounts.scripts), mounts);
+  /* nativeFolders(descriptor.scripts.native) */
+  qa_native_config *native = qa_app_console_script_files_native(record->mounts.scripts);
+  size_t native_root_count = 0;
+  char **native_roots = qa_app_native_folders(native != NULL ? native->layout : NULL, &native_root_count);
+  record->library = qa_app_demo_library_create_native(qa_app_console_script_files_root(record->mounts.scripts), mounts,
+      (const char *const *)native_roots, native_root_count);
+  qa_app_native_folders_free(native_roots, native_root_count);
   if (record->library == NULL) { free(record); qa_range_error("Out of memory"); }
   void **grown = realloc(app->demo_libraries, (app->demo_library_count + 1) * sizeof *grown);
   if (grown == NULL) qa_range_error("Out of memory");
@@ -496,7 +505,7 @@ static void submit_body(void *ctx) {
 static void configuration_submit(qa_startup_library *library, const char *name, const char *path) {
   submit_call call = {library, name, path};
   qa_caught_error caught;
-  if (!qa_try(submit_body, &call, &caught)) set_status(library, caught.message);
+  if (!qa_try(submit_body, &call, &caught)) set_status(library, qa_caught_message(&caught));
 }
 typedef struct list_call { qa_app_console_script_files *scripts; qa_command_context context; qa_app_console_script_entry *files; size_t count; } list_call;
 static void list_body(void *ctx) {
@@ -514,12 +523,13 @@ static void configuration_refresh_with(qa_startup_library *library, const char *
   list_call call;
   memset(&call, 0, sizeof call);
   qa_caught_error caught;
+  const char *listed_error = NULL;
   bool listed = false;
   {
     qa_app_client_bootstrap *client = app->client;
     const qa_app_prepared_seat *seat = client != NULL ? first_seat(client) : NULL;
-    if (client == NULL) snprintf(caught.message, sizeof caught.message, "Client console output has no published owner");
-    else if (seat == NULL) snprintf(caught.message, sizeof caught.message, "Configuration library has no local seat");
+    if (client == NULL) listed_error = "Client console output has no published owner";
+    else if (seat == NULL) listed_error = "Configuration library has no local seat";
     else {
       call.scripts = client->configuration_current.scripts;
       call.context = seat->context;
@@ -527,9 +537,10 @@ static void configuration_refresh_with(qa_startup_library *library, const char *
     }
   }
   if (!listed) {
-    if (revision == library->generation && !app->closed && app->client != NULL
-        && (const void *)app->client->configuration_current.scripts == descriptor)
-      set_status(library, caught.message);
+    /* this.client?.configuration.current === descriptor: both undefined when no client is published. */
+    const void *current = app->client != NULL ? (const void *)app->client->configuration_current.scripts : NULL;
+    if (revision == library->generation && !app->closed && current == descriptor)
+      set_status(library, listed_error != NULL ? listed_error : qa_caught_message(&caught));
     return;
   }
   if (revision != library->generation || app->closed || app->client->configuration_current.scripts != call.scripts) {
@@ -638,7 +649,7 @@ static void progress_open_body(void *ctx) {
   progress_open *open = ctx;
   open->store = qa_app_player_progress_store_open(open->file);
 }
-static char error_text[sizeof ((qa_caught_error *)0)->message];
+static char *error_text; /* the whole caught message, valid until the next failed open */
 static qa_app_player_progress_store *progress_store(void *ctx, const char **error_out) {
   progress_state *state = ctx;
   *error_out = NULL;
@@ -658,8 +669,7 @@ static qa_app_player_progress_store *progress_store(void *ctx, const char **erro
     free(file);
     if (!opened) {
       state->has_cached = false;
-      snprintf(error_text, sizeof error_text, "%s", caught.message);
-      *error_out = error_text;
+      *error_out = qa_startup_keep_text(&error_text, qa_caught_message(&caught));
       return NULL;
     }
     qa_app_player_progress_store **grown = realloc(state->stores, (state->store_count + 1) * sizeof *grown);

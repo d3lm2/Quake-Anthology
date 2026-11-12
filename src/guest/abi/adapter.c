@@ -7,7 +7,7 @@
 #include "qa/foundation/support.h"
 #include "qa/guest/floating_point/x87.h"
 
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
 
 const char *qa_guest_execution_stop_kind_name(qa_guest_execution_stop_kind kind) {
   switch (kind) {
@@ -55,26 +55,25 @@ static uint8_t *read_locations(qa_guest_cpu *cpu, const qa_abi_location *locatio
                                size_t location_count, size_t size) {
   uint8_t *output = (uint8_t *)calloc(size == 0 ? 1 : size, 1);
   if (output == NULL) return NULL;
+  qa_cleanup output_node; /* a stack read that faults */
+  qa_cleanup_push(&output_node, free, output);
   for (size_t i = 0; i < location_count; i++) {
     const qa_abi_location *location = &locations[i];
-    if (location->offset + location->bytes > (int64_t)size) {
-      free(output); qa_range_error("ABI part exceeds its value");
-    }
+    if (location->offset + location->bytes > (int64_t)size) qa_range_error("ABI part exceeds its value");
     if (location->kind == QA_LOCATION_INTEGER) {
       uint64_t value = qa_integer_register_file_read(&cpu->state->registers, location->reg,
                                                      register_width(cpu), false);
       store_le(output + location->offset, value, (int)location->bytes);
     } else if (location->kind == QA_LOCATION_SSE) {
       size_t start = (size_t)location->sse_register * 16;
-      if (start + (size_t)location->bytes > xmm_length(cpu)) {
-        free(output); qa_range_error("ABI XMM register is unavailable");
-      }
+      if (start + (size_t)location->bytes > xmm_length(cpu)) qa_range_error("ABI XMM register is unavailable");
       memcpy(output + location->offset, cpu->state->simd.xmm + start, (size_t)location->bytes);
     } else {
       qa_guest_core_address address = qa_guest_pointer(cpu->memory, stack_pointer(cpu) + (uint64_t)location->stack_offset);
       qa_memory_copy_into(cpu->memory, address, output, (size_t)location->offset, (size_t)location->bytes);
     }
   }
+  qa_cleanup_pop(&output_node);
   return output;
 }
 
@@ -188,10 +187,13 @@ static qa_call_value read_argument(qa_guest_cpu *cpu, const qa_abi_argument *arg
   size_t size = (size_t)qa_value_bytes(&argument->layout, cpu->memory->pointer_bytes);
   uint8_t *bytes = (uint8_t *)malloc(size == 0 ? 1 : size);
   if (bytes == NULL) qa_range_error("ABI argument allocation failed");
+  qa_cleanup bytes_node; /* the guest's pointer may not be readable */
+  qa_cleanup_push(&bytes_node, free, bytes);
   qa_memory_copy(cpu->memory, pointer.pointer, bytes, size);
   qa_call_value result = argument->layout.is_aggregate
       ? qa_call_aggregate(argument->layout.layout, bytes, size)
       : qa_decode_value(&argument->layout, bytes, size, cpu->memory);
+  qa_cleanup_pop(&bytes_node);
   free(bytes);
   return result;
 }
@@ -212,6 +214,30 @@ static void check(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu, const qa_guest
     type_error("ABI, signature, processor, and memory architecture disagree");
 }
 
+/* What enter() holds while it can still raise (a guest stack that faults, a value of the wrong kind). */
+typedef struct enter_encoded { bool is_bigint; uint64_t raw; uint8_t *bytes; size_t len; } enter_encoded;
+typedef struct enter_scratch {
+  qa_abi_value_layout *layouts;
+  qa_abi_call_plan plan;
+  bool has_plan;
+  enter_encoded *encoded;
+  size_t encoded_count;
+  qa_guest_core_address *indirect;
+  bool *has_indirect;
+  uint8_t *bytes; /* one transient buffer */
+} enter_scratch;
+static void enter_release(void *arg) {
+  enter_scratch *scratch = arg;
+  free(scratch->layouts);
+  for (size_t i = 0; scratch->encoded != NULL && i < scratch->encoded_count; i++) free(scratch->encoded[i].bytes);
+  free(scratch->encoded);
+  free(scratch->indirect);
+  free(scratch->has_indirect);
+  free(scratch->bytes);
+  if (scratch->has_plan) qa_abi_call_plan_free(&scratch->plan);
+  memset(scratch, 0, sizeof *scratch);
+}
+
 void qa_x86_abi_adapter_enter(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu, qa_guest_core_address target,
                               const qa_guest_call_signature *signature,
                               const qa_call_value *arguments_, size_t argument_count,
@@ -219,27 +245,32 @@ void qa_x86_abi_adapter_enter(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu, qa
   check(adapter, cpu, signature);
   qa_memory_check(cpu->memory, target, 1, QA_ACCESS_EXECUTE);
   qa_memory_check(cpu->memory, return_address, 1, QA_ACCESS_EXECUTE);
+  enter_scratch scratch;
+  memset(&scratch, 0, sizeof scratch);
+  qa_cleanup scratch_node;
+  qa_cleanup_push(&scratch_node, enter_release, &scratch);
   qa_abi_value_layout *layouts_storage = NULL;
   const qa_abi_value_layout *layouts = signature->parameters;
   size_t layout_count = signature->parameter_count;
   if (argument_count != signature->parameter_count) {
     layouts_storage = (qa_abi_value_layout *)malloc(sizeof(qa_abi_value_layout) * (argument_count == 0 ? 1 : argument_count));
     if (layouts_storage == NULL) qa_range_error("Argument layout missing");
+    scratch.layouts = layouts_storage;
     for (size_t i = 0; i < argument_count; i++)
       layouts_storage[i] = i < signature->parameter_count ? signature->parameters[i]
                                                           : qa_inferred_layout(&arguments_[i], signature->variadic);
     layouts = layouts_storage; layout_count = argument_count;
   }
-  qa_abi_call_plan plan;
-  if (!qa_plan_guest_call(&plan, signature, layouts, layout_count)) {
-    free(layouts_storage); qa_range_error("Argument allocation missing");
-  }
+  if (!qa_plan_guest_call(&scratch.plan, signature, layouts, layout_count))
+    qa_range_error("Argument allocation missing");
+  scratch.has_plan = true;
+  const qa_abi_call_plan plan = scratch.plan;
   int word = adapter->abi.pointer_bytes;
   /* Encode first, exactly like TS (before any stack mutation). */
-  typedef struct encoded { bool is_bigint; uint64_t raw; uint8_t *bytes; size_t len; } encoded;
-  encoded *enc = (encoded *)calloc(argument_count == 0 ? 1 : argument_count, sizeof(encoded));
-  qa_guest_core_address *indirect = (qa_guest_core_address *)calloc(plan.argument_count == 0 ? 1 : plan.argument_count, sizeof(qa_guest_core_address));
-  bool *has_indirect = (bool *)calloc(plan.argument_count == 0 ? 1 : plan.argument_count, sizeof(bool));
+  enter_encoded *enc = scratch.encoded = (enter_encoded *)calloc(argument_count == 0 ? 1 : argument_count, sizeof(enter_encoded));
+  scratch.encoded_count = enc == NULL ? 0 : argument_count;
+  qa_guest_core_address *indirect = scratch.indirect = (qa_guest_core_address *)calloc(plan.argument_count == 0 ? 1 : plan.argument_count, sizeof(qa_guest_core_address));
+  bool *has_indirect = scratch.has_indirect = (bool *)calloc(plan.argument_count == 0 ? 1 : plan.argument_count, sizeof(bool));
   if (enc == NULL || indirect == NULL || has_indirect == NULL) qa_range_error("Argument allocation missing");
   for (size_t i = 0; i < argument_count; i++) {
     const qa_abi_value_layout *layout = &layouts[i];
@@ -285,24 +316,26 @@ void qa_x86_abi_adapter_enter(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu, qa
   set_stack_pointer(cpu, entry_stack);
   if (has_output && plan.result.kind == QA_ABI_RESULT_MEMORY) {
     size_t size = (size_t)qa_value_bytes(&plan.result.layout, word);
-    uint8_t *zero = (uint8_t *)calloc(size == 0 ? 1 : size, 1);
+    uint8_t *zero = scratch.bytes = (uint8_t *)calloc(size == 0 ? 1 : size, 1);
     if (zero == NULL) qa_range_error("Argument allocation missing");
     qa_memory_write(cpu->memory, output, zero, size);
+    scratch.bytes = NULL;
     free(zero);
     qa_abi_value_layout pointer_layout; memset(&pointer_layout, 0, sizeof pointer_layout);
     pointer_layout.storage = QA_STORAGE_POINTER;
     qa_call_value pointer_value = qa_call_pointer(true, output);
     size_t len = 0;
-    uint8_t *bytes = qa_encode_value(&pointer_layout, &pointer_value, cpu->memory, &len);
+    uint8_t *bytes = scratch.bytes = qa_encode_value(&pointer_layout, &pointer_value, cpu->memory, &len);
     if (bytes == NULL) qa_range_error("Argument allocation missing");
     write_locations(cpu, plan.result.pointer.locations, plan.result.pointer.location_count, bytes, len);
+    scratch.bytes = NULL;
     free(bytes);
   }
   for (size_t i = 0; i < plan.argument_count; i++) {
     const qa_abi_argument *argument = &plan.arguments[i];
     if (enc[i].is_bigint) {
       if (argument->location_count == 0 || argument->locations[0].kind != QA_LOCATION_INTEGER)
-        qa_range_error("Integer argument has no assigned register");
+        qa_raise("Error", 0, 0, "Integer argument has no assigned register");
       qa_integer_register_file_write(&cpu->state->registers, argument->locations[0].reg,
                                      register_width(cpu), enc[i].raw, false);
     } else if (!has_indirect[i]) {
@@ -313,9 +346,10 @@ void qa_x86_abi_adapter_enter(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu, qa
       pointer_layout.storage = QA_STORAGE_POINTER;
       qa_call_value pointer_value = qa_call_pointer(true, indirect[i]);
       size_t len = 0;
-      uint8_t *bytes = qa_encode_value(&pointer_layout, &pointer_value, cpu->memory, &len);
+      uint8_t *bytes = scratch.bytes = qa_encode_value(&pointer_layout, &pointer_value, cpu->memory, &len);
       if (bytes == NULL) qa_range_error("Argument allocation missing");
       write_locations(cpu, argument->locations, argument->location_count, bytes, len);
+      scratch.bytes = NULL;
       free(bytes);
     }
   }
@@ -323,9 +357,16 @@ void qa_x86_abi_adapter_enter(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu, qa
     qa_integer_register_file_write(&cpu->state->registers, QA_REG_RAX, 8, (uint64_t)plan.vector_registers, false);
   qa_processor_flags_set(&cpu->state->flags, QA_FLAG_DIRECTION, false);
   cpu->state->instruction_pointer = target.byte_offset;
-  for (size_t i = 0; i < argument_count; i++) free(enc[i].bytes);
-  free(enc); free(indirect); free(has_indirect); free(layouts_storage);
-  qa_abi_call_plan_free(&plan);
+  qa_cleanup_pop(&scratch_node);
+  enter_release(&scratch);
+}
+
+static void release_plan(void *plan) { qa_abi_call_plan_free(plan); }
+typedef struct values_scope { qa_call_value *values; size_t count; } values_scope;
+static void release_values(void *arg) {
+  values_scope *scope = arg;
+  for (size_t i = 0; i < scope->count; i++) qa_call_value_free(&scope->values[i]);
+  free(scope->values);
 }
 
 bool qa_x86_abi_adapter_arguments(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu,
@@ -349,7 +390,15 @@ bool qa_x86_abi_adapter_arguments(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu
   free(combined);
   qa_call_value *values = (qa_call_value *)calloc(plan.argument_count == 0 ? 1 : plan.argument_count, sizeof(qa_call_value));
   if (values == NULL) { qa_abi_call_plan_free(&plan); return false; }
-  for (size_t i = 0; i < plan.argument_count; i++) values[i] = read_argument(cpu, &plan.arguments[i]);
+  /* A guest stack read that faults releases the plan and the values read so far. */
+  qa_cleanup plan_node;
+  qa_cleanup_push(&plan_node, release_plan, &plan);
+  values_scope read = {values, 0};
+  qa_cleanup values_node;
+  qa_cleanup_push(&values_node, release_values, &read);
+  for (size_t i = 0; i < plan.argument_count; i++) { values[i] = read_argument(cpu, &plan.arguments[i]); read.count = i + 1; }
+  qa_cleanup_pop(&values_node);
+  qa_cleanup_pop(&plan_node);
   *out = values; *out_count = plan.argument_count;
   qa_abi_call_plan_free(&plan);
   return true;
@@ -361,11 +410,11 @@ qa_call_value qa_x86_abi_adapter_argument(qa_x86_abi_adapter *adapter, qa_guest_
   if (index < 0) qa_range_error("Guest argument index is outside its signature");
   qa_abi_call_plan plan;
   if (!qa_plan_guest_call(&plan, signature, NULL, 0)) qa_range_error("Guest argument index is outside its signature");
-  if ((uint64_t)index >= plan.argument_count) {
-    qa_abi_call_plan_free(&plan);
-    qa_range_error("Guest argument index is outside its signature");
-  }
+  qa_cleanup plan_node;
+  qa_cleanup_push(&plan_node, release_plan, &plan);
+  if ((uint64_t)index >= plan.argument_count) qa_range_error("Guest argument index is outside its signature");
   qa_call_value value = read_argument(cpu, &plan.arguments[index]);
+  qa_cleanup_pop(&plan_node);
   qa_abi_call_plan_free(&plan);
   return value;
 }
@@ -375,6 +424,8 @@ qa_call_result qa_x86_abi_adapter_return_value(qa_x86_abi_adapter *adapter, qa_g
   check(adapter, cpu, signature);
   qa_abi_call_plan plan;
   if (!qa_plan_guest_call(&plan, signature, NULL, 0)) qa_range_error("ABI argument allocation failed");
+  qa_cleanup plan_node; /* a result read that faults (a null or unmapped return buffer) */
+  qa_cleanup_push(&plan_node, release_plan, &plan);
   qa_call_result result = qa_call_void();
   switch (plan.result.kind) {
     case QA_ABI_RESULT_VOID: break;
@@ -387,9 +438,12 @@ qa_call_result qa_x86_abi_adapter_return_value(qa_x86_abi_adapter *adapter, qa_g
       size_t size = (size_t)qa_value_bytes(&plan.result.layout, adapter->abi.pointer_bytes);
       uint8_t *bytes = read_locations(cpu, plan.result.locations, plan.result.location_count, size);
       if (bytes == NULL) qa_range_error("ABI argument allocation failed");
+      qa_cleanup bytes_node;
+      qa_cleanup_push(&bytes_node, free, bytes);
       result = plan.result.layout.is_aggregate
           ? qa_call_aggregate(plan.result.layout.layout, bytes, size)
           : qa_decode_value(&plan.result.layout, bytes, size, cpu->memory);
+      qa_cleanup_pop(&bytes_node);
       free(bytes);
       break;
     }
@@ -399,10 +453,13 @@ qa_call_result qa_x86_abi_adapter_return_value(qa_x86_abi_adapter *adapter, qa_g
       size_t size = (size_t)qa_value_bytes(&plan.result.layout, adapter->abi.pointer_bytes);
       uint8_t *bytes = (uint8_t *)malloc(size == 0 ? 1 : size);
       if (bytes == NULL) qa_range_error("ABI argument allocation failed");
+      qa_cleanup bytes_node;
+      qa_cleanup_push(&bytes_node, free, bytes);
       qa_memory_copy(cpu->memory, address, bytes, size);
       result = plan.result.layout.is_aggregate
           ? qa_call_aggregate(plan.result.layout.layout, bytes, size)
           : qa_decode_value(&plan.result.layout, bytes, size, cpu->memory);
+      qa_cleanup_pop(&bytes_node);
       free(bytes);
       break;
     }
@@ -416,6 +473,7 @@ qa_call_result qa_x86_abi_adapter_return_value(qa_x86_abi_adapter *adapter, qa_g
       break;
     }
   }
+  qa_cleanup_pop(&plan_node);
   qa_abi_call_plan_free(&plan);
   return result;
 }
@@ -425,20 +483,21 @@ void qa_x86_abi_adapter_leave(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu,
   check(adapter, cpu, signature);
   qa_abi_call_plan plan;
   if (!qa_plan_guest_call(&plan, signature, NULL, 0)) qa_range_error("ABI argument allocation failed");
+  qa_cleanup plan_node; /* every throw below is a raise: the plan goes with it */
+  qa_cleanup_push(&plan_node, release_plan, &plan);
   int word = adapter->abi.pointer_bytes;
   uint64_t entry_stack = stack_pointer(cpu);
   qa_guest_core_address stack_address = qa_guest_pointer(cpu->memory, entry_stack);
   uint64_t address = word == 8 ? qa_memory_read_u64(cpu->memory, stack_address)
                                : qa_memory_read_u32(cpu->memory, stack_address);
-  if (address == 0) { qa_abi_call_plan_free(&plan); qa_range_error("Guest return address is null"); }
+  if (address == 0) qa_range_error("Guest return address is null");
   if (plan.result.kind == QA_ABI_RESULT_VOID) {
-    if (result->kind != QA_CALL_VOID) { qa_abi_call_plan_free(&plan); type_error("Void callback returned a value"); }
+    if (result->kind != QA_CALL_VOID) type_error("Void callback returned a value");
   } else {
-    if (result->kind == QA_CALL_VOID) { qa_abi_call_plan_free(&plan); type_error("Nonvoid callback did not return a value"); }
+    if (result->kind == QA_CALL_VOID) type_error("Nonvoid callback did not return a value");
     if (plan.result.kind == QA_ABI_RESULT_X87) {
-      if (result->kind != QA_CALL_FLOAT32 && result->kind != QA_CALL_FLOAT64) {
-        qa_abi_call_plan_free(&plan); type_error("x87 callback result must be floating point");
-      }
+      if (result->kind != QA_CALL_FLOAT32 && result->kind != QA_CALL_FLOAT64)
+        type_error("x87 callback result must be floating point");
       qa_write_x87_return(&cpu->state->x87, result->number,
                           plan.result.storage == QA_STORAGE_FLOAT32 ? QA_X87_FLOAT32 : QA_X87_FLOAT64);
     } else {
@@ -454,6 +513,8 @@ void qa_x86_abi_adapter_leave(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu,
         size_t len = 0;
         uint8_t *bytes = qa_encode_value(layout, result, cpu->memory, &len);
         if (bytes == NULL) qa_range_error("ABI argument allocation failed");
+        qa_cleanup bytes_node;
+        qa_cleanup_push(&bytes_node, free, bytes);
         if (plan.result.kind == QA_ABI_RESULT_REGISTERS)
           write_locations(cpu, plan.result.locations, plan.result.location_count, bytes, len);
         else {
@@ -462,11 +523,13 @@ void qa_x86_abi_adapter_leave(qa_x86_abi_adapter *adapter, qa_guest_cpu *cpu,
           qa_integer_register_file_write(&cpu->state->registers, QA_REG_RAX, register_width(cpu),
                                          destination.byte_offset, false);
         }
+        qa_cleanup_pop(&bytes_node);
         free(bytes);
       }
     }
   }
   set_stack_pointer(cpu, entry_stack + (uint64_t)(word + plan.callee_pop_bytes));
   cpu->state->instruction_pointer = address;
+  qa_cleanup_pop(&plan_node);
   qa_abi_call_plan_free(&plan);
 }

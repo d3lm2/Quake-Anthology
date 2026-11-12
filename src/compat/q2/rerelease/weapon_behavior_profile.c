@@ -13,6 +13,8 @@
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 
+static void tree_release(void *v) { qa_save_value_free(v); }
+static void declaration_release(void *v) { qa_compat_q2_native_weapon_declaration_free(v); }
 static bool read_declaration(const qa_native_weapon_behavior_declaration *declaration, const qa_module_identity *module,
                              qa_native_weapon_behavior_declaration *out) {
   char *json = qa_compat_q2_serialize_native_weapon_declaration(declaration);
@@ -20,7 +22,9 @@ static bool read_declaration(const qa_native_weapon_behavior_declaration *declar
   qa_save_value *tree = qa_parse_json_value((const uint8_t *)json, strlen(json), false);
   free(json);
   if (!tree) return false;
+  qa_cleanup tree_owned; qa_cleanup_push(&tree_owned, tree_release, tree); /* released when the module differs too */
   bool ok = qa_compat_q2_read_native_weapon_declaration(tree, module, out);
+  qa_cleanup_pop(&tree_owned);
   qa_save_value_free(tree);
   return ok;
 }
@@ -28,16 +32,31 @@ bool qa_compat_q2_built_in_rerelease_weapon_declaration(qa_module_identity modul
   if (strcmp(module.digest, qa_compat_q2_q2eaks_weapon_digest) != 0) return false;
   qa_native_weapon_behavior_declaration built;
   if (!qa_compat_q2_q2eaks_weapon_declaration(module.artifact_path, &built)) return false;
+  qa_cleanup built_owned; qa_cleanup_push(&built_owned, declaration_release, &built); /* released when the read refuses it */
   bool ok = read_declaration(&built, &module, out);
+  qa_cleanup_pop(&built_owned);
   qa_compat_q2_native_weapon_declaration_free(&built);
   return ok;
 }
-static qa_native_weapon_behavior_declaration retained;
-static bool retained_valid = false;
+/* The definition's id and title: TS strings live as long as anything holds them. The texts are kept once each
+ * for the life of the process (one retained declaration, freed by the next call, left every earlier definition
+ * with freed strings). role and aspect are literals of the reader. */
+static const char *retained_text(const char *text) {
+  static char **texts; static size_t count, capacity;
+  for (size_t i = 0; i < count; i++) if (strcmp(texts[i], text) == 0) return texts[i];
+  if (count == capacity) {
+    size_t grown_capacity = capacity ? capacity * 2 : 8; char **grown = realloc(texts, grown_capacity * sizeof *grown);
+    if (!grown) qa_range_error("Out of memory");
+    texts = grown; capacity = grown_capacity;
+  }
+  size_t length = strlen(text) + 1; char *copy = malloc(length); if (!copy) qa_range_error("Out of memory");
+  memcpy(copy, text, length); texts[count++] = copy;
+  return copy;
+}
 static bool definition_from(qa_module_identity module, const qa_native_weapon_behavior_declaration *profile,
                             qa_weapon_behavior_definition *out) {
   memset(out, 0, sizeof *out);
-  out->id = profile->id; out->title = profile->title; out->module = module; out->role = profile->role; out->aspect = profile->aspect;
+  out->id = retained_text(profile->id); out->title = retained_text(profile->title); out->module = module; out->role = profile->role; out->aspect = profile->aspect;
   out->has_activate = profile->has_activate_rva;
   if (profile->has_activate_rva) {
     out->activate.kind = QA_WEAPON_CALLBACK_NATIVE_ARTIFACT; out->activate.module = module;
@@ -54,9 +73,11 @@ bool qa_compat_q2_rerelease_weapon_definition(qa_module_identity module, const q
   if (!declaration) has = qa_compat_q2_built_in_rerelease_weapon_declaration(module, &parsed);
   else has = read_declaration(declaration, &module, &parsed);
   if (!has) return false;
-  if (retained_valid) qa_compat_q2_native_weapon_declaration_free(&retained);
-  retained = parsed; retained_valid = true;
-  return definition_from(module, &retained, out);
+  qa_cleanup parsed_owned; qa_cleanup_push(&parsed_owned, declaration_release, &parsed);
+  bool ok = definition_from(module, &parsed, out);
+  qa_cleanup_pop(&parsed_owned);
+  qa_compat_q2_native_weapon_declaration_free(&parsed);
+  return ok;
 }
 char *qa_compat_q2_rerelease_weapon_initialization_entities(const char *text, qa_string_view_list initialization_classes) {
   size_t count = 0;
@@ -69,7 +90,7 @@ char *qa_compat_q2_rerelease_weapon_initialization_entities(const char *text, qa
       if (classname && strcmp(classname, initialization_classes.values[j]) == 0) included = true;
     if (included && classname && strcmp(classname, "worldspawn") == 0) worldspawn++;
   }
-  if (worldspawn != 1) { qa_q1_entities_destroy(entities, count); qa_range_error("Native component initialization requires one authored worldspawn"); }
+  if (worldspawn != 1) { qa_q1_entities_destroy(entities, count); qa_raise("Error", 0, 0, "Native component initialization requires one authored worldspawn"); }
   size_t cap = 1024, len = 0;
   char *out = malloc(cap);
   if (!out) { qa_q1_entities_destroy(entities, count); return NULL; }
@@ -83,7 +104,7 @@ char *qa_compat_q2_rerelease_weapon_initialization_entities(const char *text, qa
     size_t need = 4;
     for (size_t j = 0; j < entities[i].property_count; j++) {
       const char *key = entities[i].properties[j].key, *value = entities[i].properties[j].value;
-      if (strchr(key, '"') || strchr(value, '"')) { free(out); qa_q1_entities_destroy(entities, count); qa_range_error("Native component entity field cannot be quoted"); }
+      if (strchr(key, '"') || strchr(value, '"')) { free(out); qa_q1_entities_destroy(entities, count); qa_raise("Error", 0, 0, "Native component entity field cannot be quoted"); }
       need += strlen(key) + strlen(value) + 6;
     }
     if (len + need + 1 > cap) { while (len + need + 1 > cap) cap *= 2; out = realloc(out, cap); if (!out) { qa_q1_entities_destroy(entities, count); return NULL; } }
@@ -195,7 +216,7 @@ static qa_guest_address record_address(bind_ctx_t *b, qa_raw_entity_view record)
   qa_compat_q2_memory *memory = bmem(b);
   if (strcmp(record.module.digest, memory->module.digest) != 0 || strcmp(record.module.id, memory->module.id) != 0 ||
       record.address.address_space != memory->address_space || b->profile.entity.byte_length > record.stride_bytes)
-    qa_range_error("Native trajectory record differs from declared source layout");
+    qa_raise("Error", 0, 0, "Native trajectory record differs from declared source layout");
   return record.address;
 }
 static qa_guest_address at(bind_ctx_t *b, qa_raw_entity_view record, double offset) {
@@ -217,7 +238,7 @@ static void write_vector(bind_ctx_t *b, qa_guest_address address, qa_vec3 value)
 static qa_guest_address client_field(bind_ctx_t *b, qa_raw_entity_view record, double offset) {
   qa_guest_address client;
   if (!qa_compat_q2_mem_read_pointer(bmem(b), at(b, record, b->profile.entity.client), &client))
-    qa_range_error("Native weapon context requires an admitted source client");
+    qa_raise("Error", 0, 0, "Native weapon context requires an admitted source client");
   bmem(b)->check(bmem(b)->ctx, client, b->profile.client.byte_length, "read");
   return qa_compat_q2_mem_offset(bmem(b), client, (int64_t)offset);
 }
@@ -240,12 +261,12 @@ static void p_equip(void *v, qa_raw_entity_view record) {
   const qa_compat_q2_memory * m = bmem(b);
   qa_guest_address a = client_field(b, record, b->profile.client.weapon);
   if (!qa_compat_q2_mem_read_pointer(m, a, &weapon))
-    qa_range_error("Native source did not equip the artifact-qualified weapon");
+    qa_raise("Error", 0, 0, "Native source did not equip the artifact-qualified weapon");
   bmem(b)->check(bmem(b)->ctx, weapon, b->profile.equipped_weapon.byte_length, "read");
   qa_guest_address callback;
   bool has = qa_compat_q2_mem_read_pointer(bmem(b), qa_compat_q2_mem_offset(bmem(b), weapon, (int64_t)b->profile.equipped_weapon.callback), &callback);
   if (!has || callback.byte_offset != b->weapon_think.byte_offset)
-    qa_range_error("Native source did not equip the artifact-qualified weapon");
+    qa_raise("Error", 0, 0, "Native source did not equip the artifact-qualified weapon");
 }
 static void p_launch(void *v, qa_raw_entity_view record) {
   bind_ctx_t *b = v;
@@ -253,10 +274,14 @@ static void p_launch(void *v, qa_raw_entity_view record) {
 }
 static bool p_matches(void *v, qa_raw_entity_view record, qa_raw_entity_view shooter) {
   bind_ctx_t *b = v;
+  /* readPointer(owner)?.byteOffset === recordAddress(shooter).byteOffset && readPointer(touch)?.byteOffset === ...:
+   * the shooter record is checked whether or not there is an owner, and the touch field is read only then. */
   qa_guest_address owner, touch;
   bool has_owner = qa_compat_q2_mem_read_pointer(bmem(b), at(b, record, b->profile.entity.owner), &owner);
+  qa_guest_address shooter_address = record_address(b, shooter);
+  if (!has_owner || owner.byte_offset != shooter_address.byte_offset) return false;
   bool has_touch = qa_compat_q2_mem_read_pointer(bmem(b), at(b, record, b->profile.entity.touch_callback), &touch);
-  return has_owner && owner.byte_offset == record_address(b, shooter).byte_offset && has_touch && touch.byte_offset == b->touch.byte_offset;
+  return has_touch && touch.byte_offset == b->touch.byte_offset;
 }
 static void p_project_shooter(void *v, qa_raw_entity_view record, qa_compat_q2_rerelease_weapon_shooter shooter) {
   bind_ctx_t *b = v;
@@ -285,16 +310,16 @@ static void p_think(void *v, qa_raw_entity_view record) {
   qa_guest_address callback, registration;
   bool has_callback = qa_compat_q2_mem_read_pointer(memory, at(b, record, b->profile.entity.think_callback), &callback);
   bool has_registration = qa_compat_q2_mem_read_pointer(memory, at(b, record, b->profile.entity.think_registration), &registration);
-  if (!has_callback) qa_range_error("Native projectile has a due think with no callback");
+  if (!has_callback) qa_raise("Error", 0, 0, "Native projectile has a due think with no callback");
   qa_native_weapon_registration_layout layout = b->profile.think.registration;
-  if (!has_registration) qa_range_error("Native projectile think lacks its typed source save registration");
+  if (!has_registration) qa_raise("Error", 0, 0, "Native projectile think lacks its typed source save registration");
   memory->check(memory->ctx, registration, layout.byte_length, "read");
   memory->check(memory->ctx, callback, 1, "execute");
   qa_guest_address registered_callback;
   bool has_registered = qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, registration, (int64_t)layout.callback), &registered_callback);
   if (qa_compat_q2_mem_read_u32(memory, qa_compat_q2_mem_offset(memory, registration, (int64_t)layout.tag)) != (uint32_t)b->profile.think.tag ||
       !has_registered || registered_callback.byte_offset != callback.byte_offset)
-    qa_range_error("Native projectile think lacks its typed source save registration");
+    qa_raise("Error", 0, 0, "Native projectile think lacks its typed source save registration");
   qa_compat_q2_mem_write_i64(memory, at(b, record, b->profile.entity.next_think), 0);
   invoke_record(b, callback, record);
 }
@@ -302,7 +327,7 @@ static qa_raw_entity_view p_allocate(void *v) {
   bind_ctx_t *b = v;
   qa_guest_call_result result = qa_compat_q2_rerelease_guest_module_invoke(b->module, b->allocate, b->allocate_signature, NULL, 0, NULL, NULL);
   qa_guest_address address;
-  if (!qa_compat_q2_rerelease_result_pointer(result, &address)) qa_range_error("Native source entity allocation returned null");
+  if (!qa_compat_q2_rerelease_result_pointer(result, &address)) qa_raise("Error", 0, 0, "Native source entity allocation returned null");
   qa_raw_entity_table table = qa_compat_q2_rerelease_guest_module_entities(b->module);
   qa_raw_entity_view record = table.from_pointer(table.ctx, address);
   (void)record_address(b, record);
@@ -336,10 +361,11 @@ static qa_guest_address resolve_entry(bind_ctx_t *b, qa_guest_address image_base
     }
     if (!differs) differs = qa_compat_q2_mem_read_u32(memory, qa_compat_q2_mem_offset(memory, record, (int64_t)layout.tag)) != (uint32_t)declared->tag;
     if (!differs) differs = !has_callback || callback.byte_offset != address.byte_offset;
-    if (differs) qa_range_error("Native typed source callback registration differs: %s", declared->name);
+    if (differs) qa_raise("Error", 0, 0, "Native typed source callback registration differs: %s", declared->name);
   }
   return address;
 }
+static void profile_abandon(void *v) { qa_compat_q2_rerelease_weapon_profile_destroy(v); }
 qa_compat_q2_rerelease_weapon_profile *qa_compat_q2_rerelease_weapon_profile_create(
     qa_compat_q2_rerelease_guest_module *module, qa_guest_address image_base, const qa_native_weapon_behavior_declaration *declaration) {
   qa_compat_q2_memory *memory = qa_compat_q2_rerelease_guest_module_get_memory(module);
@@ -347,25 +373,22 @@ qa_compat_q2_rerelease_weapon_profile *qa_compat_q2_rerelease_weapon_profile_cre
   bool has;
   if (!declaration) has = qa_compat_q2_built_in_rerelease_weapon_declaration(memory->module, &profile);
   else has = read_declaration(declaration, &memory->module, &profile);
-  if (!has) qa_range_error("Native trajectory behavior requires an artifact-qualified executable profile");
+  if (!has) qa_raise("Error", 0, 0, "Native trajectory behavior requires an artifact-qualified executable profile");
   bind_ctx_t *b = calloc(1, sizeof *b);
   qa_compat_q2_rerelease_weapon_profile *out = calloc(1, sizeof *out);
   if (!b || !out) { free(b); free(out); qa_compat_q2_native_weapon_declaration_free(&profile); return NULL; }
   b->module = module; b->profile = profile;
   out->ctx = b;
-  if (memory->pointer_bytes != 8) {
-    qa_compat_q2_rerelease_weapon_profile_destroy(out);
-    qa_range_error("Native trajectory declaration requires Windows x64 pointers");
-  }
+  /* An entry or registration the image refuses leaves no profile behind. */
+  qa_cleanup abandon; qa_cleanup_push(&abandon, profile_abandon, out);
+  if (memory->pointer_bytes != 8) qa_raise("Error", 0, 0, "Native trajectory declaration requires Windows x64 pointers");
   qa_weapon_behavior_definition definition;
-  if (!qa_compat_q2_rerelease_weapon_definition(memory->module, &b->profile, &definition)) {
-    qa_compat_q2_rerelease_weapon_profile_destroy(out);
-    qa_range_error("Native trajectory declaration has no definition");
-  }
+  if (!qa_compat_q2_rerelease_weapon_definition(memory->module, &b->profile, &definition))
+    qa_raise("Error", 0, 0, "Native trajectory declaration has no definition");
   b->equip_count = b->profile.equip.call_count; b->launch_count = b->profile.launch.call_count;
   b->equip = calloc(b->equip_count ? b->equip_count : 1, sizeof *b->equip);
   b->launch = calloc(b->launch_count ? b->launch_count : 1, sizeof *b->launch);
-  if (!b->equip || !b->launch) { qa_compat_q2_rerelease_weapon_profile_destroy(out); return NULL; }
+  if (!b->equip || !b->launch) { qa_cleanup_pop(&abandon); qa_compat_q2_rerelease_weapon_profile_destroy(out); return NULL; }
   for (size_t i = 0; i < b->equip_count; i++) b->equip[i] = resolve_entry(b, image_base, b->profile.equip.calls[i]);
   for (size_t i = 0; i < b->launch_count; i++) b->launch[i] = resolve_entry(b, image_base, b->profile.launch.calls[i]);
   b->allocate = resolve_entry(b, image_base, b->profile.allocate.entry);
@@ -374,7 +397,9 @@ qa_compat_q2_rerelease_weapon_profile *qa_compat_q2_rerelease_weapon_profile_cre
   b->weapon_think = resolve_entry(b, image_base, b->profile.equipped_weapon.expected);
   b->time = qa_compat_q2_mem_offset(memory, image_base, (int64_t)b->profile.time.rva);
   memory->check(memory->ctx, b->time, 8, "write");
-  const qa_guest_value_layout ptr[] = {qa_compat_q2_rr_pointer_layout};
+  /* The signature keeps a pointer to its parameter list: static storage (a local list left the stored signature
+   * pointing at this function's dead stack). */
+  static const qa_guest_value_layout ptr[] = {{false, "pointer", {NULL, 0, 0, 0, NULL, 0}}};
   b->think_signature = qa_compat_q2_rerelease_signature(ptr, 1, true, qa_compat_q2_rr_pointer_layout);
   b->allocate_signature = qa_compat_q2_rerelease_signature(NULL, 0, false, qa_compat_q2_rr_pointer_layout);
   /* The definition borrows the retained scratch; rebind its strings
@@ -390,6 +415,7 @@ qa_compat_q2_rerelease_weapon_profile *qa_compat_q2_rerelease_weapon_profile_cre
   out->equip = p_equip; out->launch = p_launch; out->matches = p_matches; out->project_shooter = p_project_shooter;
   out->project = p_project; out->trajectory = p_trajectory; out->generation = p_generation; out->time = p_time;
   out->next_think = p_next_think; out->think = p_think; out->allocate = p_allocate; out->free_record = p_free_record;
+  qa_cleanup_pop(&abandon);
   return out;
 }
 void qa_compat_q2_rerelease_weapon_profile_destroy(qa_compat_q2_rerelease_weapon_profile *profile) {

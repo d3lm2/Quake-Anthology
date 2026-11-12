@@ -42,7 +42,7 @@ static bool current_of(P *p, qa_actor_id actor, uint64_t generation, qa_client_i
     && actor_of_client(p, entry_client, &back) && actor_eq(back, actor);
 }
 typedef struct { P *p; qa_actor_id actor; const qa_mod_pickup_rule *definition; uint64_t generation; qa_client_id client; qa_actor_id pickup; qa_original_pickup_execution observer; const qa_compat_qc_mod_input_entry *inputs; } RunCtx;
-static bool accepts_fn(double v) { if (!isfinite(v)) qa_range_error("QC pickup returned a non-finite source result"); return v != 0; }
+static bool accepts_fn(double v) { if (!isfinite(v)) qa_raise("Error", 0, 0, "QC pickup returned a non-finite source result"); return v != 0; }
 static qa_original_pickup_decision run_fn(void *ctx) {
   RunCtx *r = ctx; P *p = r->p;
   const qa_original_pickup_operation *operation = &r->definition->operation;
@@ -61,7 +61,7 @@ static qa_original_pickup_decision take_fn(void *ctx, qa_original_pickup_offer o
   bool offered_has = false; for(size_t i=0;i<t->definition->offered_count;i++) if(strcmp(t->definition->offered[i], offer.item)==0) offered_has=true;
   if (!entry || !observer.current(observer.current_ctx) || !current_of(p, actor, entry->generation, entry->client) || !actor_eq(offer.recipient, actor)
       || !qa_session_actor_registry_is_live(p->services->actors, offer.pickup) || !offered_has)
-    qa_range_error("QC pickup invocation differs from its admitted source binding");
+    qa_raise("Error", 0, 0, "QC pickup invocation differs from its admitted source binding");
   uint64_t generation = entry->generation; qa_client_id client = entry->client;
   double count = offer.count.is_override ? offer.count.amount : 0;
   double time = offer.time.kind == QA_SOURCE_TIME_SECONDS ? offer.time.value : offer.time.value / 1000;
@@ -115,15 +115,21 @@ void qa_compat_qc_mod_pickups_release(P *p, qa_actor_id actor) {
   found = find_entry(p, actor);
   if (found) { size_t idx=(size_t)(found - p->entries); memmove(&p->entries[idx],&p->entries[idx+1],(p->entry_count-idx-1)*sizeof *p->entries); p->entry_count--; }
   for (size_t i=0;i<p->rule_set_count;i++) if (actor_eq(p->rule_sets[i].actor, actor)) p->rule_sets[i].retired = true;
-  if (!removed) qa_range_error("QC pickup release failed");
+  if (!removed) qa_raise("AggregateError", 0, 0, "QC pickup release failed");
 }
 typedef struct { P *p; qa_actor_id actor; } AdmitUnwind;
 static void unwind_admit(void *arg) { AdmitUnwind *u = arg; qa_compat_qc_mod_pickups_release(u->p, u->actor); }
+typedef struct { P *p; qa_owned_actor owner; const qa_original_pickup_rule *rules; size_t rule_count; void (*remove)(void *); void *remove_ctx; bool has_binding; int64_t binding; } BindJob;
+static void bind_job(void *arg) {
+  BindJob *job = arg; P *p = job->p;
+  if (p->operations.bind_pickup) p->operations.bind_pickup(p->operations.ctx, job->owner, job->rules, job->rule_count, &job->remove, &job->remove_ctx);
+  else { job->binding = qa_shared_inventory_table_bind_pickup(p->services->inventory, job->owner, (qa_inventory_pickup_binding){p->provider, job->rules, job->rule_count}); job->has_binding = true; }
+}
 void qa_compat_qc_mod_pickups_admit(P *p, qa_actor_id actor) {
   if (find_entry(p, actor)) return;
   qa_owned_actor owner; qa_client_id client; qa_actor_id back;
   if (!resolve_owned(p, actor, &owner) || !client_of(p, actor, &client) || !actor_of_client(p, client, &back) || !actor_eq(back, actor))
-    qa_range_error("QC pickups require a live canonical client");
+    qa_raise("Error", 0, 0, "QC pickups require a live canonical client");
   if (p->entry_count==p->entry_capacity){ size_t c=p->entry_capacity?p->entry_capacity*2:4; p->entries=realloc(p->entries,c*sizeof *p->entries); if(!p->entries) qa_range_error("pickup allocation failed"); p->entry_capacity=c; }
   uint64_t generation = ++p->next_generation;
   p->entries[p->entry_count++] = (Entry){actor, client, generation, owner, NULL, NULL, false, 0};
@@ -134,13 +140,17 @@ void qa_compat_qc_mod_pickups_admit(P *p, qa_actor_id actor) {
     if (inv) set->inventory_rules[in_n++] = set->rules[i];
   }
   if (in_n == 0) return;
-  void (*remove)(void *) = NULL; void *remove_ctx = NULL; bool has_binding = false; int64_t binding = 0;
-  AdmitUnwind unwind = {p, actor}; qa_cleanup scope; qa_cleanup_push(&scope, unwind_admit, &unwind); /* TS catch: release, rethrow */
-  if (p->operations.bind_pickup) p->operations.bind_pickup(p->operations.ctx, owner, set->inventory_rules, in_n, &remove, &remove_ctx);
-  else { binding = qa_shared_inventory_table_bind_pickup(p->services->inventory, owner, (qa_inventory_pickup_binding){p->provider, set->inventory_rules, in_n}); has_binding = true; }
-  qa_cleanup_pop(&scope);
+  /* TS catch (error) { try { release(actor) } catch (cleanup) { throw AggregateError([error, cleanup]) } throw error }. */
+  BindJob job = {p, owner, set->inventory_rules, in_n, NULL, NULL, false, 0};
+  qa_caught_error caught;
+  if (!qa_try(bind_job, &job, &caught)) {
+    AdmitUnwind unwind = {p, actor};
+    qa_caught_error cleanup;
+    if (!qa_try(unwind_admit, &unwind, &cleanup)) qa_raise("AggregateError", 0, 0, "QC pickup admission failed");
+    qa_rethrow(&caught);
+  }
   Entry *entry = find_entry(p, actor);
-  if (entry) { entry->remove = remove; entry->remove_ctx = remove_ctx; entry->has_inventory_binding = has_binding; entry->inventory_binding = binding; }
+  if (entry) { entry->remove = job.remove; entry->remove_ctx = job.remove_ctx; entry->has_inventory_binding = job.has_binding; entry->inventory_binding = job.binding; }
 }
 size_t qa_compat_qc_mod_pickups_protection(P *p, qa_actor_id actor, qa_protection_channel channel, const qa_original_pickup_rule **out, size_t cap) {
   RuleSet *set = actor_rules(p, actor);
@@ -157,5 +167,5 @@ void qa_compat_qc_mod_pickups_close(P *p) {
   for (size_t i=0;i<p->rule_set_count;i++) p->rule_sets[i].retired = true;
   size_t errors = 0;
   while (p->entry_count) { CloseTry attempt = {p, p->entries[0].actor}; qa_caught_error caught; if (!qa_try(close_release, &attempt, &caught)) errors++; }
-  if (errors) qa_range_error("QC pickup close failed");
+  if (errors) qa_raise("AggregateError", 0, 0, "QC pickup close failed");
 }

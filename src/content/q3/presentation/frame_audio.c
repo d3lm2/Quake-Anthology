@@ -43,7 +43,7 @@ void qa_q3_pres_client_frame_audio_play_buffered_sounds(qa_q3_pres_client_frame_
 }
 void qa_q3_pres_client_frame_audio_powerup_timer_sounds(qa_q3_pres_client_frame_audio *audio) {
   qa_q3_pres_client_game_state *state = audio->state;
-  if (!state->snap) qa_range_error("CG_PowerupTimerSounds requires an active snapshot");
+  if (!state->snap) qa_raise("Error", 0, 0, "CG_PowerupTimerSounds requires an active snapshot");
   for (double slot = 0; slot < 16; slot++) {
     double expiry = qa_q3_base_player_state_slots_get(&state->snap->player_state.powerups, slot);
     if (expiry <= state->time) continue;

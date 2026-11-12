@@ -18,7 +18,7 @@ qa_q3_death_animation_checkpoint qa_q3_death_animation_sequence_capture(const qa
   return (qa_q3_death_animation_checkpoint){1,s->index};
 }
 void qa_q3_death_animation_sequence_restore(qa_q3_death_animation_sequence *s, qa_q3_death_animation_checkpoint c){
-  if(c.version!=1||c.index!=trunc(c.index)||c.index<0||c.index>2) qa_range_error("Invalid Q3 death animation checkpoint");
+  if(c.version!=1||c.index!=trunc(c.index)||c.index<0||c.index>2) qa_raise("TypeError", 0, 0, "Invalid Q3 death animation checkpoint");
   s->index=c.index;
 }
 qa_q3_death_animation_next qa_q3_death_animation_sequence_next(qa_q3_death_animation_sequence *s){
@@ -50,7 +50,10 @@ double qa_q3_character_actor_get_event_sequence(const qa_q3_character_actor *a){
 double qa_q3_character_actor_get_respawn_eligible_after(const qa_q3_character_actor *a){ return a->respawn_time; }
 double qa_q3_character_actor_get_spawns(const qa_q3_character_actor *a){ return a->spawn_count; }
 static void emit_event(qa_q3_character_actor *a,double event,double parameter){
-  a->services.emit(a->services.ctx,(qa_q3_character_event){a->actor,a->sequence++,a->services.time_milliseconds(a->services.ctx),event,parameter});
+  /* TS evaluates the literal left to right: the sequence bump precedes the clock read. */
+  double sequence=a->sequence++;
+  double time=a->services.time_milliseconds(a->services.ctx);
+  a->services.emit(a->services.ctx,(qa_q3_character_event){a->actor,sequence,time,event,parameter});
 }
 void qa_q3_character_actor_jump(qa_q3_character_actor *a){ emit_event(a,QA_Q3_EV_JUMP,0); }
 qa_q3_character_checkpoint qa_q3_character_actor_capture(const qa_q3_character_actor *a){
@@ -71,13 +74,13 @@ static void bind_callbacks(qa_q3_character_actor *a){
 }
 void qa_q3_character_actor_restore(qa_q3_character_actor *a, qa_q3_character_checkpoint c){
   if(c.version!=1||!c.product||strcmp(c.product,a->product)!=0||!c.animation.kind||strcmp(c.animation.kind,"q3")!=0)
-    qa_range_error("Q3 character checkpoint belongs to another source product");
-  if(!c.initialized&&a->initialized) qa_range_error("Cannot restore an unadmitted Q3 character over an admitted binding");
+    qa_raise("TypeError", 0, 0, "Q3 character checkpoint belongs to another source product");
+  if(!c.initialized&&a->initialized) qa_raise("Error", 0, 0, "Cannot restore an unadmitted Q3 character over an admitted binding");
   if(c.initialized&&!a->initialized){
     if(!qa_shared_body_table_read(a->services.bodies,a->actor.id).has_value
       ||!qa_gameplay_authority_read(a->services.combat,a->actor.id).has_value
       ||!qa_shared_inventory_table_has(a->services.inventory,a->actor.id))
-      qa_range_error("Restore shared Q3 character stores before private state");
+      qa_raise("Error", 0, 0, "Restore shared Q3 character stores before private state");
     bind_callbacks(a);
   }
   a->current_animation=c.animation; a->flags=c.flags; a->sequence=c.event_sequence;
@@ -131,7 +134,7 @@ static void gib_actor(qa_q3_character_actor *a,double killer){
 void qa_q3_character_actor_die(qa_q3_character_actor *a){
   if(a->gibbed) return;
   qa_combat_state_result hr=qa_gameplay_authority_read(a->services.combat,a->actor.id);
-  if(!hr.has_value) qa_range_error("Q3 character has no health binding");
+  if(!hr.has_value) qa_raise("Error", 0, 0, "Q3 character has no health binding");
   double health=hr.value.health;
   qa_q3_character_death_context context=a->services.death_context(a->services.ctx,a->actor);
   if(a->dead){
@@ -140,7 +143,7 @@ void qa_q3_character_actor_die(qa_q3_character_actor *a){
     return;
   }
   a->dead=true; a->flags=(double)(qa_js_to_int32(a->flags)|1);
-  a->respawn_time=(double)(int32_t)((uint32_t)qa_js_to_int32(a->services.time_milliseconds(a->services.ctx))+1700u);
+  a->respawn_time=(double)qa_js_to_int32(a->services.time_milliseconds(a->services.ctx)+1700);
   qa_body_state_result br=qa_shared_body_table_read(a->services.bodies,a->actor.id);
   if(br.has_value){
     qa_body_state body=br.value; body.angles=(qa_vec3){0,body.angles.y,0}; body.bounds.max.z=-8;
@@ -158,18 +161,18 @@ void qa_q3_character_actor_die(qa_q3_character_actor *a){
 }
 bool qa_q3_character_actor_wants_respawn(const qa_q3_character_actor *a, double now, bool attack, bool use_holdable, double force_seconds){
   if(!a->dead||now<=a->respawn_time) return false;
-  return attack||use_holdable||(force_seconds>0&&((int32_t)((uint32_t)qa_js_to_int32(now)-(uint32_t)qa_js_to_int32(a->respawn_time))>(int32_t)((uint32_t)qa_js_to_int32(force_seconds)*1000u)));
+  return attack||use_holdable||(force_seconds>0&&(qa_js_to_int32(now-a->respawn_time)>(int32_t)((uint32_t)qa_js_to_int32(force_seconds)*1000u)));
 }
 void qa_q3_character_actor_commit_animation(qa_q3_character_actor *a, qa_actor_animation_state animation){
   if(!animation.provider||!a->provider||strcmp(animation.provider,a->provider)!=0
     ||!animation.state.kind||strcmp(animation.state.kind,"q3")!=0)
-    qa_range_error("Q3 character animation belongs to another provider");
+    qa_raise("TypeError", 0, 0, "Q3 character animation belongs to another provider");
   a->current_animation=animation.state;
 }
 qa_animation_step_result qa_q3_step_character_animation(qa_animation_step_input input,
     const char *product, bool dead, double event_sequence){
   if(!input.animation.state.kind||strcmp(input.animation.state.kind,"q3")!=0)
-    qa_range_error("Q3 character requires a Q3 animation state");
+    qa_raise("TypeError", 0, 0, "Q3 character requires a Q3 animation state");
   double elapsed=input.frame.elapsed.kind==QA_SOURCE_TIME_MILLISECONDS?input.frame.elapsed.value:trunc(input.frame.elapsed.value*1000);
   qa_q3_animation_context context={input.animation,dead,elapsed,0,product,event_sequence};
   qa_q3_animation_request drop={QA_Q3_ANIM_DROP_TIMERS,0,false,0};

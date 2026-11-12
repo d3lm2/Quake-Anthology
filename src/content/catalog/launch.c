@@ -110,16 +110,12 @@ static qa_content_id *required_content(const qa_selected_launch *launch,
                                        size_t *out_count) {
   qa_content_id *values = NULL;
   size_t count = 0, capacity = 0;
-  struct refs { const qa_provider_reference *items; size_t count; } groups;
-  (void)groups;
-  qa_provider_reference fixed[32];
+  qa_provider_reference fixed[4];
   size_t fixed_count = 0;
   fixed[fixed_count++] = launch->base.map.entities;
   fixed[fixed_count++] = launch->base.movement;
   fixed[fixed_count++] = launch->base.character.definition;
   fixed[fixed_count++] = launch->base.character.appearance;
-  for (size_t i = 0; i < launch->base.weapons.count && fixed_count < 32; i++)
-    fixed[fixed_count++] = launch->base.weapons.values[i];
   size_t equipment_count = 0;
   qa_provider_reference *equipment =
       qa_equipment_providers(launch->base.equipment, &equipment_count);
@@ -139,6 +135,9 @@ static qa_content_id *required_content(const qa_selected_launch *launch,
       references[reference_count++] = (ref);                                  \
     } while (0)
   for (size_t i = 0; i < fixed_count; i++) PUSH_REF(fixed[i]);
+  /* Every selected weapon: the list has no limit. */
+  for (size_t i = 0; i < launch->base.weapons.count; i++)
+    PUSH_REF(launch->base.weapons.values[i]);
   for (size_t i = 0; i < equipment_count; i++) PUSH_REF(equipment[i]);
   PUSH_REF(launch->base.engine_behavior);
   PUSH_REF(launch->base.combat);
@@ -220,18 +219,21 @@ static bool order_for_content(qa_content_catalog *catalog,
   size_t count = 0;
   for (size_t i = 0; i < first.count; i++) {
     const char *key = mount_path_of(&first.mounts[i]);
-    for (size_t m = 0; m < plan->mount_count; m++) {
+    /* byPath is a Map: the last plan mount with this path names it. */
+    for (size_t m = plan->mount_count; m-- > 0;) {
       if (strcmp(mount_path_of(&plan->mounts[m]), key) != 0) continue;
       qa_mount_id id = mount_id_of(&plan->mounts[m]);
       bool seen = false;
-      for (size_t s = 0; s < count; s++) if (order[s] == id) seen = true;
+      /* A Set of ids: equal text is one id, whichever array holds it. */
+      for (size_t s = 0; s < count; s++) if (strcmp(order[s], id) == 0) seen = true;
       if (!seen && order != NULL) order[count++] = id;
+      break;
     }
   }
   for (size_t i = 0; i < plan->default_order_count; i++) {
     bool seen = false;
     for (size_t s = 0; s < count; s++)
-      if (order[s] == plan->default_order[i]) seen = true;
+      if (strcmp(order[s], plan->default_order[i]) == 0) seen = true;
     if (!seen && order != NULL) order[count++] = plan->default_order[i];
   }
   qa_content_catalog_mount_list_free(&first);
@@ -544,6 +546,13 @@ bool qa_prepare_launch_mount_plan(const qa_resolve_launch_options *options,
   return true;
 }
 
+/* The id string `plan` owns that equals `id`, or NULL. */
+static qa_mount_id own_mount_id(const qa_resolved_mount_plan *plan, qa_mount_id id) {
+  for (size_t m = 0; m < plan->mount_count; m++)
+    if (strcmp(mount_id_of(&plan->mounts[m]), id) == 0) return mount_id_of(&plan->mounts[m]);
+  return NULL;
+}
+
 static bool resource_seen(const qa_resolved_resource_reference *values,
                           size_t count, qa_resource_id id) {
   for (size_t i = 0; i < count; i++)
@@ -587,6 +596,11 @@ static void resources_free(qa_resolved_resource_reference *values, size_t count)
 
 void qa_resolve_launch_result_free(qa_resolve_launch_result *result) {
   free(result->execution);
+  free(result->opened_default_order);
+  free(result->opened_prefix_orders);
+  for (size_t i = 0; result->opened_prefix_mounts != NULL && i < result->opened_prefix_count; i++)
+    free(result->opened_prefix_mounts[i]);
+  free(result->opened_prefix_mounts);
   if (result->artifacts != NULL)
     for (size_t i = 0; i < result->prepared.selected.base.execution_count; i++)
       qa_resolved_resource_release(&result->artifacts[i]);
@@ -966,7 +980,42 @@ bool qa_resolve_launch(const qa_resolve_launch_options *options,
   recipe->transition = selected->base.transition;
   recipe->execution = out->execution;
   recipe->execution_count = execution_count;
+  /* TS `mounts: mounted.plan`: the plan as opened, pure archives first. The
+   * orders are rebuilt over this result's own id strings so they outlive
+   * the mount set closed below. */
   recipe->mounts = out->plan;
+  if (mounted.plan != NULL && mounted.plan != &out->plan &&
+      mounted.plan->mount_count == out->plan.mount_count) {
+    const qa_resolved_mount_plan *opened = mounted.plan;
+    size_t prefix_count = opened->prefix_order_count;
+    out->opened_default_order = (qa_mount_id *)calloc(
+        opened->default_order_count != 0 ? opened->default_order_count : 1, sizeof(qa_mount_id));
+    out->opened_prefix_orders = (qa_prefix_mount_order *)calloc(
+        prefix_count != 0 ? prefix_count : 1, sizeof(qa_prefix_mount_order));
+    out->opened_prefix_mounts = (qa_mount_id **)calloc(
+        prefix_count != 0 ? prefix_count : 1, sizeof(qa_mount_id *));
+    bool mapped = out->opened_default_order != NULL && out->opened_prefix_orders != NULL &&
+                  out->opened_prefix_mounts != NULL && prefix_count == out->plan.prefix_order_count;
+    for (size_t i = 0; mapped && i < opened->default_order_count; i++)
+      mapped = (out->opened_default_order[i] = own_mount_id(&out->plan, opened->default_order[i])) != NULL;
+    for (size_t p = 0; mapped && p < prefix_count; p++) {
+      size_t count = opened->prefix_orders[p].mount_count;
+      out->opened_prefix_mounts[p] = (qa_mount_id *)calloc(count != 0 ? count : 1, sizeof(qa_mount_id));
+      out->opened_prefix_count = p + 1;
+      mapped = out->opened_prefix_mounts[p] != NULL;
+      for (size_t i = 0; mapped && i < count; i++)
+        mapped = (out->opened_prefix_mounts[p][i] = own_mount_id(&out->plan, opened->prefix_orders[p].mounts[i])) != NULL;
+      out->opened_prefix_orders[p].prefix = out->plan.prefix_orders[p].prefix;
+      out->opened_prefix_orders[p].mounts = out->opened_prefix_mounts[p];
+      out->opened_prefix_orders[p].mount_count = count;
+    }
+    if (mapped) {
+      recipe->mounts.default_order = out->opened_default_order;
+      recipe->mounts.default_order_count = opened->default_order_count;
+      recipe->mounts.prefix_orders = out->opened_prefix_orders;
+      recipe->mounts.prefix_order_count = prefix_count;
+    }
+  }
   recipe->resources = resources;
   recipe->resource_count = resource_count;
   out->resources = resources;

@@ -11,12 +11,18 @@
 
 #include "qa/content/composition/q2/index.h"
 #include "qa/contracts/session.h"
+#include "qa/persistence/value.h"
 
 /** TS captureQ2Product(source). Returns a malloc'd record array (count in
  * *out_count); each record owns its bytes and schema. Release with
  * qa_q2_product_checkpoints_free. */
 qa_provider_checkpoint *qa_capture_q2_product(qa_q2_product_runtime *source, size_t *out_count);
 void qa_q2_product_checkpoints_free(qa_provider_checkpoint *records, size_t count);
+
+/** The `match` value of the q2:composition record: source.match.selection as
+ * encodeCheckpointValue walks it (kind; the DeathBall fields; the LMCTF travel
+ * when the selection carries one). The caller owns the tree. */
+qa_save_value *qa_q2_product_match_selection_value(qa_q2_product_match *match);
 
 /** TS restoreQ2Product(source, checkpoints). The caller restores shared
  * actor/body/combat/inventory identities first. A missing, duplicated or

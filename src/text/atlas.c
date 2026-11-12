@@ -753,22 +753,32 @@ qa_text_texture_rect qa_glyph_uv(const qa_resolved_text_glyph *glyph) {
 
 /* Decodes one UTF-8 code point; invalid bytes yield U+FFFD and consume
  * one byte (the TS iterates a well-formed UTF-16 string). */
+/* One code point of decoded text, as TextDecoder reads UTF-8: each maximal
+ * invalid subpart (overlong, surrogate, above U+10FFFF, cut short) is one
+ * U+FFFD. C0 80 is U+0000 (the decoded-text form of a NUL). */
 static int64_t decode_utf8(const unsigned char *text, size_t length,
                            size_t *advance) {
   unsigned char first = text[0];
-  if (first < 0x80) {
-    *advance = 1;
-    return first;
+  *advance = 1;
+  if (first < 0x80) return first;
+  if (first == 0xc0 && length >= 2 && text[1] == 0x80) {
+    *advance = 2;
+    return 0;
   }
-  int extra = first >= 0xf0 ? 3 : first >= 0xe0 ? 2 : first >= 0xc0 ? 1 : -1;
-  if (extra < 0 || length < (size_t)(extra + 1)) {
-    *advance = 1;
-    return 0xfffd;
-  }
+  int extra = first >= 0xc2 && first <= 0xdf ? 1 : first >= 0xe0 && first <= 0xef ? 2
+              : first >= 0xf0 && first <= 0xf4 ? 3 : 0;
+  if (extra == 0) return 0xfffd;
   int64_t code = first & (extra == 1 ? 0x1f : extra == 2 ? 0x0f : 0x07);
   for (int i = 1; i <= extra; i++) {
-    if ((text[i] & 0xc0) != 0x80) {
-      *advance = 1;
+    unsigned char lower = 0x80, upper = 0xbf;
+    if (i == 1) {
+      if (first == 0xe0) lower = 0xa0;
+      else if (first == 0xed) upper = 0x9f;
+      else if (first == 0xf0) lower = 0x90;
+      else if (first == 0xf4) upper = 0x8f;
+    }
+    if ((size_t)i >= length || text[i] < lower || text[i] > upper) {
+      *advance = (size_t)i;
       return 0xfffd;
     }
     code = (code << 6) | (text[i] & 0x3f);

@@ -2,7 +2,7 @@
  * Port of src/compat/qvm/interpreter.ts, plus qa_qvmx_* forms of memory.ts and
  * operations.ts. The TS generator and Promise machinery collapses to direct
  * synchronous recursion (docs/PORTING.md). TS try/catch/finally maps onto
- * qa_range_error_catch at the same boundaries, and cancellation is the same
+ * qa_try at the same boundaries, and cancellation is the same
  * thrown signal as in TS, so a hook's own catch and cleanup still run and the
  * exact target invocation returns zero.
  * GPL-2.0-or-later.
@@ -24,7 +24,21 @@
 /* DataView scalar access over a qa_qvmx_view (TS DataView over guest
  * bytes; bounds via memory-writes.ts index(), little-endian). */
 void qa_qvmx_view_check(const qa_qvmx_view *view, int64_t offset, int64_t width) {
-  if (offset < 0 || width < 0 || offset > (int64_t)view->length - width)
+  /* The native DataView: JavaScriptCore words its two refusals differently. */
+  if (offset < 0) qa_range_error("byteOffset cannot be negative");
+  if (width < 0 || offset > (int64_t)view->length - width) qa_range_error("Out of bounds access");
+}
+/* A store into a watched, publishing or retired allocation is the TS index()
+ * check of QvmWritableView, which has its own message; any other store is native. */
+static void view_store_check(const qa_qvmx_view *view, int64_t offset, int64_t width) {
+  const qa_qvm_memory_writes *owner = qa_qvmx_writes_for(view->bytes);
+  /* An empty view at the end of an allocation starts one past its last byte. */
+  if (owner == NULL && view->length == 0) owner = qa_qvmx_writes_for(view->bytes - 1);
+  if (owner == NULL || !qa_qvm_memory_writes_get_intercepts(owner)) {
+    qa_qvmx_view_check(view, offset, width);
+    return;
+  }
+  if (offset < 0 || offset > (int64_t)view->length - width)
     qa_range_error("Offset is outside the bounds of the DataView");
 }
 int32_t qa_qvmx_view_i32(const qa_qvmx_view *view, int64_t offset) {
@@ -44,7 +58,7 @@ static void view_store(qa_qvmx_view *view, int64_t offset, const uint8_t *bytes,
   else memcpy(target, bytes, width);
 }
 void qa_qvmx_view_set_i32(qa_qvmx_view *view, int64_t offset, int32_t value) {
-  qa_qvmx_view_check(view, offset, 4);
+  view_store_check(view, offset, 4);
   uint32_t v;
   memcpy(&v, &value, sizeof v);
   uint8_t bytes[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24)};
@@ -67,7 +81,7 @@ uint8_t qa_qvmx_view_u8(const qa_qvmx_view *view, int64_t offset) {
   return view->bytes[offset];
 }
 void qa_qvmx_view_set_u8(qa_qvmx_view *view, int64_t offset, uint8_t value) {
-  qa_qvmx_view_check(view, offset, 1);
+  view_store_check(view, offset, 1);
   view_store(view, offset, &value, 1);
 }
 uint16_t qa_qvmx_view_u16(const qa_qvmx_view *view, int64_t offset) {
@@ -76,7 +90,7 @@ uint16_t qa_qvmx_view_u16(const qa_qvmx_view *view, int64_t offset) {
   return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8));
 }
 void qa_qvmx_view_set_u16(qa_qvmx_view *view, int64_t offset, uint16_t value) {
-  qa_qvmx_view_check(view, offset, 2);
+  view_store_check(view, offset, 2);
   uint8_t bytes[2] = {(uint8_t)value, (uint8_t)(value >> 8)};
   view_store(view, offset, bytes, 2);
 }
@@ -252,8 +266,20 @@ bool qa_qvmx_evaluate_branch(qa_qvm_opcode opcode, int32_t left, int32_t right) 
 
 /* ---------- interpreter.ts ---------- */
 
-#define THROWN_CAPACITY 512
+#if defined(__GNUC__)
+#define QVM_NOINLINE __attribute__((noinline))
+#else
+#define QVM_NOINLINE
+#endif
 #define CANCEL_SIGNAL "QVM function scope cancelled"
+/* Nested invocations (a hook proceeding, an observer, a syscall reentering the
+ * module) recurse on the C stack where TS recurses on the JS stack, and guest
+ * code decides how deep. JavaScriptCore ends that with a catchable RangeError
+ * after about 3000 levels (2952 through a hook, 4294 through a syscall, measured
+ * with bun 1.3); an unchecked C stack would end it with a fault. The cap keeps
+ * the same failure, at a depth the default 8 MiB stack holds with the host's
+ * own frames between levels. */
+#define QVM_MAX_NESTED_EXECUTIONS 1024
 #define HOST_SCOPE_MESSAGE "QVM recursive call requires the active syscall or function hook with no pending child"
 
 typedef struct operands {
@@ -266,7 +292,7 @@ typedef struct operands {
 static void operands_reserve(operands *o) {
   if (o->depth == 255) {
     if (o->debug) qa_common_error(QA_COMMON_ERROR_DROP, "VM opStack overflow");
-    qa_range_error("QVM operand stack overflow");
+    qa_raise("Error", 0, 0, "QVM operand stack overflow");
   }
   o->depth++;
 }
@@ -278,7 +304,7 @@ static void operands_push(operands *o, int32_t word) {
 static int32_t operands_peek(operands *o) {
   if (!o->has[o->depth]) {
     if (o->debug) qa_common_error(QA_COMMON_ERROR_DROP, "QVM reads an uninitialized operand");
-    qa_range_error("QVM reads an uninitialized operand");
+    qa_raise("Error", 0, 0, "QVM reads an uninitialized operand");
   }
   return o->cells[o->depth];
 }
@@ -289,7 +315,7 @@ static void operands_set(operands *o, int32_t word) {
 static void operands_drop(operands *o) {
   if (o->depth == 0) {
     if (o->debug) qa_common_error(QA_COMMON_ERROR_DROP, "VM opStack underflow");
-    qa_range_error("QVM operand stack underflow");
+    qa_raise("Error", 0, 0, "QVM operand stack underflow");
   }
   o->depth--;
 }
@@ -301,7 +327,7 @@ static int32_t operands_pop(operands *o) {
 static void operands_complement_previous(operands *o) {
   if (o->depth == 0) {
     if (o->debug) qa_common_error(QA_COMMON_ERROR_DROP, "VM opStack underflow");
-    qa_range_error("QVM operand stack underflow");
+    qa_raise("Error", 0, 0, "QVM operand stack underflow");
   }
   /* ~peek in int32_t, written one slot down: the pinned interpreter's OP_BCOM. */
   o->cells[o->depth - 1] = ~operands_peek(o);
@@ -316,7 +342,7 @@ static int32_t operands_result(operands *o) {
   return operands_peek(o);
 }
 static void operands_truncate(operands *o, int depth) {
-  if (depth < 0 || depth > o->depth) qa_range_error("QVM cancellation lost its caller operands");
+  if (depth < 0 || depth > o->depth) qa_raise("Error", 0, 0, "QVM cancellation lost its caller operands");
   while (o->depth > depth) {
     o->has[o->depth] = false;
     o->depth--;
@@ -375,15 +401,13 @@ typedef struct source_region {
 
 typedef struct source_call source_call;
 
-/* A thrown error: its text, and for a cancellation which call's signal it is
- * (TS compares the Error object by identity). */
+/* A retained thrown error (TS keeps the error object): its class, payload and
+ * text, and for a cancellation which call's signal it is (TS compares the Error
+ * object by identity). Slots hold one on the heap, NULL while unset, so a frame
+ * that never fails costs no stack. */
 typedef struct thrown {
-  bool set;
   source_call *signal;
-  char message[THROWN_CAPACITY];
-  const char *name; /* the thrown class (CommonError keeps its code), RangeError when unknown */
-  int code;
-  long long detail;
+  qa_caught_error error;
 } thrown;
 
 struct source_call {
@@ -406,7 +430,7 @@ struct source_call {
   int64_t eval_frame_size;
   bool cancellation_open, cancellation_requested;
   uint64_t cancellation_serial;
-  thrown cancellation_failure;
+  thrown *cancellation_failure;
   source_call *next_scope; /* interpreter's open cancellation scopes */
 };
 
@@ -462,6 +486,12 @@ struct qa_qvm_interpreter {
   uint64_t next_serial;
   source_call *open_scopes;
   source_call *current_signal;
+  /* The one error in flight. Every catch inside the interpreter lands here, so a
+   * nested call level holds no message buffer on the C stack; a retained error is
+   * copied to a heap slot, and a rethrow copies it out before raising. */
+  qa_caught_error caught;
+  /* Nested execute() levels: C recursion where TS recurses on the JS stack. */
+  int depth;
   /* Allocations the interpreter must release or whose liveness it must check. */
   void **symbol_blocks;
   size_t symbol_block_count, symbol_block_capacity;
@@ -481,7 +511,7 @@ static void assert_allocation(const qa_qvm_interpreter *interp) {
   if (interp->registration != NULL) {
     qa_qvm_vm_binding binding = qa_qvm_vm_registration_get_binding(interp->registration);
     if (binding.kind != NULL && strcmp(binding.kind, "freed") == 0)
-      qa_range_error("QVM registration has been freed");
+      qa_raise("Error", 0, 0, "QVM registration has been freed");
   }
   for (size_t i = 0; i < interp->allocation_count; i++)
     if (interp->allocations[i].assert_live != NULL)
@@ -511,7 +541,7 @@ static const char *const opcode_names[] = {
 
 static int64_t target_pc(qa_qvm_interpreter *interp, double index) {
   if (!is_integer(index) || index < 0 || index >= (double)interp->instruction_count)
-    qa_range_error("%s: invalid QVM instruction index %.0f", interp->source, index);
+    qa_raise("Error", 0, 0, "%s: invalid QVM instruction index %.0f", interp->source, index);
   return interp->instruction_pointers[(size_t)index];
 }
 
@@ -523,12 +553,12 @@ static int64_t source_instruction(qa_qvm_interpreter *interp, int64_t pc) {
     if (candidate == pc) return middle;
     if (candidate < pc) low = middle + 1; else high = middle - 1;
   }
-  qa_range_error("%s: caller PC is not an original instruction", interp->source);
+  qa_raise("Error", 0, 0, "%s: caller PC is not an original instruction", interp->source);
 }
 
 static int32_t code_word(qa_qvm_interpreter *interp, int64_t pc) {
   if (pc < 0 || pc >= (int64_t)interp->code_length)
-    qa_range_error("%s: invalid QVM byte PC %lld", interp->source, (long long)pc);
+    qa_raise("Error", 0, 0, "%s: invalid QVM byte PC %lld", interp->source, (long long)pc);
   return interp->code[pc];
 }
 
@@ -542,7 +572,7 @@ static int64_t interp_stack(qa_qvm_interpreter *interp, int64_t address) {
   interp_range(interp, address, 0);
   if (address % 4 != 0) {
     if (interp->debug) qa_common_error(QA_COMMON_ERROR_DROP, "VM program stack misaligned");
-    qa_range_error("QVM program stack is misaligned");
+    qa_raise("Error", 0, 0, "QVM program stack is misaligned");
   }
   return address;
 }
@@ -553,7 +583,7 @@ static bool counter_read(qa_qvm_interpreter *interp, int64_t address, int64_t le
   if (scope == NULL || address + length <= scope->address || address >= scope->address + 4)
     return false;
   if (address != scope->address || length != 4)
-    qa_range_error("QVM counter evaluation cannot partially read its isolated word");
+    qa_raise("Error", 0, 0, "QVM counter evaluation cannot partially read its isolated word");
   *out = scope->value;
   return true;
 }
@@ -569,7 +599,7 @@ static bool counter_write(qa_qvm_interpreter *interp, int64_t address, int64_t l
   int64_t current = interp->active != NULL ? interp->active->sp : scope->stack_end;
   int64_t low = scope->stack_start > current ? scope->stack_start : current;
   if (address < low || address + length > scope->stack_end)
-    qa_range_error("QVM counter evaluation attempted an unrelated source write");
+    qa_raise("Error", 0, 0, "QVM counter evaluation attempted an unrelated source write");
   return false;
 }
 
@@ -611,49 +641,72 @@ static int64_t source_argument_bytes(qa_qvm_interpreter *interp, int64_t caller_
     const qa_qvm_instruction *instruction = &interp->instructions[index--];
     if (instruction->opcode != QA_QVM_OP_ENTER) continue;
     if (instruction->operand < 8 || instruction->operand % 4 != 0)
-      qa_range_error("QVM source call lacks an aligned caller frame");
+      qa_raise("Error", 0, 0, "QVM source call lacks an aligned caller frame");
     int64_t bytes = instruction->operand - 8;
     if (bytes > QA_QVM_MAX_PRIVATE_ARGUMENT_WORDS * 4) bytes = QA_QVM_MAX_PRIVATE_ARGUMENT_WORDS * 4;
     return bytes;
   }
-  qa_range_error("QVM source call has no original caller frame");
+  qa_raise("Error", 0, 0, "QVM source call has no original caller frame");
 }
 
 /* ----- thrown errors and cancellation ----- */
 
-static void capture_thrown(qa_qvm_interpreter *interp, const char *message, thrown *out) {
-  out->set = true;
-  out->signal = strcmp(message, CANCEL_SIGNAL) == 0 ? interp->current_signal : NULL;
-  snprintf(out->message, sizeof out->message, "%.*s", (int)(sizeof out->message - 1), message);
-  out->name = "RangeError";
-  out->code = 0;
-  out->detail = 0;
+/* The cancellation call the caught error is the signal of, or NULL. */
+static source_call *caught_signal(const qa_qvm_interpreter *interp) {
+  return strcmp(interp->caught.message, CANCEL_SIGNAL) == 0 ? interp->current_signal : NULL;
 }
 
-static noreturn void rethrow(qa_qvm_interpreter *interp, const thrown *error) {
+/* TS `{ error }`: keep the caught error past this frame. */
+static thrown *retain_caught(qa_qvm_interpreter *interp) {
+  thrown *copy = malloc(sizeof *copy);
+  if (copy == NULL) {
+    fprintf(stderr, "QVM memory allocation failed\n");
+    abort();
+  }
+  copy->signal = caught_signal(interp);
+  copy->error = interp->caught;
+  return copy;
+}
+
+/* TS `throw error` of the caught error: same class, code, detail and text. The
+ * copy keeps the source apart from the catch buffer the raise formats into; out
+ * of line, so that copy is not part of a frame held across a nested call. */
+static QVM_NOINLINE noreturn void rethrow_caught(qa_qvm_interpreter *interp) {
+  qa_caught_error copy = interp->caught;
+  interp->current_signal = caught_signal(interp);
+  qa_rethrow(&copy);
+}
+
+/* TS `throw slot.error`. The slot stays with its owner, which frees it. */
+static QVM_NOINLINE noreturn void rethrow(qa_qvm_interpreter *interp, const thrown *error) {
+  qa_caught_error copy = error->error;
   interp->current_signal = error->signal;
-  qa_raise(error->name != NULL ? error->name : "RangeError", error->code, error->detail, "%s", error->message);
+  qa_rethrow(&copy);
 }
 
-static void cancellation_failure(source_call *scope, const thrown *error) {
+/* TS cancellationFailure(functionScope, error) for the caught error. */
+static void cancellation_failure(qa_qvm_interpreter *interp, source_call *scope) {
+  const source_call *signal = caught_signal(interp);
   for (source_call *call = scope; call != NULL; call = call->parent)
-    if (call->active && call->cancellation_requested && error->signal == call) return;
+    if (call->active && call->cancellation_requested && signal == call) return;
   for (source_call *call = scope; call != NULL; call = call->parent)
-    if (call->active && call->cancellation_open && !call->cancellation_failure.set)
-      call->cancellation_failure = *error;
+    if (call->active && call->cancellation_open && call->cancellation_failure == NULL)
+      call->cancellation_failure = retain_caught(interp);
+}
+
+static noreturn void raise_cancelled(qa_qvm_interpreter *interp, source_call *target) {
+  interp->current_signal = target;
+  qa_raise("Error", 0, 0, CANCEL_SIGNAL);
 }
 
 static void check_cancellation(qa_qvm_interpreter *interp, source_call *scope) {
   source_call *cancelled = NULL;
   for (source_call *call = scope; call != NULL; call = call->parent) {
     if (!call->active || !call->cancellation_open) continue;
-    if (call->cancellation_failure.set) rethrow(interp, &call->cancellation_failure);
+    if (call->cancellation_failure != NULL) rethrow(interp, call->cancellation_failure);
     if (call->cancellation_requested) cancelled = call;
   }
-  if (cancelled != NULL) {
-    interp->current_signal = cancelled;
-    qa_range_error(CANCEL_SIGNAL);
-  }
+  if (cancelled != NULL) raise_cancelled(interp, cancelled);
 }
 
 /* A capability encodes its interpreter and a never-reused serial, so an expired
@@ -672,18 +725,17 @@ static void cancel_function(qa_qvm_interpreter *interp, qa_qvm_cancellation_scop
   uint64_t token = (uint64_t)(uintptr_t)capability.token;
   uint64_t serial = token & (((uint64_t)1 << TOKEN_SERIAL_BITS) - 1);
   if ((token >> TOKEN_SERIAL_BITS) != interp->identity || serial == 0 || serial >= interp->next_serial)
-    qa_range_error("QVM cancellation scope belongs to another interpreter");
+    qa_raise("Error", 0, 0, "QVM cancellation scope belongs to another interpreter");
   source_call *target = interp->open_scopes;
   while (target != NULL && target->cancellation_serial != serial) target = target->next_scope;
-  if (target == NULL) qa_range_error("QVM cancellation scope has expired");
-  if (target->cancellation_requested) qa_range_error("QVM cancellation scope has already been used");
+  if (target == NULL) qa_raise("Error", 0, 0, "QVM cancellation scope has expired");
+  if (target->cancellation_requested) qa_raise("Error", 0, 0, "QVM cancellation scope has already been used");
   source_call *current = function_scope;
   while (current != NULL && current != target) current = current->parent;
-  if (current == NULL) qa_range_error("QVM cancellation scope is not an ancestor of this call");
+  if (current == NULL) qa_raise("Error", 0, 0, "QVM cancellation scope is not an ancestor of this call");
   check_cancellation(interp, function_scope);
   target->cancellation_requested = true;
-  interp->current_signal = target;
-  qa_range_error(CANCEL_SIGNAL);
+  raise_cancelled(interp, target);
 }
 
 /* ----- host call scopes (TS hostCall) ----- */
@@ -693,7 +745,7 @@ typedef struct host_scope {
   invocation *frame;
   source_call *function_scope;
   bool open;
-  thrown failure;
+  thrown *failure; /* owned by the host_call frame */
   void *extra;
 } host_scope;
 
@@ -703,7 +755,7 @@ static void run_validate(invocation *frame) {
 }
 
 static void host_available(host_scope *scope) {
-  if (!scope->open || scope->interp->active != scope->frame) qa_range_error(HOST_SCOPE_MESSAGE);
+  if (!scope->open || scope->interp->active != scope->frame) qa_raise("Error", 0, 0, HOST_SCOPE_MESSAGE);
   assert_live(scope->interp);
   run_validate(scope->frame);
 }
@@ -723,13 +775,11 @@ static void control_body(void *ctx) {
 /* TS scope.control: a failure stays recorded even if the callback catches it. */
 static void host_control(host_scope *scope, void (*operation)(void *ctx), void *ctx) {
   control_job job = {scope, operation, ctx};
-  char message[THROWN_CAPACITY];
-  if (qa_range_error_catch(control_body, &job, message, sizeof message)) return;
-  thrown error;
-  capture_thrown(scope->interp, message, &error);
-  if (!scope->failure.set) scope->failure = error;
-  cancellation_failure(scope->function_scope, &error);
-  rethrow(scope->interp, &error);
+  qa_qvm_interpreter *interp = scope->interp;
+  if (qa_try(control_body, &job, &interp->caught)) return;
+  if (scope->failure == NULL) scope->failure = retain_caught(interp);
+  cancellation_failure(interp, scope->function_scope);
+  rethrow_caught(interp);
 }
 
 typedef double (*host_perform_fn)(void *ctx, host_scope *scope);
@@ -747,7 +797,7 @@ static void host_body(void *ctx) {
   /* TS complete(), still inside hostCall's try. */
   host_scope *scope = job->scope;
   scope->open = false;
-  if (scope->failure.set) rethrow(scope->interp, &scope->failure);
+  if (scope->failure != NULL) rethrow(scope->interp, scope->failure);
   check_cancellation(scope->interp, scope->function_scope);
   assert_live(scope->interp);
   run_validate(scope->frame);
@@ -761,17 +811,15 @@ static int32_t host_call(qa_qvm_interpreter *interp, invocation *frame, host_per
   scope.frame = frame;
   scope.function_scope = function_scope;
   scope.open = true;
-  scope.failure.set = false;
-  scope.failure.signal = NULL;
+  scope.failure = NULL;
   scope.extra = NULL;
   host_job job = {&scope, perform, ctx, 0};
-  char message[THROWN_CAPACITY];
-  if (qa_range_error_catch(host_body, &job, message, sizeof message)) return job.result;
+  bool ok = qa_try(host_body, &job, &interp->caught);
+  free(scope.failure);
+  if (ok) return job.result;
   scope.open = false;
-  thrown error;
-  capture_thrown(interp, message, &error);
-  cancellation_failure(function_scope, &error);
-  rethrow(interp, &error);
+  cancellation_failure(interp, function_scope);
+  rethrow_caught(interp);
 }
 
 /* hostCall bracketed by the TS programStack save/restore finally. */
@@ -784,22 +832,19 @@ static int32_t host_call_stack(qa_qvm_interpreter *interp, invocation *frame, ho
   scope.frame = frame;
   scope.function_scope = function_scope;
   scope.open = true;
-  scope.failure.set = false;
-  scope.failure.signal = NULL;
+  scope.failure = NULL;
   scope.extra = NULL;
   host_job job = {&scope, perform, ctx, 0};
-  char message[THROWN_CAPACITY];
-  bool ok = qa_range_error_catch(host_body, &job, message, sizeof message);
+  bool ok = qa_try(host_body, &job, &interp->caught);
+  free(scope.failure);
   if (ok) {
     interp->program_stack = previous;
     return job.result;
   }
   scope.open = false;
-  thrown error;
-  capture_thrown(interp, message, &error);
-  cancellation_failure(function_scope, &error);
+  cancellation_failure(interp, function_scope);
   interp->program_stack = previous;
-  rethrow(interp, &error);
+  rethrow_caught(interp);
 }
 
 /* ----- execute entry forms ----- */
@@ -840,7 +885,7 @@ static int32_t execute_sync(qa_qvm_interpreter *interp, const execute_options *o
     evaluation.frame_size =
         qualify_evaluation(interp, options->instruction_index, &read_only->region, "read-only");
     if (read_only->input_count != read_only->region.input_count)
-      qa_range_error("Read-only QVM region live-ins differ from its qualified frame");
+      qa_raise("Error", 0, 0, "Read-only QVM region live-ins differ from its qualified frame");
     for (size_t i = 0; i < read_only->input_count; i++) (void)signed_word(read_only->inputs[i]);
     evaluation.has = true;
     evaluation.region = read_only->region;
@@ -887,14 +932,13 @@ static void async_child_body(void *ctx) {
 static int32_t run_async_child(host_scope *scope, execute_options *options) {
   host_available(scope);
   check_cancellation(scope->interp, scope->function_scope);
-  if (!scope->frame->asynchronous) qa_range_error("Synchronous QVM call received an asynchronous syscall");
+  if (!scope->frame->asynchronous) qa_raise("Error", 0, 0, "Synchronous QVM call received an asynchronous syscall");
   async_child_job job = {scope->interp, options, 0};
-  char message[THROWN_CAPACITY];
-  if (qa_range_error_catch(async_child_body, &job, message, sizeof message)) return job.result;
-  thrown error;
-  capture_thrown(scope->interp, message, &error);
-  scope->failure = error;
-  rethrow(scope->interp, &error);
+  qa_qvm_interpreter *interp = scope->interp;
+  if (qa_try(async_child_body, &job, &interp->caught)) return job.result;
+  free(scope->failure);
+  scope->failure = retain_caught(interp);
+  rethrow_caught(interp);
 }
 
 static double host_invoke_async_validated(void *ctx, const double *args, size_t arg_count,
@@ -938,7 +982,7 @@ static void host_cancel(void *ctx, qa_qvm_cancellation_scope capability) {
 
 /* The TS `invokeAsync` of an effect scope: scope.control(() => { throw ... }). */
 typedef struct refusal_job { const char *message; } refusal_job;
-static void refusal_body(void *ctx) { qa_range_error("%s", ((refusal_job *)ctx)->message); }
+static void refusal_body(void *ctx) { qa_raise("Error", 0, 0, "%s", ((refusal_job *)ctx)->message); }
 static double refuse_async(host_scope *scope, const char *message) {
   refusal_job job = {message};
   host_control(scope, refusal_body, &job);
@@ -1044,7 +1088,7 @@ typedef struct intercept_state {
   source_call *source;
   int64_t instruction_index;
   bool proceeded;
-  thrown failure; /* a failed original cannot be swallowed by its hook */
+  thrown *failure; /* a failed original cannot be swallowed by its hook; owned by intercept */
 } intercept_state;
 
 typedef struct scope_open_job {
@@ -1057,7 +1101,7 @@ static void cancellation_scope_body(void *ctx) {
   intercept_state *state = job->state;
   source_call *source = state->source;
   if (state->proceeded || source->cancellation_open)
-    qa_range_error("QVM cancellation scope must open once before proceeding");
+    qa_raise("Error", 0, 0, "QVM cancellation scope must open once before proceeding");
   qa_qvm_interpreter *interp = state->interp;
   source->cancellation_open = true;
   source->cancellation_serial = interp->next_serial++;
@@ -1085,7 +1129,7 @@ static void branches_body(void *ctx) {
   qa_qvm_interpreter *interp = state->interp;
   source_call *source = state->source;
   if (state->proceeded || source->branches_bound)
-    qa_range_error("QVM branches must bind once before proceeding");
+    qa_raise("Error", 0, 0, "QVM branches must bind once before proceeding");
   int64_t end = state->instruction_index + 1;
   while (end < (int64_t)interp->instruction_count &&
          code_word(interp, target_pc(interp, (double)end)) != QA_QVM_OP_ENTER)
@@ -1098,13 +1142,13 @@ static void branches_body(void *ctx) {
   for (size_t i = 0; i < count; i++) {
     double index = job->bindings[i].instruction_index;
     if (!is_safe_integer(index) || index <= (double)state->instruction_index || index >= (double)end)
-      qa_range_error("QVM branch is outside its owning function");
+      qa_raise("Error", 0, 0, "QVM branch is outside its owning function");
     int64_t pc = target_pc(interp, index);
     int32_t opcode = code_word(interp, pc);
     bool duplicate = false;
     for (size_t j = 0; j < i; j++) duplicate = duplicate || source->branch_pcs[j] == pc;
     if (opcode < QA_QVM_OP_EQ || opcode > QA_QVM_OP_GEF || duplicate)
-      qa_range_error("QVM branch requires a distinct original conditional instruction");
+      qa_raise("Error", 0, 0, "QVM branch requires a distinct original conditional instruction");
     source->branch_pcs[i] = pc;
     source->branch_bindings[i] = job->bindings[i];
   }
@@ -1131,7 +1175,7 @@ static void regions_body(void *ctx) {
   qa_qvm_interpreter *interp = state->interp;
   source_call *source = state->source;
   if (state->proceeded || source->regions != NULL)
-    qa_range_error("QVM regions must bind once before proceeding");
+    qa_raise("Error", 0, 0, "QVM regions must bind once before proceeding");
   size_t count = job->count;
   source_region *regions = calloc(count == 0 ? 1 : count, sizeof(source_region));
   if (regions == NULL) qa_range_error("QVM memory allocation failed");
@@ -1152,7 +1196,7 @@ static void regions_body(void *ctx) {
   double previous = (double)state->instruction_index;
   for (size_t n = 0; n < count; n++) {
     const qa_qvm_region_binding *binding = &job->bindings[order[n]];
-    if (binding->entry < previous) qa_range_error("QVM original regions overlap");
+    if (binding->entry < previous) qa_raise("Error", 0, 0, "QVM original regions overlap");
     int64_t frame_size = qualify_region(interp, state->instruction_index, binding->entry, binding->join);
     regions[n].binding = *binding;
     regions[n].entry_pc = target_pc(interp, binding->entry);
@@ -1167,15 +1211,15 @@ static void regions_body(void *ctx) {
 
 static void regions_with_cleanup(void *ctx) {
   regions_job *job = ctx;
-  char message[THROWN_CAPACITY];
-  bool ok = qa_range_error_catch(regions_body, job, message, sizeof message);
+  qa_qvm_interpreter *interp = job->state->interp;
+  bool ok = qa_try(regions_body, job, &interp->caught);
   free(job->order);
   if (!ok) {
     /* A failed binding leaves none bound, as TS assigns only at the end. */
     free(job->state->source->regions);
     job->state->source->regions = NULL;
     job->state->source->region_count = 0;
-    qa_range_error("%s", message);
+    rethrow_caught(interp);
   }
 }
 
@@ -1186,7 +1230,7 @@ static void intercept_regions(void *ctx, const qa_qvm_region_binding *bindings, 
 }
 
 static void begin_body(intercept_state *state) {
-  if (state->proceeded) qa_range_error("QVM function continuation can only run once");
+  if (state->proceeded) qa_raise("Error", 0, 0, "QVM function continuation can only run once");
   state->proceeded = true;
 }
 
@@ -1215,7 +1259,7 @@ static void proceed_body(void *ctx) {
   if (job->region != NULL) {
     int64_t frame_size = qualify_evaluation(state->interp, state->instruction_index, job->region, "source");
     if (job->input_count != job->region->input_count)
-      qa_range_error("QVM region live-ins differ from its qualified frame");
+      qa_raise("Error", 0, 0, "QVM region live-ins differ from its qualified frame");
     for (size_t i = 0; i < job->input_count; i++) (void)signed_word(job->inputs[i]);
     source->has_evaluation = true;
     source->eval_region = *job->region;
@@ -1238,13 +1282,12 @@ static void proceed_body(void *ctx) {
 static double run_proceed(host_scope *scope, proceed_job *job) {
   host_available(scope);
   check_cancellation(scope->interp, scope->function_scope);
-  char message[THROWN_CAPACITY];
-  if (qa_range_error_catch(proceed_body, job, message, sizeof message)) return job->result;
+  qa_qvm_interpreter *interp = scope->interp;
+  if (qa_try(proceed_body, job, &interp->caught)) return job->result;
   intercept_state *state = scope->extra;
-  thrown error;
-  capture_thrown(scope->interp, message, &error);
-  state->failure = error;
-  rethrow(scope->interp, &error);
+  free(state->failure);
+  state->failure = retain_caught(interp);
+  rethrow_caught(interp);
 }
 
 static double intercept_evaluate_region(void *ctx, qa_qvmx_region_evaluation region,
@@ -1266,7 +1309,7 @@ static double intercept_proceed_async(void *ctx) {
   /* TS begin() runs inside runAsync's operation, after its availability checks. */
   host_available(scope);
   check_cancellation(scope->interp, scope->function_scope);
-  if (!scope->frame->asynchronous) qa_range_error("Synchronous QVM call received an asynchronous syscall");
+  if (!scope->frame->asynchronous) qa_raise("Error", 0, 0, "Synchronous QVM call received an asynchronous syscall");
   begin_body(state);
   execute_options options;
   init_source_options(&options, state);
@@ -1337,7 +1380,7 @@ static double hook_perform(void *ctx, host_scope *scope) {
   double value;
   if (job->hook != NULL) value = job->hook->call(job->hook->ctx, &call);
   else value = state->frame->asynchronous ? intercept_proceed_async(scope) : intercept_proceed(scope);
-  if (state->failure.set) rethrow(interp, &state->failure);
+  if (state->failure != NULL) rethrow(interp, state->failure);
   return value;
 }
 
@@ -1349,7 +1392,7 @@ typedef struct observation_host {
 
 static double observation_argument(void *ctx, double index) {
   observation_host *o = ctx;
-  if (!o->open) qa_range_error("QVM function observation has ended");
+  if (!o->open) qa_raise("Error", 0, 0, "QVM function observation has ended");
   if (!is_safe_integer(index) || index < 0 || index >= (double)o->bytes / 4)
     qa_range_error("QVM argument index outside source call");
   return raw_word(o->scope->interp, o->sp + 8 + (int64_t)index * 4);
@@ -1435,6 +1478,8 @@ static void source_cleanup(qa_qvm_interpreter *interp, source_call *source) {
   free(source->regions);
   free(source->eval_region_inputs);
   free(source->eval_inputs);
+  free(source->cancellation_failure);
+  source->cancellation_failure = NULL;
   source->branch_pcs = NULL;
   source->branch_bindings = NULL;
   source->regions = NULL;
@@ -1469,7 +1514,7 @@ static int32_t intercept(qa_qvm_interpreter *interp, invocation *frame, int64_t 
   int64_t caller_instruction = return_pc < 0 ? -1 : source_instruction(interp, return_pc - 1);
   int64_t bytes = argument_bytes_override;
   if (bytes < 0) {
-    if (caller_instruction < 0) qa_range_error("QVM host call lost its argument frame");
+    if (caller_instruction < 0) qa_raise("Error", 0, 0, "QVM host call lost its argument frame");
     bytes = source_argument_bytes(interp, caller_instruction);
   }
   interp_range(interp, sp + 8, bytes);
@@ -1487,33 +1532,28 @@ static int32_t intercept(qa_qvm_interpreter *interp, invocation *frame, int64_t 
   state.source = &source;
   state.instruction_index = instruction_index;
   state.proceeded = false;
-  state.failure.set = false;
-  state.failure.signal = NULL;
+  state.failure = NULL;
   intercept_job job = {&state, observers, observer_count, hook, caller_instruction, bytes, 0};
-  char message[THROWN_CAPACITY];
-  bool ok = qa_range_error_catch(intercept_body, &job, message, sizeof message);
+  bool ok = qa_try(intercept_body, &job, &interp->caught);
   free(observers);
-  thrown error;
+  free(state.failure);
   if (ok) {
     /* complete(): check, then end the call either way. */
-    char check_message[THROWN_CAPACITY];
     complete_check check = {interp, &source};
-    if (qa_range_error_catch(complete_check_body, &check, check_message, sizeof check_message)) {
-      source_cleanup(interp, &source);
-      return job.result;
-    }
-    capture_thrown(interp, check_message, &error);
+    ok = qa_try(complete_check_body, &check, &interp->caught);
     source_cleanup(interp, &source);
-    rethrow(interp, &error);
+    if (ok) return job.result;
+    rethrow_caught(interp);
   }
-  capture_thrown(interp, message, &error);
   /* failed(). */
-  if (source.cancellation_open && source.cancellation_failure.set) {
-    thrown failure = source.cancellation_failure;
+  if (source.cancellation_open && source.cancellation_failure != NULL) {
+    /* TS throws the recorded failure; it replaces the error in flight. */
+    interp->current_signal = source.cancellation_failure->signal;
+    interp->caught = source.cancellation_failure->error;
     source_cleanup(interp, &source);
-    rethrow(interp, &failure);
+    rethrow_caught(interp);
   }
-  if (source.cancellation_open && source.cancellation_requested && error.signal == &source) {
+  if (source.cancellation_open && source.cancellation_requested && caught_signal(interp) == &source) {
     source_cleanup(interp, &source);
     interp->current_signal = NULL;
     operands_truncate(source.ops, source.operand_depth);
@@ -1521,7 +1561,7 @@ static int32_t intercept(qa_qvm_interpreter *interp, invocation *frame, int64_t 
     return 0;
   }
   source_cleanup(interp, &source);
-  rethrow(interp, &error);
+  rethrow_caught(interp);
 }
 
 /* ----- branch decisions and regions ----- */
@@ -1583,7 +1623,7 @@ static void region_op_body(void *ctx) {
   host_scope *scope = r->scope;
   if (!r->open || !r->owner->active || scope->interp->active != scope->frame ||
       scope->frame->sp != r->region->stack)
-    qa_range_error("QVM region callback has expired");
+    qa_raise("Error", 0, 0, "QVM region callback has expired");
   switch (op->kind) {
     case 0:
       op->result = host_invoke(scope, op->args, op->arg_count, op->has_index, op->instruction_index, NULL);
@@ -1594,7 +1634,7 @@ static void region_op_body(void *ctx) {
     default:
       if (!is_safe_integer(op->offset) || op->offset < 8 || (int64_t)op->offset % 4 != 0 ||
           op->offset + 4 > (double)r->region->frame_size)
-        qa_range_error("QVM region local is outside its original frame");
+        qa_raise("Error", 0, 0, "QVM region local is outside its original frame");
       op->result = read_word(scope->interp, r->region->stack + (int64_t)op->offset);
       break;
   }
@@ -1652,7 +1692,7 @@ static void region_effect(void *ctx) {
   }
   const char *choice = binding->run(binding->ctx, job->control);
   if (choice == NULL || (strcmp(choice, "execute") != 0 && strcmp(choice, "skip") != 0))
-    qa_range_error("QVM region requires one execution decision");
+    qa_raise("Error", 0, 0, "QVM region requires one execution decision");
   job->result = strcmp(choice, "execute") == 0 ? 1 : 0;
 }
 
@@ -1684,7 +1724,7 @@ static double region_perform(void *ctx, host_scope *scope) {
 static int32_t run_region(qa_qvm_interpreter *interp, invocation *frame, source_call *owner,
                           source_region *region, bool complete_phase) {
   if (!owner->active || frame->sp != region->stack || frame->ops->depth != owner->operand_depth)
-    qa_range_error("QVM region lost its original frame or operand boundary");
+    qa_raise("Error", 0, 0, "QVM region lost its original frame or operand boundary");
   region_job job = {interp, owner, region, complete_phase, 0, NULL};
   return host_call_stack(interp, frame, region_perform, &job, owner, region->stack - 4);
 }
@@ -1696,12 +1736,14 @@ static int64_t evaluation_stack_start(qa_qvm_interpreter *interp,
       (int64_t)stack->start % 4 != 0 || (int64_t)stack->end % 4 != 0 ||
       stack->start < (double)interp->memory_initialized_end || stack->start >= stack->end ||
       stack->end > (double)interp->memory_length || (double)interp->program_stack > stack->end)
-    qa_range_error("QVM evaluation stack is outside its declared source reservation or active caller");
+    qa_raise("Error", 0, 0, "QVM evaluation stack is outside its declared source reservation or active caller");
   return (int64_t)stack->start;
 }
 
-/* TS debugString(): `${indent()}${operands.count}` via registration print. */
-static void debug_print(qa_qvm_interpreter *interp, int operand_count, const char *tail) {
+/* TS debugString(): `${indent()}${operands.count}` via registration print.
+ * The trace helpers stay out of line: their text buffers would otherwise sit in
+ * the interpreter loop's frame, which every nested invocation pays for. */
+static QVM_NOINLINE void debug_print(qa_qvm_interpreter *interp, int operand_count, const char *tail) {
   if (interp->registration == NULL) return;
   if (interp->call_level < 0) qa_range_error("VM indentation requires a nonnegative call level");
   int64_t count = interp->call_level < 20 ? interp->call_level : 20;
@@ -1711,6 +1753,26 @@ static void debug_print(qa_qvm_interpreter *interp, int operand_count, const cha
   char line[1200];
   snprintf(line, sizeof line, "%s%d%s", indent, operand_count, tail);
   qa_qvm_vm_registration_print(interp->registration, line);
+}
+
+static QVM_NOINLINE void debug_print_symbol(qa_qvm_interpreter *interp, int operand_count, const char *arrow,
+                                            int32_t value) {
+  char symbol[1024], tail[1100];
+  qa_qvm_symbols_value_to_symbol(&interp->symbols, value, symbol, sizeof symbol);
+  snprintf(tail, sizeof tail, "%s %s\n", arrow, symbol);
+  debug_print(interp, operand_count, tail);
+}
+
+static QVM_NOINLINE void debug_print_opcode(qa_qvm_interpreter *interp, int operand_count, int32_t opcode) {
+  char tail[64];
+  snprintf(tail, sizeof tail, " %s\n", opcode_names[opcode]);
+  debug_print(interp, operand_count, tail);
+}
+
+static QVM_NOINLINE void debug_print_systemcall(qa_qvm_interpreter *interp, int operand_count, int32_t target) {
+  char tail[64];
+  snprintf(tail, sizeof tail, "---> systemcall(%lld)\n", (long long)(-1 - (int64_t)target));
+  debug_print(interp, operand_count, tail);
 }
 
 typedef struct trap_job {
@@ -1826,13 +1888,13 @@ static void execute_body(void *ctx) {
       for (size_t i = 0; i < counter->function_count; i++)
         in_range = in_range || (pc >= counter->range_start[i] && pc < counter->range_end[i]);
       if (--counter->remaining < 0 || !in_range)
-        qa_range_error("QVM counter evaluation escaped its admitted original functions or instruction budget");
+        qa_raise("Error", 0, 0, "QVM counter evaluation escaped its admitted original functions or instruction budget");
     }
     source_call *owner = counter == NULL ? frame->function_scope : NULL;
     if (evaluation.has && sp == job->evaluation_stack - evaluation.frame_size &&
         pc == target_pc(interp, (double)evaluation.region.join)) {
       if (ops->depth != (source != NULL ? source->operand_depth : 0))
-        qa_range_error("QVM region evaluation lost its caller operands");
+        qa_raise("Error", 0, 0, "QVM region evaluation lost its caller operands");
       job->result = !evaluation.region.has_result ? 0 : read_word(interp, sp + evaluation.region.result);
       return;
     }
@@ -1848,7 +1910,7 @@ static void execute_body(void *ctx) {
         (void)run_region(interp, frame, owner, completed, true);
       }
       if (entered != NULL && sp == entered->stack) {
-        if (entered->state != 0) qa_range_error("QVM region can execute only once per invocation");
+        if (entered->state != 0) qa_raise("Error", 0, 0, "QVM region can execute only once per invocation");
         entered->state = 1;
         if (run_region(interp, frame, owner, entered, false) == 0) {
           entered->state = 2;
@@ -1869,9 +1931,7 @@ static void execute_body(void *ctx) {
       if (trace > 1) {
         if (opcode < 0 || opcode >= (int32_t)(sizeof opcode_names / sizeof opcode_names[0]))
           qa_common_error(QA_COMMON_ERROR_DROP, "Bad VM instruction");
-        char tail[64];
-        snprintf(tail, sizeof tail, " %s\n", opcode_names[opcode]);
-        debug_print(interp, ops->depth, tail);
+        debug_print_opcode(interp, ops->depth, opcode);
       }
       qa_qvm_function_symbol_set_profile_count(
           &profile_symbol,
@@ -1882,7 +1942,7 @@ static void execute_body(void *ctx) {
         if (debug) qa_common_error(QA_COMMON_ERROR_DROP, "Bad VM instruction");
         break;
       case QA_QVM_OP_BREAK:
-        if (counter != NULL) qa_range_error("QVM counter evaluation cannot trigger a debug break");
+        if (counter != NULL) qa_raise("Error", 0, 0, "QVM counter evaluation cannot trigger a debug break");
         interp->breaks = (int32_t)((uint32_t)interp->breaks + 1u);
         break;
       case QA_QVM_OP_CONST: operands_push(ops, code_word(interp, pc)); pc += 4; break;
@@ -1898,14 +1958,14 @@ static void execute_body(void *ctx) {
         int32_t size = code_word(interp, pc);
         if (job->evaluation_floor >= 0 &&
             (size < 0 || size % 4 != 0 || sp - size < job->evaluation_floor))
-          qa_range_error("QVM evaluation stack would overlap source data");
+          qa_raise("Error", 0, 0, "QVM evaluation stack would overlap source data");
         sp = interp_stack(interp, sp - size);
         pc += 4;
         if (evaluation.has && !evaluation_started &&
             pc - 5 == target_pc(interp, (double)instruction_index)) {
           evaluation_started = true;
           for (size_t i = 0; i < evaluation.region.input_count; i++) {
-            if (i >= evaluation.input_count) qa_range_error("Missing QVM region live-in");
+            if (i >= evaluation.input_count) qa_raise("Error", 0, 0, "Missing QVM region live-in");
             write_word(interp, sp + evaluation.region.inputs[i], (int32_t)evaluation.inputs[i]);
           }
           pc = target_pc(interp, (double)evaluation.region.entry);
@@ -1913,10 +1973,7 @@ static void execute_body(void *ctx) {
         if (debug) {
           write_word(interp, sp + 4, (int32_t)(sp + size));
           if (trace != 0) {
-            char symbol[1024], tail[1100];
-            qa_qvm_symbols_value_to_symbol(&interp->symbols, (int32_t)(pc - 5), symbol, sizeof symbol);
-            snprintf(tail, sizeof tail, "---> %s\n", symbol);
-            debug_print(interp, ops->depth, tail);
+            debug_print_symbol(interp, ops->depth, "--->", (int32_t)(pc - 5));
             if (job->profile.break_function != 0 && pc - 5 == job->profile.break_function)
               interp->breaks = (int32_t)((uint32_t)interp->breaks + 1u);
             interp->call_level++;
@@ -1930,24 +1987,21 @@ static void execute_body(void *ctx) {
         if (!interp->compiled) {
           target = read_word(interp, sp);
         } else {
-          if (frame->return_count == 0) qa_range_error("QVM function returned with an invalid program stack");
+          if (frame->return_count == 0) qa_raise("Error", 0, 0, "QVM function returned with an invalid program stack");
           target = frame->returns[--frame->return_count];
           if (frame->return_count == 0 || frame->returns[--frame->return_count] != sp)
-            qa_range_error("QVM function returned with an invalid program stack");
+            qa_raise("Error", 0, 0, "QVM function returned with an invalid program stack");
         }
         if (debug) {
           profile_symbol = qa_qvm_symbols_value_to_function_symbol(&interp->symbols, (int32_t)target);
           if (trace != 0) {
-            char symbol[1024], tail[1100];
             interp->call_level--;
-            qa_qvm_symbols_value_to_symbol(&interp->symbols, (int32_t)target, symbol, sizeof symbol);
-            snprintf(tail, sizeof tail, "<--- %s\n", symbol);
-            debug_print(interp, ops->depth, tail);
+            debug_print_symbol(interp, ops->depth, "<---", (int32_t)target);
           }
         }
         if (source != NULL && sp == source->stack && (!interp->compiled || frame->return_count == 0)) {
           if (target != source->return_pc || ops->depth != source->operand_depth + 1)
-            qa_range_error("QVM function returned with an invalid caller stack");
+            qa_raise("Error", 0, 0, "QVM function returned with an invalid caller stack");
           job->result = operands_pop(ops);
           return;
         }
@@ -1967,7 +2021,7 @@ static void execute_body(void *ctx) {
             bool admitted = false;
             for (size_t i = 0; i < counter->function_count; i++)
               admitted = admitted || counter->functions[i] == (double)target;
-            if (!admitted) qa_range_error("QVM counter evaluation called an undeclared source function");
+            if (!admitted) qa_raise("Error", 0, 0, "QVM counter evaluation called an undeclared source function");
           }
           qa_qvm_function_hook hook;
           bool has_hook = false, has_observers = false;
@@ -1984,7 +2038,7 @@ static void execute_body(void *ctx) {
               qa_qvmx_view words = {interp->memory + sp + 8, (size_t)bytes};
               has_hook = interp->resolver->resolver.resolve(interp->resolver->resolver.ctx, target, first, &words, &hook);
               if (has_hook && code_word(interp, target_pc(interp, target)) != QA_QVM_OP_ENTER)
-                qa_range_error("QVM resolver requires a function entry instruction");
+                qa_raise("Error", 0, 0, "QVM resolver requires a function entry instruction");
             }
           }
           if (!has_hook && !has_observers) {
@@ -2005,12 +2059,8 @@ static void execute_body(void *ctx) {
             interp->program_stack = saved_stack;
           }
         } else {
-          if (counter != NULL) qa_range_error("QVM counter evaluation cannot call an engine service");
-          if (trace != 0) {
-            char tail[64];
-            snprintf(tail, sizeof tail, "---> systemcall(%lld)\n", (long long)(-1 - (int64_t)target));
-            debug_print(interp, ops->depth, tail);
-          }
+          if (counter != NULL) qa_raise("Error", 0, 0, "QVM counter evaluation cannot call an engine service");
+          if (trace != 0) debug_print_systemcall(interp, ops->depth, target);
           int64_t saved_level = interp->call_level;
           interp->program_stack = sp - 4;
           int32_t saved_frame = debug ? read_word(interp, sp + 4) : 0;
@@ -2022,12 +2072,7 @@ static void execute_body(void *ctx) {
           operands_push(ops, value);
           pc = !interp->compiled ? read_word(interp, sp) : return_pc;
           interp->call_level = saved_level;
-          if (trace != 0) {
-            char symbol[1024], tail[1100];
-            qa_qvm_symbols_value_to_symbol(&interp->symbols, (int32_t)pc, symbol, sizeof symbol);
-            snprintf(tail, sizeof tail, "<--- %s\n", symbol);
-            debug_print(interp, ops->depth, tail);
-          }
+          if (trace != 0) debug_print_symbol(interp, ops->depth, "<---", (int32_t)pc);
         }
         break;
       }
@@ -2082,7 +2127,7 @@ static void execute_body(void *ctx) {
         break;
       }
       case QA_QVM_OP_BLOCK_COPY: {
-        if (counter != NULL) qa_range_error("QVM counter evaluation cannot copy source memory");
+        if (counter != NULL) qa_raise("Error", 0, 0, "QVM counter evaluation cannot copy source memory");
         int32_t source_addr = operands_pop(ops);
         int32_t destination = operands_pop(ops);
         int32_t count = code_word(interp, pc);
@@ -2144,13 +2189,13 @@ static void execute_body(void *ctx) {
           pc = taken ? target : pc + 4;
         } else {
           source_call *branch_owner = frame->function_scope;
-          if (!branch_owner->active) qa_range_error("QVM branch invocation has expired");
+          if (!branch_owner->active) qa_raise("Error", 0, 0, "QVM branch invocation has expired");
           int32_t chosen = decision(interp, frame, branch_owner, binding, taken);
           check_cancellation(interp, branch_owner);
           assert_live(interp);
           run_validate(frame);
           if (!branch_owner->active || interp->active != frame)
-            qa_range_error("QVM branch invocation is no longer current");
+            qa_raise("Error", 0, 0, "QVM branch invocation is no longer current");
           pc = chosen != 0 ? target : pc + 4;
         }
         break;
@@ -2167,6 +2212,7 @@ static void execute_body(void *ctx) {
 
 static int32_t execute(qa_qvm_interpreter *interp, const execute_options *options,
                        const evaluation_local *read_only_evaluation) {
+  if (interp->depth >= QVM_MAX_NESTED_EXECUTIONS) qa_range_error("Maximum call stack size exceeded.");
   source_call *source = options->source;
   int64_t instruction_index = options->instruction_index;
   if (source == NULL) {
@@ -2176,7 +2222,7 @@ static int32_t execute(qa_qvm_interpreter *interp, const execute_options *option
     if (instruction_index != 0 &&
         (instruction_index < 0 || instruction_index >= (int64_t)interp->instruction_count ||
          interp->instructions[instruction_index].opcode != QA_QVM_OP_ENTER))
-      qa_range_error("QVM private invocation requires an original function entry");
+      qa_raise("Error", 0, 0, "QVM private invocation requires an original function entry");
   }
   for (size_t i = 0; i < options->arg_count; i++) (void)signed_word(options->args[i]);
   if (source == NULL && interp->registration != NULL)
@@ -2198,7 +2244,7 @@ static int32_t execute(qa_qvm_interpreter *interp, const execute_options *option
   int64_t sp = source == NULL ? interp_stack(interp, entry_stack - 8 - (int64_t)argument_words * 4)
                               : source->stack;
   if (evaluation_floor >= 0 && sp < evaluation_floor)
-    qa_range_error("QVM evaluation stack would overlap source data");
+    qa_raise("Error", 0, 0, "QVM evaluation stack would overlap source data");
   interp->debug = debug;
   invocation frame;
   frame.ops = source != NULL ? source->ops : &frame.owned_ops;
@@ -2221,17 +2267,10 @@ static int32_t execute(qa_qvm_interpreter *interp, const execute_options *option
   interp->active = &frame;
   execute_job job = {interp, options, read_only_evaluation, &frame, debug, profile, evaluation_floor, sp, argument_words, 0};
   /* TS rethrows the original error object, so its class (a CommonError "drop") survives the frame cleanup. */
-  qa_caught_error caught;
-  bool ok = qa_try(execute_body, &job, &caught);
-  thrown error;
-  error.set = false;
-  if (!ok) {
-    capture_thrown(interp, caught.message, &error);
-    error.name = caught.name;
-    error.code = caught.code;
-    error.detail = caught.detail;
-    cancellation_failure(frame.function_scope, &error);
-  }
+  interp->depth++;
+  bool ok = qa_try(execute_body, &job, &interp->caught);
+  interp->depth--;
+  if (!ok) cancellation_failure(interp, frame.function_scope);
   interp->program_stack = entry_stack;
   interp->active = frame.previous;
   if (frame.previous != NULL) {
@@ -2239,7 +2278,7 @@ static int32_t execute(qa_qvm_interpreter *interp, const execute_options *option
     interp->call_level = previous_call_level;
   }
   free(frame.returns);
-  if (!ok) rethrow(interp, &error);
+  if (!ok) rethrow_caught(interp);
   return job.result;
 }
 
@@ -2467,9 +2506,9 @@ static qa_qvm_unbind bind_entry(qa_qvm_interpreter *interp, double instruction_i
   assert_live(interp);
   if (!is_safe_integer(instruction_index) || instruction_index < 0 ||
       code_word(interp, target_pc(interp, instruction_index)) != QA_QVM_OP_ENTER)
-    qa_range_error("QVM hook requires a function entry instruction");
+    qa_raise("Error", 0, 0, "QVM hook requires a function entry instruction");
   if (find_hook(interp, (int64_t)instruction_index) != NULL)
-    qa_range_error("QVM function already has a hook");
+    qa_raise("Error", 0, 0, "QVM function already has a hook");
   if (interp->hook_count == interp->hook_capacity) {
     size_t capacity = interp->hook_capacity == 0 ? 8 : interp->hook_capacity * 2;
     hook_entry **grown = realloc(interp->hooks, capacity * sizeof *grown);
@@ -2499,7 +2538,7 @@ qa_qvm_unbind qa_qvm_interpreter_bind_invocation(qa_qvm_interpreter *interp,
 qa_qvm_unbind qa_qvm_interpreter_bind_function_resolver(qa_qvm_interpreter *interp,
                                                         qa_qvm_function_resolver resolver) {
   assert_live(interp);
-  if (interp->resolver != NULL) qa_range_error("QVM already has a function resolver");
+  if (interp->resolver != NULL) qa_raise("Error", 0, 0, "QVM already has a function resolver");
   resolver_entry *entry = xmalloc(sizeof *entry);
   entry->resolver = resolver;
   entry->interp = interp;
@@ -2513,7 +2552,7 @@ qa_qvm_unbind qa_qvm_interpreter_observe_function(qa_qvm_interpreter *interp,
   assert_allocation(interp);
   if (!is_safe_integer(instruction_index) || instruction_index < 0 ||
       code_word(interp, target_pc(interp, instruction_index)) != QA_QVM_OP_ENTER)
-    qa_range_error("QVM observer requires a function entry instruction");
+    qa_raise("Error", 0, 0, "QVM observer requires a function entry instruction");
   if (interp->observer_count == interp->observer_capacity) {
     size_t capacity = interp->observer_capacity == 0 ? 8 : interp->observer_capacity * 2;
     observer_entry **grown = realloc(interp->observers, capacity * sizeof *grown);
@@ -2533,9 +2572,9 @@ qa_qvm_unbind qa_qvm_interpreter_observe_function(qa_qvm_interpreter *interp,
 
 void qa_qvm_interpreter_restore_data(qa_qvm_interpreter *interp, const uint8_t *data,
                                      size_t length) {
-  if (interp->root_active) qa_range_error("Cannot restore an active QVM");
+  if (interp->root_active) qa_raise("Error", 0, 0, "Cannot restore an active QVM");
   assert_live(interp);
-  if (length != interp->memory_length) qa_range_error("QVM checkpoint allocation mismatch");
+  if (length != interp->memory_length) qa_raise("Error", 0, 0, "QVM checkpoint allocation mismatch");
   qa_qvm_memory_clear_write_observers(&interp->guest);
   memcpy(interp->memory, data, length);
 }
@@ -2596,10 +2635,10 @@ qa_qvmx_view qa_qvm_interpreter_pointer(qa_qvm_interpreter *interp, double word)
 }
 
 void qa_qvm_interpreter_restart(qa_qvm_interpreter *interp, const qa_qvm_data_image *image) {
-  if (interp->root_active) qa_range_error("Cannot restart an active QVM");
+  if (interp->root_active) qa_raise("Error", 0, 0, "Cannot restart an active QVM");
   assert_live(interp);
   if (image->allocated_data_length > (int64_t)interp->memory_length)
-    qa_range_error("QVM restart would exceed its original allocation");
+    qa_raise("Error", 0, 0, "QVM restart would exceed its original allocation");
   qa_qvm_memory_clear_write_observers(&interp->guest);
   memset(interp->memory, 0, (size_t)image->allocated_data_length);
   if (image->initialized_length > 0) memcpy(interp->memory, image->initialized_data, image->initialized_length);
@@ -2627,14 +2666,13 @@ static void root_async_body(void *ctx) {
 
 static double root_invoke(qa_qvm_interpreter *interp, const execute_options *options, void (*body)(void *)) {
   if (interp->root_active)
-    qa_range_error("QVM is already active; recursive calls belong to the current syscall");
+    qa_raise("Error", 0, 0, "QVM is already active; recursive calls belong to the current syscall");
   assert_live(interp);
   interp->root_active = true;
   root_job job = {interp, options, 0};
-  qa_caught_error caught;
-  bool ok = qa_try(body, &job, &caught);
+  bool ok = qa_try(body, &job, &interp->caught);
   interp->root_active = false;
-  if (!ok) qa_rethrow(&caught);
+  if (!ok) rethrow_caught(interp);
   return job.result;
 }
 
@@ -2692,20 +2730,20 @@ double qa_qvm_interpreter_evaluate_counter(qa_qvm_interpreter *interp, double ad
   (void)signed_word(initial);
   if (fmod(address, 4) != 0 || address + 4 > (double)interp->source_data_end ||
       interp->counter != NULL)
-    qa_range_error("QVM counter evaluation requires one live aligned source word and a fresh scope");
-  if (function_count == 0) qa_range_error("QVM counter evaluation requires distinct original functions");
+    qa_raise("Error", 0, 0, "QVM counter evaluation requires one live aligned source word and a fresh scope");
+  if (function_count == 0) qa_raise("Error", 0, 0, "QVM counter evaluation requires distinct original functions");
   for (size_t i = 0; i < function_count; i++)
     for (size_t j = i + 1; j < function_count; j++)
       if (functions[i] == functions[j])
-        qa_range_error("QVM counter evaluation requires distinct original functions");
+        qa_raise("Error", 0, 0, "QVM counter evaluation requires distinct original functions");
   for (size_t i = 0; i < function_count; i++) {
     double entry = functions[i];
     if (!is_integer(entry) || entry < 0 || entry >= (double)interp->instruction_count ||
         interp->instructions[(size_t)entry].opcode != QA_QVM_OP_ENTER)
-      qa_range_error("QVM counter evaluation entry is not an original function");
+      qa_raise("Error", 0, 0, "QVM counter evaluation entry is not an original function");
   }
   int64_t stack_start = evaluation_stack_start(interp, stack);
-  if (address + 4 > (double)stack_start) qa_range_error("QVM counter word overlaps its evaluation stack");
+  if (address + 4 > (double)stack_start) qa_raise("Error", 0, 0, "QVM counter word overlaps its evaluation stack");
   counter_scope scope;
   memset(&scope, 0, sizeof scope);
   scope.range_start = xmalloc(function_count * sizeof(int64_t));
@@ -2730,11 +2768,10 @@ double qa_qvm_interpreter_evaluate_counter(qa_qvm_interpreter *interp, double ad
   scope.remaining = 100000;
   interp->counter = &scope;
   counter_run run = {execute_fn, execute_ctx};
-  char message[THROWN_CAPACITY];
-  bool ok = qa_range_error_catch(counter_body, &run, message, sizeof message);
+  bool ok = qa_try(counter_body, &run, &interp->caught);
   interp->counter = NULL;
   free(scope.range_start);
   free(scope.range_end);
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) rethrow_caught(interp);
   return scope.value;
 }

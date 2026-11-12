@@ -20,6 +20,26 @@ static void *xrealloc(void *p, size_t size) {
   return next;
 }
 
+/* A Quake byte string is Latin-1 text in TS (fixedByteString): a byte past
+ * 0x7f is one code unit, two UTF-8 bytes in a message. Caller frees. */
+static char *latin1_text(const char *bytes) {
+  size_t length = 0;
+  for (const unsigned char *p = (const unsigned char *)bytes; *p != 0; p++) length += *p >= 0x80 ? 2 : 1;
+  char *text = malloc(length + 1);
+  if (text == NULL) qa_range_error("Out of memory");
+  size_t at = 0;
+  for (const unsigned char *p = (const unsigned char *)bytes; *p != 0; p++) {
+    if (*p < 0x80) {
+      text[at++] = (char)*p;
+    } else {
+      text[at++] = (char)(0xc0 | (*p >> 6));
+      text[at++] = (char)(0x80 | (*p & 0x3f));
+    }
+  }
+  text[at] = '\0';
+  return text;
+}
+
 noreturn void qa_q3_text_parse_error(const char *source_name, double line, double column,
                                      const char *message) {
   /* TS throws a catchable TextParseError (startup selection marks the map
@@ -219,14 +239,18 @@ qa_q3_entity *qa_q3_parse_entities(const char *text, const char *name, size_t *o
       }
       state.pending[0] = key.value;
       qa_q3_token value;
-      char message[1200];
+      char message[QA_CAUGHT_MESSAGE_CAPACITY];
       if (!qa_q3_tokenizer_next(&tokenizer, false, &value)) {
-        snprintf(message, sizeof message, "missing value for entity key \"%s\"", key.value);
+        char *key_text = latin1_text(key.value);
+        snprintf(message, sizeof message, "missing value for entity key \"%s\"", key_text);
+        free(key_text);
         parse_error_at(&tokenizer, message, NULL);
       }
       state.pending[1] = value.value;
       if (strcmp(value.value, "}") == 0) {
-        snprintf(message, sizeof message, "missing value for entity key \"%s\"", key.value);
+        char *key_text = latin1_text(key.value);
+        snprintf(message, sizeof message, "missing value for entity key \"%s\"", key_text);
+        free(key_text);
         parse_error_at(&tokenizer, message, &value);
       }
       state.pending[0] = state.pending[1] = NULL;

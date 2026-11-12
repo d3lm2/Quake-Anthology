@@ -193,6 +193,9 @@ typedef struct qa_app_sim_bot_transport_connection {
   qa_saved_actor_id actor;
   double sequence, acknowledge;
   char *slots[QA_Q3_MAX_RELIABLE_COMMANDS]; size_t slot_count;
+  /* A slot the restored ring refuses: TS `text.length > 1023 || text.includes("\0")` (UTF-16 units; a saved
+   * "\u0000" survives decoding but the C text stops at it). */
+  bool slot_invalid[QA_Q3_MAX_RELIABLE_COMMANDS];
 } qa_app_sim_bot_transport_connection;
 typedef struct qa_app_sim_bot_transport_snapshot { double client; double *entities; size_t entity_count; } qa_app_sim_bot_transport_snapshot;
 /* TS ApplicationBotTransportCheckpoint (decoded, owned). */

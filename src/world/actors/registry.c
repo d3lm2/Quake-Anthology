@@ -39,10 +39,23 @@ typedef struct gen_map {
 } gen_map;
 static gen_map *generation_maps;
 
+/* The session ended: its generations go with it, as the TS WeakMap entry does.
+ * Otherwise the next session whose token lands on this address would continue
+ * the dead session's generations instead of starting at 0. */
+static void gen_map_forget(const void *token) {
+  for (gen_map **link = &generation_maps; *link != NULL; link = &(*link)->next) {
+    if ((*link)->token != token) continue;
+    gen_map *map = *link;
+    *link = map->next;
+    free(map->slots); free(map->values); free(map);
+    return;
+  }
+}
 static gen_map *gen_map_for(const void *token) {
   for (gen_map *map = generation_maps; map != NULL; map = map->next) {
     if (map->token == token) return map;
   }
+  qa_identity_owner_on_destroy(gen_map_forget);
   gen_map *map = calloc(1, sizeof *map);
   if (map == NULL) abort();
   map->token = token;

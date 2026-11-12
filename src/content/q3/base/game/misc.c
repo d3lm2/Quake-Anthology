@@ -10,7 +10,7 @@
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 void qa_q3_kill_box(qa_q3_game_combat_context *context, qa_q3_kill_box_host host, qa_q3_game_entity *entity) {
-  if (!entity->client) qa_range_error("G_KillBox requires a client entity");
+  if (!entity->client) qa_raise("Error", 0, 0, "G_KillBox requires a client entity");
   qa_vec3 origin = qa_q3_base_player_state_record_origin(&entity->client->ps);
   qa_vec3 min = qa_add3(origin, qa_q3_base_entity_shared_mins(&entity->r));
   qa_vec3 max = qa_add3(origin, qa_q3_base_entity_shared_maxs(&entity->r));
@@ -27,7 +27,7 @@ void qa_q3_kill_box(qa_q3_game_combat_context *context, qa_q3_kill_box_host host
 }
 void qa_q3_teleport_player(qa_q3_teleport_context context, qa_q3_game_entity *player, qa_vec3 origin, qa_vec3 angles) {
   qa_q3_game_client *client = player->client;
-  if (!client) qa_range_error("TeleportPlayer requires a client entity");
+  if (!client) qa_raise("Error", 0, 0, "TeleportPlayer requires a client entity");
   if (client->sess.session_team != 3) {
     qa_q3_game_entity *out = qa_q3_entity_pool_temp_entity(context.combat->entities, qa_q3_base_player_state_record_origin(&client->ps), 43);
     out->s.client_num = player->s.client_num;
@@ -35,7 +35,8 @@ void qa_q3_teleport_player(qa_q3_teleport_context context, qa_q3_game_entity *pl
     incoming->s.client_num = player->s.client_num;
   }
   context.world.unlink(context.world.ctx, player->s.number);
-  qa_q3_base_player_state_record_set_origin(&client->ps, (qa_vec3){origin.x, origin.y, (float)origin.z + 1});
+  /* TS vec3() stores binary32 components. */
+  qa_q3_base_player_state_record_set_origin(&client->ps, qa_math_vec3(origin.x, origin.y, (double)(float)origin.z + 1));
   qa_q3_base_player_state_record_set_velocity(&client->ps, qa_scale3(qa_qvm_angle_vectors(angles).forward, 400));
   client->ps.pm_time = 160; client->ps.pm_flags = qa_js_to_int32(client->ps.pm_flags) | 64; /* MoveFlags.TIME_KNOCKBACK */
   client->ps.e_flags = qa_js_to_int32(client->ps.e_flags) ^ 4;
@@ -61,9 +62,13 @@ void qa_q3_locate_camera(qa_q3_portal_context context, qa_q3_game_entity *entity
 }
 static void portal_think(void *ctx, qa_q3_game_entity *self) { qa_q3_locate_camera(*(qa_q3_portal_context *)ctx, self); }
 void qa_q3_bind_portal_save_callbacks(qa_q3_portal_context context) {
-  static qa_q3_portal_context retained; retained = context;
-  qa_q3_entity_callback cb; qa_q3_entity_think_fn fn = portal_think; memcpy(&cb.fn, &fn, sizeof fn); cb.ctx = &retained;
-  qa_q3_callback_family_intern(&context.selection.pool->callbacks.think, "q3.base.game.misc.spawnPortalSurface.think", cb);
+  /* TS interns one closure per pool, over the first context that pool saw. */
+  qa_q3_portal_context *retained = malloc(sizeof *retained); if (!retained) qa_range_error("out of memory");
+  *retained = context;
+  qa_q3_entity_callback cb; qa_q3_entity_think_fn fn = portal_think; memcpy(&cb.fn, &fn, sizeof fn); cb.ctx = retained;
+  qa_q3_entity_callback bound = qa_q3_callback_family_intern(&context.selection.pool->callbacks.think, "q3.base.game.misc.spawnPortalSurface.think", cb);
+  if (bound.ctx != retained) { free(retained); return; }
+  qa_q3_callback_catalog_retain(&context.selection.pool->callbacks, retained);
 }
 void qa_q3_spawn_portal_surface(qa_q3_portal_context context, qa_q3_game_entity *entity) {
   qa_q3_bind_portal_save_callbacks(context);

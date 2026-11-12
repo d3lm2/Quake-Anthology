@@ -22,7 +22,7 @@ struct qa_app_diagnostic_tools {
 };
 static void add(qa_app_diagnostic_tools *tools, qa_command_buffer *commands, const char *name,
                 qa_command_handler_fn handler, void *ctx, const char *summary, const char *usage) {
-  if (qa_command_buffer_exists(commands, name)) qa_range_error("Diagnostic command already registered: %s", name);
+  if (qa_command_buffer_exists(commands, name)) qa_raise("Error", 0, 0, "Diagnostic command already registered: %s", name);
   qa_command_documentation doc = {summary, usage, NULL, 0, NULL, 0};
   qa_command_buffer_register_engine(commands, name, handler, ctx, &doc);
   tools->handlers[tools->handler_count++] = (handler_row){name, handler, ctx};
@@ -45,8 +45,10 @@ static void timers_handler(void *ctx, qa_command_invocation *cmd) {
   } else if (strcmp(action, "stamps") == 0) {
     size_t count = 0;
     qa_timer_stamp *stamps = qa_omni_timer_stamp_list(tool->timer, &count);
-    size_t cap = 256 + count * 128, len = 0;
+    size_t cap = 32, len = 0; /* sized for every stamp: TS joins strings without a cap */
+    for (size_t i = 0; i < count; i++) cap += strlen(stamps[i].name) + QA_JS_TO_FIXED_CAPACITY + 2;
     char *text = malloc(cap);
+    if (text == NULL) qa_range_error("Out of memory");
     len += (size_t)snprintf(text + len, cap - len, "milliseconds\tname\n");
     for (size_t i = 0; i < count; i++) {
       char fixed[QA_JS_TO_FIXED_CAPACITY]; /* milliseconds.toFixed(3) */
@@ -57,17 +59,29 @@ static void timers_handler(void *ctx, qa_command_invocation *cmd) {
     tool->print(tool->print_ctx, text);
     free(text);
     free(stamps);
-  } else qa_range_error("Usage: timers [on|off|reset|report|stamps]");
+  } else qa_raise("Error", 0, 0, "Usage: timers [on|off|reset|report|stamps]");
 }
 static void timerstamp_handler(void *ctx, qa_command_invocation *cmd) {
   tool_ctx *tool = ctx;
-  char label[1024] = "";
+  /* args.join(" "), without a length cap. */
+  size_t length = 1;
+  for (size_t i = 0; i < arg_count(cmd); i++) length += strlen(arg_at(cmd, i)) + 1;
+  char *label = malloc(length);
+  if (label == NULL) qa_range_error("Out of memory");
+  label[0] = '\0';
   for (size_t i = 0; i < arg_count(cmd); i++) {
-    if (i) strncat(label, " ", sizeof label - strlen(label) - 1);
-    strncat(label, arg_at(cmd, i), sizeof label - strlen(label) - 1);
+    if (i) strcat(label, " ");
+    strcat(label, arg_at(cmd, i));
   }
-  if (label[0] == '\0') qa_range_error("Usage: timerstamp <label>");
+  if (label[0] == '\0') {
+    free(label);
+    qa_raise("Error", 0, 0, "Usage: timerstamp <label>");
+  }
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, label);
   qa_omni_timer_stamp(tool->timer, label);
+  qa_cleanup_pop(&guard);
+  free(label);
 }
 qa_app_capture_frame_result qa_app_source_capture_frame(double elapsed, double fps, double timescale, bool active, bool force) {
   /* Users set these cvars from the console; a negative value just means no capture clock. */
@@ -151,7 +165,7 @@ static void touch_run(void *op_ctx) {
 static void touch_handler(void *ctx, qa_command_invocation *cmd) {
   runtime_ctx *rt = ctx;
   const char *path = arg_at(cmd, 0);
-  if (arg_count(cmd) != 1 || !path) qa_range_error("Usage: touchFile <file>");
+  if (arg_count(cmd) != 1 || !path) qa_raise("Error", 0, 0, "Usage: touchFile <file>");
   touch_op *op = malloc(sizeof *op);
   op->rt = rt; op->path = dup_text(path);
   rt->services.queue(rt->services.ctx, touch_run, op);
@@ -167,14 +181,43 @@ static void resourceinfo_handler(void *ctx, qa_command_invocation *cmd) {
   rt->services.print(rt->services.ctx, text);
   free(text); free(json);
 }
+/* JSON.stringify(string) for the frame report: quotes, backslashes and controls escaped (short forms where JSON has them). */
+static char *json_string(const char *text) {
+  size_t length = strlen(text);
+  char *out = malloc(length * 6 + 3);
+  if (out == NULL) qa_range_error("Out of memory");
+  size_t at = 0;
+  out[at++] = '"';
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)text[i];
+    const char *escape = c == '"' ? "\\\"" : c == '\\' ? "\\\\" : c == '\b' ? "\\b" : c == '\f' ? "\\f" : c == '\n' ? "\\n"
+        : c == '\r' ? "\\r" : c == '\t' ? "\\t" : NULL;
+    if (escape != NULL) { memcpy(out + at, escape, 2); at += 2; }
+    else if (c < 0x20) at += (size_t)sprintf(out + at, "\\u%04x", c);
+    else out[at++] = (char)c;
+  }
+  out[at++] = '"';
+  out[at] = '\0';
+  return out;
+}
 static void frameinfo_handler(void *ctx, qa_command_invocation *cmd) {
   (void)cmd;
   runtime_ctx *rt = ctx;
   qa_app_diagnostic_frame frame = rt->services.frame(rt->services.ctx);
-  char text[1024];
-  snprintf(text, sizeof text, "{\n  \"frame\": %s,\n  \"milliseconds\": %s,\n  \"map\": \"%s\",\n  \"renderer\": \"%s\",\n  \"clients\": %s\n}\n",
-      QA_JS_NUMBER(frame.frame), QA_JS_NUMBER(frame.milliseconds), frame.map ? frame.map : "", frame.renderer ? frame.renderer : "", QA_JS_NUMBER(frame.clients));
+  /* JSON.stringify(frame, null, 2): the strings escaped, no fixed cap on the map name. */
+  char *map = json_string(frame.map ? frame.map : ""), *renderer = json_string(frame.renderer ? frame.renderer : "");
+  size_t size = strlen(map) + strlen(renderer) + 256;
+  char *text = malloc(size);
+  if (text == NULL) qa_range_error("Out of memory");
+  snprintf(text, size, "{\n  \"frame\": %s,\n  \"milliseconds\": %s,\n  \"map\": %s,\n  \"renderer\": %s,\n  \"clients\": %s\n}\n",
+      QA_JS_NUMBER(frame.frame), QA_JS_NUMBER(frame.milliseconds), map, renderer, QA_JS_NUMBER(frame.clients));
+  free(map);
+  free(renderer);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, text);
   rt->services.print(rt->services.ctx, text);
+  qa_cleanup_pop(&guard);
+  free(text);
 }
 qa_app_diagnostic_tools *qa_app_register_runtime_diagnostics(qa_app_runtime_diagnostic_services services) {
   qa_app_diagnostic_tools *tools = calloc(1, sizeof *tools);

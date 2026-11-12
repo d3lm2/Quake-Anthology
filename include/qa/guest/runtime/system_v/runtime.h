@@ -58,6 +58,7 @@ struct qa_system_v_guest_runtime {
   bool loading;
   int64_t budget;
   uint64_t tls_used;
+  void *owned; size_t owned_count, owned_cap; /* service states (qa_system_v_own) */
 };
 
 void qa_system_v_guest_runtime_init(qa_system_v_guest_runtime *runtime,

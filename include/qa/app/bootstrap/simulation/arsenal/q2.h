@@ -52,6 +52,8 @@ void qa_app_q2_selected_arsenal_destroy(qa_app_q2_selected_arsenal *arsenal);
 qa_app_selected_arsenal qa_app_q2_selected_arsenal_interface(qa_app_q2_selected_arsenal *arsenal);
 void qa_app_q2_selected_arsenal_release_actor(qa_app_q2_selected_arsenal *arsenal, qa_actor_id actor);
 size_t qa_app_q2_selected_arsenal_catalog(qa_app_q2_selected_arsenal *arsenal, qa_selected_pickup_weapon *out, size_t capacity);
+/* The selected weapons (rows of catalog() and ui()), so a caller sizes its storage first. */
+size_t qa_app_q2_selected_arsenal_weapon_count(const qa_app_q2_selected_arsenal *arsenal);
 bool qa_app_q2_selected_arsenal_has(qa_app_q2_selected_arsenal *arsenal, qa_actor_id actor);
 qa_arsenal_state qa_app_q2_selected_arsenal_admit(qa_app_q2_selected_arsenal *arsenal, qa_owned_actor actor, double max_health);
 qa_arsenal_state qa_app_q2_selected_arsenal_read(qa_app_q2_selected_arsenal *arsenal, qa_actor_id actor);

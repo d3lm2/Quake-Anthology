@@ -24,11 +24,17 @@ static double bounded_int(const qa_save_reader *reader, double minimum, double m
     qa_save_reader_fail(reader, "native component integer exceeds its range");
   return value;
 }
+/* TS value.length <= maximum && !value.includes("\0"): UTF-16 units (a four-byte UTF-8
+ * character is two), and a held NUL makes the whole length exceed strlen. */
 static const char *bounded_text(const qa_save_reader *reader, size_t maximum) {
-  const char *value = qa_save_reader_string(reader);
   size_t length = 0;
-  while (value[length]) length++;
-  if (length > maximum) qa_save_reader_fail(reader, "invalid native component string");
+  const char *value = qa_save_reader_string_length(reader, &length);
+  size_t units = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)value[i];
+    if ((c & 0xc0) != 0x80) units += c >= 0xf0 ? 2 : 1;
+  }
+  if (units > maximum || length != strlen(value)) qa_save_reader_fail(reader, "invalid native component string");
   return value;
 }
 static bool same_numbers(const double *a, size_t an, const double *b, size_t bn) {
@@ -40,6 +46,25 @@ static bool actor_equal(qa_actor_id a, qa_actor_id b) {
   return a.slot == b.slot && a.generation == b.generation && a.token == b.token
       && a.session.token == b.session.token;
 }
+/* TS sameConfigs over the two ReadonlyMap<number, string>: the same map, or the same size and
+ * every entry of a found with an equal value in b (Map.get: the one entry of that index). */
+static bool same_configs(const qa_native_q2_hud_frame *a, const qa_native_q2_hud_frame *b) {
+  if (a->configstrings == b->configstrings && a->configstring_count == b->configstring_count) return true;
+  if (a->configstring_count != b->configstring_count) return false;
+  for (size_t i = 0; i < a->configstring_count; i++) {
+    const qa_native_q2_config_string *found = NULL;
+    for (size_t j = 0; j < b->configstring_count && !found; j++)
+      if (b->configstrings[j].index == a->configstrings[i].index) found = &b->configstrings[j];
+    if (!found || strcmp(found->value, a->configstrings[i].value) != 0) return false;
+  }
+  return true;
+}
+/* A raise part way (an activation that changed identity or recipient) releases the shells. */
+static void projection_unwind(void *arg) {
+  qa_app_unified_native_projection *out = arg;
+  free(out->states);
+  free(out->frames);
+}
 qa_app_unified_native_projection qa_app_unified_project_native_components(
     const qa_app_unified_native_publication *previous, size_t previous_count,
     const qa_app_unified_native_publication *sources, size_t source_count) {
@@ -49,6 +74,8 @@ qa_app_unified_native_projection qa_app_unified_project_native_components(
   out.state_count = source_count;
   out.frames = xmalloc(source_count * sizeof *out.frames);
   out.frame_count = source_count;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, projection_unwind, &out);
   for (size_t i = 0; i < source_count; i++) {
     const qa_app_unified_native_publication *source = &sources[i];
     const qa_app_unified_native_publication *old = NULL;
@@ -64,7 +91,7 @@ qa_app_unified_native_projection qa_app_unified_project_native_components(
     bool old_hud = same && old->frame.has_native_hud;
     const qa_native_q2_hud_frame *hud = &source->frame.native_hud_frame;
     const qa_native_q2_hud_frame *old_frame = old ? &old->frame.native_hud_frame : NULL;
-    bool same_config = has_hud && old_hud && hud->configstrings == old_frame->configstrings;
+    bool same_config = has_hud && old_hud && same_configs(hud, old_frame);
     bool same_hud = !has_hud ? !old_hud
         : old_hud && same_config
             && strcmp(source->frame.native_hud_mode, old->frame.native_hud_mode) == 0
@@ -112,6 +139,7 @@ qa_app_unified_native_projection qa_app_unified_project_native_components(
       frame->hud.frame_time_milliseconds = hud->frame_time_milliseconds;
     }
   }
+  qa_cleanup_pop(&guard);
   return out;
 }
 void qa_app_unified_native_projection_free(qa_app_unified_native_projection *projection) {

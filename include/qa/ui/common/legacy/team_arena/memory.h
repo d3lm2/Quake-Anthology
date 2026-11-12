@@ -9,8 +9,8 @@
  *  - stringArray's live getter/setter array becomes indexed
  *    get/set functions. String reads malloc (NULL only on OOM, or
  *    the TS undefined/null where the function says so).
- *  - Plain TS `Error` alias throws abort printing "Error: <msg>";
- *    RangeErrors abort via qa_range_error.
+ *  - Plain TS `Error` alias throws raise Error through
+ *    qa_ui_script_plain_error; RangeErrors through qa_range_error.
  * Copyright (C) 1999-2005 Id Software, Inc. GPL-2.0-or-later.
  */
 #ifndef QA_UI_COMMON_LEGACY_TEAM_ARENA_MEMORY_H
@@ -38,7 +38,9 @@ typedef struct qa_ui_memory_allocation qa_ui_memory_allocation;
 
 /* NULL only on OOM. */
 qa_ui_memory_allocation *qa_ui_memory_allocation_zeroed(int64_t size);
-/* Frees the handle only; shared storage outlives handles. */
+/* Releases the caller's handle; shared storage outlives handles. A handle
+   stored as an allocation pointer stays alive while that pointer-map entry
+   does (the TS Map keeps the object), so destroy is a release. */
 void qa_ui_memory_allocation_destroy(qa_ui_memory_allocation *allocation);
 int64_t qa_ui_memory_allocation_offset(
     const qa_ui_memory_allocation *allocation);

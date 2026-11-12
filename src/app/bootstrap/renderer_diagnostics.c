@@ -37,12 +37,15 @@ static const char *decoded_kind(qa_decoded_model_kind kind) {
   }
   return "";
 }
+static void free_text(void *text) { free(*(char **)text); }
 static void diagnostic_handler(void *ctx, qa_command_invocation *invocation) {
   handler_ctx *h = ctx;
   qa_app_renderer_diagnostic_services *services = &h->reg->services;
-  /* TS invocation.args excludes the command name (landed argv excludes it too). */
-  size_t arg_count = invocation->argc;
+  /* TS invocation.args excludes the command name; argv[0] is the name. */
+  size_t arg_count = invocation->argc > 0 ? invocation->argc - 1 : 0;
   char *text = xdup("");
+  qa_cleanup text_guard;
+  qa_cleanup_push(&text_guard, free_text, &text);
   char line[4096];
   switch (h->which) {
     case DIAG_IMAGE_LIST: {
@@ -84,7 +87,7 @@ static void diagnostic_handler(void *ctx, qa_command_invocation *invocation) {
     }
     case DIAG_MODEL_LIST: {
       qa_q3_pres_q3_renderer_resources *resources = services->resources(services->ctx, invocation->source);
-      if (resources == NULL) qa_range_error("No active source client model registry");
+      if (resources == NULL) qa_raise("Error", 0, 0, "No active source client model registry");
       qa_q3_pres_registered_model *models = NULL; size_t count = 0;
       if (!qa_q3_pres_q3_renderer_resources_registered_models(resources, &models, &count)) qa_range_error("Out of memory");
       append_str(&text, "handle kind name\n");
@@ -105,7 +108,7 @@ static void diagnostic_handler(void *ctx, qa_command_invocation *invocation) {
     }
     case DIAG_SKIN_LIST: {
       qa_q3_pres_q3_renderer_resources *resources = services->resources(services->ctx, invocation->source);
-      if (resources == NULL) qa_range_error("No active source client skin registry");
+      if (resources == NULL) qa_raise("Error", 0, 0, "No active source client skin registry");
       qa_q3_pres_registered_skin *skins = NULL; size_t count = 0;
       if (!qa_q3_pres_q3_renderer_resources_registered_skins(resources, &skins, &count)) qa_range_error("Out of memory");
       for (size_t i = 0; i < count; i++) {
@@ -153,6 +156,7 @@ static void diagnostic_handler(void *ctx, qa_command_invocation *invocation) {
       break;
     }
   }
+  qa_cleanup_pop(&text_guard);
   free(text);
 }
 qa_app_renderer_diagnostics_registration *qa_app_register_renderer_diagnostics(qa_app_renderer_diagnostic_services services) {
@@ -170,11 +174,11 @@ qa_app_renderer_diagnostics_registration *qa_app_register_renderer_diagnostics(q
       {"gfxinfo", "Report the actual backend, drawable size and GL driver when present.", "gfxinfo", DIAG_GFX_INFO}};
   for (size_t i = 0; i < 6; i++) {
     if (qa_command_buffer_exists(services.commands, defs[i].name))
-      qa_range_error("Renderer diagnostic command already registered: %s", defs[i].name);
+      qa_raise("Error", 0, 0, "Renderer diagnostic command already registered: %s", defs[i].name);
     reg->ctxs[i].reg = reg; reg->ctxs[i].which = defs[i].which;
     qa_command_documentation doc = {defs[i].summary, defs[i].usage, NULL, 0, NULL, 0};
     if (!qa_command_buffer_register_engine(services.commands, defs[i].name, diagnostic_handler, &reg->ctxs[i], &doc))
-      qa_range_error("Cannot register renderer diagnostic %s", defs[i].name);
+      qa_raise("Error", 0, 0, "Cannot register renderer diagnostic %s", defs[i].name);
     reg->names[reg->count++] = defs[i].name;
   }
   return reg;

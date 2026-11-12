@@ -26,19 +26,26 @@ void qa_compat_q2_write_native_user_command(uint8_t *view, size_t len, qa_user_c
   put16(view,8,qa_js_to_int16(c.forward_move)); put16(view,10,qa_js_to_int16(c.side_move)); put16(view,12,qa_js_to_int16(c.up_move));
   view[14]=qa_js_to_uint8(c.impulse); view[15]=qa_js_to_uint8(c.light_level);
 }
+static double command_input(const qa_compat_q2_mod_command_inputs *in, int index) {
+  static const char *const names[6]={"attack","jump","impulse","forward-move","side-move","up-move"};
+  const double values[6]={in->attack,in->jump,in->impulse,in->forward_move,in->side_move,in->up_move};
+  if(!in->has[index]||!isfinite(values[index])) qa_raise("Error", 0, 0, "Missing native command input %s", names[index]);
+  return values[index];
+}
 size_t qa_compat_q2_native_mod_user_command(uint8_t *out, bool rerelease, double frame, double elapsed_ms, qa_vec3 aim, qa_compat_q2_mod_command_inputs in, void *rr_ctx, void (*write_rerelease)(void *, uint8_t *, size_t, qa_q2_rerelease_user_command)) {
-  double vals[6]={in.attack,in.jump,in.impulse,in.forward_move,in.side_move,in.up_move};
-  for(int i=0;i<6;i++) if(!in.has[i]||!isfinite(vals[i])) qa_range_error("Missing native command input");
+  /* TS input(name): each input is looked up where the command reads it, so the interval is checked first, a
+   * missing input is an Error naming it, and the rerelease command never asks for the impulse. */
   double ms=qa_js_round(elapsed_ms);
-  if(ms<0||ms>255) qa_range_error("Native command interval exceeds its original byte ABI");
+  if(ms<0||ms>255) qa_raise("Error", 0, 0, "Native command interval exceeds its original byte ABI");
   size_t len=rerelease?28:16; memset(out,0,len);
-  double fwd=in.forward_move*200, side=in.side_move*200, up=in.up_move*200;
+  double fwd=command_input(&in,3)*200, side=command_input(&in,4)*200, up=command_input(&in,5)*200;
   qa_user_command cmd; memset(&cmd,0,sizeof cmd);
   if(rerelease){ cmd.kind=QA_USER_COMMAND_Q2_RERELEASE; cmd.as.q2_rerelease.milliseconds=ms; cmd.as.q2_rerelease.angles=aim;
-    cmd.as.q2_rerelease.buttons=(double)((in.attack!=0?1:0)|(in.jump!=0?8:0)|(up<0?16:0)); cmd.as.q2_rerelease.forward_move=fwd; cmd.as.q2_rerelease.side_move=side; cmd.as.q2_rerelease.server_frame=frame; }
-  else { cmd.kind=QA_USER_COMMAND_Q2; cmd.as.q2.milliseconds=ms; cmd.as.q2.buttons=in.attack!=0?1:0;
+    double attack=command_input(&in,0), jump=command_input(&in,1);
+    cmd.as.q2_rerelease.buttons=(double)((attack!=0?1:0)|(jump!=0?8:0)|(up<0?16:0)); cmd.as.q2_rerelease.forward_move=fwd; cmd.as.q2_rerelease.side_move=side; cmd.as.q2_rerelease.server_frame=frame; }
+  else { cmd.kind=QA_USER_COMMAND_Q2; cmd.as.q2.milliseconds=ms; cmd.as.q2.buttons=command_input(&in,0)!=0?1:0;
     cmd.as.q2.angle_shorts.values[0]=aim.x*65536/360; cmd.as.q2.angle_shorts.values[1]=aim.y*65536/360; cmd.as.q2.angle_shorts.values[2]=aim.z*65536/360;
-    cmd.as.q2.forward_move=fwd; cmd.as.q2.side_move=side; cmd.as.q2.up_move=in.jump!=0?(up>200?up:200):up; cmd.as.q2.impulse=in.impulse; cmd.as.q2.light_level=0; }
+    cmd.as.q2.forward_move=fwd; cmd.as.q2.side_move=side; cmd.as.q2.up_move=command_input(&in,1)!=0?qa_js_max(200,up):up; cmd.as.q2.impulse=command_input(&in,2); cmd.as.q2.light_level=0; }
   qa_compat_q2_write_native_user_command(out,len,cmd,rr_ctx,write_rerelease); return len;
 }
 
@@ -54,7 +61,8 @@ static void stage_bind(qa_compat_q2_native_mod_stage_runner *s, stage_scope *sco
   const qa_compat_q2_native_mod_host *host = s->host;
   for (size_t i = 0; i < scope->call->skip_count; i++) {
     const qa_native_mod_skip *region = &scope->call->skips[i];
-    scope->handles[scope->handle_count++] = qa_compat_q2_native_mod_bind_region(host, qa_compat_q2_native_mod_image_rva(host, region->entry), qa_compat_q2_native_mod_image_rva(host, region->join), NULL, skip_region, NULL, NULL);
+    uint64_t handle = qa_compat_q2_native_mod_bind_region(host, qa_compat_q2_native_mod_image_rva(host, region->entry), qa_compat_q2_native_mod_image_rva(host, region->join), NULL, skip_region, NULL, NULL);
+    scope->handles[scope->handle_count++] = handle; /* counted only once the region is bound */
   }
   if (scope->extra != NULL) { scope->extra(scope->extra_ctx); scope->extra_bound = true; }
 }

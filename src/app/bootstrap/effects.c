@@ -433,7 +433,10 @@ static void reject(effects_t *e, const retained *source, const char *reason) {
   size_t length = strlen(reason) + 1;
   record->reason = xcalloc(length, 1);
   memcpy(record->reason, reason, length);
-  qa_event_ring_admit(&e->unhandled, &record);
+  if (qa_event_ring_append(&e->unhandled, &record) == 0) { /* EventRing.admit raises; the record is released first */
+    free_unhandled_record(record);
+    qa_range_error("Event ring capacity exhausted (%zu undrained records); drain before admitting more", e->unhandled.capacity);
+  }
 }
 
 /* ---- lifecycle ---- */
@@ -535,7 +538,10 @@ static void receive_one(effects_t *e, const qa_app_sim_presentation_event *event
   if (event->sequence <= e->sequence) return;
   e->sequence = event->sequence;
   retained *r = retain_event(e->strings, event);
-  qa_event_ring_admit(&e->pending, &r);
+  if (qa_event_ring_append(&e->pending, &r) == 0) { /* EventRing.admit raises; the copy is released first */
+    retained_free(r);
+    qa_range_error("Event ring capacity exhausted (%zu undrained records); drain before admitting more", e->pending.capacity);
+  }
 }
 void qa_app_application_effects_receive(qa_app_application_effects *e, const qa_app_sim_presentation_event *events, size_t count) {
   ensure_open(e);
@@ -922,9 +928,16 @@ static void q2_effect(effects_t *e, const event_scope *scope, const qa_q2_presen
       admit_sound(e, content, water ? "weapons/xpld_wat.wav" : grenade ? "weapons/grenlx1a.wav" : "weapons/rocklx1a.wav", event->origin, time);
   } else if (is(name, "footstep") || is(name, "monster-footstep") || is(name, "fall") || is(name, "fall-short") || is(name, "fall-far")) {
   } else {
-    char reason[320];
-    snprintf(reason, sizeof reason, "Unresolved Quake II source effect %s", original);
+    /* `Unresolved Quake II source effect ${original}`, uncut (the 256-byte name above only ever misses: no
+     * resolved effect name is that long) */
+    size_t length = strlen(original) + 36;
+    char *reason = xcalloc(length, 1);
+    snprintf(reason, length, "Unresolved Quake II source effect %s", original);
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, reason);
     reject(e, source, reason);
+    qa_cleanup_pop(&guard);
+    free(reason);
   }
 }
 static void q1_event(effects_t *e, const event_scope *scope, const qa_q1_event *event) {
@@ -1455,6 +1468,13 @@ static void sample_light(const void *value, size_t index, void *ctx) {
   push_sampled(s->effects, (qa_surface_dynamic_light){l->origin, qa_js_max(0, l->radius - l->decay * (s->now - l->born)), l->minimum, l->color});
 }
 static void close_effects(effects_t *e);
+typedef struct pending_batch { retained **items; size_t count, next; } pending_batch;
+static void pending_batch_release(void *value) {
+  pending_batch *batch = value;
+  for (size_t i = 0; i < batch->count; i++) retained_free(batch->items[i]);
+  free(batch->items);
+  batch->items = NULL; batch->count = 0;
+}
 static bool beam_actor_gone(const qa_world_snapshot *snapshot, const beam *b) {
   return b->has_actor && !live_actor(snapshot, b->actor);
 }
@@ -1490,14 +1510,15 @@ void qa_app_application_effects_prepare(qa_app_application_effects *e, const qa_
   for (size_t i = 0; i < snapshot->body_count; i++)
     e->poses[e->pose_count++] = (pose){snapshot->bodies[i].actor, snapshot->bodies[i].body.origin, snapshot->bodies[i].body.angles};
   for (size_t i = 0; i < e->group_count; i++) { e->groups[i]->model_count = 0; beams_clear(e->groups[i]); }
-  size_t pending_count = 0;
-  retained **pending = qa_event_ring_take(&e->pending, &e->pending_cursor, &pending_count);
+  pending_batch batch = {NULL, 0, 0};
+  batch.items = qa_event_ring_take(&e->pending, &e->pending_cursor, &batch.count);
   qa_event_ring_retire(&e->pending);
-  for (size_t i = 0; i < pending_count; i++) {
-    source_event(e, pending[i]);
-    retained_free(pending[i]);
-  }
-  free(pending);
+  /* A raising event ends the prepare; the taken events after it are released (TS drops them). */
+  qa_cleanup batch_guard;
+  qa_cleanup_push(&batch_guard, pending_batch_release, &batch);
+  for (; batch.next < batch.count; batch.next++) source_event(e, batch.items[batch.next]);
+  qa_cleanup_pop(&batch_guard);
+  pending_batch_release(&batch);
   for (size_t i = e->flashlight_count; i-- > 0;) if (!live_actor(snapshot, e->flashlights[i].actor)) REMOVE_AT(e->flashlights, e->flashlight_count, i);
   for (size_t i = e->shadow_light_count; i-- > 0;)
     if (!live_actor(snapshot, e->shadow_lights[i].state.actor)) REMOVE_AT(e->shadow_lights, e->shadow_light_count, i);

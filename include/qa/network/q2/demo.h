@@ -66,5 +66,7 @@ typedef struct qa_q2_demo_header {
 
 bool qa_q2_read_demo_header(const uint8_t *bytes, size_t length,
                             qa_q2_demo_header *out);
+/* Frees the header's server data strings. */
+void qa_q2_demo_header_free(qa_q2_demo_header *header);
 
 #endif

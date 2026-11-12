@@ -22,8 +22,14 @@ typedef struct qa_app_qw_server_administration {
   void (*execute_admin)(void *ctx, const char *command,
       void (*write)(void *, const char *, size_t), void *write_ctx);
 } qa_app_qw_server_administration;
+/* TS `authentication` getters (password, spectatorPassword, highCharacters), read live
+ * whenever the connectionless server reads them. A returned string is borrowed until the
+ * next call of the same getter. */
 typedef struct qa_app_qw_server_authentication {
-  const char *password, *spectator_password; bool high_characters;
+  void *ctx;
+  const char *(*password)(void *ctx);
+  const char *(*spectator_password)(void *ctx);
+  bool (*high_characters)(void *ctx);
 } qa_app_qw_server_authentication;
 typedef struct qa_app_qw_server_network qa_app_qw_server_network;
 qa_app_qw_server_network *qa_app_qw_server_network_create(qa_app_qw_server_network_options options);

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 
 static noreturn void media_error(const char *format, ...) {
@@ -73,7 +74,12 @@ static void reader_init(qa_save_reader *reader, const qa_save_value *value,
   }
 }
 
+static bool make_decoder_into(qa_roq_playback *playback, qa_roq_decoder *target);
 static bool make_decoder(qa_roq_playback *playback) {
+  return make_decoder_into(playback, &playback->decoder);
+}
+
+static bool make_decoder_into(qa_roq_playback *playback, qa_roq_decoder *target) {
   qa_roq_decoder_options options;
   memset(&options, 0, sizeof options);
   options.has_end_policy = true;
@@ -81,10 +87,10 @@ static bool make_decoder(qa_roq_playback *playback) {
   options.silent = playback->silent;
   options.scratch = playback->scratch;
   if (playback->is_stream) {
-    return qa_roq_decoder_init_stream(&playback->decoder, playback->stream,
+    return qa_roq_decoder_init_stream(target, playback->stream,
                                       playback->source, &options);
   }
-  return qa_roq_decoder_init_bytes(&playback->decoder, playback->data,
+  return qa_roq_decoder_init_bytes(target, playback->data,
                                    playback->data_length, playback->source,
                                    &options);
 }
@@ -98,7 +104,7 @@ static void restore_checkpoint(qa_roq_playback *playback,
   qa_roq_decoder_restore_checkpoint(&playback->decoder, f.value);
   qa_save_reader_destroy(&f);
   read_field(&r, "epoch", &f);
-  playback->epoch = (uint32_t)qa_save_reader_integer_min(&f, 0);
+  playback->epoch = qa_save_reader_integer_min(&f, 0);
   qa_save_reader_destroy(&f);
   read_field(&r, "lastTime", &f);
   playback->last_time = (int64_t)qa_save_reader_integer_min(&f, 0);
@@ -139,6 +145,17 @@ static void restore_checkpoint(qa_roq_playback *playback,
   qa_save_reader_destroy(&r);
 }
 
+static void setup_unwind(void *raw) {
+  qa_roq_playback *playback = (qa_roq_playback *)raw;
+  if (playback->has_frame) qa_cinematic_frame_dispose(&playback->frame);
+  playback->has_frame = false;
+  qa_roq_decoder_destroy(&playback->decoder);
+  free(playback->data);
+  playback->data = NULL;
+  free(playback->source);
+  playback->source = NULL;
+}
+
 static bool playback_setup(qa_roq_playback *playback,
                            const qa_roq_playback_options *options,
                            const qa_save_value *checkpoint) {
@@ -158,10 +175,19 @@ static bool playback_setup(qa_roq_playback *playback,
   playback->scratch = options->scratch;
   playback->state = QA_ROQ_PLAYBACK_PLAYING;
   playback->decoded_frames = -1;
-  if (!make_decoder(playback)) return false;
+  /* The RoqDecoder constructor reads the stream header and a checkpoint can be
+   * refused; a raise releases what this constructor built (TS: garbage). The
+   * stream itself stays with the caller, as in TS. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, setup_unwind, playback);
+  if (!make_decoder(playback)) {
+    qa_cleanup_pop(&guard);
+    return false;
+  }
   playback->epoch = epoch_of(options->clock);
   playback->last_time = (int64_t)playback->epoch;
   if (checkpoint != NULL) restore_checkpoint(playback, checkpoint);
+  qa_cleanup_pop(&guard);
   return true;
 }
 
@@ -304,10 +330,27 @@ static void reset_loop(qa_roq_playback *playback, qa_media_clock clock) {
   playback->loop_index++;
 }
 
+static void decoder_release(void *raw) {
+  qa_roq_decoder_destroy((qa_roq_decoder *)raw);
+}
+
 bool qa_roq_playback_reset(qa_roq_playback *playback, qa_media_clock clock) {
   if (playback->scratch != NULL) qa_roq_scratch_clear(playback->scratch);
+  /* TS `this.decoder = new RoqDecoder(...)`: a throwing constructor leaves
+   * the previous decoder in place. */
+  qa_roq_decoder next;
+  memset(&next, 0, sizeof next);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decoder_release, &next);
+  bool built = make_decoder_into(playback, &next);
+  qa_cleanup_pop(&guard);
+  if (!built) return false;
   qa_roq_decoder_destroy(&playback->decoder);
-  if (!make_decoder(playback)) return false;
+  playback->decoder = next;
+  /* An owned scratch is addressed through the decoder itself. */
+  if (playback->decoder.owns_scratch) {
+    playback->decoder.scratch = &playback->decoder.owned_scratch;
+  }
   if (playback->has_frame) {
     qa_cinematic_frame_dispose(&playback->frame);
     playback->has_frame = false;
@@ -372,7 +415,7 @@ static void hook_after_audio(void *raw, const qa_roq_event *event) {
 static int64_t target_frames(qa_roq_playback *playback,
                              qa_media_clock clock) {
   double time = clock_time(clock.sample(clock.ctx));
-  return (int64_t)trunc((float)((time - (double)playback->epoch) * 3.0 / 100.0));
+  return (int64_t)trunc((float)((time - playback->epoch) * 3.0 / 100.0));
 }
 
 bool qa_roq_playback_run(qa_roq_playback *playback, qa_media_clock clock,
@@ -388,10 +431,10 @@ bool qa_roq_playback_run(qa_roq_playback *playback, qa_media_clock clock,
       (int64_t)trunc((float)clock_time(clock.sample(clock.ctx)));
   int32_t gap = (int32_t)((uint32_t)this_time - (uint32_t)playback->last_time);
   if (playback->shader && (gap > 100 || gap < -100)) {
-    playback->epoch = playback->epoch + (uint32_t)gap;
+    playback->epoch = (double)qa_js_to_uint32(playback->epoch + (double)gap);
   }
   int64_t target = target_frames(playback, clock);
-  uint32_t epoch = playback->epoch;
+  double epoch = playback->epoch;
   bool dirty = false;
   hook_ctx hooks;
   hooks.playback = playback;

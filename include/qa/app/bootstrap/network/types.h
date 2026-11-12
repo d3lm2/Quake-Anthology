@@ -85,6 +85,7 @@ typedef struct qa_app_q2_server_host {
   const void *(*frame)(void *ctx, qa_app_q2_player player, const void *output, const qa_q2_protocol_identity *protocol);
   const qa_app_q2_server_event *(*events)(void *ctx, qa_app_q2_player player, const void *output,
       const void *const *events, size_t count, size_t *out_count);
+  /* NULL or a qa_actor_command borrowed for the call: the network copies it into its queue. */
   const void *(*input)(void *ctx, qa_app_q2_player player, const void *command, double sequence);
   void (*command)(void *ctx, qa_app_q2_player player, const char *name, const char *const *args, size_t count);
   void (*command_text)(void *ctx, qa_app_q2_player player, const char *text);

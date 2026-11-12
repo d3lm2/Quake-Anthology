@@ -102,11 +102,11 @@ qa_compat_q2_native_compatibility_result *qa_app_sim_prepare_native_artifact(con
                                                                            const char *edition, const char *abi_message, uint8_t **bytes, size_t *length,
                                                                            qa_compat_q2_native_primary_declaration *primary_out);
 void qa_app_sim_native_compatibility_free(qa_compat_q2_native_compatibility_result *result);
-/* TS nativeModuleIdentity(prepared). revision is written into scratch
- * when a primary declaration exists. */
+/* TS nativeModuleIdentity(prepared). When a primary declaration exists the revision is a
+ * whole malloc'd string in *owned_revision (the caller frees it); otherwise NULL. */
 qa_module_identity qa_app_sim_prepared_module_identity(const qa_resolved_execution_module *execution, bool has_primary,
                                                        const qa_compat_q2_native_primary_declaration *primary,
-                                                       char *scratch, size_t scratch_size);
+                                                       char **owned_revision);
 
 /* --- ClassicGuestSource --- */
 typedef struct qa_app_sim_classic_guest_source_options {

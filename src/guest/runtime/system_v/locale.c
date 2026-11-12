@@ -13,13 +13,8 @@ static void *xmalloc(size_t size) {
   if (p == NULL) qa_range_error("Guest runtime out of memory");
   return p;
 }
-static char *xstrdup(const char *text) {
-  char *copy = xmalloc(strlen(text) + 1);
-  strcpy(copy, text);
-  return copy;
-}
-static void plain_error(const char *message) { qa_range_error("%s", message); }
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
 static qa_guest_core_address slot(qa_system_v_classic_locale *locale, qa_guest_core_address a, int64_t o) {
   return qa_cxx_abi_slot(locale->abi, a, o);
 }
@@ -67,6 +62,8 @@ static qa_guest_core_address facet(qa_system_v_classic_locale *locale, const cha
   char *deleting_name = xmalloc(strlen(name) + 40);
   (void)snprintf(deleting_name, strlen(name) + 40, "__guest_%s_deleting_destructor", name);
   qa_guest_core_address deleting = qa_cxx_abi_unsupported(abi, deleting_name);
+  free(destructor_name);
+  free(deleting_name);
   qa_guest_core_address *entries = xmalloc((method_count + 2) * sizeof *entries);
   entries[0] = destructor; entries[1] = deleting;
   for (size_t i = 0; i < method_count; i++) entries[i + 2] = methods[i];
@@ -223,11 +220,12 @@ static qa_call_result ctype_impl(void *ctx, const qa_guest_core_call_context *co
         if (!read_ptr(locale, slot(locale, object, masks + (int64_t)bit * m->pointer_bytes),
                       &table))
           continue;
-        uint32_t index1 = value >> qa_memory_read_u32(m, table);
+        /* JS `>>>` takes the shift count mod 32 (the table is guest data). */
+        uint32_t index1 = value >> (qa_memory_read_u32(m, table) & 31u);
         if (index1 >= qa_memory_read_u32(m, slot(locale, table, 4))) continue;
         uint32_t lookup1 = qa_memory_read_u32(m, slot(locale, table, 20 + (int64_t)index1 * 4));
         if (lookup1 == 0) continue;
-        uint32_t left = (value >> qa_memory_read_u32(m, slot(locale, table, 8)));
+        uint32_t left = (value >> (qa_memory_read_u32(m, slot(locale, table, 8)) & 31u));
         uint32_t right = qa_memory_read_u32(m, slot(locale, table, 12));
         uint32_t index2 = left &
                           right;
@@ -279,13 +277,15 @@ static qa_call_result ctype_impl(void *ctx, const qa_guest_core_call_context *co
     }
     case 7: {
       qa_guest_core_address object = qa_guest_required_pointer(args, count, 0);
-      int input = (int)qa_guest_integer(args, count, 1);
+      /* TS Number(integer(...)): a wide (uint32) character at or above 2^31 stays above 127. */
+      int64_t input = qa_guest_integer(args, count, 1);
+      if (args[1].kind == QA_CALL_UINT32) input = (int64_t)(uint32_t)input;
       int64_t narrow = 3 * m->pointer_bytes;
-      int value = state->wide && input < 128 &&
-                      qa_memory_read_u8(m, slot(locale, object, narrow)) != 0
-                  ? qa_memory_read_u8(m, slot(locale, object, narrow + 1 + input))
-                  : state->wide && input > 127 ? (int)qa_guest_integer(args, count, 2) : input;
-      return qa_call_int32((int8_t)value);
+      int64_t value = state->wide && input < 128 &&
+                          qa_memory_read_u8(m, slot(locale, object, narrow)) != 0
+                      ? qa_memory_read_u8(m, slot(locale, object, narrow + 1 + input))
+                      : state->wide && input > 127 ? qa_guest_integer(args, count, 2) : input;
+      return qa_call_int32((int8_t)(uint8_t)((uint64_t)value & 255u));
     }
     default: break;
   }
@@ -297,6 +297,7 @@ static qa_guest_core_address ctype_function(qa_system_v_classic_locale *locale, 
                                        int operation) {
   ctype_state *state = xmalloc(sizeof *state);
   state->locale = locale; state->wide = wide; state->operation = operation;
+  qa_system_v_own(locale->abi->host, state, free);
   qa_system_v_implementation impl = {state, ctype_impl};
   return qa_cxx_abi_function(locale->abi, name, parameters, parameter_count, result_is_void,
                              result, impl, NULL);
@@ -312,39 +313,39 @@ static size_t ctype_methods(qa_system_v_classic_locale *locale, bool wide,
   if (wide) {
     qa_abi_storage params[] = {QA_STORAGE_POINTER, QA_STORAGE_UINT32, QA_STORAGE_UINT32};
     (void)snprintf(name, sizeof name, "__guest_ctype_%c_is", ch);
-    out[count++] = ctype_function(locale, xstrdup(name), params, 3, false, QA_STORAGE_INT32,
+    out[count++] = ctype_function(locale, name, params, 3, false, QA_STORAGE_INT32,
                                   true, 0);
     const char *unsupported[] = {"is_range", "scan_is", "scan_not"};
     for (size_t i = 0; i < 3; i++) {
       (void)snprintf(name, sizeof name, "__guest_ctype_%c_%s", ch, unsupported[i]);
-      out[count++] = qa_cxx_abi_unsupported(abi, xstrdup(name));
+      out[count++] = qa_cxx_abi_unsupported(abi, name);
     }
   }
   const char *operations[] = {"toupper", "tolower"};
   for (size_t i = 0; i < 2; i++) {
     qa_abi_storage params[] = {QA_STORAGE_POINTER, type};
     (void)snprintf(name, sizeof name, "__guest_ctype_%c_%s", ch, operations[i]);
-    out[count++] = ctype_function(locale, xstrdup(name), params, 2, false, type, wide,
+    out[count++] = ctype_function(locale, name, params, 2, false, type, wide,
                                   i == 0 ? 1 : 3);
     qa_abi_storage range_params[] = {QA_STORAGE_POINTER, QA_STORAGE_POINTER, QA_STORAGE_POINTER};
     (void)snprintf(name, sizeof name, "__guest_ctype_%c_%s_range", ch, operations[i]);
-    out[count++] = ctype_function(locale, xstrdup(name), range_params, 3, false,
+    out[count++] = ctype_function(locale, name, range_params, 3, false,
                                   QA_STORAGE_POINTER, wide, i == 0 ? 2 : 4);
   }
   qa_abi_storage widen_params[] = {QA_STORAGE_POINTER, QA_STORAGE_INT32};
   (void)snprintf(name, sizeof name, "__guest_ctype_%c_widen", ch);
-  out[count++] = ctype_function(locale, xstrdup(name), widen_params, 2, false, type, wide, 5);
+  out[count++] = ctype_function(locale, name, widen_params, 2, false, type, wide, 5);
   qa_abi_storage widen_range_params[] = {QA_STORAGE_POINTER, QA_STORAGE_POINTER,
                                          QA_STORAGE_POINTER, QA_STORAGE_POINTER};
   (void)snprintf(name, sizeof name, "__guest_ctype_%c_widen_range", ch);
-  out[count++] = ctype_function(locale, xstrdup(name), widen_range_params, 4, false,
+  out[count++] = ctype_function(locale, name, widen_range_params, 4, false,
                                 QA_STORAGE_POINTER, wide, 6);
   qa_abi_storage narrow_params[] = {QA_STORAGE_POINTER, type, QA_STORAGE_INT32};
   (void)snprintf(name, sizeof name, "__guest_ctype_%c_narrow", ch);
-  out[count++] = ctype_function(locale, xstrdup(name), narrow_params, 3, false,
+  out[count++] = ctype_function(locale, name, narrow_params, 3, false,
                                 QA_STORAGE_INT32, wide, 7);
   (void)snprintf(name, sizeof name, "__guest_ctype_%c_narrow_range", ch);
-  out[count++] = qa_cxx_abi_unsupported(abi, xstrdup(name));
+  out[count++] = qa_cxx_abi_unsupported(abi, name);
   return count;
 }
 
@@ -387,6 +388,7 @@ static built_facets construct_facets(qa_system_v_classic_locale *locale, bool wi
         (void)snprintf(method_name, strlen(names[index]) + 32, "__guest_%s_virtual_%d",
                        names[index], s);
         methods[s] = qa_cxx_abi_unsupported(abi, method_name);
+        free(method_name);
       }
     }
     size_t size = index == 0
@@ -502,6 +504,7 @@ void qa_system_v_classic_locale_init(qa_system_v_classic_locale *locale, qa_cxx_
     write_ptr(locale, slot_address, loc_tables[i]);
     ctype_loc_state *state = xmalloc(sizeof *state);
     state->host = host; state->slot_address = slot_address;
+    qa_system_v_own(host, state, free);
     qa_system_v_implementation impl = {state, ctype_loc_impl};
     const char *versions[] = {"GLIBC_2.3", NULL};
     qa_system_v_service(host, "libc.so.6", loc_names[i], versions, 2, NULL, 0, false,

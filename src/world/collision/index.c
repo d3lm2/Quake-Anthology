@@ -100,6 +100,7 @@ bool qa_shared_linked_actor(qa_shared_scene_queries*q,qa_actor_id actor,qa_spati
   return current_actor(q,linked,out)!=0;
 }
 const qa_spatial_actor *qa_shared_query_actors(qa_shared_scene_queries*q,qa_bounds bounds,const char*role,size_t*out_count){
+  if(!role)role="both"; /* TS default parameter */
   const char*qrole=q->read_collision?"both":role;
   size_t n=0; const qa_spatial_actor*found=qa_spatial_index_query(q->spatial,bounds,qrole,&n);
   free(q->actor_scratch); q->actor_scratch=malloc((n?n:1)*sizeof*q->actor_scratch); if(!q->actor_scratch)abort();

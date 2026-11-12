@@ -4,6 +4,7 @@
 
 #include <ctype.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,14 @@ static void list_push(qa_md5_string_list *list, char *value) {
   list->values[list->count++] = value;
 }
 
+/* "<source>: <text><name>[/<key>]" built to size: scale file keys can be any length. */
+static char *scale_diagnostic(const char *source, const char *text, const char *name, const char *key) {
+  size_t length = strlen(source) + 2 + strlen(text) + strlen(name) + (key != NULL ? 1 + strlen(key) : 0);
+  char *message = xmalloc(length + 1);
+  snprintf(message, length + 1, "%s: %s%s%s%s", source, text, name, key != NULL ? "/" : "", key != NULL ? key : "");
+  return message;
+}
+
 static char *read_header(qa_model_tokens *tokens) {
   qa_model_tokens_expect(tokens, "MD5Version");
   qa_model_tokens_expect(tokens, "10");
@@ -53,6 +62,35 @@ static char *read_header(qa_model_tokens *tokens) {
 static qa_vec3 vector_normal(qa_vec3 value) {
   double length = sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
   return length == 0 ? value : qa_scale3(value, 1 / length);
+}
+
+/* The bits String(x) distinguishes: -0 is 0 and every NaN is one NaN. */
+static uint64_t key_bits(double value) {
+  if (value == 0) value = 0;
+  if (value != value) return 0x7ff8000000000000ull;
+  uint64_t bits;
+  memcpy(&bits, &value, sizeof bits);
+  return bits;
+}
+
+static bool key_equal(qa_vec3 a, qa_vec3 b) {
+  return key_bits(a.x) == key_bits(b.x) && key_bits(a.y) == key_bits(b.y) && key_bits(a.z) == key_bits(b.z);
+}
+
+static uint64_t key_mix(uint64_t value) {
+  value ^= value >> 33;
+  value *= 0xff51afd7ed558ccdull;
+  value ^= value >> 33;
+  value *= 0xc4ceb9fe1a85ec53ull;
+  return value ^ (value >> 33);
+}
+
+/* Open-addressing slot for `key`: its entry index, or SIZE_MAX where it would go. */
+static size_t *key_slot(size_t *slots, size_t slot_count, const qa_vec3 *keys, qa_vec3 key) {
+  uint64_t hash = key_mix(key_bits(key.x) ^ key_mix(key_bits(key.y) ^ key_mix(key_bits(key.z))));
+  size_t at = (size_t)hash & (slot_count - 1);
+  while (slots[at] != SIZE_MAX && !key_equal(keys[slots[at]], key)) at = (at + 1) & (slot_count - 1);
+  return &slots[at];
 }
 
 static void compute_normals(qa_md5_mesh *mesh, const qa_skeleton_joint_pose *bind_pose, size_t joint_count) {
@@ -72,10 +110,17 @@ static void compute_normals(qa_md5_mesh *mesh, const qa_skeleton_joint_pose *bin
     }
     positions[v] = position;
   }
-  /* Position-keyed accumulation (linear search stands in for the Map). */
+  /* Position-keyed accumulation: TS keys a Map by `${x}|${y}|${z}`, so two
+   * positions share an entry when every component prints the same (0 and -0
+   * both print "0", every NaN prints "NaN"). A hash on the canonical bits
+   * keeps the lookups linear like the Map (a linear scan was quadratic). */
   qa_vec3 *keys = NULL;
   qa_vec3 *accumulated = NULL;
   size_t key_count = 0, key_capacity = 0;
+  size_t slot_count = 16;
+  while (slot_count < mesh->indices.count * 2 + 16) slot_count *= 2;
+  size_t *slots = xmalloc(slot_count * sizeof *slots);
+  for (size_t j = 0; j < slot_count; j++) slots[j] = SIZE_MAX;
   for (size_t i = 0; i + 2 < mesh->indices.count; i += 3) {
     qa_vec3 a = positions[qa_q3_model_at(
         mesh->indices.values[qa_q3_model_at((double)i, mesh->indices.count, "index")], vertex_count,
@@ -96,12 +141,9 @@ static void compute_normals(qa_md5_mesh *mesh, const qa_skeleton_joint_pose *bin
     qa_vec3 corners[3] = {a, b, c};
     for (int k = 0; k < 3; k++) {
       size_t found = key_count;
-      for (size_t j = 0; j < key_count; j++) {
-        if (keys[j].x == corners[k].x && keys[j].y == corners[k].y && keys[j].z == corners[k].z) {
-          found = j;
-          break;
-        }
-      }
+      size_t *slot = key_slot(slots, slot_count, keys, corners[k]);
+      if (*slot != SIZE_MAX) found = *slot;
+      else *slot = key_count;
       if (found == key_count) {
         if (key_count == key_capacity) {
           key_capacity = key_capacity ? key_capacity * 2 : 16;
@@ -120,12 +162,8 @@ static void compute_normals(qa_md5_mesh *mesh, const qa_skeleton_joint_pose *bin
     qa_md5_mesh_vertex *vertex = (qa_md5_mesh_vertex *)&mesh->vertices[v];
     qa_vec3 world_normal = qa_math_vec3(0, 0, 0);
     qa_vec3 position = positions[qa_q3_model_at((double)v, vertex_count, "position")];
-    for (size_t j = 0; j < key_count; j++) {
-      if (keys[j].x == position.x && keys[j].y == position.y && keys[j].z == position.z) {
-        world_normal = accumulated[j];
-        break;
-      }
-    }
+    size_t found = *key_slot(slots, slot_count, keys, position);
+    if (found != SIZE_MAX) world_normal = accumulated[found];
     qa_vec3 normal = qa_math_vec3(0, 0, 0);
     for (double i = 0; i < vertex->weights.count; i++) {
       const qa_md5_mesh_weight *weight =
@@ -140,6 +178,7 @@ static void compute_normals(qa_md5_mesh *mesh, const qa_skeleton_joint_pose *bin
   free(positions);
   free(keys);
   free(accumulated);
+  free(slots);
 }
 
 /* --- mesh --- */
@@ -380,74 +419,111 @@ static char *json_string(json *j) {
 
 typedef enum { JSON_OTHER, JSON_NUMBER, JSON_TRUE, JSON_OBJECT } json_kind;
 
-static json_kind json_skip_value(json *j, double *out_number);
-
-static json_kind json_skip_value(json *j, double *out_number) {
+/* An object member's key and colon. */
+static bool json_member_key(json *j) {
+  char *key = json_string(j);
+  free(key);
+  if (!j->ok) return false;
   json_ws(j);
-  if (*j->p == '{') {
-    j->p++;
+  if (*j->p != ':') return false;
+  j->p++;
+  return true;
+}
+
+/* Skip one JSON value and return the kind of that value. Iterative: bun's
+ * JSON.parse accepts millions of nested containers, which a recursive walk
+ * would turn into a stack overflow on a crafted scale file. */
+static json_kind json_skip_value(json *j, double *out_number) {
+  char *stack = NULL;
+  size_t depth = 0, capacity = 0;
+  json_kind top = JSON_OTHER;
+  bool at_top = true;
+  for (;;) {
     json_ws(j);
-    if (*j->p == '}') { j->p++; return JSON_OBJECT; }
-    for (;;) {
-      char *key = json_string(j);
-      free(key);
-      if (!j->ok) return JSON_OTHER;
-      json_ws(j);
-      if (*j->p != ':') { j->ok = false; return JSON_OTHER; }
+    json_kind kind = JSON_OTHER;
+    bool opened = false;
+    char first = *j->p;
+    if (first == '{' || first == '[') {
+      char close = first == '{' ? '}' : ']';
       j->p++;
-      json_skip_value(j, out_number);
-      if (!j->ok) return JSON_OTHER;
       json_ws(j);
-      if (*j->p == ',') { j->p++; json_ws(j); continue; }
-      if (*j->p == '}') { j->p++; return JSON_OBJECT; }
-      j->ok = false;
-      return JSON_OTHER;
+      kind = first == '{' ? JSON_OBJECT : JSON_OTHER;
+      if (*j->p == close) {
+        j->p++;
+      } else {
+        if (depth == capacity) {
+          capacity = capacity ? capacity * 2 : 64;
+          stack = xrealloc(stack, capacity);
+        }
+        stack[depth++] = first;
+        opened = true;
+        if (first == '{' && !json_member_key(j)) goto fail;
+      }
+    } else if (first == '"') {
+      char *value = json_string(j);
+      free(value);
+      if (!j->ok) goto fail;
+    } else if (strncmp(j->p, "true", 4) == 0) {
+      j->p += 4;
+      kind = JSON_TRUE;
+    } else if (strncmp(j->p, "false", 5) == 0) {
+      j->p += 5;
+    } else if (strncmp(j->p, "null", 4) == 0) {
+      j->p += 4;
+    } else {
+      /* JSON.parse number grammar: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?. strtod also took
+       * inf, nan, hex, "+1", ".5" and "01", which make JSON.parse throw. */
+      const char *at = j->p;
+      if (*at == '-') at++;
+      if (*at == '0') at++;
+      else if (*at >= '1' && *at <= '9') while (*at >= '0' && *at <= '9') at++;
+      else goto fail;
+      if (*at == '.') {
+        at++;
+        if (!(*at >= '0' && *at <= '9')) goto fail;
+        while (*at >= '0' && *at <= '9') at++;
+      }
+      if (*at == 'e' || *at == 'E') {
+        at++;
+        if (*at == '+' || *at == '-') at++;
+        if (!(*at >= '0' && *at <= '9')) goto fail;
+        while (*at >= '0' && *at <= '9') at++;
+      }
+      *out_number = strtod(j->p, NULL); /* exact over the validated JSON number */
+      j->p = at;
+      kind = JSON_NUMBER;
     }
-  }
-  if (*j->p == '[') {
-    j->p++;
-    json_ws(j);
-    if (*j->p == ']') { j->p++; return JSON_OTHER; }
+    if (at_top) top = kind;
+    at_top = false;
+    if (opened) continue;
+    /* A value ended: close containers or move to the next member. */
     for (;;) {
-      json_skip_value(j, out_number);
-      if (!j->ok) return JSON_OTHER;
+      if (depth == 0) {
+        free(stack);
+        return top;
+      }
       json_ws(j);
-      if (*j->p == ',') { j->p++; continue; }
-      if (*j->p == ']') { j->p++; return JSON_OTHER; }
-      j->ok = false;
-      return JSON_OTHER;
+      char open = stack[depth - 1];
+      if (*j->p == ',') {
+        j->p++;
+        if (open == '{') {
+          json_ws(j);
+          if (!json_member_key(j)) goto fail;
+        }
+        break;
+      }
+      if (*j->p == (open == '{' ? '}' : ']')) {
+        j->p++;
+        depth--;
+        continue;
+      }
+      goto fail;
     }
   }
-  if (*j->p == '"') {
-    char *value = json_string(j);
-    free(value);
-    return JSON_OTHER;
-  }
-  if (strncmp(j->p, "true", 4) == 0) { j->p += 4; return JSON_TRUE; }
-  if (strncmp(j->p, "false", 5) == 0) { j->p += 5; return JSON_OTHER; }
-  if (strncmp(j->p, "null", 4) == 0) { j->p += 4; return JSON_OTHER; }
-  /* JSON.parse number grammar: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?. strtod also took
-   * inf, nan, hex, "+1", ".5" and "01", which make JSON.parse throw. */
-  const char *at = j->p;
-  if (*at == '-') at++;
-  if (*at == '0') at++;
-  else if (*at >= '1' && *at <= '9') while (*at >= '0' && *at <= '9') at++;
-  else { j->ok = false; return JSON_OTHER; }
-  if (*at == '.') {
-    at++;
-    if (!(*at >= '0' && *at <= '9')) { j->ok = false; return JSON_OTHER; }
-    while (*at >= '0' && *at <= '9') at++;
-  }
-  if (*at == 'e' || *at == 'E') {
-    at++;
-    if (*at == '+' || *at == '-') at++;
-    if (!(*at >= '0' && *at <= '9')) { j->ok = false; return JSON_OTHER; }
-    while (*at >= '0' && *at <= '9') at++;
-  }
-  double value = strtod(j->p, NULL); /* exact over the validated JSON number */
-  j->p = at;
-  *out_number = value;
-  return JSON_NUMBER;
+fail:
+  free(stack);
+  j->ok = false;
+  return JSON_OTHER;
 }
 
 typedef struct {
@@ -555,9 +631,7 @@ static void parse_scales(const qa_md5_scale_source *source, qa_md5_hierarchy_joi
   json_skip_value(&j, &ignored);
   json_ws(&j);
   if (!j.ok || *j.p != '\0' || !root_object) {
-    char message[1024];
-    snprintf(message, sizeof message, "%s: Invalid JSON scale object", source->source);
-    list_push(diagnostics, xstrdup(message));
+    list_push(diagnostics, scale_diagnostic(source->source, "Invalid JSON scale object", "", NULL));
     return;
   }
   size_t entry_count = 0;
@@ -569,15 +643,11 @@ static void parse_scales(const qa_md5_scale_source *source, qa_md5_hierarchy_joi
       if (strcmp(hierarchy[i].joint.name, name) == 0) { joint = (int)i; break; }
     }
     if (!json_value_is_object(entries[e].value)) {
-      char message[1024];
-      snprintf(message, sizeof message, "%s: Invalid scale entry for %s", source->source, name);
-      list_push(diagnostics, xstrdup(message));
+      list_push(diagnostics, scale_diagnostic(source->source, "Invalid scale entry for ", name, NULL));
       break;
     }
     if (joint < 0) {
-      char message[1024];
-      snprintf(message, sizeof message, "%s: No such joint %s", source->source, name);
-      list_push(diagnostics, xstrdup(message));
+      list_push(diagnostics, scale_diagnostic(source->source, "No such joint ", name, NULL));
       continue;
     }
     size_t value_count = 0;
@@ -599,9 +669,7 @@ static void parse_scales(const qa_md5_scale_source *source, qa_md5_hierarchy_joi
         out->scales[at] = FR(number);
         out->scale_set[at] = 1;
       } else {
-        char message[1024];
-        snprintf(message, sizeof message, "%s: Invalid frame scale %s/%s", source->source, name, key);
-        list_push(diagnostics, xstrdup(message));
+        list_push(diagnostics, scale_diagnostic(source->source, "Invalid frame scale ", name, key));
       }
     }
     json_entries_free(values, value_count);
@@ -689,9 +757,13 @@ void qa_parse_md5_anim(const char *text, const char *source, const qa_md5_scale_
   qa_model_tokens_expect(&tokens, "numAnimatedComponents");
   double component_count = qa_model_tokens_integer(&tokens, 0, joint_count * 6);
   /* Each frame expands into per-joint pose objects, so bound the expansion by
-   * the input and by an absolute budget (text.length counts UTF-16 units in
-   * TS; C counts bytes). */
-  double text_length = (double)strlen(text);
+   * the input and by an absolute budget (text.length: UTF-16 units of the
+   * decoded text, counted over its UTF-8). */
+  double text_length = 0;
+  for (const unsigned char *at = (const unsigned char *)text; *at != 0; at++) {
+    if ((*at & 0xc0) == 0x80) continue;
+    text_length += *at >= 0xf0 ? 2 : 1;
+  }
   if (frame_count * joint_count > qa_js_min(500000, qa_js_max(4096, text_length)))
     qa_model_tokens_fail(&tokens, "animation expands far beyond its data");
   qa_model_tokens_expect(&tokens, "hierarchy");

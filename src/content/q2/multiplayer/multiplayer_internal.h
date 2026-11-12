@@ -32,6 +32,44 @@ static inline char *qa_q2mp_dup(const char *s) {
   memcpy(out, s, n);
   return out;
 }
+/* A TS template literal of any length: the formatted text in malloc'd storage (free it). */
+static inline char *qa_q2mp_vformat(const char *format, va_list args) {
+  va_list copy;
+  va_copy(copy, args);
+  int length = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  if (length < 0) qa_raise("Error", 0, 0, "Out of memory");
+  char *out = qa_q2mp_xalloc(malloc((size_t)length + 1));
+  vsnprintf(out, (size_t)length + 1, format, args);
+  return out;
+}
+#if defined(__GNUC__)
+__attribute__((format(printf, 1, 2)))
+#endif
+static inline char *qa_q2mp_format(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  char *out = qa_q2mp_vformat(format, args);
+  va_end(args);
+  return out;
+}
+/* TS string lengths and slices count UTF-16 units: a UTF-8 sequence of up to three bytes is one unit, a four-byte
+ * one is a surrogate pair. */
+static inline size_t qa_q2mp_utf16_units_of_lead(unsigned char lead) { return (lead & 0xC0) == 0x80 ? 0 : lead >= 0xF0 ? 2 : 1; }
+static inline size_t qa_q2mp_utf16_units(const char *text) {
+  size_t units = 0;
+  for (const unsigned char *at = (const unsigned char *)text; *at; at++) units += qa_q2mp_utf16_units_of_lead(*at);
+  return units;
+}
+/* text.slice(0, limit). A surrogate pair the limit would split is dropped whole: half of it has no UTF-8 form. */
+static inline void qa_q2mp_slice_utf16(char *text, size_t limit) {
+  size_t units = 0;
+  for (unsigned char *at = (unsigned char *)text; *at; at++) {
+    size_t step = qa_q2mp_utf16_units_of_lead(*at);
+    if (step != 0 && units + step > limit) { *at = '\0'; return; }
+    units += step;
+  }
+}
 /* TS String(number) for the values formatted by this slice. */
 static inline void qa_q2mp_format_number(char *buf, size_t size, double value) {
   qa_net_js_number(value, buf, size);

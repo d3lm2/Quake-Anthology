@@ -31,12 +31,12 @@ static uint64_t get_le(const uint8_t *in, int bytes) { uint64_t v = 0; for (int 
 int qa_compat_q2_native_encode_scalar(const qa_compat_q2_memory *memory, const char *storage, const qa_guest_call_value *value, uint8_t *out) {
   int bytes = qa_compat_q2_native_storage_bytes(storage, memory->pointer_bytes);
   if (!strcmp(storage, "pointer")) {
-    if (value->kind != QA_GUEST_VALUE_POINTER) qa_range_error("Pointer ABI argument requires a guest pointer");
+    if (value->kind != QA_GUEST_VALUE_POINTER) qa_raise("TypeError", 0, 0, "Pointer ABI argument requires a guest pointer");
     uint64_t raw = value->pointer_value.has_value ? (uint64_t)qa_compat_q2_mem_offset(memory, value->pointer_value.value, 0).byte_offset : 0;
     put_le(out, raw, bytes); return bytes;
   }
   if (!strcmp(storage, "float32") || !strcmp(storage, "float64")) {
-    if (value->kind != QA_GUEST_VALUE_FLOAT32 && value->kind != QA_GUEST_VALUE_FLOAT64) qa_range_error("Floating ABI argument requires a floating value");
+    if (value->kind != QA_GUEST_VALUE_FLOAT32 && value->kind != QA_GUEST_VALUE_FLOAT64) qa_raise("TypeError", 0, 0, "Floating ABI argument requires a floating value");
     if (bytes == 4) { float f = (float)value->number_value; uint32_t u; memcpy(&u, &f, 4); put_le(out, u, 4); }
     else { double d = value->number_value; uint64_t u; memcpy(&u, &d, 8); put_le(out, u, 8); }
     return bytes;
@@ -48,7 +48,7 @@ int qa_compat_q2_native_encode_scalar(const qa_compat_q2_memory *memory, const c
       raw = (uint64_t)(int64_t)value->number_value; break;
     case QA_GUEST_VALUE_INT64: raw = (uint64_t)value->int64_value; break;
     case QA_GUEST_VALUE_UINT64: raw = value->uint64_value; break;
-    default: qa_range_error("Integer ABI argument requires an integer value");
+    default: qa_raise("TypeError", 0, 0, "Integer ABI argument requires an integer value");
   }
   put_le(out, raw, bytes); /* BigInt.asUintN at the storage width. */
   return bytes;
@@ -69,7 +69,11 @@ qa_guest_call_value qa_compat_q2_native_decode_scalar(const qa_compat_q2_memory 
 }
 
 qa_guest_address qa_compat_q2_native_mod_image_rva(const qa_compat_q2_native_mod_host *host, double rva) {
-  return qa_compat_q2_mem_offset(host->memory, host->image_base, (int64_t)rva);
+  /* TS BigInt(rva): a number that is not an integer is JavaScriptCore's RangeError. One past the int64 range
+   * cannot be an address of the image; memory.offset refuses it as it refuses any other. */
+  if (!isfinite(rva) || rva != trunc(rva)) qa_range_error("Not an integer");
+  int64_t delta = rva >= 9223372036854775808.0 ? INT64_MAX : rva < -9223372036854775808.0 ? INT64_MIN : (int64_t)rva;
+  return qa_compat_q2_mem_offset(host->memory, host->image_base, delta);
 }
 qa_guest_address qa_compat_q2_native_mod_entry_address(const qa_compat_q2_native_mod_host *host, qa_native_mod_entry entry) {
   return !strcmp(entry.kind, "export") ? host->entry(host->ctx, entry.name) : qa_compat_q2_native_mod_image_rva(host, entry.rva);
@@ -77,26 +81,44 @@ qa_guest_address qa_compat_q2_native_mod_entry_address(const qa_compat_q2_native
 uint64_t qa_compat_q2_native_mod_stack(const qa_compat_q2_native_mod_host *host) {
   return host->runner->read_register(host->runner->ctx, "rsp", host->memory->pointer_bytes == 4 ? 32 : 64);
 }
+/* TS `difference >= 0n && difference % BigInt(table.stride) === 0n`, with the quotient. The table shape comes
+ * from the guest's exports and TS computes in BigInt: a stride that is not an integer or is zero is
+ * JavaScriptCore's RangeError, and nothing here may divide by zero or cast an unrepresentable double. */
+bool qa_compat_q2_native_mod_table_index(qa_compat_q2_native_mod_entities table, qa_guest_address address, double *out) {
+  int64_t difference = address.byte_offset - table.base.byte_offset;
+  if (difference < 0) return false;
+  if (!isfinite(table.stride) || table.stride != trunc(table.stride)) qa_range_error("Not an integer");
+  if (table.stride == 0) qa_range_error("0 is an invalid divisor value.");
+  int64_t remainder, quotient;
+  if (fabs(table.stride) >= 9223372036854775808.0) { remainder = difference; quotient = 0; }
+  else { int64_t stride = (int64_t)table.stride; remainder = stride == -1 ? 0 : difference % stride; quotient = stride == -1 ? -difference : difference / stride; }
+  if (remainder != 0) return false;
+  *out = (double)quotient; return true;
+}
+/* Every TS site throws a plain Error for a pointer outside the table. */
 double qa_compat_q2_native_mod_table_slot(const qa_compat_q2_native_mod_host *host, qa_guest_address address, const char *message) {
-  qa_compat_q2_native_mod_entities table = host->entities(host->ctx);
-  int64_t difference = address.byte_offset - table.base.byte_offset, stride = (int64_t)table.stride;
-  if (difference < 0 || difference % stride != 0 || (double)(difference / stride) >= table.count) qa_range_error("%s", message);
-  return (double)(difference / stride);
+  qa_compat_q2_native_mod_entities table = host->entities(host->ctx); double slot;
+  if (!qa_compat_q2_native_mod_table_index(table, address, &slot)) qa_raise("Error", 0, 0, "%s", message);
+  if (!isfinite(table.count) || table.count != trunc(table.count)) qa_range_error("Not an integer");
+  if (slot >= table.count) qa_raise("Error", 0, 0, "%s", message);
+  return slot;
 }
 bool qa_compat_q2_text_equal(const char *a, const char *b) { return a == b || (a != NULL && b != NULL && strcmp(a, b) == 0); }
+/* isDeepStrictEqual compares numbers as Object.is does: NaN equals NaN, +0 differs from -0. */
+static bool same_number(double a, double b) { return a != a ? b != b : a == b && signbit(a) == signbit(b); }
 bool qa_compat_q2_regular_armor_equal(qa_regular_armor_state a, qa_regular_armor_state b) {
   if (a.kind != b.kind) return false;
   switch (a.kind) {
     case QA_REGULAR_ARMOR_NONE: return true;
-    case QA_REGULAR_ARMOR_Q1: return a.points == b.points && a.absorption == b.absorption && qa_compat_q2_text_equal(a.item, b.item);
-    case QA_REGULAR_ARMOR_Q2: return a.points == b.points && a.normal_protection == b.normal_protection && a.energy_protection == b.energy_protection && qa_compat_q2_text_equal(a.item, b.item);
-    case QA_REGULAR_ARMOR_Q3: return a.points == b.points && a.protection == b.protection;
-    case QA_REGULAR_ARMOR_SOURCE: return a.points == b.points && qa_compat_q2_text_equal(a.item, b.item);
+    case QA_REGULAR_ARMOR_Q1: return same_number(a.points, b.points) && same_number(a.absorption, b.absorption) && qa_compat_q2_text_equal(a.item, b.item);
+    case QA_REGULAR_ARMOR_Q2: return same_number(a.points, b.points) && same_number(a.normal_protection, b.normal_protection) && same_number(a.energy_protection, b.energy_protection) && qa_compat_q2_text_equal(a.item, b.item);
+    case QA_REGULAR_ARMOR_Q3: return same_number(a.points, b.points) && same_number(a.protection, b.protection);
+    case QA_REGULAR_ARMOR_SOURCE: return same_number(a.points, b.points) && qa_compat_q2_text_equal(a.item, b.item);
   }
   return false;
 }
 bool qa_compat_q2_powered_protection_equal(qa_powered_protection_state a, qa_powered_protection_state b) {
-  return qa_compat_q2_text_equal(a.kind, b.kind) && (!strcmp(a.kind, "none") || a.cells == b.cells);
+  return qa_compat_q2_text_equal(a.kind, b.kind) && (!strcmp(a.kind, "none") || same_number(a.cells, b.cells));
 }
 void *qa_compat_q2_grow(void **items, size_t *count, size_t *capacity, size_t element) {
   if (*count == *capacity) {

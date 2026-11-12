@@ -248,8 +248,7 @@ static void tech_sound(qa_q2_ctf_techs *t, qa_owned_actor entity, qa_q2_game_ser
   event.kind = "sound";
   event.has_actor = true;
   event.actor = entity.id;
-  qa_q2_entity *e = qa_q2_game_entity_of(g, &entity.id);
-  event.origin = e == NULL ? QA_Q2_ZERO : qa_q2_game_body(g, e).origin;
+  event.origin = g->body(g->ctx, entity).origin; /* TS game.body(entity): the body of the actor, raising when it is gone */
   event.path = path;
   event.channel = 2;
   event.volume = volume;

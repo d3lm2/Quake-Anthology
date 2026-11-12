@@ -8,6 +8,7 @@
 #include "qa/app/bootstrap/renderer_diagnostics.h"
 #include "qa/camera/application.h"
 #include "qa/content/mounts.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/support.h"
 #include "qa/settings/config.h"
 
@@ -52,16 +53,19 @@ static char *camera_read(void *ctx, const char *path) {
   if (!qa_config_store_init(&store, root)) qa_range_error("Out of memory");
   free(root);
   size_t length = 0;
+  /* loadText rejects for an existing file it cannot read: the store goes with the raise. */
+  qa_cleanup store_guard;
+  qa_cleanup_push(&store_guard, (void (*)(void *))qa_config_store_destroy, &store);
   char *saved = qa_config_store_load_text(&store, path, &length);
+  qa_cleanup_pop(&store_guard);
   qa_config_store_destroy(&store);
   if (saved != NULL) return saved;
   qa_content_opened_resource file;
   if (!qa_content_mounted_open(tools->services.mounts(tools->services.ctx), path, NULL, NULL, &file)) return NULL;
-  char *text = malloc(file.byte_length + 1);
-  if (text == NULL) qa_range_error("Out of memory");
-  memcpy(text, file.bytes, file.byte_length);
-  text[file.byte_length] = '\0';
+  /* new TextDecoder().decode(file.bytes): a leading byte order mark dropped, invalid UTF-8 as U+FFFD. */
+  char *text = qa_text_decoder_decode(file.bytes, file.byte_length, NULL);
   free(file.bytes);
+  if (text == NULL) qa_range_error("Out of memory");
   return text;
 }
 /* write: new ConfigStore(outputRoot()).dump(path, text). */

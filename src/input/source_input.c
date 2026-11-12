@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "qa/input/device_settings.h"
 
 struct qa_source_input_state {
@@ -234,6 +235,9 @@ void qa_source_input_joystick_frame(qa_source_input_state *state,
   }
   free(polled);
   state->event_count = 0;
+  /* A missing cvar or a raising key consumer abandons the batch (TS throw). */
+  qa_cleanup events_node;
+  qa_cleanup_push(&events_node, free, events);
   if (state->profile == QA_SOURCE_JOYSTICK_WINDOWS) {
     qa_cvar_snapshot snapshot;
     cvar_snapshot(state, "in_debugjoystick", &snapshot);
@@ -280,6 +284,7 @@ void qa_source_input_joystick_frame(qa_source_input_state *state,
         break;
     }
   }
+  qa_cleanup_pop(&events_node);
   free(events);
   double threshold = 0;
   const double *threshold_ptr = NULL;

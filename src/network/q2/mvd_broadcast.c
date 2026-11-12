@@ -54,6 +54,7 @@ static void viewer_send(qa_q2_mvd_broadcast *b, qa_q2_mvd_viewer *viewer,
   if (!send_all(viewer->socket_fd, bytes, length)) {
     qa_q2_throw_error("GTV viewer retired");
   }
+  viewer->activity_ms = monotonic_ms();
 }
 static void free_arg(void *arg) { free(arg); }
 static void viewer_send_owned(qa_q2_mvd_broadcast *b, qa_q2_mvd_viewer *viewer,
@@ -335,17 +336,18 @@ static void retire(qa_q2_mvd_broadcast *b, qa_q2_mvd_viewer *viewer) {
     viewer->socket_fd = -1;
   }
 }
+/* Removal keeps the TS Set order (attachment order), in which observe() serves viewers. */
 static void sweep_closed(qa_q2_mvd_broadcast *b) {
-  size_t i = 0;
-  while (i < b->viewer_count) {
+  size_t kept = 0;
+  for (size_t i = 0; i < b->viewer_count; i++) {
     if (b->viewers[i].closed) {
       qa_q2_mvd_framer_destroy(&b->viewers[i].frames);
-      b->viewers[i] = b->viewers[b->viewer_count - 1];
-      b->viewer_count--;
-    } else {
-      i++;
+      continue;
     }
+    if (kept != i) b->viewers[kept] = b->viewers[i];
+    kept++;
   }
+  b->viewer_count = kept;
 }
 static void attach(qa_q2_mvd_broadcast *b, int fd) {
   sweep_closed(b);
@@ -376,7 +378,8 @@ static void attach(qa_q2_mvd_broadcast *b, int fd) {
   qa_q2_gtv_server_stream_init(&viewer->stream);
   qa_q2_mvd_framer_init(&viewer->frames, true, 256);
   viewer->needs_gamestate = true;
-  viewer->deadline_ms = monotonic_ms() + 10000;
+  viewer->activity_ms = monotonic_ms();
+  viewer->deadline_ms = viewer->activity_ms + 10000;
   struct sockaddr_storage peer;
   socklen_t peer_length = sizeof peer;
   if (getpeername(fd, (struct sockaddr *)&peer, &peer_length) == 0) {
@@ -531,8 +534,12 @@ size_t qa_q2_mvd_broadcast_poll(qa_q2_mvd_broadcast *b,
   sweep_closed(b);
   size_t slots = b->viewer_count + (b->listener_fd >= 0 ? 1 : 0);
   double now = monotonic_ms();
+  /* TS: the 10 s authorization deadline, and socket.setTimeout(90000), which retires a viewer
+   * with no read or write for 90 s. */
   for (size_t i = 0; i < b->viewer_count; i++)
-    if (!b->viewers[i].authorized && now >= b->viewers[i].deadline_ms) retire(b, &b->viewers[i]);
+    if ((!b->viewers[i].authorized && now >= b->viewers[i].deadline_ms) ||
+        now - b->viewers[i].activity_ms >= 90000)
+      retire(b, &b->viewers[i]);
   sweep_closed(b);
   slots = b->viewer_count + (b->listener_fd >= 0 ? 1 : 0);
   if (slots == 0) return 0;
@@ -588,6 +595,7 @@ size_t qa_q2_mvd_broadcast_poll(qa_q2_mvd_broadcast *b,
         retire(b, viewer);
         continue;
       }
+      viewer->activity_ms = monotonic_ms();
       viewer_data(b, viewer, buffer, (size_t)n);
     }
   }

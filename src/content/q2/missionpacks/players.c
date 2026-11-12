@@ -55,8 +55,7 @@ bool qa_q2mp_rogue_player_spawns_select_spawn(qa_q2mp_rogue_player_spawns *s, qa
     for (size_t j = 0; j < players; j++) {
       qa_body_state_result body = q2mp_bread(game, list[j]);
       if (body.has_value && q2mp_health(game, list[j]) > 0) {
-        double d = q2mp_len(q2mp_sub(origin, body.value.origin));
-        if (d < distance) distance = d;
+        distance = qa_js_min(distance, q2mp_len(q2mp_sub(origin, body.value.origin))); /* Math.min: NaN propagates */
       }
     }
     if (distance > 32 && origin.z < lowest) { selected = point; lowest = origin.z; }

@@ -31,11 +31,11 @@ static void help_use(void *c, qa_q2_entity *e, qa_q2_game_services *g, const qa_
 static void verify_target(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   (void)c;
   if (!e->targetname || e->targetname[0] == '\0') {
-    char b[512]; snprintf(b, sizeof b, "WARNING: missing targetname on %s", e->classname); rr_diag(g, b); return;
+    rr_diagf(g, "WARNING: missing targetname on %s", e->classname); return;
   }
   size_t n = 0; qa_q2_entity *const *ents = g->entities(g->ctx, &n);
   for (size_t i = 0; i < n; i++) if (ents[i]->target && strcmp(ents[i]->target, e->targetname) == 0) return;
-  char b[1024]; snprintf(b, sizeof b, "WARNING: nothing targets %s %s", e->classname, e->targetname); rr_diag(g, b);
+  rr_diagf(g, "WARNING: nothing targets %s %s", e->classname, e->targetname);
 }
 static void goal_use(void *c, qa_q2_entity *e, qa_q2_game_services *g, const qa_actor_id *other, const qa_actor_id *act) {
   (void)other; qa_q2_rerelease_goals *gl = c;
@@ -100,9 +100,10 @@ void qa_q2_rerelease_goals_notify(qa_q2_rerelease_goals *gl, qa_q2_entity *e, qa
   if (gl->goals) {
     if (m->primary_changes != m->secondary_changes) {
       /* goals.split("\t")[goalNumber] */
-      long idx = (long)gl->goal_number;
+      /* An index that is not a whole number >= 0 reads undefined (a C cast would round it). */
+      double idx = gl->goal_number;
       const char *s = gl->goals; const char *goal = NULL; size_t glen = 0;
-      for (long i = 0;; i++) {
+      for (double i = 0; idx >= 0 && idx == floor(idx); i++) {
         const char *tab = strchr(s, '\t');
         if (i == idx) { goal = s; glen = tab ? (size_t)(tab - s) : strlen(s); break; }
         if (!tab) break;
@@ -111,7 +112,9 @@ void qa_q2_rerelease_goals_notify(qa_q2_rerelease_goals *gl, qa_q2_entity *e, qa
       if (!goal) qa_q2rr_error("Invalid Quake 64 goals: completed goal index exceeds the authored goal list");
       free(m->primary);
       size_t n = glen > 511 ? 511 : glen;
-      m->primary = malloc(n + 1); memcpy(m->primary, goal, n); m->primary[n] = '\0';
+      m->primary = malloc(n + 1);
+      if (!m->primary) qa_range_error("Out of memory");
+      memcpy(m->primary, goal, n); m->primary[n] = '\0';
       m->secondary_changes = m->primary_changes;
     }
     if (extra->game_help1_changed != m->primary_changes) {
@@ -152,7 +155,7 @@ void qa_q2_rerelease_goals_end_player_frame(qa_q2_rerelease_goals *gl, qa_q2_ent
   }
   qa_q2_rerelease_event ev; memset(&ev, 0, sizeof ev);
   ev.kind = "mission-status"; ev.has_actor = true; ev.actor = e->actor.id;
-  ev.icon_visible = extra->help_changed >= 1 && extra->help_changed <= 2 && (int64_t)trunc(now * 1000) % 1000 < 500;
+  ev.icon_visible = extra->help_changed >= 1 && extra->help_changed <= 2 && fmod(trunc(now * 1000), 1000) < 500;
   rr_emit_rr(&gl->hooks, ev);
 }
 void qa_q2_rerelease_goals_help(qa_q2_rerelease_goals *gl, qa_q2_entity *e, qa_q2_game_services *g) {

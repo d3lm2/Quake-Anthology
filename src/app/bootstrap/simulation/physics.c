@@ -14,8 +14,6 @@
 #include "qa/persistence/shared.h"
 #include "qa/world/actors/triggers.h"
 #include "qa/foundation/js.h"
-#define MAX_ENTRIES 1024
-#define MAX_PUSHED 1024
 typedef struct solid_entry { qa_owned_actor actor; qa_app_sim_shared_solid solid; qa_actor_id owner_storage; bool owner_is_storage; } solid_entry;
 typedef struct motion_entry { qa_owned_actor actor; qa_q2_motion motion; } motion_entry;
 typedef struct flags_entry { qa_owned_actor actor; qa_app_sim_shared_physics_flags flags; qa_actor_id enemy_storage; bool enemy_is_storage; } flags_entry;
@@ -28,19 +26,17 @@ struct qa_app_sim_shared_physics {
   qa_q2_rerelease_movement_context rerelease;
   qa_shared_body_table *bodies;
   qa_app_sim_q2_rerelease_fly_move *fly_move;
-  solid_entry solids[MAX_ENTRIES]; size_t solid_count;
-  motion_entry motions[MAX_ENTRIES]; size_t motion_count;
-  flags_entry flags[MAX_ENTRIES]; size_t flag_count;
-  collision_entry collisions[MAX_ENTRIES]; size_t collision_count;
-  source_entry sources[MAX_ENTRIES]; int next_handle;
+  /* TS Maps: no fixed size; each grows on demand and keeps insertion order. */
+  solid_entry *solids; size_t solid_count, solid_capacity;
+  motion_entry *motions; size_t motion_count, motion_capacity;
+  flags_entry *flags; size_t flag_count, flag_capacity;
+  collision_entry *collisions; size_t collision_count, collision_capacity;
+  source_entry *sources; size_t source_count, source_capacity; int next_handle;
   double world_gravity;
   qa_app_sim_physics_event events[8192]; size_t event_count;
-  pushed_entry *push_transaction; size_t push_count; bool push_active;
+  pushed_entry *push_transaction; size_t push_count, push_capacity; bool push_active;
   int64_t release_subscription;
   qa_actor_id link_owner_scratch, ground_scratch;
-  qa_plane plane_scratch;
-  qa_touch_surface surface_scratch;
-  qa_touch_source_trace source_trace_scratch;
   qa_owned_actor *candidates; size_t candidate_count, candidate_capacity;
   qa_actor_id *candidate_ids; size_t candidate_id_capacity;
 };
@@ -48,6 +44,44 @@ static const qa_vec3 ZERO3 = {0, 0, 0};
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 static bool same_owned(qa_owned_actor a, qa_owned_actor b) {
   return qa_same_actor(a.id, b.id) && a.token == b.token;
+}
+/* Grows a table by one slot. Entries hold pointers into their own storage (owner, enemy), so a move re-points them. */
+static void *grow_table(void *items, size_t count, size_t *capacity, size_t size) {
+  if (count < *capacity) return items;
+  size_t next = *capacity ? *capacity * 2 : 64;
+  void *grown = realloc(items, next * size);
+  if (grown == NULL) qa_range_error("Out of memory");
+  *capacity = next;
+  return grown;
+}
+static void repoint_solids(qa_app_sim_shared_physics *p) {
+  for (size_t i = 0; i < p->solid_count; i++) if (p->solids[i].owner_is_storage) p->solids[i].solid.owner = &p->solids[i].owner_storage;
+}
+static void repoint_collisions(qa_app_sim_shared_physics *p) {
+  for (size_t i = 0; i < p->collision_count; i++)
+    if (p->collisions[i].owner_is_storage) p->collisions[i].collision.owner = &p->collisions[i].owner_storage;
+}
+static void repoint_flags(qa_app_sim_shared_physics *p) {
+  for (size_t i = 0; i < p->flag_count; i++) if (p->flags[i].enemy_is_storage) p->flags[i].flags.enemy = &p->flags[i].enemy_storage;
+}
+static solid_entry *append_solid(qa_app_sim_shared_physics *p) {
+  p->solids = grow_table(p->solids, p->solid_count, &p->solid_capacity, sizeof *p->solids);
+  repoint_solids(p);
+  return &p->solids[p->solid_count++];
+}
+static collision_entry *append_collision(qa_app_sim_shared_physics *p) {
+  p->collisions = grow_table(p->collisions, p->collision_count, &p->collision_capacity, sizeof *p->collisions);
+  repoint_collisions(p);
+  return &p->collisions[p->collision_count++];
+}
+static flags_entry *append_flags(qa_app_sim_shared_physics *p) {
+  p->flags = grow_table(p->flags, p->flag_count, &p->flag_capacity, sizeof *p->flags);
+  repoint_flags(p);
+  return &p->flags[p->flag_count++];
+}
+static motion_entry *append_motion(qa_app_sim_shared_physics *p) {
+  p->motions = grow_table(p->motions, p->motion_count, &p->motion_capacity, sizeof *p->motions);
+  return &p->motions[p->motion_count++];
 }
 static qa_vec3 vec_of(qa_app_sim_shared_physics *p, double x, double y, double z) {
   qa_numeric_operations *n = &p->numeric;
@@ -75,7 +109,7 @@ static bool live(qa_app_sim_shared_physics *p, qa_owned_actor actor) {
   return qa_session_actor_registry_is_live(p->options.actors, actor.id);
 }
 static source_entry *source_of_entry(qa_app_sim_shared_physics *p, qa_owned_actor actor) {
-  for (int i = 0; i < MAX_ENTRIES; i++)
+  for (size_t i = 0; i < p->source_count; i++)
     if (p->sources[i].used && same_owned(p->sources[i].actor, actor)) return &p->sources[i];
   return NULL;
 }
@@ -186,24 +220,25 @@ static qa_app_sim_shared_physics_flags actor_flags(qa_app_sim_shared_physics *p,
   }
   return out;
 }
+/* TS keeps the enemy ActorId value: the entry holds its own copy, never the caller's (or a source entity's) storage. */
 static void store_flags(qa_app_sim_shared_physics *p, qa_owned_actor actor, qa_app_sim_shared_physics_flags flags) {
   flags_entry *e = flags_entry_of(p, actor);
-  if (e) { e->flags = flags; e->enemy_is_storage = false; return; }
-  if (p->flag_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-  p->flags[p->flag_count++] = (flags_entry){actor, flags, actor.id, false};
+  if (!e) { e = append_flags(p); e->actor = actor; }
+  e->flags = flags;
+  e->enemy_is_storage = flags.has_enemy && flags.enemy != NULL;
+  if (e->enemy_is_storage) { e->enemy_storage = *flags.enemy; e->flags.enemy = &e->enemy_storage; }
 }
 static void store_motion(qa_app_sim_shared_physics *p, qa_q2_motion motion) {
   motion_entry *e = motion_entry_of(p, motion.actor);
   if (e) { e->motion = motion; return; }
-  if (p->motion_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-  p->motions[p->motion_count++] = (motion_entry){motion.actor, motion};
+  e = append_motion(p);
+  *e = (motion_entry){motion.actor, motion};
 }
 /* TS stores ActorId values: the owner is copied into the entry, never borrowed from the caller. */
 static void store_solid(qa_app_sim_shared_physics *p, qa_owned_actor actor, qa_app_sim_shared_solid solid) {
   solid_entry *e = solid_entry_of(p, actor);
   if (!e) {
-    if (p->solid_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-    e = &p->solids[p->solid_count++];
+    e = append_solid(p);
     e->actor = actor;
   }
   e->solid = solid;
@@ -212,7 +247,10 @@ static void store_solid(qa_app_sim_shared_physics *p, qa_owned_actor actor, qa_a
 }
 static void emit_event(qa_app_sim_shared_physics *p, qa_app_sim_physics_event event) {
   if (p->options.event) { p->options.event(p->options.ctx, event); return; }
-  if (p->event_count < 8192) p->events[p->event_count++] = event;
+  /* EventRing.admit throws once 8192 records are undrained. */
+  if (p->event_count >= 8192)
+    qa_range_error("Event ring capacity exhausted (8192 undrained records); drain before admitting more");
+  p->events[p->event_count++] = event;
 }
 static void write_angular(qa_app_sim_shared_physics *p, qa_owned_actor actor, qa_vec3 value) {
   source_entry *s = source_of_entry(p, actor);
@@ -301,7 +339,7 @@ static void on_body_unlink(void *ctx, qa_actor_id actor) {
   if (p->options.scene) qa_shared_unlink(p->options.scene, actor);
 }
 static void erase_actor(qa_app_sim_shared_physics *p, qa_owned_actor actor) {
-  for (int i = 0; i < MAX_ENTRIES; i++)
+  for (size_t i = 0; i < p->source_count; i++)
     if (p->sources[i].used && same_owned(p->sources[i].actor, actor)) p->sources[i].used = false;
   /* TS Map.delete keeps the remaining entries in insertion order (the checkpoint writes that order). */
   for (size_t i = 0; i < p->solid_count;) if (same_owned(p->solids[i].actor, actor)) {
@@ -344,6 +382,7 @@ void qa_app_sim_shared_physics_destroy(qa_app_sim_shared_physics *physics) {
   qa_shared_body_table_destroy(physics->bodies);
   qa_app_sim_q2_rerelease_fly_move_destroy(physics->fly_move);
   free(physics->push_transaction);
+  free(physics->solids); free(physics->motions); free(physics->flags); free(physics->collisions); free(physics->sources);
   free(physics->candidates);
   free(physics->candidate_ids);
   free(physics);
@@ -352,16 +391,18 @@ qa_shared_body_table *qa_app_sim_shared_physics_bodies(qa_app_sim_shared_physics
 qa_q2_rerelease_movement_context *qa_app_sim_shared_physics_rerelease_movement(qa_app_sim_shared_physics *physics) { return &physics->rerelease; }
 int qa_app_sim_shared_physics_bind_source(qa_app_sim_shared_physics *physics, qa_owned_actor actor, qa_app_sim_source_body_physics source) {
   qa_session_actor_registry_assert_owned(physics->options.actors, actor);
-  if (source_of_entry(physics, actor)) qa_range_error("Actor already has source physics");
-  for (int i = 0; i < MAX_ENTRIES; i++) if (!physics->sources[i].used) {
-    int handle = physics->next_handle++;
+  if (source_of_entry(physics, actor)) qa_raise("Error", 0, 0, "Actor already has source physics");
+  int handle = physics->next_handle++;
+  for (size_t i = 0; i < physics->source_count; i++) if (!physics->sources[i].used) {
     physics->sources[i] = (source_entry){true, handle, actor, source};
     return handle;
   }
-  qa_range_error("Out of memory");
+  physics->sources = grow_table(physics->sources, physics->source_count, &physics->source_capacity, sizeof *physics->sources);
+  physics->sources[physics->source_count++] = (source_entry){true, handle, actor, source};
+  return handle;
 }
 void qa_app_sim_shared_physics_unbind_source(qa_app_sim_shared_physics *physics, int handle) {
-  for (int i = 0; i < MAX_ENTRIES; i++)
+  for (size_t i = 0; i < physics->source_count; i++)
     if (physics->sources[i].used && physics->sources[i].handle == handle) physics->sources[i].used = false;
 }
 double qa_app_sim_shared_physics_gravity(qa_app_sim_shared_physics *physics) { return physics->world_gravity; }
@@ -383,8 +424,7 @@ void qa_app_sim_shared_physics_set_collision(qa_app_sim_shared_physics *physics,
   qa_session_actor_registry_assert_owned(physics->options.actors, actor);
   collision_entry *e = collision_entry_of(physics, actor);
   if (!e) {
-    if (physics->collision_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-    e = &physics->collisions[physics->collision_count++];
+    e = append_collision(physics);
     e->actor = actor;
   }
   e->collision = collision;
@@ -545,17 +585,18 @@ static void impact(qa_app_sim_shared_physics *p, qa_owned_actor actor, qa_trace_
   qa_actor_id other_id;
   if (!hit_actor(p, trace, &other_id) || !live(p, actor)) return;
   qa_owned_actor other; bool has_other = qa_session_actor_registry_resolve_owned(p->options.actors, other_id, &other);
+  /* TS locals: a touch callback can run another impact, so the contact keeps its own plane and surface. */
   qa_plane plane_value;
   if (trace.contact.has_plane) plane_value = trace.contact.plane;
   else if (is(trace.kind, "q1")) plane_value = trace.source_plane_q1;
   else plane_value = trace.source_plane.plane;
-  p->plane_scratch = plane_value;
+  qa_touch_surface surface_value; memset(&surface_value, 0, sizeof surface_value);
   bool has_surface = false;
   if (is(trace.kind, "q2") && trace.surface != NULL) {
-    p->surface_scratch = (qa_touch_surface){trace.surface->name, trace.surface->flags, trace.surface->value};
+    surface_value = (qa_touch_surface){trace.surface->name, trace.surface->flags, trace.surface->value};
     has_surface = true;
   } else if (is(trace.kind, "q1") && trace.has_surface_flags) {
-    p->surface_scratch = (qa_touch_surface){"", (double)(qa_js_to_int32(trace.surface_flags) & 0x86), 0};
+    surface_value = (qa_touch_surface){"", (double)(qa_js_to_int32(trace.surface_flags) & 0x86), 0};
     has_surface = true;
   }
   qa_app_sim_shared_solid solid; bool has_solid = solid_of(p, actor, &solid);
@@ -563,12 +604,12 @@ static void impact(qa_app_sim_shared_physics *p, qa_owned_actor actor, qa_trace_
   if (is(family_of(p, actor), "q2") && is(p->options.q2_edition, "rerelease") && is(trace.kind, "q2")) {
     qa_app_sim_shared_physics_flags own_flags = actor_flags(p, actor);
     if (!is(self_solid, "none") || (own_flags.has_always_touch && own_flags.always_touch)) {
-      p->source_trace_scratch = (qa_touch_source_trace){trace, other_id, false};
+      qa_touch_source_trace source_trace = {trace, other_id, false};
       qa_touch_contact contact; memset(&contact, 0, sizeof contact);
       contact.self = actor; contact.other = other_id;
-      contact.plane = &p->plane_scratch;
-      contact.surface = has_surface ? &p->surface_scratch : NULL;
-      contact.source_trace = &p->source_trace_scratch;
+      contact.plane = &plane_value;
+      contact.surface = has_surface ? &surface_value : NULL;
+      contact.source_trace = &source_trace;
       (void)qa_actor_callback_table_touch(p->options.callbacks, contact);
     }
     if (has_other && live(p, other)) {
@@ -576,12 +617,12 @@ static void impact(qa_app_sim_shared_physics *p, qa_owned_actor actor, qa_trace_
       const char *other_solid_name = solid_of(p, other, &other_solid) ? other_solid.solid : NULL;
       qa_app_sim_shared_physics_flags other_flags = actor_flags(p, other);
       if (!is(other_solid_name, "none") || (other_flags.has_always_touch && other_flags.always_touch)) {
-        p->source_trace_scratch = (qa_touch_source_trace){trace, other_id, true};
+        qa_touch_source_trace source_trace = {trace, other_id, true};
         qa_touch_contact contact; memset(&contact, 0, sizeof contact);
         contact.self = other; contact.other = actor.id;
-        contact.plane = &p->plane_scratch;
-        contact.surface = has_surface ? &p->surface_scratch : NULL;
-        contact.source_trace = &p->source_trace_scratch;
+        contact.plane = &plane_value;
+        contact.surface = has_surface ? &surface_value : NULL;
+        contact.source_trace = &source_trace;
         (void)qa_actor_callback_table_touch(p->options.callbacks, contact);
       }
     }
@@ -590,8 +631,8 @@ static void impact(qa_app_sim_shared_physics *p, qa_owned_actor actor, qa_trace_
   if (!is(self_solid, "none")) {
     qa_touch_contact contact; memset(&contact, 0, sizeof contact);
     contact.self = actor; contact.other = other_id;
-    contact.plane = &p->plane_scratch;
-    contact.surface = has_surface ? &p->surface_scratch : NULL;
+    contact.plane = &plane_value;
+    contact.surface = has_surface ? &surface_value : NULL;
     (void)qa_actor_callback_table_touch(p->options.callbacks, contact);
   }
   if (has_other && live(p, actor) && live(p, other)) {
@@ -851,11 +892,7 @@ static void restore_pushed(qa_app_sim_shared_physics *p, pushed_entry entry, boo
   qa_shared_body_table_link(p->bodies, entry.actor, NULL);
 }
 static void push_saved(qa_app_sim_shared_physics *p, pushed_entry entry) {
-  if (!p->push_transaction) {
-    p->push_transaction = malloc(MAX_PUSHED * sizeof *p->push_transaction);
-    if (!p->push_transaction) qa_range_error("Out of memory");
-  }
-  if (p->push_count >= MAX_PUSHED) qa_range_error("Out of memory");
+  p->push_transaction = grow_table(p->push_transaction, p->push_count, &p->push_capacity, sizeof *p->push_transaction);
   p->push_transaction[p->push_count++] = entry;
 }
 bool qa_app_sim_shared_physics_push_move(qa_app_sim_shared_physics *physics, qa_owned_actor actor,
@@ -962,11 +999,19 @@ bool qa_app_sim_shared_physics_push_move(qa_app_sim_shared_physics *physics, qa_
   }
   return false;
 }
+static void end_push_transaction(void *arg) {
+  qa_app_sim_shared_physics *physics = arg;
+  physics->push_active = false;
+  physics->push_count = 0;
+}
 bool qa_app_sim_shared_physics_push_team(qa_app_sim_shared_physics *physics, const qa_owned_actor *actors,
     size_t actor_count, double elapsed, qa_actor_id *out_blocked) {
-  if (physics->push_active) qa_range_error("Nested pusher team movement is not permitted by the source frame");
+  if (physics->push_active) qa_raise("Error", 0, 0, "Nested pusher team movement is not permitted by the source frame");
   physics->push_active = true;
   physics->push_count = 0;
+  /* try/finally: a raise from a pushed actor's callback ends the transaction. */
+  qa_cleanup finally;
+  qa_cleanup_push(&finally, end_push_transaction, physics);
   bool blocked = false;
   for (size_t i = 0; i < actor_count; i++) {
     qa_owned_actor actor = actors[i];
@@ -976,6 +1021,7 @@ bool qa_app_sim_shared_physics_push_team(qa_app_sim_shared_physics *physics, con
     if (qa_app_sim_shared_physics_push_move(physics, actor, vscale(physics, body.velocity, elapsed),
         vscale(physics, motion.angular_velocity, elapsed), out_blocked)) { blocked = true; break; }
   }
+  qa_cleanup_pop(&finally);
   physics->push_active = false;
   if (blocked) { physics->push_count = 0; return true; }
   for (size_t j = physics->push_count; j-- > 0;) {
@@ -1292,7 +1338,7 @@ static void toss_touch_triggers(void *ctx) {
 static double toss_point_contents(void *ctx, qa_vec3 point) {
   toss_env *e = ctx;
   qa_point_contents_result contents = point_contents_at(e->physics, point, "q2", -1, &e->actor.id);
-  if (!is(contents.kind, "q2")) qa_range_error("NewToss requires Q2 contents representation");
+  if (!is(contents.kind, "q2")) qa_raise("Error", 0, 0, "NewToss requires Q2 contents representation");
   return contents.stored;
 }
 static void toss_write_water(void *ctx, double level, double type) {
@@ -1444,7 +1490,7 @@ const char *qa_app_sim_shared_physics_step(qa_app_sim_shared_physics *physics, q
     }
     if (moving3(velocity)) {
       if (state.ground != NULL || flag_fly || flag_swim) {
-        double speed = hypot(velocity.x, velocity.y);
+        double speed = qa_js_hypot2(velocity.x, velocity.y);
         if (speed > 0 && (!flag_dead || check_bottom(physics, actor, state))) {
           double fraction = qa_js_max(0, speed - elapsed * qa_js_max(speed, 100) * 6) / speed;
           velocity = vec_of(physics, velocity.x * fraction, velocity.y * fraction, velocity.z);
@@ -1514,7 +1560,7 @@ void qa_app_sim_shared_physics_commit_attachments(qa_app_sim_shared_physics *phy
 }
 qa_app_sim_physics_capture qa_app_sim_shared_physics_capture(qa_app_sim_shared_physics *physics) {
   if (physics->push_active || physics->event_count != 0)
-    qa_range_error("Physics save requires a completed event boundary");
+    qa_raise("Error", 0, 0, "Physics save requires a completed event boundary");
   qa_app_sim_physics_capture out; memset(&out, 0, sizeof out);
   out.gravity = physics->world_gravity;
   out.rerelease_movement = qa_q2_rerelease_movement_context_capture(&physics->rerelease);
@@ -1670,22 +1716,45 @@ static void optional_number_field(const qa_save_reader *value, const char *name,
   if (!qa_save_reader_is_undefined(&field)) { *has = true; *out = qa_save_reader_number(&field); }
   qa_save_reader_destroy(&field);
 }
+typedef struct kept_entries {
+  solid_entry *solids; motion_entry *motions; flags_entry *flags; collision_entry *collisions;
+} kept_entries;
+static void kept_entries_free(void *arg) {
+  kept_entries *kept = arg;
+  free(kept->solids); free(kept->motions); free(kept->flags); free(kept->collisions);
+}
+static void *kept_alloc(size_t count, size_t size) {
+  if (count == 0) return NULL;
+  void *items = malloc(count * size);
+  if (items == NULL) qa_range_error("Out of memory");
+  return items;
+}
+/* TS `for (actor of map.keys()) if (reconstructed(actor.id)) map.delete(actor)`: the rest keep their order. */
+#define REMOVE_RECONSTRUCTED(items, count) do { \
+    size_t kept_at = 0; \
+    for (size_t at = 0; at < (count); at++) \
+      if (!is_reconstructed(reconstructed_ctx, (items)[at].actor.id)) (items)[kept_at++] = (items)[at]; \
+    (count) = kept_at; \
+  } while (0)
 void qa_app_sim_shared_physics_restore_checkpoint(qa_app_sim_shared_physics *physics, const qa_save_reader *reader,
     bool require_exact_collisions, bool (*reconstructed)(void *ctx, qa_actor_id actor), void *reconstructed_ctx) {
   reconstructed_fn is_reconstructed = reconstructed ? reconstructed : never_reconstructed;
-  solid_entry *kept_solids = physics->solid_count ? malloc(physics->solid_count * sizeof *kept_solids) : NULL;
-  motion_entry *kept_motions = physics->motion_count ? malloc(physics->motion_count * sizeof *kept_motions) : NULL;
-  flags_entry *kept_flags = physics->flag_count ? malloc(physics->flag_count * sizeof *kept_flags) : NULL;
-  collision_entry *kept_collisions = physics->collision_count ? malloc(physics->collision_count * sizeof *kept_collisions) : NULL;
+  kept_entries kept = {0};
+  qa_cleanup kept_cleanup;
+  qa_cleanup_push(&kept_cleanup, kept_entries_free, &kept);
+  kept.solids = kept_alloc(physics->solid_count, sizeof *kept.solids);
+  kept.motions = kept_alloc(physics->motion_count, sizeof *kept.motions);
+  kept.flags = kept_alloc(physics->flag_count, sizeof *kept.flags);
+  kept.collisions = kept_alloc(physics->collision_count, sizeof *kept.collisions);
   size_t kept_solid_count = 0, kept_motion_count = 0, kept_flag_count = 0, kept_collision_count = 0;
   for (size_t i = 0; i < physics->solid_count; i++)
-    if (is_reconstructed(reconstructed_ctx, physics->solids[i].actor.id)) kept_solids[kept_solid_count++] = physics->solids[i];
+    if (is_reconstructed(reconstructed_ctx, physics->solids[i].actor.id)) kept.solids[kept_solid_count++] = physics->solids[i];
   for (size_t i = 0; i < physics->motion_count; i++)
-    if (is_reconstructed(reconstructed_ctx, physics->motions[i].actor.id)) kept_motions[kept_motion_count++] = physics->motions[i];
+    if (is_reconstructed(reconstructed_ctx, physics->motions[i].actor.id)) kept.motions[kept_motion_count++] = physics->motions[i];
   for (size_t i = 0; i < physics->flag_count; i++)
-    if (is_reconstructed(reconstructed_ctx, physics->flags[i].actor.id)) kept_flags[kept_flag_count++] = physics->flags[i];
+    if (is_reconstructed(reconstructed_ctx, physics->flags[i].actor.id)) kept.flags[kept_flag_count++] = physics->flags[i];
   for (size_t i = 0; i < physics->collision_count; i++)
-    if (is_reconstructed(reconstructed_ctx, physics->collisions[i].actor.id)) kept_collisions[kept_collision_count++] = physics->collisions[i];
+    if (is_reconstructed(reconstructed_ctx, physics->collisions[i].actor.id)) kept.collisions[kept_collision_count++] = physics->collisions[i];
   qa_save_reader field;
   reader_field_or_fail(reader, "gravity", &field);
   qa_app_sim_shared_physics_set_world_gravity(physics, qa_save_reader_finite(&field));
@@ -1707,13 +1776,12 @@ void qa_app_sim_shared_physics_restore_checkpoint(qa_app_sim_shared_physics *phy
       collision_read_env env = {physics, actor.id};
       qa_actor_collision collision = read_collision(&env, &collision_reader);
       qa_save_reader_destroy(&collision_reader);
-      if (physics->collision_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-      size_t slot = physics->collision_count++;
-      physics->collisions[slot].actor = actor;
-      physics->collisions[slot].owner_storage = env.owner_id;
-      physics->collisions[slot].owner_is_storage = collision.owner != NULL;
-      collision.owner = collision.owner != NULL ? &physics->collisions[slot].owner_storage : NULL;
-      physics->collisions[slot].collision = collision;
+      collision_entry *entry = append_collision(physics);
+      entry->actor = actor;
+      entry->owner_storage = env.owner_id;
+      entry->owner_is_storage = collision.owner != NULL;
+      collision.owner = collision.owner != NULL ? &entry->owner_storage : NULL;
+      entry->collision = collision;
       qa_save_reader_destroy(&value);
     }
   }
@@ -1739,20 +1807,20 @@ void qa_app_sim_shared_physics_restore_checkpoint(qa_app_sim_shared_physics *phy
       static const char *const families[] = {"q1", "q2", "q3"};
       solid.family = qa_save_reader_choice_string(&part, families, 3);
       qa_save_reader_destroy(&part);
+      /* The literal reads owner after family, before the optional members. */
+      qa_actor_id owner_id = actor.id;
+      bool has_owner = reader_reference(physics, &value, "owner", &owner_id);
       optional_bool_field(&value, "monster", &solid.has_monster, &solid.monster);
       optional_bool_field(&value, "deadMonster", &solid.has_dead_monster, &solid.dead_monster);
       solid.q1_corpse = reader_corpse(&value);
       optional_bool_field(&value, "item", &solid.has_item, &solid.item);
-      if (physics->solid_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-      size_t slot = physics->solid_count;
-      qa_actor_id owner_id = actor.id;
-      bool has_owner = reader_reference(physics, &value, "owner", &owner_id);
-      physics->solids[slot].actor = actor;
-      physics->solids[slot].owner_storage = owner_id;
-      physics->solids[slot].owner_is_storage = has_owner;
-      solid.owner = has_owner ? &physics->solids[slot].owner_storage : NULL;
-      physics->solids[slot].solid = solid;
-      physics->solid_count++;
+      /* Map.set: a repeated actor keeps its first position with the last value. */
+      solid_entry *entry = solid_entry_of(physics, actor);
+      if (entry == NULL) { entry = append_solid(physics); entry->actor = actor; }
+      entry->owner_storage = owner_id;
+      entry->owner_is_storage = has_owner;
+      solid.owner = has_owner ? &entry->owner_storage : NULL;
+      entry->solid = solid;
       qa_save_reader_destroy(&value);
     }
   }
@@ -1810,85 +1878,68 @@ void qa_app_sim_shared_physics_restore_checkpoint(qa_app_sim_shared_physics *phy
       optional_number_field(&value, "waterLevel", &flags.has_water_level, &flags.water_level);
       optional_number_field(&value, "waterType", &flags.has_water_type, &flags.water_type);
       optional_number_field(&value, "deltaYaw", &flags.has_delta_yaw, &flags.delta_yaw);
-      if (physics->flag_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-      size_t slot = physics->flag_count;
       qa_save_reader enemy_reader;
       reader_field_or_fail(&value, "enemy", &enemy_reader);
       bool enemy_present = !qa_save_reader_is_undefined(&enemy_reader);
       qa_save_reader_destroy(&enemy_reader);
       qa_actor_id enemy_id = actor.id;
       bool has_enemy_ref = enemy_present && reader_reference(physics, &value, "enemy", &enemy_id);
-      physics->flags[slot].actor = actor;
-      physics->flags[slot].enemy_storage = enemy_id;
-      physics->flags[slot].enemy_is_storage = has_enemy_ref;
       flags.has_enemy = enemy_present;
-      flags.enemy = has_enemy_ref ? &physics->flags[slot].enemy_storage : NULL;
-      physics->flags[slot].flags = flags;
-      physics->flag_count++;
+      flags.enemy = has_enemy_ref ? &enemy_id : NULL;
+      store_flags(physics, actor, flags); /* Map.set: a repeated actor keeps its first position */
       qa_save_reader_destroy(&value);
     }
   }
   qa_save_reader_destroy(&field);
-  for (size_t i = 0; i < physics->solid_count;) {
-    if (is_reconstructed(reconstructed_ctx, physics->solids[i].actor.id)) {
-      physics->solids[i] = physics->solids[--physics->solid_count];
-      if (physics->solids[i].owner_is_storage) physics->solids[i].solid.owner = &physics->solids[i].owner_storage;
-    } else i++;
-  }
+  REMOVE_RECONSTRUCTED(physics->solids, physics->solid_count);
+  repoint_solids(physics);
   for (size_t i = 0; i < kept_solid_count; i++) {
-    solid_entry *e = solid_entry_of(physics, kept_solids[i].actor);
-    if (!e) {
-      if (physics->solid_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-      e = &physics->solids[physics->solid_count++];
-    }
-    *e = kept_solids[i];
+    solid_entry *e = solid_entry_of(physics, kept.solids[i].actor);
+    if (!e) e = append_solid(physics);
+    *e = kept.solids[i];
     if (e->owner_is_storage) e->solid.owner = &e->owner_storage;
   }
-  for (size_t i = 0; i < physics->motion_count;)
-    if (is_reconstructed(reconstructed_ctx, physics->motions[i].actor.id)) physics->motions[i] = physics->motions[--physics->motion_count]; else i++;
-  for (size_t i = 0; i < kept_motion_count; i++) store_motion(physics, kept_motions[i].motion);
-  for (size_t i = 0; i < physics->flag_count;) {
-    if (is_reconstructed(reconstructed_ctx, physics->flags[i].actor.id)) {
-      physics->flags[i] = physics->flags[--physics->flag_count];
-      if (physics->flags[i].enemy_is_storage) physics->flags[i].flags.enemy = &physics->flags[i].enemy_storage;
-    } else i++;
-  }
+  REMOVE_RECONSTRUCTED(physics->motions, physics->motion_count);
+  for (size_t i = 0; i < kept_motion_count; i++) store_motion(physics, kept.motions[i].motion);
+  REMOVE_RECONSTRUCTED(physics->flags, physics->flag_count);
+  repoint_flags(physics);
   for (size_t i = 0; i < kept_flag_count; i++) {
-    flags_entry *e = flags_entry_of(physics, kept_flags[i].actor);
-    if (!e) {
-      if (physics->flag_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-      e = &physics->flags[physics->flag_count++];
-    }
-    *e = kept_flags[i];
+    flags_entry *e = flags_entry_of(physics, kept.flags[i].actor);
+    if (!e) e = append_flags(physics);
+    *e = kept.flags[i];
     if (e->enemy_is_storage) e->flags.enemy = &e->enemy_storage;
   }
-  for (size_t i = 0; i < physics->collision_count;) {
-    if (is_reconstructed(reconstructed_ctx, physics->collisions[i].actor.id)) {
-      physics->collisions[i] = physics->collisions[--physics->collision_count];
-      if (physics->collisions[i].owner_is_storage) physics->collisions[i].collision.owner = &physics->collisions[i].owner_storage;
-    } else i++;
-  }
+  REMOVE_RECONSTRUCTED(physics->collisions, physics->collision_count);
+  repoint_collisions(physics);
   for (size_t i = 0; i < kept_collision_count; i++) {
-    collision_entry *e = collision_entry_of(physics, kept_collisions[i].actor);
-    if (!e) {
-      if (physics->collision_count >= MAX_ENTRIES) qa_range_error("Out of memory");
-      e = &physics->collisions[physics->collision_count++];
-    }
-    *e = kept_collisions[i];
+    collision_entry *e = collision_entry_of(physics, kept.collisions[i].actor);
+    if (!e) e = append_collision(physics);
+    *e = kept.collisions[i];
     if (e->owner_is_storage) e->collision.owner = &e->owner_storage;
   }
-  free(kept_solids); free(kept_motions); free(kept_flags); free(kept_collisions);
+  qa_cleanup_pop(&kept_cleanup);
+  kept_entries_free(&kept);
 }
+#undef REMOVE_RECONSTRUCTED
 void qa_app_sim_shared_physics_restore_spatial(qa_app_sim_shared_physics *physics, const qa_save_reader *reader,
     bool (*reconstructed)(void *ctx, qa_actor_id actor), void *reconstructed_ctx) {
   reconstructed_fn is_reconstructed = reconstructed ? reconstructed : never_reconstructed;
   qa_bounds everywhere = {{-INFINITY, -INFINITY, -INFINITY}, {INFINITY, INFINITY, INFINITY}};
   size_t retained_count = 0;
   const qa_spatial_actor *current = qa_spatial_index_query(physics->options.scene->spatial, everywhere, "both", &retained_count);
-  qa_spatial_actor *retained = retained_count ? malloc(retained_count * sizeof *retained) : NULL;
+  /* A linked actor's ground and collision owner point into the index member that clear() frees (TS keeps the
+   * objects): each retained entry carries its own copies. */
+  typedef struct retained_actor { qa_spatial_actor actor; qa_actor_id ground, owner; } retained_actor;
+  retained_actor *retained = retained_count ? malloc(retained_count * sizeof *retained) : NULL;
+  if (retained_count != 0 && retained == NULL) qa_range_error("Out of memory");
   size_t kept = 0;
-  for (size_t i = 0; i < retained_count; i++)
-    if (is_reconstructed(reconstructed_ctx, current[i].body.actor)) retained[kept++] = current[i];
+  for (size_t i = 0; i < retained_count; i++) {
+    if (!is_reconstructed(reconstructed_ctx, current[i].body.actor)) continue;
+    retained_actor *entry = &retained[kept++];
+    entry->actor = current[i];
+    if (entry->actor.body.state.ground != NULL) { entry->ground = *entry->actor.body.state.ground; entry->actor.body.state.ground = &entry->ground; }
+    if (entry->actor.collision.owner != NULL) { entry->owner = *entry->actor.collision.owner; entry->actor.collision.owner = &entry->owner; }
+  }
   qa_spatial_index_clear(physics->options.scene->spatial);
   qa_save_reader field;
   reader_field_or_fail(reader, "spatial", &field);
@@ -1923,6 +1974,6 @@ void qa_app_sim_shared_physics_restore_spatial(qa_app_sim_shared_physics *physic
     qa_save_reader_destroy(&value);
   }
   qa_save_reader_destroy(&field);
-  for (size_t i = 0; i < kept; i++) qa_shared_link(physics->options.scene, retained[i].body, retained[i].collision);
+  for (size_t i = 0; i < kept; i++) qa_shared_link(physics->options.scene, retained[i].actor.body, retained[i].actor.collision);
   free(retained);
 }

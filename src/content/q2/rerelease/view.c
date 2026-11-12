@@ -78,7 +78,7 @@ qa_q2_base_player_view qa_q2_rerelease_build_view(qa_q2_player_context *c, qa_q2
   qa_q2_character_weapon weapon_value;
   bool has_weapon = qa_q2_player_context_weapon_state(c->players, e, g, &weapon_value);
   qa_angle_vectors vectors = qa_math_angle_vectors_rule(c->movement.view_angles, QA_ANGLE_RULE_NATIVE);
-  double speed = hypot(body.velocity.x, body.velocity.y);
+  double speed = qa_js_hypot2(body.velocity.x, body.velocity.y);
   bool duck = c->movement.ducked && c->movement.grounded;
   double bob_time = st->bob_time * (duck ? 4 : 1);
   int32_t cycle = qa_js_to_int32(bob_time); /* TS Math.trunc(bobTime) & 1: ToInt32 */

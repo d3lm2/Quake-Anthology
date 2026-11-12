@@ -47,7 +47,7 @@ bool qa_compat_qc_actor_state_motion(qa_compat_qc_actor_state *s, qa_owned_actor
   else if (move == 9) kind = "fly-missile";
   else if (move == 10) kind = "bounce";
   else if (move == 11 && s->options.rerelease) kind = "bounce";
-  else qa_range_error("Unsupported id1 movetype %s", QA_JS_NUMBER(move));
+  else qa_raise("Error", 0, 0, "Unsupported id1 movetype %s", QA_JS_NUMBER(move));
   memset(out, 0, sizeof *out);
   out->actor = actor; out->kind = kind; out->velocity = body.velocity;
   out->angular_velocity = qa_compat_qc_words_vector(w, fld(s, "avelocity"));
@@ -94,7 +94,7 @@ void qa_compat_qc_actor_state_write_angular_velocity(qa_compat_qc_actor_state *s
 }
 static int64_t bfield(qa_compat_qc_body_binding_state *st, const char *n) {
   const qa_compat_qc_definition *d = qa_compat_qc_program_field_named(st->program, n);
-  if (!d) qa_range_error("Missing QC body field %s", n);
+  if (!d) qa_raise("Error", 0, 0, "Missing QC body field %s", n);
   return d->offset;
 }
 static qa_body_state bread(void *ctx) {

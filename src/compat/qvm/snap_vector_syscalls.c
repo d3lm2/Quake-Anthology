@@ -8,7 +8,7 @@
 
 static int32_t word_i32(const uint8_t *words, size_t length, size_t offset) {
   if (offset > length || length - offset < 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   uint32_t bits = (uint32_t)words[offset] | ((uint32_t)words[offset + 1] << 8) |
                   ((uint32_t)words[offset + 2] << 16) | ((uint32_t)words[offset + 3] << 24);
   return (int32_t)bits;

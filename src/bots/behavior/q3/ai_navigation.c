@@ -130,7 +130,8 @@ qa_bot_waypoint_bots_a *qa_bot_create_way_point_bots_a(qa_game_ai_context_bots_a
   }
   globals->free_waypoints = waypoint->next;
   /* A C string already stops at its first NUL; slice(0, 31) keeps 31 bytes. */
-  snprintf(waypoint->name, sizeof waypoint->name < 32 ? sizeof waypoint->name : 32, "%s", name);
+  size_t name_length = strlen(name);
+  qa_bot_waypoint_set_name_bots_a(waypoint, name, name_length < 31 ? name_length : 31);
   waypoint->goal.origin = qa_bot_fv3(origin);
   waypoint->goal.mins = qa_bot_fv3(qa_math_vec3(-8, -8, -8));
   waypoint->goal.maxs = qa_bot_fv3(qa_math_vec3(8, 8, 8));
@@ -142,7 +143,7 @@ qa_bot_waypoint_bots_a *qa_bot_create_way_point_bots_a(qa_game_ai_context_bots_a
 
 qa_bot_waypoint_bots_a *qa_bot_find_way_point_bots_a(qa_bot_waypoint_bots_a *waypoints, const char *name) {
   for (qa_bot_waypoint_bots_a *waypoint = waypoints; waypoint != NULL; waypoint = waypoint->next)
-    if (same_name(waypoint->name, name))
+    if (same_name(qa_bot_waypoint_name_bots_a(waypoint), name))
       return waypoint;
   return NULL;
 }

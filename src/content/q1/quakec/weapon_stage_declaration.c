@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "qa/content/mods/source_call.h"
+#include "qa/foundation/support.h"
 
 static qa_save_reader field(const qa_save_reader *reader, const char *name) {
   qa_save_reader out;
@@ -35,33 +36,41 @@ static double field_integer_min(const qa_save_reader *reader, const char *name, 
   qa_save_reader_destroy(&f);
   return value;
 }
+/* Zeroed, so a partly read declaration can be destroyed when a reader raises. */
 static void *xmalloc_at(const qa_save_reader *reader, size_t size) {
-  void *value = malloc(size != 0 ? size : 1);
+  void *value = calloc(1, size != 0 ? size : 1);
   if (value == NULL) qa_save_reader_fail(reader, "out of memory");
   return value;
 }
 
+static void destroy_partial_stage(void *arg) { qa_q1qc_weapon_stage_declaration_destroy(arg); }
+static void destroy_partial_primary(void *arg) { qa_q1qc_primary_weapon_stage_destroy(arg); }
 qa_qc_weapon_stage_declaration qa_q1qc_read_weapon_stage_declaration(const qa_save_reader *reader) {
   qa_qc_weapon_stage_declaration declaration;
   memset(&declaration, 0, sizeof declaration);
+  /* A malformed declaration raises from the readers below (TS GC frees the parts). */
+  qa_cleanup node;
+  qa_cleanup_push(&node, destroy_partial_stage, &declaration);
   declaration.dispatcher = field_string(reader, "dispatcher");
   {
     qa_save_reader list = field(reader, "continuations");
     size_t count = qa_save_reader_list_count(&list);
     const char **values = xmalloc_at(&list, count * sizeof *values);
+    declaration.continuations.values = values;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&list, i);
       values[i] = qa_save_reader_string(&entry);
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&list);
-    declaration.continuations.values = values;
     declaration.continuations.count = count;
   }
   {
     qa_save_reader list = field(reader, "repeats");
     size_t count = qa_save_reader_list_count(&list);
     qa_qc_weapon_stage_repeat *repeats = xmalloc_at(&list, count * sizeof *repeats);
+    declaration.repeats = repeats;
+    declaration.repeat_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&list, i);
       qa_qc_weapon_stage_repeat repeat;
@@ -79,6 +88,7 @@ qa_qc_weapon_stage_declaration qa_q1qc_read_weapon_stage_declaration(const qa_sa
       qa_save_reader statements = field(&entry, "statements");
       size_t statement_count = qa_save_reader_list_count(&statements);
       qa_qc_statement *words = xmalloc_at(&statements, statement_count * sizeof *words);
+      repeats[i].statements = words;
       for (size_t s = 0; s < statement_count; s++) {
         qa_save_reader statement = item(&statements, s);
         words[s].opcode = field_integer_min(&statement, "opcode", 0);
@@ -94,9 +104,8 @@ qa_qc_weapon_stage_declaration qa_q1qc_read_weapon_stage_declaration(const qa_sa
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&list);
-    declaration.repeats = repeats;
-    declaration.repeat_count = count;
   }
+  qa_cleanup_pop(&node);
   return declaration;
 }
 void qa_q1qc_weapon_stage_declaration_destroy(qa_qc_weapon_stage_declaration *declaration) {
@@ -127,6 +136,8 @@ static qa_qc_named_call read_named_call(const qa_save_reader *reader) {
 qa_qc_primary_weapon_stage_declaration qa_q1qc_read_primary_weapon_stage(const qa_save_reader *reader) {
   qa_qc_primary_weapon_stage_declaration declaration;
   memset(&declaration, 0, sizeof declaration);
+  qa_cleanup node;
+  qa_cleanup_push(&node, destroy_partial_primary, &declaration);
   qa_save_reader client = field(reader, "client");
   qa_save_reader objectives = field(&client, "objectives");
   qa_save_reader kind_reader = field(&objectives, "kind");
@@ -158,6 +169,7 @@ qa_qc_primary_weapon_stage_declaration qa_q1qc_read_primary_weapon_stage(const q
   qa_save_reader_destroy(&call_field);
   qa_save_reader_destroy(&objectives);
   qa_save_reader_destroy(&client);
+  qa_cleanup_pop(&node);
   return declaration;
 }
 void qa_q1qc_primary_weapon_stage_destroy(qa_qc_primary_weapon_stage_declaration *declaration) {

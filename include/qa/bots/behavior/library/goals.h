@@ -228,6 +228,9 @@ typedef struct qa_goal_source_binding {
   qa_actor_id actor;
   char *name;
   qa_bot_goal goal;
+  /* TS goal object key order: a binding read back from a save lists origin, mins, maxs, area, ...
+   * and keeps that order through later updates; a fresh one lists origin, area, mins, maxs, ... */
+  bool restored_order;
 } qa_goal_source_binding;
 typedef struct qa_goal_info_entity {
   bool live, is_camp;

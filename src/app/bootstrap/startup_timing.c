@@ -10,8 +10,13 @@ static double now_ms(void) {
   return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 static double started = -1, last = -1;
-void qa_app_startup_stamp(const char *label) {
+/* TS `const started = performance.now()` runs when the module loads, before main's first stamp; the C clock starts at
+ * program load the same way. */
+__attribute__((constructor)) static void start_clock(void) {
   if (started < 0) { started = now_ms(); last = started; }
+}
+void qa_app_startup_stamp(const char *label) {
+  start_clock();
   if (getenv("QTS_STARTUP_TIMING") == NULL) return;
   double now = now_ms();
   char delta[QA_JS_TO_FIXED_CAPACITY], total[QA_JS_TO_FIXED_CAPACITY]; /* toFixed(0) */

@@ -80,14 +80,14 @@ void qa_q3_pres_client_console_runtime_init(qa_q3_pres_client_console_runtime *r
     qa_q3_pres_client_console_host host, qa_q3_pres_client_game_state *view_state,
     qa_q3_pres_client_game_state *weapons_state) {
   if (state->product != static_state->product || view_state != state || weapons_state != state)
-    qa_range_error("Console services must share canonical cgame state");
+    qa_raise("Error", 0, 0, "Console services must share canonical cgame state");
   runtime->state = state;
   runtime->static_state = static_state;
   runtime->host = host;
   runtime->closed = false;
 }
 static void runtime_open(qa_q3_pres_client_console_runtime *runtime) {
-  if (runtime->closed) qa_range_error("Cgame console runtime is closed");
+  if (runtime->closed) qa_raise("Error", 0, 0, "Cgame console runtime is closed");
 }
 void qa_q3_pres_client_console_runtime_initialize_commands(qa_q3_pres_client_console_runtime *runtime) {
   runtime_open(runtime);
@@ -113,7 +113,7 @@ double qa_q3_pres_client_console_runtime_crosshair_player(qa_q3_pres_client_cons
 }
 double qa_q3_pres_client_console_runtime_last_attacker(qa_q3_pres_client_console_runtime *runtime) {
   if (runtime->state->attacker_time == 0) return -1;
-  if (!runtime->state->snap) qa_range_error("CG_LastAttacker requires cg.snap");
+  if (!runtime->state->snap) qa_raise("Error", 0, 0, "CG_LastAttacker requires cg.snap");
   return qa_q3_base_player_state_slots_get(&runtime->state->snap->player_state.persistant, QA_Q3_BASE_PERS_ATTACKER);
 }
 static const char *argument(const char *const *argv, size_t argc, size_t index, char *buffer, size_t size) {
@@ -134,11 +134,11 @@ static void immediate(qa_q3_pres_client_console_runtime *runtime, const char *na
 }
 static void require_hud(qa_q3_pres_client_console_runtime *runtime) {
   if (!runtime->host.hud_available)
-    qa_range_error("Cgame HUD unavailable: %s", runtime->host.hud_reason ? runtime->host.hud_reason : "");
+    qa_raise("Error", 0, 0, "Cgame HUD unavailable: %s", runtime->host.hud_reason ? runtime->host.hud_reason : "");
 }
 static void require_orders(qa_q3_pres_client_console_runtime *runtime) {
   if (!runtime->host.orders_available)
-    qa_range_error("Cgame team orders unavailable: %s",
+    qa_raise("Error", 0, 0, "Cgame team orders unavailable: %s",
                    runtime->host.orders_reason ? runtime->host.orders_reason : "");
 }
 static double vm_cvar_integer(qa_q3_pres_client_console_runtime *runtime, qa_q3_pres_console_cvar name) {
@@ -161,15 +161,18 @@ static void scores_down(qa_q3_pres_client_console_runtime *runtime) {
   } else state->show_scores = true;
 }
 static void next_order(qa_q3_pres_client_console_runtime *runtime) {
-  if (!runtime->state->snap) qa_range_error("CG_NextOrder requires cg.snap");
+  if (!runtime->state->snap) qa_raise("Error", 0, 0, "CG_NextOrder requires cg.snap");
   double client_num = runtime->state->snap->player_state.client_num;
   if (client_num < 0 || client_num >= 64)
     qa_range_error("Console source array index %s outside 64", QA_JS_NUMBER(client_num));
   qa_q3_pres_client_info *client = &runtime->static_state->client_info[(size_t)client_num];
-  double selected_index = vm_cvar_integer(runtime, QA_Q3_PRES_CONSOLE_CVAR_CURRENT_SELECTED_PLAYER);
-  if (!(selected_index >= 0 && selected_index < 32) || selected_index != trunc(selected_index)) /* sortedTeamPlayers has 32 slots */
-    qa_range_error("Console source array index %s outside 32", QA_JS_NUMBER(selected_index));
-  if (!client->team_leader && runtime->state->sorted_team_players[(size_t)selected_index] != client_num) return;
+  /* TS `!client.teamLeader && slot(sortedTeamPlayers, cvar) !== clientNum`: a team leader never reads the cvar. */
+  if (!client->team_leader) {
+    double selected_index = vm_cvar_integer(runtime, QA_Q3_PRES_CONSOLE_CVAR_CURRENT_SELECTED_PLAYER);
+    if (!(selected_index >= 0 && selected_index < 32) || selected_index != trunc(selected_index)) /* sortedTeamPlayers has 32 slots */
+      qa_range_error("Console source array index %s outside 32", QA_JS_NUMBER(selected_index));
+    if (runtime->state->sorted_team_players[(size_t)selected_index] != client_num) return;
+  }
   qa_q3_pres_client_game_static_state *cgs = runtime->static_state;
   if (cgs->current_order < 7) {
     cgs->current_order = qa_int32(cgs->current_order + 1);
@@ -208,7 +211,7 @@ static bool dispatch(qa_q3_pres_client_console_runtime *runtime, const char *nam
   char buffer[1024];
   if (strcmp(name, "testgun") == 0 || strcmp(name, "testmodel") == 0) {
     const char *model_name = argc < 2 ? NULL : argument(argv, argc, 1, buffer, sizeof buffer);
-    char number_buffer[128];
+    char number_buffer[1024];
     double parsed = 0;
     const double *back_lerp = NULL;
     if (argc == 3) {
@@ -285,7 +288,8 @@ static bool dispatch(qa_q3_pres_client_console_runtime *runtime, const char *nam
     size_t used = 0;
     for (size_t i = 1; i < argc; i++) {
       size_t piece = strlen(argv[i]);
-      if (used + piece + 1 >= 1024) qa_range_error("Cmd_Args exceeds MAX_STRING_CHARS");
+      /* TS joins first and throws when the joined length reaches 1024. */
+      if (used + (i > 1 ? 1 : 0) + piece >= 1024) qa_range_error("Cmd_Args exceeds MAX_STRING_CHARS");
       if (i > 1) joined[used++] = ' ';
       memcpy(joined + used, argv[i], piece);
       used += piece;
@@ -413,7 +417,7 @@ static bool dispatch(qa_q3_pres_client_console_runtime *runtime, const char *nam
     host->center_print(host->ctx, win ? "YOU WIN!" : "YOU LOSE...", 144, 0);
     return true;
   }
-  qa_range_error("Registered cgame console command has no handler: %s", name);
+  qa_raise("Error", 0, 0, "Registered cgame console command has no handler: %s", name);
 }
 typedef struct execute_job {
   qa_q3_pres_client_console_runtime *runtime; const char *const *argv; size_t argc; bool result;

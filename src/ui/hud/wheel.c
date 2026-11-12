@@ -26,6 +26,10 @@ struct qa_seat_weapon_wheel {
   size_t item_count, item_capacity;
   qa_ui_wheel_item *owned_items; /* filtered copy for carousel view */
   size_t owned_count, owned_capacity;
+  /* The carousel's own sorted weapons list: drawState returns the wheel view
+     (wheel->items) and the carousel view together. */
+  qa_ui_wheel_item *carousel_items;
+  size_t carousel_capacity;
 };
 
 qa_ui_wheel_options qa_ui_wheel_default_options(void) {
@@ -51,31 +55,40 @@ static bool id_eq(const char *a, const char *b) {
   return strcmp(a, b) == 0;
 }
 
+/* a.sortOrder - b.sortOrder || a.sourceOrdinal - b.sourceOrdinal: a NaN
+ * difference is falsy (and a NaN result compares as 0). */
 static int item_order(const void *a, const void *b) {
   const qa_ui_wheel_item *x = a, *y = b;
   double by_sort = x->sort_order - y->sort_order;
-  if (by_sort != 0) return by_sort < 0 ? -1 : 1;
+  if (by_sort != 0 && !isnan(by_sort)) return by_sort < 0 ? -1 : 1;
   double by_ordinal = x->source_ordinal - y->source_ordinal;
-  if (by_ordinal != 0) return by_ordinal < 0 ? -1 : 1;
+  if (by_ordinal != 0 && !isnan(by_ordinal)) return by_ordinal < 0 ? -1 : 1;
   return 0;
+}
+
+static const qa_ui_wheel_item *sort_into(qa_seat_weapon_wheel *wheel,
+                                         qa_ui_wheel_mode mode,
+                                         qa_ui_wheel_item **storage,
+                                         size_t *capacity, size_t *out_count) {
+  const qa_ui_wheel_item *source =
+      wheel->services.items(wheel->services.ctx, mode, out_count);
+  if (*out_count > *capacity) {
+    qa_ui_wheel_item *grown = realloc(*storage, *out_count * sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    *storage = grown;
+    *capacity = *out_count;
+  }
+  if (*out_count > 0)
+    memcpy(*storage, source, *out_count * sizeof *source);
+  qa_js_sort(*storage, *out_count, sizeof **storage, item_order);
+  return *storage;
 }
 
 /* TS private items(mode): sorted copy in wheel storage. */
 static const qa_ui_wheel_item *sorted_items(qa_seat_weapon_wheel *wheel,
                                             qa_ui_wheel_mode mode,
                                             size_t *out_count) {
-  const qa_ui_wheel_item *source =
-      wheel->services.items(wheel->services.ctx, mode, out_count);
-  if (*out_count > wheel->item_capacity) {
-    qa_ui_wheel_item *grown =
-        realloc(wheel->items, *out_count * sizeof *grown);
-    if (grown == NULL) qa_range_error("Out of memory");
-    wheel->items = grown;
-    wheel->item_capacity = *out_count;
-  }
-  if (*out_count > 0)
-    memcpy(wheel->items, source, *out_count * sizeof *source);
-  qa_js_sort(wheel->items, *out_count, sizeof *wheel->items, item_order);
+  sort_into(wheel, mode, &wheel->items, &wheel->item_capacity, out_count);
   wheel->item_count = *out_count;
   return wheel->items;
 }
@@ -103,6 +116,7 @@ void qa_seat_weapon_wheel_destroy(qa_seat_weapon_wheel *wheel) {
   free(wheel->carousel_selected);
   free(wheel->items);
   free(wheel->owned_items);
+  free(wheel->carousel_items);
   free(wheel);
 }
 
@@ -155,7 +169,7 @@ void qa_seat_weapon_wheel_close(qa_seat_weapon_wheel *wheel, bool select) {
 }
 
 static void move_to(qa_seat_weapon_wheel *wheel, qa_vec2 position) {
-  double distance = hypot(position.x, position.y);
+  double distance = qa_js_hypot2(position.x, position.y);
   double factor = distance > wheel->options.radius
       ? wheel->options.radius / distance : 1;
   wheel->position.x = position.x * factor;
@@ -165,7 +179,7 @@ static void move_to(qa_seat_weapon_wheel *wheel, qa_vec2 position) {
 bool qa_seat_weapon_wheel_input(qa_seat_weapon_wheel *wheel,
                                 qa_seat_input_event event) {
   if (!qa_same_seat(event.seat, wheel->services.seat))
-    qa_range_error("Weapon wheel input belongs to another seat");
+    qa_raise("Error", 0, 0, "Weapon wheel input belongs to another seat");
   if (wheel->state == WHEEL_CLOSED) return false;
   if (strcmp(event.kind, "focus") == 0 && !event.focused) {
     qa_seat_weapon_wheel_close(wheel, false);
@@ -283,7 +297,7 @@ void qa_seat_weapon_wheel_update(qa_seat_weapon_wheel *wheel,
     qa_seat_weapon_wheel_close(wheel, false);
     return;
   }
-  double distance = hypot(wheel->position.x, wheel->position.y);
+  double distance = qa_js_hypot2(wheel->position.x, wheel->position.y);
   double slice = 3.141592653589793 * 2 / (double)count;
   char *prior = dup_or_null(wheel->selected);
   if (wheel->selected != NULL && prior == NULL)
@@ -343,7 +357,8 @@ qa_ui_wheel_draw_state qa_seat_weapon_wheel_draw_state(
   }
   if (wheel->carousel == CAROUSEL_OPEN) {
     size_t count;
-    const qa_ui_wheel_item *all = sorted_items(wheel, "weapons", &count);
+    const qa_ui_wheel_item *all = sort_into(wheel, "weapons", &wheel->carousel_items,
+                                            &wheel->carousel_capacity, &count);
     if (count > wheel->owned_capacity) {
       qa_ui_wheel_item *grown =
           realloc(wheel->owned_items, count * sizeof *grown);
@@ -359,7 +374,8 @@ qa_ui_wheel_draw_state qa_seat_weapon_wheel_draw_state(
     out.carousel.items = wheel->owned_items;
     out.carousel.item_count = owned;
     out.carousel.selected = wheel->carousel_selected;
-    /* The wheel view above borrows wheel->items, still valid. */
+    /* The wheel view above keeps wheel->items: the carousel sorted into its
+       own storage. */
   }
   return out;
 }

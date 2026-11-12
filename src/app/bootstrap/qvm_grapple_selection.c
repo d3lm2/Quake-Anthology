@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 /* Port of src/app/bootstrap/qvm-grapple-selection.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/qvm_grapple_selection.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,15 @@ void qa_app_prepared_qvm_grapple_destroy(qa_app_prepared_qvm_grapple *prepared) 
   free(prepared->artifact_path); free(prepared->digest); free(prepared->revision);
   memset(prepared, 0, sizeof *prepared);
 }
+typedef struct partial_grapple { qa_app_prepared_qvm_grapple *out; uint8_t *bytes; bool resolved; } partial_grapple;
+static void partial_grapple_free(void *v) {
+  partial_grapple *partial = v;
+  free(partial->bytes);
+  if (partial->resolved) qa_resolved_qvm_artifact_destroy(&partial->out->artifact);
+  free(partial->out->module_id);
+  memset(partial->out, 0, sizeof *partial->out);
+}
+static void destroy_mounts(void *mounts) { qa_content_mounted_destroy(mounts); }
 static bool from_mounts(qa_content_id content, qa_content_mounted *mounts,
     const qa_app_qvm_grapple_host *host, qa_app_prepared_qvm_grapple *out) {
   memset(out, 0, sizeof *out);
@@ -33,6 +43,10 @@ static bool from_mounts(qa_content_id content, qa_content_mounted *mounts,
     free(resource.bytes);
     return false;
   }
+  /* A raise below (artifact resolution, the profile reader) leaves nothing behind. */
+  partial_grapple partial = {out, resource.bytes, false};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, partial_grapple_free, &partial);
   size_t id_size = strlen("q3:grapple/") + strlen(content) + 1;
   out->module_id = malloc(id_size);
   if (out->module_id == NULL) qa_range_error("Out of memory");
@@ -44,14 +58,16 @@ static bool from_mounts(qa_content_id content, qa_content_mounted *mounts,
   options.bytes = resource.bytes;
   options.length = resource.byte_length;
   bool resolved = qa_qvm_resolve_artifact(options, &out->artifact);
+  partial.resolved = resolved;
   free(resource.bytes);
+  partial.bytes = NULL;
   if (!resolved) qa_range_error("Out of memory");
-  if (out->artifact.is_typescript) {
-    qa_app_prepared_qvm_grapple_destroy(out);
-    return false;
-  }
-  if (!host->profile_for(host->ctx, &out->artifact, &out->profile)) {
-    qa_app_prepared_qvm_grapple_destroy(out);
+  bool profiled = !out->artifact.is_typescript && host->profile_for(host->ctx, &out->artifact, &out->profile);
+  qa_cleanup_pop(&guard);
+  if (!profiled) {
+    qa_resolved_qvm_artifact_destroy(&out->artifact);
+    free(out->module_id);
+    memset(out, 0, sizeof *out);
     return false;
   }
   out->selection.is_enabled = true;
@@ -71,7 +87,11 @@ bool qa_app_application_qvm_grapple_selection(const qa_content_catalog *catalog,
   if (qa_content_catalog_product(catalog, content)->expectation.family != QA_GAME_FAMILY_Q3) return false;
   qa_content_mounted *mounts = host->open_plan(host->ctx, catalog, content);
   qa_app_prepared_qvm_grapple prepared;
+  /* using opened = ...: the plan is disposed when the read raises as well. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, destroy_mounts, mounts);
   bool found = from_mounts(content, mounts, host, &prepared);
+  qa_cleanup_pop(&guard);
   if (!found) {
     qa_content_mounted_destroy(mounts);
     return false;
@@ -89,7 +109,10 @@ static bool values_equal(const qa_save_value *a, const qa_save_value *b) {
   if (a->kind != b->kind) return false;
   switch (a->kind) {
     case QA_SAVE_BOOLEAN: return a->boolean == b->boolean;
-    case QA_SAVE_NUMBER: return a->number == b->number;
+    case QA_SAVE_NUMBER:
+      /* isDeepStrictEqual compares numbers with Object.is: NaN equals NaN, 0 and -0 differ. */
+      if (a->number != a->number || b->number != b->number) return a->number != a->number && b->number != b->number;
+      return a->number == b->number && signbit(a->number) == signbit(b->number);
     case QA_SAVE_STRING: case QA_SAVE_BIGINT:
       return (a->text == NULL) == (b->text == NULL) && (a->text == NULL || strcmp(a->text, b->text) == 0);
     case QA_SAVE_ARRAY:

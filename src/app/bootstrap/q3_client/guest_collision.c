@@ -154,7 +154,7 @@ double qa_app_shared_qvm_client_clip_models_transformed_point_contents(
   q.policy = policy(models);
   qa_point_contents_result result = qa_shared_point_contents(models->scene, q);
   if (result.kind == NULL || strcmp(result.kind, "q3") != 0)
-    qa_range_error("QVM client contents lost Q3 policy");
+    qa_raise("Error", 0, 0, "QVM client contents lost Q3 policy");
   return result.contents;
 }
 bool qa_app_shared_qvm_client_clip_models_trace_without_nodes(
@@ -204,7 +204,7 @@ qa_source_trace_result qa_app_shared_qvm_client_clip_models_transformed_trace(
   q.policy.contents_mask = query.mask;
   qa_trace_result result = qa_shared_geometry_trace(models->scene, q);
   if (result.kind == NULL || strcmp(result.kind, "q3") != 0)
-    qa_range_error("QVM client trace lost Q3 policy");
+    qa_raise("Error", 0, 0, "QVM client trace lost Q3 policy");
   qa_source_trace_result out;
   out.fraction = result.fraction;
   out.end = result.end;

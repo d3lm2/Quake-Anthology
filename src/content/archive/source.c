@@ -5,7 +5,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,13 +13,6 @@
 
 #include "qa/content/archive/types.h"
 #include "qa/foundation/support.h"
-
-/* TS fs failures surface as plain Node Errors; the C port aborts with
- * the strerror text under the Error class name. */
-/* Node fs errors are plain Errors that TS catch sites may recover. */
-static noreturn void fs_error(const char *source) {
-  qa_raise("Error", errno, 0, "%s: %s", source, strerror(errno));
-}
 
 static char *copy_text(const char *text) {
   size_t length = strlen(text) + 1;
@@ -58,20 +50,22 @@ bool qa_file_source_init(qa_archive_source *out, const char *source) {
     int saved = errno;
     free(out->source);
     out->source = NULL;
-    errno = saved;
-    fs_error(source);
+    qa_content_fs_error(saved, "open", source);
   }
   struct stat info;
   if (fstat(descriptor, &info) != 0) {
     int saved = errno;
     (void)close(descriptor);
-    errno = saved;
-    fs_error(source);
+    free(out->source);
+    out->source = NULL;
+    qa_content_fs_error(saved, "fstat", NULL);
   }
   int64_t byte_length = (int64_t)info.st_size;
   if (!S_ISREG(info.st_mode) || byte_length < 0 ||
       byte_length > QA_MAX_SAFE_INTEGER) {
     (void)close(descriptor);
+    free(out->source);
+    out->source = NULL;
     qa_archive_error(source, 0,
                      "expected a regular file with a safe byte length");
   }
@@ -84,7 +78,7 @@ bool qa_file_source_init(qa_archive_source *out, const char *source) {
 
 static void verify_unchanged(const qa_archive_source *storage, int64_t offset) {
   struct stat info;
-  if (fstat(storage->descriptor, &info) != 0) fs_error(storage->source);
+  if (fstat(storage->descriptor, &info) != 0) qa_content_fs_error(errno, "fstat", NULL);
   if ((int64_t)info.st_size != storage->byte_length ||
       timespec_ns(info.st_mtim) != storage->modified_ns ||
       timespec_ns(info.st_ctim) != storage->changed_ns) {
@@ -118,9 +112,10 @@ uint8_t *qa_archive_source_read_sync(qa_archive_source *storage,
                           (off_t)(offset + total));
     if (count < 0) {
       if (errno == EINTR) continue;
+      int saved = errno;
       storage->active_reads--;
       free(bytes);
-      fs_error(storage->source);
+      qa_content_fs_error(saved, "read", NULL);
     }
     if (count == 0) {
       storage->active_reads--;
@@ -139,7 +134,13 @@ uint8_t *qa_archive_source_read_sync(qa_archive_source *storage,
     (void)close(storage->descriptor);
     storage->descriptor = -1;
   }
-  verify_unchanged(storage, offset);
+  {
+    /* TS verifyUnchanged after the read: the bytes are dropped on a throw. */
+    qa_cleanup node;
+    qa_cleanup_push(&node, free, bytes);
+    verify_unchanged(storage, offset);
+    qa_cleanup_pop(&node);
+  }
   if (length == 0) { free(bytes); return NULL; }
   return bytes;
 }

@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "qa/content/mounts/paths.h"
+#include "qa/foundation/support.h"
 
 static char *copy_text(const char *text) {
   size_t length = strlen(text) + 1;
@@ -34,9 +35,14 @@ static const char *read_kind(const qa_save_reader *reader) {
   qa_save_reader_destroy(&value);
   return kind;
 }
+/* lump.length in 1..16 UTF-16 units (a C string carries no NUL). */
 static bool valid_lump(const char *lump) {
-  size_t length = strlen(lump);
-  return length != 0 && length <= 16; /* a C string carries no NUL */
+  size_t units = 0;
+  for (const unsigned char *p = (const unsigned char *)lump; *p != '\0'; p++) {
+    if ((*p & 0xc0) == 0x80) continue; /* continuation byte */
+    units += *p >= 0xf0 ? 2 : 1;       /* astral characters are surrogate pairs */
+  }
+  return units != 0 && units <= 16;
 }
 
 void qa_content_item_icon_free(qa_source_item_icon_declaration *value) {
@@ -69,9 +75,13 @@ bool qa_read_item_icon_declaration(const qa_save_reader *reader,
   out->path = normalized_field(reader, "path");
   if (out->path == NULL) return false;
   if (strcmp(kind, "image") == 0) return true;
+  /* The path read so far is released when the lump field or its check raises. */
+  qa_cleanup path_node;
+  qa_cleanup_push(&path_node, free, (void *)(const void *)out->path);
   const char *lump = field_string(reader, "lump");
   if (!valid_lump(lump))
     qa_save_reader_fail(reader, "Item icon requires a valid WAD lump name");
+  qa_cleanup_pop(&path_node);
   out->lump = copy_text(lump);
   if (out->lump == NULL) {
     qa_content_item_icon_free(out);
@@ -132,9 +142,12 @@ bool qa_read_source_item_icon(const qa_save_reader *reader,
     out->kind = QA_WEAPON_HUD_ICON_IMAGE;
     return true;
   }
+  qa_cleanup path_node;
+  qa_cleanup_push(&path_node, free, path);
   const char *lump = field_string(reader, "lump");
   if (!valid_lump(lump))
     qa_save_reader_fail(reader, "Item icon requires a valid WAD lump name");
+  qa_cleanup_pop(&path_node);
   out->kind = QA_WEAPON_HUD_ICON_WAD_PICTURE;
   out->lump = copy_text(lump);
   if (out->lump == NULL) {

@@ -34,38 +34,49 @@ static void qview_free(QView *v){ free(v->globals); free(v->fields); free(v->fun
 void qa_compat_qc_protection_regions_free(qa_q1qc_armor_stage **regions, size_t count){
   for(size_t i=0;i<count;i++) { qa_q1qc_armor_stage_destroy(regions[i]); } free(regions);
 }
+/* A refused declaration releases the program view, the regions built so far and the one being checked. */
+typedef struct { QView *view; qa_q1qc_armor_stage ***regions; size_t *count; qa_q1qc_armor_stage *pending; } RegionScratch;
+static void region_scratch_free(void *arg) {
+  RegionScratch *s = arg;
+  qview_free(s->view);
+  qa_compat_qc_protection_regions_free(*s->regions, *s->count);
+  if (s->pending) qa_q1qc_armor_stage_destroy(s->pending);
+}
 qa_q1qc_armor_stage **qa_compat_qc_protection_regions(qa_compat_qc_program *program, qa_mod_callback_declaration declaration, size_t *out_count) {
   qa_q1qc_armor_stage **regions = NULL; size_t rn = 0, cap = 0;
   bool seen_regular=false, seen_powered=false;
-  QView view; qview_build(&view, program);
+  QView view; memset(&view, 0, sizeof view);
+  RegionScratch scratch = {&view, &regions, &rn, NULL};
+  qa_cleanup scope; qa_cleanup_push(&scope, region_scratch_free, &scratch);
+  qview_build(&view, program);
   for (size_t di = 0; di < declaration.protection_count; di++) {
     const qa_mod_qc_protection *definition = &declaration.protection[di];
     bool reg = strcmp(definition->channel, "regular") == 0;
-    if (!declaration.clients || (reg ? seen_regular : seen_powered)) qa_range_error("QC protection requires clients and one declaration per channel");
+    if (!declaration.clients || (reg ? seen_regular : seen_powered)) qa_raise("Error", 0, 0, "QC protection requires clients and one declaration per channel");
     if (reg) seen_regular = true; else seen_powered = true;
     const char *count_name = reg ? definition->storage_points : definition->storage_cells;
     const char *names[2] = {count_name, definition->has_selection ? definition->selection_field : NULL};
     for (int ni = 0; ni < 2; ni++) { const char *name = names[ni]; if (!name) break;
       const qa_compat_qc_definition *f = qa_compat_qc_program_field_named(program, name);
       bool priv = false; for(size_t j=0;j<declaration.actor_field_count;j++) if(strcmp(declaration.actor_fields[j].field,name)==0 && strcmp(declaration.actor_fields[j].binding,"private")==0) priv=true;
-      if (!f || strcmp(f->type,"float")!=0 || !priv) qa_range_error("QC protection requires private float storage %s", name); }
+      if (!f || strcmp(f->type,"float")!=0 || !priv) qa_raise("Error", 0, 0, "QC protection requires private float storage %s", name); }
     size_t val_count = reg ? definition->item_value_count : definition->kind_value_count;
     if (definition->has_selection) {
       bool bad = strcmp(definition->selection_field, count_name)==0 || val_count==0;
       for(size_t i=0;i<val_count && !bad;i++){ double v = reg?definition->item_values[i].value:definition->kind_values[i].value;
         if(!isfinite(v)||qa_float32(v)!=v) bad=true;
         for(size_t j=i+1;j<val_count;j++){ double w=reg?definition->item_values[j].value:definition->kind_values[j].value; if(w==v) bad=true; } }
-      if (bad) qa_range_error("QC protection selection is not representable");
+      if (bad) qa_raise("Error", 0, 0, "QC protection selection is not representable");
       if (definition->has_selection_mask) { double mask = definition->selection_mask; bool bad2 = mask != trunc(mask) || mask <= 0 || mask > 0x7fffff;
         for(size_t i=0;i<val_count;i++){ double v=reg?definition->item_values[i].value:definition->kind_values[i].value; if(v!=trunc(v) || (double)(qa_js_to_int32(v)&(int32_t)mask)!=v) bad2=true; /* (value & mask) !== value */ }
-        if (bad2) qa_range_error("QC protection selection mask is invalid"); }
+        if (bad2) qa_raise("Error", 0, 0, "QC protection selection mask is invalid"); }
     }
     double flagv[5] = {definition->flags.no_armor, definition->flags.no_power_armor, definition->flags.no_regular_armor, definition->flags.energy, definition->flags.radius};
-    for(int i=0;i<5;i++) if(flagv[i]!=trunc(flagv[i])||flagv[i]<0||flagv[i]>0x7fffff) qa_range_error("QC protection flags exceed source integer precision");
+    for(int i=0;i<5;i++) if(flagv[i]!=trunc(flagv[i])||flagv[i]<0||flagv[i]>0x7fffff) qa_raise("Error", 0, 0, "QC protection flags exceed source integer precision");
     if (definition->absorb_is_region) {
-      qa_q1qc_armor_stage *region = qa_q1qc_armor_stage_create(&view.program, &definition->absorb_stage);
+      qa_q1qc_armor_stage *region = scratch.pending = qa_q1qc_armor_stage_create(&view.program, &definition->absorb_stage);
       if (!region || !region->region.has_standalone || strcmp(definition->absorb_call.function, region->source.function)!=0)
-        qa_range_error("QC donor region lacks a qualified standalone frame");
+        qa_raise("Error", 0, 0, "QC donor region lacks a qualified standalone frame");
       const qa_compat_qc_function *fn = qa_compat_qc_program_function_named(program, definition->absorb_call.function);
       /* parameter words -> declared arguments */
       int64_t word = fn->parameter_start;
@@ -74,11 +85,12 @@ qa_q1qc_armor_stage **qa_compat_qc_protection_regions(qa_compat_qc_program *prog
       const struct { int64_t word; const char *name; } req[3] = {{definition->absorb_stage.target, "self"}, {definition->absorb_stage.damage, "amount"}, {(int64_t)definition->absorb_stage.flags.word, "damage-flags"}};
       size_t req_n = definition->absorb_stage.flags.is_bits ? 3 : 2;
       for(size_t i=0;i<req_n;i++){ bool ok=false; for(size_t j=0;j<an;j++) if(args[j].word==req[i].word && strcmp(args[j].value.kind,"input")==0 && strcmp(args[j].value.name,req[i].name)==0) ok=true;
-        if(!ok) qa_range_error("QC donor region must initialize %s from its current stage", req[i].name); }
-      if(rn==cap){ cap=cap?cap*2:4; regions=realloc(regions,cap*sizeof *regions); if(!regions) { qa_range_error("protection allocation failed"); } }
-      regions[rn++]=region;
+        if(!ok) qa_raise("Error", 0, 0, "QC donor region must initialize %s from its current stage", req[i].name); }
+      if(rn==cap){ size_t grown_cap=cap?cap*2:4; qa_q1qc_armor_stage **grown=realloc(regions,grown_cap*sizeof *regions); if(!grown) { qa_range_error("protection allocation failed"); } regions=grown; cap=grown_cap; }
+      regions[rn++]=region; scratch.pending = NULL;
     }
   }
+  qa_cleanup_pop(&scope);
   qview_free(&view);
   *out_count = rn; return regions;
 }
@@ -90,7 +102,7 @@ static struct ProtEntry *require_entry(P *p, qa_actor_id actor) {
   if (entry) { has_client = clients && clients->for_actor(clients->ctx, actor, &client);
     has_back = has_client && clients->actor(clients->ctx, entry->client, &back); }
   if (!entry || !qa_session_actor_registry_is_live(p->services->actors, actor) || !clients || !has_client || !client_eq(client, entry->client) || !has_back || !actor_eq(back, actor))
-    qa_range_error("QC protection client is retired");
+    qa_raise("Error", 0, 0, "QC protection client is retired");
   return entry;
 }
 void qa_compat_qc_mod_protection_init(P *p, qa_mod_callback_declaration decl, qa_provider_id provider, qa_mod_host_services *services, qa_compat_qc_mod_protection_operations ops) {
@@ -104,11 +116,18 @@ void qa_compat_qc_mod_protection_destroy(P *p) {
   for(size_t i=0;i<p->bind_count;i++) free(p->bind_storage[i]);
   free(p->bind_storage); memset(p,0,sizeof *p);
 }
-typedef struct { struct ProtLane *lanes; size_t count; } ReserveUnwind;
-static void unwind_reserve(void *arg) {
-  ReserveUnwind *u = arg;
-  for (size_t i = 0; i < u->count; i++) u->lanes[i].reservation.close(u->lanes[i].reservation.ctx);
-  free(u->lanes);
+typedef struct { P *p; qa_owned_actor owner; struct ProtLane *lanes; size_t count; } ReserveJob;
+static void reserve_lanes(void *arg) {
+  ReserveJob *job = arg; P *p = job->p;
+  for (size_t i = 0; i < p->declaration.protection_count; i++) {
+    const qa_mod_qc_protection *definition = &p->declaration.protection[i];
+    qa_protection_claim claim; memset(&claim,0,sizeof claim); claim.owner=p->provider; claim.rule=definition->id;
+    claim.admission.kind = definition->admission.kind ? definition->admission.kind : "claim"; claim.admission.owner = definition->admission.owner;
+    bool reg = strcmp(definition->channel, "regular") == 0;
+    job->lanes[i] = (struct ProtLane){definition->channel, definition,
+      qa_gameplay_authority_reserve_protection(p->services->combat, job->owner, reg ? QA_PROTECTION_REGULAR : QA_PROTECTION_POWERED, claim)};
+    job->count = i + 1;
+  }
 }
 void qa_compat_qc_mod_protection_reserve(P *p, qa_actor_id actor) {
   if (find_entry(p, actor)) { require_entry(p, actor); return; }
@@ -116,20 +135,19 @@ void qa_compat_qc_mod_protection_reserve(P *p, qa_actor_id actor) {
   const qa_mod_client_services *clients = (const qa_mod_client_services *)p->services->clients;
   qa_client_id client; bool has_client = clients && clients->for_actor(clients->ctx, actor, &client);
   qa_actor_id back; bool live = has_client && clients->actor(clients->ctx, client, &back) && actor_eq(back, actor);
-  if (!has_owner || !has_client || !live) qa_range_error("QC protection requires a live canonical client");
+  if (!has_owner || !has_client || !live) qa_raise("Error", 0, 0, "QC protection requires a live canonical client");
   struct ProtLane *lanes = calloc(p->declaration.protection_count ? p->declaration.protection_count : 1, sizeof *lanes);
   if (!lanes) qa_range_error("protection allocation failed");
-  ReserveUnwind unwind = {lanes, 0}; qa_cleanup scope; qa_cleanup_push(&scope, unwind_reserve, &unwind); /* TS catch */
-  for (size_t i = 0; i < p->declaration.protection_count; i++) {
-    const qa_mod_qc_protection *definition = &p->declaration.protection[i];
-    qa_protection_claim claim; memset(&claim,0,sizeof claim); claim.owner=p->provider; claim.rule=definition->id;
-    claim.admission.kind = definition->admission.kind ? definition->admission.kind : "claim"; claim.admission.owner = definition->admission.owner;
-    bool reg = strcmp(definition->channel, "regular") == 0;
-    lanes[i] = (struct ProtLane){definition->channel, definition,
-      qa_gameplay_authority_reserve_protection(p->services->combat, owner, reg ? QA_PROTECTION_REGULAR : QA_PROTECTION_POWERED, claim)};
-    unwind.count = i + 1;
+  /* TS catch (error) { for (lane of lanes) lane.reservation.close(); throw error }: a raising close
+   * propagates its own error and stops the closes after it. */
+  ReserveJob job = {p, owner, lanes, 0};
+  qa_caught_error caught;
+  if (!qa_try(reserve_lanes, &job, &caught)) {
+    qa_cleanup scope; qa_cleanup_push(&scope, free, lanes);
+    for (size_t i = 0; i < job.count; i++) lanes[i].reservation.close(lanes[i].reservation.ctx);
+    qa_cleanup_pop(&scope); free(lanes);
+    qa_rethrow(&caught);
   }
-  qa_cleanup_pop(&scope);
   if (p->entry_count==p->entry_capacity){ size_t c=p->entry_capacity?p->entry_capacity*2:4; p->entries=realloc(p->entries,c*sizeof *p->entries); if(!p->entries) qa_range_error("protection allocation failed"); p->entry_capacity=c; }
   p->entries[p->entry_count++] = (struct ProtEntry){actor, client, lanes, p->declaration.protection_count, false};
 }
@@ -152,32 +170,32 @@ static qa_regular_armor_state regular_read(P *p, qa_actor_id actor, const qa_mod
   qa_item_id item = def->storage_item;
   if (def->has_selection) { item = NULL; double sel = prot_selected(p, actor, def);
     for(size_t i=0;i<def->item_value_count;i++) if(def->item_values[i].value==sel) item = def->item_values[i].item; }
-  if (!item) qa_range_error("QC regular armor selection is undeclared");
+  if (!item) qa_raise("Error", 0, 0, "QC regular armor selection is undeclared");
   qa_regular_armor_state r; memset(&r,0,sizeof r); r.kind = QA_REGULAR_ARMOR_SOURCE; r.points = points; r.item = item; return r;
 }
 static qa_powered_protection_state powered_read(P *p, qa_actor_id actor, const qa_mod_qc_protection *def) {
   const char *kind = def->storage_kind;
   if (def->has_selection) { kind = NULL; double sel = prot_selected(p, actor, def);
     for(size_t i=0;i<def->kind_value_count;i++) if(def->kind_values[i].value==sel) kind = def->kind_values[i].kind; }
-  if (!kind) qa_range_error("QC powered armor selection is undeclared");
+  if (!kind) qa_raise("Error", 0, 0, "QC powered armor selection is undeclared");
   return (qa_powered_protection_state){kind, strcmp(kind,"none")==0 ? 0 : prot_count(p, actor, def->storage_cells, false, 0)};
 }
-static void valid_count(double count) { if (count < 0 || !isfinite(count) || qa_float32(count) != count) qa_range_error("QC protection count is not representable"); }
+static void valid_count(double count) { if (count < 0 || !isfinite(count) || qa_float32(count) != count) qa_raise("Error", 0, 0, "QC protection count is not representable"); }
 static void validate_regular(P *p, qa_actor_id actor, const qa_mod_qc_protection *def, qa_regular_armor_state next) {
   require_entry(p, actor);
-  if (next.kind != QA_REGULAR_ARMOR_SOURCE) qa_range_error("QC independent regular armor requires its source projection");
+  if (next.kind != QA_REGULAR_ARMOR_SOURCE) qa_raise("Error", 0, 0, "QC independent regular armor requires its source projection");
   valid_count(next.points);
   bool ok;
   if (!def->has_selection) ok = (next.item == def->storage_item) || (next.item && def->storage_item && strcmp(next.item, def->storage_item)==0);
   else { ok=false; for(size_t i=0;i<def->item_value_count;i++) if(next.item && def->item_values[i].item && strcmp(def->item_values[i].item,next.item)==0) ok=true; }
-  if (!ok) qa_range_error("QC regular armor item is undeclared");
+  if (!ok) qa_raise("Error", 0, 0, "QC regular armor item is undeclared");
 }
 static void validate_powered(P *p, qa_actor_id actor, const qa_mod_qc_protection *def, qa_powered_protection_state next) {
   require_entry(p, actor); valid_count(strcmp(next.kind,"none")==0 ? 0 : next.cells);
   bool ok;
   if (!def->has_selection) ok = strcmp(next.kind, def->storage_kind)==0;
   else { ok=false; for(size_t i=0;i<def->kind_value_count;i++) if(strcmp(def->kind_values[i].kind,next.kind)==0) ok=true; }
-  if (!ok) qa_range_error("QC powered armor kind is undeclared");
+  if (!ok) qa_raise("Error", 0, 0, "QC powered armor kind is undeclared");
 }
 static void prot_select(P *p, qa_actor_id actor, const qa_mod_qc_protection *def, double next) {
   prot_count(p, actor, def->selection_field, true, def->has_selection_mask
@@ -213,7 +231,7 @@ static void b_write_regular(void *ctx, qa_regular_armor_state next){
   validate_regular(p,b->actor,def,next);
   if (def->has_selection && next.kind==QA_REGULAR_ARMOR_SOURCE){
     bool found=false; double v=0; for(size_t i=0;i<def->item_value_count;i++) if(next.item&&def->item_values[i].item&&strcmp(def->item_values[i].item,next.item)==0){v=def->item_values[i].value;found=true;}
-    if(!found) qa_range_error("Missing validated QC armor selection");
+    if(!found) qa_raise("Error", 0, 0, "Missing validated QC armor selection");
     prot_select(p,b->actor,def,v);
   }
   prot_count(p,b->actor,def->storage_points,true,next.kind==QA_REGULAR_ARMOR_NONE?0:next.points); rebase(p,b->actor);
@@ -223,7 +241,7 @@ static void b_write_powered(void *ctx, qa_powered_protection_state next){
   validate_powered(p,b->actor,def,next);
   if (def->has_selection){
     bool found=false; double v=0; for(size_t i=0;i<def->kind_value_count;i++) if(strcmp(def->kind_values[i].kind,next.kind)==0){v=def->kind_values[i].value;found=true;}
-    if(!found) qa_range_error("Missing validated QC power selection");
+    if(!found) qa_raise("Error", 0, 0, "Missing validated QC power selection");
     prot_select(p,b->actor,def,v);
   }
   prot_count(p,b->actor,def->storage_cells,true,strcmp(next.kind,"none")==0?0:next.cells); rebase(p,b->actor);
@@ -245,7 +263,7 @@ static qa_armor_stage_result absorb_impl(P *p, qa_actor_id actor, const qa_mod_q
     bool has=false;
     for(size_t i=0;i<definition->absorb_call.argument_count;i++) if(strcmp(definition->absorb_call.arguments[i].kind,"input")==0&&strcmp(definition->absorb_call.arguments[i].name,"regular-protection-scale")==0) has=true;
     for(size_t i=0;i<definition->absorb_call.global_count;i++) if(strcmp(definition->absorb_call.globals[i].value.kind,"input")==0&&strcmp(definition->absorb_call.globals[i].value.name,"regular-protection-scale")==0) has=true;
-    if(!has) qa_range_error("QC regular protection scale requires an explicit source input");
+    if(!has) qa_raise("Error", 0, 0, "QC regular protection scale requires an explicit source input");
   }
   int64_t damage_flags = (input.flags.no_armor?(int64_t)flags.no_armor:0)|(input.flags.no_power_armor?(int64_t)flags.no_power_armor:0)
     |(input.flags.no_regular_armor?(int64_t)flags.no_regular_armor:0)|(input.flags.energy?(int64_t)flags.energy:0)
@@ -274,12 +292,25 @@ static qa_armor_stage_result absorb_impl(P *p, qa_actor_id actor, const qa_mod_q
 }
 static qa_armor_stage_result b_absorb(void *ctx, qa_armor_stage_input input, qa_protection_observer observer){ BindCtx *b=ctx; return absorb_impl(b->p,b->actor,b->definition,input,observer); }
 void qa_compat_qc_mod_protection_release(P *p, qa_actor_id actor);
-typedef struct { P *p; qa_actor_id actor; void *flat; void *pickup_rules; } ActivateUnwind;
-static void unwind_activate(void *arg) { ActivateUnwind *u = arg; free(u->flat); free(u->pickup_rules); qa_compat_qc_mod_protection_release(u->p, u->actor); }
+typedef struct { P *p; qa_actor_id actor; void *flat; void *pickup_rules; struct ProtLane *lanes; size_t lane_count; } ActivateJob;
+static void activate_scratch_free(void *arg) { ActivateJob *u = arg; free(u->flat); free(u->pickup_rules); u->flat = NULL; u->pickup_rules = NULL; }
+static void activate_lanes(void *arg);
 void qa_compat_qc_mod_protection_activate(P *p, qa_actor_id actor) {
   struct ProtEntry *entry = require_entry(p, actor); if (entry->bound) return;
-  struct ProtLane *lanes = entry->lanes; size_t lane_count = entry->lane_count; /* bind may move the entry table */
-  ActivateUnwind unwind = {p, actor, NULL, NULL}; qa_cleanup scope; qa_cleanup_push(&scope, unwind_activate, &unwind); /* TS catch: release, rethrow */
+  /* TS try { bind every lane } catch (error) { this.release(actor); throw error } */
+  ActivateJob job = {p, actor, NULL, NULL, entry->lanes, entry->lane_count}; /* bind may move the entry table */
+  qa_caught_error caught;
+  if (!qa_try(activate_lanes, &job, &caught)) {
+    qa_compat_qc_mod_protection_release(p, actor);
+    qa_rethrow(&caught);
+  }
+  entry = find_entry(p, actor);
+  if (entry) entry->bound = true;
+}
+static void activate_lanes(void *arg) {
+  ActivateJob *job = arg; P *p = job->p; qa_actor_id actor = job->actor;
+  struct ProtLane *lanes = job->lanes; size_t lane_count = job->lane_count;
+  ActivateJob *unwind = job; qa_cleanup scope; qa_cleanup_push(&scope, activate_scratch_free, job);
   for (size_t i = 0; i < lane_count; i++) {
     struct ProtLane *lane = &lanes[i];
     const qa_mod_qc_protection *definition = lane->definition;
@@ -289,10 +320,10 @@ void qa_compat_qc_mod_protection_activate(P *p, qa_actor_id actor) {
     if (p->operations.pickups) pickup_count = p->operations.pickups(p->operations.ctx, actor, reg ? QA_PROTECTION_REGULAR : QA_PROTECTION_POWERED, NULL, 0);
     const qa_original_pickup_rule **pickup_rules = calloc(pickup_count + 1, sizeof *pickup_rules);
     qa_original_pickup_rule *flat = calloc(pickup_count + 1, sizeof *flat); /* authority captures the rules at bind */
+    unwind->flat = flat; unwind->pickup_rules = (void *)pickup_rules;
     if (!pickup_rules || !flat) qa_range_error("protection allocation failed");
     if (pickup_count) p->operations.pickups(p->operations.ctx, actor, reg ? QA_PROTECTION_REGULAR : QA_PROTECTION_POWERED, pickup_rules, pickup_count);
     for(size_t j=0;j<pickup_count;j++) flat[j]=*pickup_rules[j];
-    unwind.flat = flat; unwind.pickup_rules = pickup_rules;
     BindCtx *b = bind_for(p, actor, definition);
     qa_protection_binding binding; memset(&binding,0,sizeof binding);
     binding.ctx=b; binding.claim=claim; binding.channel=reg?QA_PROTECTION_REGULAR:QA_PROTECTION_POWERED;
@@ -303,11 +334,9 @@ void qa_compat_qc_mod_protection_activate(P *p, qa_actor_id actor) {
     binding.write_regular=b_write_regular; binding.write_powered=b_write_powered;
     binding.absorb=b_absorb;
     lane->reservation.bind(lane->reservation.ctx, binding);
-    free(flat); free(pickup_rules); unwind.flat = NULL; unwind.pickup_rules = NULL;
+    free(flat); free(pickup_rules); unwind->flat = NULL; unwind->pickup_rules = NULL;
   }
   qa_cleanup_pop(&scope);
-  entry = find_entry(p, actor);
-  if (entry) entry->bound = true;
 }
 static bool regular_equal(qa_regular_armor_state a, qa_regular_armor_state b){ return a.kind==b.kind && same_value(a.points,b.points) && ((a.item==b.item)||(a.item&&b.item&&strcmp(a.item,b.item)==0)); }
 static bool powered_equal(qa_powered_protection_state a, qa_powered_protection_state b){ return strcmp(a.kind,b.kind)==0 && same_value(a.cells,b.cells); }
@@ -355,17 +384,19 @@ void qa_compat_qc_mod_protection_release(P *p, qa_actor_id actor) {
   for(size_t i=0;i<lane_count;i++) { qa_caught_error caught; if (!qa_try(close_lane, &lanes[i], &caught)) errors++; }
   free(lanes);
   entry = find_entry(p, actor); /* close may re-enter and move the table */
-  size_t idx=(size_t)(entry-p->entries);
-  memmove(&p->entries[idx],&p->entries[idx+1],(p->entry_count-idx-1)*sizeof *p->entries); p->entry_count--;
-  if (errors) qa_range_error("QC protection release failed");
+  if (entry) {
+    size_t idx=(size_t)(entry-p->entries);
+    memmove(&p->entries[idx],&p->entries[idx+1],(p->entry_count-idx-1)*sizeof *p->entries); p->entry_count--;
+  }
+  if (errors) qa_raise("AggregateError", 0, 0, "QC protection release failed");
 }
 typedef struct { P *p; qa_actor_id actor; } CloseTry;
 static void close_release(void *ctx) { CloseTry *t = ctx; qa_compat_qc_mod_protection_release(t->p, t->actor); }
 void qa_compat_qc_mod_protection_close(P *p) {
   size_t errors = 0;
   while (p->entry_count) { CloseTry attempt = {p, p->entries[0].actor}; qa_caught_error caught; if (!qa_try(close_release, &attempt, &caught)) errors++; }
-  if (errors) qa_range_error("QC protection close failed");
+  if (errors) qa_raise("AggregateError", 0, 0, "QC protection close failed");
 }
 void qa_compat_qc_mod_protection_assert_idle(P *p) {
-  if (p->stage_count) qa_range_error("QC protection requires an idle source stage");
+  if (p->stage_count) qa_raise("Error", 0, 0, "QC protection requires an idle source stage");
 }

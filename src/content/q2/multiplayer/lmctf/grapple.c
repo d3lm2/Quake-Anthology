@@ -1,6 +1,6 @@
 /* Port of src/content/q2/multiplayer/lmctf/grapple.ts. GPL-2.0-or-later.
- * Note: TS equipment.states clear/delete have no landed equipment API;
- * only the inactive map is cleared/deleted. */
+ * The TS `states` getter is the equipment's map when there is one, else the
+ * inactive map; the module's state accessors below pick the same map. */
 #include "qa/content/q2/multiplayer/lmctf/grapple.h"
 #include "../multiplayer_internal.h"
 #include "qa/content/q2/equipment/grapple_weapon.h"
@@ -214,13 +214,14 @@ qa_lmctf_grapple_state *qa_lmctf_grapple_module_state_ref(qa_lmctf_grapple *g, q
   return inactive_ref(g, actor, true);
 }
 bool qa_lmctf_grapple_module_state_has(qa_lmctf_grapple *g, qa_actor_id actor) {
-  if (g->equipment != NULL) return qa_lmctf_grapple_state_of(g->equipment, actor) != NULL;
+  if (g->equipment != NULL) return qa_lmctf_grapple_find_state(g->equipment, actor) != NULL; /* Map.has creates nothing */
   return inactive_ref(g, actor, false) != NULL;
 }
 void qa_lmctf_grapple_module_state_set(qa_lmctf_grapple *g, qa_actor_id actor, qa_lmctf_grapple_state state) {
   *qa_lmctf_grapple_module_state_ref(g, actor) = state;
 }
 void qa_lmctf_grapple_module_state_delete(qa_lmctf_grapple *g, qa_actor_id actor) {
+  if (g->equipment != NULL) { qa_lmctf_grapple_delete_state(g->equipment, actor); return; } /* TS equipment.states.delete */
   for (size_t i = 0; i < g->inactive_count; i++)
     if (qa_same_actor(g->inactive[i].actor, actor)) {
       memmove(&g->inactive[i], &g->inactive[i + 1], (g->inactive_count - i - 1) * sizeof *g->inactive);
@@ -228,7 +229,10 @@ void qa_lmctf_grapple_module_state_delete(qa_lmctf_grapple *g, qa_actor_id actor
       return;
     }
 }
-void qa_lmctf_grapple_module_states_clear(qa_lmctf_grapple *g) { g->inactive_count = 0; }
+void qa_lmctf_grapple_module_states_clear(qa_lmctf_grapple *g) {
+  if (g->equipment != NULL) qa_lmctf_grapple_clear_states(g->equipment); /* TS states is the equipment's map when there is one */
+  else g->inactive_count = 0;
+}
 qa_q2_callback_definitions qa_lmctf_grapple_module_callbacks(qa_lmctf_grapple *g) {
   if (g->equipment != NULL) return qa_lmctf_grapple_callbacks(g->equipment);
   qa_q2_callback_definitions empty = {0};

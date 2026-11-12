@@ -26,7 +26,7 @@ void qa_q3_game_memory_allocation_write_string(qa_q3_game_memory_allocation allo
   alloc.bytes[n] = 0;
 }
 qa_q3_game_memory_pointer qa_q3_game_memory_capture_allocation(qa_q3_game_memory *mem, qa_q3_game_memory_allocation alloc) {
-  if (alloc.pool != mem) qa_range_error("Game allocation belongs to another pool");
+  if (alloc.pool != mem) qa_raise("Error", 0, 0, "Game allocation belongs to another pool");
   qa_q3_game_memory_pointer p = {(double)alloc.offset, (double)alloc.length}; return p;
 }
 static double field_integer0(const qa_save_value *value, const char *path, const char *name) {

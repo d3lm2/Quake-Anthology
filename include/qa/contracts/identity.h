@@ -59,6 +59,11 @@ typedef struct qa_identity_owner {
  * SessionIdentity retains the JS string. */
 bool qa_identity_owner_create(qa_identity_owner *owner, const char *name);
 void qa_identity_owner_destroy(qa_identity_owner *owner);
+/* C-only: fn(token) runs just before qa_identity_owner_destroy frees an owner's
+ * token, for process tables keyed by that token (a TS WeakMap keyed by the
+ * session object ends with it; a freed token's address is reused by the next
+ * owner). Registering the same function again is a no-op. */
+void qa_identity_owner_on_destroy(void (*fn)(const void *token));
 
 /* Slot/generation/index must be nonnegative safe integers (TS RangeError). */
 qa_actor_id qa_identity_owner_actor(const qa_identity_owner *owner, int64_t slot, int64_t generation);

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "qa/input/sdl_keys.h"
 #include "qa/input/support.h"
 
@@ -258,13 +259,22 @@ static void finish_gyro_calibration(qa_input_router *router) {
 }
 
 qa_input_router *qa_input_router_create(const qa_input_router_options *options) {
+  /* TS throws from the constructor before anything is kept: check first. */
+  check_duplicates(options->seats, options->seat_count);
+  if (options->has_keyboard_seat) {
+    bool found = false;
+    for (size_t i = 0; i < options->seat_count; i++) {
+      found = found || qa_same_seat(qa_seat_input_seat(options->seats[i].input),
+                                    options->keyboard_seat);
+    }
+    if (!found) qa_input_error("Keyboard route refers to an unregistered seat");
+  }
   qa_input_router *router = (qa_input_router *)calloc(1, sizeof *router);
   if (router == NULL) return NULL;
   router->options = *options;
   router->platform_active = !options->defer_platform;
   router->has_controllers = options->controllers != NULL;
   if (router->has_controllers) router->controllers = *options->controllers;
-  check_duplicates(options->seats, options->seat_count);
   if (!set_routes(router, options->seats, options->seat_count) ||
       !refresh_controller_seats(router)) {
     qa_input_router_destroy(router);
@@ -932,24 +942,40 @@ void qa_input_router_handle_controller(qa_input_router *router,
   }
 }
 
+typedef struct polled_controller_events {
+  qa_controller_event *events;
+  size_t count;
+} polled_controller_events;
+static void free_polled_controller_events(void *arg) {
+  polled_controller_events *polled = (polled_controller_events *)arg;
+  qa_controller_events_free(polled->events, polled->count);
+}
+
 void qa_input_router_pump(qa_input_router *router) {
+  /* A handler that raises abandons the rest of the batch, as the TS throw
+     does; the polled arrays are released on the way out. */
   size_t count = 0;
   qa_sdl_event *platform =
       router->has_window ? router->window.poll_events(router->window.ctx, &count)
                          : NULL;
+  qa_cleanup platform_node;
+  qa_cleanup_push(&platform_node, free, platform);
   for (size_t i = 0; i < count; i++) {
     qa_input_router_handle_platform(router, &platform[i]);
   }
+  qa_cleanup_pop(&platform_node);
   free(platform);
-  count = 0;
-  qa_controller_event *controller =
-      router->has_controllers
-          ? router->controllers.poll_events(router->controllers.ctx, &count)
-          : NULL;
-  for (size_t i = 0; i < count; i++) {
-    qa_input_router_handle_controller(router, &controller[i]);
+  polled_controller_events polled = {NULL, 0};
+  if (router->has_controllers) {
+    polled.events = router->controllers.poll_events(router->controllers.ctx, &polled.count);
   }
-  qa_controller_events_free(controller, count);
+  qa_cleanup controller_node;
+  qa_cleanup_push(&controller_node, free_polled_controller_events, &polled);
+  for (size_t i = 0; i < polled.count; i++) {
+    qa_input_router_handle_controller(router, &polled.events[i]);
+  }
+  qa_cleanup_pop(&controller_node);
+  qa_controller_events_free(polled.events, polled.count);
   for (size_t i = 0; i < router->device_seat_count; i++) {
     double instance = router->device_seats[i].instance;
     qa_seat_input *seat = router->device_seats[i].input;

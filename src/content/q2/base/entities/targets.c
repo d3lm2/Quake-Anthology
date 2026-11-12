@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "qa/content/q2/foundation/fields.h"
+#include "../diagnostic.h"
 #include "qa/content/q2/foundation/scenery.h"
 #include "qa/foundation/support.h"
 
@@ -41,6 +42,13 @@ static int32_t sf(const qa_q2_entity *e) { return qa_js_to_int32(e->spawnflags);
 
 const qa_q2_think QA_Q2_TARGET_LASER_THINK = {NULL, qa_q2_target_laser_think_fn};
 
+typedef struct passed_list { qa_actor_id *inline_storage; qa_actor_id *heap; } passed_list;
+static void passed_list_free(void *arg) {
+  passed_list *list = arg;
+  free(list->heap);
+  list->heap = NULL;
+}
+
 void qa_q2_target_laser_think_fn(void *ctx, qa_q2_entity *self, qa_q2_game_services *services) {
   (void)ctx;
   double count = (sf(self) & INT32_MIN) != 0 ? 8 : 4;
@@ -57,12 +65,16 @@ void qa_q2_target_laser_think_fn(void *ctx, qa_q2_entity *self, qa_q2_game_servi
   qa_vec3 end = qa_q2_add(origin, qa_q2_scale(self->movedir, 2048));
   qa_vec3 start = origin, terminal = end;
   qa_actor_id ignore = self->actor.id;
-  /* Passed-through actors need growable storage; a file-scope scratch
-   * is safe because execution is single-threaded and non-reentrant
-   * between trace calls. */
-  static qa_actor_id *passed = NULL;
-  static size_t passed_cap = 0;
+  /* TS `passed` is this call's own array. The damage below can kill a monster whose
+   * death target switches another laser on, which runs this think again, so the
+   * storage cannot be shared between calls. */
+  qa_actor_id passed_inline[16];
+  passed_list list = {passed_inline, NULL};
+  qa_actor_id *passed = passed_inline;
+  size_t passed_cap = sizeof passed_inline / sizeof passed_inline[0];
   size_t passed_count = 0;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, passed_list_free, &list);
   for (;;) {
     qa_q2_trace_request request = {0};
     request.start = start; request.end = end; request.bounds = NULL; request.ignore = &ignore;
@@ -92,14 +104,19 @@ void qa_q2_target_laser_think_fn(void *ctx, qa_q2_entity *self, qa_q2_game_servi
       break;
     }
     if (passed_count == passed_cap) {
-      passed_cap = passed_cap ? passed_cap * 2 : 8;
-      passed = realloc(passed, passed_cap * sizeof *passed);
-      if (!passed) qa_range_error("Out of memory");
+      passed_cap *= 2;
+      qa_actor_id *grown = realloc(list.heap, passed_cap * sizeof *grown);
+      if (!grown) qa_range_error("Out of memory");
+      if (!list.heap) memcpy(grown, passed_inline, passed_count * sizeof *grown);
+      list.heap = grown;
+      passed = grown;
     }
     passed[passed_count++] = hit;
     ignore = hit;
     start = trace.end;
   }
+  qa_cleanup_pop(&guard);
+  passed_list_free(&list);
   qa_q2_presentation_event beam = {0};
   beam.kind = "beam"; beam.has_actor = true; beam.actor = self->actor.id;
   beam.start = origin; beam.end = terminal; beam.width = self->frame; beam.color = self->skin; beam.visible = true;
@@ -147,9 +164,7 @@ static void laser_start_fn(void *c, qa_q2_entity *self, qa_q2_game_services *gam
       qa_q2_entity *const *targets = game->targets(game->ctx, self->target, &count);
       if (count > 0) { self->has_enemy = true; self->enemy = targets[0]->actor.id; }
       if (!self->has_enemy) {
-        char message[512];
-        (void)snprintf(message, sizeof message, "target_laser has missing target %s", self->target);
-        game->host->diagnostic(game->host->ctx, message);
+        q2b_diagnosticf(game, "target_laser has missing target %s", self->target);
       }
     } else {
       self->movedir = qa_q2_movedir(qa_q2_game_body(game, self).angles);
@@ -190,15 +205,11 @@ static void ramp_use_fn(void *c, qa_q2_entity *self, qa_q2_game_services *game, 
     for (size_t i = 0; i < count; i++) {
       if (strcmp(targets[i]->classname, "light") == 0) { self->has_enemy = true; self->enemy = targets[i]->actor.id; }
       else {
-        char message[512];
-        (void)snprintf(message, sizeof message, "target_lightramp target %s is not a light", targets[i]->classname);
-        game->host->diagnostic(game->host->ctx, message);
+        q2b_diagnosticf(game, "target_lightramp target %s is not a light", targets[i]->classname);
       }
     }
     if (!self->has_enemy) {
-      char message[512];
-      (void)snprintf(message, sizeof message, "target_lightramp missing target %s", self->target);
-      game->host->diagnostic(game->host->ctx, message);
+      q2b_diagnosticf(game, "target_lightramp missing target %s", self->target);
       game->remove(game->ctx, self);
       return;
     }
@@ -367,9 +378,7 @@ bool qa_q2_base_targets_spawn(qa_q2_base_targets *t, qa_q2_entity *entity, qa_q2
     bool valid = message[0] >= 'a' && message[0] <= 'z' && message[1] >= 'a' && message[1] <= 'z' && message[2] == '\0';
     if (!valid || message[0] == message[1] || entity->target[0] == '\0' || game->options.mode == QA_Q2_MODE_DEATHMATCH) {
       if (game->options.mode != QA_Q2_MODE_DEATHMATCH) {
-        char diagnostic[512];
-        (void)snprintf(diagnostic, sizeof diagnostic, "Invalid target_lightramp %s", message);
-        game->host->diagnostic(game->host->ctx, diagnostic);
+        q2b_diagnosticf(game, "Invalid target_lightramp %s", message);
       }
       game->remove(game->ctx, entity);
       return true;

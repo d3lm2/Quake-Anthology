@@ -3,6 +3,7 @@
 #include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -117,7 +118,7 @@ bool qa_q2_entity_flare(const qa_q2_entity *e, qa_scene_flare *out, qa_vec3 *rim
   out->image = image;
   out->fade_start = trunc(qa_q2_number_field(&e->spawn, "fade_start_dist", 96));
   out->fade_end = trunc(qa_q2_number_field(&e->spawn, "fade_end_dist", 384));
-  out->scale = e->scale != 0 ? e->scale : 1;
+  out->scale = e->scale != 0 && !isnan(e->scale) ? e->scale : 1; /* TS scale || 1: NaN is falsy */
   out->lock_angle = (rf & 1) != 0;
   out->color = e->skin == 0 ? (qa_vec3){255, 255, 255}
       : (qa_vec3){(double)(skin >> 24), (double)(qa_js_to_int32((skin >> 16) & 255)), (double)(qa_js_to_int32((skin >> 8) & 255))};
@@ -141,6 +142,16 @@ void qa_q2_game_move(qa_q2_game_services *g, qa_q2_entity *e, qa_q2_body_changes
 qa_q2_entity *qa_q2_game_entity_of(qa_q2_game_services *g, const qa_actor_id *a) { return g->entity(g->ctx, a); }
 void qa_q2_game_use_targets_entity(qa_q2_game_services *g, qa_q2_entity *e, const qa_actor_id *a, bool ignore) {
   g->use_targets(g->ctx, qa_q2_entity_authored_target(e), a, ignore);
+}
+qa_actor_id *qa_q2_game_nearby_copy(qa_q2_game_services *g, qa_vec3 origin, double radius, size_t *out_count) {
+  size_t count = 0;
+  const qa_actor_id *near = g->host->nearby(g->host->ctx, origin, radius, &count);
+  *out_count = count;
+  if (count == 0) return NULL;
+  qa_actor_id *copy = malloc(count * sizeof *copy);
+  if (!copy) qa_range_error("out of memory");
+  memcpy(copy, near, count * sizeof *copy);
+  return copy;
 }
 void qa_q2_game_mark_dodgeable(qa_q2_game_services *g, qa_q2_entity *e) {
   if (g->mark_dodgeable != NULL) g->mark_dodgeable(g->ctx, e);

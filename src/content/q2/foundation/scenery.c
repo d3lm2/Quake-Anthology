@@ -56,10 +56,9 @@ qa_q2_entity *qa_q2_throw_debris(qa_q2_entity *self, qa_q2_game_services *g, con
 }
 
 static void explode_scenery(qa_q2_entity *e, qa_q2_game_services *g, int type) {
-  static _Thread_local char buf[64];
-  snprintf(buf, sizeof buf, "q2:explosion%d", type);
+  /* TS `q2:explosion${type}`, type 1 or 2: literals, so the event's text outlives the call. */
   qa_q2_presentation_event ev = {0};
-  ev.kind = "effect"; ev.effect = buf; ev.origin = qa_q2_game_body(g, e).origin; ev.direction = QA_Q2_ZERO; ev.count = 1;
+  ev.kind = "effect"; ev.effect = type == 2 ? "q2:explosion2" : "q2:explosion1"; ev.origin = qa_q2_game_body(g, e).origin; ev.direction = QA_Q2_ZERO; ev.count = 1;
   g->host->emit(g->host->ctx, ev);
   g->remove(g->ctx, e);
 }
@@ -76,8 +75,8 @@ bool qa_q2_kill_box(qa_q2_entity *e, qa_q2_game_services *g) {
     g->damage(g->ctx, victim, e, e->actor.id, &self_id, 100000, 0, QA_Q2_ZERO, body.origin, QA_Q2_ZERO, 21, 32, NULL);
     qa_q2_entity *live_ent = g->entity(g->ctx, &victim);
     if (!live_ent) {
-      qa_body_state b2 = qa_q2_game_body(g, e);
-      qa_q2_trace_request tr2 = {.start = b2.origin, .end = b2.origin, .bounds = &b2.bounds, .ignore = &e->actor.id, .mask = 0x2010003};
+      /* TS traces again with the body it read before the damage. */
+      qa_q2_trace_request tr2 = {.start = body.origin, .end = body.origin, .bounds = &body.bounds, .ignore = &e->actor.id, .mask = 0x2010003};
       qa_trace_result next = g->host->trace(g->host->ctx, tr2);
       return next.hit.kind != QA_TRACE_HIT_ACTOR || !qa_same_actor(next.hit.actor, victim);
     }

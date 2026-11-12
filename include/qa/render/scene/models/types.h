@@ -45,9 +45,24 @@ typedef struct qa_scene_model_group {
   double surface, fog, dlight;
   qa_draw_batch *batches; /* owned */
   size_t batch_count;
+  /* TS SceneShadowGroup (shadowVolumeGroup): the group's one operation is a
+   * "shadow-volume" instead of a draw. kind/material/source_* carry its order;
+   * batches is NULL. Positions and indices are owned. */
+  bool is_shadow_volume;
+  qa_vec4 *shadow_positions; size_t shadow_position_count;
+  double *shadow_indices; size_t shadow_index_count;
+  bool shadow_mirror;
+  qa_renderer_image shadow_white_image;
+  /* Storage the batches view but qa_mat_draw_batches_destroy does not free
+   * (batch lighting arrays; TS keeps them alive through the batch). */
+  void **owned_storage; size_t owned_storage_count;
 } qa_scene_model_group;
 void qa_scene_model_group_destroy(qa_scene_model_group *group);
 void qa_scene_model_groups_destroy(qa_scene_model_group *groups, size_t count);
+/* The SceneGroup of a shadow-volume model group (TS: the SceneShadowGroup itself).
+ * The operation borrows the group's positions and indices; the caller destroys the
+ * result with qa_scene_group_destroy before the model group. */
+qa_scene_group qa_scene_model_shadow_volume_group(const qa_scene_model_group *group);
 
 typedef struct qa_model_skinning_frame { void *reserved; } qa_model_skinning_frame;
 
@@ -88,7 +103,9 @@ typedef struct qa_model_source_options {
   bool has_sprite_roll;
   double sprite_roll;
   const char *custom_shader; /* NULL is TS null/undefined */
-  const qa_model_custom_skin_entry *custom_skin; /* NULL is null/undefined */
+  /* TS customSkin?: readonly {...}[] | null. Present when has_custom_skin is set or the pointer is non-NULL, so
+   * an empty skin (TS []: every surface is "missing-skin-surface") needs no placeholder allocation. */
+  const qa_model_custom_skin_entry *custom_skin;
   size_t custom_skin_count;
   const qa_q3_mesh_model *const *q3_lods; /* NULL is undefined; entries nullable */
   size_t q3_lod_count;
@@ -116,6 +133,7 @@ typedef struct qa_model_source_options {
   bool overbright_models;
   bool has_player_colors;
   double player_color_top, player_color_bottom;
+  bool has_custom_skin; /* customSkin is an array, possibly empty (see custom_skin) */
 } qa_model_source_options;
 
 /* TS ModelVertexLighting closure. */
@@ -177,6 +195,9 @@ typedef struct qa_prepared_model_surface {
   const char *name; /* borrowed unless owned_name */
   char *owned_name;
   qa_scene_entity entity; /* shallow copy, as TS shares the reference */
+  /* The identity TS gets from sharing that reference: the shade_ctx of the vertex lighting prepared for this
+   * surface's entity (NULL when none was). The renderer keys its per-entity light cache on it. */
+  const void *lighting_identity;
   qa_model_transform transform;
   qa_model_image_selection image;
   qa_material_geometry local_geometry;
@@ -212,7 +233,8 @@ struct qa_prepared_model_entity {
 
 /* TS ModelGroupContext. draw returns owned groups (may be NULL/0). */
 typedef qa_scene_model_group *(*qa_model_group_draw_fn)(
-    void *ctx, const qa_prepared_model_surface *surface, size_t *out_count);
+    void *ctx, const qa_prepared_model_surface *surface, bool personal_model,
+    size_t *out_count);
 typedef struct qa_model_group_context {
   void *ctx;
   qa_model_group_draw_fn draw;

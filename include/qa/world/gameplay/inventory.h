@@ -1,7 +1,8 @@
 /*
  * Port of src/world/gameplay/inventory.ts: the shared inventory
  * table. Returned entry arrays are table-owned scratch. The TS
- * SourceItemRetired throw aborts with QA_SOURCE_ITEM_RETIRED_MESSAGE.
+ * SourceItemRetired throw is a raise named "SourceItemRetired" with
+ * QA_SOURCE_ITEM_RETIRED_MESSAGE.
  * isDeepStrictEqual entry comparisons use Object.is number equality
  * (NaN matches NaN, -0 differs from 0). GPL-2.0-or-later.
  */

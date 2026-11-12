@@ -57,9 +57,9 @@ bool qa_q2mpm_stalker_transition_ok(qa_q2m_context *context, bool spawned_by_wid
 }
 void qa_q2mpm_stalker_jump_angles(qa_vec3 start, qa_vec3 end, double velocity, double out[2]) {
   qa_vec3 delta = qa_sub3_double(end, start);
-  double horizontal = hypot(delta.x, delta.y);
+  double horizontal = qa_js_hypot2(delta.x, delta.y);
   double vertical = fabs(delta.z);
-  double distance = hypot(horizontal, vertical);
+  double distance = qa_js_hypot2(horizontal, vertical);
   double angle = vertical == 0 ? 0 : atan(vertical / horizontal) * (delta.z > 0 ? -1 : 1);
   double first = asin(distance * 800 * qa_js_pow(cos(angle), 2) / qa_js_pow(velocity, 2) - sin(angle));
   out[0] = (first - angle) / 2;

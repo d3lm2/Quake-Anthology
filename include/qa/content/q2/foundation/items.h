@@ -116,6 +116,8 @@ bool qa_q2_item_module_spawn(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_s
 bool qa_q2_item_module_spawn_item(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g, const char *descriptor);
 const qa_q2_item_definition *qa_q2_item_module_item_definition(qa_q2_item_module *m, qa_q2_entity *e);
 bool qa_q2_item_module_preview_supply(qa_q2_item_module *m, qa_q2_game_services *g, qa_actor_id pickup, qa_actor_id recipient, qa_pickup_supply_preview *out);
+/* A weapon offer's `ammo` array points into `out` itself (its `offer.grant` member), so it stays valid for as long
+ * as `*out` does and no later call rewrites it; a copy of the struct still points at the original. */
 bool qa_q2_item_module_observe_supply(qa_q2_item_module *m, qa_q2_game_services *g, qa_actor_id pickup, qa_actor_id recipient, qa_pickup_supply_observation *out);
 void qa_q2_item_module_replace_item(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g, const char *descriptor);
 void qa_q2_item_module_touch(qa_q2_item_module *m, qa_q2_entity *e, qa_q2_game_services *g, qa_actor_id player);

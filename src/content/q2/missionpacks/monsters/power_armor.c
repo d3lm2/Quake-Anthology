@@ -5,37 +5,40 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/contracts/identity.h"
+#include "qa/foundation/support.h"
 
-/* TS WeakSet<OwnedActor> of bound actors. */
-static qa_owned_actor *bindings;
-static size_t binding_count, binding_cap;
-static bool binding_has(qa_owned_actor actor) {
-  for (size_t i = 0; i < binding_count; i++)
-    if (bindings[i].token == actor.token && qa_same_actor(bindings[i].id, actor.id)) return true;
-  return false;
-}
-static void binding_add(qa_owned_actor actor) {
-  if (binding_count == binding_cap) {
-    size_t cap = binding_cap ? binding_cap * 2 : 8;
-    qa_owned_actor *grown = realloc(bindings, cap * sizeof *grown);
-    if (!grown) qa_raise("Error", 0, 0, "Out of memory recording monster power armor binding");
-    bindings = grown;
-    binding_cap = cap;
-  }
-  bindings[binding_count++] = actor;
-}
 
-typedef struct cell_ctx {
-  qa_q2_game_services *game;
+/* TS WeakSet<OwnedActor> of bound actors (identity: id + owner + token). A TS
+ * OwnedActor object ends with its session; a session token's address is reused
+ * by the next session, so the records of a token are retired when its identity
+ * owner is destroyed, as content/q2/base/monsters/brain.c does (a retired
+ * record is reused, never freed: an authority may still hold it as its cell
+ * binding). The closures read the actor, never the entity, which is freed
+ * while the binding stays with the authority. */
+typedef struct cell_binding {
   qa_owned_actor actor;
-  double capacity;
-} cell_ctx;
+  bool retired;
+  qa_q2_game_services *game;
+  double capacity; /* TS entry.capacity captured at bind time */
+  struct cell_binding *next;
+} cell_binding;
+static cell_binding *bindings;
+static bool retire_registered;
+static void retire_session(const void *token) {
+  for (cell_binding *b = bindings; b; b = b->next)
+    if (b->actor.token == token) b->retired = true;
+}
+static bool same_owned(qa_owned_actor a, qa_owned_actor b) {
+  return qa_same_actor(a.id, b.id) && a.token == b.token
+      && ((a.owner == NULL && b.owner == NULL) || (a.owner && b.owner && strcmp(a.owner, b.owner) == 0));
+}
 static double cell_read(void *ctx) {
-  cell_ctx *cell = ctx;
+  cell_binding *cell = ctx;
   return qa_shared_inventory_table_count(cell->game->host->inventory, cell->actor.id, "q2:monster-power");
 }
 static void cell_write(void *ctx, double count) {
-  cell_ctx *cell = ctx;
+  cell_binding *cell = ctx;
   qa_inventory_entry entry;
   memset(&entry, 0, sizeof entry);
   entry.item = "q2:monster-power";
@@ -43,25 +46,40 @@ static void cell_write(void *ctx, double count) {
   entry.capacity = cell->capacity;
   qa_shared_inventory_table_configure(cell->game->host->inventory, cell->actor, entry, NULL, NULL);
 }
+/* TS: bindPowerArmorCells, then bindings.add: a bind that raises records nothing. */
+static void unbind_record(void *arg) { ((cell_binding *)arg)->retired = true; }
 
 void qa_q2mpm_restore_monster_power_armor(qa_q2m_context *context) {
   qa_q2_entity *entity = context->entity;
   qa_q2_game_services *game = context->game;
-  if (binding_has(entity->actor)) return;
+  if (!retire_registered) { qa_identity_owner_on_destroy(retire_session); retire_registered = true; }
+  cell_binding *cell = NULL;
+  for (cell_binding *seen = bindings; seen; seen = seen->next) {
+    if (seen->retired) { if (!cell) cell = seen; continue; }
+    if (same_owned(seen->actor, entity->actor)) return;
+  }
   size_t count = 0;
   const qa_inventory_entry *entries = qa_shared_inventory_table_entries(game->host->inventory, entity->actor.id, &count);
   const qa_inventory_entry *found = NULL;
   for (size_t i = 0; i < count; i++)
     if (strcmp(entries[i].item, "q2:monster-power") == 0) { found = &entries[i]; break; }
   if (!found) qa_raise("Error", 0, 0, "Monster power armor is missing its shared inventory cells");
-  cell_ctx *cell = malloc(sizeof *cell);
-  if (!cell) qa_raise("Error", 0, 0, "Out of memory binding monster power armor cells");
+  if (!cell) {
+    cell = malloc(sizeof *cell);
+    if (!cell) qa_raise("Error", 0, 0, "Out of memory binding monster power armor cells");
+    cell->retired = true;
+    cell->next = bindings;
+    bindings = cell;
+  }
   cell->game = game;
   cell->actor = entity->actor;
   cell->capacity = found->capacity;
+  cell->retired = false;
   qa_power_armor_cell_binding binding = {cell, cell_read, cell_write};
+  qa_cleanup node;
+  qa_cleanup_push(&node, unbind_record, cell);
   qa_gameplay_authority_bind_power_armor_cells(game->host->combat, entity->actor, binding);
-  binding_add(entity->actor);
+  qa_cleanup_pop(&node);
 }
 
 void qa_q2mpm_monster_power_armor(qa_q2m_context *context, const char *kind, double cells) {

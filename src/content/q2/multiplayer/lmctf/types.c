@@ -157,10 +157,9 @@ const char *qa_lmctf_name(qa_lmctf_context *context, qa_actor_id actor) {
 }
 
 void qa_lmctf_print(qa_q2_game_services *game, const qa_actor_id *actor, const char *format, ...) {
-  char text[2048];
   va_list args;
   va_start(args, format);
-  vsnprintf(text, sizeof text, format, args);
+  char *text = qa_q2mp_vformat(format, args); /* TS prints the whole text: names and maps have no length limit */
   va_end(args);
   qa_q2_presentation_event event = {0};
   event.kind = "print";
@@ -168,7 +167,11 @@ void qa_lmctf_print(qa_q2_game_services *game, const qa_actor_id *actor, const c
   if (actor != NULL) event.actor = *actor;
   event.level = "high";
   event.text = text;
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, free, text);
   game->host->emit(game->host->ctx, event);
+  qa_cleanup_pop(&cleanup);
+  free(text);
 }
 
 void qa_lmctf_stat(qa_lmctf_context *context, qa_actor_id actor, const char *name, double amount) {

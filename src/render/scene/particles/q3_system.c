@@ -783,7 +783,7 @@ static double distance_to(qa_particle_system *s, qa_vec3 origin,
                           const qa_vec3 *view_origin) {
   if (view_origin != NULL) return qa_length3(qa_sub3(*view_origin, origin));
   if (s->state.snap_origin == NULL)
-    qa_range_error("particle distance culling requires the current cgame snapshot");
+    qa_raise("Error", 0, 0, "particle distance culling requires the current cgame snapshot");
   return qa_length3(qa_sub3(*s->state.snap_origin, origin));
 }
 
@@ -1005,10 +1005,10 @@ static void add_to_scene(qa_particle_system *s, particle *p, qa_vec3 origin,
     }
     case PT_NONE: case PT_ROTATE: case PT_BAT: case PT_FLAT_SCALE_UP_FADE:
       if (p->shader == NULL) return;
-      qa_range_error("source particle type %d has no initialized polygon geometry", p->type);
+      qa_raise("Error", 0, 0, "source particle type %d has no initialized polygon geometry", p->type);
     default:
       if (p->shader == NULL) return;
-      qa_range_error("source particle type %d has no initialized polygon geometry", p->type);
+      qa_raise("Error", 0, 0, "source particle type %d has no initialized polygon geometry", p->type);
   }
   if (p->shader != NULL) push_poly(output, p->shader, vertices, vertex_count);
 }

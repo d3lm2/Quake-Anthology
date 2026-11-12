@@ -48,6 +48,9 @@ void qa_scene_group_destroy(qa_scene_group *group);
 qa_scene_group qa_compiled_draw_group(const qa_compiled_material *material, const qa_draw_batch *batches, size_t count);
 qa_scene_group qa_source_draw_group(qa_registered_scene_material material, qa_source_surface_order source, const qa_draw_batch *batches, size_t count);
 qa_scene_group qa_sequence_draw_group(qa_sequence_phase phase, const qa_draw_batch *batches, size_t count);
+/* TS shadowVolumeGroup: a group whose one operation is the given "shadow-volume" (copied; its
+ * positions and indices stay borrowed). source NULL is TS undefined (compiled order). */
+qa_scene_group qa_shadow_volume_group(qa_registered_scene_material material, const qa_source_surface_order *source, qa_render_operation operation);
 /* Batches borrowed (group ops). Array malloc'd, caller frees array. */
 const qa_draw_batch **qa_scene_model_batches(const qa_scene_group *groups, size_t count, size_t *out_count);
 typedef struct qa_finished_operations { qa_render_operation *operations; size_t count; } qa_finished_operations;

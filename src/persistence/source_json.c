@@ -9,6 +9,7 @@
 
 #include "qa/persistence/value.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
 
 static char *dup_range(const char *text, size_t length) {
   char *out = (char *)malloc(length + 1);
@@ -152,17 +153,12 @@ const char *qa_save_number_bigint_text(const qa_save_json *number) {
   size_t i = 0;
   if (text[i] == '-') i++;
   bool digits = false;
+  /* JavaScriptCore's BigInt(string) failure: a catchable SyntaxError (save input must not abort). */
   for (; text[i] != '\0'; i++) {
-    if (text[i] < '0' || text[i] > '9') {
-      fprintf(stderr, "SyntaxError: Cannot convert %s to a BigInt\n", text);
-      abort();
-    }
+    if (text[i] < '0' || text[i] > '9') qa_raise("SyntaxError", 0, 0, "Failed to parse String to BigInt");
     digits = true;
   }
-  if (!digits) {
-    fprintf(stderr, "SyntaxError: Cannot convert %s to a BigInt\n", text);
-    abort();
-  }
+  if (!digits) qa_raise("SyntaxError", 0, 0, "Failed to parse String to BigInt");
   return text;
 }
 uint64_t qa_save_number_bigint_u64(const qa_save_json *number) {
@@ -179,11 +175,14 @@ static noreturn void source_fail(const source_parser *p, const char *message) {
   (void)snprintf(path, sizeof path, "json:%zu", p->offset);
   qa_save_format_error(path, "%s", message);
 }
-static bool is_js_space(unsigned char c) {
-  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
-}
+/* TS whitespace(): JS \s, so also VT, FF and the Unicode spaces (U+00A0, U+FEFF, U+2028, ...) of
+ * the UTF-8 text. */
 static void source_ws(source_parser *p) {
-  while (p->offset < p->length && is_js_space((unsigned char)p->text[p->offset])) p->offset++;
+  while (p->offset < p->length) {
+    size_t space = qa_js_white_space_length(p->text + p->offset);
+    if (space == 0 || p->offset + space > p->length) break;
+    p->offset += space;
+  }
 }
 static char char_at(const source_parser *p, size_t offset) {
   return offset < p->length ? p->text[offset] : '\0';
@@ -208,78 +207,6 @@ static bool text_add(text_buffer *b, const char *text, size_t length) {
   return true;
 }
 static bool text_add_char(text_buffer *b, char c) { return text_add(b, &c, 1); }
-static bool encode_utf8(text_buffer *out, uint32_t cp) {
-  char buf[4]; size_t n;
-  if (cp < 0x80) { buf[0] = (char)cp; n = 1; }
-  else if (cp < 0x800) { buf[0] = (char)(0xc0 | (cp >> 6)); buf[1] = (char)(0x80 | (cp & 0x3f)); n = 2; }
-  else if (cp < 0x10000) { buf[0] = (char)(0xe0 | (cp >> 12)); buf[1] = (char)(0x80 | ((cp >> 6) & 0x3f)); buf[2] = (char)(0x80 | (cp & 0x3f)); n = 3; }
-  else { buf[0] = (char)(0xf0 | (cp >> 18)); buf[1] = (char)(0x80 | ((cp >> 12) & 0x3f)); buf[2] = (char)(0x80 | ((cp >> 6) & 0x3f)); buf[3] = (char)(0x80 | (cp & 0x3f)); n = 4; }
-  return text_add(out, buf, n);
-}
-static int hex_value(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-/* Decodes a raw JSON string token (including quotes), mirroring the
- * TS JSON.parse slice. Returns NULL on OOM or invalid string. */
-static char *decode_json_token(const char *token, size_t length) {
-  text_buffer out = {NULL, 0, 0};
-  size_t i = 1;
-  while (i + 1 < length) {
-    unsigned char c = (unsigned char)token[i++];
-    if (c < 0x20) { free(out.data); return NULL; }
-    if (c == '\\') {
-      if (i >= length) { free(out.data); return NULL; }
-      char e = token[i++];
-      bool ok = true;
-      switch (e) {
-        case '"': ok = text_add_char(&out, '"'); break;
-        case '\\': ok = text_add_char(&out, '\\'); break;
-        case '/': ok = text_add_char(&out, '/'); break;
-        case 'b': ok = text_add_char(&out, '\b'); break;
-        case 'f': ok = text_add_char(&out, '\f'); break;
-        case 'n': ok = text_add_char(&out, '\n'); break;
-        case 'r': ok = text_add_char(&out, '\r'); break;
-        case 't': ok = text_add_char(&out, '\t'); break;
-        case 'u': {
-          if (i + 4 > length) { free(out.data); return NULL; }
-          uint32_t cp = 0;
-          for (int k = 0; k < 4; k++) {
-            int d = hex_value(token[i++]);
-            if (d < 0) { free(out.data); return NULL; }
-            cp = (cp << 4) | (uint32_t)d;
-          }
-          if (cp >= 0xd800 && cp <= 0xdbff && i + 6 <= length &&
-              token[i] == '\\' && token[i + 1] == 'u') {
-            uint32_t lo = 0;
-            bool valid = true;
-            for (int k = 0; k < 4; k++) {
-              int d = hex_value(token[i + 2 + (size_t)k]);
-              if (d < 0) { valid = false; break; }
-              lo = (lo << 4) | (uint32_t)d;
-            }
-            if (valid && lo >= 0xdc00 && lo <= 0xdfff) {
-              cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
-              i += 6;
-            }
-          }
-          ok = encode_utf8(&out, cp);
-          break;
-        }
-        default: free(out.data); return NULL;
-      }
-      if (!ok) { free(out.data); return NULL; }
-    } else if (!text_add_char(&out, (char)c)) {
-      free(out.data);
-      return NULL;
-    }
-  }
-  if (out.data == NULL) return dup_text("");
-  return out.data;
-}
-
 static char *source_string(source_parser *p) {
   if (char_at(p, p->offset) != '"') source_fail(p, "expected a string");
   size_t start = p->offset++;
@@ -292,7 +219,13 @@ static char *source_string(source_parser *p) {
     if (character == '"') break;
     if (character == '\0') source_fail(p, "unterminated string");
   }
-  char *decoded = decode_json_token(p->text + start, p->offset - start);
+  /* TS JSON.parse(text.slice(start, offset)): an invalid escape or a raw control character is
+   * JSON.parse's SyntaxError (JavaScriptCore's text), which TS does not catch. */
+  qa_save_value *parsed = qa_parse_json_value((const uint8_t *)p->text + start, p->offset - start, false);
+  if (parsed == NULL) qa_range_error("Out of memory");
+  char *decoded = parsed->kind == QA_SAVE_STRING ? parsed->text : NULL;
+  if (decoded != NULL) parsed->text = NULL;
+  qa_save_value_free(parsed);
   if (decoded == NULL) source_fail(p, "invalid string");
   return decoded;
 }

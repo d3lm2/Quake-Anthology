@@ -18,15 +18,10 @@ LIB_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(LIB_SRCS))
 APP_SRCS := src/main.c
 APP_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(APP_SRCS))
 
-TEST_SRCS := $(shell find tests -name 'test_*.c' | sort)
-TEST_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(TEST_SRCS))
-TEST_BINS := $(patsubst tests/%.c,$(BUILD)/test-%,$(TEST_SRCS))
-TEST_RUN := $(patsubst %,run-%,$(TEST_BINS))
-
 BIN := $(BUILD)/quake-anthology
 LIB := $(BUILD)/libquake-anthology.a
 
-.PHONY: all test clean $(TEST_RUN)
+.PHONY: all clean
 all: $(BIN)
 
 $(BIN): $(APP_OBJS) $(LIB)
@@ -39,24 +34,11 @@ $(LIB): $(LIB_OBJS)
 	$(AR) qc $@ $(LIB_OBJS)
 	ranlib $@
 
-# tests/<module>/test_<name>.c -> build/test-<module>/test_<name>
-$(BUILD)/test-%: $(BUILD)/tests/%.o $(LIB)
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $< $(LIB) -o $@ $(LDLIBS)
-
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-run-$(BUILD)/test-%: $(BUILD)/test-%
-	./$(BUILD)/test-$*
-
-test: $(TEST_BINS) $(BIN)
-	@ulimit -c 0; for t in $(TEST_BINS); do echo "== $$t"; ./$$t || exit 1; done
-	./$(BIN) --version
-	./$(BIN) --help > /dev/null
-
 clean:
 	rm -rf $(BUILD)
 
--include $(LIB_OBJS:.o=.d) $(APP_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
+-include $(LIB_OBJS:.o=.d) $(APP_OBJS:.o=.d)

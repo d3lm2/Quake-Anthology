@@ -2,6 +2,7 @@
  * GPL-2.0-or-later. */
 #include "qa/network/common/js_number.h"
 #include "qa/app/bootstrap/network/qw_server.h"
+#include "qa/foundation/caught_message.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +65,10 @@ struct peer {
   double message_level;
   double loss_percent;
   ping_frame ping_frames[64];
+  /* TS pingFrames Map insertion order (a key keeps its first position): peerPing sums in it. */
+  uint8_t ping_order[64]; size_t ping_order_count;
+  /* TS compares peer.player by identity; changeWorld replaces it (carriedPlayer). */
+  double player_serial;
   qa_source_chat_flood chat_flood;
   struct peer_network *network; /* NULL until networkInfo is published */
 };
@@ -232,7 +237,7 @@ static void farewell_body(void *ctx) {
 }
 static bool disconnect_client(qa_app_qw_server_network *n, qa_client_id client, const char *reason) {
   peer *p = NULL;
-  for (size_t i = 0; i < n->peer_count; i++)
+  for (size_t i = 0; i < n->peer_count && !p; i++) /* TS find(): the first match */
     if (client_equal(n->peers[i]->player.client, client)) p = n->peers[i];
   if (!p) return false;
   /* The farewell is best effort: an exhausted or overflowing channel must not stop the peer from being removed. */
@@ -274,11 +279,13 @@ static void client_print(qa_app_qw_server_network *n, peer *p, double level, con
 static double peer_ping(peer *p) {
   double sum = 0;
   size_t count = 0;
-  for (size_t i = 0; i < 64; i++)
-    if (p->ping_frames[i].ping > 0) {
-      sum += p->ping_frames[i].ping;
+  for (size_t k = 0; k < p->ping_order_count; k++) {
+    const ping_frame *frame = &p->ping_frames[p->ping_order[k]];
+    if (frame->ping > 0) {
+      sum += frame->ping;
       count++;
     }
+  }
   return count == 0 ? 9999 : trunc(sum / (double)count);
 }
 static const char *info_value(qa_app_qw_server_network *n, qa_app_qw_player player,
@@ -353,8 +360,14 @@ static bool client_command(qa_app_qw_server_network *n, peer *p, const char *nam
     return true;
   }
   if (strcmp(name, "pings") == 0) {
-    for (size_t i = 0; i < n->peer_count; i++) {
-      peer *other = n->peers[i];
+    /* TS [...this.peers]: a snapshot. */
+    size_t other_count = n->peer_count;
+    peer **others = xmalloc(other_count * sizeof *others);
+    if (other_count) memcpy(others, n->peers, other_count * sizeof *others);
+    qa_cleanup others_guard;
+    qa_cleanup_push(&others_guard, free, others);
+    for (size_t i = 0; i < other_count; i++) {
+      peer *other = others[i];
       if (!other->active) continue;
       qa_quakeworld_message ping = {0};
       ping.kind = "ping";
@@ -367,6 +380,8 @@ static bool client_command(qa_app_qw_server_network *n, peer *p, const char *nam
       loss.value = other->loss_percent;
       deliver(n, p, &loss);
     }
+    qa_cleanup_pop(&others_guard);
+    free(others);
     return true;
   }
   if (strcmp(name, "kill") == 0 && !p->active) {
@@ -417,8 +432,15 @@ static bool client_command(qa_app_qw_server_network *n, peer *p, const char *nam
   qa_cleanup message_guard;
   qa_cleanup_push(&message_guard, free, message);
   n->host.print(n->host.ctx, message);
-  for (size_t i = 0; i < n->peer_count; i++) {
-    peer *recipient = n->peers[i];
+  /* TS iterates [...this.peers]: a recipient dropped by a failed delivery does not shift the
+   * rest (removed peers stay allocated until reaped). */
+  size_t recipient_count = n->peer_count;
+  peer **recipients = xmalloc(recipient_count * sizeof *recipients);
+  if (recipient_count) memcpy(recipients, n->peers, recipient_count * sizeof *recipients);
+  qa_cleanup recipients_guard;
+  qa_cleanup_push(&recipients_guard, free, recipients);
+  for (size_t i = 0; i < recipient_count; i++) {
+    peer *recipient = recipients[i];
     if (!recipient->active) continue;
     if (team) {
       const char *value = info_value(n, recipient->player, "team");
@@ -426,6 +448,8 @@ static bool client_command(qa_app_qw_server_network *n, peer *p, const char *nam
     }
     client_print(n, recipient, 3, message);
   }
+  qa_cleanup_pop(&recipients_guard);
+  free(recipients);
   qa_cleanup_pop(&message_guard);
   free(message);
   return true;
@@ -462,9 +486,11 @@ static uint8_t **signon_spawn(void *ctx, double start, size_t **lens, size_t *ou
 static void signon_begin(void *ctx) {
   signon_ctx *signon = ctx;
   signon->source->begin(signon->source->ctx);
-  for (size_t i = 0; i < signon->n->peer_count; i++)
-    if (client_equal(signon->n->peers[i]->player.client, signon->player.client))
+  for (size_t i = 0; i < signon->n->peer_count; i++) /* TS find(): the first match */
+    if (client_equal(signon->n->peers[i]->player.client, signon->player.client)) {
       signon->n->peers[i]->active = true;
+      break;
+    }
 }
 static void signon_disconnect(void *ctx, const char *reason) {
   signon_ctx *signon = ctx;
@@ -592,7 +618,7 @@ static void admit_body(void *ctx) {
   qa_cleanup peer_guard;
   qa_cleanup_push(&peer_guard, free_partial_peer, p);
   if (!qa_quakeworld_channel_init(&p->channel, false, request->qport, 1450,
-          rate ? rate_of(rate) : 2500)) qa_range_error("out of memory");
+          rate && rate[0] ? rate_of(rate) : 2500)) qa_range_error("out of memory"); /* "" is falsy */
   qa_cleanup_pop(&peer_guard);
   qa_quakeworld_command_replay_init(&p->replay);
   qa_movement_budget_init(&p->budget, 1800, 1.8);
@@ -641,7 +667,7 @@ static qa_qw_host_result conn_connect(void *ctx, const qa_qw_connect_request *re
     return result;
   }
   peer *existing = NULL;
-  for (size_t i = 0; i < n->peer_count; i++)
+  for (size_t i = 0; i < n->peer_count && !existing; i++) /* TS find(): the first match */
     if (qa_net_same_address(&n->peers[i]->remote, &request->from, false)
         && n->peers[i]->channel.qport == request->qport) existing = n->peers[i];
   if (existing) {
@@ -681,9 +707,11 @@ static qa_qw_host_result conn_connect(void *ctx, const qa_qw_connect_request *re
 static void refresh_connectionless(qa_app_qw_server_network *n) {
   const qa_app_qw_server_authentication *auth = authentication(n);
   const qa_app_qw_server_administration *admin = administration(n);
-  n->connectionless.host.password = auth && auth->password ? auth->password : "";
-  n->connectionless.host.spectator_password = auth && auth->spectator_password ? auth->spectator_password : "";
-  n->connectionless.host.high_characters = auth ? auth->high_characters : false;
+  const char *password = auth && auth->password ? auth->password(auth->ctx) : NULL;
+  n->connectionless.host.password = password != NULL ? password : "";
+  const char *spectator = auth && auth->spectator_password ? auth->spectator_password(auth->ctx) : NULL;
+  n->connectionless.host.spectator_password = spectator != NULL ? spectator : "";
+  n->connectionless.host.high_characters = auth && auth->high_characters ? auth->high_characters(auth->ctx) : false;
   const char *rcon = admin && admin->rcon_password ? admin->rcon_password(admin->ctx) : NULL;
   n->connectionless.host.rcon_password = rcon != NULL ? rcon : "";
 }
@@ -771,15 +799,37 @@ bool qa_app_qw_server_network_disconnect_client(qa_app_qw_server_network *n,
     qa_client_id client, const char *reason) {
   return disconnect_client(n, client, reason);
 }
+typedef struct carried_bindings {
+  qa_app_qw_player *players; binding_result *bindings; size_t count;
+} carried_bindings;
+static void carried_bindings_free(void *arg) {
+  carried_bindings *carried = arg;
+  for (size_t i = 0; i < carried->count; i++) {
+    qa_quakeworld_signon_server_free(carried->bindings[i].signon);
+    free(carried->bindings[i].ctx);
+    free(carried->bindings[i].baselines);
+    free(carried->bindings[i].baseline_states);
+  }
+  free(carried->players);
+  free(carried->bindings);
+}
 void qa_app_qw_server_network_change_world(qa_app_qw_server_network *n,
     qa_app_qw_server_host host) {
   validate_host(&host);
-  qa_app_qw_player *players = xmalloc(n->peer_count * sizeof *players);
-  binding_result *bindings = xmalloc(n->peer_count * sizeof *bindings);
+  /* A raise part way (a carried player the new source cannot sign on) releases the bindings
+   * made so far; the peers keep their old ones, as TS assigns nothing before the map completes. */
+  carried_bindings carried = {xmalloc(n->peer_count * sizeof *carried.players),
+      xmalloc(n->peer_count * sizeof *carried.bindings), 0};
+  qa_cleanup carried_guard;
+  qa_cleanup_push(&carried_guard, carried_bindings_free, &carried);
+  qa_app_qw_player *players = carried.players;
+  binding_result *bindings = carried.bindings;
   for (size_t i = 0; i < n->peer_count; i++) {
     players[i] = host.carried_player(host.ctx, n->peers[i]->player.client);
     bindings[i] = bind_player(n, players[i], &host);
+    carried.count = i + 1;
   }
+  qa_cleanup_pop(&carried_guard);
   n->host = host;
   refresh_connectionless(n);
   for (size_t i = 0; i < n->peer_count; i++) {
@@ -789,6 +839,7 @@ void qa_app_qw_server_network_change_world(qa_app_qw_server_network *n,
     free(p->baselines);
     free(p->baseline_states);
     p->player = players[i];
+    p->player_serial++;
     p->signon = bindings[i].signon;
     p->signon_ctx = bindings[i].ctx;
     p->baselines = bindings[i].baselines;
@@ -832,13 +883,13 @@ static void apply_command(void *ctx, const qa_qw_user_command *command) {
 }
 typedef struct phase_ctx {
   qa_app_qw_server_network *n; peer *p;
-  qa_app_qw_server_host host; qa_app_qw_player player;
+  qa_app_qw_server_host host; qa_app_qw_player player; double player_serial;
   char *name; char **args; size_t arg_count; const char *text; double now;
 } phase_ctx;
 static bool phase_current(phase_ctx *phase) {
   return !phase->n->ended && phase->n->host.ctx == phase->host.ctx
       && peer_present(phase->n, phase->p)
-      && client_equal(phase->p->player.client, phase->player.client);
+      && phase->p->player_serial == phase->player_serial; /* peer.player === acceptedPlayer */
 }
 static void phase_body(void *ctx) {
   phase_ctx *phase = ctx;
@@ -931,42 +982,34 @@ static void string_command(packet_scope *scope, peer *owner, const qa_quakeworld
     disconnect_client(n, owner->player.client, "Client disconnected");
     return;
   }
+  qa_download_source *prepared = NULL;
+  bool has_prepared = false;
   if (name && strcmp(name, "download") == 0 && n->host.prepare_download) {
-    /* TS runs the open as a detached task, one outstanding per client; C opens synchronously,
-     * so the request finishes before the next datagram and `preparing` only brackets it. */
+    /* TS awaits prepareDownload inside the poll; C opens synchronously, so the request
+     * finishes before the next datagram and `preparing` only brackets it. */
     if (owner->preparing) return;
     owner->preparing = true;
     qa_app_qw_server_host accepted_host = n->host;
     qa_quakeworld_signon_server *accepted_signon = owner->signon;
-    qa_app_qw_player accepted_player = owner->player;
-    prepare_scope prepare = { &accepted_host, accepted_player, scope->arg_count > 1 ? scope->args[1] : "", NULL };
+    double accepted_serial = owner->player_serial;
+    prepare_scope prepare = { &accepted_host, owner->player, scope->arg_count > 1 ? scope->args[1] : "", NULL };
     qa_caught_error caught;
     if (!qa_try(prepare_body, &prepare, &caught)) {
       prepare.prepared = NULL;
-      char *printable = qa_printable_peer_text(caught.message, 256);
-      if (printable) accepted_host.print(accepted_host.ctx, printable);
-      free(printable);
+      /* TS this.host.print(error.message): the whole message, unfiltered. */
+      n->host.print(n->host.ctx, qa_caught_message(&caught));
     }
     owner->preparing = false;
     if (n->ended || !peer_present(n, owner) || n->host.ctx != accepted_host.ctx
-        || owner->signon != accepted_signon
-        || !client_equal(owner->player.client, accepted_player.client)) {
+        || owner->signon != accepted_signon || owner->player_serial != accepted_serial) {
       if (prepare.prepared && prepare.prepared->close) prepare.prepared->close(prepare.prepared->ctx);
       return;
     }
-    /* A throw here is an unhandled rejection of the detached TS task; C lets it reach the
-     * per-datagram catch, which drops this peer. */
-    scope->result = qa_quakeworld_signon_server_command(owner->signon, message->text, prepare.prepared, true);
-    if (scope->result.handled)
-      for (size_t j = 0; j < scope->result.count; j++) {
-        uint8_t *bytes = scope->result.messages[j];
-        scope->result.messages[j] = NULL;
-        enqueue(owner, bytes, scope->result.lens[j]);
-      }
-    return;
+    prepared = prepare.prepared;
+    has_prepared = true;
   }
-  qa_download_source *prepared = NULL;
-  bool has_prepared = false;
+  /* TS: a handled download is queued; an unhandled one goes to the command phase like any
+   * other command. */
   scope->result = qa_quakeworld_signon_server_command(owner->signon, message->text, prepared, has_prepared);
   if (scope->result.handled) {
     for (size_t j = 0; j < scope->result.count; j++) {
@@ -980,6 +1023,7 @@ static void string_command(packet_scope *scope, peer *owner, const qa_quakeworld
     phase.p = owner;
     phase.host = n->host;
     phase.player = owner->player;
+    phase.player_serial = owner->player_serial;
     phase.name = scope->args[0];
     phase.args = scope->args + 1;
     phase.arg_count = scope->arg_count - 1;
@@ -996,6 +1040,9 @@ static void packet_body(void *ctx) {
   if (packet->length >= 4 && packet->payload[0] == 255 && packet->payload[1] == 255
       && packet->payload[2] == 255 && packet->payload[3] == 255) {
     if (!qa_connectionless_gate_allow(&n->gate, &packet->from, now)) return;
+    /* TS reads the password, spectator password, high-characters and rcon getters live
+     * when the connectionless server consults them; re-read them for each packet. */
+    refresh_connectionless(n);
     scope->replies = qa_qw_connectionless_receive(&n->connectionless,
         packet->payload, packet->length, &packet->from, now, &scope->reply_lengths, &scope->reply_count);
     for (size_t i = 0; i < scope->reply_count; i++)
@@ -1026,7 +1073,9 @@ static void packet_body(void *ctx) {
   if (acknowledged->used && acknowledged->sequence == delivery->acknowledged)
     acknowledged->ping = now - acknowledged->sent;
   double next_sequence = qa_quakeworld_channel_outgoing_sequence(&owner->channel);
-  ping_frame *slot = &owner->ping_frames[(qa_js_to_int32(next_sequence) & 63)];
+  size_t slot_key = (size_t)(qa_js_to_int32(next_sequence) & 63);
+  ping_frame *slot = &owner->ping_frames[slot_key];
+  if (!slot->used) owner->ping_order[owner->ping_order_count++] = (uint8_t)slot_key;
   slot->used = true;
   slot->sequence = next_sequence;
   slot->sent = now;

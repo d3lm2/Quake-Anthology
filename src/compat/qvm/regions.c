@@ -58,12 +58,13 @@ static void run_tracked(void (*body)(void *ctx), void *ctx) {
   tracker t = {NULL, 0, 0};
   tracker *previous = active_tracker;
   active_tracker = &t;
-  char message[512];
-  bool ok = qa_range_error_catch(body, ctx, message, sizeof message);
+  /* The error leaves as thrown: TS has no catch here, only collected garbage. */
+  qa_caught_error caught;
+  bool ok = qa_try(body, ctx, &caught);
   active_tracker = previous;
   for (size_t i = 0; i < t.count; i++) free(t.blocks[i]);
   free(t.blocks);
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) qa_rethrow(&caught);
 }
 
 static const qa_qvm_instruction *at(const qa_qvm_instruction *instructions,
@@ -76,7 +77,7 @@ static int64_t qualify_region_body(const qa_qvm_instruction *instructions, size_
                                    int64_t owner, int64_t entry, int64_t join) {
   const qa_qvm_instruction *first = at(instructions, count, owner);
   if (first == NULL || first->opcode != QA_QVMY_OP_ENTER)
-    qa_range_error("QVM region owner is not a function");
+    qa_raise("Error", 0, 0, "QVM region owner is not a function");
   int64_t end = owner + 1;
   while (end < (int64_t)count) {
     const qa_qvm_instruction *ins = at(instructions, count, end);
@@ -84,7 +85,7 @@ static int64_t qualify_region_body(const qa_qvm_instruction *instructions, size_
     end++;
   }
   if (entry <= owner || join <= entry || join >= end)
-    qa_range_error("QVM region is outside its owning function");
+    qa_raise("Error", 0, 0, "QVM region is outside its owning function");
 
   /* depth map + pending stack as parallel dynamic arrays. */
   typedef struct { int64_t pc; int64_t depth; } item;
@@ -107,18 +108,18 @@ static int64_t qualify_region_body(const qa_qvm_instruction *instructions, size_
       }
     }
     if (known) {
-      if (known_depth != next.depth) qa_range_error("QVM region paths disagree on operand depth");
+      if (known_depth != next.depth) qa_raise("Error", 0, 0, "QVM region paths disagree on operand depth");
       continue;
     }
     depths = xrealloc(depths, (depth_count + 1) * sizeof *depths);
     depths[depth_count++] = next;
     if (next.pc == join) {
-      if (next.depth != 0) qa_range_error("QVM region join retains live operands");
+      if (next.depth != 0) qa_raise("Error", 0, 0, "QVM region join retains live operands");
       joined = true;
       continue;
     }
     const qa_qvm_instruction *instruction = at(instructions, count, next.pc);
-    if (instruction == NULL) qa_range_error("QVM region has no original instruction");
+    if (instruction == NULL) qa_raise("Error", 0, 0, "QVM region has no original instruction");
     int32_t opcode = instruction->opcode;
     int64_t required = 0, change = 0;
     if (opcode == QA_QVMY_OP_CONST || opcode == QA_QVMY_OP_LOCAL || opcode == QA_QVMY_OP_PUSH) change = 1;
@@ -133,25 +134,25 @@ static int64_t qualify_region_body(const qa_qvm_instruction *instructions, size_
                (opcode >= QA_QVMY_OP_SEX8 && opcode <= QA_QVMY_OP_NEGI) || opcode == QA_QVMY_OP_NEGF ||
                opcode == QA_QVMY_OP_CVIF || opcode == QA_QVMY_OP_CVFI) required = 1;
     else if (opcode != QA_QVMY_OP_IGNORE && opcode != QA_QVMY_OP_BREAK)
-      qa_range_error("QVM region contains a frame or unsupported instruction");
-    if (next.depth < required) qa_range_error("QVM region requires operands from outside its boundary");
+      qa_raise("Error", 0, 0, "QVM region contains a frame or unsupported instruction");
+    if (next.depth < required) qa_raise("Error", 0, 0, "QVM region requires operands from outside its boundary");
     int64_t result = next.depth + change;
     if (opcode == QA_QVMY_OP_JUMP) {
       const qa_qvm_instruction *target = at(instructions, count, next.pc - 1);
       if (target == NULL || target->opcode != QA_QVMY_OP_CONST)
-        qa_range_error("QVM region has an indirect jump");
+        qa_raise("Error", 0, 0, "QVM region has an indirect jump");
       if (target->operand <= next.pc || target->operand > join)
-        qa_range_error("QVM region has an escaping or backward edge");
+        qa_raise("Error", 0, 0, "QVM region has an escaping or backward edge");
       pending = xrealloc(pending, (pending_count + 1) * sizeof *pending);
       pending[pending_count++] = (item){target->operand, result};
     } else {
       if (next.pc + 1 <= next.pc || next.pc + 1 > join)
-        qa_range_error("QVM region has an escaping or backward edge");
+        qa_raise("Error", 0, 0, "QVM region has an escaping or backward edge");
       pending = xrealloc(pending, (pending_count + 1) * sizeof *pending);
       pending[pending_count++] = (item){next.pc + 1, result};
       if (opcode >= QA_QVMY_OP_EQ && opcode <= QA_QVMY_OP_GEF && instruction->operand_width == 4) {
         if (instruction->operand <= next.pc || instruction->operand > join)
-          qa_range_error("QVM region has an escaping or backward edge");
+          qa_raise("Error", 0, 0, "QVM region has an escaping or backward edge");
         pending = xrealloc(pending, (pending_count + 1) * sizeof *pending);
         pending[pending_count++] = (item){instruction->operand, result};
       }
@@ -159,7 +160,7 @@ static int64_t qualify_region_body(const qa_qvm_instruction *instructions, size_
   }
   xfree(depths);
   xfree(pending);
-  if (!joined) qa_range_error("QVM region does not reach its original join");
+  if (!joined) qa_raise("Error", 0, 0, "QVM region does not reach its original join");
   for (int64_t pc = owner + 1; pc < end; pc++) {
     if (pc >= entry && pc < join) continue;
     const qa_qvm_instruction *instruction = at(instructions, count, pc);
@@ -177,7 +178,7 @@ static int64_t qualify_region_body(const qa_qvm_instruction *instructions, size_
       }
     }
     if (has_destination && destination > entry && destination < join)
-      qa_range_error("QVM region has an incoming interior edge");
+      qa_raise("Error", 0, 0, "QVM region has an incoming interior edge");
   }
   return first->operand;
 }
@@ -268,14 +269,14 @@ static int64_t qualify_evaluation_body(const qa_qvm_instruction *instructions, s
   for (size_t i = 0; i < region->input_count; i++) {
     int64_t offset = region->inputs[i];
     if (offset < 8 || offset % 4 != 0 || offset + 4 > frame)
-      qa_range_error("QVM region live-in or result is outside its source frame");
+      qa_raise("Error", 0, 0, "QVM region live-in or result is outside its source frame");
     for (size_t j = i + 1; j < region->input_count; j++)
       if (region->inputs[j] == offset)
-        qa_range_error("QVM region live-in or result is outside its source frame");
+        qa_raise("Error", 0, 0, "QVM region live-in or result is outside its source frame");
   }
   if (region->has_result &&
       (region->result < 8 || region->result % 4 != 0 || region->result + 4 > frame))
-    qa_range_error("QVM region live-in or result is outside its source frame");
+    qa_raise("Error", 0, 0, "QVM region live-in or result is outside its source frame");
 
   pending_paths pending = {NULL, 0};
   int64_t *initial = copy_set(region->inputs, region->input_count);
@@ -289,14 +290,14 @@ static int64_t qualify_evaluation_body(const qa_qvm_instruction *instructions, s
     int64_t pc = current.pc;
     if (pc == region->join) {
       if (region->has_result && !set_has(current.initialized, current.initialized_count, region->result)) {
-        qa_range_error("QVM region result is not initialized on every source path");
+        qa_raise("Error", 0, 0, "QVM region result is not initialized on every source path");
       }
       xfree(current.stack);
       xfree(current.initialized);
       continue;
     }
     const qa_qvm_instruction *instruction = at(instructions, count, pc);
-    if (instruction == NULL) qa_range_error("Missing QVM region instruction");
+    if (instruction == NULL) qa_raise("Error", 0, 0, "Missing QVM region instruction");
     operand *stack = current.stack;
     size_t stack_count = current.stack_count;
     int64_t *initialized = current.initialized;
@@ -304,11 +305,11 @@ static int64_t qualify_evaluation_body(const qa_qvm_instruction *instructions, s
     int32_t opcode = instruction->opcode;
     if (read_only && (opcode == QA_QVMY_OP_CALL || opcode == QA_QVMY_OP_ARG ||
                       opcode == QA_QVMY_OP_BLOCK_COPY || opcode == QA_QVMY_OP_BREAK))
-      qa_range_error("Read-only QVM region cannot call, publish arguments, copy memory or break");
+      qa_raise("Error", 0, 0, "Read-only QVM region cannot call, publish arguments, copy memory or break");
     bool jumped = false;
     if (opcode == QA_QVMY_OP_LOCAL) {
       if (instruction->operand < 8 || instruction->operand % 4 != 0 || instruction->operand + 4 > frame + 48)
-        qa_range_error("QVM region local address exceeds its source frame and arguments");
+        qa_raise("Error", 0, 0, "QVM region local address exceeds its source frame and arguments");
       stack = xrealloc(stack, (stack_count + 1) * sizeof *stack);
       stack[stack_count++] = (operand){OPERAND_LOCAL, instruction->operand};
     } else if (opcode == QA_QVMY_OP_CONST) {
@@ -318,49 +319,49 @@ static int64_t qualify_evaluation_body(const qa_qvm_instruction *instructions, s
       stack = xrealloc(stack, (stack_count + 1) * sizeof *stack);
       stack[stack_count++] = (operand){OPERAND_UNKNOWN, 0};
     } else if (opcode == QA_QVMY_OP_POP || opcode == QA_QVMY_OP_ARG) {
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       stack_count--;
       if (opcode == QA_QVMY_OP_ARG) set_add(&initialized, &initialized_count, instruction->operand);
     } else if (opcode >= QA_QVMY_OP_LOAD1 && opcode <= QA_QVMY_OP_LOAD4) {
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       operand address = stack[--stack_count];
       if (address.kind == OPERAND_LOCAL_DERIVED)
-        qa_range_error("QVM region reads an unresolved source local address");
+        qa_raise("Error", 0, 0, "QVM region reads an unresolved source local address");
       if (address.kind == OPERAND_LOCAL && address.value < frame &&
           !set_has(initialized, initialized_count, address.value))
-        qa_range_error("QVM region reads undeclared source local %lld", (long long)address.value);
+        qa_raise("Error", 0, 0, "QVM region reads undeclared source local %lld", (long long)address.value);
       stack = xrealloc(stack, (stack_count + 1) * sizeof *stack);
       stack[stack_count++] = (operand){OPERAND_UNKNOWN, 0};
     } else if (opcode >= QA_QVMY_OP_STORE1 && opcode <= QA_QVMY_OP_STORE4) {
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       operand value = stack[--stack_count];
-      if (is_local(value)) qa_range_error("QVM region stores an escaping source local pointer");
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (is_local(value)) qa_raise("Error", 0, 0, "QVM region stores an escaping source local pointer");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       operand address = stack[--stack_count];
       if (read_only && (address.kind != OPERAND_LOCAL || address.value < 8 || address.value + 4 > frame))
-        qa_range_error("Read-only QVM region cannot write outside its own local frame");
+        qa_raise("Error", 0, 0, "Read-only QVM region cannot write outside its own local frame");
       if (address.kind == OPERAND_LOCAL && opcode == QA_QVMY_OP_STORE4)
         set_add(&initialized, &initialized_count, address.value);
     } else if (opcode == QA_QVMY_OP_BLOCK_COPY) {
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       operand source = stack[--stack_count];
       if (source.kind == OPERAND_LOCAL_DERIVED)
-        qa_range_error("QVM region copies an unresolved source local address");
+        qa_raise("Error", 0, 0, "QVM region copies an unresolved source local address");
       if (source.kind == OPERAND_LOCAL) {
         for (int64_t offset = 0; offset < instruction->operand; offset += 4)
           if (!set_has(initialized, initialized_count, source.value + offset))
-            qa_range_error("QVM region copies an undeclared source local");
+            qa_raise("Error", 0, 0, "QVM region copies an undeclared source local");
       }
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       operand address = stack[--stack_count];
       if (address.kind == OPERAND_LOCAL) {
         for (int64_t offset = 0; offset + 4 <= instruction->operand; offset += 4)
           set_add(&initialized, &initialized_count, address.value + offset);
       }
     } else if (opcode == QA_QVMY_OP_JUMP) {
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       operand destination = stack[--stack_count];
-      if (destination.kind != OPERAND_CONSTANT) qa_range_error("QVM region jump lost its source target");
+      if (destination.kind != OPERAND_CONSTANT) qa_raise("Error", 0, 0, "QVM region jump lost its source target");
       pending_paths * pending3 = &pending;
       int64_t pc3 = destination.value;
       operand * stack3 = copy_stack(stack, stack_count);
@@ -370,7 +371,7 @@ static int64_t qualify_evaluation_body(const qa_qvm_instruction *instructions, s
                initialized3, initialized_count);
       jumped = true;
     } else if (opcode >= QA_QVMY_OP_EQ && opcode <= QA_QVMY_OP_GEF && instruction->operand_width == 4) {
-      if (stack_count < 2) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count < 2) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       stack_count -= 2;
       pending_paths * pending2 = &pending;
       int64_t pc2 = instruction->operand;
@@ -380,12 +381,12 @@ static int64_t qualify_evaluation_body(const qa_qvm_instruction *instructions, s
       path_add(pending2, pc2, stack2, stack_count2,
                initialized2, initialized_count);
     } else if (opcode == QA_QVMY_OP_CALL) {
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       stack[--stack_count] = (operand){OPERAND_UNKNOWN, 0};
       stack_count++;
     } else if (((opcode >= QA_QVMY_OP_ADD && opcode <= QA_QVMY_OP_RSHU && opcode != QA_QVMY_OP_BCOM) ||
                 (opcode >= QA_QVMY_OP_ADDF && opcode <= QA_QVMY_OP_MULF))) {
-      if (stack_count < 2) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count < 2) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       operand right = stack[--stack_count];
       operand left = stack[--stack_count];
       operand merged;
@@ -399,7 +400,7 @@ static int64_t qualify_evaluation_body(const qa_qvm_instruction *instructions, s
       stack = xrealloc(stack, (stack_count + 1) * sizeof *stack);
       stack[stack_count++] = merged;
     } else if (opcode != QA_QVMY_OP_IGNORE && opcode != QA_QVMY_OP_BREAK) {
-      if (stack_count == 0) qa_range_error("Invalid QVM region operand proof");
+      if (stack_count == 0) qa_raise("Error", 0, 0, "Invalid QVM region operand proof");
       operand value = stack[--stack_count];
       stack = xrealloc(stack, (stack_count + 1) * sizeof *stack);
       stack[stack_count++] = is_local(value) ? (operand){OPERAND_LOCAL_DERIVED, 0}

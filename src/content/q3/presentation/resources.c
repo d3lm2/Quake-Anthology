@@ -121,6 +121,8 @@ void qa_q3_pres_q3_renderer_resources_destroy(resources_t *resources) {
   free(resources);
 }
 
+/* TS try/finally around each host load: a throw still ends the pending operation. */
+static void end_operation(void *arg) { ((resources_t *)arg)->operations--; }
 bool qa_q3_pres_q3_renderer_resources_register_model(resources_t *resources, const char *path,
     qa_q3_pres_scene_model *out) {
   if (path == NULL || path[0] == '\0') {
@@ -134,8 +136,11 @@ bool qa_q3_pres_q3_renderer_resources_register_model(resources_t *resources, con
     }
   }
   resources->operations++;
+  qa_cleanup operations_node;
+  qa_cleanup_push(&operations_node, end_operation, resources);
   qa_q3_pres_scene_model model;
   bool ok = resources->host.model(resources->host.ctx, path, &model);
+  qa_cleanup_pop(&operations_node);
   resources->operations--;
   if (!ok) return false;
   size_t model_index = 0;
@@ -173,8 +178,11 @@ bool qa_q3_pres_q3_renderer_resources_register_skin(resources_t *resources, cons
     }
   }
   resources->operations++;
+  qa_cleanup operations_node;
+  qa_cleanup_push(&operations_node, end_operation, resources);
   const qa_q3_pres_scene_skin *skin = NULL;
   bool ok = resources->host.skin(resources->host.ctx, path, &skin);
+  qa_cleanup_pop(&operations_node);
   resources->operations--;
   if (!ok) return false;
   if (skin != NULL || resources->failed_skins++ < MAX_FAILED_LOOKUPS) {
@@ -241,8 +249,13 @@ static bool register_shader_impl(resources_t *resources, const char *path, bool 
     return true;
   }
   resources->operations++;
+  qa_cleanup operations_node, key_node;
+  qa_cleanup_push(&operations_node, end_operation, resources);
+  qa_cleanup_push(&key_node, free, key);
   const qa_material_picture *picture = NULL;
   bool ok = resources->host.shader(resources->host.ctx, path, mip, &picture);
+  qa_cleanup_pop(&key_node);
+  qa_cleanup_pop(&operations_node);
   resources->operations--;
   if (!ok) { free(key); return false; }
   if (picture == NULL) {
@@ -307,7 +320,7 @@ static picture_entry *picture_entry_for_shader(resources_t *resources, const qa_
   picture_entry *entry = picture_for_key(resources, key);
   free(key);
   if (entry == NULL) {
-    qa_range_error("Cgame shader is not registered in this resource owner: %s", shader->name);
+    qa_raise("Error", 0, 0, "Cgame shader is not registered in this resource owner: %s", shader->name);
   }
   return entry;
 }
@@ -321,7 +334,7 @@ double qa_q3_pres_q3_renderer_resources_model_handle(resources_t *resources,
   for (size_t i = 0; i < resources->model_count; i++) {
     if (model_same(&resources->models[i], model)) return (double)i;
   }
-  qa_range_error("Cgame model belongs to another resource owner");
+  qa_raise("Error", 0, 0, "Cgame model belongs to another resource owner");
 }
 static void handle_error(const char *kind, double handle) {
   if (handle == trunc(handle) && fabs(handle) < 1e21) {
@@ -353,7 +366,7 @@ double qa_q3_pres_q3_renderer_resources_skin_handle(resources_t *resources, cons
   for (size_t i = 0; i < resources->skin_handle_count; i++) {
     if (resources->skin_handles[i] == skin) return (double)i;
   }
-  qa_range_error("Cgame skin belongs to another resource owner");
+  qa_raise("Error", 0, 0, "Cgame skin belongs to another resource owner");
 }
 const qa_q3_pres_scene_skin *qa_q3_pres_q3_renderer_resources_skin_for_handle(resources_t *resources,
     double handle) {
@@ -465,7 +478,7 @@ bool qa_q3_pres_q3_renderer_resources_registered_models(resources_t *resources,
     }
     if (path == NULL) {
       free(rows);
-      qa_range_error("Registered cgame model has no source name");
+      qa_raise("Error", 0, 0, "Registered cgame model has no source name");
     }
     rows[count].path = path;
     rows[count].handle = (double)handle;
@@ -497,7 +510,7 @@ bool qa_q3_pres_q3_renderer_resources_registered_skins(resources_t *resources,
     }
     if (path == NULL) {
       free(rows);
-      qa_range_error("Registered cgame skin has no source name");
+      qa_raise("Error", 0, 0, "Registered cgame skin has no source name");
     }
     rows[count].path = path;
     rows[count].handle = (double)handle;
@@ -531,7 +544,7 @@ static bool save_push(qa_save_value *array, qa_save_value *child) {
 
 qa_save_value *qa_q3_pres_q3_renderer_resources_capture_checkpoint(resources_t *resources) {
   if (resources->handles != QA_Q3_PRES_HANDLES_CLIENT || resources->operations != 0) {
-    qa_range_error("Resource checkpoint requires an idle client handle owner");
+    qa_raise("Error", 0, 0, "Resource checkpoint requires an idle client handle owner");
   }
   qa_save_value *root = qa_save_value_object();
   if (root == NULL) return NULL;
@@ -626,11 +639,46 @@ oom:
 static bool reader_field(const qa_save_reader *reader, const char *name, qa_save_reader *out) {
   return qa_save_reader_field(reader, name, out);
 }
+/* TS decodes every row of a section (r.field(...).list(...)) before it registers the first
+ * one, so a malformed later row raises with nothing of that section registered. These passes
+ * do that decode; the loops below read the same rows again and register them. */
+typedef enum row_field_kind { ROW_STRING, ROW_BOOLEAN, ROW_INTEGER_0, ROW_INTEGER_1, ROW_NULLABLE_STRING,
+                              ROW_NULLABLE_SURFACES } row_field_kind;
+typedef struct row_field { const char *name; row_field_kind kind; } row_field;
+static bool decode_rows(const qa_save_reader *list, const row_field *fields, size_t field_count) {
+  size_t count = qa_save_reader_list_count(list);
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader item;
+    if (!qa_save_reader_item(list, i, &item)) return false;
+    for (size_t f = 0; f < field_count; f++) {
+      qa_save_reader field;
+      if (!qa_save_reader_field(&item, fields[f].name, &field)) return false;
+      switch (fields[f].kind) {
+        case ROW_STRING: (void)qa_save_reader_string(&field); break;
+        case ROW_BOOLEAN: (void)qa_save_reader_boolean(&field); break;
+        case ROW_INTEGER_0: (void)qa_save_reader_integer_min(&field, 0); break;
+        case ROW_INTEGER_1: (void)qa_save_reader_integer_min(&field, 1); break;
+        case ROW_NULLABLE_STRING:
+          if (!qa_save_reader_is_null(&field)) (void)qa_save_reader_string(&field);
+          break;
+        case ROW_NULLABLE_SURFACES:
+          if (!qa_save_reader_is_null(&field)) {
+            static const row_field surface_fields[] = {{"name", ROW_STRING}, {"shader", ROW_STRING}};
+            if (!decode_rows(&field, surface_fields, 2)) return false;
+          }
+          break;
+      }
+      qa_save_reader_destroy(&field);
+    }
+    qa_save_reader_destroy(&item);
+  }
+  return true;
+}
 bool qa_q3_pres_q3_renderer_resources_restore_checkpoint(resources_t *resources, const qa_save_value *value) {
   if (resources->handles != QA_Q3_PRES_HANDLES_CLIENT || resources->operations != 0 ||
       resources->model_name_count != 0 || resources->skin_count != 0 || resources->picture_key_count != 0 ||
       resources->world_loaded) {
-    qa_range_error("Resource restore requires an empty client handle owner");
+    qa_raise("Error", 0, 0, "Resource restore requires an empty client handle owner");
   }
   qa_save_reader root;
   if (!qa_save_reader_init(&root, value, "client-resources")) return false;
@@ -642,6 +690,9 @@ bool qa_q3_pres_q3_renderer_resources_restore_checkpoint(resources_t *resources,
   memset(&bindings, 0, sizeof bindings);
   memset(&field, 0, sizeof field);
   if (!reader_field(&root, "models", &models)) goto done;
+  static const row_field model_fields[] = {{"path", ROW_STRING}, {"handle", ROW_INTEGER_0},
+                                           {"resource", ROW_NULLABLE_STRING}};
+  if (!decode_rows(&models, model_fields, 3)) goto done;
   for (size_t i = 0; i < qa_save_reader_list_count(&models); i++) {
     qa_save_reader item, path_r, handle_r, resource_r;
     if (!qa_save_reader_item(&models, i, &item)) goto done;
@@ -670,6 +721,9 @@ bool qa_q3_pres_q3_renderer_resources_restore_checkpoint(resources_t *resources,
     if (!registered) goto done;
   }
   if (!reader_field(&root, "skins", &skins)) goto done;
+  static const row_field skin_fields[] = {{"path", ROW_STRING}, {"handle", ROW_INTEGER_0},
+                                          {"surfaces", ROW_NULLABLE_SURFACES}};
+  if (!decode_rows(&skins, skin_fields, 3)) goto done;
   for (size_t i = 0; i < qa_save_reader_list_count(&skins); i++) {
     qa_save_reader item, path_r, handle_r, surfaces_r;
     if (!qa_save_reader_item(&skins, i, &item)) goto done;
@@ -712,6 +766,9 @@ bool qa_q3_pres_q3_renderer_resources_restore_checkpoint(resources_t *resources,
     if (!registered) goto done;
   }
   if (!reader_field(&root, "shaders", &shaders)) goto done;
+  static const row_field shader_fields[] = {{"path", ROW_STRING}, {"mip", ROW_BOOLEAN},
+                                            {"handle", ROW_INTEGER_1}, {"name", ROW_STRING}};
+  if (!decode_rows(&shaders, shader_fields, 4)) goto done;
   for (size_t i = 0; i < qa_save_reader_list_count(&shaders); i++) {
     qa_save_reader item, path_r, mip_r, handle_r, name_r;
     if (!qa_save_reader_item(&shaders, i, &item)) goto done;

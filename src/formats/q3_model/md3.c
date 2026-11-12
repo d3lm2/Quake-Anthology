@@ -462,7 +462,10 @@ static char *skin_next_token(qa_md3_skin_iterator *iterator) {
       iterator->offset++;
     }
     if (iterator->offset < iterator->length && iterator->text[iterator->offset] == '"') iterator->offset++;
-    if (length >= 1024) qa_range_error("CommaParse quoted token exceeds its source allocation");
+    if (length >= 1024) {
+      free(result);
+      qa_range_error("CommaParse quoted token exceeds its source allocation");
+    }
     return result;
   }
   if (length + 1 >= capacity) { capacity *= 2; result = xrealloc(result, capacity); }

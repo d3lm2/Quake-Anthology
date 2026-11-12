@@ -30,14 +30,15 @@ typedef qa_app_q3_selected_source source_t;
 typedef qa_app_q3_selected_source_entry entry_t;
 typedef qa_app_q3_selected_source_map map_t;
 
-/* One TS step closure per track(): host.execute keeps it for the source's life. */
+/* One TS step closure per track(). The host drops its execution entry when the actor is
+ * released, so the closure is freed then (released()); closures of actors still live at close
+ * stay until destroy, where the host may still call them (they return at once when closed). */
 struct qa_app_q3_selected_source_step {
   source_t *source;
   qa_owned_actor actor;
-  struct qa_app_q3_selected_source_step *next;
+  struct qa_app_q3_selected_source_step *previous, *next;
 };
 
-static const qa_vec3 zero = {0, 0, 0};
 enum { MASK_SHOT = 0x6000001, CONTENTS_TRIGGER = 0x40000000 };
 
 /* ---- insertion-ordered OwnedActor maps (TS Map/Set; deletion during
@@ -78,7 +79,7 @@ static void map_free(map_t *map) { free(map->items); memset(map, 0, sizeof *map)
 static bool provider_equal(qa_provider_id a, qa_provider_id b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 static double now_of(source_t *s) { return s->has_clock ? s->clock : s->host.now(s->host.ctx); }
 static qa_q3_game_combat_context *combat_of(source_t *s) { return qa_q3_base_combat_bridge_context(&s->bridge); }
-static void assert_open(source_t *s) { if (s->closed) qa_range_error("Selected Q3 source is closed"); }
+static void assert_open(source_t *s) { if (s->closed) qa_raise("Error", 0, 0, "Selected Q3 source is closed"); }
 static qa_q3_game_entity *native_of(source_t *s, qa_actor_id actor) {
   return qa_q3_base_entity_records_native_by_actor(s->records, true, actor);
 }
@@ -122,18 +123,25 @@ static bool same_effects(qa_app_q3_selected_client_effects a, qa_app_q3_selected
       && a.delta_angles.x == b.delta_angles.x && a.delta_angles.y == b.delta_angles.y && a.delta_angles.z == b.delta_angles.z;
 }
 
-/* ---- run(): depth bookkeeping and publication after each source call ---- */
+/* ---- run(operation): depth bookkeeping and publication after each source call ---- */
 static void publish(source_t *s);
 static void run_unwind(void *arg) { ((source_t *)arg)->depth--; }
-typedef struct run_frame { qa_cleanup node; } run_frame;
-static void run_begin(source_t *s, run_frame *frame) {
-  assert_open(s); s->depth++;
-  qa_cleanup_push(&frame->node, run_unwind, s);
-  (void)combat_of(s);
-}
-static void run_end(source_t *s, run_frame *frame) {
-  publish(s);
-  qa_cleanup_pop(&frame->node);
+static void run_publish(void *arg) { publish(arg); }
+/* TS run: the operation, then publish() whether or not it threw; a publish failure after a
+ * failed operation is AggregateError "Selected Q3 call and publication failed", otherwise it
+ * replaces the result; depth is restored in the finally. */
+static void run(source_t *s, void (*operation)(void *ctx), void *ctx) {
+  assert_open(s);
+  s->depth++;
+  qa_cleanup depth_node; qa_cleanup_push(&depth_node, run_unwind, s);
+  qa_caught_error caught; bool ok = qa_try(operation, ctx, &caught);
+  qa_caught_error published; bool publish_ok = qa_try(run_publish, s, &published);
+  if (!publish_ok) {
+    if (!ok) qa_raise("AggregateError", 0, 0, "Selected Q3 call and publication failed");
+    qa_rethrow(&published);
+  }
+  if (!ok) qa_rethrow(&caught);
+  qa_cleanup_pop(&depth_node);
   s->depth--;
 }
 
@@ -144,8 +152,20 @@ static void track(source_t *s, qa_owned_actor actor) {
   map_set(&s->executing, actor);
   struct qa_app_q3_selected_source_step *step = calloc(1, sizeof *step);
   if (step == NULL) qa_range_error("Out of memory");
-  step->source = s; step->actor = actor; step->next = s->steps; s->steps = step;
+  step->source = s; step->actor = actor; step->next = s->steps;
+  if (s->steps != NULL) s->steps->previous = step;
+  s->steps = step;
   s->host.execute(s->host.ctx, actor, step_fn, step);
+}
+/* The released actor's step closure: the host's execution entry for it is gone. */
+static void free_step(source_t *s, qa_owned_actor actor) {
+  for (struct qa_app_q3_selected_source_step *step = s->steps; step != NULL; step = step->next)
+    if (qa_same_owned_actor(step->actor, actor)) {
+      if (step->previous != NULL) step->previous->next = step->next; else s->steps = step->next;
+      if (step->next != NULL) step->next->previous = step->previous;
+      free(step);
+      return;
+    }
 }
 
 static void publish_client(source_t *s, qa_q3_game_entity *entity, qa_q3_game_client *client) {
@@ -185,13 +205,13 @@ static qa_app_q3_presented_client *presented_at(source_t *s, double slot) {
 static void refresh(source_t *s, qa_q3_game_entity *entity) {
   qa_owned_actor actor = qa_q3_game_entity_actor(entity);
   qa_body_state body;
-  if (!body_of(s, actor.id, &body)) qa_range_error("Selected Q3 projected body was removed");
+  if (!body_of(s, actor.id, &body)) qa_raise("Error", 0, 0, "Selected Q3 projected body was removed");
   if (entity->s.pos.type != QA_Q3_BASE_TR_STATIONARY || !same_vector(entity->s.pos.base, body.origin)) {
-    qa_q3_base_trajectory pos = {QA_Q3_BASE_TR_STATIONARY, 0, 0, body.origin, zero};
+    qa_q3_base_trajectory pos = {QA_Q3_BASE_TR_STATIONARY, 0, 0, body.origin, qa_zero_vec3};
     entity->s.pos = pos;
   }
   if (entity->s.apos.type != QA_Q3_BASE_TR_STATIONARY || !same_vector(entity->s.apos.base, body.angles)) {
-    qa_q3_base_trajectory apos = {QA_Q3_BASE_TR_STATIONARY, 0, 0, body.angles, zero};
+    qa_q3_base_trajectory apos = {QA_Q3_BASE_TR_STATIONARY, 0, 0, body.angles, qa_zero_vec3};
     entity->s.apos = apos;
   }
   qa_q3_game_client *client = entity->client;
@@ -264,12 +284,12 @@ static qa_q3_game_entity *project(source_t *s, qa_actor_id actor) {
   if (!qa_session_actor_registry_resolve_owned(s->host.actors, actor, &owned)) return NULL;
   qa_q3_game_entity *current = native_of(s, actor);
   if (current != NULL) return current;
-  if (!body_of(s, actor, NULL)) qa_range_error("Q3 source projection requires the existing actor body");
+  if (!body_of(s, actor, NULL)) qa_raise("Error", 0, 0, "Q3 source projection requires the existing actor body");
   bool player = pose_of(s, actor, NULL);
   double slot = player ? 0 : QA_Q3_MAX_CLIENTS;
   double end = player ? s->host.max_clients : 1022;
   while (slot < end && qa_q3_game_entity_inuse(qa_q3_entity_pool_at(&s->pool, slot))) slot++;
-  if (slot >= end) qa_range_error("Selected Q3 source projection capacity exceeded");
+  if (slot >= end) qa_raise("Error", 0, 0, "Selected Q3 source projection capacity exceeded");
   qa_q3_game_entity *entity = qa_q3_base_entity_records_attach(s->records, slot, owned, player);
   map_set(&s->projected, owned)->slot = slot;
   if (slot >= s->pool.num_entities) {
@@ -294,7 +314,7 @@ static void bind_world(source_t *s) {
   qa_owned_actor world = s->host.world_actor(s->host.ctx);
   qa_q3_game_entity *current = native_of(s, world.id);
   if (current == NULL) (void)qa_q3_base_entity_records_attach(s->records, 1022, world, false);
-  else if (current->slot != 1022) qa_range_error("Selected Q3 world actor changed its source slot");
+  else if (current->slot != 1022) qa_raise("Error", 0, 0, "Selected Q3 world actor changed its source slot");
 }
 
 static qa_q3_game_entity *player_of(source_t *s, qa_owned_actor actor) {
@@ -302,7 +322,7 @@ static qa_q3_game_entity *player_of(source_t *s, qa_owned_actor actor) {
   qa_session_actor_registry_assert_owned(s->host.actors, actor);
   bind_world(s);
   qa_q3_game_entity *entity = project(s, actor.id);
-  if (entity == NULL || entity->client == NULL) qa_range_error("Selected Q3 arsenal requires an admitted player");
+  if (entity == NULL || entity->client == NULL) qa_raise("Error", 0, 0, "Selected Q3 arsenal requires an admitted player");
   refresh(s, entity);
   return entity;
 }
@@ -353,6 +373,13 @@ static void step_unwind(void *arg) {
   saved->source->has_clock = saved->has_clock; saved->source->clock = saved->clock;
   saved->source->previous = saved->previous; saved->source->missiles.host.previous_time = saved->previous;
 }
+typedef struct step_call { source_t *s; qa_owned_actor actor; qa_q3_game_entity *entity; double time; } step_call;
+static void step_operation(void *ctx) {
+  step_call *c = ctx;
+  if (c->entity != NULL && qa_q3_entity_pool_expire_events(&c->s->pool, c->entity) == QA_Q3_EVENT_ACTIVE
+      && !qa_q3_missile_runtime_run_owned(&c->s->missiles, c->actor))
+    qa_q3_run_think(c->entity, c->time);
+}
 static void step_fn(void *ctx, double previous, double time) {
   struct qa_app_q3_selected_source_step *step = ctx;
   source_t *s = step->source;
@@ -366,13 +393,8 @@ static void step_fn(void *ctx, double previous, double time) {
     if (!entry->present || !is_live(s, entry->actor.id)) continue;
     refresh(s, qa_q3_entity_pool_at(&s->pool, entry->slot));
   }
-  qa_q3_game_entity *entity = native_of(s, actor.id);
-  run_frame frame;
-  run_begin(s, &frame);
-  if (entity != NULL && qa_q3_entity_pool_expire_events(&s->pool, entity) == QA_Q3_EVENT_ACTIVE
-      && !qa_q3_missile_runtime_run_owned(&s->missiles, actor))
-    qa_q3_run_think(entity, time);
-  run_end(s, &frame);
+  step_call call = {s, actor, native_of(s, actor.id), time};
+  run(s, step_operation, &call);
   qa_cleanup_pop(&saved.node);
   step_unwind(&saved);
 }
@@ -389,13 +411,13 @@ static void clock_unwind(void *arg) {
 static void records_run_think(void *ctx, qa_owned_actor actor, double time) {
   source_t *s = ctx;
   qa_q3_game_entity *entity = native_of(s, actor.id);
-  if (entity == NULL || !owns(s, actor)) qa_range_error("Selected Q3 think actor is retired");
+  if (entity == NULL || !owns(s, actor)) qa_raise("Error", 0, 0, "Selected Q3 think actor is retired");
   clock_restore saved = {{0}, s, s->has_clock, s->clock};
   qa_cleanup_push(&saved.node, clock_unwind, &saved);
   s->has_clock = true; s->clock = time;
   (void)combat_of(s);
   qa_q3_game_entity_set_nextthink(entity, 0);
-  if (entity->think.fn == NULL) qa_range_error("NULL ent->think");
+  if (entity->think.fn == NULL) qa_raise("Error", 0, 0, "NULL ent->think");
   call_think(entity->think, entity);
   qa_cleanup_pop(&saved.node);
   clock_unwind(&saved);
@@ -531,7 +553,7 @@ static double weapon_damage_factor(void *ctx, qa_q3_game_entity *entity) {
         && entity->client->persistant_powerup->item->tag == QA_Q3_PW_DOUBLER ? 2 : 1;
     return (double)(float)(s->host.weapon_damage_factor(s->host.ctx, actor) * source_factor);
   }
-  if (entity->client == NULL) qa_range_error("Selected weapon damage has no source client");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "Selected weapon damage has no source client");
   return qa_q3_weapon_damage_factor(entity->client, s->host.quad_factor(s->host.ctx, &actor), s->host.product);
 }
 #define FIRE(name, call)                                                                                  \
@@ -628,7 +650,8 @@ static void portal_teleport(void *ctx, qa_q3_game_entity *player, qa_vec3 origin
 /* ---- actors.onRelease ---- */
 static void released(void *ctx, qa_owned_actor actor) {
   source_t *s = ctx;
-  map_delete(&s->executing, actor); map_delete(&s->published, actor); map_delete(&s->client_effects, actor);
+  if (map_delete(&s->executing, actor)) free_step(s, actor);
+  map_delete(&s->published, actor); map_delete(&s->client_effects, actor);
   entry_t *entry = map_find(&s->projected, actor);
   bool had = entry != NULL;
   double slot = had ? entry->slot : 0;
@@ -733,9 +756,11 @@ qa_app_q3_selected_source *qa_app_q3_selected_source_create(qa_app_q3_selected_s
   return s;
 }
 
+static void destroy_close(void *ctx) { qa_app_q3_selected_source_close(ctx); }
 void qa_app_q3_selected_source_destroy(qa_app_q3_selected_source *source) {
   if (source == NULL) return;
-  qa_app_q3_selected_source_close(source);
+  /* The owner closes first and sees close's failure; destroy releases the storage either way. */
+  qa_caught_error ignored; (void)qa_try(destroy_close, source, &ignored);
   qa_q3_entity_pool_destroy(&source->pool);
   qa_q3_base_combat_bridge_destroy(&source->bridge);
   qa_q3_base_world_adapter_destroy(&source->world);
@@ -782,17 +807,17 @@ static bool owner_actor(source_t *s, qa_q3_game_entity *entity, qa_actor_id *out
 }
 qa_q2_motion qa_app_q3_selected_source_motion(qa_app_q3_selected_source *source, qa_owned_actor actor, qa_body_state body) {
   qa_q3_game_entity *entity = native_of(source, actor.id);
-  if (entity == NULL || !owns(source, actor)) qa_range_error("Selected Q3 motion actor is retired");
+  if (entity == NULL || !owns(source, actor)) qa_raise("Error", 0, 0, "Selected Q3 motion actor is retired");
   qa_q2_motion motion;
   memset(&motion, 0, sizeof motion);
-  motion.actor = actor; motion.kind = "stationary"; motion.velocity = body.velocity; motion.angular_velocity = zero;
+  motion.actor = actor; motion.kind = "stationary"; motion.velocity = body.velocity; motion.angular_velocity = qa_zero_vec3;
   motion.gravity = 1; motion.gravity_vector = (qa_vec3){0, 0, -1}; motion.clip_mask = entity->clipmask;
   motion.has_owner = owner_actor(source, entity, &motion.owner);
   return motion;
 }
 qa_app_sim_shared_solid qa_app_q3_selected_source_collision(qa_app_q3_selected_source *source, qa_owned_actor actor) {
   qa_q3_game_entity *entity = native_of(source, actor.id);
-  if (entity == NULL || !owns(source, actor)) qa_range_error("Selected Q3 collision actor is retired");
+  if (entity == NULL || !owns(source, actor)) qa_raise("Error", 0, 0, "Selected Q3 collision actor is retired");
   qa_app_sim_shared_solid solid;
   memset(&solid, 0, sizeof solid);
   solid.family = "q3";
@@ -807,7 +832,7 @@ bool qa_app_q3_selected_source_fixed_pose(qa_app_q3_selected_source *source, qa_
     qa_q3_postures postures, qa_fixed_movement_pose *out) {
   qa_q3_game_entity *entity = player_of(source, actor);
   qa_q3_game_client *client = entity->client;
-  if (client == NULL) qa_range_error("Selected Q3 pose has no source client");
+  if (client == NULL) qa_raise("Error", 0, 0, "Selected Q3 pose has no source client");
   if (client->invulnerability_time <= now_of(source)) {
     client->ps.pm_flags = (double)(qa_js_to_int32(client->ps.pm_flags) & ~QA_Q3_FLAG_INVULEXPAND);
     return false;
@@ -819,7 +844,7 @@ bool qa_app_q3_selected_source_fixed_pose(qa_app_q3_selected_source *source, qa_
 }
 void qa_app_q3_selected_source_advance_movement(qa_app_q3_selected_source *source, qa_owned_actor actor, double milliseconds) {
   qa_q3_game_entity *entity = player_of(source, actor);
-  if (entity->client == NULL) qa_range_error("Selected Q3 movement clock has no source client");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "Selected Q3 movement clock has no source client");
   /* dropQ3MovementTimers reads and writes only pmTime and pmFlags. */
   qa_q3_motion timers;
   memset(&timers, 0, sizeof timers);
@@ -828,15 +853,23 @@ void qa_app_q3_selected_source_advance_movement(qa_app_q3_selected_source *sourc
   entity->client->ps.pm_time = timers.pm_time; entity->client->ps.pm_flags = timers.pm_flags;
   publish_client(source, entity, entity->client);
 }
+typedef struct end_command_call { source_t *s; qa_q3_game_entity *entity; double milliseconds; } end_command_call;
+static void end_command_operation(void *ctx) {
+  end_command_call *c = ctx;
+  qa_q3_ta_client_timer_ownership ownership = {false, false, NULL, 0};
+  qa_q3_ta_client_timer_actions(event_context(c->s), c->entity, c->milliseconds, &ownership);
+}
 void qa_app_q3_selected_source_end_command(qa_app_q3_selected_source *source, qa_owned_actor actor, double milliseconds) {
   if (!qa_app_q3_selected_source_owns_equipment(source)) return;
   qa_q3_game_entity *entity = player_of(source, actor);
   if (qa_q3_game_entity_health(entity) <= 0) return;
-  qa_q3_ta_client_timer_ownership ownership = {false, false, NULL, 0};
-  run_frame frame;
-  run_begin(source, &frame);
-  qa_q3_ta_client_timer_actions(event_context(source), entity, milliseconds, &ownership);
-  run_end(source, &frame);
+  end_command_call call = {source, entity, milliseconds};
+  run(source, end_command_operation, &call);
+}
+typedef struct blocks_call { source_t *s; qa_q3_game_entity *target; qa_vec3 direction, point; double method; bool blocked; } blocks_call;
+static void blocks_operation(void *ctx) {
+  blocks_call *c = ctx;
+  c->blocked = qa_q3_invulnerability_blocks(combat_of(c->s), c->target, &c->direction, &c->point, c->method);
 }
 bool qa_app_q3_selected_source_blocks_damage(qa_app_q3_selected_source *source, qa_damage_request request) {
   assert_open(source);
@@ -844,14 +877,14 @@ bool qa_app_q3_selected_source_blocks_damage(qa_app_q3_selected_source *source, 
   if (target == NULL) return false;
   qa_vec3 direction = request.direction, point = request.point;
   double method = request.attack.cause.kind == QA_ATTACK_CAUSE_Q3 ? request.attack.cause.means_of_death : -1;
-  run_frame frame;
-  run_begin(source, &frame);
-  bool blocked = qa_q3_invulnerability_blocks(combat_of(source), target, &direction, &point, method);
-  run_end(source, &frame);
-  return blocked;
+  blocks_call call = {source, target, direction, point, method, false};
+  run(source, blocks_operation, &call);
+  return call.blocked;
 }
 void qa_app_q3_selected_source_admit(qa_app_q3_selected_source *source, qa_owned_actor actor) { (void)player_of(source, actor); }
 
+typedef struct respawn_call { source_t *s; qa_q3_game_entity *entity; qa_q3_game_client *client; } respawn_call;
+static void respawn_operation(void *ctx);
 void qa_app_q3_selected_source_respawn(qa_app_q3_selected_source *source, qa_actor_id actor) {
   assert_open(source);
   qa_q3_game_entity *entity = native_of(source, actor);
@@ -859,47 +892,53 @@ void qa_app_q3_selected_source_respawn(qa_app_q3_selected_source *source, qa_act
   if (entity == NULL || client == NULL) return;
   qa_app_q3_selected_source_release_hook(source, actor);
   return_persistent(source, entity);
-  run_frame frame;
-  run_begin(source, &frame);
+  respawn_call call = {source, entity, client};
+  run(source, respawn_operation, &call);
+}
+static void respawn_operation(void *ctx) {
+  respawn_call *c = ctx; source_t *source = c->s; qa_q3_game_entity *entity = c->entity; qa_q3_game_client *client = c->client;
   int32_t *persistant = qa_q3_base_player_state_slots_copy(&client->ps.persistant);
   if (persistant == NULL) qa_range_error("Out of memory");
+  qa_cleanup persistant_node; qa_cleanup_push(&persistant_node, free, persistant);
   double length = client->ps.persistant.length;
   double event_sequence = client->ps.event_sequence, ping = client->ps.ping;
   assign_fresh_client(source, client, true);
   for (double index = 0; index < length; index++) stat_set(&client->ps.persistant, index, persistant[(size_t)index]);
+  qa_cleanup_pop(&persistant_node);
   free(persistant);
   client->ps.event_sequence = event_sequence; client->ps.ping = ping; client->ps.client_num = entity->slot;
   map_delete(&source->client_effects, qa_q3_game_entity_actor(entity));
   refresh(source, entity);
-  run_end(source, &frame);
 }
+/* One entity-scoped run operation: its entity, an optional second entity, a number and a result. */
+typedef struct entity_call { source_t *s; qa_q3_game_entity *entity; qa_q3_game_entity *other; double value; bool result; } entity_call;
+static void gauntlet_operation(void *ctx) { entity_call *c = ctx; c->result = qa_q3_weapon_check_gauntlet_attack(&c->s->weapons, c->entity); }
 bool qa_app_q3_selected_source_gauntlet_hit(qa_app_q3_selected_source *source, qa_owned_actor actor) {
-  qa_q3_game_entity *player = player_of(source, actor);
-  run_frame frame;
-  run_begin(source, &frame);
-  bool hit = qa_q3_weapon_check_gauntlet_attack(&source->weapons, player);
-  run_end(source, &frame);
-  return hit;
+  entity_call call = {source, player_of(source, actor), NULL, 0, false};
+  run(source, gauntlet_operation, &call);
+  return call.result;
+}
+typedef struct command_call { source_t *s; qa_q3_game_client *client; bool attack, selected, alive; } command_call;
+static void command_operation(void *ctx) {
+  command_call *c = ctx;
+  if (!c->attack || !c->alive) c->client->fire_held = false;
+  if ((!c->attack || !c->selected || !c->alive) && c->client->hook != NULL) qa_q3_missile_runtime_hook_free(&c->s->missiles, c->client->hook);
 }
 void qa_app_q3_selected_source_command(qa_app_q3_selected_source *source, qa_owned_actor actor, bool attack, bool selected, bool alive) {
   qa_q3_game_entity *player = player_of(source, actor);
   qa_q3_game_client *client = player->client;
-  if (client == NULL) qa_range_error("Missing selected Q3 client");
-  run_frame frame;
-  run_begin(source, &frame);
-  if (!attack || !alive) client->fire_held = false;
-  if ((!attack || !selected || !alive) && client->hook != NULL) qa_q3_missile_runtime_hook_free(&source->missiles, client->hook);
-  run_end(source, &frame);
+  if (client == NULL) qa_raise("Error", 0, 0, "Missing selected Q3 client");
+  command_call call = {source, client, attack, selected, alive};
+  run(source, command_operation, &call);
 }
+static void hook_free_operation(void *ctx) { entity_call *c = ctx; qa_q3_missile_runtime_hook_free(&c->s->missiles, c->entity); }
 void qa_app_q3_selected_source_release_hook(qa_app_q3_selected_source *source, qa_actor_id actor) {
   assert_open(source);
   qa_q3_game_entity *entity = native_of(source, actor);
   qa_q3_game_entity *hook = entity != NULL && entity->client != NULL ? entity->client->hook : NULL;
   if (hook == NULL) return;
-  run_frame frame;
-  run_begin(source, &frame);
-  qa_q3_missile_runtime_hook_free(&source->missiles, hook);
-  run_end(source, &frame);
+  entity_call call = {source, hook, NULL, 0, false};
+  run(source, hook_free_operation, &call);
 }
 bool qa_app_q3_selected_source_grapple_point(qa_app_q3_selected_source *source, qa_actor_id actor, qa_vec3 *out) {
   qa_q3_game_entity *entity = native_of(source, actor);
@@ -922,7 +961,7 @@ bool qa_app_q3_selected_source_pull(qa_app_q3_selected_source *source, qa_owned_
 qa_app_q3_selected_equipment_state qa_app_q3_selected_source_equipment(qa_app_q3_selected_source *source, qa_owned_actor actor) {
   qa_q3_game_entity *entity = player_of(source, actor);
   qa_q3_game_client *client = entity->client;
-  if (client == NULL) qa_range_error("Missing selected Q3 client");
+  if (client == NULL) qa_raise("Error", 0, 0, "Missing selected Q3 client");
   const qa_q3_base_stat_schema *schema = schema_of(source);
   double holdable = stat_get(&client->ps.stats, schema->holdable_item);
   qa_app_q3_selected_equipment_state state;
@@ -956,7 +995,7 @@ size_t qa_app_q3_selected_source_inventory(qa_app_q3_selected_source *source, qa
 double qa_app_q3_selected_source_firing_delay(qa_app_q3_selected_source *source, qa_owned_actor actor, double milliseconds) {
   qa_q3_game_entity *entity = player_of(source, actor);
   qa_q3_game_client *client = entity->client;
-  if (client == NULL) qa_range_error("Selected firing delay requires its source client");
+  if (client == NULL) qa_raise("Error", 0, 0, "Selected firing delay requires its source client");
   double persistent = qa_app_q3_selected_source_owns_equipment(source) && client->persistant_powerup != NULL
       && client->persistant_powerup->item != NULL ? client->persistant_powerup->item->tag : 0;
   if (source->host.has_weapon_effects)
@@ -981,6 +1020,18 @@ bool qa_app_q3_selected_source_pickup_allowed(qa_app_q3_selected_source *source,
   return (tag != QA_Q3_PW_SCOUT && tag != QA_Q3_PW_GUARD) || qa_q3_base_can_q3_armor_be_grabbed(&inventory);
 }
 static bool same_class(const char *a, const char *b) { return a == NULL ? b == NULL : b != NULL && strcmp(a, b) == 0; }
+typedef struct pickup_call {
+  source_t *s; qa_q3_game_entity *pickup, *player; qa_owned_actor actor; const qa_q3_base_item_definition *item; double respawn;
+} pickup_call;
+static void pickup_operation(void *ctx) {
+  pickup_call *c = ctx;
+  if (c->item->type == QA_Q3_BASE_IT_HOLDABLE) { c->respawn = qa_q3_pickup_holdable(c->pickup, c->player); return; }
+  char *handicap = qa_q3_ta_client_info_value(c->s->host.userinfo(c->s->host.ctx, c->actor.id), "handicap");
+  if (handicap == NULL) qa_range_error("Out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, free, handicap);
+  c->respawn = qa_q3_pickup_persistent_powerup(c->pickup, c->player, handicap);
+  qa_cleanup_pop(&node); free(handicap);
+}
 qa_q3_source_pickup_admission qa_app_q3_selected_source_take_pickup(qa_app_q3_selected_source *source,
     qa_q3_source_pickup_descriptor offer) {
   qa_q3_source_pickup_admission native = {QA_Q3_SOURCE_PICKUP_NATIVE, 0}, rejected = {QA_Q3_SOURCE_PICKUP_REJECTED, 0};
@@ -998,34 +1049,24 @@ qa_q3_source_pickup_admission qa_app_q3_selected_source_take_pickup(qa_app_q3_se
       || !is_live(source, offer.item_actor)) return rejected;
   qa_q3_game_entity *player = player_of(source, actor);
   qa_q3_game_client *client = player->client;
-  if (client == NULL) qa_range_error("Original equipment pickup requires a source client");
+  if (client == NULL) qa_raise("Error", 0, 0, "Original equipment pickup requires a source client");
   qa_q3_base_pickup_entity grabbed = {(double)model_index, offer.dropped ? 1 : 0, offer.generic1};
   qa_q3_base_player_inventory inventory = qa_q3_item_inventory(client);
   if (!qa_q3_base_can_item_be_grabbed(offer.game_type, grabbed, &inventory)) return rejected;
   qa_q3_game_entity *pickup = project(source, offer.item_actor);
   if (pickup == NULL) return rejected;
   pickup->item = item; pickup->count = offer.count; pickup->s.modelindex = (double)model_index; pickup->s.generic1 = offer.generic1;
-  run_frame frame;
-  run_begin(source, &frame);
-  double respawn;
-  if (item->type == QA_Q3_BASE_IT_HOLDABLE) respawn = qa_q3_pickup_holdable(pickup, player);
-  else {
-    char *handicap = qa_q3_ta_client_info_value(source->host.userinfo(source->host.ctx, actor.id), "handicap");
-    if (handicap == NULL) qa_range_error("Out of memory");
-    respawn = qa_q3_pickup_persistent_powerup(pickup, player, handicap);
-    free(handicap);
-  }
-  run_end(source, &frame);
-  qa_q3_source_pickup_admission picked = {QA_Q3_SOURCE_PICKUP_PICKED, respawn};
+  pickup_call call = {source, pickup, player, actor, item, 0};
+  run(source, pickup_operation, &call);
+  qa_q3_source_pickup_admission picked = {QA_Q3_SOURCE_PICKUP_PICKED, call.respawn};
   return picked;
 }
+static void return_persistent_operation(void *ctx) { entity_call *c = ctx; return_persistent(c->s, c->entity); }
 void qa_app_q3_selected_source_died(qa_app_q3_selected_source *source, qa_actor_id actor) {
   qa_q3_game_entity *entity = native_of(source, actor);
   if (entity == NULL || entity->client == NULL) return;
-  run_frame frame;
-  run_begin(source, &frame);
-  return_persistent(source, entity);
-  run_end(source, &frame);
+  entity_call call = {source, entity, NULL, 0, false};
+  run(source, return_persistent_operation, &call);
 }
 void qa_app_q3_selected_source_consume(qa_app_q3_selected_source *source, qa_owned_actor actor, double item) {
   qa_q3_game_entity *entity = player_of(source, actor);
@@ -1033,7 +1074,7 @@ void qa_app_q3_selected_source_consume(qa_app_q3_selected_source *source, qa_own
   const qa_q3_base_stat_schema *schema = schema_of(source);
   if (client == NULL || stat_get(&client->ps.stats, schema->holdable_item) != item
       || qa_q3_base_item_at(source->host.product, item)->type != QA_Q3_BASE_IT_HOLDABLE)
-    qa_range_error("Selected Q3 holdable consumption differs from its current source item");
+    qa_raise("Error", 0, 0, "Selected Q3 holdable consumption differs from its current source item");
   stat_set(&client->ps.stats, schema->holdable_item, 0);
 }
 static bool lower_equal(const char *value, const char *wanted_lower) {
@@ -1043,6 +1084,21 @@ static bool lower_equal(const char *value, const char *wanted_lower) {
   bool equal = strcmp(lower, wanted_lower) == 0;
   free(lower);
   return equal;
+}
+typedef struct give_call { source_t *s; qa_q3_game_entity *player; const qa_q3_base_item_definition *item; } give_call;
+typedef struct give_pickup { source_t *s; qa_q3_game_entity *pickup, *player; const qa_q3_base_item_definition *item; } give_pickup;
+static void give_pickup_body(void *ctx) {
+  give_pickup *g = ctx;
+  g->pickup->item = g->item;
+  (void)qa_q3_pickup_holdable(g->pickup, g->player);
+}
+static void give_operation(void *ctx) {
+  give_call *c = ctx;
+  give_pickup g = {c->s, qa_q3_entity_pool_spawn(&c->s->pool), c->player, c->item};
+  /* try { pickupHoldable } finally { if (pickup.inuse) pool.free(pickup) }: a free failure supersedes. */
+  qa_caught_error caught; bool ok = qa_try(give_pickup_body, &g, &caught);
+  if (qa_q3_game_entity_inuse(g.pickup)) qa_q3_entity_pool_free(&c->s->pool, g.pickup);
+  if (!ok) qa_rethrow(&caught);
 }
 bool qa_app_q3_selected_source_give_holdable(qa_app_q3_selected_source *source, qa_owned_actor actor, const char *name) {
   if (!qa_app_q3_selected_source_owns_equipment(source)) return false;
@@ -1056,14 +1112,8 @@ bool qa_app_q3_selected_source_give_holdable(qa_app_q3_selected_source *source, 
       item = &items[i];
   free(wanted);
   if (item == NULL) return false;
-  qa_q3_game_entity *player = player_of(source, actor);
-  run_frame frame;
-  run_begin(source, &frame);
-  qa_q3_game_entity *pickup = qa_q3_entity_pool_spawn(&source->pool);
-  pickup->item = item;
-  (void)qa_q3_pickup_holdable(pickup, player);
-  if (qa_q3_game_entity_inuse(pickup)) qa_q3_entity_pool_free(&source->pool, pickup);
-  run_end(source, &frame);
+  give_call call = {source, player_of(source, actor), item};
+  run(source, give_operation, &call);
   return true;
 }
 void qa_app_q3_selected_source_restore_equipment(qa_app_q3_selected_source *source, qa_owned_actor actor,
@@ -1072,25 +1122,24 @@ void qa_app_q3_selected_source_restore_equipment(qa_app_q3_selected_source *sour
   qa_session_actor_registry_assert_owned(source->host.actors, actor);
   qa_q3_game_entity *entity = native_of(source, actor.id);
   qa_q3_game_client *client = entity != NULL ? entity->client : NULL;
-  if (client == NULL) qa_range_error("Restored selected equipment has no source client");
+  if (client == NULL) qa_raise("Error", 0, 0, "Restored selected equipment has no source client");
   const qa_q3_base_item_definition *item = qa_q3_base_item_at(source->host.product, saved.holdable_item);
   if (saved.holdable_item != 0 && (item->type != QA_Q3_BASE_IT_HOLDABLE || item->tag != saved.holdable_tag))
-    qa_range_error("Restored selected holdable differs from its source item");
+    qa_raise("Error", 0, 0, "Restored selected holdable differs from its source item");
   stat_set(&client->ps.stats, schema_of(source)->holdable_item, saved.holdable_item);
 }
+static void fire_operation(void *ctx) { entity_call *c = ctx; qa_q3_weapon_fire(&c->s->weapons, c->entity); }
 void qa_app_q3_selected_source_fire(qa_app_q3_selected_source *source, qa_owned_actor actor, double weapon, qa_weapon_step_input input) {
   (void)input; /* TS fire(actor, weapon, _input): the step input is unused. */
   qa_q3_game_entity *entity = player_of(source, actor);
   entity->s.weapon = weapon;
-  if (entity->client == NULL) qa_range_error("Missing selected Q3 client");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "Missing selected Q3 client");
   entity->client->ps.weapon = weapon;
   qa_q3_base_predictable_event added;
   (void)qa_q3_entity_pool_add_predictable_event(&source->pool, entity, QA_Q3_EV_FIRE_WEAPON, 0, &added);
   entity->event_time = now_of(source);
-  run_frame frame;
-  run_begin(source, &frame);
-  qa_q3_weapon_fire(&source->weapons, entity);
-  run_end(source, &frame);
+  entity_call call = {source, entity, NULL, 0, false};
+  run(source, fire_operation, &call);
 }
 static void holdable_teleport(void *ctx, qa_q3_game_entity *player) {
   source_t *s = ctx;
@@ -1109,24 +1158,29 @@ static void holdable_portal_source(void *ctx, qa_q3_game_entity *entity) {
 static void holdable_portal_destination(void *ctx, qa_q3_game_entity *entity) {
   qa_q3_personal_portal_drop_destination(((source_t *)ctx)->personal_portal, entity);
 }
+static void use_holdable_operation(void *ctx);
 void qa_app_q3_selected_source_use_holdable(qa_app_q3_selected_source *source, qa_owned_actor actor, double event) {
   qa_q3_game_entity *entity = player_of(source, actor);
   qa_q3_game_combat_context *combat = combat_of(source);
   qa_q3_base_predictable_event added;
   (void)qa_q3_entity_pool_add_predictable_event(&source->pool, entity, event, 0, &added);
   entity->event_time = now_of(source);
-  run_frame frame;
-  run_begin(source, &frame);
+  entity_call call = {source, entity, NULL, event, false};
+  (void)combat;
+  run(source, use_holdable_operation, &call);
+}
+static void use_holdable_operation(void *ctx) {
+  entity_call *c = ctx; source_t *source = c->s; qa_q3_game_entity *entity = c->entity; double event = c->value;
+  qa_q3_game_combat_context *combat = combat_of(source);
   qa_q3_ta_holdable_context context;
   memset(&context, 0, sizeof context);
   context.product = combat->product; context.combat = combat; context.ctx = source;
   context.teleport = holdable_teleport; context.start_kamikaze = holdable_kamikaze;
   if (combat->product != QA_Q3_BASE_PRODUCT_BASEQ3) {
-    if (source->personal_portal == NULL) qa_range_error("Missionpack holdable has no portal service");
+    if (source->personal_portal == NULL) qa_raise("Error", 0, 0, "Missionpack holdable has no portal service");
     context.drop_portal_source = holdable_portal_source; context.drop_portal_destination = holdable_portal_destination;
   }
   qa_q3_ta_use_holdable(&context, entity, event);
-  run_end(source, &frame);
 }
 void qa_app_q3_selected_source_synchronize(qa_app_q3_selected_source *source) { assert_open(source); publish(source); }
 
@@ -1153,7 +1207,7 @@ static qa_q3_graph_services graph_services(source_t *s) {
 }
 qa_save_value *qa_app_q3_selected_source_capture(qa_app_q3_selected_source *source) {
   assert_open(source);
-  if (source->depth != 0) qa_range_error("Cannot save selected Q3 during a source call");
+  if (source->depth != 0) qa_raise("Error", 0, 0, "Cannot save selected Q3 during a source call");
   bind_world(source);
   qa_save_value *root = qa_save_value_object();
   if (root == NULL) return NULL;
@@ -1238,10 +1292,11 @@ static void set_baseline(source_t *s) {
   s->restored_presentation = state;
   s->revision++;
 }
+static void destroy_graph(void *arg) { qa_q3_graph_state_destroy(arg); }
 void qa_app_q3_selected_source_restore(qa_app_q3_selected_source *source, const qa_save_value *value) {
   assert_open(source);
   if (source->depth != 0 || source->projected.live != 0 || source->executing.live != 0)
-    qa_range_error("Selected Q3 restore requires an unused source owner");
+    qa_raise("Error", 0, 0, "Selected Q3 restore requires an unused source owner");
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, "selected Q3 source")) qa_range_error("Out of memory");
   qa_save_reader r = field_of(&reader, "version"); (void)qa_save_reader_literal_number(&r, 1); qa_save_reader_destroy(&r);
@@ -1255,8 +1310,10 @@ void qa_app_q3_selected_source_restore(qa_app_q3_selected_source *source, const 
   qa_save_reader_destroy(&r);
   if (product != source->host.product) qa_save_reader_fail(&reader, "Saved Q3 equipment product changed");
   qa_q3_graph_state graph = qa_q3_read_complete_graph(field_value(value, "graph"));
+  qa_cleanup graph_node; qa_cleanup_push(&graph_node, destroy_graph, &graph); /* a refused graph keeps nothing */
   qa_q3_prepare_q3_graph(graph_services(source), &graph);
   qa_q3_restore_q3_graph(graph_services(source), &graph);
+  qa_cleanup_pop(&graph_node);
   qa_q3_graph_state_destroy(&graph);
   qa_q3_base_combat_bridge_restore_save_state(&source->bridge, field_value(value, "bridge"));
   r = field_of(&reader, "personalPortal");
@@ -1279,6 +1336,7 @@ void qa_app_q3_selected_source_restore(qa_app_q3_selected_source *source, const 
   size_t count = qa_save_reader_list_count(&list);
   entry_t *rows = calloc(count ? count : 1, sizeof *rows);
   if (rows == NULL) qa_range_error("Out of memory");
+  qa_cleanup rows_node; qa_cleanup_push(&rows_node, free, rows); /* a refused row keeps nothing */
   for (size_t i = 0; i < count; i++) {
     qa_save_reader entry;
     if (!qa_save_reader_item(&list, i, &entry)) qa_range_error("Out of memory");
@@ -1298,6 +1356,7 @@ void qa_app_q3_selected_source_restore(qa_app_q3_selected_source *source, const 
     entry_t *entry = map_set(&source->published, rows[i].actor);
     entry->event = rows[i].event; entry->time = rows[i].time;
   }
+  qa_cleanup_pop(&rows_node);
   free(rows);
   qa_save_reader_destroy(&list);
   qa_q3_game_entity *world = native_of(source, source->host.world_actor(source->host.ctx).id);
@@ -1312,17 +1371,17 @@ void qa_app_q3_selected_source_restore_legacy(qa_app_q3_selected_source *source,
     const qa_owned_actor *client_actors, const qa_app_q3_selected_arsenal_checkpoint *client_states, size_t client_count) {
   assert_open(source);
   if (source->depth != 0 || source->projected.live != 0 || source->executing.live != 0 || source->host.product != QA_Q3_BASE_PRODUCT_BASEQ3)
-    qa_range_error("Legacy Q3 restore requires an unused base source owner");
+    qa_raise("Error", 0, 0, "Legacy Q3 restore requires an unused base source owner");
   bind_world(source);
   for (size_t i = 0; i < client_count; i++) {
     const qa_app_q3_selected_arsenal_checkpoint *state = &client_states[i];
     if (state->runtime.product == NULL || strcmp(state->runtime.product, "baseq3") != 0
         || !provider_equal(state->arsenal.provider, source->host.provider)
         || state->arsenal.state.kind == NULL || strcmp(state->arsenal.state.kind, "q3") != 0)
-      qa_range_error("Legacy Q3 player arsenal differs from its source");
+      qa_raise("Error", 0, 0, "Legacy Q3 player arsenal differs from its source");
     qa_q3_game_entity *entity = player_of(source, client_actors[i]);
     qa_q3_game_client *client = entity->client;
-    if (client == NULL) qa_range_error("Legacy Q3 player lost its source client");
+    if (client == NULL) qa_raise("Error", 0, 0, "Legacy Q3 player lost its source client");
     qa_app_q3_selected_equipment_state equipment = {state->runtime.max_health, state->runtime.persistent_powerup_tag,
         state->runtime.holdable_item, state->runtime.holdable_tag};
     qa_app_q3_selected_source_restore_equipment(source, client_actors[i], equipment);
@@ -1336,7 +1395,7 @@ void qa_app_q3_selected_source_restore_legacy(qa_app_q3_selected_source *source,
   for (size_t i = 0; i < saved->projectile_count; i++) {
     qa_owned_actor actor = saved->projectiles[i].base.actor;
     qa_q3_game_entity *entity = native_of(source, actor.id);
-    if (entity == NULL) qa_range_error("Imported Q3 projectile disappeared");
+    if (entity == NULL) qa_raise("Error", 0, 0, "Imported Q3 projectile disappeared");
     track(source, actor);
     if (entity->s.event != 0) {
       entry_t *entry = map_set(&source->published, actor);
@@ -1346,26 +1405,41 @@ void qa_app_q3_selected_source_restore_legacy(qa_app_q3_selected_source *source,
   set_baseline(source);
 }
 
+typedef struct close_call { source_t *s; double slot; qa_owned_actor actor; } close_call;
+static void close_return_persistent(void *ctx) { close_call *c = ctx; return_persistent(c->s, qa_q3_entity_pool_at(&c->s->pool, c->slot)); }
+static void close_release(void *ctx) { close_call *c = ctx; qa_session_actor_registry_release(c->s->host.actors, c->actor); }
+static void close_missiles(void *ctx) { qa_q3_missile_runtime_close(&((close_call *)ctx)->s->missiles); }
+static void close_records(void *ctx) { qa_q3_base_entity_records_close(((close_call *)ctx)->s->records); }
+static void close_unobserve(void *ctx) { source_t *s = ((close_call *)ctx)->s; qa_session_actor_registry_off_release(s->host.actors, s->unobserve); }
+/* TS close: every step runs, its failure collected; AggregateError "Selected Q3 source close failed" after all. */
 void qa_app_q3_selected_source_close(qa_app_q3_selected_source *source) {
   if (source->closed) return;
-  if (source->depth != 0) qa_range_error("Cannot close selected Q3 during a source call");
+  if (source->depth != 0) qa_raise("Error", 0, 0, "Cannot close selected Q3 during a source call");
+  bool failed = false;
+  qa_caught_error caught;
+  close_call call; memset(&call, 0, sizeof call); call.s = source;
   for (size_t i = 0; i < source->projected.count; i++) {
     entry_t *entry = &source->projected.items[i];
-    if (entry->present && entry->slot < source->host.max_clients)
-      return_persistent(source, qa_q3_entity_pool_at(&source->pool, entry->slot));
+    if (!entry->present || !(entry->slot < source->host.max_clients)) continue;
+    call.slot = entry->slot;
+    if (!qa_try(close_return_persistent, &call, &caught)) failed = true;
   }
   source->closed = true;
   qa_q3_base_ownership_state *ownership = qa_q3_base_entity_records_capture_ownership(source->records);
   if (ownership == NULL) qa_range_error("Out of memory");
+  qa_cleanup ownership_node; qa_cleanup_push(&ownership_node, free, ownership);
   for (size_t slot = 0; slot < QA_Q3_MAX_GENTITIES; slot++) {
     qa_q3_base_ownership_state *record = &ownership[slot];
-    if (record->has_actor && !record->borrowed && is_live(source, record->actor.id))
-      qa_session_actor_registry_release(source->host.actors, record->actor);
+    if (!record->has_actor || record->borrowed || !is_live(source, record->actor.id)) continue;
+    call.actor = record->actor;
+    if (!qa_try(close_release, &call, &caught)) failed = true;
   }
+  qa_cleanup_pop(&ownership_node);
   free(ownership);
-  qa_q3_missile_runtime_close(&source->missiles);
-  qa_q3_base_entity_records_close(source->records);
-  qa_session_actor_registry_off_release(source->host.actors, source->unobserve);
+  if (!qa_try(close_missiles, &call, &caught)) failed = true;
+  if (!qa_try(close_records, &call, &caught)) failed = true;
+  if (!qa_try(close_unobserve, &call, &caught)) failed = true;
   map_clear(&source->projected); map_clear(&source->executing); map_clear(&source->published); map_clear(&source->client_effects);
   clear_presented(source);
+  if (failed) qa_raise("AggregateError", 0, 0, "Selected Q3 source close failed");
 }

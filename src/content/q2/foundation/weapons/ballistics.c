@@ -117,7 +117,8 @@ static bool set_double(qa_q2w_actor_double **a, size_t *n, size_t *cap, qa_actor
 }
 static void del_double(qa_q2w_actor_double *a, size_t *n, qa_actor_id actor) {
   size_t i = find_double(a, *n, actor);
-  if (i < *n) { a[i] = a[*n - 1]; (*n)--; }
+  /* TS Map.delete keeps the insertion order of the rest (captures list it). */
+  if (i < *n) { memmove(&a[i], &a[i + 1], (*n - i - 1) * sizeof *a); (*n)--; }
 }
 qa_q2w_state *qa_q2w_ballistics_state(qa_q2w_ballistics *b, qa_actor_id actor) {
   for (size_t i = 0; i < b->state_count; i++) if (qa_same_actor(b->states[i].actor, actor)) return b->states[i].state;
@@ -145,9 +146,18 @@ bool qa_q2w_ballistics_set_input(qa_q2w_ballistics *b, qa_actor_id actor, qa_q2w
 static void on_release(void *ctx, qa_owned_actor actor) {
   qa_q2w_ballistics *b = ctx;
   for (size_t i = 0; i < b->state_count; i++)
-    if (qa_same_actor(b->states[i].actor, actor.id)) { free(b->states[i].state); b->states[i] = b->states[--b->state_count]; break; }
+    if (qa_same_actor(b->states[i].actor, actor.id)) {
+      free(b->states[i].state);
+      memmove(&b->states[i], &b->states[i + 1], (b->state_count - i - 1) * sizeof *b->states);
+      b->state_count--;
+      break;
+    }
   for (size_t i = 0; i < b->input_count; i++)
-    if (qa_same_actor(b->inputs[i].actor, actor.id)) { b->inputs[i] = b->inputs[--b->input_count]; break; }
+    if (qa_same_actor(b->inputs[i].actor, actor.id)) {
+      memmove(&b->inputs[i], &b->inputs[i + 1], (b->input_count - i - 1) * sizeof *b->inputs);
+      b->input_count--;
+      break;
+    }
   del_double(b->blaster_causes, &b->blaster_cause_count, actor.id);
   del_double(b->silencer_charges, &b->silencer_count, actor.id);
 }
@@ -785,8 +795,10 @@ static void bfg_explode(void *ctx, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2w_ballistics *b = ctx;
   if (rerelease(g)) bfg_ambient(b, e, g);
   if (e->frame == 0) {
+    /* Copied: damage below can run another nearby() query (an exploding
+     * barrel's radius damage), which reuses the host's result storage. */
     size_t count = 0;
-    const qa_actor_id *actors = g->host->nearby(g->host->ctx, g->body(g->ctx, e->actor).origin, e->damage_radius, &count);
+    qa_actor_id *actors = qa_q2_game_nearby_copy(g, g->body(g->ctx, e->actor).origin, e->damage_radius, &count);
     for (size_t i = 0; i < count; i++) {
       qa_actor_id actor = actors[i];
       if ((e->has_owner && qa_same_actor(actor, e->owner)) || !can_hurt(g, true, actor) || !g->can_damage(g->ctx, actor, e->actor)) continue;
@@ -815,6 +827,7 @@ static void bfg_explode(void *ctx, qa_q2_entity *e, qa_q2_game_services *g) {
         b->hooks.emit(b->hooks.ctx, ev);
       }
     }
+    free(actors);
   }
   e->frame++;
   g->show(g->ctx, e);
@@ -853,7 +866,7 @@ static void bfg_think(void *ctx, qa_q2_entity *e, qa_q2_game_services *g) {
   if (rerelease(g)) bfg_ambient(b, e, g);
   qa_vec3 origin = g->body(g->ctx, e->actor).origin;
   size_t count = 0;
-  const qa_actor_id *actors = g->host->nearby(g->host->ctx, origin, 256, &count);
+  qa_actor_id *actors = qa_q2_game_nearby_copy(g, origin, 256, &count); /* copied: see bfg_explode */
   for (size_t i = 0; i < count; i++) {
     qa_actor_id actor = actors[i];
     if (qa_same_actor(actor, e->actor.id) || (e->has_owner && qa_same_actor(actor, e->owner)) || !can_hurt(g, true, actor) || !bfg_target(g, actor)) continue;
@@ -881,6 +894,8 @@ static void bfg_think(void *ctx, qa_q2_entity *e, qa_q2_game_services *g) {
         do_damage(g, target, e, e->actor.id, e->has_owner ? &e->owner : NULL,
                   g->options.mode == QA_Q2_MODE_DEATHMATCH ? 5 : 10, 1, direction, trace.end, zv(),
                   QA_Q2W_MOD_BFG_LASER, true, 4, "q2:weapon_bfg");
+      /* TS asks weaponTarget(target) again here: the damage may have destroyed it. */
+      if (has_target) wt = g->weapon_target(g->ctx, target);
       if (!has_target || (!g->host->is_monster(g->host->ctx, target) && !g->host->is_player(g->host->ctx, target)
           && !(rerelease(g) && wt.has_value && wt.value.damageable_target))) {
         effect(g, "laser-sparks", trace.end, trace_normal(trace), 4, e->skin);
@@ -896,6 +911,7 @@ static void bfg_think(void *ctx, qa_q2_entity *e, qa_q2_game_services *g) {
     ev.end = g->options.edition == QA_Q2_EDITION_RERELEASE ? center : trace.end;
     b->hooks.emit(b->hooks.ctx, ev);
   }
+  free(actors);
   g->schedule(g->ctx, e, 0.1, (qa_q2_think){b, bfg_think});
 }
 static void blaster_impact(void *ctx, qa_q2_entity *e, qa_q2_game_services *g, bool has_other, qa_actor_id other, qa_vec3 plane, bool sky_hit) {
@@ -908,7 +924,8 @@ static void blaster_impact(void *ctx, qa_q2_entity *e, qa_q2_game_services *g, b
   size_t i = find_double(b->blaster_causes, b->blaster_cause_count, e->actor.id);
   if (i >= b->blaster_cause_count) qa_raise("Error", 0, 0, "Q2 blaster projectile lost its source cause");
   double mod = b->blaster_causes[i].value;
-  if (has_other && e->has_owner && qa_same_actor(other, e->owner)) return;
+  /* TS other === entity.owner (null === null included). */
+  if (has_other ? (e->has_owner && qa_same_actor(other, e->owner)) : !e->has_owner) return;
   if (sky_hit) { g->remove(g->ctx, e); return; }
   impact_noise(b, e, g);
   if (can_hurt(g, has_other, other))

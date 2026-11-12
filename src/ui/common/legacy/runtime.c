@@ -119,6 +119,9 @@ struct qa_ui_runtime {
    * runtime owns each until a later setbackground replaces it or destroy. */
   qa_ui_shader_reference **backgrounds;
   size_t background_count, background_capacity;
+  /* definitions.menus when the runtime rebuilt it (appendMenu); a caller's
+     array (create, reloadDefinitions) is borrowed. */
+  qa_ui_menu_definition **owned_menus;
 };
 
 typedef qa_ui_runtime runtime_t;
@@ -137,6 +140,30 @@ static char *dupnstr(const char *text, size_t length) {
   memcpy(copy, text, length);
   copy[length] = '\0';
   return copy;
+}
+
+/* Texts a script command holds across a call that can raise (a nested
+   script, a callback); TS drops them with the frame. */
+typedef struct held_texts {
+  char *text[3];
+  qa_cleanup node;
+} held_texts;
+static void held_texts_free(void *raw) {
+  held_texts *held = raw;
+  for (int i = 0; i < 3; i++) {
+    free(held->text[i]);
+    held->text[i] = NULL;
+  }
+}
+static void held_texts_push(held_texts *held, char *a, char *b, char *c) {
+  held->text[0] = a;
+  held->text[1] = b;
+  held->text[2] = c;
+  qa_cleanup_push(&held->node, held_texts_free, held);
+}
+static void held_texts_pop(held_texts *held) {
+  qa_cleanup_pop(&held->node);
+  held_texts_free(held);
 }
 
 static void opened(runtime_t *rt) {
@@ -939,6 +966,8 @@ static qa_ui_cinematic_asset cinematic_asset(runtime_t *rt, const char *path) {
 
 /* ---- creation ---- */
 
+static void runtime_destroy_cleanup(void *rt) { qa_ui_runtime_destroy(rt); }
+
 qa_ui_runtime *qa_ui_runtime_create(const qa_ui_runtime_options *options) {
   runtime_t *rt = calloc(1, sizeof *rt);
   if (rt == NULL) return NULL;
@@ -949,6 +978,10 @@ qa_ui_runtime *qa_ui_runtime_create(const qa_ui_runtime_options *options) {
       options->source_parser != NULL ? options->source_parser
                                      : &rt->owned_parser;
   rt->capture.kind = CAPTURE_IDLE;
+  /* A missing completed model or a malformed menu raises below (TS create
+     throws); the partly built runtime is freed. */
+  qa_cleanup create_node;
+  qa_cleanup_push(&create_node, runtime_destroy_cleanup, rt);
   bool completed =
       options->definitions.registration_kind == QA_UI_REGISTRATION_COMPLETED;
   for (size_t i = 0; i < options->definitions.registration_event_count; i++)
@@ -975,6 +1008,7 @@ qa_ui_runtime *qa_ui_runtime_create(const qa_ui_runtime_options *options) {
     int32_t item_count = qa_ui_menu_item_count(menu->def);
     for (int32_t j = 0; j < item_count; j++) (void)menu_item_at(rt, menu, j);
   }
+  qa_cleanup_pop(&create_node);
   return rt;
 }
 
@@ -1006,6 +1040,7 @@ void qa_ui_runtime_destroy(qa_ui_runtime *rt) {
   for (size_t i = 0; i < rt->background_count; i++)
     qa_ui_resource_reference_destroy(rt->backgrounds[i]);
   free(rt->backgrounds);
+  free(rt->owned_menus);
   free(rt);
 }
 
@@ -1129,12 +1164,16 @@ void qa_ui_runtime_assert_menu_memory(
 }
 
 static void sync_definitions_menus(runtime_t *rt) {
-  /* TS rebuilds definitions.menus from the active menu states. */
+  /* TS rebuilds definitions.menus from the active menu states; the array it
+     replaces is freed when the runtime made it (each menu load). */
   qa_ui_menu_definition **menus =
       malloc((size_t)(rt->active_menu_count > 0 ? rt->active_menu_count : 1) *
              sizeof *menus);
+  if (menus == NULL) qa_range_error("UI runtime allocation failed");
   for (int64_t i = 0; i < rt->active_menu_count; i++)
     menus[i] = rt->menus[i]->def;
+  free(rt->owned_menus);
+  rt->owned_menus = menus;
   rt->definitions.menus = menus;
   rt->definitions.menu_count = (size_t)rt->active_menu_count;
 }
@@ -1214,6 +1253,8 @@ void qa_ui_runtime_reload_definitions(
     }
   }
   rt->definitions = *definitions;
+  free(rt->owned_menus);
+  rt->owned_menus = NULL;
   for (size_t i = 0; i < definitions->menu_count; i++) {
     qa_ui_menu_definition *def = definitions->menus[i];
     if (def == NULL) continue;
@@ -1363,7 +1404,10 @@ static bool activate_impl(runtime_t *rt, const char *name,
     }
     if (requested != NULL && equal_name(menu_name, requested)) {
       activated = menu;
-      activate_menu(rt, menu);
+      held_texts held;
+      held_texts_push(&held, menu_name, requested_copy, NULL);
+      activate_menu(rt, menu); /* onOpen can raise (exec, a callback) */
+      qa_cleanup_pop(&held.node);
       if (focus != NULL && rt->open_count < MAX_OPEN_MENUS)
         open_stack_push(rt, focus);
     } else {
@@ -1574,9 +1618,11 @@ static void script_set_color(item_state *item, qa_ui_script_cursor *cursor) {
 
 static void script_open(runtime_t *rt, qa_ui_script_cursor *cursor) {
   cursor_string name = cursor_string_read(cursor);
+  held_texts held;
+  held_texts_push(&held, name.text, NULL, NULL);
   if (name.kind != QA_UI_SCRIPT_STRING_NONE)
     (void)qa_ui_runtime_activate(rt, name.text);
-  free(name.text);
+  held_texts_pop(&held);
 }
 
 static void script_conditional_open(runtime_t *rt,
@@ -1594,21 +1640,23 @@ static void script_conditional_open(runtime_t *rt,
     free(first.text);
     return;
   }
+  held_texts held;
+  held_texts_push(&held, cvar.text, first.text, second.text);
   if (cvar.kind == QA_UI_SCRIPT_STRING_NULL)
     qa_ui_script_plain_error("Cvar_VariableValue hashes NULL in Cvar_FindVar");
   double value = cvar_value(rt, cvar.text);
   cursor_string *selected = value == 0 ? &second : &first;
   (void)qa_ui_runtime_activate(rt, selected->text);
-  free(cvar.text);
-  free(first.text);
-  free(second.text);
+  held_texts_pop(&held);
 }
 
 static void script_close(runtime_t *rt, qa_ui_script_cursor *cursor) {
   cursor_string name = cursor_string_read(cursor);
+  held_texts held;
+  held_texts_push(&held, name.text, NULL, NULL);
   if (name.kind == QA_UI_SCRIPT_STRING_TEXT)
     (void)qa_ui_runtime_close(rt, name.text);
-  free(name.text);
+  held_texts_pop(&held);
 }
 
 static void adopt_background(runtime_t *rt, qa_ui_resource_reference *previous,
@@ -1633,6 +1681,8 @@ static void script_set_background(runtime_t *rt, item_state *item,
                                   qa_ui_script_cursor *cursor) {
   cursor_string path = cursor_string_read(cursor);
   if (path.kind == QA_UI_SCRIPT_STRING_NONE) return;
+  held_texts held;
+  held_texts_push(&held, path.text, NULL, NULL);
   qa_picture_asset background;
   bool has = rt->options.resources.register_picture(
       rt->options.resources.ctx, path.text, &background);
@@ -1656,7 +1706,7 @@ static void script_set_background(runtime_t *rt, item_state *item,
   char *key = resource_key(path.text);
   pictures_set(rt, key, has, &background);
   free(key);
-  free(path.text);
+  held_texts_pop(&held);
 }
 
 static void script_set_item_color(runtime_t *rt, script_owner owner,
@@ -1786,12 +1836,13 @@ static void script_set_cvar(runtime_t *rt, qa_ui_script_cursor *cursor,
     if (read_name) free(name.text);
     return;
   }
+  held_texts held;
+  held_texts_push(&held, read_name ? name.text : NULL, value.text, NULL);
   if (value.kind == QA_UI_SCRIPT_STRING_NULL)
     set_cvar(rt, name.text, NULL, true);
   else
     set_cvar(rt, name.text, value.text, true);
-  if (read_name) free(name.text);
-  free(value.text);
+  held_texts_pop(&held);
 }
 
 static void script_exec(runtime_t *rt, qa_ui_script_cursor *cursor) {
@@ -1805,6 +1856,8 @@ static void script_exec(runtime_t *rt, qa_ui_script_cursor *cursor) {
 
 static void script_play(runtime_t *rt, qa_ui_script_cursor *cursor) {
   cursor_string path = cursor_string_read(cursor);
+  held_texts held;
+  held_texts_push(&held, path.text, NULL, NULL);
   if (path.kind != QA_UI_SCRIPT_STRING_NONE) {
     qa_pcm_sound sound;
     bool has = rt->options.resources.register_sound(
@@ -1814,16 +1867,18 @@ static void script_play(runtime_t *rt, qa_ui_script_cursor *cursor) {
     free(key);
     play_local_sound(rt, has ? sounds_get(rt, path.text) : NULL);
   }
-  free(path.text);
+  held_texts_pop(&held);
 }
 
 static void script_play_looped(runtime_t *rt, qa_ui_script_cursor *cursor) {
   cursor_string path = cursor_string_read(cursor);
   if (path.kind == QA_UI_SCRIPT_STRING_NONE) return;
+  held_texts held;
+  held_texts_push(&held, path.text, NULL, NULL);
   rt->options.audio.stop_background(rt->options.audio.ctx);
   opened(rt);
   start_background(rt, path.text);
-  free(path.text);
+  held_texts_pop(&held);
 }
 
 typedef struct transition_ctx {
@@ -2001,6 +2056,16 @@ static bool run_shared_command(runtime_t *rt, script_owner owner,
   return true;
 }
 
+typedef struct script_frame {
+  runtime_t *rt;
+  qa_ui_script_cursor *cursor;
+} script_frame;
+static void script_frame_leave(void *raw) {
+  script_frame *frame = raw;
+  script_cursor_destroy(frame->cursor);
+  frame->rt->script_depth--;
+}
+
 static void run_script(runtime_t *rt, menu_state *menu, item_state *item,
                        qa_ui_menu_script *script) {
   char *text = qa_ui_menu_script_text(script);
@@ -2020,22 +2085,27 @@ static void run_script(runtime_t *rt, menu_state *menu, item_state *item,
   qa_ui_script_cursor *cursor =
       script_cursor_create(text, rt->source_parser, rt->definitions.memory);
   free(text);
+  /* TS try/finally: a command that raises (exec, a callback, a nested
+     script) still restores the depth and drops the cursor. */
+  script_frame frame = {rt, cursor};
+  qa_cleanup frame_node;
+  qa_cleanup_push(&frame_node, script_frame_leave, &frame);
   for (;;) {
     cursor_string command = cursor_string_read(cursor);
     if (command.kind == QA_UI_SCRIPT_STRING_NONE) break;
-    if (command.kind == QA_UI_SCRIPT_STRING_NULL) {
-      script_cursor_destroy(cursor);
+    if (command.kind == QA_UI_SCRIPT_STRING_NULL)
       qa_ui_script_plain_error(
           "Item_RunScript dereferences NULL command after String_Alloc");
-    }
     if (strcmp(command.text, ";") == 0) {
       free(command.text);
       continue;
     }
     char *lower = ascii_lower(command.text);
     free(command.text);
+    held_texts held_command;
+    held_texts_push(&held_command, lower, NULL, NULL);
     bool handled = run_shared_command(rt, owner, lower, cursor);
-    free(lower);
+    held_texts_pop(&held_command);
     if (!handled) {
       menu_state *owner_menu = script_menu(rt, owner);
       char *menu_name = owner_menu == NULL
@@ -2043,15 +2113,16 @@ static void run_script(runtime_t *rt, menu_state *menu, item_state *item,
                             : qa_ui_window_name(&owner_menu->def->window);
       char *item_name =
           item == NULL ? NULL : qa_ui_window_name(&item->def->window);
+      held_texts held;
+      held_texts_push(&held, menu_name, item_name, NULL);
       qa_ui_external_script_context context = {menu_name, item_name};
       rt->options.external_script.run(rt->options.external_script.ctx,
                                       cursor, context);
-      free(menu_name);
-      free(item_name);
+      held_texts_pop(&held);
     }
   }
-  script_cursor_destroy(cursor);
-  rt->script_depth--;
+  qa_cleanup_pop(&frame_node);
+  script_frame_leave(&frame);
 }
 
 void qa_ui_runtime_run_menu_script(qa_ui_runtime *rt, const char *menu_name,
@@ -2700,7 +2771,8 @@ static bool handle_list_key(runtime_t *rt, item_state *item, int32_t key,
   bool page_up = key == QA_KEY_PAGE_UP || key == QA_KEY_KEYPAD_PAGE_UP;
   bool page_down = key == QA_KEY_PAGE_DOWN || key == QA_KEY_KEYPAD_PAGE_DOWN;
   if (page_up || page_down) {
-    int32_t amount = page_up ? -view : view;
+    /* TS -view of INT32_MIN is 2^31; the int32 sum below wraps the same. */
+    int32_t amount = page_up ? i32_sub(0, view) : view;
     if (!not_selectable) {
       qa_ui_list_set_cursor_position(
           &list, i32_add(qa_ui_list_cursor_position(&list), amount));
@@ -3256,7 +3328,7 @@ void qa_ui_runtime_set_feeder_selection(qa_ui_runtime *rt, double feeder,
                                         double index,
                                         const char *menu_name) {
   opened(rt);
-  if (!isfinite(feeder) || index != trunc(index))
+  if (!isfinite(feeder) || !isfinite(index) || index != trunc(index))
     qa_range_error("Invalid feeder selection");
   menu_state *menu =
       menu_name == NULL ? focused_menu(rt) : find_menu(rt, menu_name);
@@ -3268,7 +3340,7 @@ void qa_ui_runtime_set_captured_feeder_selection(
     qa_ui_runtime *rt, qa_ui_captured_menu *handle, double feeder,
     double index) {
   opened(rt);
-  if (!isfinite(feeder) || index != trunc(index))
+  if (!isfinite(feeder) || !isfinite(index) || index != trunc(index))
     qa_range_error("Invalid feeder selection");
   select_feeder(rt, captured_menu(rt, handle), feeder, index);
 }
@@ -3350,7 +3422,10 @@ static void run_capture(runtime_t *rt) {
                        QA_UI_WINDOW_HORIZONTAL) != 0;
     qa_rect rect = qa_ui_window_rect(&capture->item->def->window);
     if (horizontal) {
-      if (rt->display_cursor_x != capture->x_start) {
+      /* TS returns here: an unmoved horizontal thumb skips the scroll
+         timers below. */
+      if (rt->display_cursor_x == capture->x_start) return;
+      {
         double width = FR(FR(rect.width - SCROLLBAR_SIZE * 2) - 2);
         double start = FR(FR(rect.x + SCROLLBAR_SIZE) + 1);
         int32_t maximum = list_maximum(rt, capture->item);
@@ -3836,12 +3911,17 @@ static void paint_text_field(runtime_t *rt, item_state *item,
   }
   qa_rect text_rect = qa_ui_item_text_rect(item->def);
   int32_t paint_offset = qa_ui_edit_paint_offset(&edit);
-  const char *shown = value;
-  if (paint_offset > 0) {
-    size_t length = strlen(value);
-    shown = (size_t)paint_offset <= length ? value + paint_offset
-                                            : value + length;
+  /* TS value.slice(paintOffset): a negative offset counts from the end. */
+  size_t value_length = strlen(value);
+  size_t start;
+  if (paint_offset < 0) {
+    int64_t from_end = (int64_t)value_length + paint_offset;
+    start = from_end < 0 ? 0 : (size_t)from_end;
+  } else {
+    start = (size_t)paint_offset < value_length ? (size_t)paint_offset
+                                                 : value_length;
   }
+  const char *shown = value + start;
   qa_q3_text_paint_options options;
   options.x = FR(FR(text_rect.x + text_rect.width) + offset);
   options.y = text_rect.y;
@@ -4137,9 +4217,8 @@ static void paint_list(runtime_t *rt, item_state *item,
     qa_draw2d_draw_handle_pic(
         draw, arrow_right,
         &rt->options.widget_assets.scroll_bar_arrow_right);
-    double thumb = FR((double)list_thumb_draw_position(rt, item));
-    double thumb_max = FR(FR(x - SCROLLBAR_SIZE) - 1);
-    if (thumb > thumb_max) thumb = thumb_max;
+    double thumb = qa_js_min(FR((double)list_thumb_draw_position(rt, item)),
+                             FR(FR(x - SCROLLBAR_SIZE) - 1));
     qa_rect thumb_rect = {thumb, y, SCROLLBAR_SIZE, SCROLLBAR_SIZE};
     qa_draw2d_draw_handle_pic(draw, thumb_rect,
                               &rt->options.widget_assets.scroll_bar_thumb);
@@ -4199,9 +4278,8 @@ static void paint_list(runtime_t *rt, item_state *item,
   qa_rect arrow_down = {x, y, SCROLLBAR_SIZE, SCROLLBAR_SIZE};
   qa_draw2d_draw_handle_pic(
       draw, arrow_down, &rt->options.widget_assets.scroll_bar_arrow_down);
-  double thumb = FR((double)list_thumb_draw_position(rt, item));
-  double thumb_max = FR(FR(y - SCROLLBAR_SIZE) - 1);
-  if (thumb > thumb_max) thumb = thumb_max;
+  double thumb = qa_js_min(FR((double)list_thumb_draw_position(rt, item)),
+                           FR(FR(y - SCROLLBAR_SIZE) - 1));
   qa_rect thumb_rect = {x, thumb, SCROLLBAR_SIZE, SCROLLBAR_SIZE};
   qa_draw2d_draw_handle_pic(draw, thumb_rect,
                             &rt->options.widget_assets.scroll_bar_thumb);

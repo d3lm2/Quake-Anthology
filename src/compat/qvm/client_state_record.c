@@ -143,7 +143,7 @@ static void write_player_state(qa_qvmx_view view, const qa_q3_player_state *stat
   } else if (!modern(profile)) {
     for (size_t i = 9; i < state->powerups.count; i++)
       if (state->powerups.values[i] != 0)
-        qa_range_error("Legacy ball or private powerup has no modern presentation mapping");
+        qa_raise("Error", 0, 0, "Legacy ball or private powerup has no modern presentation mapping");
   }
   qa_qvmx_write_source_player_state(view, &translated, profile);
 }

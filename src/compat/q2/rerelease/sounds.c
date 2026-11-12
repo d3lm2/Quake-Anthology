@@ -34,7 +34,7 @@ bool qa_compat_q2_rerelease_sound_imports_invoke(qa_compat_q2_rerelease_sound_im
   double floats[3];
   for (int i = 0; i < 3; i++) {
     const qa_guest_call_value *v = qa_compat_q2_guest_argument(args, count, offset + 3 + (size_t)i);
-    if (v->kind != QA_GUEST_VALUE_FLOAT32) qa_range_error("Q2 sound requires a source float");
+    if (v->kind != QA_GUEST_VALUE_FLOAT32) qa_raise("TypeError", 0, 0, "Q2 sound requires a source float");
     floats[i] = v->number_value;
   }
   event.volume = floats[0]; event.attenuation = floats[1]; event.time_offset = floats[2];

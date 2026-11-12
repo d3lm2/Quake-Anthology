@@ -21,10 +21,12 @@ qa_app_sim_source_random *qa_app_sim_source_random_create(double seed, const cha
   r->front = 3; r->rear = 0;
   if (profile != NULL && strcmp(profile, "q2-rerelease") == 0) {
     r->has_rerelease = true;
-    qa_q2_rerelease_random_init(&r->rerelease, qa_js_to_uint32(seed));
+    /* new Q2RereleaseRandom(seed) */
+    if (seed != trunc(seed) || seed < 0 || seed >= 4294967296.0) { free(r); qa_range_error("MT19937 seed must be uint32"); }
+    qa_q2_rerelease_random_init(&r->rerelease, (uint32_t)seed);
     return r;
   }
-  if (seed != trunc(seed) || seed < 0 || seed > 4294967295.0) qa_range_error("Source random seed must be uint32");
+  if (seed != trunc(seed) || seed < 0 || seed > 4294967295.0) { free(r); qa_range_error("Source random seed must be uint32"); }
   int32_t word = (int32_t)qa_js_to_uint32(seed == 0 ? 1 : seed);
   r->words[0] = word;
   for (int i = 1; i < 31; i++) {
@@ -59,11 +61,11 @@ qa_app_sim_source_random_state qa_app_sim_source_random_checkpoint(qa_app_sim_so
 }
 void qa_app_sim_source_random_restore(qa_app_sim_source_random *r, qa_app_sim_source_random_state state) {
   if (state.kind != NULL && strcmp(state.kind, "q2-rerelease-mt19937") == 0) {
-    if (!r->has_rerelease) qa_range_error("Rerelease random state cannot restore a classic source stream");
+    if (!r->has_rerelease) qa_raise("Error", 0, 0, "Rerelease random state cannot restore a classic source stream");
     qa_q2_rerelease_random_restore(&r->rerelease, &state.rerelease);
     return;
   }
-  if (r->has_rerelease) qa_range_error("Classic random state cannot restore a rerelease source stream");
+  if (r->has_rerelease) qa_raise("Error", 0, 0, "Classic random state cannot restore a rerelease source stream");
   if (state.front < 0 || state.front >= 31 || state.rear < 0 || state.rear >= 31)
     qa_range_error("Invalid source random state");
   memcpy(r->words, state.words, sizeof r->words); r->front = state.front; r->rear = state.rear; r->draws = state.draws;

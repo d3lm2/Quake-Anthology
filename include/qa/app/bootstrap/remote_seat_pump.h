@@ -8,11 +8,12 @@
 #ifndef QA_APP_BOOTSTRAP_REMOTE_SEAT_PUMP_H
 #define QA_APP_BOOTSTRAP_REMOTE_SEAT_PUMP_H
 #include <stdbool.h>
+#include "qa/foundation/support.h"
 typedef struct qa_app_remote_seat_pump_source {
   void *ctx;
-  /* Returns error message (borrowed) or NULL. The retirement error
-   * pointer compares equal to qa_app_remote_seat_pump_retirement_error. */
-  const char *(*network_poll)(void *ctx, double now_milliseconds);
+  /* Returns the caught error (borrowed until the next call) or NULL. The retirement
+   * error is an Error whose message is qa_app_remote_seat_pump_retirement_error_text. */
+  const qa_caught_error *(*network_poll)(void *ctx, double now_milliseconds);
   void (*close)(void *ctx);
 } qa_app_remote_seat_pump_source;
 typedef struct qa_app_remote_seat_publication {
@@ -26,7 +27,7 @@ extern const char qa_app_remote_seat_pump_retirement_error_text[];
 qa_app_remote_seat_pump *qa_app_remote_seat_pump_create(qa_app_remote_seat_pump_source source);
 void qa_app_remote_seat_pump_destroy(qa_app_remote_seat_pump *p);
 void qa_app_remote_seat_pump_poll(qa_app_remote_seat_pump *p, double now_milliseconds);
-void qa_app_remote_seat_pump_throw_failure(qa_app_remote_seat_pump *p); /* aborts with stored failure */
+void qa_app_remote_seat_pump_throw_failure(qa_app_remote_seat_pump *p); /* rethrows the stored failure, class kept */
 /* Returns false when closed (TS rejected promise with retirementError;
  * reject is invoked immediately). */
 bool qa_app_remote_seat_pump_enqueue(qa_app_remote_seat_pump *p, qa_app_remote_seat_publication publication);

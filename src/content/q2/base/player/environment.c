@@ -51,8 +51,9 @@ void qa_q2_world_effects(qa_q2_character_context *context) {
   if (level == 3) {
     if (breather || suit) {
       state->air_finished = now + 10;
-      int64_t remaining = (int64_t)qa_js_round((powers.breather_until - now) * 10);
-      if (remaining % 25 == 0) {
+      /* JS %: a non-finite remainder is NaN and never equals 0 (no integer cast). */
+      double remaining = qa_js_round((powers.breather_until - now) * 10);
+      if (fmod(remaining, 25) == 0) {
         play(context, state->breather_sound == 0 ? "player/u_breath1.wav" : "player/u_breath2.wav", 0);
         state->breather_sound = (double)(qa_js_to_int32(state->breather_sound) ^ 1);
         noise(context);

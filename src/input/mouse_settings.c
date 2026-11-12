@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/core/cvars/setting_declarations.h"
 #include "qa/input/support.h"
 
 static void register_unless_present(qa_cvar_registry *cvars, const char *name,
@@ -21,12 +22,39 @@ static void register_unless_present(qa_cvar_registry *cvars, const char *name,
   }
 }
 
+/* The cvar registry borrows documentation (summary, usage, examples), so it
+ * lives in static storage: "<name> [value]" usage texts and one example each. */
 typedef struct declaration {
   const char *name;
-  double value;
   const char *summary;
-  const char *example;
+  const char *usage;
+  const char *const examples[1];
 } declaration;
+
+static const declaration DECLARATIONS[] = {
+    {"sensitivity", "Mouse sensitivity multiplier for this seat.", "sensitivity [value]", {"sensitivity 4.5"}},
+    {"cl_mouseAccel",
+     "Mouse acceleration added per count per millisecond. Shared extension "
+     "outside Quake III.",
+     "cl_mouseAccel [value]", {"cl_mouseAccel 0"}},
+    {"m_filter", "Mouse smoothing averages the current and previous mouse sample.", "m_filter [value]",
+     {"m_filter 1"}},
+    {"m_yaw", "Mouse horizontal turn scale in degrees per scaled count.", "m_yaw [value]", {"m_yaw 0.022"}},
+    {"m_pitch",
+     "Mouse vertical turn scale. Negative values enable Invert mouse in the "
+     "menu.",
+     "m_pitch [value]", {"m_pitch -0.022"}},
+    {"m_side", "Mouse sideways movement scale while strafing.", "m_side [value]", {"m_side 0.8"}},
+    {"m_forward", "Mouse forward movement scale when free look is disabled or strafing.", "m_forward [value]",
+     {"m_forward 1"}},
+    {"lookspring", "Start grounded pitch centering when mouse look is released.", "lookspring [value]",
+     {"lookspring 1"}},
+    {"lookstrafe", "Mouse horizontal motion strafes while holding mouse look.", "lookstrafe [value]",
+     {"lookstrafe 1"}},
+    {"freelook",
+     "Mouse vertical motion controls view pitch without holding +mlook. Shared "
+     "name across games.",
+     "freelook [value]", {"freelook 1"}}};
 
 void qa_mouse_settings_init(qa_mouse_settings *settings, qa_cvar_registry *cvars) {
   settings->cvars = cvars;
@@ -38,52 +66,23 @@ void qa_mouse_settings_init(qa_mouse_settings *settings, qa_cvar_registry *cvars
   for (size_t i = 0; i < sizeof center / sizeof center[0]; i++) {
     register_unless_present(cvars, center[i].name, center[i].value, QA_CVAR_FLAG_NONE);
   }
-  const declaration declarations[] = {
-      {"sensitivity", defaults->sensitivity,
-       "Mouse sensitivity multiplier for this seat.", "sensitivity 4.5"},
-      {"cl_mouseAccel", defaults->acceleration,
-       "Mouse acceleration added per count per millisecond. Shared extension "
-       "outside Quake III.",
-       "cl_mouseAccel 0"},
-      {"m_filter", defaults->filter ? 1 : 0,
-       "Mouse smoothing averages the current and previous mouse sample.",
-       "m_filter 1"},
-      {"m_yaw", defaults->yaw,
-       "Mouse horizontal turn scale in degrees per scaled count.", "m_yaw 0.022"},
-      {"m_pitch", defaults->pitch,
-       "Mouse vertical turn scale. Negative values enable Invert mouse in the "
-       "menu.",
-       "m_pitch -0.022"},
-      {"m_side", defaults->side,
-       "Mouse sideways movement scale while strafing.", "m_side 0.8"},
-      {"m_forward", defaults->forward,
-       "Mouse forward movement scale when free look is disabled or strafing.",
-       "m_forward 1"},
-      {"lookspring", 0,
-       "Start grounded pitch centering when mouse look is released.",
-       "lookspring 1"},
-      {"lookstrafe", 0, "Mouse horizontal motion strafes while holding mouse look.",
-       "lookstrafe 1"},
-      {"freelook", defaults->free_look ? 1 : 0,
-       "Mouse vertical motion controls view pitch without holding +mlook. Shared "
-       "name across games.",
-       "freelook 1"}};
-  for (size_t i = 0; i < sizeof declarations / sizeof declarations[0]; i++) {
-    char *text = qa_input_js_number(declarations[i].value);
-    register_unless_present(cvars, declarations[i].name, text != NULL ? text : "",
+  const double values[sizeof DECLARATIONS / sizeof DECLARATIONS[0]] = {
+      defaults->sensitivity, defaults->acceleration, defaults->filter ? 1 : 0, defaults->yaw, defaults->pitch,
+      defaults->side,        defaults->forward,      0,                       0,             defaults->free_look ? 1 : 0};
+  for (size_t i = 0; i < sizeof DECLARATIONS / sizeof DECLARATIONS[0]; i++) {
+    char *text = qa_input_js_number(values[i]);
+    register_unless_present(cvars, DECLARATIONS[i].name, text != NULL ? text : "",
                             QA_CVAR_FLAG_ARCHIVE);
     free(text);
-    char usage[64];
-    snprintf(usage, sizeof usage, "%s [value]", declarations[i].name);
-    const char *examples[] = {declarations[i].example};
     qa_command_documentation documentation;
     memset(&documentation, 0, sizeof documentation);
-    documentation.summary = declarations[i].summary;
-    documentation.usage = usage;
-    documentation.examples = examples;
+    documentation.summary = DECLARATIONS[i].summary;
+    documentation.usage = DECLARATIONS[i].usage;
+    documentation.examples = DECLARATIONS[i].examples;
     documentation.example_count = 1;
-    qa_cvar_registry_document(cvars, declarations[i].name, documentation);
+    qa_cvar_registry_document(cvars, DECLARATIONS[i].name, documentation);
   }
+  qa_register_setting_aliases(cvars, QA_ENGINE_SETTING_INPUT);
 }
 
 qa_mouse_tuning qa_mouse_settings_read(const qa_mouse_settings *settings) {
@@ -108,12 +107,14 @@ qa_mouse_tuning qa_mouse_settings_read(const qa_mouse_settings *settings) {
   tuning.filter = filter;
   tuning.yaw = qa_cvar_registry_variable_value(cvars, "m_yaw");
   tuning.pitch = fabs(pitch);
-  tuning.invert_pitch = pitch < 0 || signbit(pitch);
+  /* pitch < 0 || Object.is(pitch, -0): a NaN with its sign bit set is neither. */
+  tuning.invert_pitch = pitch < 0 || (pitch == 0 && signbit(pitch));
   tuning.side = qa_cvar_registry_variable_value(cvars, "m_side");
   tuning.forward = qa_cvar_registry_variable_value(cvars, "m_forward");
   tuning.free_look = qa_cvar_registry_variable_value(cvars, "freelook") != 0;
   tuning.look_spring = qa_cvar_registry_variable_value(cvars, "lookspring") != 0;
   tuning.look_strafe = qa_cvar_registry_variable_value(cvars, "lookstrafe") != 0;
+  tuning.key_order = QA_MOUSE_KEYS_CVARS; /* read()'s object literal order */
   return tuning;
 }
 

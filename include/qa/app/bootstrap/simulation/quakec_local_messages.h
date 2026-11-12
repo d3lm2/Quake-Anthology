@@ -1,7 +1,9 @@
 /* Port of src/app/bootstrap/simulation/quakec-local-messages.ts.
- * Retained messages are stored by value; their text pointers borrow
- * the caller's decoded messages. A mirror of this class exists in
- * include/qa/compat/qc/mod_messages.h. GPL-2.0-or-later. */
+ * Retained messages are stored by value (tables grow like the TS Maps); each table owns deep
+ * copies of its messages' text, so a caller's messages need only live for the call. Pointers
+ * handed out (capture, presentation, prompt, session state) borrow the tables until the next
+ * receive, restore or retire. A mirror of this class exists in include/qa/compat/qc/mod_messages.h.
+ * GPL-2.0-or-later. */
 #ifndef QA_APP_BOOTSTRAP_SIMULATION_QUAKEC_LOCAL_MESSAGES_H
 #define QA_APP_BOOTSTRAP_SIMULATION_QUAKEC_LOCAL_MESSAGES_H
 #include <stdbool.h>

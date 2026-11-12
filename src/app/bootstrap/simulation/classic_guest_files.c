@@ -3,17 +3,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "qa/foundation/support.h"
+#include "qa/content/archive/types.h"
 #include "qa/platform/files/contained.h"
-
-#define MAXIMUM_FILE_BYTES (64.0 * 1024 * 1024)
-#define MAXIMUM_GROWTH_BYTES (512.0 * 1024 * 1024)
-#define MAXIMUM_WRITTEN_FILES 256
 
 static bool safe_integer(double value) { return value == trunc(value) && fabs(value) <= 9007199254740991.0; }
 void qa_app_sim_classic_guest_file_position(double offset, double length) {
@@ -26,7 +24,10 @@ char *qa_app_sim_classic_guest_file_name(const char *path) {
   out[n] = '\0';
   char *start = out; while (strncmp(start, "./", 2) == 0) start += 2;
   if (start != out) memmove(out, start, strlen(start) + 1);
+  /* containedFileParts(name) refuses a path outside the root; the normalized name is released with the refusal. */
+  qa_cleanup node; qa_cleanup_push(&node, free, out);
   size_t count = 0; char **parts = qa_contained_file_parts(out, &count);
+  qa_cleanup_pop(&node);
   qa_contained_file_parts_free(parts, count);
   return out;
 }
@@ -54,13 +55,12 @@ typedef struct native_file {
   /* mounted resource */
   const uint8_t *bytes; size_t length; bool closed;
   /* descriptor-backed */
-  int fd; bool owned; bool read, write; double high_water;
+  int fd; bool owned; bool read, write;
   struct native_file *next;
 } native_file;
 struct qa_app_sim_classic_guest_files {
   const char *root;
   const qa_app_sim_classic_guest_resource *resources; size_t resource_count;
-  double grown; int written_files;
   native_file *files;
 };
 
@@ -72,38 +72,31 @@ static size_t file_read(void *ctx, size_t offset, uint8_t *out, size_t length) {
   qa_app_sim_classic_guest_file_position((double)offset, (double)length);
   int fd = fd_of(f);
   ssize_t count = pread(fd, out, length, (off_t)offset);
-  if (count < 0) fail(strerror(errno));
+  if (count < 0) qa_content_fs_error(errno, "read", NULL);
   return (size_t)count;
 }
 static int64_t file_write(void *ctx, size_t offset, const uint8_t *bytes, size_t length) {
   native_file *f = ctx;
   if (!f->write) fail("Native file is not writable");
   qa_app_sim_classic_guest_file_position((double)offset, (double)length);
-  double end = (double)offset + (double)length, growth = end - f->high_water > 0 ? end - f->high_water : 0;
-  /* Past a quota the guest sees a short write, as on a full disk. */
-  if (end > MAXIMUM_FILE_BYTES || f->owner->grown + growth > MAXIMUM_GROWTH_BYTES) return 0;
   int fd = fd_of(f);
   ssize_t written = pwrite(fd, bytes, length, (off_t)offset);
-  if (written < 0) fail(strerror(errno));
-  f->owner->grown += growth;
-  if ((double)offset + (double)written > f->high_water) f->high_water = (double)offset + (double)written;
+  if (written < 0) qa_content_fs_error(errno, "write", NULL);
   return written;
 }
 static int64_t file_size(void *ctx) {
   native_file *f = ctx; struct stat st; int fd = fd_of(f);
-  if (fstat(fd, &st) != 0) fail(strerror(errno));
+  if (fstat(fd, &st) != 0) qa_content_fs_error(errno, "fstat", NULL);
   return (int64_t)st.st_size;
 }
 static void file_truncate(void *ctx, size_t length) {
   native_file *f = ctx;
   if (!f->write) fail("Native file is not writable");
   qa_app_sim_classic_guest_file_position((double)length, 0);
-  if ((double)length > MAXIMUM_FILE_BYTES) return;
   int fd = fd_of(f);
-  if (ftruncate(fd, (off_t)length) != 0) fail(strerror(errno));
-  f->high_water = (double)length;
+  if (ftruncate(fd, (off_t)length) != 0) qa_content_fs_error(errno, "ftruncate", NULL);
 }
-static void file_flush(void *ctx) { native_file *f = ctx; int fd = fd_of(f); if (fsync(fd) != 0) fail(strerror(errno)); }
+static void file_flush(void *ctx) { native_file *f = ctx; int fd = fd_of(f); if (fsync(fd) != 0) qa_content_fs_error(errno, "fsync", NULL); }
 static void file_close(void *ctx) { native_file *f = ctx; if (f->owned) { int current = f->fd; f->owned = false; f->fd = -1; close(current); } }
 
 static void check_open(native_file *f) { if (f->closed) fail("Native file is closed"); }
@@ -136,9 +129,13 @@ static native_file *add_file(qa_app_sim_classic_guest_files *files) {
 
 typedef struct open_parent { const char *root, *name; bool create; int descriptor; char *leaf; } open_parent;
 static void run_open_parent(void *ctx) { open_parent *p = ctx; p->descriptor = qa_open_contained_parent(p->root, p->name, p->create, &p->leaf); }
+/* error.code is ENOENT, EEXIST, EACCES, ELOOP or ENOTDIR. The contained-file helpers and this file's own open and
+ * fstat raise the Node text ("ENOTDIR: not a directory, open '...'"); an unlisted code is strerror text. */
 static bool recoverable_message(const char *message) {
   static const int codes[] = {ENOENT, EEXIST, EACCES, ELOOP, ENOTDIR};
-  for (size_t i = 0; i < sizeof codes / sizeof *codes; i++) if (strcmp(message, strerror(codes[i])) == 0) return true;
+  static const char *const names[] = {"ENOENT: ", "EEXIST: ", "EACCES: ", "ELOOP: ", "ENOTDIR: "};
+  for (size_t i = 0; i < sizeof codes / sizeof *codes; i++)
+    if (strcmp(message, strerror(codes[i])) == 0 || strncmp(message, names[i], strlen(names[i])) == 0) return true;
   return false;
 }
 static qa_windows_file *mounted_or_null(qa_app_sim_classic_guest_files *files, const char *name, bool write, int creation) {
@@ -156,9 +153,12 @@ qa_windows_file *qa_app_sim_classic_guest_files_open(void *ctx, const char *path
   qa_app_sim_classic_guest_files *files = ctx;
   char *name = qa_app_sim_classic_guest_file_name(path);
   qa_app_sim_classic_guest_file_options options = {(double)creation, read, write};
-  if (!qa_app_sim_classic_guest_file_allowed(options)) { free(name); return NULL; }
+  qa_cleanup name_node; qa_cleanup_push(&name_node, free, name);
+  bool allowed = qa_app_sim_classic_guest_file_allowed(options);
+  qa_cleanup_pop(&name_node);
+  if (!allowed) { free(name); return NULL; }
   /* A refused open reads as a missing file to the guest. */
-  if (write && (protected_write(name) || files->written_files >= MAXIMUM_WRITTEN_FILES)) { free(name); return NULL; }
+  if (write && protected_write(name)) { free(name); return NULL; }
   open_parent parent = {files->root, name, write && creation != 3 && creation != 5, -1, NULL};
   qa_caught_error caught;
   if (!qa_try(run_open_parent, &parent, &caught)) {
@@ -171,20 +171,38 @@ qa_windows_file *qa_app_sim_classic_guest_files_open(void *ctx, const char *path
   if (creation == 2) flags |= O_CREAT | O_TRUNC;
   if (creation == 4) flags |= O_CREAT;
   if (creation == 5) flags |= O_TRUNC;
+  /* TS openSync(`/proc/self/fd/${parent.descriptor}/${parent.leaf}`): Node names that path in its error. */
   int descriptor = openat(parent.descriptor, parent.leaf, flags | O_NOFOLLOW | O_NONBLOCK, 0600);
   int code = errno;
-  close(parent.descriptor); free(parent.leaf);
+  const char *syscall = "open";
+  struct stat st;
+  if (descriptor >= 0 && fstat(descriptor, &st) != 0) { code = errno; syscall = "fstat"; close(descriptor); descriptor = -2; }
   if (descriptor < 0) {
-    if (!recoverable_message(strerror(code))) { free(name); qa_raise("Error", 0, 0, "%s", strerror(code)); }
+    static const int codes[] = {ENOENT, EEXIST, EACCES, ELOOP, ENOTDIR};
+    bool recoverable = false;
+    for (size_t i = 0; i < sizeof codes / sizeof *codes; i++) recoverable = recoverable || code == codes[i];
+    if (!recoverable) {
+      /* fstatSync(fd) names no path. */
+      char *path_text = NULL;
+      if (descriptor == -1) {
+        size_t length = strlen(parent.leaf) + 40;
+        path_text = malloc(length);
+        if (path_text != NULL) (void)snprintf(path_text, length, "/proc/self/fd/%d/%s", parent.descriptor, parent.leaf);
+      }
+      close(parent.descriptor); free(parent.leaf); free(name);
+      qa_cleanup node;
+      if (path_text != NULL) qa_cleanup_push(&node, free, path_text);
+      qa_content_fs_error(code, syscall, descriptor == -1 ? (path_text != NULL ? path_text : "") : NULL);
+    }
+    close(parent.descriptor); free(parent.leaf);
     qa_windows_file *mounted = mounted_or_null(files, name, write, creation);
     free(name); return mounted;
   }
+  close(parent.descriptor); free(parent.leaf);
   free(name);
-  struct stat st;
-  if (fstat(descriptor, &st) != 0 || !S_ISREG(st.st_mode)) { close(descriptor); return NULL; }
-  if (write) files->written_files++;
+  if (!S_ISREG(st.st_mode)) { close(descriptor); return NULL; }
   native_file *f = add_file(files);
-  f->fd = descriptor; f->owned = true; f->read = read; f->write = write; f->high_water = (double)st.st_size;
+  f->fd = descriptor; f->owned = true; f->read = read; f->write = write;
   f->iface.read = file_read; f->iface.write = file_write; f->iface.size = file_size;
   f->iface.truncate = file_truncate; f->iface.flush = file_flush; f->iface.close = file_close;
   return &f->iface;

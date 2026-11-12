@@ -8,7 +8,7 @@
 qa_q3_launch_result qa_q3_launch_projectile(qa_vec3 start, qa_vec3 direction, double speed, bool gravity, double duration, double time) {
   qa_q3_launch_result r; r.expires = qa_int32(time + duration);
   r.trajectory.type = gravity ? QA_Q3_BASE_TR_GRAVITY : QA_Q3_BASE_TR_LINEAR; r.trajectory.time = qa_int32(time - 50);
-  r.trajectory.duration = 0; r.trajectory.base = start; r.trajectory.delta = qa_q3_snap_vector(qa_scale3(direction, speed)); return r;
+  r.trajectory.duration = 0; r.trajectory.base = qa_math_vec3(start.x, start.y, start.z) /* TS vec3(): binary32 */; r.trajectory.delta = qa_q3_snap_vector(qa_scale3(direction, speed)); return r;
 }
 static qa_vec3 trace_normal(qa_q3_base_actor_trace_result t) { qa_vec3 z = {0, 0, 0}; return t.contact_is_plane ? t.contact_plane.normal : z; }
 void qa_q3_bounce_projectile(qa_q3_projectile *p, qa_q3_projectile_host host, qa_q3_base_actor_trace_result trace) {

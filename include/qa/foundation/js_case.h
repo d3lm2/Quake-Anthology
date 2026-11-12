@@ -15,12 +15,17 @@
  *    point of the same value (Latin-1). toLowerCase of such a string stays in
  *    Latin-1: qa_js_latin1_lower folds A-Z and U+00C0-U+00DE except U+00D7.
  *
- * qa_js_locale_compare is a.localeCompare(b) with bun's default collator (en-US,
- * tertiary strength, punctuation not ignorable), exact for ASCII: controls other
- * than TAB..CR are ignorable, punctuation and symbols sort before digits before
- * letters, letters compare case-insensitively first and then lowercase before
- * uppercase. Non-ASCII code points are ordered after ASCII letters by code point,
- * which only approximates ICU's collation for them.
+ * qa_js_locale_compare is a.localeCompare(b) with bun's default collator (ICU root,
+ * tertiary strength, punctuation not ignorable): per-code-point primary, secondary
+ * and tertiary weights generated under bun (`bun tools/js_collation_tables.js`) for
+ * U+0000-U+052F, U+1E00-U+1EFF, U+2000-U+20CF, U+2100-U+218F, U+3000-U+30FF and
+ * U+FF00-U+FFEF, with expansions (Æ, ß, ¼, ĳ, ...); a string compares by its primary
+ * weights, then secondary, then tertiary. A byte that is not UTF-8 is its Latin-1
+ * code point (Quake byte strings). Approximate: code points outside those ranges
+ * sort after every table weight by code point (ICU puts Arabic, Hebrew, Indic and
+ * other scripts between Cyrillic and kana, and Han last); combining marks are weighed
+ * per code point (ICU gives "e" + U+0301 the weights of "é"); contractions are not
+ * modelled (root has none in these ranges).
  * GPL-2.0-or-later.
  */
 #ifndef QA_FOUNDATION_JS_CASE_H
@@ -49,6 +54,10 @@ bool qa_js_equals_ignore_case(const char *a, const char *b);
 bool qa_js_ends_with_ignore_case(const char *text, const char *suffix);
 /** a.toLowerCase().startsWith(prefix.toLowerCase()) for UTF-8 text. */
 bool qa_js_starts_with_ignore_case(const char *text, const char *prefix);
+
+/** The default Array.prototype.sort order (a < b over UTF-16 code units) of UTF-8 text: code point order, except
+ * that a code point above U+FFFF (a surrogate pair) sorts before U+E000..U+FFFF. C0 80 is U+0000. */
+int qa_js_compare_code_units(const char *a, const char *b);
 
 /** a.localeCompare(b): negative, zero or positive. */
 int qa_js_locale_compare(const char *a, const char *b);

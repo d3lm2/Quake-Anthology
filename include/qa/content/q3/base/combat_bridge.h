@@ -1,5 +1,5 @@
 /* Port of src/content/q3/base/combat-bridge.ts. GPL-2.0-or-later.
- * The landed game/combat context is a simplified mirror: TS live
+ * The game/combat context is a reduced C record: TS live
  * getters become a refresh-on-access context pointer, the TS attack()
  * and dispatch() closures become bridge functions, and the TS
  * q3DamageFeedback/q3ForeignDamageFeedback exports (not in the landed
@@ -25,8 +25,7 @@
 
 /* TS Q3CombatBridgeHost. debug_damage NULL fn is TS null; the three
  * missionpack callbacks are only used for the missionpack product.
- * apply_damage/is_live fill the landed combat context's simplified
- * authority surface. */
+ * apply_damage/is_live fill the combat context's authority surface. */
 typedef struct qa_q3_base_combat_bridge_host {
   qa_q3_base_product product;
   qa_gameplay_authority *authority;

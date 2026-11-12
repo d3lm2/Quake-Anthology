@@ -10,20 +10,20 @@ static bimpl *B(qa_scene_frame_builder *b){ return (bimpl*)b->impl; }
 static void push(qa_scene_frame_builder *b,qa_render_command c){ bimpl *p=B(b);
   if(p->count==p->cap){ size_t nc=p->cap?p->cap*2:16; qa_render_command *n=(qa_render_command*)realloc(p->commands,nc*sizeof *n); if(!n)qa_range_error("frame builder allocation failed"); p->commands=n;p->cap=nc; }
   p->commands[p->count++]=c; }
-static void require_active(qa_scene_frame_builder *b){ if(!B(b)->active) qa_range_error("Begin a scene frame before submitting commands"); }
+static void require_active(qa_scene_frame_builder *b){ if(!B(b)->active) qa_raise("Error", 0, 0, "Begin a scene frame before submitting commands"); }
 bool qa_scene_frame_builder_init(qa_scene_frame_builder *b,qa_render_frame_image_registry images){ b->impl=calloc(1,sizeof(bimpl)); b->images=images; return b->impl!=NULL; }
 void qa_scene_frame_builder_destroy(qa_scene_frame_builder *b){ if(!b->impl)return; free(B(b)->commands); free(b->impl); b->impl=NULL; }
 void qa_scene_frame_builder_resources(qa_scene_frame_builder *b,const qa_image_resource_operation *ops,size_t count){ require_active(b);
   for(size_t i=0;i<count;i++){ qa_render_command c; memset(&c,0,sizeof c); c.kind=QA_RENDER_COMMAND_IMAGE_RESOURCE; c.operation=ops[i]; push(b,c); } }
 void qa_scene_frame_builder_begin(qa_scene_frame_builder *b,const char *buffer,bool clear){ bimpl *p=B(b);
-  if(p->active) qa_range_error("A scene frame is already being prepared");
+  if(p->active) qa_raise("Error", 0, 0, "A scene frame is already being prepared");
   p->active=true; p->count=0;
   qa_render_command c; memset(&c,0,sizeof c); c.kind=QA_RENDER_COMMAND_DRAW_BUFFER; c.buffer=buffer; c.clear=clear; push(b,c);
   size_t n=0; const qa_image_resource_operation *ops=b->images.drain_operations(b->images.ctx,&n);
   qa_scene_frame_builder_resources(b,ops,n); }
 void qa_scene_frame_builder_begin_default(qa_scene_frame_builder *b){ qa_scene_frame_builder_begin(b,"back",false); }
 void qa_scene_frame_builder_view(qa_scene_frame_builder *b,qa_render_view view){ require_active(b);
-  if(view.target_is_seat&&view.target_seat.session.token!=b->images.owner.session.token) qa_range_error("Render seat belongs to another session");
+  if(view.target_is_seat&&view.target_seat.session.token!=b->images.owner.session.token) qa_raise("Error", 0, 0, "Render seat belongs to another session");
   size_t n=0; const qa_image_resource_operation *ops=b->images.drain_operations(b->images.ctx,&n);
   qa_scene_frame_builder_resources(b,ops,n);
   qa_render_command c; memset(&c,0,sizeof c); c.kind=QA_RENDER_COMMAND_VIEW; c.view=view; push(b,c); }
@@ -41,7 +41,7 @@ bool qa_clip_picture(qa_rect rect,qa_texture_rect uv,qa_rect clip,qa_clipped_pic
   return true;
 }
 void qa_scene_frame_builder_picture(qa_scene_frame_builder *b,qa_seat_id seat,qa_rect viewport,qa_rect rect,qa_renderer_image image,qa_texture_rect uv,qa_vec4 color){
-  if(seat.session.token!=b->images.owner.session.token) qa_range_error("HUD seat belongs to another session");
+  if(seat.session.token!=b->images.owner.session.token) qa_raise("Error", 0, 0, "HUD seat belongs to another session");
   b->images.require(b->images.ctx,image);
   qa_rect clip; clip.x=0;clip.y=0;clip.width=viewport.width;clip.height=viewport.height;
   qa_clipped_picture clipped; if(!qa_clip_picture(rect,uv,clip,&clipped))return;

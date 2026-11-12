@@ -154,7 +154,7 @@ static bool initial_snapshot(runtime_t *runtime, const qa_q3_wire_snapshot *inpu
 static bool next_snapshot(runtime_t *runtime, const qa_q3_wire_snapshot *input) {
   qa_q3_pres_client_game_state *state = runtime->state;
   qa_q3_pres_retail_snapshot *previous = state->snap;
-  if (previous == NULL) qa_range_error("CG_SetNextSnap requires cg.snap");
+  if (previous == NULL) qa_raise("Error", 0, 0, "CG_SetNextSnap requires cg.snap");
   if (runtime->has_next_snap) qa_q3_pres_retail_snapshot_destroy(&runtime->next_snap_storage);
   runtime->has_next_snap = false;
   if (!qa_q3_pres_retail_snapshot_from_wire(&runtime->next_snap_storage, input)) return false;
@@ -246,6 +246,7 @@ static bool read_next_snapshot(runtime_t *runtime, qa_q3_wire_snapshot *out) {
   return false;
 }
 
+static void destroy_wire_snapshot(void *arg) { qa_q3_wire_snapshot_destroy(arg); }
 static bool process(runtime_t *runtime) {
   qa_q3_pres_client_game_state *state = runtime->state;
   qa_q3_pres_snapshot_current latest = runtime->host.source.current(runtime->host.source.ctx);
@@ -258,7 +259,10 @@ static bool process(runtime_t *runtime) {
     qa_q3_wire_snapshot snapshot;
     if (!read_next_snapshot(runtime, &snapshot)) return true;
     bool ok = true;
+    qa_cleanup snapshot_node; /* the read snapshot is released when the transition raises */
+    qa_cleanup_push(&snapshot_node, destroy_wire_snapshot, &snapshot);
     if (((int32_t)snapshot.flags & 2) == 0) ok = initial_snapshot(runtime, &snapshot);
+    qa_cleanup_pop(&snapshot_node);
     qa_q3_wire_snapshot_destroy(&snapshot);
     if (!ok) return false;
   }
@@ -267,7 +271,10 @@ static bool process(runtime_t *runtime) {
       qa_q3_wire_snapshot snapshot;
       if (!read_next_snapshot(runtime, &snapshot)) break;
       int64_t server_time = snapshot.server_time;
+      qa_cleanup snapshot_node;
+      qa_cleanup_push(&snapshot_node, destroy_wire_snapshot, &snapshot);
       bool ok = next_snapshot(runtime, &snapshot);
+      qa_cleanup_pop(&snapshot_node);
       qa_q3_wire_snapshot_destroy(&snapshot);
       if (!ok) return false;
       if (server_time < state->snap->server_time) {
@@ -275,7 +282,7 @@ static bool process(runtime_t *runtime) {
       }
     }
     qa_q3_pres_retail_snapshot *next = state->next_snap;
-    if (next == NULL) qa_range_error("CG_ProcessSnapshots: missing next snapshot");
+    if (next == NULL) qa_raise("Error", 0, 0, "CG_ProcessSnapshots: missing next snapshot");
     if (state->time >= (double)state->snap->server_time && state->time < (double)next->server_time) break;
     if (!transition(runtime)) return false;
   }
@@ -287,11 +294,17 @@ static bool process(runtime_t *runtime) {
 }
 
 /* TS exclusive(): reentrant transitions abort with the TS Error text. */
+static void clear_transitioning(void *arg) { ((runtime_t *)arg)->transitioning = false; }
 typedef bool (*operation_fn)(runtime_t *runtime, const qa_q3_wire_snapshot *input);
 static bool exclusive(runtime_t *runtime, operation_fn operation, const qa_q3_wire_snapshot *input) {
-  if (runtime->transitioning) qa_range_error("Snapshot transition already in progress");
+  if (runtime->transitioning) qa_raise("Error", 0, 0, "Snapshot transition already in progress");
   runtime->transitioning = true;
+  /* TS try/finally: a throw out of the operation (a CommonError drop from a server snapshot or an event) still
+   * ends the transition, so the next call is not refused as "already in progress". */
+  qa_cleanup transitioning_node;
+  qa_cleanup_push(&transitioning_node, clear_transitioning, runtime);
   bool result = operation(runtime, input);
+  qa_cleanup_pop(&transitioning_node);
   runtime->transitioning = false;
   return result;
 }
@@ -336,6 +349,6 @@ bool qa_q3_pres_snapshot_runtime_process_snapshots(runtime_t *runtime) {
   return exclusive(runtime, op_process, NULL);
 }
 bool qa_q3_pres_snapshot_runtime_set_next_snapshot(runtime_t *runtime, const qa_q3_wire_snapshot *input) {
-  if (runtime->transitioning) qa_range_error("Snapshot transition already in progress");
+  if (runtime->transitioning) qa_raise("Error", 0, 0, "Snapshot transition already in progress");
   return next_snapshot(runtime, input);
 }

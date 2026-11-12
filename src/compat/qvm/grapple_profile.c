@@ -117,6 +117,8 @@ static const char *nested_nullable_string(const qa_save_reader *parent, const ch
   return value;
 }
 
+static void free_profile_on_raise(void *arg) { qa_qvm_grapple_profile_free(arg); }
+
 qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
                                                     const qa_resolved_qvm_artifact *artifact) {
   profile_ctx ctx;
@@ -149,10 +151,53 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
     qa_save_reader_destroy(&ctx.reader);
     return NULL;
   }
+  /* TS throws out of the reader and the half-read profile goes to the GC. */
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, free_profile_on_raise, profile);
   profile->module = artifact->module;
   profile->abi_profile = ctx.abi;
   profile->entity_stride = ctx.entity_stride;
   profile->client_stride = ctx.client_stride;
+  /* TS reads the pulling flag, the initial settings and the cable kind before
+   * it builds the profile (the order decides which refusal is named). */
+  double pulling = top_integer(&ctx, "pullingFlag", 1);
+  if (pulling > 1073741824.0 || ((int64_t)pulling & ((int64_t)pulling - 1)) != 0) {
+    qa_save_reader field;
+    reader_field(&ctx.reader, "pullingFlag", &field);
+    qa_save_reader_fail(&field, "expected one player movement flag");
+  }
+  /* initial cvars object */
+  {
+    qa_save_reader cvars;
+    reader_field(&ctx.reader, "initialCvars", &cvars);
+    if (cvars.value == NULL || cvars.value->kind != QA_SAVE_OBJECT)
+      qa_save_reader_fail(&cvars, "Expected initial source settings");
+    size_t count = cvars.value->entry_count;
+    qa_qvm_grapple_cvar *list = calloc(count == 0 ? 1 : count, sizeof *list);
+    if (list == NULL) goto oom;
+    profile->initial_cvars = list;
+    profile->initial_cvar_count = count;
+    for (size_t i = 0; i < count; i++) {
+      qa_save_reader entry;
+      reader_field(&cvars, cvars.value->entries[i].key, &entry);
+      list[i].name = cvars.value->entries[i].key;
+      list[i].value = qa_save_reader_string(&entry);
+      qa_save_reader_destroy(&entry);
+    }
+    qa_save_reader_destroy(&cvars);
+  }
+  const char *cable_kind;
+  {
+    qa_save_reader presentation, cable, kind_reader;
+    reader_field(&ctx.reader, "presentation", &presentation);
+    reader_field(&presentation, "cable", &cable);
+    reader_field(&cable, "kind", &kind_reader);
+    static const char *const kinds[] = {"shader", "model"};
+    cable_kind = qa_save_reader_choice_string(&kind_reader, kinds, 2);
+    qa_save_reader_destroy(&kind_reader);
+    qa_save_reader_destroy(&cable);
+    qa_save_reader_destroy(&presentation);
+  }
   profile->id = top_string(&ctx, "id");
   profile->title = top_string(&ctx, "title");
   profile->fields.inuse = entity_field(&ctx, "inuse");
@@ -186,12 +231,6 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
   profile->callbacks.damage = callback_at(&ctx, "damage");
   profile->callbacks.same_team = callback_at(&ctx, "sameTeam");
   profile->callbacks.player_move = callback_at(&ctx, "playerMove");
-  double pulling = top_integer(&ctx, "pullingFlag", 1);
-  if (pulling > 1073741824.0 || ((int64_t)pulling & ((int64_t)pulling - 1)) != 0) {
-    qa_save_reader field;
-    reader_field(&ctx.reader, "pullingFlag", &field);
-    qa_save_reader_fail(&field, "expected one player movement flag");
-  }
   profile->pulling_flag = pulling;
   /* fire arguments */
   qa_save_reader fire;
@@ -199,6 +238,7 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
   size_t fire_count = qa_save_reader_list_count(&fire);
   double *fire_values = calloc(fire_count == 0 ? 1 : fire_count, sizeof(double));
   if (fire_values == NULL) goto oom;
+  profile->fire_arguments.values = fire_values;
   for (size_t i = 0; i < fire_count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(&fire, i, &item)) goto oom;
@@ -206,7 +246,6 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
     qa_save_reader_destroy(&item);
   }
   qa_save_reader_destroy(&fire);
-  profile->fire_arguments.values = fire_values;
   profile->fire_arguments.count = fire_count;
   /* movement */
   {
@@ -218,6 +257,7 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
     qa_qvm_grapple_movement_word *movement_words =
         calloc(word_count == 0 ? 1 : word_count, sizeof *movement_words);
     if (movement_words == NULL) goto oom;
+    profile->movement.words = movement_words;
     for (size_t i = 0; i < word_count; i++) {
       qa_save_reader item;
       if (!qa_save_reader_item(&words, i, &item)) goto oom;
@@ -235,28 +275,7 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
     }
     qa_save_reader_destroy(&words);
     qa_save_reader_destroy(&movement);
-    profile->movement.words = movement_words;
     profile->movement.word_count = word_count;
-  }
-  /* initial cvars object */
-  {
-    qa_save_reader cvars;
-    reader_field(&ctx.reader, "initialCvars", &cvars);
-    if (cvars.value == NULL || cvars.value->kind != QA_SAVE_OBJECT)
-      qa_save_reader_fail(&cvars, "Expected initial source settings");
-    size_t count = cvars.value->entry_count;
-    qa_qvm_grapple_cvar *list = calloc(count == 0 ? 1 : count, sizeof *list);
-    if (list == NULL) goto oom;
-    for (size_t i = 0; i < count; i++) {
-      qa_save_reader entry;
-      reader_field(&cvars, cvars.value->entries[i].key, &entry);
-      list[i].name = cvars.value->entries[i].key;
-      list[i].value = qa_save_reader_string(&entry);
-      qa_save_reader_destroy(&entry);
-    }
-    qa_save_reader_destroy(&cvars);
-    profile->initial_cvars = list;
-    profile->initial_cvar_count = count;
   }
   profile->event_lifetime_milliseconds = top_integer(&ctx, "eventLifetimeMilliseconds", 1);
   profile->grapple_damage_method = top_integer(&ctx, "grappleDamageMethod", 0);
@@ -265,11 +284,6 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
     qa_save_reader presentation, cable, anchor, attachments;
     reader_field(&ctx.reader, "presentation", &presentation);
     reader_field(&presentation, "cable", &cable);
-    qa_save_reader kind_reader;
-    reader_field(&cable, "kind", &kind_reader);
-    const char *kinds[] = {"shader", "model"};
-    const char *cable_kind = qa_save_reader_choice_string(&kind_reader, kinds, 2);
-    qa_save_reader_destroy(&kind_reader);
     reader_field(&presentation, "viewAnchor", &anchor);
     profile->presentation.projectile_model = nested_string(&presentation, "projectileModel");
     profile->presentation.view_model = nested_string(&presentation, "viewModel");
@@ -293,6 +307,7 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
     qa_qvm_grapple_view_attachment *list =
         calloc(attachment_count == 0 ? 1 : attachment_count, sizeof *list);
     if (list == NULL) goto oom;
+    profile->presentation.view_attachments = list;
     for (size_t i = 0; i < attachment_count; i++) {
       qa_save_reader item;
       if (!qa_save_reader_item(&attachments, i, &item)) goto oom;
@@ -301,7 +316,6 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
       qa_save_reader_destroy(&item);
     }
     qa_save_reader_destroy(&attachments);
-    profile->presentation.view_attachments = list;
     profile->presentation.view_attachment_count = attachment_count;
     profile->presentation.cable.is_shader = strcmp(cable_kind, "shader") == 0;
     if (profile->presentation.cable.is_shader) {
@@ -321,9 +335,11 @@ qa_qvm_grapple_profile *qa_qvm_read_grapple_profile(const qa_save_value *value,
     profile->presentation.hang_sound = nested_nullable_string(&presentation, "hangSound");
     qa_save_reader_destroy(&presentation);
   }
+  qa_cleanup_pop(&refused);
   qa_save_reader_destroy(&ctx.reader);
   return profile;
 oom:
+  qa_cleanup_pop(&refused);
   qa_qvm_grapple_profile_free(profile);
   qa_save_reader_destroy(&ctx.reader);
   return NULL;

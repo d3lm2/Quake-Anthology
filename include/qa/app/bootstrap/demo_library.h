@@ -16,6 +16,10 @@ typedef struct qa_app_demo_library_mounts {
 } qa_app_demo_library_mounts;
 typedef struct qa_app_demo_library qa_app_demo_library;
 qa_app_demo_library *qa_app_demo_library_create(const char *root, qa_app_demo_library_mounts mounts);
+/* TS `new DemoLibrary(root, mounts, nativeRoots)`: the stock game's own folders, where its demos are recorded
+ * (copied); the user store stays as the fallback for earlier recordings. */
+qa_app_demo_library *qa_app_demo_library_create_native(const char *root, qa_app_demo_library_mounts mounts,
+    const char *const *native_roots, size_t native_root_count);
 void qa_app_demo_library_destroy(qa_app_demo_library *library);
 const char *qa_app_demo_library_root(const qa_app_demo_library *library);
 /* *out_error set on scan failure (non-missing readdir errors). */

@@ -32,7 +32,7 @@ static qa_call_result syscall_invoke(void *ctx, const qa_guest_core_call_context
 bool qa_compat_q3_native_syscalls_init(S *syscalls, qa_guest_callback_table *callbacks,
   qa_guest_native_abi abi, qa_compat_q3_native_syscall_handler handler, void *handler_ctx) {
   memset(syscalls, 0, sizeof *syscalls);
-  if (abi.pointer_bytes != 4) qa_range_error("Q3 1.32 syscalls require the i386 source ABI");
+  if (abi.pointer_bytes != 4) qa_raise("Error", 0, 0, "Q3 1.32 syscalls require the i386 source ABI");
   syscalls->handler = handler;
   syscalls->handler_ctx = handler_ctx;
   for (size_t i = 0; i < QA_NATIVE_Q3_SYSCALL_WORDS - 1; i++) {

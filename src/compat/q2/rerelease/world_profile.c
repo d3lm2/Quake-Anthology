@@ -157,7 +157,7 @@ const qa_compat_q2_rerelease_primary_world_profile *qa_compat_q2_rerelease_get_p
 }
 static void range(double value, double min, double max) {
   if (value != trunc(value) || fabs(value) > 9007199254740991.0 || value < min || value > max)
-    qa_range_error("Source world metadata is outside its declared range");
+    qa_raise("Error", 0, 0, "Source world metadata is outside its declared range");
 }
 static double storage_bytes(const char *storage) {
   if (!strcmp(storage, "int8") || !strcmp(storage, "uint8")) return 1;
@@ -169,18 +169,29 @@ static const qa_guest_field_layout *find_field(const qa_guest_layout *layout, co
   for (size_t i = 0; i < layout->field_count; i++) if (strcmp(layout->fields[i].name, name) == 0) return &layout->fields[i];
   return NULL;
 }
+static bool safe_integer(double v) { return v == trunc(v) && fabs(v) <= 9007199254740991.0; }
 static void validate_layout(const qa_guest_layout *layout, const qa_guest_layout *public_layout) {
-  /* validateValueLayout(aggregate, 8): pointer bytes domain. */
-  if (layout->pointer_bytes != 8) qa_range_error("Rerelease layout must use 8-byte pointers");
+  /* validateValueLayout({ kind: "aggregate", layout }, 8) (guest/abi/values.ts): the record shape, then each field
+   * inside the record; both are RangeErrors. byteOrder is always little-endian in the C layout. */
+  bool power_of_two = safe_integer(layout->alignment) && layout->alignment > 0 && layout->alignment <= 4096 &&
+                      (((int64_t)layout->alignment) & ((int64_t)layout->alignment - 1)) == 0;
+  if (layout->pointer_bytes != 8 || !safe_integer(layout->byte_length) || layout->byte_length <= 0 || !power_of_two)
+    qa_raise("RangeError", 0, 0, "Invalid aggregate ABI layout");
+  for (size_t i = 0; i < layout->field_count; i++) {
+    const qa_guest_field_layout *f = &layout->fields[i];
+    if (!safe_integer(f->byte_offset) || f->byte_offset < 0 || !safe_integer(f->count) || f->count < 0 ||
+        f->byte_offset + f->count * storage_bytes(f->storage) > layout->byte_length)
+      qa_raise("RangeError", 0, 0, "Aggregate field %s exceeds its record", f->name);
+  }
   for (size_t i = 0; i < layout->field_count; i++) {
     const qa_guest_field_layout *f = &layout->fields[i];
     double end = f->byte_offset + storage_bytes(f->storage) * f->count;
-    if (f->count <= 0) qa_range_error("Overlapping or empty native source fields");
+    if (f->count <= 0) qa_raise("Error", 0, 0, "Overlapping or empty native source fields");
     for (size_t j = 0; j < i; j++) {
       const qa_guest_field_layout *g = &layout->fields[j];
       double gend = g->byte_offset + storage_bytes(g->storage) * g->count;
       if (strcmp(f->name, g->name) == 0 || (f->byte_offset < gend && end > g->byte_offset))
-        qa_range_error("Overlapping or empty native source fields");
+        qa_raise("Error", 0, 0, "Overlapping or empty native source fields");
     }
   }
   for (size_t i = 0; i < public_layout->field_count; i++) {
@@ -188,7 +199,7 @@ static void validate_layout(const qa_guest_layout *layout, const qa_guest_layout
     char buf[512]; snprintf(buf, sizeof buf, "shared.%s", expected->name);
     const qa_guest_field_layout *actual = find_field(layout, buf);
     if (!actual || actual->byte_offset != expected->byte_offset || strcmp(actual->storage, expected->storage) != 0 || actual->count != expected->count)
-      qa_range_error("Source world layout changes the public API2023 prefix");
+      qa_raise("Error", 0, 0, "Source world layout changes the public API2023 prefix");
   }
 }
 void qa_compat_q2_validate_rerelease_primary_world_profile(const qa_compat_q2_rerelease_primary_world_profile *p, qa_content_digest digest) {
@@ -201,7 +212,7 @@ void qa_compat_q2_validate_rerelease_primary_world_profile(const qa_compat_q2_re
   qa_compat_q2_validate_native_combat_call(&p->calls.power_armor, QA_Q2CO_POWER_ARMOR, abi);
   if (!p->digest || !digest || strcmp(p->digest, digest) != 0 || !p->client.authority_is_artifact ||
       !p->client.digest || strcmp(p->client.digest, digest) != 0)
-    qa_range_error("Rerelease source world profile belongs to another artifact");
+    qa_raise("Error", 0, 0, "Rerelease source world profile belongs to another artifact");
   const double rvas[] = {p->entries.spawn, p->entries.free_, p->entries.damage, p->entries.power_armor, p->entries.process_pain,
                          p->entries.time, p->entries.regular_armor.entry, p->entries.regular_armor.join, p->armor.table, p->movement.game_api, p->movement.pmove};
   for (size_t i = 0; i < 11; i++) range(rvas[i], 1, 4294967295.0);
@@ -214,7 +225,7 @@ void qa_compat_q2_validate_rerelease_primary_world_profile(const qa_compat_q2_re
   for (size_t i = 0; i < p->movement.speed_load_count; i++) {
     range(p->movement.speed_loads[i].next, 1, 4294967295.0); range(p->movement.speed_loads[i].reg, 0, 15);
     for (size_t j = 0; j < i; j++) if (p->movement.speed_loads[j].next == p->movement.speed_loads[i].next)
-      qa_range_error("Repeated source movement load would apply equipment twice");
+      qa_raise("Error", 0, 0, "Repeated source movement load would apply equipment twice");
   }
   const qa_compat_q2_rerelease_world_location *locs[] = {&p->regular_armor.target, &p->regular_armor.amount, &p->regular_armor.point,
                                                          &p->regular_armor.normal, &p->regular_armor.flags, &p->regular_armor.result};
@@ -230,7 +241,7 @@ void qa_compat_q2_validate_rerelease_primary_world_profile(const qa_compat_q2_re
     if (strncmp(expected->name, "shared.", 7) == 0) continue;
     const qa_guest_field_layout *field = find_field(&p->edict, expected->name);
     if (!field || strcmp(field->storage, expected->storage) != 0 || field->count != expected->count)
-      qa_range_error("Missing typed source edict field %s", expected->name);
+      qa_raise("Error", 0, 0, "Missing typed source edict field %s", expected->name);
   }
   const struct { const char *name; const char *storage; double count; } required[] = {
     {"pers.inventory", "int32", p->client.inventory_count}, {"pers.max_ammo", "int16", p->client.ammo_count},
@@ -238,32 +249,32 @@ void qa_compat_q2_validate_rerelease_primary_world_profile(const qa_compat_q2_re
   for (size_t i = 0; i < 4; i++) {
     const qa_guest_field_layout *field = find_field(&p->client.layout, required[i].name);
     if (!field || strcmp(field->storage, required[i].storage) != 0 || field->count != required[i].count)
-      qa_range_error("Missing typed source client field %s", required[i].name);
+      qa_raise("Error", 0, 0, "Missing typed source client field %s", required[i].name);
   }
   const double monster[] = {p->monster.attacker, p->monster.inflictor, p->monster.blood, p->monster.knockback,
                             p->monster.point, p->monster.mod, p->monster.invincible_time};
   const double monster_bytes[] = {8, 8, 4, 4, 12, 3, 8};
   for (size_t i = 0; i < 7; i++)
     if (monster[i] != trunc(monster[i]) || fabs(monster[i]) > 9007199254740991.0 || monster[i] < 0 || monster[i] + monster_bytes[i] > p->edict.byte_length)
-      qa_range_error("Source monster accumulator exceeds its edict");
+      qa_raise("Error", 0, 0, "Source monster accumulator exceeds its edict");
   if (strcmp(p->regular_armor.target.storage, "pointer") != 0 || strcmp(p->regular_armor.point.storage, "pointer") != 0 ||
       strcmp(p->regular_armor.normal.storage, "pointer") != 0)
-    qa_range_error("Source armor geometry requires pointer locations");
+    qa_raise("Error", 0, 0, "Source armor geometry requires pointer locations");
   if (strcmp(p->regular_armor.amount.storage, "int32") != 0 || strcmp(p->regular_armor.flags.storage, "int32") != 0 ||
       strcmp(p->regular_armor.result.storage, "int32") != 0)
-    qa_range_error("Source armor values require int32 locations");
+    qa_raise("Error", 0, 0, "Source armor values require int32 locations");
   for (size_t i = 0; i < p->regular_armor.repair_count; i++)
     if (strcmp(p->regular_armor.repair[i].source.storage, p->regular_armor.repair[i].target.storage) != 0)
-      qa_range_error("Source armor repair changes scalar representation");
-  if (p->entries.regular_armor.entry == p->entries.regular_armor.join) qa_range_error("Source armor region is empty");
+      qa_raise("Error", 0, 0, "Source armor repair changes scalar representation");
+  if (p->entries.regular_armor.entry == p->entries.regular_armor.join) qa_raise("Error", 0, 0, "Source armor region is empty");
   size_t remaining = 0;
   for (size_t i = 0; i < p->inventory_count; i++) {
     if (strcmp(p->inventory[i].source_kind, "remaining") == 0) remaining++;
     for (size_t j = 0; j < i; j++) if (strcmp(p->inventory[i].item, p->inventory[j].item) == 0)
-      qa_range_error("Source inventory requires one complete unique roster");
+      qa_raise("Error", 0, 0, "Source inventory requires one complete unique roster");
   }
   if ((double)p->inventory_count != p->client.inventory_count || remaining > 1)
-    qa_range_error("Source inventory requires one complete unique roster");
+    qa_raise("Error", 0, 0, "Source inventory requires one complete unique roster");
   for (size_t i = 0; i < p->inventory_count; i++) {
     const qa_compat_q2_rerelease_inventory_row *row = &p->inventory[i];
     if (strcmp(row->source_kind, "index") == 0) range(row->source_index, 0, p->client.inventory_count - 1);
@@ -272,13 +283,13 @@ void qa_compat_q2_validate_rerelease_primary_world_profile(const qa_compat_q2_re
     if ((strcmp(row->source_kind, "index") == 0 && row->source_index >= p->client.inventory_count) ||
         (strcmp(row->source_kind, "classname") == 0 && (!row->source_name || row->source_name[0] == 0)) ||
         (row->capacity_is_ammo && row->capacity_source_index >= p->client.ammo_count))
-      qa_range_error("Source inventory mapping exceeds its private storage");
+      qa_raise("Error", 0, 0, "Source inventory mapping exceeds its private storage");
   }
   bool has_empty = false;
   for (size_t i = 0; i < p->armor.regular_count; i++) {
     if (strcmp(p->armor.regular[i], p->armor.empty) == 0) has_empty = true;
     for (size_t j = 0; j < i; j++) if (strcmp(p->armor.regular[i], p->armor.regular[j]) == 0)
-      qa_range_error("Source armor metadata has no declared inventory item");
+      qa_raise("Error", 0, 0, "Source armor metadata has no declared inventory item");
   }
   const qa_item_id armor_items[4] = {0}; (void)armor_items;
   bool all_present = has_empty && p->armor.cells_index < p->client.inventory_count;
@@ -297,10 +308,11 @@ void qa_compat_q2_validate_rerelease_primary_world_profile(const qa_compat_q2_re
     }
     all_present = all_present && have_screen && have_shield && have_cells && have_regular;
   }
-  if (!all_present) qa_range_error("Source armor metadata has no declared inventory item");
+  if (!all_present) qa_raise("Error", 0, 0, "Source armor metadata has no declared inventory item");
   if (p->armor.normal + 4 > 65536 || p->armor.energy + 4 > 65536 || p->movement.speed_load_count == 0)
-    qa_range_error("Invalid source armor or movement metadata");
+    qa_raise("Error", 0, 0, "Invalid source armor or movement metadata");
 }
+static void profile_release(void *v) { qa_compat_q2_rerelease_world_profile_free(v); memset(v, 0, sizeof(qa_compat_q2_rerelease_primary_world_profile)); }
 static double bounded(const qa_save_reader *r, double min, double max) {
   double v = qa_save_reader_integer_min(r, min);
   if (v > max) qa_save_reader_fail(r, "Expected integer at most %.0f", max);
@@ -333,6 +345,8 @@ static double int_field(const qa_save_reader *r, const char *n, double min) { qa
 bool qa_compat_q2_read_rerelease_primary_world_profile(const qa_save_reader *reader, qa_content_digest digest,
                                                        qa_compat_q2_rerelease_primary_world_profile *out) {
   memset(out, 0, sizeof *out);
+  /* A profile that is refused keeps nothing: every list joins `out` as soon as it exists. */
+  qa_cleanup refused; qa_cleanup_push(&refused, profile_release, out);
   qa_save_reader client, entries, regular, monster, armor, flags, movement, calls;
   qa_save_reader_field(reader, "client", &client); qa_save_reader_field(reader, "entries", &entries);
   qa_save_reader_field(reader, "regularArmor", &regular); qa_save_reader_field(reader, "monster", &monster);
@@ -359,6 +373,7 @@ bool qa_compat_q2_read_rerelease_primary_world_profile(const qa_save_reader *rea
     for (int i = 0; i < 6; i++) { qa_save_reader f; qa_save_reader_field(&regular, names[i], &f); *slots[i] = read_location(&f); qa_save_reader_destroy(&f); } }
   { qa_save_reader f; qa_save_reader_field(&regular, "repair", &f); size_t n = qa_save_reader_list_count(&f);
     qa_compat_q2_rerelease_armor_repair *arr = malloc((n ? n : 1) * sizeof *arr); if (!arr) { qa_save_reader_destroy(&f); ok = false; goto done; }
+    out->regular_armor.repair = arr;
     for (size_t i = 0; i < n; i++) { qa_save_reader x, s, t; qa_save_reader_item(&f, i, &x);
       qa_save_reader_field(&x, "source", &s); arr[i].source = read_location(&s); qa_save_reader_destroy(&s);
       qa_save_reader_field(&x, "target", &t); arr[i].target = read_location(&t); qa_save_reader_destroy(&t);
@@ -371,13 +386,16 @@ bool qa_compat_q2_read_rerelease_primary_world_profile(const qa_save_reader *rea
   { qa_save_reader f; qa_save_reader_field(reader, "inventory", &f); size_t n = qa_save_reader_list_count(&f);
     qa_compat_q2_rerelease_inventory_row *arr = malloc((n ? n : 1) * sizeof *arr); if (!arr) { qa_save_reader_destroy(&f); ok = false; goto done; }
     memset(arr, 0, (n ? n : 1) * sizeof *arr);
+    out->inventory = arr; out->inventory_count = n;
     for (size_t i = 0; i < n; i++) { qa_save_reader x, source, capacity; qa_save_reader_item(&f, i, &x);
       { qa_save_reader it; qa_save_reader_field(&x, "item", &it); arr[i].item = qa_namespaced(&it); qa_save_reader_destroy(&it); }
       qa_save_reader_field(&x, "source", &source); qa_save_reader_field(&x, "capacity", &capacity);
       { qa_save_reader k; static const char *const kinds[] = {"classname", "index", "remaining"};
         qa_save_reader_field(&source, "kind", &k); arr[i].source_kind = qa_save_reader_choice_string(&k, kinds, 3); qa_save_reader_destroy(&k); }
       if (strcmp(arr[i].source_kind, "classname") == 0) { qa_save_reader nm; qa_save_reader_field(&source, "name", &nm);
-          static char names_scratch[65536]; (void)names_scratch; arr[i].source_name = strdup(qa_save_reader_string(&nm)); qa_save_reader_destroy(&nm); }
+          const char *text = qa_save_reader_string(&nm); size_t length = strlen(text) + 1; char *copy = malloc(length);
+          if (!copy) qa_range_error("Out of memory");
+          memcpy(copy, text, length); arr[i].source_name = copy; qa_save_reader_destroy(&nm); }
       else if (strcmp(arr[i].source_kind, "index") == 0) arr[i].source_index = int_field(&source, "index", 0);
       { qa_save_reader k; static const char *const kinds[] = {"ammo", "fixed"};
         qa_save_reader_field(&capacity, "kind", &k); const char *ck = qa_save_reader_choice_string(&k, kinds, 2); qa_save_reader_destroy(&k);
@@ -391,6 +409,7 @@ bool qa_compat_q2_read_rerelease_primary_world_profile(const qa_save_reader *rea
   out->armor.normal = int_field(&armor, "normal", 0); out->armor.energy = int_field(&armor, "energy", 0);
   { qa_save_reader f; qa_save_reader_field(&armor, "regular", &f); size_t n = qa_save_reader_list_count(&f);
     qa_item_id *arr = malloc((n ? n : 1) * sizeof *arr); if (!arr) { qa_save_reader_destroy(&f); ok = false; goto done; }
+    out->armor.regular = arr;
     for (size_t i = 0; i < n; i++) { qa_save_reader x; qa_save_reader_item(&f, i, &x); arr[i] = qa_namespaced(&x); qa_save_reader_destroy(&x); }
     qa_save_reader_destroy(&f); out->armor.regular = arr; out->armor.regular_count = n; }
   { qa_save_reader f; qa_save_reader_field(&armor, "empty", &f); out->armor.empty = qa_namespaced(&f); qa_save_reader_destroy(&f); }
@@ -407,6 +426,7 @@ bool qa_compat_q2_read_rerelease_primary_world_profile(const qa_save_reader *rea
   out->movement.game_api = rva_field(&movement, "gameApi"); out->movement.pmove = rva_field(&movement, "pmove");
   { qa_save_reader f; qa_save_reader_field(&movement, "speedLoads", &f); size_t n = qa_save_reader_list_count(&f);
     qa_compat_q2_rerelease_speed_load *arr = malloc((n ? n : 1) * sizeof *arr); if (!arr) { qa_save_reader_destroy(&f); ok = false; goto done; }
+    out->movement.speed_loads = arr;
     for (size_t i = 0; i < n; i++) { qa_save_reader x; qa_save_reader_item(&f, i, &x);
       arr[i].next = rva_field(&x, "next");
       { qa_save_reader rg; qa_save_reader_field(&x, "register", &rg); arr[i].reg = bounded(&rg, 0, 15); qa_save_reader_destroy(&rg); }
@@ -414,6 +434,8 @@ bool qa_compat_q2_read_rerelease_primary_world_profile(const qa_save_reader *rea
     qa_save_reader_destroy(&f); out->movement.speed_loads = arr; out->movement.speed_load_count = n; }
   qa_compat_q2_validate_rerelease_primary_world_profile(out, digest);
 done:
+  qa_cleanup_pop(&refused);
+  if (!ok) profile_release(out);
   qa_save_reader_destroy(&client); qa_save_reader_destroy(&entries); qa_save_reader_destroy(&regular);
   qa_save_reader_destroy(&monster); qa_save_reader_destroy(&armor); qa_save_reader_destroy(&flags);
   qa_save_reader_destroy(&movement); qa_save_reader_destroy(&calls);
@@ -421,6 +443,9 @@ done:
 }
 void qa_compat_q2_rerelease_world_profile_free(qa_compat_q2_rerelease_primary_world_profile *p) {
   if (!p || p == &retail) return;
+  /* readLayout's field lists (the retail profile borrows the built-in layouts). */
+  if (p->edict.fields != qa_compat_q2_rerelease_private_edict_prefix_layout.fields) free((void *)p->edict.fields);
+  if (!retail_built || p->client.layout.fields != retail.client.layout.fields) free((void *)p->client.layout.fields);
   qa_compat_q2_native_combat_call *calls[] = {&p->calls.pain, &p->calls.death, &p->calls.process_pain, &p->calls.damage, &p->calls.power_armor};
   for (size_t i = 0; i < 5; i++) if (calls[i]->arguments && calls[i]->arguments != p->calls.storage[i]) qa_compat_q2_native_combat_call_free(calls[i]);
   if (p->regular_armor.repair != retail_repair) free((void *)p->regular_armor.repair);

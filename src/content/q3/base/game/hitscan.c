@@ -4,6 +4,7 @@
 #include "qa/content/q3/base/game/missile.h"
 #include "qa/core/math.h"
 #include "qa/core/numeric.h"
+#include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 static int actor_equal(qa_actor_id a, qa_actor_id b) { return a.slot == b.slot && a.generation == b.generation && a.token == b.token && a.session.token == b.session.token; }
 static int team_equal(const char *a, const char *b) { if (!a || !b) return a == b; return strcmp(a, b) == 0; }
@@ -120,11 +121,20 @@ static void emit_trail(qa_q3_rail_host host, qa_q3_bullet_attack *attack, qa_vec
   qa_q3_rail_trail t = {qa_add3(qa_add3(attack->muzzle, qa_scale3(attack->right, 4)), qa_scale3(attack->up, -1)), point, kind, normal};
   host.trail(host.ctx, t);
 }
+/* TS try/finally: relink every penetrated actor, also when a raise unwinds the shot. */
+typedef struct rail_restores { qa_q3_rail_host host; void *restores[4]; int count; } rail_restores;
+static void run_rail_restores(void *arg) {
+  rail_restores *pending = arg;
+  int count = pending->count; pending->count = 0;
+  for (int i = 0; i < count; i++) pending->host.restore(pending->host.ctx, pending->restores[i]);
+}
 double qa_q3_rail_fire(qa_q3_rail_host host, qa_actor_id shooter, qa_q3_bullet_attack *attack) {
   qa_vec3 end = qa_add3(attack->muzzle, qa_scale3(attack->forward, 8192));
   bool has_pass = true; qa_actor_id pass = shooter; double hits = 0; int penetrated = 0;
-  void *restores[4]; int restore_count = 0; bool has_trace = false; qa_q3_base_actor_trace_result trace;
+  rail_restores pending; pending.host = host; pending.count = 0;
+  bool has_trace = false; qa_q3_base_actor_trace_result trace;
   memset(&trace, 0, sizeof trace);
+  qa_cleanup restore_node; qa_cleanup_push(&restore_node, run_rail_restores, &pending);
   do {
     if (!host.alive(host.ctx)) break;
     trace = host.trace(host.ctx, attack->muzzle, end, has_pass ? &pass : NULL); has_trace = true;
@@ -146,10 +156,11 @@ double qa_q3_rail_fire(qa_q3_rail_host host, qa_actor_id shooter, qa_q3_bullet_a
       }
     }
     if (qa_js_to_int32(trace.contents) & 1) break;
-    void *restore = host.unlink(host.ctx, actor); if (restore) restores[restore_count++] = restore;
+    void *restore = host.unlink(host.ctx, actor); if (restore) pending.restores[pending.count++] = restore;
     penetrated++;
   } while (penetrated < 4);
-  for (int i = 0; i < restore_count; i++) host.restore(host.ctx, restores[i]);
+  qa_cleanup_pop(&restore_node);
+  run_rail_restores(&pending);
   if (has_trace) {
     if (qa_js_to_int32(trace.surface_flags) & 0x10) { qa_vec3 z = {0,0,0}; emit_trail(host, attack, qa_q3_snap_vector_towards(trace.end, attack->muzzle), QA_Q3_RAIL_NONE, z); }
     else emit_trail(host, attack, qa_q3_snap_vector_towards(trace.end, attack->muzzle), QA_Q3_RAIL_SURFACE, trace_normal(trace));

@@ -10,6 +10,7 @@
 #include "qa/content/q3/base/shared/entity_shared.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
+#include "qa/core/math.h"
 
 static bool is(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 static void *grow(void *array, size_t *capacity, size_t count, size_t element) {
@@ -279,8 +280,7 @@ static bool route_begin(void *ctx, qa_traversal_request request, qa_navigation_p
   if (!world_player(route->world, &player)) return false;
   const qa_app_sim_navigation_simulation *sim = &route->world->nav->simulation;
   qa_app_sim_prediction_simulation view = sim->prediction(sim->ctx);
-  qa_vec3 zero = {0, 0, 0};
-  qa_app_sim_player_movement_prediction *projection = qa_app_sim_create_player_movement_prediction(view, player.value, request.from, zero, 16, false, &selected.movement);
+  qa_app_sim_player_movement_prediction *projection = qa_app_sim_create_player_movement_prediction(view, player.value, request.from, qa_zero_vec3, 16, false, &selected.movement);
   if (route->prediction) qa_app_sim_player_movement_prediction_destroy(route->prediction);
   route->prediction = projection; route->request = request;
   memset(out, 0, sizeof *out);

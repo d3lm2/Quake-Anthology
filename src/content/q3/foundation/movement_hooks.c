@@ -16,7 +16,7 @@ typedef struct holder { qa_q3_arsenal_runtime_access runtime; } holder;
 static bool firing_hook(void *ctx, qa_q3_hook_context context){
   (void)ctx;
   if(!context.arsenal.state.kind||strcmp(context.arsenal.state.kind,"q3")!=0)
-    qa_range_error("Q3 source hooks require the selected Q3 arsenal");
+    qa_raise("TypeError", 0, 0, "Q3 source hooks require the selected Q3 arsenal");
   const qa_q3_weapon_item *item=qa_q3_get_weapon_item(context.arsenal.state.source_weapon);
   if(!item) return false;
   if(!item->ammo) return true;
@@ -47,7 +47,7 @@ static qa_q3_weapon_phase_result weapon_hook(void *ctx, qa_q3_hook_context conte
 static qa_animation_step_result torso_hook(void *ctx, qa_q3_hook_context context){
   (void)ctx;
   if(!context.arsenal.state.kind||strcmp(context.arsenal.state.kind,"q3")!=0)
-    qa_range_error("Q3 source torso hooks require a Q3 arsenal");
+    qa_raise("TypeError", 0, 0, "Q3 source torso hooks require a Q3 arsenal");
   if(context.arsenal.state.state!=QA_Q3_WEAPON_READY) return (qa_animation_step_result){context.animation,NULL,0};
   return qa_q3_source_torso(context.arsenal.state.source_weapon==QA_Q3_WP_GAUNTLET?QA_Q3_ANIM_TORSO_STAND2:QA_Q3_ANIM_TORSO_STAND,&context,true);
 }

@@ -37,4 +37,8 @@ void qa_compat_q2_rerelease_core_imports_refresh_cvars(qa_compat_q2_rerelease_co
 bool qa_compat_q2_rerelease_core_imports_cvar(qa_compat_q2_rerelease_core_imports *c, const qa_cvar_snapshot *value, qa_guest_address *out);
 void qa_compat_q2_rerelease_core_imports_free(qa_compat_q2_rerelease_core_imports *c, bool has, qa_guest_address address);
 qa_guest_call_result qa_compat_q2_rerelease_core_imports_invoke(qa_compat_q2_rerelease_core_imports *c, qa_compat_q2_rerelease_import_call call);
+/* new TextDecoder().decode(bytes) over a malloc'd, terminated byte string, kept as the UTF-8 of the decoded text: each
+ * maximal invalid subpart becomes U+FFFD and one leading byte order mark is dropped. Returns raw itself when it is
+ * plain ASCII, otherwise frees it and returns a new malloc'd string. */
+char *qa_compat_q2_decode_guest_text(char *raw, size_t length);
 #endif

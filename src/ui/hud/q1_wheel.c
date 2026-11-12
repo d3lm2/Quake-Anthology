@@ -138,7 +138,8 @@ bool qa_ui_parse_q1_weapon_wheel(const char *text,
   size_t slot_cap = 0, error_cap = 0;
   qa_tokenizer parser;
   memset(&parser, 0, sizeof parser);
-  if (!qa_tokenizer_init(&parser, text, strlen(text), "wwheel.txt"))
+  /* TS parses new TextDecoder().decode(bytes): decoded text (token limit in UTF-16 units). */
+  if (!qa_tokenizer_init_text(&parser, text, strlen(text), "wwheel.txt"))
     return false;
   bool ok = true;
   qa_text_token header;

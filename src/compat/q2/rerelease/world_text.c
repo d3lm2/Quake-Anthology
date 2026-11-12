@@ -28,12 +28,7 @@ bool qa_compat_q2_rerelease_world_text_imports_invoke(qa_compat_q2_rerelease_wor
     w->text_scratch[len++] = (char)byte;
   }
   w->text_scratch[len] = 0;
-  double floats[2];
-  for (int i = 0; i < 2; i++) {
-    const qa_guest_call_value *v = qa_compat_q2_guest_argument(args, count, 3 + offset + (size_t)i);
-    if (v->kind != QA_GUEST_VALUE_FLOAT32) qa_range_error("Q2 world text requires a source float");
-    floats[i] = v->number_value;
-  }
+  /* TS argument order: origin, angles, the colour bytes, size, depthTest, then lifetime. */
   qa_compat_q2_world_text_input input; memset(&input, 0, sizeof input);
   input.origin = qa_compat_q2_mem_read_f32_vector(memory, qa_compat_q2_guest_required_pointer(args, count, 0));
   input.has_angles = fixed;
@@ -44,8 +39,13 @@ bool qa_compat_q2_rerelease_world_text_imports_invoke(qa_compat_q2_rerelease_wor
   double z = qa_compat_q2_mem_read_u8(memory, qa_compat_q2_mem_offset(memory, color_addr, 2)) / 255.0;
   double w2 = qa_compat_q2_mem_read_u8(memory, qa_compat_q2_mem_offset(memory, color_addr, 3)) / 255.0;
   input.color = (qa_vec4){x, y, z, w2};
-  input.size = floats[0];
-  input.depth_test = qa_compat_q2_guest_integer(args, count, 5 + offset) != 0;
+  double floats[2] = {0, 0};
+  for (int i = 0; i < 2; i++) {
+    const qa_guest_call_value *v = qa_compat_q2_guest_argument(args, count, 3 + offset + (size_t)i);
+    if (v->kind != QA_GUEST_VALUE_FLOAT32) qa_raise("TypeError", 0, 0, "Q2 world text requires a source float");
+    floats[i] = v->number_value;
+    if (i == 0) { input.size = floats[0]; input.depth_test = qa_compat_q2_guest_integer(args, count, 5 + offset) != 0; }
+  }
   w->emit(w->emit_ctx, (qa_compat_q2_rerelease_world_text_event){qa_compat_q2_q2_world_text(input), floats[1]});
   if (out) *out = qa_compat_q2_call_void();
   return true;

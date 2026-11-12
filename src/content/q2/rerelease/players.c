@@ -27,11 +27,6 @@ struct qa_q2rr_release_record {
   int64_t subscription;
 };
 
-static void set_buf(char *dst, size_t cap, const char *src, size_t max) {
-  if (!src) src = "";
-  size_t n = strlen(src); if (n > max) n = max; if (n >= cap) n = cap - 1;
-  memcpy(dst, src, n); dst[n] = '\0';
-}
 static qa_inventory_entry *copy_entries(const qa_inventory_entry *entries, size_t n) {
   if (n == 0) return NULL;
   qa_inventory_entry *copy = malloc(n * sizeof *copy);
@@ -129,13 +124,15 @@ static qa_q2_callback_definitions rr_callbacks(void *self) {
 static qa_q2_connection_result rr_connect(void *self, qa_q2_game_services *g, const char *userinfo, bool is_bot) {
   qa_q2_rerelease_players *p = self;
   qa_q2_base_player_rules *rules = qa_q2_players_rules(p->base);
-  char b1[2048], b2[2048];
-  const char *spec = userinfo_get(userinfo, "spectator", b1, sizeof b1);
-  bool spectator = g->options.mode == QA_Q2_MODE_DEATHMATCH && spec && spec[0] && strcmp(spec, "0") != 0;
+  /* The userinfo is client text of any length: values are compared in place. */
+  size_t spec_length = 0, given_length = 0;
+  const char *spec = qa_q2_userinfo_find(userinfo, "spectator", &spec_length);
+  bool spectator = g->options.mode == QA_Q2_MODE_DEATHMATCH && spec && spec_length != 0 && !(spec_length == 1 && spec[0] == '0');
   const char *password = spectator ? rules->spectator_password : rules->password;
   const char *reason = "";
-  const char *given = userinfo_get(userinfo, spectator ? "spectator" : "password", b2, sizeof b2);
-  if ((spectator || !is_bot) && password[0] && strcmp(password, "none") != 0 && (!given || strcmp(password, given) != 0))
+  const char *given = qa_q2_userinfo_find(userinfo, spectator ? "spectator" : "password", &given_length);
+  if ((spectator || !is_bot) && password[0] && strcmp(password, "none") != 0 &&
+      (!given || strlen(password) != given_length || memcmp(password, given, given_length) != 0))
     reason = spectator ? "Spectator password required or incorrect." : "Password required or incorrect.";
   else if (spectator) {
     size_t cnt = 0, n = qa_q2_players_state_count(p->base);
@@ -145,38 +142,9 @@ static qa_q2_connection_result rr_connect(void *self, qa_q2_game_services *g, co
     }
     if ((double)cnt >= rules->max_spectators) reason = "Server spectator limit is full.";
   }
-  qa_q2_connection_result r; memset(&r, 0, sizeof r);
-  if (!reason[0]) { r.allowed = true; set_buf(r.userinfo, sizeof r.userinfo, userinfo, sizeof r.userinfo - 1); return r; }
-  /* [...info].filter(key !== "rejmsg") then rejmsg; info keeps the first
-   * occurrence of each key. */
-  r.allowed = false; set_buf(r.reason, sizeof r.reason, reason, sizeof r.reason - 1);
-  size_t w = 0;
-  const char *s = userinfo; if (s[0] == '\\') s++;
-  bool tok_key = true; const char *kstart = NULL; size_t klen = 0;
-  while (*s) {
-    const char *end = strchr(s, '\\'); size_t len = end ? (size_t)(end - s) : strlen(s);
-    if (tok_key) { kstart = s; klen = len; tok_key = false; }
-    else {
-      bool seen = false;
-      for (const char *q = userinfo[0] == '\\' ? userinfo + 1 : userinfo; q < kstart;) {
-        const char *qe = strchr(q, '\\'); size_t ql = qe ? (size_t)(qe - q) : strlen(q);
-        if (ql == klen && strncmp(q, kstart, klen) == 0) { seen = true; break; }
-        if (!qe) break;
-        const char *ve = strchr(qe + 1, '\\');
-        if (!ve) break;
-        q = ve + 1;
-      }
-      if (!seen && !(klen == 6 && strncmp(kstart, "rejmsg", 6) == 0) && w + klen + len + 2 < sizeof r.userinfo) {
-        r.userinfo[w++] = '\\'; memcpy(r.userinfo + w, kstart, klen); w += klen;
-        r.userinfo[w++] = '\\'; memcpy(r.userinfo + w, s, len); w += len;
-      }
-      tok_key = true;
-    }
-    if (!end) break;
-    s = end + 1;
-  }
-  snprintf(r.userinfo + w, sizeof r.userinfo - w, "\\rejmsg\\%s", reason);
-  return r;
+  /* TS { allowed: true, userinfo } or [...info].filter(key !== "rejmsg") plus the reason. */
+  if (!reason[0]) return qa_q2_players_connection_allowed(p->base, userinfo);
+  return qa_q2_players_connection_refused(p->base, userinfo, reason);
 }
 qa_q2_connection_result qa_q2_rerelease_players_connect(qa_q2_rerelease_players *p, qa_q2_game_services *g,
                                                         const char *userinfo, bool is_bot) {
@@ -235,36 +203,53 @@ static void rr_userinfo_changed(void *self, qa_q2_entity *e, qa_q2_game_services
   qa_q2_rerelease_players *p = self;
   qa_q2_base_player_state *st = state_of(p, e->actor.id);
   if (!st) qa_q2rr_error("Q2 rerelease userinfo requires an admitted player");
-  char truncated[2048]; set_buf(truncated, sizeof truncated, source, 2047);
-  char b[2048];
-  const char *nm = userinfo_get(truncated, "name", b, sizeof b);
-  char name[32]; set_buf(name, sizeof name, nm ? nm : "badinfo", 31);
-  set_buf(st->userinfo, sizeof st->userinfo, truncated, 2047);
-  char b2[2048]; const char *sk = userinfo_get(truncated, "skin", b2, sizeof b2);
-  set_buf(st->skin, sizeof st->skin, sk ? sk : "male/grunt", sizeof st->skin - 1);
-  char b3[2048]; const char *sp = userinfo_get(truncated, "spectator", b3, sizeof b3);
+  /* TS source.slice(0, 2047) and name.slice(0, 31) count UTF-16 units; values are never longer than the userinfo. */
+  char *truncated = qa_q2_text_slice_units(source, strlen(source), 2047);
+  size_t value_size = strlen(truncated) + 1;
+  char *b = malloc(value_size);
+  if (!b) { free(truncated); qa_range_error("Out of memory"); }
+  const char *nm = userinfo_get(truncated, "name", b, value_size);
+  if (!nm) nm = "badinfo";
+  char *name_units = qa_q2_text_slice_units(nm, strlen(nm), 31);
+  const char *name = name_units;
+  qa_cleanup name_cleanup; /* a raise below releases the name */
+  qa_cleanup_push(&name_cleanup, free, name_units);
+  qa_q2_base_player_state_set_userinfo(st, truncated);
+  const char *sk = userinfo_get(truncated, "skin", b, value_size);
+  if (!sk) sk = "male/grunt";
+  qa_q2_base_player_state_set_skin(st, sk, strlen(sk));
+  const char *sp = userinfo_get(truncated, "spectator", b, value_size);
   st->requested_spectator = g->options.mode == QA_Q2_MODE_DEATHMATCH && sp && sp[0] && strcmp(sp, "0") != 0;
-  char b4[2048]; double fov = info_int(userinfo_get(truncated, "fov", b4, sizeof b4));
+  double fov = info_int(userinfo_get(truncated, "fov", b, value_size));
   st->fov = qa_js_max(1, qa_js_min(160, fov));
-  char b5[2048]; double hand = qa_js_max(0, qa_js_min(2, info_int(userinfo_get(truncated, "hand", b5, sizeof b5))));
+  double hand = qa_js_max(0, qa_js_min(2, info_int(userinfo_get(truncated, "hand", b, value_size))));
   st->hand = hand == 1 ? "left" : hand == 2 ? "center" : "right";
-  qa_q2rr_player_extra_state *extra = qa_q2_rerelease_players_get_extra(p, e->actor.id);
-  char b6[2048]; double asw = qa_js_max(0, qa_js_min(3, info_int(userinfo_get(truncated, "autoswitch", b6, sizeof b6))));
-  char b7[2048]; const char *bob = userinfo_get(truncated, "bobskip", b7, sizeof b7);
+  qa_q2rr_player_extra_state *extra = qa_q2rr_players_get_extra_or_null(p, e->actor.id);
+  if (!extra) { free(b); free(truncated); qa_q2rr_error("Q2 rerelease player is not admitted"); }
+  double asw = qa_js_max(0, qa_js_min(3, info_int(userinfo_get(truncated, "autoswitch", b, value_size))));
+  const char *bob = userinfo_get(truncated, "bobskip", b, value_size);
   extra->bob_skip = bob ? bob[0] == '1' : false;
   extra->auto_switch = asw == 1 ? 1 : asw == 2 ? 2 : asw == 3 ? 3 : 0;
-  char b8[2048]; const char *ash = userinfo_get(truncated, "autoshield", b8, sizeof b8);
+  const char *ash = userinfo_get(truncated, "autoshield", b, value_size);
   extra->auto_shield = userinfo_has(truncated, "autoshield") ? info_int(ash) : -1;
-  char b9[2048]; const char *dt = userinfo_get(truncated, "dogtag", b9, sizeof b9);
-  set_buf(extra->dogtag, sizeof extra->dogtag, dt ? dt : "", sizeof extra->dogtag - 1);
+  const char *dt = userinfo_get(truncated, "dogtag", b, value_size);
+  qa_q2rr_set_text(&extra->dogtag, dt ? dt : "");
+  free(b);
+  free(truncated);
   qa_q2_player_event ev; memset(&ev, 0, sizeof ev);
   ev.kind = "userinfo"; ev.actor = e->actor.id; ev.slot = st->slot; ev.name = name; ev.skin = st->skin;
   hooks_of(p)->emit(hooks_of(p)->ctx, ev);
   qa_q2_rerelease_event rev; memset(&rev, 0, sizeof rev);
   rev.kind = "player-dogtag"; rev.has_actor = true; rev.actor = e->actor.id; rev.value = extra->dogtag;
   rr_emit_rr(&p->rerelease_hooks, rev);
-  if (rr_band(e->server_flags, 16) != 0) set_buf(st->name, sizeof st->name, name, sizeof st->name - 1);
-  else snprintf(st->name, sizeof st->name, "##P%s", QA_JS_NUMBER(st->slot));
+  if (rr_band(e->server_flags, 16) != 0) qa_q2_base_player_state_set_name(st, name);
+  else {
+    char bot[48];
+    snprintf(bot, sizeof bot, "##P%s", QA_JS_NUMBER(st->slot));
+    qa_q2_base_player_state_set_name(st, bot);
+  }
+  qa_cleanup_pop(&name_cleanup);
+  free(name_units);
 }
 
 void qa_q2_rerelease_players_weapon_picked(qa_q2_rerelease_players *p, qa_q2_entity *e, qa_q2_game_services *g, qa_item_id item, bool first) {
@@ -713,7 +698,9 @@ static void rr_put_in_server(void *self, qa_q2_entity *e, qa_q2_game_services *g
       if (!placement_set(&p->squad_spawns, &p->squad_count, &p->squad_cap, e->actor.id, v)) qa_range_error("Out of memory");
   }
   if (lm) {
-    extra->pending_landmark.has = true; extra->pending_landmark.name = lm->name;
+    /* TS keeps the name string; the caller's text (an entity's targetname) can be
+     * released while the player still waits for a spawn point. */
+    extra->pending_landmark.has = true; extra->pending_landmark.name = qa_q2_intern(lm->name ? lm->name : "");
     extra->pending_landmark.relative_origin = lm->relative_origin;
     extra->pending_landmark.relative_velocity = lm->relative_velocity;
     extra->pending_landmark.relative_view_angles = lm->relative_view_angles;
@@ -932,7 +919,7 @@ static qa_q2_base_player_view rr_build_view(void *self, qa_q2_player_context *c,
 static void rr_update_bob(void *self, qa_q2_player_context *c) {
   (void)self;
   qa_body_state b = rr_body_of(c->game, c->entity);
-  double speed = hypot(b.velocity.x, b.velocity.y);
+  double speed = qa_js_hypot2(b.velocity.x, b.velocity.y);
   qa_q2_base_player_state *st = c->state;
   if (speed < 5) { st->bob_move = 0; st->bob_time = 0; }
   else if (c->movement.grounded) st->bob_move = rr_frame(c->game) / (speed > 210 ? 0.4 : speed > 100 ? 0.8 : 1.6);

@@ -1,10 +1,12 @@
 /* Port of src/ui/common/controls.ts. GPL-2.0-or-later. */
 #include "qa/ui/common/controls.h"
+#include "qa/input/support.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 
 qa_ui_control qa_ui_button_control(qa_ui_control_id id, const char *label, qa_rect rect,
@@ -152,3 +154,6 @@ void qa_ui_wrapped_lines_free(char **lines, size_t count) {
   for (size_t i = 0; i < count; i++) free(lines[i]);
   free(lines);
 }
+
+/* JS String.prototype.trim over UTF-8 text; one implementation, in input/support.c. */
+char *qa_ui_js_trim(const char *text) { return qa_input_js_trim(text); }

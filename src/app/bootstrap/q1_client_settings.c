@@ -10,21 +10,21 @@
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
+typedef struct size_ctx { qa_command_buffer *commands; double step; } size_ctx;
 struct qa_app_q1_view_commands {
   qa_command_buffer *commands;
   const char *names[4];
   size_t count;
+  /* Each registration's closures capture its own command buffer (TS closes over `commands`). */
+  size_ctx sizeup, sizedown;
 };
-typedef struct size_ctx { qa_command_buffer *commands; double step; } size_ctx;
-static size_ctx sizeup_ctx, sizedown_ctx;
 static void size_handler(void *v, qa_command_invocation *command) {
   size_ctx *ctx = v;
   qa_cvar_read size;
   if (qa_command_buffer_find_cvar(ctx->commands, "viewsize", &command->source, &size)) {
     char text[64];
     double next = size.numeric_value + ctx->step;
-    if ((fabs(next) < 9.2e18 && next == trunc(next))) snprintf(text, sizeof text, "viewsize %s\n", QA_JS_NUMBER(next));
-    else snprintf(text, sizeof text, "viewsize %s\n", QA_JS_NUMBER(next));
+    snprintf(text, sizeof text, "viewsize %s\n", QA_JS_NUMBER(next));
     qa_cvar_read_free(&size);
     qa_command_invocation_insert(command, text);
   }
@@ -39,14 +39,29 @@ static void name_handler(void *v, qa_command_invocation *command) {
   (void)v;
   if (arg_count(command) == 0) { qa_command_invocation_execute_now(command, "_cl_name"); return; }
   const char *source = arg_count(command) == 1 ? arg_at(command, 0) : command->args_text;
-  char name[16];
-  size_t at = 0;
-  for (size_t i = 0; source[i] != '\0' && i < 15; i++)
-    if (source[i] != '"' && source[i] != '\n' && source[i] != '\r') name[at++] = source[i];
-  name[at] = '\0';
-  char text[32];
-  snprintf(text, sizeof text, "_cl_name \"%s\"", name);
+  /* .slice(0, 15) counts UTF-16 units (a surrogate pair cut in half is dropped whole), then
+   * .replace(/["\n\r]/g, ""). */
+  const unsigned char *p = (const unsigned char *)source;
+  size_t units = 0, end = 0;
+  while (p[end] != '\0') {
+    size_t width = p[end] >= 0xf0 ? 4 : p[end] >= 0xe0 ? 3 : p[end] >= 0xc0 ? 2 : 1;
+    size_t cost = width == 4 ? 2 : 1;
+    if (units + cost > 15) break;
+    for (size_t i = 1; i < width; i++) if (p[end + i] == '\0') { width = i; break; }
+    units += cost; end += width;
+  }
+  char *text = malloc(end + 12);
+  if (text == NULL) qa_range_error("Out of memory");
+  size_t at = (size_t)snprintf(text, end + 12, "_cl_name \"");
+  for (size_t i = 0; i < end; i++)
+    if (source[i] != '"' && source[i] != '\n' && source[i] != '\r') text[at++] = source[i];
+  text[at++] = '"';
+  text[at] = '\0';
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, text);
   qa_command_invocation_execute_now(command, text);
+  qa_cleanup_pop(&node);
+  free(text);
 }
 static int color_component(const char *text) {
   int value = qa_native_atoi(text) & 15;
@@ -82,13 +97,13 @@ qa_app_q1_view_commands *qa_app_register_q1_view_commands(qa_command_buffer *com
   registration->commands = commands;
   qa_command_dialect dialect = qa_command_buffer_dialect(commands);
   if (dialect != QA_COMMAND_DIALECT_Q1_NETQUAKE && dialect != QA_COMMAND_DIALECT_Q1_QUAKEWORLD) return registration;
-  sizeup_ctx.commands = commands; sizeup_ctx.step = 10;
-  sizedown_ctx.commands = commands; sizedown_ctx.step = -10;
+  registration->sizeup.commands = commands; registration->sizeup.step = 10;
+  registration->sizedown.commands = commands; registration->sizedown.step = -10;
   if (!qa_command_buffer_exists(commands, "sizeup")
-      && qa_command_buffer_register(commands, "sizeup", size_handler, &sizeup_ctx, NULL, QA_COMMAND_WORLD))
+      && qa_command_buffer_register(commands, "sizeup", size_handler, &registration->sizeup, NULL, QA_COMMAND_WORLD))
     registration->names[registration->count++] = "sizeup";
   if (!qa_command_buffer_exists(commands, "sizedown")
-      && qa_command_buffer_register(commands, "sizedown", size_handler, &sizedown_ctx, NULL, QA_COMMAND_WORLD))
+      && qa_command_buffer_register(commands, "sizedown", size_handler, &registration->sizedown, NULL, QA_COMMAND_WORLD))
     registration->names[registration->count++] = "sizedown";
   if (dialect == QA_COMMAND_DIALECT_Q1_NETQUAKE) {
     qa_cvar_read probe;
@@ -134,17 +149,20 @@ static char *validate_number(void *ctx, const char *value) {
   return NULL;
 }
 static void changed_noop(void *ctx, const char *value) { (void)ctx; (void)value; }
+/* The registry borrows documentation: `examples` is a static array. */
 static void register_number(qa_cvar_registry *cvars, const char *name, const char *value,
-    double flags, const char *summary, const char *usage, const char *example) {
+    double flags, const char *summary, const char *usage, const char *const *examples) {
   qa_cvar_snapshot snap;
   if (qa_cvar_registry_register(cvars, name, value, flags, &snap)) qa_cvar_read_free(&snap);
   qa_cvar_value_binding binding = {NULL, validate_number, changed_noop};
   qa_cvar_registry_bind_value(cvars, name, binding);
-  const char *examples[2];
-  examples[0] = example; examples[1] = NULL;
   qa_command_documentation documentation = {summary, usage, examples, 1, NULL, 0};
   qa_cvar_registry_document(cvars, name, documentation);
 }
+static const char *const chase_active_examples[] = {"chase_active 0"};
+static const char *const chase_back_examples[] = {"chase_back 100"};
+static const char *const chase_up_examples[] = {"chase_up 16"};
+static const char *const chase_right_examples[] = {"chase_right 0"};
 void qa_app_register_q1_client_settings(qa_cvar_registry *cvars, qa_command_dialect profile, bool profile_all) {
   bool q1 = profile == QA_COMMAND_DIALECT_Q1_NETQUAKE || profile == QA_COMMAND_DIALECT_Q1_QUAKEWORLD;
   if (!profile_all && !q1) return;
@@ -161,10 +179,10 @@ void qa_app_register_q1_client_settings(qa_cvar_registry *cvars, qa_command_dial
       "viewsize <30..120>", view_examples, 2, NULL, 0};
   qa_cvar_registry_document(cvars, "viewsize", view_doc);
   if (profile_all || profile == QA_COMMAND_DIALECT_Q1_NETQUAKE) {
-    register_number(cvars, "chase_active", "0", 0, "Enable the local chase camera without changing player aim.", "chase_active <number>", "chase_active 0");
-    register_number(cvars, "chase_back", "100", 0, "Chase distance behind the player, in world units.", "chase_back <number>", "chase_back 100");
-    register_number(cvars, "chase_up", "16", 0, "Chase height above the eye, in world units.", "chase_up <number>", "chase_up 16");
-    register_number(cvars, "chase_right", "0", 0, "Q1 lateral chase offset: positive moves opposite the view's right vector.", "chase_right <number>", "chase_right 0");
+    register_number(cvars, "chase_active", "0", 0, "Enable the local chase camera without changing player aim.", "chase_active <number>", chase_active_examples);
+    register_number(cvars, "chase_back", "100", 0, "Chase distance behind the player, in world units.", "chase_back <number>", chase_back_examples);
+    register_number(cvars, "chase_up", "16", 0, "Chase height above the eye, in world units.", "chase_up <number>", chase_up_examples);
+    register_number(cvars, "chase_right", "0", 0, "Q1 lateral chase offset: positive moves opposite the view's right vector.", "chase_right <number>", chase_right_examples);
   }
 }
 bool qa_app_read_q1_view_settings(qa_cvar_registry *cvars, qa_command_dialect profile,
@@ -179,7 +197,7 @@ bool qa_app_read_q1_view_settings(qa_cvar_registry *cvars, qa_command_dialect pr
   if (!qa_cvar_registry_find(cvars, "viewsize", &current)) return false;
   double numeric = current.numeric_value;
   qa_cvar_read_free(&current);
-  double size = numeric < 30 ? 30 : numeric > 120 ? 120 : numeric;
+  double size = qa_js_max(30, qa_js_min(120, numeric));
   if (size != numeric) {
     char text[32];
     snprintf(text, sizeof text, "%s", QA_JS_NUMBER(size));
@@ -235,7 +253,7 @@ qa_scene_camera qa_app_q1_chase_camera(qa_scene_camera camera, qa_vec3 angles,
   qa_trace_result aim = scene->trace(scene->ctx, query);
   qa_vec3 target = aim.fraction == 1 || aim.start_solid || aim.all_solid ? far : aim.end;
   qa_vec3 delta = {target.x - origin.x, target.y - origin.y, target.z - origin.z};
-  double horizontal = hypot(delta.x, delta.y);
+  double horizontal = qa_js_hypot2(delta.x, delta.y);
   qa_vec3 view_angles = {
       math->store(math->ctx, -atan2(delta.z, horizontal) * 180 / acos(-1.0)),
       horizontal == 0 ? angles.y : math->store(math->ctx, atan2(delta.y, delta.x) * 180 / acos(-1.0)),
@@ -246,17 +264,13 @@ qa_scene_camera qa_app_q1_chase_camera(qa_scene_camera camera, qa_vec3 angles,
   return out;
 }
 qa_rect qa_app_q1_view_rectangle(qa_rect area, double viewsize, bool intermission, bool overlay_status) {
-  double size = intermission ? 120 : viewsize < 30 ? 30 : viewsize > 120 ? 120 : viewsize;
+  /* Math.min/Math.max propagate NaN. */
+  double size = intermission ? 120 : qa_js_max(30, qa_js_min(120, viewsize));
   double lines = size >= 120 ? 0 : size >= 110 ? 24 : 48;
-  double available = area.height - (overlay_status && size >= 100 ? 0 : lines);
-  if (available < 1) available = 1;
-  double fraction = (size < 100 ? size : 100) / 100;
-  double width = trunc(area.width * fraction);
-  if (width < 96) width = 96;
-  if (width > area.width) width = area.width;
-  double height = trunc(area.height * fraction);
-  if (height > available) height = available;
-  if (height < 1) height = 1;
+  double available = qa_js_max(1, area.height - (overlay_status && size >= 100 ? 0 : lines));
+  double fraction = qa_js_min(size, 100) / 100;
+  double width = qa_js_min(area.width, qa_js_max(96, trunc(area.width * fraction)));
+  double height = qa_js_max(1, qa_js_min(available, trunc(area.height * fraction)));
   qa_rect out = {area.x + trunc((area.width - width) / 2),
       area.y + (size >= 100 ? 0 : trunc((available - height) / 2)), width, height};
   return out;

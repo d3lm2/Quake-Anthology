@@ -55,7 +55,8 @@ typedef struct qa_cvar_read {
   char *value;
   char *reset_value;
   char *latched_value; /* NULL is TS undefined */
-  int32_t flags;
+  int32_t flags;      /* ToInt32 of flags_value: what every bit test sees */
+  double flags_value; /* TS CvarSnapshot.flags: a restored or fullSet number as given */
   bool modified;
   double modification_count;
   double numeric_value;

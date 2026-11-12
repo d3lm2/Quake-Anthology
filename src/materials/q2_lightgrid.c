@@ -5,6 +5,7 @@
 #include "qa/core/math.h"
 #include "qa/materials/q2_lightgrid.h"
 #include "qa/materials/shader_types.h"
+#include "qa/foundation/js.h"
 
 static float fr(double v) { return (float)v; }
 static int32_t imul(double a, double b) {
@@ -53,7 +54,10 @@ qa_vec3 qa_adjust_q2_lighting(qa_vec3 color,
   double r = fr(fr(color.x + adjustment.add) * adjustment.modulate);
   double g = fr(fr(color.y + adjustment.add) * adjustment.modulate);
   double b = fr(fr(color.z + adjustment.add) * adjustment.modulate);
-  r = r > 0 ? r : 0; g = g > 0 ? g : 0; b = b > 0 ? b : 0;
+  /* Math.max(0, ...): NaN stays NaN. */
+  r = qa_js_max(0, r);
+  g = qa_js_max(0, g);
+  b = qa_js_max(0, b);
   qa_vec3 rgb = {r, g, b};
   if (adjustment.saturation == 1) return qa_scale3(rgb, fr(1.0 / 255));
   double luminance = fr(fr(fr(r * fr(0.2126)) + fr(g * fr(0.7152))) +

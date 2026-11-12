@@ -86,7 +86,9 @@ static void invoke_cb(S *s, qa_actor_id actor, const char *name, const qa_actor_
   SavedGlobals g = {vm, self_off, other_off, saved_self, saved_other}; qa_cleanup scope; qa_cleanup_push(&scope, restore_globals, &g);
   qa_compat_qc_words_set_int(&vm->globals, self_off, (double)qa_compat_qc_entity_memory_reference(s->world->options.entities, slot));
   qa_compat_qc_words_set_int(&vm->globals, other_off, other ? (double)qa_compat_qc_world_host_reference(s->world, *other) : 0);
-  qa_compat_qc_words_set_float(&vm->globals, qa_compat_qc_machine_global_offset(vm, "time"), s->server_time(s->ctx));
+  int64_t time_off = qa_compat_qc_machine_global_offset(vm, "time"); /* the offset, then the clock, as TS evaluates them */
+  double now = s->server_time(s->ctx);
+  qa_compat_qc_words_set_float(&vm->globals, time_off, now);
   qa_compat_qc_machine_execute(vm, callback, 0);
   qa_cleanup_pop(&scope); restore_globals(&g);
 }

@@ -1,6 +1,6 @@
 /* Port of src/app/bootstrap/simulation/rerelease-guest-player.ts.
- * q2WeaponStatus (simulation/arsenal sibling slice) is supplied by the
- * caller until that slice lands. GPL-2.0-or-later. */
+ * q2WeaponStatus (simulation/arsenal/weapon_status.c) is supplied by the
+ * caller. GPL-2.0-or-later. */
 #ifndef QA_APP_BOOTSTRAP_SIMULATION_RERELEASE_GUEST_PLAYER_H
 #define QA_APP_BOOTSTRAP_SIMULATION_RERELEASE_GUEST_PLAYER_H
 #include <stddef.h>

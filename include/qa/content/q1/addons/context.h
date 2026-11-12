@@ -86,6 +86,8 @@ typedef struct qa_q1ad_context {
    * qa_q1ad_context_destroy (TS GC): the MG3 item tables and addon monsters. */
   struct qa_q1ad_mg3_items *mg3_items;
   bool addon_monsters;
+  /* The world endtext the last stage-2 finale returned (its result borrows it). */
+  char *finale_text;
 } qa_q1ad_context;
 
 /* new Q1AddonContext(base, program, services). NULL only on OOM. */

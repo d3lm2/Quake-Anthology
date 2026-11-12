@@ -2,6 +2,7 @@
 #include "qa/app/bootstrap/network/types.h"
 #include <string.h>
 #include "qa/foundation/support.h"
+#include "qa/foundation/caught_message.h"
 const char *qa_app_network_phase_name(qa_app_network_phase phase) {
   switch (phase) {
     case QA_APP_PHASE_CHALLENGING: return "challenging";
@@ -22,5 +23,6 @@ void qa_app_q2_game_callback(void (*fn)(void *ctx), void *ctx) {
   qa_caught_error caught;
   if (qa_try(fn, ctx, &caught)) return;
   if (strcmp(caught.name, "Q2GameCallbackError") == 0) qa_rethrow(&caught);
-  qa_app_q2_game_callback_error(caught.message);
+  /* The whole message of the caught error (caught.message is cut at its buffer). */
+  qa_app_q2_game_callback_error(qa_caught_message(&caught));
 }

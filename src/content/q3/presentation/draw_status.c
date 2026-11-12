@@ -23,11 +23,11 @@ void qa_q3_pres_client_draw_status_init(qa_q3_pres_client_draw_status *status,
     qa_q3_pres_client_draw_tools *tools, qa_q3_pres_client_game_static_state *tools_static_state,
     qa_q3_pres_draw_status_variant variant, qa_q3_pres_draw_status_host host) {
   if (state->product != static_state->product || tools_static_state != static_state)
-    qa_range_error("Draw status services must share canonical cgame state");
-  if (variant.kind != state->product) qa_range_error("Draw status product variant differs from cgame state");
+    qa_raise("Error", 0, 0, "Draw status services must share canonical cgame state");
+  if (variant.kind != state->product) qa_raise("Error", 0, 0, "Draw status product variant differs from cgame state");
   if (variant.kind == QA_Q3_BASE_PRODUCT_MISSIONPACK &&
       (!variant.fonts || variant.fonts->profile != QA_Q3_FONT_CGAME))
-    qa_range_error("Missionpack center print requires cgame fonts");
+    qa_raise("Error", 0, 0, "Missionpack center print requires cgame fonts");
   memset(status, 0, sizeof *status);
   status->state = state;
   status->static_state = static_state;
@@ -114,11 +114,11 @@ void qa_q3_pres_client_draw_status_add_lagometer_snapshot_info(qa_q3_pres_client
   status->snapshot_count = qa_int32((double)status->snapshot_count + 1);
 }
 bool qa_q3_pres_client_draw_status_draw_disconnect(qa_q3_pres_client_draw_status *status) {
-  if (!status->state->snap) qa_range_error("CG_DrawDisconnect requires a current snapshot");
+  if (!status->state->snap) qa_raise("Error", 0, 0, "CG_DrawDisconnect requires a current snapshot");
   double number = qa_int32(status->host.commands.current_number(status->host.commands.ctx) - 64 + 1);
   qa_q3_base_user_command command;
   if (!status->host.commands.read(status->host.commands.ctx, number, &command))
-    qa_range_error("CG_DrawDisconnect command fell outside CMD_BACKUP");
+    qa_raise("Error", 0, 0, "CG_DrawDisconnect command fell outside CMD_BACKUP");
   if (command.server_time <= status->state->snap->player_state.command_time ||
       command.server_time > status->state->time) return true;
   const char *message = "Connection Interrupted";

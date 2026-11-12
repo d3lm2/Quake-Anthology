@@ -30,6 +30,8 @@ struct qa_app_base_arena_progression {
   qa_app_arena_progression_catalog catalog;
 };
 static bool is_int(double v) { return isfinite(v) && trunc(v) == v; }
+/* level === catalog.training / catalog.final, where a negative slot is TS null (never equal). */
+static bool is_slot(double level, double slot) { return slot >= 0 && level == slot; }
 static double read_key(qa_app_base_arena_progression *p, const char *name, const char *key) {
   qa_cvar_read read;
   const char *value = "";
@@ -41,7 +43,9 @@ static double read_key(qa_app_base_arena_progression *p, const char *name, const
   if (found) qa_cvar_read_free(&read);
   return result;
 }
-static void info_print_throw(void *ctx, const char *text) { (void)ctx; qa_range_error("%s", text); }
+/* print: message => { throw new Error(message); } */
+static void info_print_throw(void *ctx, const char *text) { (void)ctx; qa_raise("Error", 0, 0, "%s", text); }
+static void read_free_node(void *arg) { qa_cvar_read_free(arg); }
 static void write_key(qa_app_base_arena_progression *p, const char *name, const char *key, double value) {
   qa_cvar_read read;
   const char *current = "";
@@ -50,15 +54,21 @@ static void write_key(qa_app_base_arena_progression *p, const char *name, const 
   char buf[64];
   snprintf(buf, sizeof buf, "%s", QA_JS_NUMBER(value)); /* String(value) */
   qa_info_options options = {QA_COMMAND_DIALECT_Q3, 1024, QA_CVAR_INFO_CLIENT_USERINFO, true, info_print_throw, NULL};
+  qa_cleanup node;
+  if (found) qa_cleanup_push(&node, read_free_node, &read);
   char *text = qa_set_info_value(current, key, buf, &options);
-  set_cvar(p->cvars, name, text ? text : "", true, NULL);
-  free(text);
+  if (found) qa_cleanup_pop(&node);
   if (found) qa_cvar_read_free(&read);
+  qa_cleanup text_node;
+  qa_cleanup_push(&text_node, free, text);
+  set_cvar(p->cvars, name, text ? text : "", true, NULL);
+  qa_cleanup_pop(&text_node);
+  free(text);
 }
 qa_app_base_arena_progression *qa_app_base_arena_progression_create(qa_cvar_registry *cvars, qa_app_arena_progression_catalog catalog) {
   if (!is_int(catalog.regular_levels) || catalog.regular_levels < 0 || fmod(catalog.regular_levels, 4) != 0 ||
       !is_int(catalog.total_levels) || catalog.total_levels < catalog.regular_levels)
-    qa_range_error("Invalid arena progression catalog");
+    qa_raise("Error", 0, 0, "Invalid arena progression catalog");
   qa_app_base_arena_progression *p = calloc(1, sizeof *p);
   if (!p) return NULL;
   p->cvars = cvars;
@@ -96,21 +106,21 @@ double qa_app_base_arena_progression_current_level(qa_app_base_arena_progression
   if (p->catalog.training >= 0 && qa_app_base_arena_progression_best(p, p->catalog.training).rank != 1) return p->catalog.training;
   for (double level = 0; level < p->catalog.regular_levels; level++)
     if (qa_app_base_arena_progression_best(p, level).rank != 1) return level;
-  return p->catalog.final;
+  return p->catalog.final >= 0 ? p->catalog.final : -1; /* catalog.final ?? -1 */
 }
 bool qa_app_base_arena_progression_level_available(qa_app_base_arena_progression *p, double level) {
-  if (level == p->catalog.training) return true;
+  if (is_slot(level, p->catalog.training)) return true;
   if (level < 0 || level >= p->catalog.total_levels) return false;
   double current = qa_app_base_arena_progression_current_level(p);
-  if (current == p->catalog.training) return false;
+  if (is_slot(current, p->catalog.training)) return false;
   if (current < 0) return true;
-  double current_tier = current == p->catalog.final ? p->catalog.regular_levels / 4 : trunc(current / 4);
-  double tier = level == p->catalog.final ? p->catalog.regular_levels / 4 : trunc(level / 4);
+  double current_tier = is_slot(current, p->catalog.final) ? p->catalog.regular_levels / 4 : trunc(current / 4);
+  double tier = is_slot(level, p->catalog.final) ? p->catalog.regular_levels / 4 : trunc(level / 4);
   return tier <= current_tier;
 }
 double qa_app_base_arena_progression_completed_tier(qa_app_base_arena_progression *p, double level) {
-  if (level == p->catalog.training) return 0;
-  if (level == p->catalog.final) return p->catalog.regular_levels / 4 + 1;
+  if (is_slot(level, p->catalog.training)) return 0;
+  if (is_slot(level, p->catalog.final)) return p->catalog.regular_levels / 4 + 1;
   if (level < 0 || level >= p->catalog.regular_levels) return -1;
   double tier = trunc(level / 4);
   for (double n = tier * 4; n < tier * 4 + 4; n++)
@@ -131,7 +141,7 @@ static void grant(grant_ctx *ctx, double medal, double count, double display) {
 qa_app_arena_progression_result qa_app_base_arena_progression_record(qa_app_base_arena_progression *p, qa_app_arena_result result) {
   if (!is_int(result.level) || result.level < 0 || result.level >= p->catalog.total_levels ||
       !is_int(result.rank) || result.rank < 1 || result.rank > 8)
-    qa_range_error("Invalid arena result");
+    qa_raise("Error", 0, 0, "Invalid arena result");
   qa_app_arena_progression_result out = {result.rank, -1, -1, 0, NULL, 0};
   char name[32], key[32];
   snprintf(name, sizeof name, "g_spScores%s", QA_JS_NUMBER(result.skill));

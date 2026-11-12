@@ -1,6 +1,6 @@
 /* Port of src/app/bootstrap/simulation/prediction/types.ts (types only).
- * recipe/scene borrowed. relative_command/resolve_controls mirror the
- * sibling slices q3-commands.ts/arsenal-intent.ts (not landed): NULL is
+ * recipe/scene borrowed. relative_command/resolve_controls are the
+ * q3-commands.ts/arsenal-intent.ts hooks the caller supplies: NULL is
  * identity command / no arsenal rewrite. GPL-2.0-or-later. */
 #ifndef QA_APP_BOOTSTRAP_SIMULATION_PREDICTION_TYPES_H
 #define QA_APP_BOOTSTRAP_SIMULATION_PREDICTION_TYPES_H

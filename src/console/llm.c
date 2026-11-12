@@ -7,6 +7,8 @@
 #include <string.h>
 
 #include "qa/console/llm_batch.h"
+#include "qa/foundation/support.h"
+#include "qa/input/support.h"
 
 static char *dup_text(const char *text) {
   size_t length = strlen(text);
@@ -180,6 +182,18 @@ static bool signal_aborted(void *ctx) {
   return qa_llm_signal_is_aborted((qa_llm_abort_signal *)ctx);
 }
 
+typedef struct batch_call {
+  qa_command_buffer *commands;
+  const char *text;
+  qa_command_context source;
+  qa_llm_abort_signal *signal;
+} batch_call;
+static void run_batch(void *ctx) {
+  batch_call *call = (batch_call *)ctx;
+  (void)qa_command_buffer_execute_batch(call->commands, call->text, call->source, signal_aborted,
+                                        call->signal);
+}
+
 typedef struct llm_definition {
   const char *name;
   const char *usage;
@@ -202,12 +216,12 @@ static void run_request(qa_llm_commands_registration *reg, const llm_definition 
   }
   char *prompt = builder_finish(&joined);
   if (prompt == NULL) return;
-  size_t begin = 0, end = strlen(prompt);
-  while (prompt[begin] == ' ' || (prompt[begin] >= '\t' && prompt[begin] <= '\r')) begin++;
-  while (end > begin && (prompt[end - 1] == ' ' || (prompt[end - 1] >= '\t' && prompt[end - 1] <= '\r')))
-    end--;
-  memmove(prompt, prompt + begin, end - begin);
-  prompt[end - begin] = '\0';
+  /* args.join(" ").trim(): every JS white space and line terminator (U+00A0, U+2028, U+FEFF
+     and the Unicode spaces too), by code point. */
+  char *trimmed = qa_input_js_trim(prompt);
+  free(prompt);
+  prompt = trimmed;
+  if (prompt == NULL) return;
   if (prompt[0] == '\0') {
     print_format(reg, &source, "Usage: %s\nQuote text containing semicolons.\n",
                  definition->usage);
@@ -326,9 +340,14 @@ static void run_request(qa_llm_commands_registration *reg, const llm_definition 
             builder_add(&submitted, "\n");
           }
           if (printed.data != NULL) print_format(reg, &source, "%s\n", printed.data);
-          if (submitted.data != NULL)
-            qa_command_buffer_execute_batch(reg->commands, submitted.data, source,
-                                            signal_aborted, signal);
+          /* TS run()'s try/catch: an executeBatch throw (a cancelled or over-budget
+             batch, a raising handler) is reported while the request is current. */
+          if (submitted.data != NULL) {
+            batch_call call = {reg->commands, submitted.data, source, signal};
+            qa_caught_error caught;
+            if (!qa_try(run_batch, &call, &caught) && request_current(reg, key, signal))
+              print_format(reg, &source, "LLM request failed: %s\n", caught.message);
+          }
           free(printed.data);
           free(submitted.data);
         }

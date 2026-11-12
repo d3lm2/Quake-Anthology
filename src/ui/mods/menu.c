@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/ui/common/controls.h"
@@ -171,7 +172,7 @@ static qa_ui_menu factory(void *v) {
   const qa_ui_mod_menu_row *all_rows =
       s->service->rows(s->service->ctx, &all_count);
   char *query_lower = lower_dup(s->query);
-  char *trimmed = qa_input_js_trim(query_lower);
+  char *trimmed = qa_ui_js_trim(query_lower);
   if (trimmed == NULL) qa_range_error("Out of memory");
   free(query_lower);
   /* Split the trimmed query on whitespace runs (JS split(/\s+/u);
@@ -186,12 +187,13 @@ static qa_ui_menu factory(void *v) {
     term_count = 1;
     term_capacity = 1;
   } else {
+    /* JS \s over UTF-8 code points. */
     const char *cursor = trimmed;
     while (*cursor != '\0') {
-      while (*cursor != '\0' && isspace((unsigned char)*cursor)) cursor++;
+      for (size_t space; (space = qa_js_white_space_length(cursor)) > 0;) cursor += space;
       if (*cursor == '\0') break;
       const char *start = cursor;
-      while (*cursor != '\0' && !isspace((unsigned char)*cursor)) cursor++;
+      while (*cursor != '\0' && qa_js_white_space_length(cursor) == 0) cursor++;
       if (term_count == term_capacity) {
         term_capacity = term_capacity != 0 ? term_capacity * 2 : 8;
         terms = realloc(terms, term_capacity * sizeof *terms);
@@ -226,7 +228,7 @@ static qa_ui_menu factory(void *v) {
   free(terms);
   free(trimmed);
   const qa_ui_mod_menu_row *current = NULL;
-  for (size_t i = 0; i < filtered; i++)
+  for (size_t i = 0; current == NULL && i < filtered; i++)
     if (s->selected != NULL && strcmp(rows[i]->id, s->selected) == 0)
       current = rows[i];
   if (current == NULL && filtered > 0) current = rows[0];
@@ -356,7 +358,7 @@ static qa_ui_menu factory(void *v) {
     s->scroll_capacity = line_count;
   }
   for (size_t i = 0; i < line_count; i++) {
-    char *trimmed_line = qa_input_js_trim(lines[i]);
+    char *trimmed_line = qa_ui_js_trim(lines[i]);
     if (trimmed_line == NULL) qa_range_error("Out of memory");
     qa_ui_control *detail = next_control(s, &at, X_NONE);
     detail->id = pool_format(s, "ui:mods:detail:%zu", i);
@@ -367,6 +369,8 @@ static qa_ui_menu factory(void *v) {
     detail->activate_seat = on_activate;
     s->scroll_ids[i] = detail->id;
   }
+  /* next_control may have moved the ctx array while the detail rows were added. */
+  for (size_t i = 0; i < at; i++) s->controls[i].ctx = &s->ctxs[i];
   free(lines);
   free(rows);
   free(current_line);

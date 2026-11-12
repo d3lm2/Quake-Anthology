@@ -80,7 +80,10 @@ static qa_actor_id actor_field(const qa_save_reader *reader, const char *name,
   return qa_app_unified_read_actor(&f, identity);
 }
 qa_vec3 qa_app_unified_read_vector(const qa_save_reader *reader) {
-  qa_vec3 out = {finite_field(reader, "x"), finite_field(reader, "y"), finite_field(reader, "z")};
+  qa_vec3 out; /* TS reads x, y, z in order; C initializer order is unspecified */
+  out.x = finite_field(reader, "x");
+  out.y = finite_field(reader, "y");
+  out.z = finite_field(reader, "z");
   return out;
 }
 qa_vec4 qa_app_unified_read_color(const qa_save_reader *reader) {
@@ -89,14 +92,16 @@ qa_vec4 qa_app_unified_read_color(const qa_save_reader *reader) {
   return out;
 }
 void qa_app_unified_read_axis(const qa_save_reader *reader, qa_vec3 out[3]) {
+  /* TS r.list(vector) reads every item before the length check. */
   size_t count = qa_save_reader_list_count(reader);
-  if (count != 3) qa_save_reader_fail(reader, "expected three axes");
-  for (size_t i = 0; i < 3; i++) {
+  for (size_t i = 0; i < count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(reader, i, &item)) qa_range_error("out of memory");
-    out[i] = qa_app_unified_read_vector(&item);
+    qa_vec3 value = qa_app_unified_read_vector(&item);
+    if (i < 3) out[i] = value;
     qa_save_reader_destroy(&item);
   }
+  if (count != 3) qa_save_reader_fail(reader, "expected three axes");
 }
 qa_app_sim_player_view qa_app_unified_read_player_view(const qa_save_reader *reader) {
   qa_app_sim_player_view view = {0};
@@ -509,18 +514,9 @@ void qa_app_unified_model_free(qa_app_simulation_presentation *model) {
 qa_q3_character_view qa_app_unified_read_character_view(const qa_save_reader *reader,
     const qa_app_unified_identity_decoder *identity) {
   qa_q3_character_view view = {0};
+  /* TS reads the optional scale and opacity, then the literal's fields in order: actor, origin,
+   * angles, velocity, movementDirection, animation, sourceFlags, powerups, team, color. */
   qa_save_reader a = field_of(reader, "animation"), f;
-  qa_save_reader kind = field_of(&a, "kind");
-  qa_save_reader_literal_string(&kind, "q3");
-  qa_save_reader_destroy(&kind);
-  view.animation.kind = "q3";
-  qa_save_reader legs = field_of(&a, "legs"), torso = field_of(&a, "torso");
-  view.animation.legs = qa_save_reader_integer(&legs);
-  view.animation.torso = qa_save_reader_integer(&torso);
-  qa_save_reader_destroy(&legs); qa_save_reader_destroy(&torso);
-  view.animation.legs_timer_milliseconds = finite_field(&a, "legsTimerMilliseconds");
-  view.animation.torso_timer_milliseconds = finite_field(&a, "torsoTimerMilliseconds");
-  qa_save_reader_destroy(&a);
   if (has_field(reader, "scale", &f)) {
     view.scale = qa_save_reader_finite(&f); view.has_scale = true;
     qa_save_reader_destroy(&f);
@@ -542,6 +538,19 @@ qa_q3_character_view qa_app_unified_read_character_view(const qa_save_reader *re
   qa_save_reader v = field_of(reader, "movementDirection");
   view.movement_direction = qa_save_reader_integer(&v);
   qa_save_reader_destroy(&v);
+  qa_save_reader kind = field_of(&a, "kind");
+  qa_save_reader_literal_string(&kind, "q3");
+  qa_save_reader_destroy(&kind);
+  view.animation.kind = "q3";
+  qa_save_reader legs = field_of(&a, "legs");
+  view.animation.legs = qa_save_reader_integer(&legs);
+  qa_save_reader_destroy(&legs);
+  qa_save_reader torso = field_of(&a, "torso");
+  view.animation.torso = qa_save_reader_integer(&torso);
+  qa_save_reader_destroy(&torso);
+  view.animation.legs_timer_milliseconds = finite_field(&a, "legsTimerMilliseconds");
+  view.animation.torso_timer_milliseconds = finite_field(&a, "torsoTimerMilliseconds");
+  qa_save_reader_destroy(&a);
   v = field_of(reader, "sourceFlags");
   view.source_flags = qa_save_reader_integer(&v);
   qa_save_reader_destroy(&v);

@@ -4,9 +4,10 @@
  * GPL-2.0-or-later.
  * C accommodations: TS Q2Weapons / Q2WeaponState are the real
  * qa_q2w_weapons / qa_q2w_state (foundation/weapons/player.h).
- * Live-state strings the TS mutates in place (userinfo/name/skin) are
- * fixed buffers bounded by the largest TS truncation (Q2RereleasePlayers
- * keeps 2047/31 characters; the base 511/15). Type names use
+ * userinfo, name and skin are owned strings of any length (TS strings; set
+ * them with qa_q2_base_player_state_set_userinfo/_set_name/_set_skin): play
+ * truncates a name (Q2RereleasePlayers keeps 31 UTF-16 units, the base 15),
+ * a restored one is kept whole. Type names use
  * the qa_q2_base_* prefix where contracts/protocol.h or
  * persistence/q2-players.h already own the plain qa_q2_* spelling.
  */
@@ -183,9 +184,9 @@ typedef struct qa_q2_base_player_state {
   double slot, entered_at;
   bool use_q2_weapons, use_q2_inventory;
   qa_inventory_entry *spawn_inventory; size_t spawn_inventory_count;
-  char userinfo[2048];
-  char name[32];
-  char skin[2048];
+  char *userinfo; /* owned; never NULL after init */
+  char *name; /* owned; never NULL after init */
+  char *skin; /* owned; never NULL after init */
   const char *gender;
   double fov;
   const char *hand;
@@ -219,6 +220,14 @@ typedef struct qa_q2_base_player_state {
 /* TS Q2PlayerState constructor. */
 void qa_q2_base_player_state_init(qa_q2_base_player_state *state, double slot, double entered_at);
 void qa_q2_base_player_state_destroy(qa_q2_base_player_state *state);
+/* state.userinfo = text / state.skin = text (length bytes of text): owned copies; text may alias the old value. */
+void qa_q2_base_player_state_set_userinfo(qa_q2_base_player_state *state, const char *text);
+void qa_q2_base_player_state_set_skin(qa_q2_base_player_state *state, const char *text, size_t length);
+/* state.name = text: an owned copy; text may alias the old value. */
+void qa_q2_base_player_state_set_name(qa_q2_base_player_state *state, const char *text);
+/* text.slice(0, units) over UTF-8 text of `length` bytes, malloc'd: a four-byte sequence is two UTF-16 units and a
+ * cut inside one keeps its high surrogate (WTF-8), as the JS string does. */
+char *qa_q2_text_slice_units(const char *text, size_t length, size_t units);
 
 /** TS Q2PlayerContext. The TS powerups()/weaponState()/
  * environmentDamage() closures become the qa_q2_player_context_*

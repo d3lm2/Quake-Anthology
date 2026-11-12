@@ -645,6 +645,16 @@ uint8_t *qa_q2_gtv_server_stream_hello(qa_q2_gtv_server_stream *stream,
   }
   return gtv_packet(QA_Q2_GTS_HELLO, body, 4, out_length);
 }
+typedef struct stream_message_scope {
+  qa_q2_gtv_server_stream *stream;
+  uint8_t *packet;
+} stream_message_scope;
+static void stream_message_release(void *arg) {
+  stream_message_scope *scope = (stream_message_scope *)arg;
+  scope->stream->busy = false;
+  free(scope->packet);
+  scope->packet = NULL;
+}
 uint8_t *qa_q2_gtv_server_stream_message(qa_q2_gtv_server_stream *stream,
                                          double opcode, const uint8_t *body,
                                          size_t body_length,
@@ -654,16 +664,21 @@ uint8_t *qa_q2_gtv_server_stream_message(qa_q2_gtv_server_stream *stream,
     qa_q2_throw_error("Invalid GTV server stream state");
   }
   stream->busy = true;
+  /* TS try/finally: busy is cleared, and the framed packet released, when the push raises. */
+  stream_message_scope scope = {stream, NULL};
+  qa_cleanup node;
+  qa_cleanup_push(&node, stream_message_release, &scope);
   size_t length = 0;
-  uint8_t *packet = gtv_packet(opcode, body, body_length, &length);
-  uint8_t *result = packet;
-  if (packet != NULL && stream->compression.active) {
-    result = compression_push(&stream->compression, packet, length, out_length);
-    free(packet);
-  } else if (out_length != NULL) {
-    *out_length = length;
+  scope.packet = gtv_packet(opcode, body, body_length, &length);
+  uint8_t *result = scope.packet;
+  if (scope.packet != NULL && stream->compression.active) {
+    result = compression_push(&stream->compression, scope.packet, length, out_length);
+  } else {
+    scope.packet = NULL; /* returned to the caller */
+    if (out_length != NULL) *out_length = length;
   }
-  stream->busy = false;
+  qa_cleanup_pop(&node);
+  stream_message_release(&scope);
   return result;
 }
 void qa_q2_gtv_server_stream_close(qa_q2_gtv_server_stream *stream) {

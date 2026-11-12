@@ -544,6 +544,7 @@ static void adopt_legacy_monsters(qa_q1_creatures *creatures, const qa_owned_act
   }
   game->legacy_animation_count = 0;
 }
+static void free_unset_monster(void *monster) { qa_q1_base_monster_destroy(monster); }
 void qa_q1_creatures_restore_fields(qa_q1_creatures *creatures, const qa_save_reader *root) {
   qa_q1_services *game = creatures->game;
   creatures->hell_knight_type = field_number(root, "hellKnightType");
@@ -574,10 +575,13 @@ void qa_q1_creatures_restore_fields(qa_q1_creatures *creatures, const qa_save_re
     qa_q1_base_monster *monster = qa_q1_base_monster_create(game, entity, spec,
                                                             qa_q1_creatures_as_services(creatures), NULL);
     if (monster == NULL) qa_range_error("out of memory");
+    qa_cleanup monster_cleanup; /* not in the map yet: a bad saved state raises out of the load */
+    qa_cleanup_push(&monster_cleanup, free_unset_monster, monster);
     must_field(&entry, "state", &state);
     qa_q1_base_monster_restore(monster, &state);
     qa_save_reader_destroy(&state);
     qa_save_reader_destroy(&entry);
+    qa_cleanup_pop(&monster_cleanup);
     qa_q1_creatures_monsters_set(creatures, owner, monster);
     restored[restored_count++] = owner;
   }

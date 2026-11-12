@@ -6,6 +6,7 @@
 #include <string.h>
 #include "qa/compat/qvm/abi.h"
 #include "qa/compat/qvm/shared_entity_record.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/network/common/js_number.h"
@@ -119,10 +120,8 @@ static char *bsp_value(qa_app_q3_guest_bots *bots, int64_t entity, const char *k
   if (!qa_aas_bsp_entities_value(&bots->bsp_entities, entity, key, bytes, sizeof bytes)) return copy_text("");
   size_t end = 0;
   while (end < sizeof bytes && bytes[end] != 0) end++;
-  char *text = checked(malloc(end + 1));
-  memcpy(text, bytes, end);
-  text[end] = 0;
-  return text;
+  /* new TextDecoder().decode(bytes before the first NUL): a leading BOM dropped, invalid bytes U+FFFD (UTF-8 text). */
+  return checked(qa_text_decoder_decode(bytes, end, NULL));
 }
 static char *find_model_classname(qa_app_q3_guest_bots *bots, int64_t model) {
   char wanted[32];

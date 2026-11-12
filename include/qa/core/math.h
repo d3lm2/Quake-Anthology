@@ -27,6 +27,8 @@
 
 qa_vec2 qa_math_vec2(double x, double y);
 qa_vec3 qa_math_vec3(double x, double y, double z);
+/* TS zeroVec3: the shared zero vector (frozen in TS; const here). */
+extern const qa_vec3 qa_zero_vec3;
 qa_vec4 qa_math_vec4(double x, double y, double z, double w);
 
 qa_vec3 qa_add3(qa_vec3 a, qa_vec3 b);

@@ -18,19 +18,6 @@ typedef struct qa_app_sim_prepared_q2_native_guest {
   qa_execution_module execution;
   const void *source; /* PreparedClassicGuest|PreparedRereleaseGuest */
 } qa_app_sim_prepared_q2_native_guest;
-typedef struct qa_app_sim_q2_guest_prepare_host {
-  void *ctx;
-  /* mounts.read(artifact): malloc'd bytes or NULL. */
-  uint8_t *(*read_artifact)(void *ctx, const qa_resolved_resource_reference *artifact, size_t *out_length);
-  /* parsePe(bytes).abi (guest/pe headers cannot mix with
-   * contracts/execution.h in one TU, so parsing is caller-side). */
-  void (*pe_abi)(void *ctx, const uint8_t *bytes, size_t length, qa_native_abi *out);
-  qa_app_sim_prepared_q2_native_guest (*prepare_classic)(void *ctx, qa_execution_module execution);
-  qa_app_sim_prepared_q2_native_guest (*prepare_rerelease)(void *ctx, qa_execution_module execution);
-  const void *(*builtin_primary)(void *ctx, const char *digest, const char *edition);
-} qa_app_sim_q2_guest_prepare_host;
-/* Synchronous form of the TS async prepare (PORTING.md). */
-qa_app_sim_prepared_q2_native_guest qa_app_sim_prepare_q2_guest(qa_execution_module execution, qa_app_sim_q2_guest_prepare_host host);
 /* TS prepareQ2Guest over mounted content: the PE header of the artifact
  * decides the edition, and the prepared execution carries the corrected
  * api/profile. Returns an owned qa_app_sim_prepared_classic_guest or
@@ -40,9 +27,8 @@ struct qa_content_mounted;
 void *qa_app_sim_prepare_q2_guest_mounted(const qa_resolved_execution_module *execution, struct qa_content_mounted *mounts,
     const char **out_edition);
 void qa_app_sim_prepared_q2_guest_free(void *prepared, const char *edition);
-/* revision is malloc'd into scratch when a primary exists (caller
- * copies before the next call). */
-qa_module_identity qa_app_sim_native_module_identity(qa_app_sim_prepared_q2_native_guest prepared, char *scratch, size_t scratch_size);
-/* WeakMap cache becomes a small identity cache in the .c file. */
-const void *qa_app_sim_prepared_native_primary(qa_app_sim_prepared_q2_native_guest *prepared, qa_app_sim_q2_guest_prepare_host host);
+/* TS nativeModuleIdentity(prepared). With a primary declaration the revision is a whole
+ * malloc'd string stored in *owned_revision (the caller frees it); otherwise it is the
+ * artifact digest and *owned_revision is NULL. */
+qa_module_identity qa_app_sim_native_module_identity(qa_app_sim_prepared_q2_native_guest prepared, char **owned_revision);
 #endif

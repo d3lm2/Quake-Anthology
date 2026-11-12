@@ -56,7 +56,7 @@ typedef struct rimpl {
   size_t count;
 } rimpl;
 static rimpl *R(qa_software_renderer *r) { return (rimpl *)r->impl; }
-static void assert_open(qa_software_renderer *r) { if (r->impl == NULL || R(r)->closed) qa_range_error("CPU renderer is closed"); }
+static void assert_open(qa_software_renderer *r) { if (r->impl == NULL || R(r)->closed) qa_raise("Error", 0, 0, "CPU renderer is closed"); }
 static int finite4(qa_vec4 v) { return isfinite(v.x) && isfinite(v.y) && isfinite(v.z) && isfinite(v.w); }
 static double f32(double v) { return (double)(float)v; }
 static bool is_safe_integer(double v) { return isfinite(v) && floor(v) == v && fabs(v) <= (double)QA_MAX_SAFE_INTEGER; }
@@ -120,12 +120,23 @@ bool qa_software_renderer_read_rgba(qa_software_renderer *r, qa_image_level *out
   memcpy(copy, qa_software_renderer_pixels(r, NULL), n);
   out->width = r->width; out->height = r->height; out->pixels.bytes = copy; out->pixels.length = n; return true;
 }
+typedef struct opacity_scope { rimpl *p; qa_cpu_framebuffer parent; } opacity_scope;
+static void opacity_scope_leave(void *arg) { opacity_scope *scope = arg; scope->p->fb = scope->parent; scope->p->opacity_active = false; }
 void qa_software_renderer_with_object_opacity(qa_software_renderer *r, double opacity, qa_software_draw_fn draw, void *ctx) {
   assert_open(r); rimpl *p = R(r);
   if (!isfinite(opacity) || opacity < 0 || opacity > 1) qa_range_error("Object opacity must be in 0..1");
-  if (p->opacity_active) qa_range_error("Object opacity scopes cannot nest");
+  if (p->opacity_active) qa_raise("Error", 0, 0, "Object opacity scopes cannot nest");
   if (opacity == 0) return;
-  if (opacity == 1) { p->opacity_active = true; draw(ctx); p->opacity_active = false; return; }
+  /* TS runs draw() in try/finally: a throwing draw still leaves the scope. */
+  opacity_scope scope; scope.p = p; scope.parent = p->fb;
+  qa_cleanup node;
+  if (opacity == 1) {
+    p->opacity_active = true;
+    qa_cleanup_push(&node, opacity_scope_leave, &scope);
+    draw(ctx);
+    qa_cleanup_pop(&node);
+    p->opacity_active = false; return;
+  }
   qa_cpu_framebuffer parent = p->fb;
   if (!p->has_opacity_fb) {
     p->opacity_words = (uint32_t *)xmalloc(p->count * sizeof(uint32_t)); p->opacity_depth = (double *)xmalloc(p->count * sizeof(double));
@@ -139,7 +150,9 @@ void qa_software_renderer_with_object_opacity(qa_software_renderer *r, double op
   if (scratch.stencil && parent.stencil) memcpy(scratch.stencil, parent.stencil, p->count * sizeof(uint32_t));
   qa_rect vp = p->viewport;
   p->opacity_active = true; p->fb = scratch;
+  qa_cleanup_push(&node, opacity_scope_leave, &scope);
   draw(ctx);
+  qa_cleanup_pop(&node);
   double left = qa_js_max(0, vp.x), right = qa_js_min(r->width, vp.x + vp.width);
   double y_end = qa_js_min(r->height, vp.y + vp.height);
   for (double y = qa_js_max(0, vp.y); y < y_end; y++) {
@@ -168,7 +181,7 @@ void qa_software_renderer_close(qa_software_renderer *r) {
 void qa_software_renderer_apply_image_resource(qa_software_renderer *r, qa_image_resource_operation op) { assert_open(r); qa_cpu_images_apply(&R(r)->images, op); }
 void qa_software_renderer_select_draw_buffer(qa_software_renderer *r, const char *buffer, bool clear) {
   assert_open(r);
-  if (strcmp(buffer, "front") && strcmp(buffer, "back")) qa_range_error("CPU stereo draw buffers are unavailable");
+  if (strcmp(buffer, "front") && strcmp(buffer, "back")) qa_raise("Error", 0, 0, "CPU stereo draw buffers are unavailable");
   if (clear) {
     rimpl *p = R(r); qa_render_view_state v; memset(&v, 0, sizeof v); v.viewport = p->viewport;
     qa_vec4 plane = p->clip_plane; v.clip_plane = p->has_clip ? &plane : NULL;
@@ -214,12 +227,12 @@ double qa_software_renderer_read_depth_pixel(qa_software_renderer *r, double x, 
 }
 void qa_software_renderer_set_overdraw_measurement(qa_software_renderer *r, bool enabled) {
   assert_open(r); rimpl *p = R(r);
-  if (enabled && !p->fb.stencil) qa_range_error("CPU overdraw measurement requires stencil storage");
+  if (enabled && !p->fb.stencil) qa_raise("Error", 0, 0, "CPU overdraw measurement requires stencil storage");
   p->stencil_enabled = enabled; p->stencil_function = "always"; p->stencil_compare_mask = 4294967295.0; p->stencil_write_mask = 4294967295.0; p->stencil_depth_fail = "increment"; p->stencil_depth_pass = "increment";
 }
 void qa_software_renderer_read_stencil_overdraw(qa_software_renderer *r, uint8_t *dest, size_t length) {
   assert_open(r); rimpl *p = R(r);
-  if (!p->fb.stencil) qa_range_error("CPU stencil readback requires stencil storage");
+  if (!p->fb.stencil) qa_raise("Error", 0, 0, "CPU stencil readback requires stencil storage");
   /* Rows are tightly packed, matching the GL backend's pack alignment of one. */
   double stride = r->width;
   if ((double)length < stride * r->height) qa_range_error("CPU stencil destination is too small");
@@ -295,7 +308,9 @@ static qa_cpu_vertex intersect(const qa_cpu_vertex *a, const qa_cpu_vertex *b, d
   o.color.x = a->color.x * aw + b->color.x * bw; o.color.y = a->color.y * aw + b->color.y * bw; o.color.z = a->color.z * aw + b->color.z * bw; o.color.w = a->color.w * aw + b->color.w * bw;
   return o;
 }
-#define CLIP_CAPACITY 16
+/* TS arrays grow. A convex polygon gains one vertex per plane (10 at most from a triangle); the capacity covers the
+ * bound when rounding breaks convexity and every edge crosses every plane (3 * 2^7). */
+#define CLIP_CAPACITY 384
 static size_t clip_polygon(qa_cpu_vertex *polygon, size_t n, const qa_vec4 *extra) {
   double magnitude = 0;
   for (size_t i = 0; i < n; i++) { qa_vec4 q = polygon[i].position; magnitude = qa_js_max(qa_js_max(qa_js_max(qa_js_max(magnitude, fabs(q.x)), fabs(q.y)), fabs(q.z)), fabs(q.w)); }
@@ -323,6 +338,9 @@ static size_t clip_polygon(qa_cpu_vertex *polygon, size_t n, const qa_vec4 *extr
   }
   /* All six planes permit w=0 only at the homogeneous origin. It has no
    * projected area; remove it before division instead of inventing an epsilon plane. */
+  bool behind = false;
+  for (size_t i = 0; i < n; i++) if (polygon[i].position.w <= 0) behind = true;
+  if (!behind) return n; /* polygon.some(w <= 0) ? filter(w > 0) : polygon: a NaN w alone removes nothing */
   size_t kept = 0;
   for (size_t i = 0; i < n; i++) if (polygon[i].position.w > 0) polygon[kept++] = polygon[i];
   return kept;
@@ -662,13 +680,14 @@ static void draw_batch(qa_software_renderer *r, const qa_draw_batch *batch, cons
   if (p->row_pool == ROW_POOL_NONE) { draw_all(r, batch, texture, secondary, &invariants); return; }
   free_pending_lightings(p); /* a previous batch's kernel error left them behind */
   p->collecting = true; p->pending_count = 0; p->pending_pixels = 0;
-  collect_ctx collect = {r, batch, texture, secondary, &invariants}; char failure[1024];
-  bool collected = qa_range_error_catch(collect_batch, &collect, failure, sizeof failure);
+  collect_ctx collect = {r, batch, texture, secondary, &invariants}; qa_caught_error failure;
+  bool collected = qa_try(collect_batch, &collect, &failure);
   p->collecting = false;
   if (!collected) {
+    /* catch (error) { run what was collected; throw error; }: the same error, whatever its class */
     for (size_t i = 0; i < p->pending_count; i++) qa_run_triangle_rows_default(&p->pending_setups[i], &p->fb, &p->sampled);
     p->pending_count = 0; free_pending_lightings(p);
-    qa_range_error("%s", failure);
+    qa_rethrow(&failure);
   }
   /* The setups and their culled light storage stay alive through the synchronous barrier. */
   if (p->pending_count >= 4 && p->pending_pixels >= 50000) qa_row_parallel_pool_run(&p->pool, p->pending_setups, p->pending_count);
@@ -735,7 +754,7 @@ static void own_batch(owned_batch *o, qa_draw_batch input, qa_render_state state
   }
   if (world) {
     size_t n = input.texturing_is_pair ? input.pair_vertex_count : input.vertex_count;
-    if (n != 0 && view_projection == NULL) qa_range_error("CPU world-space batch requires a view projection");
+    if (n != 0 && view_projection == NULL) qa_raise("Error", 0, 0, "CPU world-space batch requires a view projection");
     for (size_t i = 0; i < n; i++) {
       qa_vec4 *position = input.texturing_is_pair ? &o->pair_vertices[i].vertex.position : &o->vertices[i].position;
       qa_vec3 point; point.x = position->x; point.y = position->y; point.z = position->z;
@@ -756,17 +775,17 @@ static qa_bound_texture bound_unit(rimpl *p, int unit) { return qa_cpu_images_bo
 static qa_bound_texture incomplete_texture(void) { qa_bound_texture t; memset(&t, 0, sizeof t); t.kind = QA_BOUND_TEXTURE_INCOMPLETE; return t; }
 
 typedef enum phase { PHASE_PREPARED, PHASE_BEGUN, PHASE_TEXTURED, PHASE_DRAWN, PHASE_CLEANED } phase;
-typedef struct prep { qa_software_renderer *r; owned_batch owned; qa_texture_resolver resolver; phase phase; double next_unit; } prep;
+typedef struct prep { qa_software_renderer *r; owned_batch owned; qa_texture_resolver resolver; bool has_resolver; phase phase; double next_unit; } prep;
 static void prep_begin(void *ctx) {
   prep *q = (prep *)ctx; assert_open(q->r);
-  if (q->phase != PHASE_PREPARED) qa_range_error("CPU prepared draw has already begun");
+  if (q->phase != PHASE_PREPARED) qa_raise("Error", 0, 0, "CPU prepared draw has already begun");
   apply_diagnostic_state(R(q->r), q->owned.batch.state);
   q->phase = PHASE_BEGUN;
 }
 static void prep_texture(void *ctx, double unit, qa_texture_binding op) {
   prep *q = (prep *)ctx; assert_open(q->r); rimpl *p = R(q->r);
   if (q->phase != PHASE_BEGUN || unit != q->next_unit || (unit != 0 && unit != 1) || (unit == 1 && !q->owned.batch.texturing_is_pair))
-    qa_range_error("CPU texture slots must execute in order");
+    qa_raise("Error", 0, 0, "CPU texture slots must execute in order");
   qa_cpu_images_bind(&p->images, unit, qa_texture_resolver_resolve(&q->resolver, op));
   p->current_unit = (int)unit;
   if (unit == 0) p->primary_enabled = true; else p->secondary_enabled = true;
@@ -775,7 +794,7 @@ static void prep_texture(void *ctx, double unit, qa_texture_binding op) {
 static void prep_draw(void *ctx) {
   prep *q = (prep *)ctx; assert_open(q->r); rimpl *p = R(q->r);
   const qa_draw_batch *batch = &q->owned.batch;
-  if (q->phase != PHASE_BEGUN || q->next_unit != (batch->texturing_is_pair ? 2 : 1)) qa_range_error("CPU prepared draw has unapplied texture slots");
+  if (q->phase != PHASE_BEGUN || q->next_unit != (batch->texturing_is_pair ? 2 : 1)) qa_raise("Error", 0, 0, "CPU prepared draw has unapplied texture slots");
   qa_bound_texture texture = bound_unit(p, 0), secondary = batch->texturing_is_pair ? bound_unit(p, 1) : incomplete_texture();
   draw_batch(q->r, batch, &texture, &secondary);
   if (batch->indices.count != 0) {
@@ -785,20 +804,34 @@ static void prep_draw(void *ctx) {
   }
   q->phase = PHASE_DRAWN;
 }
+/* The prepared draw is garbage in TS once nothing can run it: after cleanup (which also runs, and throws, for a
+ * draw that never completed) or when an earlier step threw. */
+static void prep_destroy(void *ctx) {
+  prep *q = (prep *)ctx;
+  if (q->has_resolver) qa_texture_resolver_destroy(&q->resolver);
+  free_owned(&q->owned); free(q);
+}
 static void prep_cleanup(void *ctx) {
-  prep *q = (prep *)ctx; assert_open(q->r); rimpl *p = R(q->r);
-  if (q->phase != PHASE_DRAWN) qa_range_error("CPU prepared draw has not completed");
+  prep *q = (prep *)ctx;
+  qa_cleanup node; qa_cleanup_push(&node, prep_destroy, q);
+  assert_open(q->r); rimpl *p = R(q->r);
+  if (q->phase != PHASE_DRAWN) qa_raise("Error", 0, 0, "CPU prepared draw has not completed");
+  qa_cleanup_pop(&node);
   if (q->owned.batch.texturing_is_pair) p->secondary_enabled = false;
   p->current_unit = 0;
   q->phase = PHASE_CLEANED;
-  qa_texture_resolver_destroy(&q->resolver); free_owned(&q->owned); free(q);
+  prep_destroy(q);
 }
 qa_prepared_backend_draw qa_software_renderer_prepare_geometry(qa_software_renderer *r, qa_draw_batch batch) {
   assert_open(r); rimpl *p = R(r);
   prep *q = (prep *)xmalloc(sizeof *q);
+  memset(q, 0, sizeof *q);
+  qa_cleanup node; qa_cleanup_push(&node, prep_destroy, q); /* the snapshot and the validation can throw */
   own_batch(&q->owned, batch, batch.state, p->has_vp ? &p->view_projection : NULL);
   if (!qa_texture_resolver_init(&q->resolver, resolver_apply, r)) qa_range_error("CPU renderer allocation failed");
+  q->has_resolver = true;
   validate_batch(p, &q->owned.batch);
+  qa_cleanup_pop(&node);
   q->r = r; q->phase = PHASE_PREPARED; q->next_unit = 0;
   qa_prepared_backend_draw o; memset(&o, 0, sizeof o);
   o.ctx = q; o.begin = prep_begin; o.apply_texture = prep_texture; o.draw = prep_draw; o.cleanup = prep_cleanup;
@@ -806,10 +839,12 @@ qa_prepared_backend_draw qa_software_renderer_prepare_geometry(qa_software_rende
 }
 void qa_software_renderer_draw(qa_software_renderer *r, qa_draw_batch batch) {
   qa_prepared_backend_draw prepared = qa_software_renderer_prepare_geometry(r, batch);
+  qa_cleanup node; qa_cleanup_push(&node, prep_destroy, prepared.ctx); /* TS draw() has no finally: a throw abandons it */
   prepared.begin(prepared.ctx);
   prepared.apply_texture(prepared.ctx, 0, batch.texture);
   if (batch.texturing_is_pair) prepared.apply_texture(prepared.ctx, 1, batch.second_texture.binding);
   prepared.draw(prepared.ctx);
+  qa_cleanup_pop(&node);
   prepared.cleanup(prepared.ctx);
 }
 static void draw_quad(qa_software_renderer *r, qa_renderer_image image, const double x[4], const double y[4], const double s[4], const double t[4], qa_vec4 color, qa_render_state state) {
@@ -895,7 +930,9 @@ static void immediate_depth_atlas(qa_software_renderer *r, const qa_render_opera
       batch.lighting.kind = "vertex"; batch.indices = draw->indices; batch.texture.kind = QA_TEXTURE_BINDING_RETAIN_CURRENT;
       batch.state = QA_CPU_OPAQUE_STATE; batch.state.cull = draw->cull; batch.state.polygon_offset = draw->polygon_offset;
       batch.vertices = vertices; batch.vertex_count = count;
+      qa_cleanup node; qa_cleanup_push(&node, free, vertices);
       qa_software_renderer_draw(target, batch);
+      qa_cleanup_pop(&node);
       free(vertices);
     }
   }
@@ -918,9 +955,18 @@ static void immediate_sky_side(qa_software_renderer *r, const qa_render_operatio
     batch.texture.kind = QA_TEXTURE_BINDING_BIND_IMAGE; batch.texture.image = op->image; batch.state = p->retained_state;
     batch.state.blend.source = "one"; batch.state.blend.destination = "zero"; batch.state.alpha_test = "none";
     batch.vertices = vertices; batch.vertex_count = strip->vertex_count;
+    qa_cleanup index_node, vertex_node; qa_cleanup_push(&index_node, free, indices); qa_cleanup_push(&vertex_node, free, vertices);
     qa_software_renderer_draw(r, batch);
+    qa_cleanup_pop(&vertex_node); qa_cleanup_pop(&index_node);
     free(indices); free(vertices);
   }
+}
+typedef struct shadow_scope { rimpl *p; bool finishing; void *vertices; } shadow_scope;
+static void shadow_scope_leave(void *arg) {
+  shadow_scope *scope = arg;
+  scope->p->color_write = true;
+  if (scope->finishing) scope->p->stencil_enabled = false;
+  free(scope->vertices);
 }
 static void immediate_shadow(qa_software_renderer *r, const qa_render_operation *op) {
   rimpl *p = R(r);
@@ -949,15 +995,17 @@ static void immediate_shadow(qa_software_renderer *r, const qa_render_operation 
   batch.lighting.kind = "vertex"; batch.vertices = vertices; batch.vertex_count = count;
   if (finishing) { batch.indices.values = finish_indices; batch.indices.count = 6; } else batch.indices = op->indices;
   batch.texture.kind = QA_TEXTURE_BINDING_BIND_IMAGE; batch.texture.image = op->white_image; batch.state = state;
+  /* try { draws } finally { colorWrite = true; if (finishing) stencilEnabled = false; } */
+  shadow_scope scope = {p, finishing, vertices};
+  qa_cleanup node; qa_cleanup_push(&node, shadow_scope_leave, &scope);
   qa_software_renderer_draw(r, batch);
   if (!finishing) {
     p->stencil_depth_pass = "decrement";
     batch.state.cull = streq(state.cull, "front") ? "back" : "front";
     qa_software_renderer_draw(r, batch);
   }
-  p->color_write = true;
-  if (finishing) p->stencil_enabled = false;
-  free(vertices);
+  qa_cleanup_pop(&node);
+  shadow_scope_leave(&scope);
 }
 void qa_software_renderer_draw_immediate(qa_software_renderer *r, qa_render_operation op) {
   assert_open(r); rimpl *p = R(r);
@@ -972,7 +1020,7 @@ void qa_software_renderer_draw_immediate(qa_software_renderer *r, qa_render_oper
     }
     case QA_RENDER_OP_SKY_SIDE: immediate_sky_side(r, &op); return;
     case QA_RENDER_OP_SHADOW_VOLUME: case QA_RENDER_OP_SHADOW_FINISH: immediate_shadow(r, &op); return;
-    default: qa_range_error("Invalid CPU operation");
+    default: qa_raise("Error", 0, 0, "Invalid CPU operation");
   }
 }
 
@@ -988,7 +1036,7 @@ static void state_change_visit(qa_source_state_change change, void *ctx) {
   else if (streq(change.kind, "polygon-mode")) p->polygon_line = streq(change.value, "line");
   else if (streq(change.kind, "depth-test")) p->depth_test_enabled = change.enabled;
   else if (streq(change.kind, "alpha-test")) p->retained_state.alpha_test = change.value;
-  else qa_range_error("Invalid source state operation %s", change.kind);
+  else qa_raise("Error", 0, 0, "Invalid source state operation %s", change.kind);
 }
 static void apply_source_state(rimpl *p, uint32_t bits) {
   (void)qa_source_state_changes(p->has_source_bits, p->source_bits, bits, state_change_visit, p);
@@ -1022,7 +1070,7 @@ static void validate_client_coordinates(rimpl *p, const qa_double_view *indices)
   for (int unit = 0; unit < 2; unit++) {
     if (!(unit == 0 ? p->primary_client_enabled : p->secondary_client_enabled)) continue;
     const client_coords *array = &p->client_tex_coords[unit];
-    if (!array->present) qa_range_error("CPU texture unit %d has no source client coordinate array", unit);
+    if (!array->present) qa_raise("Error", 0, 0, "CPU texture unit %d has no source client coordinate array", unit);
     for (size_t i = 0; i < indices->count; i++) {
       double index = indices->values[i];
       /* array.values[index] is undefined for a fractional index too. */
@@ -1068,7 +1116,7 @@ static qa_bound_texture immediate_texture(rimpl *p, int unit) {
   }
   /* OpenGL 1.2.1 section 2.8 leaves enabled current attributes indeterminate after
    * DrawElements. A coordinate-dependent read has no source-defined sample. */
-  qa_range_error("CPU immediate texture unit %d has source-indeterminate coordinates and coordinate-dependent texels", unit);
+  qa_raise("Error", 0, 0, "CPU immediate texture unit %d has source-indeterminate coordinates and coordinate-dependent texels", unit);
 }
 void qa_software_renderer_begin_source_iterator(qa_software_renderer *r, bool set_arrays_once, const qa_source_stage_cell *scratch, size_t scratch_count) {
   assert_open(r); rimpl *p = R(r);
@@ -1089,7 +1137,16 @@ typedef struct source_prep {
   qa_source_stage_cell *scratch; size_t scratch_count;
   bool paired, state_before_binding;
   phase phase; int next_unit; int pending_unit; /* -1 = null */
+  bool has_resolver;
 } source_prep;
+/* As prep_destroy: the prepared source draw once TS would leave it to the collector. */
+static void source_destroy(void *ctx) {
+  source_prep *q = (source_prep *)ctx;
+  if (q->has_resolver) qa_texture_resolver_destroy(&q->resolver);
+  free_owned(&q->owned); free(q->scratch); free(q);
+}
+typedef struct draw_scratch { void *blocks[4]; } draw_scratch;
+static void draw_scratch_free(void *arg) { draw_scratch *d = arg; for (int i = 0; i < 4; i++) free(d->blocks[i]); }
 static size_t batch_vertex_count(const qa_draw_batch *b) { return b->texturing_is_pair ? b->pair_vertex_count : b->vertex_count; }
 static qa_vec2 batch_tex_coord(const qa_draw_batch *b, size_t i) { return b->texturing_is_pair ? b->pair_vertices[i].vertex.tex_coord : b->vertices[i].tex_coord; }
 static void source_coordinates(source_prep *q, bool secondary) {
@@ -1106,11 +1163,11 @@ static void source_coordinates(source_prep *q, bool secondary) {
   }
   qa_vec2 *values;
   if (streq(origin, "raw0") || streq(origin, "raw1")) {
-    if (q->scratch == NULL) qa_range_error("CPU raw source coordinates require stage scratch");
+    if (q->scratch == NULL) qa_raise("Error", 0, 0, "CPU raw source coordinates require stage scratch");
     values = scratch_coords(q->scratch, q->scratch_count, origin);
     n = q->scratch_count;
   } else {
-    if (secondary && !batch->texturing_is_pair) qa_range_error("CPU secondary client coordinates require a paired batch");
+    if (secondary && !batch->texturing_is_pair) qa_raise("Error", 0, 0, "CPU secondary client coordinates require a paired batch");
     values = (qa_vec2 *)xmalloc(n * sizeof *values);
     for (size_t i = 0; i < n; i++) values[i] = secondary ? batch->pair_vertices[i].tex_coord2 : batch_tex_coord(batch, i);
   }
@@ -1128,7 +1185,7 @@ static void source_apply_state(source_prep *q) {
 }
 static void source_begin(void *ctx) {
   source_prep *q = (source_prep *)ctx; assert_open(q->r); rimpl *p = R(q->r); const char *kind = q->source_kind;
-  if (q->phase != PHASE_PREPARED) qa_range_error("CPU prepared draw has already begun");
+  if (q->phase != PHASE_PREPARED) qa_raise("Error", 0, 0, "CPU prepared draw has already begun");
   if (q->scratch != NULL) refresh_source_coordinates(p, q->scratch, q->scratch_count);
   if ((!streq(kind, "generic-single") && !streq(kind, "generic-pair")) || !p->generic_arrays_once) p->color_client_enabled = true;
   if (streq(kind, "vertex-lit") || streq(kind, "dlight") || streq(kind, "fog")) {
@@ -1141,7 +1198,7 @@ static void source_prepare_texture(void *ctx, double unit_value) {
   source_prep *q = (source_prep *)ctx; assert_open(q->r); rimpl *p = R(q->r); const char *kind = q->source_kind;
   int unit = (int)unit_value; const qa_draw_batch *batch = &q->owned.batch;
   if (q->phase != PHASE_BEGUN || q->pending_unit != -1 || unit_value != q->next_unit || (unit == 1 && !batch->texturing_is_pair))
-    qa_range_error("CPU prepared texture slot order is invalid");
+    qa_raise("Error", 0, 0, "CPU prepared texture slot order is invalid");
   if (unit == 1 && streq(kind, "lightmapped-pair")) source_coordinates(q, false);
   if (kind == NULL || batch->texturing_is_pair) p->current_unit = unit;
   if (unit == 0) {
@@ -1161,7 +1218,7 @@ static void source_prepare_texture(void *ctx, double unit_value) {
 static void source_apply_texture(void *ctx, double unit, qa_texture_binding op) {
   source_prep *q = (source_prep *)ctx; assert_open(q->r); rimpl *p = R(q->r);
   if (q->source_kind == NULL) source_prepare_texture(ctx, unit);
-  if (q->phase != PHASE_BEGUN || q->pending_unit != (int)unit) qa_range_error("CPU prepared texture slot has not begun");
+  if (q->phase != PHASE_BEGUN || q->pending_unit != (int)unit) qa_raise("Error", 0, 0, "CPU prepared texture slot has not begun");
   qa_cpu_images_bind(&p->images, p->current_unit, qa_texture_resolver_resolve(&q->resolver, op));
   q->pending_unit = -1;
   q->next_unit++;
@@ -1169,7 +1226,7 @@ static void source_apply_texture(void *ctx, double unit, qa_texture_binding op) 
 static void source_finish_textures(void *ctx) {
   source_prep *q = (source_prep *)ctx; assert_open(q->r); rimpl *p = R(q->r);
   if (q->phase != PHASE_BEGUN || q->pending_unit != -1 || q->next_unit != (q->owned.batch.texturing_is_pair ? 2 : 1))
-    qa_range_error("CPU prepared draw has unapplied texture slots");
+    qa_raise("Error", 0, 0, "CPU prepared draw has unapplied texture slots");
   if (!q->state_before_binding) source_apply_state(q);
   if (streq(q->source_kind, "lightmapped-pair")) {
     if (p->current_unit == 0) p->primary_client_enabled = true; else p->secondary_client_enabled = true;
@@ -1190,7 +1247,7 @@ static void strip_element(void *ctx, double index) {
   if (!(index >= 0) || index >= (double)s->vertex_count || index != floor(index)) qa_range_error("CPU source strip vertex is missing");
   const qa_cpu_vertex *vertex = &s->vertices[(size_t)index];
   if (s->discrete || p->color_client_enabled) { p->current_color.known = true; p->current_color.value = vertex->color; }
-  if (s->discrete && p->current_unit != 0) qa_range_error("Unsupported source R_ArrayElementDiscrete multitexture targets 0 and 1");
+  if (s->discrete && p->current_unit != 0) qa_raise("Error", 0, 0, "Unsupported source R_ArrayElementDiscrete multitexture targets 0 and 1");
   if (s->discrete || p->primary_client_enabled) {
     p->current_tex_coords[0].known = true; p->current_tex_coords[0].value.x = f32(vertex->tex_coord.x); p->current_tex_coords[0].value.y = f32(vertex->tex_coord.y);
   }
@@ -1213,23 +1270,26 @@ static void source_draw(void *ctx, double primitives) {
   source_prep *q = (source_prep *)ctx; qa_software_renderer *r = q->r; assert_open(r); rimpl *p = R(r);
   const qa_draw_batch *batch = &q->owned.batch; bool has_source = q->source_kind != NULL;
   if (q->phase != (!has_source ? PHASE_BEGUN : PHASE_TEXTURED) || q->pending_unit != -1 || q->next_unit != (batch->texturing_is_pair ? 2 : 1))
-    qa_range_error("CPU prepared draw has unapplied texture slots");
+    qa_raise("Error", 0, 0, "CPU prepared draw has unapplied texture slots");
   qa_source_primitive_mode mode = qa_source_primitive_mode_for(primitives, false);
   bool discrete = streq(mode, "discrete-strips"), none = streq(mode, "none");
   qa_render_state state = raster_state(p);
   qa_cpu_vertex *source_vertices = NULL; qa_render_vertex *single = NULL; qa_multitexture_vertex *pair = NULL;
+  draw_scratch scratch_blocks = {{NULL, NULL, NULL, NULL}};
+  qa_cleanup scratch_node; qa_cleanup_push(&scratch_node, draw_scratch_free, &scratch_blocks); /* the vertex build and the draw can throw */
   qa_draw_batch draw = *batch;
   size_t n = batch_vertex_count(batch);
   if (has_source) {
     if (!none && !discrete && batch->indices.count != 0) validate_client_coordinates(p, &batch->indices);
     bool has_retained = false; qa_vec4 retained_color; memset(&retained_color, 0, sizeof retained_color);
     if (!discrete && !p->color_client_enabled && !none && batch->indices.count != 0) {
-      if (!p->current_color.known) qa_range_error("CPU source draw color is source-indeterminate");
+      if (!p->current_color.known) qa_raise("Error", 0, 0, "CPU source draw color is source-indeterminate");
       has_retained = true; retained_color = p->current_color.value;
     }
     const client_coords *primary = !discrete && p->primary_client_enabled && p->client_tex_coords[0].present ? &p->client_tex_coords[0] : NULL;
     const client_coords *secondary = !discrete && p->secondary_client_enabled && p->client_tex_coords[1].present ? &p->client_tex_coords[1] : NULL;
     source_vertices = (qa_cpu_vertex *)xmalloc(n * sizeof *source_vertices);
+    scratch_blocks.blocks[0] = source_vertices;
     for (size_t i = 0; i < n; i++) {
       if (q->scratch == NULL || i >= q->scratch_count) qa_range_error("CPU source scratch vertex is missing");
       const qa_source_stage_cell *cell = &q->scratch[i];
@@ -1253,11 +1313,13 @@ static void source_draw(void *ctx, double primitives) {
     draw.texture.kind = QA_TEXTURE_BINDING_RETAIN_CURRENT;
     if (p->secondary_enabled) {
       pair = (qa_multitexture_vertex *)xmalloc(n * sizeof *pair);
+      scratch_blocks.blocks[1] = pair;
       for (size_t i = 0; i < n; i++) { pair[i].vertex.position = source_vertices[i].position; pair[i].vertex.color = source_vertices[i].color; pair[i].vertex.tex_coord = source_vertices[i].tex_coord; pair[i].tex_coord2 = source_vertices[i].tex_coord2; }
       draw.texturing_is_pair = true; draw.pair_vertices = pair; draw.pair_vertex_count = n;
       draw.second_texture.binding.kind = QA_TEXTURE_BINDING_RETAIN_CURRENT; draw.second_texture.environment = p->secondary_environment;
     } else {
       single = (qa_render_vertex *)xmalloc(n * sizeof *single);
+      scratch_blocks.blocks[2] = single;
       for (size_t i = 0; i < n; i++) { single[i].position = source_vertices[i].position; single[i].color = source_vertices[i].color; single[i].tex_coord = source_vertices[i].tex_coord; }
       draw.vertices = single; draw.vertex_count = n;
     }
@@ -1275,22 +1337,26 @@ static void source_draw(void *ctx, double primitives) {
       if (!has_source || p->primary_client_enabled) p->current_tex_coords[0].known = false;
       if (!has_source ? draw.texturing_is_pair : p->secondary_client_enabled) p->current_tex_coords[1].known = false;
     } else {
-      if (source_vertices == NULL) qa_range_error("CPU source strips require stage scratch");
+      if (source_vertices == NULL) qa_raise("Error", 0, 0, "CPU source strips require stage scratch");
       strip_ctx *s = (strip_ctx *)xmalloc(sizeof *s);
+      scratch_blocks.blocks[3] = s;
       s->r = r; s->batch = &draw; s->vertices = source_vertices; s->vertex_count = n; s->discrete = discrete;
       s->texture = enabled_texture(p, 0); s->secondary = enabled_texture(p, 1);
       s->has_first = false; s->has_second = false; s->even = true; s->has_invariants = false;
       qa_source_strip_emitter emit; emit.ctx = s; emit.begin = strip_begin; emit.element = strip_element; emit.end = strip_end;
       qa_emit_source_triangle_strips(draw.indices.values, draw.indices.count, emit);
-      free(s);
     }
   }
-  free(source_vertices); free(single); free(pair);
+  qa_cleanup_pop(&scratch_node);
+  draw_scratch_free(&scratch_blocks);
   q->phase = PHASE_DRAWN;
 }
 static void source_cleanup(void *ctx) {
-  source_prep *q = (source_prep *)ctx; assert_open(q->r); rimpl *p = R(q->r); const char *kind = q->source_kind;
-  if (q->phase != PHASE_DRAWN) qa_range_error("CPU prepared draw has not completed");
+  source_prep *q = (source_prep *)ctx;
+  qa_cleanup node; qa_cleanup_push(&node, source_destroy, q);
+  assert_open(q->r); rimpl *p = R(q->r); const char *kind = q->source_kind;
+  if (q->phase != PHASE_DRAWN) qa_raise("Error", 0, 0, "CPU prepared draw has not completed");
+  qa_cleanup_pop(&node);
   if (q->paired) {
     if (kind == NULL) p->current_unit = 1;
     if (p->current_unit == 0) {
@@ -1305,7 +1371,7 @@ static void source_cleanup(void *ctx) {
   if (kind == NULL && q->owned.batch.state.polygon_offset != NULL) p->retained_state.polygon_offset = NULL;
   if (q->owned.batch.primitive_is_lines) p->line_width = 1;
   q->phase = PHASE_CLEANED;
-  qa_texture_resolver_destroy(&q->resolver); free_owned(&q->owned); free(q->scratch); free(q);
+  source_destroy(q);
 }
 static bool float32_finite(double v) { return isfinite(f32(v)); }
 qa_prepared_source_draw qa_software_renderer_prepare_source_geometry(qa_software_renderer *r, const qa_source_stage_data *stage) {
@@ -1313,7 +1379,9 @@ qa_prepared_source_draw qa_software_renderer_prepare_source_geometry(qa_software
   source_prep *q = (source_prep *)xmalloc(sizeof *q);
   memset(q, 0, sizeof *q);
   q->r = r; q->source_batch = &stage->batch; q->has_source = true; q->state_bits = qa_js_to_uint32(stage->state_bits); /* TS applies ToInt32 in each & / ^ */ q->source_kind = stage->kind;
+  qa_cleanup node; qa_cleanup_push(&node, source_destroy, q); /* the validation below can throw */
   if (!qa_texture_resolver_init(&q->resolver, resolver_apply, r)) qa_range_error("CPU renderer allocation failed");
+  q->has_resolver = true;
   /* snapshotSourceBatch: triangles with the retained state. */
   qa_draw_batch input = stage->batch;
   input.primitive_is_lines = false; input.space = NULL; input.texture_effect = NULL;
@@ -1329,6 +1397,7 @@ qa_prepared_source_draw qa_software_renderer_prepare_source_geometry(qa_software
     if (!finite4(cell->color) || !float32_finite(cell->tex_coord.x) || !float32_finite(cell->tex_coord.y) || !float32_finite(cell->tex_coord2.x) || !float32_finite(cell->tex_coord2.y))
       qa_range_error("CPU source scratch attributes must be finite float32 values");
   }
+  qa_cleanup_pop(&node);
   q->state_before_binding = streq(q->source_kind, "generic-pair") || streq(q->source_kind, "lightmapped-pair");
   q->phase = PHASE_PREPARED; q->next_unit = 0; q->pending_unit = -1;
   qa_prepared_source_draw o; memset(&o, 0, sizeof o);

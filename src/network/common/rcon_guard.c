@@ -41,9 +41,9 @@ void qa_rcon_guard_failed(qa_rcon_guard *guard, const qa_net_address *from, doub
     guard->failures[slot] = 0;
     guard->until[slot] = 0;
   }
-  /* Int32Array store of failures + 1. */
-  int32_t failures = qa_js_to_int32((double)guard->failures[slot] + 1);
-  guard->failures[slot] = failures;
+  /* Int32Array store of failures + 1; the comparison and backoff use the unwrapped local. */
+  double failures = (double)guard->failures[slot] + 1;
+  guard->failures[slot] = qa_js_to_int32(failures);
   if (failures >= guard->free_attempts)
     guard->until[slot] = now + qa_js_min(60000, 1000 * qa_js_pow(2, failures - guard->free_attempts));
 }

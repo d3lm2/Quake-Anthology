@@ -5,11 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/content/q2/base/player/index.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js_case.h"
 #include "qa/foundation/js.h"
 #include "qa/network/common/js_number.h"
 struct qa_app_q2_console { qa_app_q2_console_options options; };
+typedef struct forward_ctx { qa_app_q2_console *console; const char *name; } forward_ctx;
 struct qa_app_q2_console_binding {
   qa_command_buffer *commands;
   qa_app_q2_console *console;
@@ -17,6 +19,8 @@ struct qa_app_q2_console_binding {
   qa_command_handler_fn handlers[5];
   void *ctxs[5];
   size_t count;
+  /* Each bind's forwarding closures capture its own console (TS closes over `options`). */
+  forward_ctx forwards[3];
 };
 const char *qa_app_q2_operator_player_name(const char *userinfo, const char *name,
     char *scratch, size_t scratch_size) {
@@ -24,7 +28,7 @@ const char *qa_app_q2_operator_player_name(const char *userinfo, const char *nam
   return value != NULL ? value : name;
 }
 qa_app_q2_console *qa_app_q2_console_create(qa_app_q2_console_options options) {
-  if (!options.has_q2_source(options.ctx)) qa_range_error("Q2 console requires a Q2 source runtime");
+  if (!options.has_q2_source(options.ctx)) qa_raise("Error", 0, 0, "Q2 console requires a Q2 source runtime");
   qa_app_q2_console *console = calloc(1, sizeof *console);
   if (console == NULL) qa_range_error("Out of memory");
   console->options = options;
@@ -33,10 +37,9 @@ qa_app_q2_console *qa_app_q2_console_create(qa_app_q2_console_options options) {
 void qa_app_q2_console_destroy(qa_app_q2_console *console) { free(console); }
 qa_cvar_registry *qa_app_q2_console_cvars(qa_app_q2_console *console) {
   qa_cvar_registry *cvars = console->options.q2_server_cvars(console->options.ctx);
-  if (cvars == NULL) qa_range_error("Q2 console requires the simulation's source registry");
+  if (cvars == NULL) qa_raise("Error", 0, 0, "Q2 console requires the simulation's source registry");
   return cvars;
 }
-typedef struct forward_ctx { qa_app_q2_console *console; const char *name; } forward_ctx;
 static void forward_handler(void *v, qa_command_invocation *invocation) {
   forward_ctx *ctx = v;
   size_t count = invocation->argc > 0 ? invocation->argc - 1 : 0;
@@ -56,24 +59,59 @@ static void print_selection_entry(void *v, const char *axis, const char *outcome
   print_text(console, line);
   free(line);
 }
+/* q2OperatorPlayerName, whole (a malloc'd copy). */
+static char *operator_name(const qa_app_q2_console_player *player) {
+  size_t length = 0;
+  const char *value = qa_q2_userinfo_find(player->userinfo, "name", &length);
+  if (value == NULL) { value = player->name; length = strlen(value); }
+  char *out = malloc(length + 1);
+  if (out == NULL) qa_range_error("Out of memory");
+  memcpy(out, value, length);
+  out[length] = '\0';
+  return out;
+}
+static char *format_line(const char *format, const char *a, const char *b, const char *c, const char *d) {
+  size_t size = strlen(format) + strlen(a) + strlen(b) + strlen(c) + strlen(d) + 1;
+  char *out = malloc(size);
+  if (out == NULL) qa_range_error("Out of memory");
+  snprintf(out, size, format, a, b, c, d);
+  return out;
+}
+/* UTF-16 units of UTF-8 text (String.prototype.length). */
+static size_t utf16_units(const char *text, size_t bytes) {
+  size_t units = 0;
+  for (size_t i = 0; i < bytes; i++) {
+    unsigned char byte = (unsigned char)text[i];
+    if ((byte & 0xc0) != 0x80) units += byte >= 0xf0 ? 2 : 1;
+  }
+  return units;
+}
 static void status_handler(void *v, qa_command_invocation *invocation) {
   (void)invocation;
   qa_app_q2_console *console = v;
   if (!console->options.has_q2_source(console->options.ctx)) { print_text(console, "No server running.\n"); return; }
-  char header[1024];
-  snprintf(header, sizeof header, "map              : %s\nnum score ping name\n",
-      console->options.map_name(console->options.ctx));
+  const char *map_name = console->options.map_name(console->options.ctx);
+  char *header = format_line("map              : %s\nnum score ping name\n", map_name, "", "", "");
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, header);
   print_text(console, header);
+  qa_cleanup_pop(&node);
+  free(header);
   const qa_app_q2_console_player *players = NULL;
   size_t count = console->options.players(console->options.ctx, &players);
   for (size_t i = 0; i < count; i++) {
     if (!players[i].connected) continue;
-    char scratch[256];
-    const char *name = qa_app_q2_operator_player_name(players[i].userinfo, players[i].name, scratch, sizeof scratch);
-    char line[1024];
-    snprintf(line, sizeof line, "%s %s %s %s\n", QA_JS_NUMBER(players[i].slot),
-        QA_JS_NUMBER(players[i].score), QA_JS_NUMBER(players[i].ping), name);
+    char *name = operator_name(&players[i]);
+    char slot[32], score[32], ping[32];
+    snprintf(slot, sizeof slot, "%s", QA_JS_NUMBER(players[i].slot));
+    snprintf(score, sizeof score, "%s", QA_JS_NUMBER(players[i].score));
+    snprintf(ping, sizeof ping, "%s", QA_JS_NUMBER(players[i].ping));
+    char *line = format_line("%s %s %s %s\n", slot, score, ping, name);
+    free(name);
+    qa_cleanup_push(&node, free, line);
     print_text(console, line);
+    qa_cleanup_pop(&node);
+    free(line);
   }
   if (console->options.selection_consumption != NULL)
     console->options.selection_consumption(console->options.ctx, print_selection_entry, console);
@@ -91,24 +129,35 @@ static void dumpuser_handler(void *v, qa_command_invocation *invocation) {
   const qa_app_q2_console_player *players = NULL;
   size_t count = console->options.has_q2_source(console->options.ctx)
       ? console->options.players(console->options.ctx, &players) : 0;
+  /* [...players].find(...): the first match. */
   const qa_app_q2_console_player *player = NULL;
-  char scratch[256];
-  for (size_t i = 0; i < count; i++) {
+  bool digits = all_digits(target);
+  double slot = digits ? strtod(target, NULL) : 0;
+  for (size_t i = 0; i < count && player == NULL; i++) {
     if (!players[i].connected) continue;
-    bool match = all_digits(target) ? players[i].slot == strtod(target, NULL)
-        : strcmp(qa_app_q2_operator_player_name(players[i].userinfo, players[i].name, scratch, sizeof scratch), target) == 0;
+    bool match;
+    if (digits) match = players[i].slot == slot;
+    else {
+      char *name = operator_name(&players[i]);
+      match = strcmp(name, target) == 0;
+      free(name);
+    }
     if (match) player = &players[i];
   }
+  qa_cleanup node;
   if (player == NULL) {
-    char line[1024];
-    snprintf(line, sizeof line, "Player %s is not on the server\n", target);
+    char *line = format_line("Player %s is not on the server\n", target, "", "", "");
+    qa_cleanup_push(&node, free, line);
     print_text(console, line);
+    qa_cleanup_pop(&node);
+    free(line);
     return;
   }
   print_text(console, "userinfo\n--------\n");
-  /* q2Userinfo iteration over \key\value pairs in source order. */
-  const char *p = player->userinfo;
-  if (*p == '\\') p++;
+  /* q2Userinfo: \key\value pairs in source order, the first of a repeated key kept (a Map that skips
+   * keys it has), a trailing unpaired token dropped; printed as `${key.padEnd(20)}${value}\n`. */
+  const char *source = player->userinfo;
+  const char *p = source[0] == '\\' ? source + 1 : source;
   while (*p != '\0') {
     const char *key_end = strchr(p, '\\');
     if (key_end == NULL) break;
@@ -116,16 +165,29 @@ static void dumpuser_handler(void *v, qa_command_invocation *invocation) {
     const char *value_end = strchr(value, '\\');
     size_t key_len = (size_t)(key_end - p);
     size_t value_len = value_end != NULL ? (size_t)(value_end - value) : strlen(value);
-    char line[1024];
-    char key[256];
-    if (key_len >= sizeof key) key_len = sizeof key - 1;
-    memcpy(key, p, key_len); key[key_len] = '\0';
-    char value_text[512];
-    if (value_len >= sizeof value_text) value_len = sizeof value_text - 1;
-    memcpy(value_text, value, value_len); value_text[value_len] = '\0';
-    snprintf(line, sizeof line, "%-20s%s\n", key, value_text);
+    const char *next = value_end != NULL ? value_end + 1 : value + value_len;
+    bool repeated = false;
+    for (const char *q = source[0] == '\\' ? source + 1 : source; q < p && !repeated;) {
+      const char *q_key_end = strchr(q, '\\');
+      const char *q_value_end = strchr(q_key_end + 1, '\\');
+      if ((size_t)(q_key_end - q) == key_len && memcmp(q, p, key_len) == 0) repeated = true;
+      q = q_value_end + 1;
+    }
+    p = next;
+    if (repeated) continue;
+    size_t units = utf16_units(key_end - key_len, key_len);
+    size_t pad = units < 20 ? 20 - units : 0;
+    char *line = malloc(key_len + pad + value_len + 2);
+    if (line == NULL) qa_range_error("Out of memory");
+    memcpy(line, key_end - key_len, key_len);
+    memset(line + key_len, ' ', pad);
+    memcpy(line + key_len + pad, value, value_len);
+    line[key_len + pad + value_len] = '\n';
+    line[key_len + pad + value_len + 1] = '\0';
+    qa_cleanup_push(&node, free, line);
     print_text(console, line);
-    p = value_end != NULL ? value_end + 1 : value + value_len;
+    qa_cleanup_pop(&node);
+    free(line);
   }
 }
 qa_app_q2_console_binding *qa_app_q2_console_bind(qa_app_q2_console *console, qa_command_buffer *commands) {
@@ -133,7 +195,7 @@ qa_app_q2_console_binding *qa_app_q2_console_bind(qa_app_q2_console *console, qa
   if (binding == NULL) qa_range_error("Out of memory");
   binding->commands = commands;
   binding->console = console;
-  static forward_ctx forwards[3];
+  forward_ctx *forwards = binding->forwards;
   static const char *const forward_names[] = {"quit", "map", "say"};
   for (size_t i = 0; i < 3; i++) {
     forwards[i].console = console; forwards[i].name = forward_names[i];
@@ -178,11 +240,18 @@ void qa_app_q2_console_bind_current(qa_app_q2_console *console) {
   console->options.bind_lmctf_rules(console->options.ctx, cvars, rules);
   char *maplist_file = qa_cvar_registry_variable_string(cvars, "maplist_file");
   size_t length = 0;
-  uint8_t *bytes = maplist_file != NULL
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, maplist_file);
+  uint8_t *raw = maplist_file != NULL
       ? console->options.open_match_file(console->options.ctx, maplist_file, &length) : NULL;
+  qa_cleanup_pop(&node);
   free(maplist_file);
-  if (bytes == NULL) bytes = console->options.open_match_file(console->options.ctx, "maplist.txt", &length);
-  if (bytes == NULL) return;
+  if (raw == NULL) raw = console->options.open_match_file(console->options.ctx, "maplist.txt", &length);
+  if (raw == NULL) return;
+  /* new TextDecoder().decode(file.bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD. */
+  uint8_t *bytes = (uint8_t *)qa_text_decoder_decode(raw, length, &length);
+  free(raw);
+  if (bytes == NULL) qa_range_error("Out of memory");
   /* Split lines, trim, first token lowercased. */
   size_t capacity = 0, count = 0;
   const char **names = NULL;

@@ -254,7 +254,10 @@ static void thunk_system_info(void *ctx) {
     s->bindings.system_info(s->bindings.ctx, "");
     return;
   }
+  qa_cleanup guard; /* the binding can raise */
+  qa_cleanup_push(&guard, free, info);
   s->bindings.system_info(s->bindings.ctx, info);
+  qa_cleanup_pop(&guard);
   free(info);
 }
 static void thunk_map_restart(void *ctx) {

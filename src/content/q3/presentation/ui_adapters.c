@@ -14,7 +14,7 @@ void qa_q3_pres_engine_ui_model_painter_init(qa_q3_pres_engine_ui_model_painter 
 void qa_q3_pres_engine_ui_model_painter_paint(qa_q3_pres_engine_ui_model_painter *painter,
                                               const qa_ui_model_paint_request *request) {
   if (request->draw->commands.ctx != painter->commands_token)
-    qa_range_error("UI model painter must use its seat's drawing queue");
+    qa_raise("Error", 0, 0, "UI model painter must use its seat's drawing queue");
   qa_rect viewport = qa_draw2d_adjust(request->draw, request->rect);
   qa_q3_pres_refdef refdef = qa_q3_pres_create_refdef();
   refdef.render_flags = QA_Q3_PRES_RDF_NOWORLDMODEL;
@@ -34,7 +34,8 @@ void qa_q3_pres_engine_ui_model_painter_paint(qa_q3_pres_engine_ui_model_painter
                             f32(-0.5 * f32(bounds.min.z + bounds.max.z))};
   entity.lighting_origin = entity.origin;
   entity.old_origin = entity.origin;
-  entity.axis = qa_qvm_angles_to_axis((qa_vec3){0, request->angle, 0});
+  /* TS vec3(0, request.angle, 0) rounds the angle to binary32. */
+  entity.axis = qa_qvm_angles_to_axis((qa_vec3){0, f32(request->angle), 0});
   entity.shading.render_flags = QA_Q3_PRES_RF_LIGHTING_ORIGIN | QA_Q3_PRES_RF_NOSHADOW;
   painter->resources.clear_scene(painter->resources.ctx);
   qa_q3_pres_admitted_ref_entity admitted;

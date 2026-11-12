@@ -232,14 +232,17 @@ static void composed_run(void *ctx, qa_q1qc_call_site call, qa_q1qc_function_exe
     return;
   }
   qa_q1qc_machine *vm = proj_vm(attacks);
+  /* TS builds the emission (owner lookup and time read can throw) before the push. */
+  emission fired;
+  fired.owner = proj_actor(attacks, qa_q1qc_words_int(&vm->globals,
+                                                      qa_q1qc_machine_global_offset(vm, "self")));
+  fired.emitted_at = qa_q1qc_words_float(&vm->globals, qa_q1qc_machine_global_offset(vm, "time"));
+  fired.weapon = *weapon;
   if (attacks->firing_count == attacks->firing_capacity) {
     attacks->firing_capacity = attacks->firing_capacity == 0 ? 4 : attacks->firing_capacity * 2;
     attacks->firing = xrealloc(attacks->firing, attacks->firing_capacity * sizeof *attacks->firing);
   }
-  attacks->firing[attacks->firing_count++] = (emission){
-      proj_actor(attacks, qa_q1qc_words_int(&vm->globals,
-                                            qa_q1qc_machine_global_offset(vm, "self"))),
-      qa_q1qc_words_float(&vm->globals, qa_q1qc_machine_global_offset(vm, "time")), *weapon};
+  attacks->firing[attacks->firing_count++] = fired;
   /* TS pops in a finally, which also runs when execute throws. */
   qa_cleanup node;
   qa_cleanup_push(&node, pop_firing, attacks);

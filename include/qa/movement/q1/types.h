@@ -67,6 +67,8 @@ typedef struct qa_q1_movement_options {
   qa_vec3 source_punch_angles;
   bool has_view_height;
   double view_height;
+  /* A TS `get viewHeight()` over a caller's variable: read on each use when set (with has_view_height). */
+  const double *view_height_ref;
   bool has_max_velocity;
   double max_velocity;
   bool no_step;

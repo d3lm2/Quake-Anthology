@@ -200,6 +200,7 @@ struct qa_app_sim_player_movement_prediction {
   qa_q2_rerelease_movement_context q2_context;
   qa_q3_movement_provider_options q3_options;
   qa_q3_arsenal_runtime_state runtime;
+  qa_q3_movement_hooks q3_hooks; bool owns_q3_hooks; /* createQ3SourceMovementHooks holder */
   qa_movement_services services;
 };
 static qa_movement_continuation pred_touch(void *ctx, qa_movement_touch_contact contact, qa_movement_state state) {
@@ -242,11 +243,15 @@ static qa_animation_step_result pred_anim(void *ctx, qa_animation_step_input inp
   (void)ctx;
   qa_animation_step_result out; memset(&out, 0, sizeof out); out.animation = input.animation; return out;
 }
+static void prediction_cleanup(void *value) { qa_app_sim_player_movement_prediction_destroy(value); }
 qa_app_sim_player_movement_prediction *qa_app_sim_create_player_movement_prediction(
     qa_app_sim_prediction_simulation simulation, qa_app_sim_movement_prediction_player player,
     qa_vec3 origin, qa_vec3 velocity, double milliseconds, bool crouched, const qa_movement_profile *selected_profile) {
   qa_app_sim_player_movement_prediction *p = calloc(1, sizeof *p);
   if (!p) qa_range_error("Out of memory");
+  /* Every step below can raise (combat state, source reads, provider allocation). */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, prediction_cleanup, p);
   p->simulation = simulation; p->player = player; p->milliseconds = milliseconds; p->crouched = crouched;
   qa_app_sim_selected_profile_player sel; memset(&sel, 0, sizeof sel);
   sel.profile = player.profile; sel.world_gravity = player.world_gravity;
@@ -260,7 +265,7 @@ qa_app_sim_player_movement_prediction *qa_app_sim_create_player_movement_predict
     memset(&combat_state, 0, sizeof combat_state);
     combat_state.health = player.source_environment.health;
     combat_state.invulnerable = player.source_environment.invulnerable;
-  } else qa_range_error("Player has no combat state during movement prediction");
+  } else qa_raise("Error", 0, 0, "Player has no combat state during movement prediction");
   qa_app_sim_movement_environment_player envp; memset(&envp, 0, sizeof envp);
   envp.has_source_environment = player.has_source_environment; envp.source_environment = player.source_environment;
   envp.gravity_multiplier = player.gravity_multiplier; envp.state = player.state; envp.flight = player.flight;
@@ -276,12 +281,16 @@ qa_app_sim_player_movement_prediction *qa_app_sim_create_player_movement_predict
   qa_q3_movement_hooks q3_hooks; memset(&q3_hooks, 0, sizeof q3_hooks);
   if (is(player.arsenal.state.kind, "q3")) {
     const char *product = "baseq3";
-    qa_q3_arsenal_runtime_state runtime;
+    /* readQ3ArsenalRuntime(entity, q3SpawnArsenalRuntime(source.options.product, 100)): the reader
+     * keeps the spawn fields it does not read (the product it reads too), so the spawn state of
+     * any product is the same previous value. */
+    qa_q3_arsenal_runtime_state runtime = qa_q3_spawn_arsenal_runtime("baseq3", 100, 0);
     bool got = simulation.q3_arsenal_runtime && simulation.q3_arsenal_runtime(simulation.ctx, player.client, &product, &runtime);
     p->runtime = got ? runtime : player.has_q3_arsenal ? player.q3_arsenal : qa_q3_spawn_arsenal_runtime("baseq3", 100, 0);
     qa_q3_arsenal_runtime_access access; memset(&access, 0, sizeof access);
     access.ctx = p; access.read = pred_runtime_read; access.write = pred_runtime_write; access.gauntlet_hit = pred_gauntlet;
     q3_hooks = qa_q3_create_source_movement_hooks(access);
+    p->q3_hooks = q3_hooks; p->owns_q3_hooks = true;
     (void)product;
   } else {
     q3_hooks.firing = pred_q3_firing;
@@ -302,6 +311,7 @@ qa_app_sim_player_movement_prediction *qa_app_sim_create_player_movement_predict
   memset(&p->services, 0, sizeof p->services);
   p->services.scene = simulation.scene; p->services.numeric = player.numeric;
   p->services.touch = pred_touch; p->services.weapon_step = pred_weapon; p->services.animation_step = pred_anim;
+  qa_cleanup_pop(&guard);
   return p;
 }
 void qa_app_sim_player_movement_prediction_destroy(qa_app_sim_player_movement_prediction *prediction) {
@@ -309,16 +319,17 @@ void qa_app_sim_player_movement_prediction_destroy(qa_app_sim_player_movement_pr
   qa_app_sim_player_movement_hooks hooks; memset(&hooks, 0, sizeof hooks);
   hooks.native_quakeworld = prediction->native_quakeworld; hooks.q3_options_storage = &prediction->q3_options;
   qa_app_sim_release_player_movement_provider(hooks, prediction->provider);
+  if (prediction->owns_q3_hooks) qa_q3_source_movement_hooks_destroy(&prediction->q3_hooks);
   free(prediction);
 }
 qa_movement_provider qa_app_sim_player_movement_prediction_provider(qa_app_sim_player_movement_prediction *prediction) { return prediction->provider; }
 qa_movement_services qa_app_sim_player_movement_prediction_services(qa_app_sim_player_movement_prediction *prediction) { return prediction->services; }
 qa_movement_input qa_app_sim_player_movement_prediction_input(qa_app_sim_player_movement_prediction *p,
     const qa_movement_result *previous, double index, qa_vec3 command_move) {
-  if (previous && is(previous->status, "actor-removed")) qa_range_error("Movement prediction removed its actor");
+  if (previous && is(previous->status, "actor-removed")) qa_raise("Error", 0, 0, "Movement prediction removed its actor");
   qa_movement_state state = previous ? previous->state : p->initial;
   double yaw = atan2(command_move.y, command_move.x);
-  double horizontal = qa_js_min(400, hypot(command_move.x, command_move.y));
+  double horizontal = qa_js_min(400, qa_js_hypot2(command_move.x, command_move.y));
   double up = qa_js_max(-400, qa_js_min(400, command_move.z));
   qa_vec3 angles = {0, yaw * 180 / 3.141592653589793, 0};
   double words[3] = {0, (double)(qa_js_to_int32(qa_js_round(yaw * 65536 / (3.141592653589793 * 2))) & 65535), 0};
@@ -381,7 +392,7 @@ qa_movement_input qa_app_sim_player_movement_prediction_input(qa_app_sim_player_
         : (is(p->player.arsenal.state.kind, "q3") ? p->player.arsenal.state.source_weapon : 0);
     return out;
   }
-  qa_range_error("Player state differs from selected movement");
+  qa_raise("Error", 0, 0, "Player state differs from selected movement");
 }
 qa_app_sim_movement_observation qa_app_sim_movement_observation_of(qa_movement_result result) {
   const char *medium = result.water_level == 0 ? "dry"

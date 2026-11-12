@@ -2,6 +2,7 @@
  * the qcWeaponBehaviorCapabilityError check (TS owner:
  * src/compat/qc/weapon-behavior-profile.ts). GPL-2.0-or-later. */
 #include "qa/content/catalog/weapon_behaviors.h"
+#include "qa/content/json_text.h"
 
 #include "catalog_internal.h"
 #include "qa/persistence/value.h"
@@ -233,6 +234,8 @@ qa_qc_trajectory_binding_inspection *qa_inspect_qc_trajectory_bindings(
                       ? functions[index + 1]->first_statement
                       : (int64_t)program->statement_count;
     for (int64_t cursor = fn->first_statement; cursor + 1 < end; cursor++) {
+      /* TS reads statements[cursor] with `?.`: past the table nothing matches. */
+      if ((uint64_t)cursor + 1 >= program->statement_count) break;
       const qa_catalog_qc_statement *address = &program->statements[cursor];
       const qa_catalog_qc_statement *store = &program->statements[cursor + 1];
       int32_t field_offset = 0;
@@ -284,7 +287,7 @@ static bool behavior_id_valid(const char *value) {
   const char *colon = strchr(value, ':');
   if (colon == NULL || colon == value || colon[1] == '\0') return false;
   for (size_t i = 0; value[i] != '\0'; i++)
-    if (isspace((unsigned char)value[i])) return false;
+    if (qa_js_white_space_length(value + i) != 0) return false; /* regex \s */
   return true;
 }
 static bool projectile_role_valid(const char *value) {
@@ -334,7 +337,7 @@ bool qa_discover_qc_weapon_behaviors(qa_catalog_mounted_reader content,
     return true;
   }
   qa_save_value *value =
-      qa_parse_json_value(resource.bytes, resource.byte_length, false);
+      qa_content_parse_json_fatal(resource.bytes, resource.byte_length);
   if (value == NULL) return false;
   const qa_save_value *version =
       is_record_value(value) ? qa_save_value_get(value, "version") : NULL;

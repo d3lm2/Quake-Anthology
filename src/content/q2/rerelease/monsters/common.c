@@ -8,6 +8,8 @@
 
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/content/q2/foundation/monsters/ai.h"
+#include "qa/contracts/identity.h"
+#include "qa/foundation/support.h"
 #include "rrm_internal.h"
 
 double qa_q2rm_host_gravity(qa_q2_game_services *game) { return game->host->gravity(game->host->ctx); }
@@ -17,12 +19,31 @@ void qa_q2rm_set_powered(qa_q2_game_services *game, qa_owned_actor actor, const 
   qa_gameplay_authority_set_powered_protection(game->host->combat, actor, powered);
 }
 
+/* TS bindArmor closures: { read, write } over the q2:monster-power entry, bound on
+ * every call. The authority keeps the binding and has no release hook, so the
+ * record cannot be freed with the monster: records stay on this list, carry the
+ * actor identity, and are reused once their actor is released or their session's
+ * identity owner is destroyed (as content/q2/missionpacks/monsters/power_armor.c).
+ * The closures read the actor, never the entity, which is freed while the binding
+ * stays with the authority; the capacity is the spawn field's value, which does
+ * not change after spawn. */
 typedef struct cell_ctx {
   qa_q2_game_services *game;
   qa_owned_actor actor;
-  qa_q2_entity *entity;
-  double minimum_cells;
+  double capacity;
+  bool retired;
+  struct cell_ctx *next;
 } cell_ctx;
+static cell_ctx *cell_records;
+static bool cell_retire_registered;
+static void cell_retire_session(const void *token) {
+  for (cell_ctx *cell = cell_records; cell; cell = cell->next)
+    if (cell->actor.token == token) cell->retired = true;
+}
+static bool cell_same_owned(qa_owned_actor a, qa_owned_actor b) {
+  return qa_same_actor(a.id, b.id) && a.token == b.token
+      && ((a.owner == NULL && b.owner == NULL) || (a.owner && b.owner && strcmp(a.owner, b.owner) == 0));
+}
 static double cell_read(void *ctx) {
   cell_ctx *cell = ctx;
   return qa_shared_inventory_table_count(cell->game->host->inventory, cell->actor.id, "q2:monster-power");
@@ -33,19 +54,33 @@ static void cell_write(void *ctx, double count) {
   memset(&entry, 0, sizeof entry);
   entry.item = "q2:monster-power";
   entry.count = count;
-  double field = qa_q2_number_field(&cell->entity->spawn, "power_armor_power", cell->minimum_cells);
-  entry.capacity = field > cell->minimum_cells ? field : cell->minimum_cells;
+  entry.capacity = cell->capacity;
   qa_shared_inventory_table_configure(cell->game->host->inventory, cell->actor, entry, NULL, NULL);
 }
 void qa_q2rm_bind_armor(qa_q2m_context *context, double minimum_cells) {
-  cell_ctx *cell = malloc(sizeof *cell);
-  if (!cell) qa_raise("Error", 0, 0, "Out of memory binding rerelease monster power armor cells");
-  cell->game = context->game;
-  cell->actor = context->entity->actor;
-  cell->entity = context->entity;
-  cell->minimum_cells = minimum_cells;
+  qa_q2_game_services *game = context->game;
+  qa_q2_entity *entity = context->entity;
+  if (!cell_retire_registered) { qa_identity_owner_on_destroy(cell_retire_session); cell_retire_registered = true; }
+  cell_ctx *cell = NULL, *spare = NULL;
+  for (cell_ctx *seen = cell_records; seen && !cell; seen = seen->next) {
+    if (seen->retired) { if (!spare) spare = seen; continue; }
+    if (cell_same_owned(seen->actor, entity->actor)) cell = seen;
+    else if (!spare && seen->actor.token == entity->actor.token && !q2rm_live(game, seen->actor.id)) spare = seen;
+  }
+  if (!cell) cell = spare;
+  if (!cell) {
+    cell = malloc(sizeof *cell);
+    if (!cell) qa_raise("Error", 0, 0, "Out of memory binding rerelease monster power armor cells");
+    cell->next = cell_records;
+    cell_records = cell;
+  }
+  cell->game = game;
+  cell->actor = entity->actor;
+  /* Math.max(minimum, numberField(entity.spawn, "power_armor_power", minimum)) */
+  cell->capacity = qa_js_max(minimum_cells, qa_q2_number_field(&entity->spawn, "power_armor_power", minimum_cells));
+  cell->retired = false;
   qa_power_armor_cell_binding binding = {cell, cell_read, cell_write};
-  qa_gameplay_authority_bind_power_armor_cells(context->game->host->combat, context->entity->actor, binding);
+  qa_gameplay_authority_bind_power_armor_cells(game->host->combat, entity->actor, binding);
 }
 void qa_q2rm_bind_armor_handler_200(void *ctx, qa_q2m_context *context) {
   (void)ctx;
@@ -62,7 +97,7 @@ void qa_q2rm_init_power_armor(qa_q2m_context *context, double default_cells) {
   memset(&entry, 0, sizeof entry);
   entry.item = "q2:monster-power";
   entry.count = cells;
-  entry.capacity = cells > default_cells ? cells : default_cells;
+  entry.capacity = qa_js_max(default_cells, cells);
   qa_shared_inventory_table_configure(game->host->inventory, entity->actor, entry, NULL, NULL);
   qa_q2rm_bind_armor(context, default_cells);
   qa_q2rm_set_powered(game, entity->actor, type == 0 ? "none" : type == 1 ? "screen" : "shield", cells);
@@ -99,8 +134,7 @@ bool qa_q2rm_calculate_pitch_to_fire(qa_q2m_context *context, qa_vec3 target, qa
   qa_q2_game_services *game = context->game;
   qa_vec3 angles = qa_vector_to_angles_with_rule(aim, QA_VECTOR_TO_ANGLES_NATIVE_AI);
   double gravity = qa_q2rm_host_gravity(game);
-  double best_pitch = 0, best_distance = DBL_MAX;
-  bool have_best = false;
+  double best_pitch = 0, best_distance = INFINITY;
   static const double pitches[9] = {-80, -70, -60, -50, -40, -30, -20, -10, -5};
   for (int p = 0; p < 9; p++) {
     double pitch = pitches[p];
@@ -126,12 +160,12 @@ bool qa_q2rm_calculate_pitch_to_fire(qa_q2m_context *context, qa_vec3 target, qa
           && ((context->entity->has_enemy && qa_same_actor(context->entity->enemy, trace.hit.actor))
               || game->host->is_player(game->host->ctx, trace.hit.actor));
       if (hit_enemy || (normal.z >= 0.7 && distance < 128 * 128 && distance < best_distance)) {
-        best_pitch = pitch; best_distance = distance; have_best = true;
+        best_pitch = pitch; best_distance = distance;
       }
       if (destroy_on_touch || (qa_js_to_int32(trace_contents(trace)) & (0x2000000 | 0x4000000 | 0x40000000)) != 0) break;
     }
   }
-  if (!have_best) return false;
+  if (!isfinite(best_distance)) return false; /* Number.isFinite(bestDistance) */
   qa_vec3 pitched = angles;
   pitched.x = best_pitch;
   *out = qa_math_angle_vectors_rule(pitched, QA_ANGLE_RULE_NATIVE).forward;

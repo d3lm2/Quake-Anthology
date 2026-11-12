@@ -1,5 +1,6 @@
 /* Port of src/content/mods/declaration.ts. GPL-2.0-or-later. */
 #include "qa/content/mods/declaration.h"
+#include "qa/content/json_text.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -137,7 +138,7 @@ qa_mod_declaration qa_parse_gameplay_mod_declaration(const uint8_t *bytes,
    * the declaration's owner keeps the parsed tree its strings borrow. */
   qa_mod_declaration declaration;
   memset(&declaration, 0, sizeof declaration);
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (value == NULL) return declaration;
   qa_cleanup cleanup;
   qa_cleanup_push(&cleanup, free_parsed_value, value);

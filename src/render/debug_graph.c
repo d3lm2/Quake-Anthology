@@ -7,7 +7,7 @@
 static double f32(double v){ return (double)(float)v; }
 qa_vec4 qa_debug_graph_color(qa_palette palette, double index){
   int32_t i=qa_js_to_int32(index); size_t offset=(size_t)(i&255)*3; /* index & 255 */
-  if(offset+2>=palette.colors.length) qa_range_error("Incomplete debug graph palette");
+  if(offset+2>=palette.colors.length) qa_raise("Error", 0, 0, "Incomplete debug graph palette");
   qa_vec4 c; c.x=palette.colors.bytes[offset]/255.0; c.y=palette.colors.bytes[offset+1]/255.0;
   c.z=palette.colors.bytes[offset+2]/255.0; c.w=1; return c;
 }

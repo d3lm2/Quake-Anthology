@@ -1,7 +1,8 @@
 /*
  * Port of src/guest/elf/parse.ts: checked ELF32/ELF64 inspection (headers,
  * program/section tables, dynamic tags, symbols, versions, relocations).
- * ElfError aborts with the same "ELF: ..." message via qa_range_error.
+ * ElfError is a qa_raise under that name with the same "ELF: ..." message; an
+ * inspection that raises frees what it had built.
  * The unwind module's qa_elf_inspection/qa_elf_segment/qa_elf_section
  * (unwind.h) are field subsets used by unwind.ts; the full parse.ts shapes
  * use _info/_full names here, with qa_elf_unwind_view() adapting a full

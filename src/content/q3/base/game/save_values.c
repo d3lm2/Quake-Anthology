@@ -2,7 +2,8 @@
 #include "qa/content/q3/base/game/save_values.h"
 #include <stdlib.h>
 #include <string.h>
-static char *dupstr(const char *v) { if (!v) return NULL; size_t n = strlen(v); char *d = malloc(n + 1); if (d) memcpy(d, v, n + 1); return d; }
+#include "qa/foundation/support.h"
+static char *dupstr(const char *v) { if (!v) return NULL; size_t n = strlen(v); char *d = malloc(n + 1); if (!d) qa_range_error("out of memory"); memcpy(d, v, n + 1); return d; }
 static void set_owned(char **dst, const char *v) { free(*dst); *dst = dupstr(v); }
 qa_q3_entity_values qa_q3_capture_entity_values(qa_q3_game_entity *s) {
   qa_q3_entity_values v; v.spawnflags = s->spawnflags; v.never_free = s->never_free; v.flags = s->flags;
@@ -23,6 +24,7 @@ qa_q3_entity_values qa_q3_capture_entity_values(qa_q3_game_entity *s) {
 void qa_q3_entity_values_destroy(qa_q3_entity_values *v) {
   free(v->model); free(v->model2); free(v->message); free(v->target); free(v->targetname); free(v->team);
   free(v->target_shader_name); free(v->target_shader_new_name);
+  v->model = v->model2 = v->message = v->target = v->targetname = v->team = v->target_shader_name = v->target_shader_new_name = NULL;
 }
 void qa_q3_restore_entity_values(qa_q3_game_entity *t, qa_q3_entity_values *s) {
   t->spawnflags = s->spawnflags; t->never_free = s->never_free; t->flags = s->flags;
@@ -131,14 +133,22 @@ void qa_q3_restore_level_values(qa_q3_game_level *t, qa_q3_level_values *s) {
   t->base.intermission_angle = s->intermission_angle; set_owned(&t->base.changemap, s->changemap); t->base.ready_to_exit = s->ready_to_exit;
   t->base.exit_time = s->exit_time; t->frame_num = s->frame_num; t->previous_time = s->previous_time; t->new_session = s->new_session; t->fry_sound = s->fry_sound;
 }
-/* Reader helpers: field may be absent only where TS reader would throw; mirrors read present fields. */
+/* Reader helpers. Fields are read in the TS order; a read that owns text releases it when a later field
+   raises (qa_cleanup), the role the GC plays for the TS object literal that never completes. */
+static void destroy_entity_values(void *arg) { qa_q3_entity_values_destroy(arg); }
+static void destroy_persistant_values(void *arg) { qa_q3_persistant_values_destroy(arg); }
+static void destroy_level_values(void *arg) { qa_q3_level_values_destroy(arg); }
 static double rf_num(const qa_save_reader *r, const char *n) { qa_save_reader f; qa_save_reader_field(r, n, &f); double v = qa_save_reader_number(&f); qa_save_reader_destroy(&f); return v; }
 static bool rf_bool(const qa_save_reader *r, const char *n) { qa_save_reader f; qa_save_reader_field(r, n, &f); bool v = qa_save_reader_boolean(&f); qa_save_reader_destroy(&f); return v; }
 static char *rf_str(const qa_save_reader *r, const char *n) { qa_save_reader f; qa_save_reader_field(r, n, &f); if (qa_save_reader_is_null(&f)) { qa_save_reader_destroy(&f); return NULL; } char *v = dupstr(qa_save_reader_string(&f)); qa_save_reader_destroy(&f); return v; }
-qa_vec3 qa_q3_read_vector(const qa_save_reader *r) { qa_vec3 v = {rf_num(r, "x"), rf_num(r, "y"), rf_num(r, "z")}; return v; }
+/* TS reader.field(n).string(): null is not accepted. */
+static char *rf_text(const qa_save_reader *r, const char *n) { qa_save_reader f; qa_save_reader_field(r, n, &f); char *v = dupstr(qa_save_reader_string(&f)); qa_save_reader_destroy(&f); return v; }
+/* Statements, not an initializer list: x, y, z are read (and reported) in that order. */
+qa_vec3 qa_q3_read_vector(const qa_save_reader *r) { qa_vec3 v; v.x = rf_num(r, "x"); v.y = rf_num(r, "y"); v.z = rf_num(r, "z"); return v; }
 static qa_vec3 rf_vec(const qa_save_reader *r, const char *n) { qa_save_reader f; qa_save_reader_field(r, n, &f); qa_vec3 v = qa_q3_read_vector(&f); qa_save_reader_destroy(&f); return v; }
 qa_q3_entity_values qa_q3_read_entity_values(const qa_save_reader *r) {
-  qa_q3_entity_values v; v.spawnflags = rf_num(r, "spawnflags"); v.never_free = rf_bool(r, "neverFree"); v.flags = rf_num(r, "flags");
+  qa_q3_entity_values v; memset(&v, 0, sizeof v); qa_cleanup guard; qa_cleanup_push(&guard, destroy_entity_values, &v);
+  v.spawnflags = rf_num(r, "spawnflags"); v.never_free = rf_bool(r, "neverFree"); v.flags = rf_num(r, "flags");
   v.model = rf_str(r, "model"); v.model2 = rf_str(r, "model2"); v.freetime = rf_num(r, "freetime"); v.event_time = rf_num(r, "eventTime");
   v.free_after_event = rf_bool(r, "freeAfterEvent"); v.unlink_after_event = rf_bool(r, "unlinkAfterEvent"); v.physics_object = rf_bool(r, "physicsObject");
   v.physics_bounce = rf_num(r, "physicsBounce"); v.clipmask = rf_num(r, "clipmask"); v.mover_state = rf_num(r, "moverState");
@@ -152,7 +162,8 @@ qa_q3_entity_values qa_q3_read_entity_values(const qa_save_reader *r) {
   v.damage = rf_num(r, "damage"); v.splash_damage = rf_num(r, "splashDamage"); v.splash_radius = rf_num(r, "splashRadius");
   v.method_of_death = rf_num(r, "methodOfDeath"); v.splash_method_of_death = rf_num(r, "splashMethodOfDeath"); v.count = rf_num(r, "count");
   v.kamikaze_time = rf_num(r, "kamikazeTime"); v.kamikaze_shock_time = rf_num(r, "kamikazeShockTime"); v.watertype = rf_num(r, "watertype");
-  v.waterlevel = rf_num(r, "waterlevel"); v.noise_index = rf_num(r, "noiseIndex"); v.wait = rf_num(r, "wait"); v.random = rf_num(r, "random"); return v;
+  v.waterlevel = rf_num(r, "waterlevel"); v.noise_index = rf_num(r, "noiseIndex"); v.wait = rf_num(r, "wait"); v.random = rf_num(r, "random");
+  qa_cleanup_pop(&guard); return v;
 }
 qa_q3_client_values qa_q3_read_client_values(const qa_save_reader *r) {
   qa_q3_client_values v; v.ready_to_exit = rf_bool(r, "readyToExit"); v.noclip = rf_bool(r, "noclip");
@@ -183,10 +194,12 @@ qa_q3_player_values qa_q3_read_player_values(const qa_save_reader *r) {
   v.jumppad_frame = rf_num(r, "jumppadFrame"); v.entity_event_sequence = rf_num(r, "entityEventSequence"); return v;
 }
 qa_q3_persistant_values qa_q3_read_persistant_values(const qa_save_reader *r) {
-  qa_q3_persistant_values v; v.connected = rf_num(r, "connected"); v.local_client = rf_bool(r, "localClient");
+  qa_q3_persistant_values v; memset(&v, 0, sizeof v); qa_cleanup guard; qa_cleanup_push(&guard, destroy_persistant_values, &v);
+  v.connected = rf_num(r, "connected"); v.local_client = rf_bool(r, "localClient");
   v.initial_spawn = rf_bool(r, "initialSpawn"); v.predict_item_pickup = rf_bool(r, "predictItemPickup"); v.pmove_fixed = rf_bool(r, "pmoveFixed");
-  v.netname = rf_str(r, "netname"); v.max_health = rf_num(r, "maxHealth"); v.enter_time = rf_num(r, "enterTime");
-  v.vote_count = rf_num(r, "voteCount"); v.team_vote_count = rf_num(r, "teamVoteCount"); v.team_info = rf_bool(r, "teamInfo"); return v;
+  v.netname = rf_text(r, "netname"); v.max_health = rf_num(r, "maxHealth"); v.enter_time = rf_num(r, "enterTime");
+  v.vote_count = rf_num(r, "voteCount"); v.team_vote_count = rf_num(r, "teamVoteCount"); v.team_info = rf_bool(r, "teamInfo");
+  qa_cleanup_pop(&guard); return v;
 }
 qa_q3_team_values qa_q3_read_team_values(const qa_save_reader *r) {
   qa_q3_team_values v; v.state = rf_num(r, "state"); v.location = rf_num(r, "location"); v.captures = rf_num(r, "captures");
@@ -210,7 +223,8 @@ qa_q3_network_values qa_q3_read_network_values(const qa_save_reader *r) {
   v.legs_anim = rf_num(r, "legsAnim"); v.torso_anim = rf_num(r, "torsoAnim"); v.generic1 = rf_num(r, "generic1"); return v;
 }
 qa_q3_level_values qa_q3_read_level_values(const qa_save_reader *r) {
-  qa_q3_level_values v; v.time = rf_num(r, "time"); v.start_time = rf_num(r, "startTime"); v.warmup_time = rf_num(r, "warmupTime");
+  qa_q3_level_values v; memset(&v, 0, sizeof v); qa_cleanup guard; qa_cleanup_push(&guard, destroy_level_values, &v);
+  v.time = rf_num(r, "time"); v.start_time = rf_num(r, "startTime"); v.warmup_time = rf_num(r, "warmupTime");
   v.warmup_modification_count = rf_num(r, "warmupModificationCount"); v.restarted = rf_bool(r, "restarted");
   v.num_connected_clients = rf_num(r, "numConnectedClients"); v.num_non_spectator_clients = rf_num(r, "numNonSpectatorClients");
   v.num_playing_clients = rf_num(r, "numPlayingClients"); v.num_voting_clients = rf_num(r, "numVotingClients");
@@ -218,5 +232,6 @@ qa_q3_level_values qa_q3_read_level_values(const qa_save_reader *r) {
   v.intermission_queued = rf_num(r, "intermissionQueued"); v.intermission_origin = rf_vec(r, "intermissionOrigin");
   v.intermission_angle = rf_vec(r, "intermissionAngle"); v.changemap = rf_str(r, "changemap"); v.ready_to_exit = rf_bool(r, "readyToExit");
   v.exit_time = rf_num(r, "exitTime"); v.frame_num = rf_num(r, "frameNum"); v.previous_time = rf_num(r, "previousTime");
-  v.new_session = rf_bool(r, "newSession"); v.fry_sound = rf_num(r, "frySound"); return v;
+  v.new_session = rf_bool(r, "newSession"); v.fry_sound = rf_num(r, "frySound");
+  qa_cleanup_pop(&guard); return v;
 }

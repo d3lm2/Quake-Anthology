@@ -51,14 +51,11 @@ const qa_pe_image *const *qa_windows_images(qa_windows_service_host *host, size_
   return host->images(host->ctx, count);
 }
 void qa_unsupported_windows_import(const char *library, const char *symbol, const char *detail) {
-  qa_range_error("Unsupported Windows guest import %s!%s: %s", library, symbol,
+  qa_raise("UnsupportedWindowsImport", 0, 0, "Unsupported Windows guest import %s!%s: %s", library, symbol,
                  detail != NULL ? detail : "runtime service is not implemented");
 }
 void qa_windows_own(qa_windows_service_host *host, void *resource, void (*release)(void *resource)) {
   host->own(host->ctx, resource, release);
-}
-void qa_windows_charge_bytes(qa_windows_service_host *host, size_t byte_length) {
-  if (host->charge_bytes != NULL) host->charge_bytes(host->ctx, byte_length);
 }
 void qa_windows_kernel_tables_free(qa_windows_kernel_tables *tables) {
   free(tables->heaps);

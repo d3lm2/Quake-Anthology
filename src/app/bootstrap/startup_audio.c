@@ -1,9 +1,10 @@
 /* Port of src/app/bootstrap/startup-audio.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/startup_audio.h"
-#include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "qa/app/bootstrap/audio/output_settings.h"
 #include "qa/app/bootstrap/audio/menu.h"
 #include "qa/app/bootstrap/audio/playlist.h"
@@ -12,6 +13,7 @@
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 #include "qa/network/common/js_number.h"
 typedef struct queued {
   const char *name;
@@ -36,66 +38,106 @@ struct qa_app_startup_audio {
   bool closed;
 };
 static char *xdup(const char *s) { char *r = qa_input_dup(s); if (!r) qa_range_error("Out of memory"); return r; }
+static char *xprintf(const char *format, ...) {
+  va_list args, measure;
+  va_start(args, format);
+  va_copy(measure, args);
+  int length = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  char *text = length >= 0 ? malloc((size_t)length + 1) : NULL;
+  if (text == NULL) { va_end(args); qa_range_error("Out of memory"); }
+  vsnprintf(text, (size_t)length + 1, format, args);
+  va_end(args);
+  return text;
+}
+/* The names and paths one selectMenuTrack candidate tries; released when a raise unwinds. */
+typedef struct track_names { char *names[2]; char *paths[2]; } track_names;
+static void track_names_clear(void *raw) {
+  track_names *t = raw;
+  for (size_t i = 0; i < 2; i++) { free(t->names[i]); free(t->paths[i]); t->names[i] = t->paths[i] = NULL; }
+}
+static void print_owned(qa_app_startup_audio *a, char *text) {
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, text);
+  a->print(a->print_ctx, text);
+  qa_cleanup_pop(&guard);
+  free(text);
+}
 static void select_menu_track(qa_app_startup_audio *a, const char *value) {
   if (a->closed || (a->menu_track != NULL && strcmp(a->menu_track, value) == 0)) return;
   free(a->menu_track); a->menu_track = xdup(value);
   qa_app_application_music_stop_playback(a->music, "source");
   if (strcmp(value, "0") == 0) return;
+  track_names owned = {{NULL, NULL}, {NULL, NULL}};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, track_names_clear, &owned);
   for (size_t ci = 0; ci < a->candidate_count; ci++) {
+    /* /^\d+$/ (ASCII digits) */
     bool numeric = value[0] != '\0';
-    for (const char *p = value; *p; p++) if (!isdigit((unsigned char)*p)) numeric = false;
+    for (const char *p = value; *p; p++) if (*p < '0' || *p > '9') numeric = false;
     char number_buf[64] = "";
     if (numeric) {
-      /* String(Number(value)).padStart(2, "0"): strtol clamped long digit runs. */
+      /* String(Number(value)).padStart(2, "0") */
       char text[40];
       qa_net_js_number(qa_js_string_to_number(value), text, sizeof text);
       snprintf(number_buf, sizeof number_buf, "%s%s", strlen(text) < 2 ? "0" : "", text);
     }
-    char names_storage[2][512];
+    track_names_clear(&owned);
     const char *names[4];
     size_t name_count = 0;
     if (strcmp(value, "auto") == 0) {
       for (size_t i = 0; i < a->candidates[ci].name_count && name_count < 4; i++) names[name_count++] = a->candidates[ci].names[i];
     } else if (numeric) {
-      snprintf(names_storage[0], sizeof names_storage[0], "music/%s", number_buf);
-      snprintf(names_storage[1], sizeof names_storage[1], "music/track%s", number_buf);
-      names[name_count++] = names_storage[0];
-      names[name_count++] = names_storage[1];
-    } else {
-      if (strncmp(value, "music/", 6) == 0) names[name_count++] = value;
-      else { snprintf(names_storage[0], sizeof names_storage[0], "music/%s", value); names[name_count++] = names_storage[0]; }
+      owned.names[0] = xprintf("music/%s", number_buf);
+      owned.names[1] = xprintf("music/track%s", number_buf);
+      names[name_count++] = owned.names[0];
+      names[name_count++] = owned.names[1];
+    } else if (strncmp(value, "music/", 6) == 0) names[name_count++] = value;
+    else {
+      owned.names[0] = xprintf("music/%s", value);
+      names[name_count++] = owned.names[0];
     }
     for (size_t ni = 0; ni < name_count; ni++) {
       const char *name = names[ni];
       size_t len = strlen(name);
-      bool has_ext = (len > 4 && (strcasecmp(name + len - 4, ".ogg") == 0 || strcasecmp(name + len - 4, ".wav") == 0));
-      char paths[2][560];
+      /* /\.(?:ogg|wav)$/i folds ASCII only */
+      bool has_ext = len >= 4 && (strcasecmp(name + len - 4, ".ogg") == 0 || strcasecmp(name + len - 4, ".wav") == 0);
       const char *path_list[2];
       size_t path_count = 0;
+      free(owned.paths[0]); free(owned.paths[1]);
+      owned.paths[0] = owned.paths[1] = NULL;
       if (has_ext) path_list[path_count++] = name;
       else {
-        snprintf(paths[0], sizeof paths[0], "%s.ogg", name);
-        snprintf(paths[1], sizeof paths[1], "%s.wav", name);
-        path_list[path_count++] = paths[0];
-        path_list[path_count++] = paths[1];
+        owned.paths[0] = xprintf("%s.ogg", name);
+        owned.paths[1] = xprintf("%s.wav", name);
+        path_list[path_count++] = owned.paths[0];
+        path_list[path_count++] = owned.paths[1];
       }
       for (size_t pi = 0; pi < path_count; pi++) {
         const qa_resolved_resource_reference *resolved = NULL;
-        if (!qa_content_mounted_resolve(a->candidates[ci].mounts, path_list[pi], &resolved)) continue;
-        if (a->closed || a->menu_track == NULL || strcmp(a->menu_track, value) != 0) return;
+        bool found = qa_content_mounted_resolve(a->candidates[ci].mounts, path_list[pi], &resolved);
+        if (a->closed || a->menu_track == NULL || strcmp(a->menu_track, value) != 0) {
+          qa_cleanup_pop(&guard);
+          track_names_clear(&owned);
+          return;
+        }
+        if (!found) continue;
         char *cue = qa_app_music_file_cue(path_list[pi]);
+        qa_cleanup cue_guard;
+        qa_cleanup_push(&cue_guard, free, cue);
         qa_app_application_music_play(a->music, a->candidates[ci].source, a->candidates[ci].bank, cue,
                                       (qa_app_open_music_track){NULL, NULL}, NULL);
+        qa_cleanup_pop(&cue_guard);
         free(cue);
+        qa_cleanup_pop(&guard);
+        track_names_clear(&owned);
         return;
       }
     }
   }
-  if (strcmp(value, "auto") != 0) {
-    char buf[1024];
-    snprintf(buf, sizeof buf, "Menu music unavailable: %s\n", value);
-    a->print(a->print_ctx, buf);
-  }
+  qa_cleanup_pop(&guard);
+  track_names_clear(&owned);
+  if (strcmp(value, "auto") != 0) print_owned(a, xprintf("Menu music unavailable: %s\n", value));
 }
 /* UnifiedAudio milliseconds: () => Math.trunc(performance.now()); random: () => 0. */
 static double engine_milliseconds(void *ctx) {
@@ -182,10 +224,10 @@ qa_app_startup_audio *qa_app_startup_audio_open(const qa_app_startup_audio_optio
     }
     free(list);
   }
-  /* localeCompare-free byte sort matches TS sort() for ASCII track names. */
+  /* [...new Set(...)].sort(): UTF-16 code-unit order (the names are unique). */
   for (size_t i = 0; i < a->track_count; i++)
     for (size_t j = i + 1; j < a->track_count; j++)
-      if (strcmp(a->tracks[j], a->tracks[i]) < 0) { char *tmp = a->tracks[i]; a->tracks[i] = a->tracks[j]; a->tracks[j] = tmp; }
+      if (qa_js_compare_code_units(a->tracks[j], a->tracks[i]) < 0) { char *tmp = a->tracks[i]; a->tracks[i] = a->tracks[j]; a->tracks[j] = tmp; }
   select_menu_track(a, options->preferences.menu_track ? options->preferences.menu_track : "auto");
   qa_cleanup_pop(&guard);
   return a;
@@ -209,7 +251,7 @@ qa_audio_output_format qa_app_startup_audio_output_format(qa_app_startup_audio *
 static void select_output(qa_unified_audio *engine, const char *name, qa_audio_output_format format, bool restart) {
   qa_sdl_audio_open_result result = qa_unified_audio_select_output(engine, name, &format, restart);
   if (result != QA_SDL_AUDIO_OPEN_OK)
-    qa_raise("Error", 0, 0, "%s", result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : "Audio output is unavailable");
+    qa_raise("Error", 0, 0, "%s", result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : qa_unified_audio_open_error(engine));
 }
 void qa_app_startup_audio_bind_output_cvars(qa_app_startup_audio *a, qa_cvar_registry *cvars) { a->output_cvars = cvars; }
 void qa_app_startup_audio_select_output_format(qa_app_startup_audio *a, qa_audio_output_format format) {
@@ -232,18 +274,22 @@ qa_app_audio_music_preferences qa_app_startup_audio_music_preferences(qa_app_sta
   }
   return qa_app_read_music_settings(a->output_cvars);
 }
-static const char *open_error(qa_sdl_audio_open_result result) {
-  return result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : "Audio output is unavailable";
+/* The thrown error's message: SdlAudioUnavailableError's SDL text, which the engine keeps for its last failed open. */
+static const char *open_error(qa_unified_audio *engine, qa_sdl_audio_open_result result) {
+  return result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : qa_unified_audio_open_error(engine);
 }
 void qa_app_startup_audio_open_output(qa_app_startup_audio *a, const char *device_name, void (*print)(void *ctx, const char *text), void *print_ctx) {
   qa_sdl_audio_open_result result = qa_unified_audio_open_device(a->engine, device_name, 0);
   if (result == QA_SDL_AUDIO_OPEN_OK) return;
-  if (device_name == NULL) qa_raise("Error", 0, 0, "%s", open_error(result));
-  char buf[2048];
-  snprintf(buf, sizeof buf, "Audio output %s unavailable: %s. Using system default.\n", device_name, open_error(result));
-  print(print_ctx, buf);
+  if (device_name == NULL) qa_raise("Error", 0, 0, "%s", open_error(a->engine, result));
+  char *text = xprintf("Audio output %s unavailable: %s. Using system default.\n", device_name, open_error(a->engine, result));
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, text);
+  print(print_ctx, text);
+  qa_cleanup_pop(&guard);
+  free(text);
   result = qa_unified_audio_open_device(a->engine, NULL, 0);
-  if (result != QA_SDL_AUDIO_OPEN_OK) qa_raise("Error", 0, 0, "%s", open_error(result));
+  if (result != QA_SDL_AUDIO_OPEN_OK) qa_raise("Error", 0, 0, "%s", open_error(a->engine, result));
 }
 void qa_app_startup_audio_cd_command(qa_app_startup_audio *a, const char *const *args, size_t count, void (*print)(void *ctx, const char *text), void *print_ctx) {
   if (!a->closed) qa_app_application_music_cd_command(a->music, args, count, print, print_ctx);
@@ -266,20 +312,32 @@ void qa_app_startup_audio_queue_cd_command(qa_app_startup_audio *a, const char *
 void qa_app_startup_audio_queue_music_command(qa_app_startup_audio *a, const char *const *args, size_t count, void (*print)(void *ctx, const char *text), void *print_ctx) {
   queue_command(a, "music", args, count, print, print_ctx);
 }
+static void queued_free(void *raw) {
+  queued *command = raw;
+  for (size_t i = 0; i < command->arg_count; i++) free(command->args[i]);
+  free(command->args);
+  command->args = NULL;
+  command->arg_count = 0;
+}
 void qa_app_startup_audio_flush_commands(qa_app_startup_audio *a) {
   if (a->output_cvars != NULL) {
     qa_app_audio_music_preferences prefs = qa_app_read_music_settings(a->output_cvars);
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, prefs.menu_track);
     select_menu_track(a, prefs.menu_track);
+    qa_cleanup_pop(&guard);
     free(prefs.menu_track);
   }
   while (!a->closed && a->command_count > 0) {
     queued command = a->commands[a->command_head];
     a->command_head = (a->command_head + 1) % 1024;
     a->command_count--;
+    qa_cleanup guard; /* the read record is retired; a raising command still releases its copy */
+    qa_cleanup_push(&guard, queued_free, &command);
     if (strcmp(command.name, "cd") == 0) qa_app_startup_audio_cd_command(a, (const char *const *)command.args, command.arg_count, command.print, command.print_ctx);
     else qa_app_application_music_music_command(a->music, (const char *const *)command.args, command.arg_count, command.print, command.print_ctx);
-    for (size_t i = 0; i < command.arg_count; i++) free(command.args[i]);
-    free(command.args);
+    qa_cleanup_pop(&guard);
+    queued_free(&command);
   }
 }
 void qa_app_startup_audio_set_volumes(qa_app_startup_audio *a, double effects, double music) {

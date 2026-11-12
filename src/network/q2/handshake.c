@@ -19,8 +19,10 @@
 #include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 
+/* new TextDecoder("utf-8", { fatal: true }).decode: Bun 1.3.14 throws
+ * TypeError "Invalid byte sequence" (code ERR_ENCODING_INVALID_ENCODED_DATA). */
 noreturn void qa_q2_throw_utf8_error(void) {
-  qa_q2_throw_error("The encoded data was not valid for encoding utf-8");
+  qa_raise("TypeError", 0, 0, "%s", "Invalid byte sequence");
 }
 
 static char *dup_str(const char *s) {
@@ -51,7 +53,8 @@ static bool valid_utf8(const uint8_t *bytes, size_t length) {
     else if ((c & 0xf0) == 0xe0) { need = 2; cp = c & 0x0f; }
     else if ((c & 0xf8) == 0xf0) { need = 3; cp = c & 0x07; }
     else return false;
-    if (i + (size_t)need >= length + 1) return false;
+    /* The continuation bytes are bytes[i + 1 .. i + need]; all must be inside the span. */
+    if (i + (size_t)need >= length) return false;
     for (int k = 0; k < need; k++) {
       uint8_t d = bytes[i + 1 + (size_t)k];
       if ((d & 0xc0) != 0x80) return false;
@@ -64,6 +67,83 @@ static bool valid_utf8(const uint8_t *bytes, size_t length) {
     i += (size_t)need + 1;
   }
   return true;
+}
+
+/* Bytes of the (validated) UTF-8 character led by `lead`, and its UTF-16 units. */
+static size_t utf8_sequence(uint8_t lead, size_t *units) {
+  size_t n = lead < 0x80 ? 1 : (lead & 0xe0) == 0xc0 ? 2 : (lead & 0xf0) == 0xe0 ? 3 : 4;
+  if (units != NULL) *units = n == 4 ? 2 : 1;
+  return n;
+}
+/* TS string.length of UTF-8 text: UTF-16 code units. */
+static size_t utf16_length(const char *text) {
+  size_t units = 0;
+  for (const uint8_t *p = (const uint8_t *)text; *p != 0; p++)
+    if ((*p & 0xc0) != 0x80) units += *p >= 0xf0 ? 2 : 1;
+  return units;
+}
+/* TS length of a message string: UTF-16 units for UTF-8 text, else one per Latin-1 byte. */
+static size_t message_length(const qa_q2_connectionless_message *message, const char *text) {
+  return message->utf8 ? utf16_length(text) : strlen(text);
+}
+
+/* parseQ2Token(cursor) over UTF-8 text: the TS limit counts UTF-16 units, so a character outside
+ * the BMP is two. When only its high surrogate fits, TS keeps that lone surrogate; it is kept here
+ * as U+FFFD, what TextEncoder writes for it (also one unit). */
+static char *parse_q2_token_utf8(qa_legacy_parse_state *state, size_t max_units) {
+  const uint8_t *s = (const uint8_t *)state->data;
+  size_t n = state->length, idx = state->index, len = 0;
+  char *token = (char *)malloc(n + 4);
+  size_t used = 0;
+  if (token == NULL) return NULL;
+#define AT(i) ((i) < n ? s[i] : 0)
+  for (;;) {
+    int c = AT(idx);
+    while (c <= 32) {
+      if (c == 0) {
+        state->index = idx;
+        token[0] = '\0';
+        return token;
+      }
+      idx++;
+      c = AT(idx);
+    }
+    if (c == 47 && AT(idx + 1) == 47) {
+      while (AT(idx) != 0 && AT(idx) != 10) idx++;
+      continue;
+    }
+    break;
+  }
+  bool quoted = AT(idx) == 34;
+  if (quoted) idx++;
+  for (;;) {
+    int c = AT(idx);
+    if (quoted && (c == 34 || c == 0)) {
+      state->index = idx + 1;
+      token[used] = '\0';
+      return token;
+    }
+    size_t units = 1, bytes = c == 0 ? 1 : utf8_sequence((uint8_t)c, &units);
+    if (bytes > n - idx && idx < n) bytes = n - idx;
+    if (len < max_units) {
+      if (units == 2 && len + 1 == max_units) {
+        memcpy(token + used, "\xef\xbf\xbd", 3);
+        used += 3;
+        len++;
+      } else {
+        memcpy(token + used, s + idx, bytes);
+        used += bytes;
+        len += units;
+      }
+    }
+    idx += bytes;
+    if (!quoted && AT(idx) <= 32) break;
+  }
+#undef AT
+  if (len == max_units) used = 0;
+  token[used] = '\0';
+  state->index = idx;
+  return token;
 }
 
 void qa_q2_connectionless_message_free(qa_q2_connectionless_message *message) {
@@ -104,7 +184,9 @@ bool qa_q2_read_out_of_band(const uint8_t *bytes, size_t length, bool utf8,
       if (rest[i] == 0) { zero = i; break; }
     }
     if (!valid_utf8(rest, zero)) qa_q2_throw_utf8_error();
-    text = dup_span((const char *)rest, zero);
+    /* TextDecoder without ignoreBOM drops one leading byte order mark. */
+    size_t bom = zero >= 3 && rest[0] == 0xef && rest[1] == 0xbb && rest[2] == 0xbf ? 3 : 0;
+    text = dup_span((const char *)rest + bom, zero - bom);
   } else {
     size_t n = 0;
     while (n < rest_len && rest[n] != 0) n++;
@@ -119,7 +201,7 @@ bool qa_q2_read_out_of_band(const uint8_t *bytes, size_t length, bool utf8,
     return false;
   }
   qa_legacy_parse_state cursor = {line, line_len, 0};
-  char *command = qa_parse_q2_token(&cursor, 128);
+  char *command = utf8 ? parse_q2_token_utf8(&cursor, 128) : qa_parse_q2_token(&cursor, 128);
   if (command == NULL) {
     free(line);
     free(text);
@@ -136,7 +218,7 @@ bool qa_q2_read_out_of_band(const uint8_t *bytes, size_t length, bool utf8,
   }
   while (cursor.index < line_len) {
     size_t before = cursor.index;
-    char *value = qa_parse_q2_token(&cursor, 128);
+    char *value = utf8 ? parse_q2_token_utf8(&cursor, 128) : qa_parse_q2_token(&cursor, 128);
     if (value == NULL) break;
     if (cursor.index == before) {
       free(value);
@@ -172,6 +254,7 @@ bool qa_q2_read_out_of_band(const uint8_t *bytes, size_t length, bool utf8,
   out->argument_count = count;
   out->text = text;
   out->body = body;
+  out->utf8 = utf8;
   return true;
 }
 
@@ -483,7 +566,7 @@ bool qa_q2_read_connect(const qa_q2_connectionless_message *message,
       w += len;
     }
     *w = '\0';
-    if (strlen(userinfo) > 8192 || format_has_bad(userinfo, true)) {
+    if (message_length(message, userinfo) > 8192 || format_has_bad(userinfo, true)) {
       free(userinfo);
       qa_q2_throw_error("Invalid KEX userinfo");
     }
@@ -560,6 +643,16 @@ void qa_q2_challenge_free(qa_q2_challenge *challenge) {
   memset(challenge, 0, sizeof *challenge);
 }
 
+typedef struct challenge_parse {
+  char *copy;
+  double *versions;
+} challenge_parse;
+static void challenge_parse_release(void *arg) {
+  challenge_parse *parse = (challenge_parse *)arg;
+  free(parse->copy);
+  free(parse->versions);
+}
+
 bool qa_q2_read_challenge(const qa_q2_connectionless_message *message,
                           qa_q2_challenge *out) {
   memset(out, 0, sizeof *out);
@@ -581,16 +674,20 @@ bool qa_q2_read_challenge(const qa_q2_connectionless_message *message,
     out->version_count = 1;
     return true;
   }
-  char *copy = dup_str(offer);
-  if (copy == NULL) return false;
+  /* decimal() raises on a bad entry: the copy and the list are released on that path. */
+  challenge_parse parse = {dup_str(offer), NULL};
+  if (parse.copy == NULL) return false;
   size_t capacity = 4;
   size_t count = 0;
-  double *versions = (double *)malloc(capacity * sizeof(double));
-  if (versions == NULL) {
-    free(copy);
+  parse.versions = (double *)malloc(capacity * sizeof(double));
+  if (parse.versions == NULL) {
+    free(parse.copy);
     return false;
   }
-  char *part = copy;
+  qa_cleanup node;
+  qa_cleanup_push(&node, challenge_parse_release, &parse);
+  bool ok = true;
+  char *part = parse.copy;
   for (;;) {
     char *comma = strchr(part, ',');
     if (comma != NULL) *comma = '\0';
@@ -598,20 +695,24 @@ bool qa_q2_read_challenge(const qa_q2_connectionless_message *message,
     double v = decimal_arg(single, 1, 0, false, 0);
     if (count == capacity) {
       capacity *= 2;
-      double *grown = (double *)realloc(versions, capacity * sizeof(double));
+      double *grown = (double *)realloc(parse.versions, capacity * sizeof(double));
       if (grown == NULL) {
-        free(versions);
-        free(copy);
-        return false;
+        ok = false;
+        break;
       }
-      versions = grown;
+      parse.versions = grown;
     }
-    versions[count++] = v;
+    parse.versions[count++] = v;
     if (comma == NULL) break;
     part = comma + 1;
   }
-  free(copy);
-  out->versions = versions;
+  qa_cleanup_pop(&node);
+  free(parse.copy);
+  if (!ok) {
+    free(parse.versions);
+    return false;
+  }
+  out->versions = parse.versions;
   out->version_count = count;
   return true;
 }
@@ -623,74 +724,6 @@ static bool ascii_case_prefix(const char *s, const char *prefix) {
     }
   }
   return true;
-}
-
-/* TS privateHost(hostname). */
-static bool private_host(const char *hostname) {
-  size_t n = strlen(hostname);
-  const char *start = hostname;
-  if (n > 0 && start[0] == '[') { start++; n--; }
-  if (n > 0 && start[n - 1] == ']') n--;
-  char host[600];
-  if (n >= sizeof host) n = sizeof host - 1;
-  /* TS hostname.toLowerCase(): Unicode lowering (U+212A becomes the 'k' of "localhost"). */
-  memcpy(host, start, n);
-  host[n] = '\0';
-  {
-    char *lowered = qa_js_to_lower_case(host);
-    if (lowered == NULL) qa_range_error("Out of memory");
-    snprintf(host, sizeof host, "%s", lowered);
-    free(lowered);
-  }
-  size_t len = strlen(host);
-#define ENDS_WITH(s) (len >= sizeof(s) - 1 && strcmp(host + len - (sizeof(s) - 1), s) == 0)
-  if (strcmp(host, "localhost") == 0 || ENDS_WITH(".localhost") || ENDS_WITH(".local") ||
-      ENDS_WITH(".internal"))
-    return true;
-#undef ENDS_WITH
-  /* /^(\d+)\.(\d+)\.\d+\.\d+$/ */
-  {
-    const char *p = host;
-    double part[2] = {0, 0};
-    bool match = true;
-    for (int i = 0; i < 4 && match; i++) {
-      if (!isdigit((unsigned char)*p)) { match = false; break; }
-      double value = 0;
-      while (isdigit((unsigned char)*p)) value = value * 10 + (*p++ - '0');
-      if (i < 2) part[i] = value;
-      if (i < 3) {
-        if (*p != '.') match = false;
-        else p++;
-      }
-    }
-    if (match && *p == '\0') {
-      double a = part[0], b = part[1];
-      return a == 0 || a == 10 || a == 127 || (a == 169 && b == 254) ||
-             (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) ||
-             (a == 100 && b >= 64 && b <= 127);
-    }
-  }
-  if (strchr(host, ':') != NULL) {
-    return strcmp(host, "::") == 0 || strcmp(host, "::1") == 0 ||
-           (host[0] == 'f' && (host[1] == 'c' || host[1] == 'd')) ||
-           (host[0] == 'f' && host[1] == 'e' && host[2] != '\0' &&
-            strchr("89ab", host[2]) != NULL) ||
-           strncmp(host, "::ffff:", 7) == 0;
-  }
-  return false;
-}
-
-/* TS privateAddress(address). */
-static bool private_address(const qa_net_address *address) {
-  if (address->kind == QA_NET_LOOPBACK) return true;
-  if (address->kind == QA_NET_IPV4) {
-    char text[32];
-    snprintf(text, sizeof text, "%u.%u.%u.%u", address->ipv4[0], address->ipv4[1],
-             address->ipv4[2], address->ipv4[3]);
-    return private_host(text);
-  }
-  if (address->kind == QA_NET_IPV6) return private_host(address->host != NULL ? address->host : "");
-  return false;
 }
 
 /* WHATWG IPv4 number parser: false on failure; *value saturates past 2^32. */
@@ -1038,7 +1071,8 @@ char *qa_q2_read_download_server(char **arguments, size_t argument_count,
   char *out = NULL;
   bool rejected = url.credentials || (url.has_fragment && !url.fragment_empty) ||
                   (url.has_query && !url.query_empty) ||
-                  (server != NULL && private_host(url.host) && !private_address(server));
+                  (server != NULL && qa_net_is_private_host(url.host) &&
+                   !qa_net_is_private_network_address(server));
   if (!rejected) {
     bool slash = url.path.length > 0 && url.path.data[url.path.length - 1] == '/';
     out = format_string("%s://%s%s%s%s%s%s%s", url.https ? "https" : "http", url.host,
@@ -1171,13 +1205,14 @@ uint8_t *qa_q2_client_handshake_poll(qa_q2_client_handshake *handshake, double n
       return NULL;
     }
   }
-  uint8_t *packet = qa_q2_write_connect(&request, out_length);
+  /* TS sets the state before writeQ2Connect, so a refused userinfo still leaves the new request
+   * and lastSent behind. */
   qa_q2_connect_request_free(&handshake->request);
   handshake->request = request;
   handshake->kind = QA_Q2_HANDSHAKE_CONNECTING;
   handshake->has_last_sent = true;
   handshake->last_sent = now;
-  return packet;
+  return qa_q2_write_connect(&handshake->request, out_length);
 }
 
 static void reject_with(qa_q2_client_handshake *handshake, const char *reason) {
@@ -1534,6 +1569,16 @@ char *qa_q2_kex_seat_userinfo(const char *text, double seat) {
   return out;
 }
 
+/* keys.has(`${key}_0`) over the odd parts. */
+static bool has_zero_key(char **parts, size_t count, const char *key) {
+  size_t length = strlen(key);
+  for (size_t k = 1; k < count; k += 2)
+    if (strlen(parts[k]) == length + 2 && strncmp(parts[k], key, length) == 0 &&
+        strcmp(parts[k] + length, "_0") == 0)
+      return true;
+  return false;
+}
+
 char *qa_q2_kex_client_userinfo(const char *text) {
   if (text[0] == '\0') return dup_str("");
   char **parts;
@@ -1555,12 +1600,7 @@ char *qa_q2_kex_client_userinfo(const char *text) {
         if (!isdigit((unsigned char)*p)) suffixed = false;
       }
     }
-    bool has_zero = false;
-    char zero_key[512];
-    (void)snprintf(zero_key, sizeof zero_key, "%s_0", key);
-    for (size_t k = 1; k < count; k += 2) {
-      if (strcmp(parts[k], zero_key) == 0) has_zero = true;
-    }
+    bool has_zero = has_zero_key(parts, count, key);
     if (!suffixed && !has_zero) needed += strlen(key) + strlen(value) + 4;
   }
   char *out = (char *)malloc(needed);
@@ -1581,12 +1621,7 @@ char *qa_q2_kex_client_userinfo(const char *text) {
         if (!isdigit((unsigned char)*p)) suffixed = false;
       }
     }
-    bool has_zero = false;
-    char zero_key[512];
-    (void)snprintf(zero_key, sizeof zero_key, "%s_0", key);
-    for (size_t k = 1; k < count; k += 2) {
-      if (strcmp(parts[k], zero_key) == 0) has_zero = true;
-    }
+    bool has_zero = has_zero_key(parts, count, key);
     if (!suffixed && !has_zero) w += sprintf(w, "\\%s_0\\%s", key, value);
   }
   free_parts(parts, count);

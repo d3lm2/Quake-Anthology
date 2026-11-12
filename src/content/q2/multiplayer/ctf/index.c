@@ -309,18 +309,21 @@ void qa_q2_ctf_assign_skin(qa_q2_ctf *ctf, qa_q2_entity *entity) {
   qa_q2_base_player_state *player = ctf->context.hooks.player(ctf->context.hooks.ctx, entity->actor.id);
   qa_q2_ctf_player_state *state = qa_ctf_player(&ctf->context, entity->actor.id);
   if (player == NULL) qa_raise("Error", 0, 0, "Missing shared CTF player");
-  char skin_buf[512];
-  const char *from_info = qa_q2mp_userinfo_get(player->userinfo, "skin", skin_buf, sizeof skin_buf);
+  /* A userinfo value is never longer than the userinfo, so the skin is not cut. */
+  size_t skin_size = strlen(player->userinfo) + 1;
+  char *skin_buf = qa_q2mp_xalloc(malloc(skin_size));
+  const char *from_info = qa_q2mp_userinfo_get(player->userinfo, "skin", skin_buf, skin_size);
   const char *original = from_info == NULL ? player->skin : from_info;
-  if (state->team == 0) {
-    ctf->context.hooks.set_skin(ctf->context.hooks.ctx, entity->actor.id, original);
-    return;
-  }
   const char *slash = strrchr(original, '/');
-  char skin[560];
-  if (slash == NULL) snprintf(skin, sizeof skin, "male/%s", state->team == 1 ? "ctf_r" : "ctf_b");
-  else snprintf(skin, sizeof skin, "%.*s%s", (int)(slash - original) + 1, original, state->team == 1 ? "ctf_r" : "ctf_b");
+  char *skin = state->team == 0 ? qa_q2mp_dup(original)
+               : slash == NULL ? qa_q2mp_format("male/%s", state->team == 1 ? "ctf_r" : "ctf_b")
+               : qa_q2mp_format("%.*s%s", (int)(slash - original) + 1, original, state->team == 1 ? "ctf_r" : "ctf_b");
+  free(skin_buf);
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, free, skin);
   ctf->context.hooks.set_skin(ctf->context.hooks.ctx, entity->actor.id, skin);
+  qa_cleanup_pop(&cleanup);
+  free(skin);
 }
 
 static void spawn_player_impl(qa_q2_ctf *ctf, qa_q2_entity *entity, qa_q2_game_services *g) {
@@ -495,10 +498,9 @@ bool qa_q2_ctf_select_spawn(qa_q2_ctf *ctf, qa_q2_entity *entity, qa_q2_game_ser
       if (n > 2 && (starts[i] == sorted[0] || starts[i] == sorted[1])) continue;
       candidates[candidate_count++] = starts[i];
     }
-    if (candidate_count > 0) {
-      double pick = floor(g->host->random(g->host->ctx) * (double)candidate_count);
-      spot = candidates[(size_t)pick];
-    }
+    /* TS candidates[Math.floor(random() * candidates.length)]: the random number is drawn with no candidate too. */
+    double pick = floor(g->host->random(g->host->ctx) * (double)candidate_count);
+    if (candidate_count > 0) spot = candidates[(size_t)pick];
     free(starts);
     free(sorted);
     free(ranges);
@@ -757,9 +759,8 @@ bool qa_q2_ctf_command(qa_q2_ctf *ctf, qa_q2_entity *entity, qa_q2_game_services
   } else if (strcmp(lowered, "playerlist") == 0) {
     size_t pn = 0;
     const qa_actor_id *players = g->host->players(g->host->ctx, &pn);
-    char *lines = qa_q2mp_xalloc(malloc(pn * 256 + 1));
-    lines[0] = '\0';
-    size_t used = 0;
+    /* lines.join("").slice(0, 1399): each line is as long as its player's name makes it. */
+    char *lines = qa_q2mp_dup("");
     for (size_t i = 0; i < pn; i++) {
       qa_q2_base_player_state *common = ctf->context.hooks.player(ctf->context.hooks.ctx, players[i]);
       qa_q2_ctf_player_state *member = qa_q2_ctf_context_get(&ctf->context, players[i]);
@@ -771,10 +772,12 @@ bool qa_q2_ctf_command(qa_q2_ctf *ctf, qa_q2_entity *entity, qa_q2_game_services
       qa_q2mp_format_number(seconds, sizeof seconds, fmod(trunc(elapsed), 60));
       qa_q2mp_format_number(ping, sizeof ping, common->ping);
       qa_q2mp_format_number(score, sizeof score, common->score);
-      used += (size_t)snprintf(lines + used, pn * 256 + 1 - used, "%s %s:%s %s %s %s%s%s\n", slot, minutes, seconds, ping, score,
-                             common->name, member->team == 0 ? " (spectator)" : "", member->admin ? " (admin)" : "");
+      char *next = qa_q2mp_format("%s%s %s:%s %s %s %s%s%s\n", lines, slot, minutes, seconds, ping, score,
+                                  common->name, member->team == 0 ? " (spectator)" : "", member->admin ? " (admin)" : "");
+      free(lines);
+      lines = next;
     }
-    if (strlen(lines) > 1399) lines[1399] = '\0';
+    qa_q2mp_slice_utf16(lines, 1399);
     qa_ctf_print(g, &entity->actor.id, NULL, "%s", lines);
     free(lines);
   } else if (strcmp(lowered, "drop") == 0) {

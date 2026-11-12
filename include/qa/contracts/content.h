@@ -369,11 +369,20 @@ typedef struct qa_resolved_weapon_behavior_selection {
   const qa_weapon_behavior_definition *definition;
 } qa_resolved_weapon_behavior_selection;
 
+/* C-only: whether and where the optional `mods` / `weaponBehaviors` key sits in
+ * the recipe's JS key order. */
+typedef enum qa_recipe_optional_key {
+  QA_RECIPE_KEY_IF_ANY, /* present (first) only when the list is non-empty */
+  QA_RECIPE_KEY_FIRST,  /* present even when empty, first: readRecipe of a saved key */
+  QA_RECIPE_KEY_LAST    /* present even when empty, appended: { ...recipe, mods, weaponBehaviors } */
+} qa_recipe_optional_key;
+
 typedef struct qa_executable_recipe {
   const qa_resolved_weapon_behavior_selection *weapon_behaviors; /* optional */
   size_t weapon_behavior_count;
   const qa_resolved_gameplay_mod *const *mods; /* optional (mods.h) */
   size_t mod_count;
+  qa_recipe_optional_key mods_key, weapon_behaviors_key;
   int64_t schema_version; /* TS literal 3 */
   qa_recipe_id id;
   qa_recipe_id preset;

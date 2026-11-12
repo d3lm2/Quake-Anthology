@@ -39,7 +39,13 @@ struct qa_qvm_primary_weapons {
   bool has_equipment_removal;
   evaluation_frame *evaluations; /* innermost frame */
   void *eval_hooks[2]; /* owned eval_ctx allocations */
+  bool dispatcher_ready;
 };
+
+static bool same_text(const char *a, const char *b) {
+  if (a == NULL || b == NULL) return a == b;
+  return strcmp(a, b) == 0;
+}
 
 static bool is_integer(double value) { return isfinite(value) && trunc(value) == value; }
 static bool is_safe_integer(double value) {
@@ -63,9 +69,41 @@ static float mem_f32(qa_qvm_primary_weapons *w, int64_t address) {
   return qa_qvm_writable_view_get_float32(&view, 0, true);
 }
 
+/* TS `finally { view.setInt32(0, previous, true) }` when the guarded call
+ * raises: the word is put back, and nothing raises while that raise unwinds. */
+typedef struct word_restore {
+  qa_qvm_primary_weapons *weapons;
+  int64_t address;
+  int32_t value;
+} word_restore;
+static void word_restore_body(void *ctx) {
+  word_restore *restore = ctx;
+  mem_set_i32(restore->weapons, restore->address, restore->value);
+}
+static void word_restore_unwind(void *ctx) {
+  qa_caught_error ignored;
+  (void)qa_try(word_restore_body, ctx, &ignored);
+}
+
+/* TS `finally { memory.writeBytes(scratch, saved) }` on the same path. */
+typedef struct scratch_restore {
+  qa_qvm_memory *memory;
+  int64_t address;
+  const uint8_t *saved;
+  size_t length;
+} scratch_restore;
+static void scratch_restore_body(void *ctx) {
+  scratch_restore *restore = ctx;
+  qa_qvm_memory_write_bytes(restore->memory, restore->address, restore->saved, restore->length);
+}
+static void scratch_restore_unwind(void *ctx) {
+  qa_caught_error ignored;
+  (void)qa_try(scratch_restore_body, ctx, &ignored);
+}
+
 static int32_t call_word(const qa_qvm_module_function_call *call, int64_t byte_offset) {
   if (byte_offset < 0 || byte_offset > (int64_t)call->words_length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   const uint8_t *p = call->words + byte_offset;
   uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
                   ((uint32_t)p[3] << 24);
@@ -88,17 +126,17 @@ static int64_t pointer_of(qa_qvm_primary_weapons *w, qa_actor_id actor) {
   bool has_slot = w->services.slot(w->services.ctx, actor, &slot);
   qa_qvm_game_data_state located = qa_qvm_game_data_checkpoint(&w->game->data);
   if (!live(w, actor) || !has_slot)
-    qa_range_error("Primary QVM weapon actor is no longer current");
+    qa_raise("Error", 0, 0, "Primary QVM weapon actor is no longer current");
   if (located.entity_stride != w->profile.entity_stride ||
       located.client_stride != w->profile.client_stride)
-    qa_range_error("Primary QVM weapon records differ from their qualified layout");
+    qa_raise("Error", 0, 0, "Primary QVM weapon records differ from their qualified layout");
   qa_qvm_writable_view bytes;
   qa_qvm_game_data_entity_bytes(&w->game->data, slot, &bytes);
   int32_t pointer =
       qa_qvm_writable_view_get_int32(&bytes, (int64_t)w->profile.client_pointer, true);
   qa_qvm_game_data_public_player_bytes(&w->game->data, slot, &bytes);
   if (pointer != located.clients_word + slot * located.client_stride)
-    qa_range_error("Primary QVM actor does not own its original player state");
+    qa_raise("Error", 0, 0, "Primary QVM actor does not own its original player state");
   return pointer;
 }
 
@@ -124,10 +162,10 @@ static bool actor_of(qa_qvm_primary_weapons *w, const qa_qvm_weapon_actor *sourc
   qa_qvm_game_data_state located = qa_qvm_game_data_checkpoint(&w->game->data);
   double slot = ((double)pointer - located.clients_word) / located.client_stride;
   if (strcmp(source->record, "client") != 0 || !is_integer(slot) || slot < 0)
-    qa_range_error("Primary weapon dispatcher has no located source client");
+    qa_raise("Error", 0, 0, "Primary weapon dispatcher has no located source client");
   if (!w->services.actor(w->services.ctx, slot, out)) return false;
   if (pointer_of(w, *out) != pointer)
-    qa_range_error("Primary weapon dispatcher has a different source actor");
+    qa_raise("Error", 0, 0, "Primary weapon dispatcher has a different source actor");
   return true;
 }
 
@@ -140,13 +178,13 @@ bool qa_qvm_primary_weapons_get_match(const qa_qvm_primary_weapons *weapons,
 
 double qa_qvm_primary_weapons_score(qa_qvm_primary_weapons *weapons, qa_actor_id actor) {
   if (!weapons->profile.has_match)
-    qa_range_error("Original QVM score storage has no declaration");
+    qa_raise("Error", 0, 0, "Original QVM score storage has no declaration");
   return mem_i32(weapons, pointer_of(weapons, actor) + (int64_t)weapons->profile.match.score);
 }
 void qa_qvm_primary_weapons_set_score(qa_qvm_primary_weapons *weapons, qa_actor_id actor,
                                       double score) {
   if (!weapons->profile.has_match)
-    qa_range_error("Original QVM score storage has no declaration");
+    qa_raise("Error", 0, 0, "Original QVM score storage has no declaration");
   mem_set_i32(weapons, pointer_of(weapons, actor) + (int64_t)weapons->profile.match.score,
               (int32_t)qa_source_score(score));
 }
@@ -170,18 +208,23 @@ typedef struct drop_ctx {
   size_t saved_count;
 } drop_ctx;
 
+/* TS new DataView(call.memory.buffer, byteOffset + address, 4): the
+ * constructor's own refusals. */
+static void drop_view_bounds(drop_ctx *d, int64_t address) {
+  if (address < 0) qa_range_error("byteOffset cannot be negative");
+  if (address > (int64_t)d->call->memory_length)
+    qa_range_error("byteOffset exceeds source ArrayBuffer byteLength");
+  if (address > (int64_t)d->call->memory_length - 4) qa_range_error("Length out of range of buffer");
+}
 static int32_t drop_view_get(drop_ctx *d, int64_t address) {
-  /* TS new DataView(call.memory.buffer, byteOffset + address, 4). */
-  if (address < 0 || address > (int64_t)d->call->memory_length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+  drop_view_bounds(d, address);
   const uint8_t *p = d->call->memory + address;
   uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
                   ((uint32_t)p[3] << 24);
   return (int32_t)bits;
 }
 static void drop_view_set(drop_ctx *d, int64_t address, int32_t value) {
-  if (address < 0 || address > (int64_t)d->call->memory_length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+  drop_view_bounds(d, address);
   uint8_t *p = (uint8_t *)d->call->memory + address;
   uint32_t bits = (uint32_t)value;
   p[0] = (uint8_t)bits;
@@ -198,7 +241,16 @@ static void drop_restore(drop_ctx *d) {
     for (size_t i = 0; i < count; i++) drop_view_set(d, previous[i].address, previous[i].value);
   free(previous);
 }
-static void drop_unwind(void *ctx) { drop_restore(ctx); }
+static void drop_restore_body(void *ctx) { drop_restore(ctx); }
+/* TS catch { restore(); throw }: nothing raises while that raise unwinds. */
+static void drop_unwind(void *ctx) {
+  drop_ctx *d = ctx;
+  qa_caught_error ignored;
+  (void)qa_try(drop_restore_body, d, &ignored);
+  free(d->saved); /* only left when the restore itself was refused */
+  d->saved = NULL;
+  d->saved_count = 0;
+}
 static const char *drop_region_run(void *ctx, void *control_ctx) {
   (void)control_ctx;
   drop_ctx *d = ctx;
@@ -211,33 +263,45 @@ static const char *drop_region_run(void *ctx, void *control_ctx) {
       if (w->profile.stage.selection.values[i].value == projection.weapon) known = true;
     if ((projection.weapon != 0 && !known) || !is_integer(projection.ammo) ||
         projection.ammo < -2147483648.0 || projection.ammo > 2147483647.0)
-      qa_range_error("Selected death drop has no original weapon or int32 ammo counter");
+      qa_raise("Error", 0, 0, "Selected death drop has no original weapon or int32 ammo counter");
     if (profile->ammo_is_inventory && !projection.has_ammo_words)
-      qa_range_error("Original drop requires its declared inventory projection");
+      qa_raise("Error", 0, 0, "Original drop requires its declared inventory projection");
     size_t extra = profile->ammo_is_inventory ? projection.ammo_word_count : 1;
     size_t count = 1 + extra;
     drop_saved *writes = malloc(count * sizeof *writes);
     if (writes == NULL) qa_range_error("QVM memory allocation failed");
     writes[0].address = (int64_t)d->entity + (int64_t)profile->weapon;
-    writes[0].value = (int32_t)projection.weapon;
+    writes[0].value = qa_int32(projection.weapon);
     if (profile->ammo_is_inventory) {
       for (size_t i = 0; i < extra; i++) {
         writes[1 + i].address = (int64_t)projection.ammo_words[i].address;
         writes[1 + i].value = qa_int32(projection.ammo_words[i].value); /* setInt32: ToInt32 */
       }
     } else {
-      writes[1].address = pointer_of(w, d->actor) + (int64_t)profile->ammo +
-                          (int64_t)projection.weapon * 4;
+      qa_cleanup pending;
+      qa_cleanup_push(&pending, free, writes);
+      int64_t client = pointer_of(w, d->actor);
+      qa_cleanup_pop(&pending);
+      writes[1].address = client + (int64_t)profile->ammo + (int64_t)projection.weapon * 4;
       writes[1].value = (int32_t)projection.ammo;
     }
-    d->saved = malloc(count * sizeof *d->saved);
-    if (d->saved == NULL) qa_range_error("QVM memory allocation failed");
-    d->saved_count = count;
+    /* TS saved = writes.map(...): the list is replaced only once every word
+     * was read, so a refused address leaves nothing half-saved to restore. */
+    qa_cleanup writes_cleanup, saved_cleanup;
+    qa_cleanup_push(&writes_cleanup, free, writes);
+    drop_saved *saved = malloc(count * sizeof *saved);
+    if (saved == NULL) qa_range_error("QVM memory allocation failed");
+    qa_cleanup_push(&saved_cleanup, free, saved);
     for (size_t i = 0; i < count; i++) {
-      d->saved[i].address = writes[i].address;
-      d->saved[i].value = drop_view_get(d, writes[i].address);
+      saved[i].address = writes[i].address;
+      saved[i].value = drop_view_get(d, writes[i].address);
     }
+    qa_cleanup_pop(&saved_cleanup);
+    free(d->saved);
+    d->saved = saved;
+    d->saved_count = count;
     for (size_t i = 0; i < count; i++) drop_view_set(d, writes[i].address, writes[i].value);
+    qa_cleanup_pop(&writes_cleanup);
     free(writes);
   }
   return "execute";
@@ -302,7 +366,10 @@ static void give_region_completed(void *ctx, void *control_ctx) {
   if (control->local_word(control->ctx, named->item) == 0 && live(g->weapons, g->actor)) {
     char *name = qa_qvm_memory_read_string(g->guest,
                                            (int64_t)control->local_word(control->ctx, named->name));
+    qa_cleanup name_cleanup;
+    qa_cleanup_push(&name_cleanup, free, name);
     bool given = g->weapons->services.give_item(g->weapons->services.ctx, g->actor, name);
+    qa_cleanup_pop(&name_cleanup);
     free(name);
     if (given) {
       qa_qvm_cancellation_scope scope = {g->cancellation.token};
@@ -362,16 +429,17 @@ static int32_t evaluate_call(void *ctx, qa_qvm_module_function_call *call) {
   bool has_slot = w->services.slot(w->services.ctx, frame->actor, &slot);
   if (!has_slot || !live(w, frame->actor) ||
       qa_qvm_game_data_number_from_pointer(&w->game->data, call_word(call, 0)) != slot)
-    qa_range_error("Primary QVM source effect lost its original actor");
+    qa_raise("Error", 0, 0, "Primary QVM source effect lost its original actor");
   if (e->kind == EFFECT_TELEPORT)
     return call->evaluate_region(call->call_ctx,
                                  frame->kind == EFFECT_OBJECTIVES ? &w->profile.teleport.objectives
                                                                   : &w->profile.teleport.region,
                                  NULL, 0);
-  e->frame = frame;
-  e->cancellation = call->cancellation_scope(call->call_ctx);
+  /* A context of this call: a nested evaluation must not replace the frame
+   * and scope the outer stop region reports to. */
+  eval_ctx stop = {w, e->kind, frame, call->cancellation_scope(call->call_ctx)};
   qa_qvm_module_region_binding binding = {(int64_t)w->profile.damage_factor.stop.entry,
-                                    (int64_t)w->profile.damage_factor.stop.join, e,
+                                    (int64_t)w->profile.damage_factor.stop.join, &stop,
                                     damage_stop_run, NULL};
   call->regions(call->call_ctx, &binding, 1);
   return call->proceed(call->call_ctx);
@@ -391,7 +459,7 @@ static bool effect(qa_qvm_primary_weapons *w, qa_actor_id actor, effect_kind kin
                    double *out) {
   double slot = 0;
   if (!w->services.slot(w->services.ctx, actor, &slot) || !live(w, actor))
-    qa_range_error("Primary QVM source effect requires its original actor");
+    qa_raise("Error", 0, 0, "Primary QVM source effect requires its original actor");
   (void)pointer_of(w, actor);
   evaluation_frame frame_storage = {w->evaluations, actor, kind, false, false, 0};
   evaluation_frame *frame = &frame_storage;
@@ -415,7 +483,7 @@ bool qa_qvm_primary_weapons_settled(qa_qvm_primary_weapons *weapons, qa_actor_id
   return qa_qvm_weapon_dispatcher_runtime_settled(&weapons->dispatcher, actor);
 }
 qa_item_id qa_qvm_primary_weapons_active(qa_qvm_primary_weapons *weapons, qa_actor_id actor) {
-  if (!live(weapons, actor)) qa_range_error("Primary QVM weapon actor is no longer current");
+  if (!live(weapons, actor)) qa_raise("Error", 0, 0, "Primary QVM weapon actor is no longer current");
   return qa_qvm_weapon_dispatcher_runtime_active(&weapons->dispatcher, actor);
 }
 void qa_qvm_primary_weapons_drop_objectives(qa_qvm_primary_weapons *weapons, qa_actor_id actor) {
@@ -431,7 +499,7 @@ void qa_qvm_primary_weapons_spawn_point(qa_qvm_primary_weapons *weapons, qa_acto
                                         qa_vec3 *out_origin, qa_vec3 *out_angles) {
   double slot = 0;
   if (!weapons->services.slot(weapons->services.ctx, actor, &slot) || !live(weapons, actor))
-    qa_range_error("Original QVM spawn selection requires its live player");
+    qa_raise("Error", 0, 0, "Original QVM spawn selection requires its live player");
   (void)pointer_of(weapons, actor);
   qa_qvm_memory *memory = weapons->game->module.memory;
   int64_t scratch = (int64_t)weapons->scratch;
@@ -447,11 +515,15 @@ void qa_qvm_primary_weapons_spawn_point(qa_qvm_primary_weapons *weapons, qa_acto
   qa_qvm_writable_view_set_float32(&view, 4, state.origin.y, true);
   qa_qvm_writable_view_set_float32(&view, 8, state.origin.z, true);
   int32_t words[3] = {(int32_t)scratch, (int32_t)(scratch + 12), (int32_t)(scratch + 24)};
+  scratch_restore restore = {memory, scratch, saved, 36};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, scratch_restore_unwind, &restore);
   (void)qa_qvm_module_call(&weapons->game->module, words, 3,
                            (int64_t)weapons->profile.teleport.spawn);
+  qa_cleanup_pop(&guard);
   if (!live(weapons, actor)) {
     qa_qvm_memory_write_bytes(memory, scratch, saved, 36);
-    qa_range_error("Original QVM spawn selection retired its player");
+    qa_raise("Error", 0, 0, "Original QVM spawn selection retired its player");
   }
   qa_vec3 origin = {qa_qvm_writable_view_get_float32(&view, 12, true),
                     qa_qvm_writable_view_get_float32(&view, 16, true),
@@ -469,7 +541,7 @@ void qa_qvm_primary_weapons_teleport_state(qa_qvm_primary_weapons *weapons, qa_a
                                            double hold_milliseconds) {
   double slot = 0;
   if (!weapons->services.slot(weapons->services.ctx, actor, &slot) || !live(weapons, actor))
-    qa_range_error("Original QVM teleport requires its live player");
+    qa_raise("Error", 0, 0, "Original QVM teleport requires its live player");
   (void)pointer_of(weapons, actor);
   qa_q3_player_state state;
   double stats[16], persistent[16], powerups[16], ammo[16];
@@ -494,8 +566,12 @@ void qa_qvm_primary_weapons_teleport_state(qa_qvm_primary_weapons *weapons, qa_a
   qa_qvm_game_data_state located = qa_qvm_game_data_checkpoint(&weapons->game->data);
   int32_t words[2] = {(int32_t)(located.entities_word + slot * located.entity_stride),
                       (int32_t)scratch};
+  scratch_restore restore = {memory, scratch, saved, 12};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, scratch_restore_unwind, &restore);
   (void)qa_qvm_module_call(&weapons->game->module, words, 2,
                            (int64_t)weapons->profile.teleport.view);
+  qa_cleanup_pop(&guard);
   qa_qvm_memory_write_bytes(memory, scratch, saved, 12);
 }
 
@@ -503,10 +579,14 @@ double qa_qvm_primary_weapons_damage_factor(qa_qvm_primary_weapons *weapons, qa_
   int64_t address = (int64_t)weapons->profile.damage_factor.result;
   int32_t previous = mem_i32(weapons, address);
   double result = 0;
+  word_restore restore = {weapons, address, previous};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, word_restore_unwind, &restore);
   bool has = effect(weapons, actor, EFFECT_DAMAGE_FACTOR, &result);
+  qa_cleanup_pop(&guard);
   mem_set_i32(weapons, address, previous);
   if (!has || !isfinite(result) || result < 0)
-    qa_range_error("Original QVM damage factor did not produce a finite result");
+    qa_raise("Error", 0, 0, "Original QVM damage factor did not produce a finite result");
   return result;
 }
 
@@ -515,15 +595,32 @@ qa_item_id qa_qvm_primary_weapons_equipment_context(qa_qvm_primary_weapons *weap
   qa_item_id item = qa_source_equipment_item(weapons->profile.equipment_contexts,
                                              weapons->profile.equipment_context_count, provider);
   if (item != NULL && strcmp(weapons->profile.stage.selection.field.record, "client") != 0)
-    qa_range_error("Equipment %s requires an original client selection field", provider);
+    qa_raise("Error", 0, 0, "Equipment %s requires an original client selection field", provider);
   if (item != NULL) {
     bool found = false;
     for (size_t i = 0; i < weapons->profile.stage.selection.value_count; i++)
       if (strcmp(weapons->profile.stage.selection.values[i].item, item) == 0) found = true;
     if (!found)
-      qa_range_error("Equipment %s names an unavailable original cadence item %s", provider, item);
+      qa_raise("Error", 0, 0, "Equipment %s names an unavailable original cadence item %s", provider, item);
   }
   return item;
+}
+
+typedef struct selection_restore {
+  qa_qvm_primary_weapons *weapons;
+  qa_actor_id actor;
+  int64_t pointer, address;
+  int32_t previous;
+} selection_restore;
+static void selection_restore_body(void *ctx) {
+  selection_restore *restore = ctx;
+  if (live(restore->weapons, restore->actor) &&
+      pointer_of(restore->weapons, restore->actor) == restore->pointer)
+    mem_set_i32(restore->weapons, restore->address, restore->previous);
+}
+static void selection_restore_unwind(void *ctx) {
+  qa_caught_error ignored;
+  (void)qa_try(selection_restore_body, ctx, &ignored);
 }
 
 double qa_qvm_primary_weapons_equipment_delay(qa_qvm_primary_weapons *weapons, qa_actor_id actor,
@@ -535,29 +632,37 @@ double qa_qvm_primary_weapons_equipment_delay(qa_qvm_primary_weapons *weapons, q
   for (size_t i = 0; i < selection->value_count; i++)
     if (strcmp(selection->values[i].item, item) == 0) value = &selection->values[i];
   if (value == NULL || strcmp(selection->field.record, "client") != 0)
-    qa_range_error("Equipment cadence has no original client selection field");
+    qa_raise("Error", 0, 0, "Equipment cadence has no original client selection field");
   int64_t pointer = pointer_of(weapons, actor);
   int64_t address = pointer + (int64_t)selection->field.offset;
   int32_t previous = mem_i32(weapons, address);
+  /* TS try { select; delay } finally { put the selection back for the same player }. */
+  selection_restore restore = {weapons, actor, pointer, address, previous};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, selection_restore_unwind, &restore);
   mem_set_i32(weapons, address, qa_int32(value->value)); /* setInt32: ToInt32 */
   double result = qa_qvm_primary_weapons_weapon_delay(weapons, actor, milliseconds);
-  if (live(weapons, actor) && pointer_of(weapons, actor) == pointer)
-    mem_set_i32(weapons, address, previous);
+  qa_cleanup_pop(&guard);
+  selection_restore_body(&restore);
   return result;
 }
 
 double qa_qvm_primary_weapons_weapon_delay(qa_qvm_primary_weapons *weapons, qa_actor_id actor,
                                            double milliseconds) {
   if (!is_integer(milliseconds) || milliseconds < 0 || milliseconds > 0x7fffffff)
-    qa_range_error("Original QVM weapon delay requires its int32 input");
+    qa_raise("Error", 0, 0, "Original QVM weapon delay requires its int32 input");
   int32_t movement = mem_i32(weapons, (int64_t)weapons->profile.delay_player.movement_global);
-  if (movement <= 0) qa_range_error("Original QVM delay has no established Pmove context");
+  if (movement <= 0) qa_raise("Error", 0, 0, "Original QVM delay has no established Pmove context");
   int64_t address = movement + (int64_t)weapons->profile.delay_player.player_offset;
   int32_t previous = mem_i32(weapons, address);
+  word_restore restore = {weapons, address, previous};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, word_restore_unwind, &restore);
   mem_set_i32(weapons, address, (int32_t)pointer_of(weapons, actor));
   int64_t input = (int64_t)milliseconds;
   int32_t result = qa_qvm_weapon_dispatcher_runtime_evaluate(&weapons->dispatcher, actor,
                                                              &weapons->profile.delay, &input, 1);
+  qa_cleanup_pop(&guard);
   mem_set_i32(weapons, address, previous);
   return result;
 }
@@ -565,14 +670,18 @@ double qa_qvm_primary_weapons_weapon_delay(qa_qvm_primary_weapons *weapons, qa_a
 void qa_qvm_primary_weapons_attack_animation(qa_qvm_primary_weapons *weapons, qa_actor_id actor,
                                              bool melee) {
   int32_t movement = mem_i32(weapons, (int64_t)weapons->profile.delay_player.movement_global);
-  if (movement <= 0) qa_range_error("Original QVM animation has no established Pmove context");
+  if (movement <= 0) qa_raise("Error", 0, 0, "Original QVM animation has no established Pmove context");
   int64_t address = movement + (int64_t)weapons->profile.delay_player.player_offset;
   int32_t previous = mem_i32(weapons, address);
+  word_restore restore = {weapons, address, previous};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, word_restore_unwind, &restore);
   mem_set_i32(weapons, address, (int32_t)pointer_of(weapons, actor));
-  int32_t argument = (int32_t)(melee ? weapons->profile.torso_animation.melee
-                                     : weapons->profile.torso_animation.attack);
+  int32_t argument = qa_int32(melee ? weapons->profile.torso_animation.melee
+                                    : weapons->profile.torso_animation.attack);
   (void)qa_qvm_module_call(&weapons->game->module, &argument, 1,
                            (int64_t)weapons->profile.torso_animation.entry);
+  qa_cleanup_pop(&guard);
   mem_set_i32(weapons, address, previous);
 }
 
@@ -581,7 +690,7 @@ double qa_qvm_primary_weapons_water_level(qa_qvm_primary_weapons *weapons, qa_ac
   int32_t right;
   double slot = 0;
   if (!weapons->services.slot(weapons->services.ctx, actor, &slot) || !live(weapons, actor))
-    qa_range_error("Original QVM water state lost its actor");
+    qa_raise("Error", 0, 0, "Original QVM water state lost its actor");
   int32_t movement = mem_i32(weapons, (int64_t)weapons->profile.delay_player.movement_global);
   if (movement > 0 &&
       (left = mem_i32(weapons, movement + (int64_t)weapons->profile.delay_player.player_offset), right = (int32_t)pointer_of(weapons, actor), left ==
@@ -598,7 +707,7 @@ double qa_qvm_primary_weapons_max_health(qa_qvm_primary_weapons *weapons, qa_act
 void qa_qvm_primary_weapons_set_max_health(qa_qvm_primary_weapons *weapons, qa_actor_id actor,
                                            double health) {
   if (!is_integer(health) || health <= 0 || health > 0x7fffffff)
-    qa_range_error("Original QVM maximum health must be a positive int32");
+    qa_raise("Error", 0, 0, "Original QVM maximum health must be a positive int32");
   int64_t pointer = pointer_of(weapons, actor);
   mem_set_i32(weapons, pointer + (int64_t)weapons->profile.max_health, (int32_t)health);
   mem_set_i32(weapons, pointer + (int64_t)weapons->profile.persistent_max_health, (int32_t)health);
@@ -635,7 +744,7 @@ static bool ops_actor(void *ctx, const qa_qvm_weapon_actor *source, qa_qvm_modul
 }
 static int64_t ops_pointer(void *ctx, qa_actor_id actor, const char *record) {
   if (strcmp(record, "client") != 0)
-    qa_range_error("Primary QVM weapon field is not a located client record");
+    qa_raise("Error", 0, 0, "Primary QVM weapon field is not a located client record");
   return pointer_of(ctx, actor);
 }
 static bool ops_live(void *ctx, qa_actor_id actor) { return live(ctx, actor); }
@@ -693,19 +802,6 @@ static bool equipment_motion(void *ctx, qa_actor_id actor, qa_qvm_equipment_moti
   return w->services.equipment_movement(w->services.ctx, actor, out);
 }
 
-static qa_qvm_instruction *region_instructions(const qa_qvm_image *image) {
-  qa_qvm_instruction *list =
-      malloc((image->instruction_count == 0 ? 1 : image->instruction_count) * sizeof *list);
-  if (list == NULL) qa_range_error("QVM memory allocation failed");
-  for (size_t i = 0; i < image->instruction_count; i++) {
-    list[i].opcode = (int32_t)image->instructions[i].opcode;
-    list[i].operand_width = image->instructions[i].operand_width;
-    list[i].operand = image->instructions[i].operand;
-    list[i].byte_offset = image->instructions[i].byte_offset;
-  }
-  return list;
-}
-
 static size_t bind(qa_qvm_primary_weapons *w, qa_module_identity identity, double entry,
                    qa_qvm_function_hook_fn hook, void *hook_ctx) {
   qa_guest_callback_reference reference;
@@ -718,28 +814,30 @@ static size_t bind(qa_qvm_primary_weapons *w, qa_module_identity identity, doubl
   return id;
 }
 
+static void destroy_on_raise(void *arg) { qa_qvm_primary_weapons_destroy(arg); }
+
 qa_qvm_primary_weapons *qa_qvm_primary_weapons_create(qa_qvm_game *game,
                                                       const qa_resolved_qvm_artifact *artifact,
                                                       qa_qvm_primary_weapon_profile profile,
                                                       qa_qvm_primary_weapon_services services) {
   const qa_module_identity *identity = &game->module.profile.module;
-  if (strcmp(identity->id, profile.module.id) != 0 ||
-      strcmp(identity->digest, profile.module.digest) != 0 ||
-      strcmp(identity->revision, profile.module.revision) != 0 ||
-      strcmp(identity->artifact_path, profile.module.artifact_path) != 0 ||
-      strcmp(artifact->module.digest, identity->digest) != 0 ||
-      strcmp(qa_qvm_module_get_abi_profile(&game->module), profile.abi_profile) != 0)
-    qa_range_error("Primary QVM weapon profile belongs to another executable");
+  if (!same_text(identity->id, profile.module.id) ||
+      !same_text(identity->digest, profile.module.digest) ||
+      !same_text(identity->revision, profile.module.revision) ||
+      !same_text(identity->artifact_path, profile.module.artifact_path) ||
+      !same_text(artifact->module.digest, identity->digest) ||
+      !same_text(qa_qvm_module_get_abi_profile(&game->module), profile.abi_profile))
+    qa_raise("Error", 0, 0, "Primary QVM weapon profile belongs to another executable");
   const qa_qvm_image *image = &artifact->image;
   double torso_entry = profile.torso_animation.entry;
   if (!is_integer(torso_entry) || torso_entry < 0 || torso_entry >= (double)image->instruction_count ||
       image->instructions[(size_t)torso_entry].opcode != QA_QVM_OP_ENTER)
-    qa_range_error("Primary QVM torso animation entry is not an original function");
+    qa_raise("Error", 0, 0, "Primary QVM torso animation entry is not an original function");
   if (profile.has_match && (!is_safe_integer(profile.match.score) || profile.match.score < 0 ||
                             (int64_t)profile.match.score % 4 != 0 ||
                             profile.match.score + 4 > profile.client_stride))
-    qa_range_error("Original QVM score exceeds its declared client record");
-  qa_qvm_instruction *list = region_instructions(image);
+    qa_raise("Error", 0, 0, "Original QVM score exceeds its declared client record");
+  const qa_qvm_instruction *list = image->instructions; /* read in place: a refusal raises */
   qa_qvm_validate_weapon_dispatcher(&profile.stage, list, image->instruction_count);
   (void)qa_qvm_qualify_region(list, image->instruction_count, (int64_t)profile.damage_factor.entry,
                               (int64_t)profile.damage_factor.stop.entry,
@@ -757,31 +855,30 @@ qa_qvm_primary_weapons *qa_qvm_primary_weapons_create(qa_qvm_game *game,
     double entry = i == 0 ? profile.teleport.spawn : profile.teleport.view;
     if (!is_integer(entry) || entry < 0 || entry >= (double)image->instruction_count ||
         image->instructions[(size_t)entry].opcode != QA_QVM_OP_ENTER)
-      qa_range_error("Original QVM spawn selector is not a function");
+      qa_raise("Error", 0, 0, "Original QVM spawn selector is not a function");
   }
   qa_qvm_primary_weapons *w = calloc(1, sizeof *w);
-  if (w == NULL) {
-    free(list);
-    return NULL;
-  }
+  if (w == NULL) return NULL;
+  /* TS: a refused profile goes to the GC, and a failed hook closes what was bound. */
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, destroy_on_raise, w);
   w->game = game;
   w->profile = profile;
   w->services = services;
   w->scratch = ceil((double)(image->data_length + image->literal_length + image->bss_length) / 16) * 16;
   if (w->scratch + 36 > (double)image->allocated_data_length - 65536)
-    qa_range_error("Source player services require scratch outside source data and stack");
+    qa_raise("Error", 0, 0, "Source player services require scratch outside source data and stack");
   (void)qa_qvm_qualify_region(list, image->instruction_count, (int64_t)profile.give.entry,
                               (int64_t)profile.give.named.entry, (int64_t)profile.give.named.join);
   (void)qa_qvm_qualify_region(list, image->instruction_count, (int64_t)profile.drop.entry,
                               (int64_t)profile.drop.region.entry, (int64_t)profile.drop.region.join);
-  free(list);
   for (size_t i = 0; i < 2; i++) {
     double pc = i == 0 ? profile.give.weapons : profile.give.ammo;
     if (pc <= profile.give.entry || !is_integer(pc) || pc < 0 ||
         pc >= (double)image->instruction_count ||
         image->instructions[(size_t)pc].opcode < QA_QVM_OP_EQ ||
         image->instructions[(size_t)pc].opcode > QA_QVM_OP_GEF)
-      qa_range_error("Primary QVM give grant lacks its original completion decision");
+      qa_raise("Error", 0, 0, "Primary QVM give grant lacks its original completion decision");
   }
   qa_qvm_weapon_dispatcher_ops ops;
   memset(&ops, 0, sizeof ops);
@@ -797,14 +894,15 @@ qa_qvm_primary_weapons *qa_qvm_primary_weapons_create(qa_qvm_game *game,
   ops.completed = ops_completed;
   ops.prepare = ops_prepare;
   qa_qvm_weapon_dispatcher_runtime_init(&w->dispatcher, &w->profile.stage, &ops);
+  w->dispatcher_ready = true;
   if (services.has_equipment_movement) {
     qa_qvm_equipment_movement_services equipment_services = {w, equipment_actor, equipment_live,
                                                              equipment_motion};
     w->equipment = qa_qvm_equipment_movement_create(game, artifact, profile.equipment_movement,
                                                     equipment_services);
     if (w->equipment == NULL) {
-      qa_qvm_weapon_dispatcher_runtime_destroy(&w->dispatcher);
-      free(w);
+      qa_cleanup_pop(&refused);
+      qa_qvm_primary_weapons_destroy(w);
       return NULL;
     }
     w->has_equipment_removal = true;
@@ -814,6 +912,8 @@ qa_qvm_primary_weapons *qa_qvm_primary_weapons_create(qa_qvm_game *game,
   /* Per-kind hook contexts outlive the bindings (freed on destroy). */
   eval_ctx *damage = calloc(1, sizeof *damage);
   eval_ctx *teleport = calloc(1, sizeof *teleport);
+  w->eval_hooks[0] = damage;
+  w->eval_hooks[1] = teleport;
   if (damage == NULL || teleport == NULL) qa_range_error("QVM memory allocation failed");
   damage->weapons = w;
   damage->kind = EFFECT_DAMAGE_FACTOR;
@@ -823,6 +923,7 @@ qa_qvm_primary_weapons *qa_qvm_primary_weapons_create(qa_qvm_game *game,
   w->eval_hooks[1] = teleport;
   (void)bind(w, *identity, profile.damage_factor.entry, evaluate_call, damage);
   (void)bind(w, *identity, profile.teleport.entry, evaluate_call, teleport);
+  qa_cleanup_pop(&refused);
   return w;
 }
 
@@ -836,13 +937,14 @@ void qa_qvm_primary_weapons_close(qa_qvm_primary_weapons *weapons) {
     qa_qvm_equipment_movement_close(weapons->equipment);
     weapons->has_equipment_removal = false;
   }
-  qa_qvm_weapon_dispatcher_runtime_close(&weapons->dispatcher);
+  if (weapons->dispatcher_ready) qa_qvm_weapon_dispatcher_runtime_close(&weapons->dispatcher);
 }
 
 void qa_qvm_primary_weapons_destroy(qa_qvm_primary_weapons *weapons) {
   if (weapons == NULL) return;
   qa_qvm_primary_weapons_close(weapons);
-  qa_qvm_weapon_dispatcher_runtime_destroy(&weapons->dispatcher);
+  if (weapons->dispatcher_ready) qa_qvm_weapon_dispatcher_runtime_destroy(&weapons->dispatcher);
+  weapons->dispatcher_ready = false;
   qa_qvm_equipment_movement_destroy(weapons->equipment);
   free(weapons->eval_hooks[0]);
   free(weapons->eval_hooks[1]);

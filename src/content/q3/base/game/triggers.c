@@ -25,12 +25,12 @@ static double game_time(RT *r) {
 }
 static void owned(RT *r, qa_q3_game_entity *e) {
   if (qa_q3_entity_pool_get(r->host.entities, e->slot) != e)
-    qa_range_error("Trigger entity does not belong to its entity pool or was replaced");
+    qa_raise("Error", 0, 0, "Trigger entity does not belong to its entity pool or was replaced");
 }
 static qa_q3_game_combat_context *combat_ctx(RT *r) {
   qa_q3_game_combat_context *c = r->host.combat(r->host.ctx);
-  if (c->entities != r->host.entities) qa_range_error("Trigger combat context does not match its entity pool and world");
-  if (c->time != game_time(r)) qa_range_error("Trigger combat context contains stale game time");
+  if (c->entities != r->host.entities) qa_raise("Error", 0, 0, "Trigger combat context does not match its entity pool and world");
+  if (c->time != game_time(r)) qa_raise("Error", 0, 0, "Trigger combat context contains stale game time");
   return c;
 }
 static void dispatch(RT *r, qa_q3_game_entity *e, const qa_q3_use_participant *activator) {
@@ -79,7 +79,7 @@ static void multi_trigger(RT *r, qa_q3_game_entity *e, const qa_q3_use_participa
   if (activator) (void)qa_q3_require_use_participant(activator);
   e->has_activation = activator != NULL; if (activator) e->activation = *activator;
   if (e->nextthink != 0) return;
-  if (!activator) qa_range_error("trigger_multiple requires an activator");
+  if (!activator) qa_raise("Error", 0, 0, "trigger_multiple requires an activator");
   qa_q3_game_entity *act = qa_q3_use_client(activator, r->host.has_participants ? &r->host.participants : NULL);
   qa_q3_game_client *client = act ? act->client : NULL;
   if (client) {

@@ -60,7 +60,8 @@ static int64_t vis_pvs_byte(void *ctx, int64_t cluster, int64_t index) {
 }
 static qa_q3_visibility_entity vis_entity(void *ctx, int64_t number) {
   qa_app_q3_snapshot_selection *s = ctx;
-  for (size_t i = 0; i < s->record_count; i++) {
+  /* entities is a Map keyed by number: a repeated number keeps the last row (Map.set overwrites) */
+  for (size_t i = s->record_count; i-- > 0;) {
     if (s->record_numbers[i] == number) {
       qa_q3_visibility_entity out = {&s->records[i], s->row_linked[i], s->row_flags[i], s->row_single[i]};
       return out;
@@ -80,12 +81,21 @@ static qa_q3_visibility_entity vis_entity(void *ctx, int64_t number) {
 }
 static bool vis_link(void *ctx, int64_t number, qa_q3_visibility_link *out) {
   qa_app_q3_snapshot_selection *s = ctx;
-  for (size_t i = 0; i < s->link_count; i++)
+  for (size_t i = s->link_count; i-- > 0;) /* links.set overwrites: the last link of a number */
     if (s->links[i].number == number) { *out = s->links[i].link; return true; }
   return false;
 }
 qa_app_q3_snapshot_selection *qa_app_select_application_q3_snapshot(
     const qa_q3_player_state_record *player,
+    const qa_app_q3_snapshot_source_entity *entities, size_t entity_row_count,
+    qa_shared_scene_queries *queries,
+    bool (*bounds)(void *ctx, double number, qa_bounds *out), void *bounds_ctx,
+    double leaf_count, void (*print)(void *ctx, const char *text), void *print_ctx) {
+  return qa_app_select_application_q3_snapshot_from(player, (double)player->viewheight, entities, entity_row_count, queries,
+                                                    bounds, bounds_ctx, leaf_count, print, print_ctx);
+}
+qa_app_q3_snapshot_selection *qa_app_select_application_q3_snapshot_from(
+    const qa_q3_player_state_record *player, double viewheight,
     const qa_app_q3_snapshot_source_entity *entities, size_t entity_row_count,
     qa_shared_scene_queries *queries,
     bool (*bounds)(void *ctx, double number, qa_bounds *out), void *bounds_ctx,
@@ -98,9 +108,11 @@ qa_app_q3_snapshot_selection *qa_app_select_application_q3_snapshot(
   s->links = xmalloc(entity_row_count * sizeof *s->links);
   /* Row metadata for vis_entity, kept in a parallel scratch via the
    * record's own fields plus these arrays. */
-  bool *row_linked = xmalloc(entity_row_count * sizeof *row_linked);
-  int64_t *row_flags = xmalloc(entity_row_count * sizeof *row_flags);
-  int64_t *row_single = xmalloc(entity_row_count * sizeof *row_single);
+  bool *row_linked = s->row_linked = xmalloc(entity_row_count * sizeof *row_linked);
+  int64_t *row_flags = s->row_flags = xmalloc(entity_row_count * sizeof *row_flags);
+  int64_t *row_single = s->row_single = xmalloc(entity_row_count * sizeof *row_single);
+  qa_cleanup selection_guard; /* a raise below (lost body bounds, a query) releases the partial selection */
+  qa_cleanup_push(&selection_guard, (void (*)(void *))qa_app_q3_snapshot_selection_destroy, s);
   int64_t entity_count = 0;
   for (size_t r = 0; r < entity_row_count; r++) {
     const qa_app_q3_snapshot_source_entity *row = &entities[r];
@@ -116,7 +128,7 @@ qa_app_q3_snapshot_selection *qa_app_select_application_q3_snapshot(
     if (!row->linked) continue;
     qa_bounds box;
     if (!bounds(bounds_ctx, (double)number, &box))
-      qa_range_error("Linked Q3 source entity %lld lost its shared body bounds", (long long)number);
+      qa_raise("Error", 0, 0, "Linked Q3 source entity %lld lost its shared body bounds", (long long)number);
     qa_leaf_query_result leaf_result = qa_shared_box_leaves(queries, box, leaf_count);
     size_t all_count = leaf_result.leaves.count;
     size_t leaf_take = all_count < 128 ? all_count : 128;
@@ -166,7 +178,8 @@ qa_app_q3_snapshot_selection *qa_app_select_application_q3_snapshot(
   bindings.ctx = s;
   bindings.print = print;
   bindings.print_ctx = print_ctx;
-  qa_q3_select_snapshot_entities(player, &bindings, &s->visible);
+  qa_q3_select_snapshot_entities_from(player, viewheight, &bindings, &s->visible);
+  qa_cleanup_pop(&selection_guard);
   return s;
 }
 const qa_q3_visible_entities *qa_app_q3_snapshot_selection_visible(const qa_app_q3_snapshot_selection *selection) {

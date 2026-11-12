@@ -275,7 +275,7 @@ static void retain(qa_app_q1_service_presentation *presentation, const char *key
 }
 void qa_app_q1_service_presentation_receive(qa_app_q1_service_presentation *presentation,
     const qa_app_sim_presentation_event *events, size_t event_count) {
-  if (presentation->closed) qa_range_error("Q1 service presentation is closed");
+  if (presentation->closed) qa_raise("Error", 0, 0, "Q1 service presentation is closed");
   for (size_t i = 0; i < event_count; i++) {
     const qa_app_sim_presentation_event *source = &events[i];
     if (is(source->kind, "presentation-owner")) {
@@ -358,11 +358,16 @@ static loaded_sky load_sky(const sky_selection *selection, const qa_app_q1_servi
   for (size_t i = 0; i < 6; i++) {
     char *path = format_text("gfx/env/%s%s.tga", selection->name, qa_sky_face_suffixes[i]);
     qa_renderer_image image;
+    qa_cleanup node;
+    qa_cleanup_push(&node, free, path);
     bool loaded = assets->load_texture(assets->ctx, selection->content, path, &image);
+    qa_cleanup_pop(&node);
     free(path);
     if (!loaded) {
       path = format_text("gfx/env/%s%s.png", selection->name, qa_sky_face_suffixes[i]);
+      qa_cleanup_push(&node, free, path);
       loaded = assets->load_texture(assets->ctx, selection->content, path, &image);
+      qa_cleanup_pop(&node);
       free(path);
     }
     if (loaded) sky.found = true;
@@ -372,7 +377,7 @@ static loaded_sky load_sky(const sky_selection *selection, const qa_app_q1_servi
 }
 void qa_app_q1_service_presentation_prepare(qa_app_q1_service_presentation *presentation,
     const qa_app_q1_service_assets *assets) {
-  if (presentation->closed) qa_range_error("Q1 service presentation is closed");
+  if (presentation->closed) qa_raise("Error", 0, 0, "Q1 service presentation is closed");
   size_t count = 0;
   sky_selection **selections = collect_selections(presentation, &count);
   double *serials = calloc(count + 1, sizeof *serials);
@@ -380,12 +385,15 @@ void qa_app_q1_service_presentation_prepare(qa_app_q1_service_presentation *pres
   size_t pending = 0;
   for (size_t i = 0; i < count; i++) if (!selections[i]->ready) serials[pending++] = selections[i]->serial;
   free(selections);
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, serials);
   for (size_t i = 0; i < pending; i++) {
     sky_selection *selection = current_selection(presentation, serials[i]);
     if (selection == NULL) continue;
     loaded_sky sky = load_sky(selection, assets);
     publish_sky(presentation, serials[i], &sky);
   }
+  qa_cleanup_pop(&node);
   free(serials);
 }
 struct qa_app_q1_sky_refresh {
@@ -394,9 +402,10 @@ struct qa_app_q1_sky_refresh {
   loaded_sky *skies;
   size_t count;
 };
+static void refresh_cleanup(void *refresh) { qa_app_q1_sky_refresh_destroy(refresh); }
 qa_app_q1_sky_refresh *qa_app_q1_service_presentation_prepare_image_refresh(
     qa_app_q1_service_presentation *presentation, const qa_app_q1_service_assets *assets) {
-  if (presentation->closed) qa_range_error("Q1 service presentation is closed");
+  if (presentation->closed) qa_raise("Error", 0, 0, "Q1 service presentation is closed");
   qa_app_q1_sky_refresh *refresh = calloc(1, sizeof *refresh);
   if (refresh == NULL) qa_range_error("Out of memory");
   refresh->presentation = presentation;
@@ -405,10 +414,15 @@ qa_app_q1_sky_refresh *qa_app_q1_service_presentation_prepare_image_refresh(
   refresh->serials = calloc(count + 1, sizeof *refresh->serials);
   refresh->skies = calloc(count + 1, sizeof *refresh->skies);
   if (refresh->serials == NULL || refresh->skies == NULL) qa_range_error("Out of memory");
+  qa_cleanup selections_node, refresh_node;
+  qa_cleanup_push(&selections_node, free, selections);
+  qa_cleanup_push(&refresh_node, refresh_cleanup, refresh);
   for (size_t i = 0; i < count; i++) {
     refresh->serials[i] = selections[i]->serial;
     refresh->skies[i] = load_sky(selections[i], assets);
   }
+  qa_cleanup_pop(&refresh_node);
+  qa_cleanup_pop(&selections_node);
   free(selections);
   refresh->count = count;
   return refresh;
@@ -443,9 +457,10 @@ size_t qa_app_q1_service_presentation_clients(qa_app_q1_service_presentation *pr
   if (table == NULL) table = tables->shared;
   const qa_app_q1_client_row *rows = NULL;
   size_t count = qa_app_q1_client_table_rows(table, &rows);
+  /* Sort every row (the view is the table's scratch), then hand out the first `capacity`. */
+  qa_js_sort((qa_app_q1_client_row *)rows, count, sizeof *rows, compare_rows);
   size_t written = count < capacity ? count : capacity;
   memcpy(out, rows, written * sizeof *out);
-  qa_js_sort(out, written, sizeof *out, compare_rows);
   return written;
 }
 void qa_app_q1_service_presentation_retire(qa_app_q1_service_presentation *presentation, qa_actor_id actor) {

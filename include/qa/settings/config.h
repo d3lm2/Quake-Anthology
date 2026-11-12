@@ -35,6 +35,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdnoreturn.h>
 
 #include "qa/contracts/common.h"
 #include "qa/contracts/ui.h"
@@ -60,8 +61,24 @@ typedef struct qa_settings_controller_selection {
   char *serial;    /* serial, owned */
 } qa_settings_controller_selection;
 
+/* The keys of a TS SeatSettings object, for its JSON.stringify key order. */
+typedef enum qa_seat_settings_key {
+  QA_SEAT_KEY_VERSION,
+  QA_SEAT_KEY_BINDINGS,
+  QA_SEAT_KEY_ALWAYS_RUN,
+  QA_SEAT_KEY_GAMEPAD,
+  QA_SEAT_KEY_MOUSE,
+  QA_SEAT_KEY_HISTORY,
+  QA_SEAT_KEY_RUMBLE,
+  QA_SEAT_KEY_RUMBLE_STRENGTH,
+  QA_SEAT_KEY_CONTROLLER,
+  QA_SEAT_KEY_COUNT
+} qa_seat_settings_key;
+
 /* TS SeatSettings. Binding action/axis/direction strings point at
- * vocabulary literals; command texts and history strings are owned. */
+ * vocabulary literals; command texts and history strings are owned.
+ * A bound command's text is console text (one byte per code unit); a
+ * history line is UTF-8 as the console field holds it. */
 typedef struct qa_seat_settings {
   int32_t version; /* TS literal 1 */
   qa_input_binding *bindings;
@@ -74,8 +91,20 @@ typedef struct qa_seat_settings {
   size_t history_count;
   bool rumble;
   double rumble_strength; /* parser always resolves (default 1) */
+  /* TS rumbleStrength undefined: a document built without the key (JSON.stringify leaves it out). The parser always
+   * sets the value, so a parsed or zeroed struct has it. */
+  bool rumble_strength_absent;
   qa_settings_controller_selection controller;
+  /* The TS object's key order, which JSON.stringify keeps. key_count 0 is the parser's order (version, bindings,
+   * alwaysRun, gamepad, mouse, history, rumble, rumbleStrength, controller); otherwise key_order[0..key_count) lists
+   * the keys as the object literal and its spreads inserted them. alwaysRun is written only with has_always_run and
+   * rumbleStrength only without rumble_strength_absent. */
+  uint8_t key_order[QA_SEAT_KEY_COUNT];
+  uint8_t key_count;
 } qa_seat_settings;
+/* A spread that sets `key` ({ ...settings, key: value }): a key the object does not hold yet is appended after the
+ * others. Call before marking the key present (has_always_run, rumble_strength_absent). */
+void qa_seat_settings_note_key(qa_seat_settings *settings, qa_seat_settings_key key);
 void qa_parse_seat_settings(const qa_save_value *value, qa_seat_settings *out);
 void qa_seat_settings_free(qa_seat_settings *settings);
 
@@ -110,12 +139,23 @@ char *qa_settings_path(const char *root, const char *name);
  * False on I/O or allocation failure; the temp is always removed. */
 bool qa_write_atomic(const char *path, const void *contents, size_t length);
 bool qa_write_atomic_text(const char *path, const char *contents);
+/* The error TS writeAtomic (and so every ConfigStore save) rejects with, for the last false return of a save on this
+ * thread: the Node fs Error ("EACCES: permission denied, open '<path>.<uuid>.tmp'", "EISDIR: illegal operation on a
+ * directory, rename '<temp>' -> '<path>'", ...). With no file-system failure recorded (allocation failure) it raises
+ * RangeError "Out of memory". */
+noreturn void qa_settings_raise_write_failure(void);
 
-/** TS ConfigStore. Owns a copy of root. */
+/** TS ConfigStore. Owns a copy of root. `legacy` (borrowed, NULL when absent)
+ * is the store a document lived in before it moved here: loadSeat and loadText
+ * fall back to it so nothing saved earlier is lost; writes only go to root. */
 typedef struct qa_config_store {
   char *root;
+  const struct qa_config_store *legacy;
 } qa_config_store;
 bool qa_config_store_init(qa_config_store *store, const char *root);
+/* TS `new ConfigStore(root, legacy)`; the legacy store must outlive this one. */
+bool qa_config_store_init_legacy(qa_config_store *store, const char *root,
+                                 const qa_config_store *legacy);
 void qa_config_store_destroy(qa_config_store *store);
 
 /* Malloc'd file bytes (NUL-terminated for convenience; *out_length

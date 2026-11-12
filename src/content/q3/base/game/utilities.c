@@ -47,7 +47,7 @@ double qa_q3_config_string_registry_find(qa_q3_config_string_registry *r, const 
     if (strcmp(buf, text) == 0) return index;
   }
   if (!create) return 0;
-  if (index == maximum) qa_range_error("G_FindConfigstringIndex: overflow");
+  if (index == maximum) qa_raise("Error", 0, 0, "G_FindConfigstringIndex: overflow");
   r->store.set(r->store.ctx, start + index, text); return index;
 }
 double qa_q3_config_string_registry_model_index(qa_q3_config_string_registry *r, const char *n) { return qa_q3_config_string_registry_find(r, n, 32, 256, true); }
@@ -74,10 +74,15 @@ qa_q3_game_entity *qa_q3_pick_target(qa_q3_target_selection_context ctx, const c
   if (!target_name) { ctx.warn(ctx.ctx, "G_PickTarget called with NULL targetname\n"); return NULL; }
   qa_q3_game_entity *choices[32]; size_t count = 0; qa_q3_game_entity *found = NULL;
   while (count < 32) { found = qa_q3_find_entity(ctx.pool, found, QA_Q3_FIELD_TARGETNAME, target_name); if (!found) break; choices[count++] = found; }
-  if (count == 0) { char buf[1024]; snprintf(buf, sizeof buf, "G_PickTarget: target %s not found\n", target_name); ctx.warn(ctx.ctx, buf); return NULL; }
+  if (count == 0) {
+    /* TS template literal: the name is not cut. */
+    size_t need = strlen(target_name) + sizeof "G_PickTarget: target  not found\n"; char *text = malloc(need); if (!text) qa_range_error("out of memory");
+    snprintf(text, need, "G_PickTarget: target %s not found\n", target_name); ctx.warn(ctx.ctx, text); free(text); return NULL;
+  }
   double random = ctx.random_int(ctx.ctx);
-  if (random != trunc(random) || random < 0) qa_range_error("Game rand must return a nonnegative integer");
-  return choices[(size_t)((int64_t)random % (int64_t)count)];
+  /* Number.isInteger rejects NaN and the infinities; JS % is fmod. */
+  if (!isfinite(random) || random != trunc(random) || random < 0) qa_range_error("Game rand must return a nonnegative integer");
+  return choices[(size_t)fmod(random, (double)count)];
 }
 void qa_q3_use_targets(qa_q3_target_use_context ctx, qa_q3_game_entity *entity, const qa_q3_use_participant *activator) {
   if (!entity) return;

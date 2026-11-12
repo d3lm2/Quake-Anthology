@@ -15,6 +15,7 @@
 #include "qa/movement/q1/netquake.h"
 #include "qa/movement/q2/index.h"
 #include "qa/foundation/js.h"
+#include "qa/core/math.h"
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 static bool starts(const char *a, const char *prefix) { return a != NULL && strncmp(a, prefix, strlen(prefix)) == 0; }
 qa_game_family qa_app_sim_provider_family(const char *provider) {
@@ -26,7 +27,7 @@ qa_game_family qa_app_sim_provider_family(const char *provider) {
 qa_provider_timing qa_app_sim_provider_timing(qa_executable_recipe recipe, const char *provider) {
   for (size_t i = 0; i < recipe.timing_count; i++)
     if (is(recipe.timing[i].provider, provider)) return recipe.timing[i];
-  qa_range_error("Recipe has no timing for %s", provider ? provider : "(null)");
+  qa_raise("Error", 0, 0, "Recipe has no timing for %s", provider ? provider : "(null)");
 }
 qa_movement_profile qa_app_sim_movement_profile(qa_executable_recipe recipe) {
   qa_provider_timing timing = qa_app_sim_provider_timing(recipe, recipe.movement.provider);
@@ -116,7 +117,7 @@ double qa_app_sim_movement_player_speed_multiplier(qa_app_sim_movement_player *p
 static void fixed_environment(qa_app_sim_movement_player *p, qa_movement_environment *env, qa_mod_client_movement_outputs *outputs_out);
 qa_movement_environment qa_app_sim_movement_player_prediction_environment(qa_app_sim_movement_player *player) {
   qa_combat_state_result combat = combat_of(player);
-  if (!combat.has_value) qa_range_error("Prediction player has no combat state");
+  if (!combat.has_value) qa_raise("Error", 0, 0, "Prediction player has no combat state");
   qa_movement_environment out = qa_app_sim_player_movement_environment(environment_view(player), combat.value);
   qa_mod_client_movement_outputs outputs;
   fixed_environment(player, &out, &outputs);
@@ -137,8 +138,12 @@ static qa_mod_client_movement_outputs client_outputs_of(qa_app_sim_movement_play
   }
   if (!p->has_body_shape_base) return outputs;
   qa_bounds base = p->body_shape_base, current = p->bounds;
-  if (memcmp(&current, &base, sizeof base) == 0) p->has_body_shape_base = false;
-  static qa_bounds storage; storage = base; outputs.body_bounds = &storage;
+  /* Six === comparisons (memcmp told -0 from 0 and matched equal NaN bits). */
+  if (current.min.x == base.min.x && current.min.y == base.min.y && current.min.z == base.min.z
+      && current.max.x == base.max.x && current.max.y == base.max.y && current.max.z == base.max.z)
+    p->has_body_shape_base = false;
+  /* { ...outputs, bodyBounds: base }: per player, so another player's movement cannot overwrite it mid-move. */
+  p->client_body_bounds = base; outputs.body_bounds = &p->client_body_bounds;
   return outputs;
 }
 static void accept_body_shape(qa_app_sim_movement_player *p, qa_bounds bounds) {
@@ -164,10 +169,9 @@ static void fixed_environment(qa_app_sim_movement_player *p, qa_movement_environ
   }
   p->fixed_pose_active = pose != NULL;
   env->pose = pose;
-  static qa_mod_client_movement_outputs outputs_storage;
-  outputs_storage = client_outputs_of(p);
-  env->client_outputs = &outputs_storage;
-  if (outputs_out) *outputs_out = outputs_storage;
+  p->client_outputs_storage = client_outputs_of(p);
+  env->client_outputs = &p->client_outputs_storage;
+  if (outputs_out) *outputs_out = p->client_outputs_storage;
 }
 static qa_movement_continuation application_continuation(qa_app_sim_movement_player *p) {
   qa_movement_continuation out; memset(&out, 0, sizeof out);
@@ -175,14 +179,34 @@ static qa_movement_continuation application_continuation(qa_app_sim_movement_pla
   if (out.is_continue) out.state = qa_app_sim_movement_player_read_state(p);
   return out;
 }
+static bool inputs_active(const qa_app_sim_movement_player *p) {
+  return p->host.input_applications_active != NULL && p->host.input_applications_active(p->host.ctx);
+}
+/* TS services.inputApplication is a getter (active owner -> appliedMovement): the movement code takes the services by
+ * value, so the flag is refreshed at each call into it. */
+static qa_movement_services services_now(qa_app_sim_movement_player *p) {
+  p->services.has_input_application = inputs_active(p);
+  return p->services;
+}
 static qa_movement_input_continuation applied_begin(void *ctx, qa_user_command command, qa_frame_context frame, qa_movement_state state) {
   qa_app_sim_movement_player *p = ctx;
+  /* const index = this.sliceApplications.length; this.sliceApplications.push(null); */
+  if (p->slice_depth == p->slice_capacity) {
+    size_t capacity = p->slice_capacity == 0 ? 8 : p->slice_capacity * 2;
+    bool *grown = realloc(p->slice_pushed, capacity * sizeof *grown);
+    if (!grown) qa_range_error("Out of memory");
+    p->slice_pushed = grown; p->slice_capacity = capacity;
+  }
+  size_t index = p->slice_depth++;
+  p->slice_pushed[index] = false;
   qa_movement_continuation committed = qa_app_sim_movement_player_commit(p, state, false, false);
   qa_movement_input_continuation out; memset(&out, 0, sizeof out);
   if (!committed.is_continue) return out;
   qa_user_command replaced; const qa_arsenal_intent *arsenal = NULL;
+  bool has_application = false;
   bool began = p->host.input_begin && p->host.input_begin(p->host.ctx, p, "movement-slice", command, frame, state,
-      p->has_arsenal_intent ? &p->arsenal_intent : NULL, &replaced, &arsenal);
+      p->has_arsenal_intent ? &p->arsenal_intent : NULL, &replaced, &arsenal, &has_application);
+  p->slice_pushed[index] = began;
   qa_movement_continuation cont = application_continuation(p);
   out.is_continue = cont.is_continue; out.state = cont.state;
   if (!cont.is_continue) return out;
@@ -195,7 +219,9 @@ static qa_movement_continuation applied_end(void *ctx, qa_movement_state state, 
   bool f = has_failed && failed;
   if (posture && !f) { p->bounds = posture->bounds; p->view_height = posture->view_height; }
   if (live_of(p) && !f) qa_app_sim_movement_player_commit(p, state, false, false);
-  if (p->host.input_finish) p->host.input_finish(p->host.ctx, f);
+  /* this.host.inputApplications?.finish(this.sliceApplications.pop() ?? null, failed): finish(null) does nothing. */
+  bool pushed = p->slice_depth > 0 && p->slice_pushed[--p->slice_depth];
+  if (pushed && p->host.input_finish) p->host.input_finish(p->host.ctx, f);
   return application_continuation(p);
 }
 static qa_movement_continuation player_touch(void *ctx, qa_movement_touch_contact contact, qa_movement_state state) {
@@ -245,18 +271,17 @@ qa_app_sim_movement_player *qa_app_sim_movement_player_create(qa_owned_actor act
   p->services.ctx = p;
   p->services.scene = host.scene;
   p->services.numeric = *qa_create_numeric_operations(&p->profile.numeric);
-  p->services.has_input_application = host.input_applications_active;
+  p->services.has_input_application = false; /* services_now() reads the owner on each call */
   p->services.input_application.ctx = p;
   p->services.input_application.begin = applied_begin;
   p->services.input_application.end = applied_end;
   p->services.touch = player_touch;
   p->services.weapon_step = player_weapon_step;
   p->services.animation_step = player_animation_step;
-  qa_vec3 zero = {0, 0, 0};
   if (is(p->profile.kind, "q1-netquake")) {
     p->state.kind = QA_MOVEMENT_STATE_Q1;
     qa_q1_movement_state *s = &p->state.as.q1;
-    s->origin = origin; s->velocity = zero; s->angles = angles; s->old_origin = origin;
+    s->origin = origin; s->velocity = qa_zero_vec3; s->angles = angles; s->old_origin = origin;
     s->view_angles = angles; s->move_type = 3; s->flags = 4096; s->ground = p->ground;
     s->water_type = -1; s->health = 100;
   } else if (is(p->profile.kind, "q1-quakeworld")) {
@@ -295,6 +320,7 @@ void qa_app_sim_movement_player_destroy(qa_app_sim_movement_player *player) {
   release_result_arrays(player);
   free((void *)player->owned_weapon_effects);
   free((void *)player->owned_arsenal_ammo);
+  free(player->slice_pushed);
   free(player);
 }
 bool qa_app_sim_movement_player_set_flight(qa_app_sim_movement_player *player, bool enabled) {
@@ -332,14 +358,14 @@ void qa_app_sim_movement_player_set_source_view_roll(qa_app_sim_movement_player 
 }
 qa_app_sim_player_view qa_app_sim_movement_player_view(qa_app_sim_movement_player *player) {
   qa_body_state_result body = body_of(player);
-  if (!body.has_value) qa_range_error("Player no longer has a body");
+  if (!body.has_value) qa_raise("Error", 0, 0, "Player no longer has a body");
   qa_app_sim_player_view out; memset(&out, 0, sizeof out);
   out.origin = body.value.origin; out.angles = player->view_angles; out.view_height = player->view_height;
   return out;
 }
 static qa_movement_state read_movement_state(qa_app_sim_movement_player *p) {
   qa_body_state_result read = body_of(p);
-  if (!read.has_value) qa_range_error("Player no longer has a body");
+  if (!read.has_value) qa_raise("Error", 0, 0, "Player no longer has a body");
   qa_body_state body = read.value;
   qa_movement_state state = p->state;
   qa_actor_id world; bool has_world = p->host.world_actor && p->host.world_actor(p->host.ctx, &world);
@@ -396,7 +422,7 @@ qa_movement_continuation qa_app_sim_movement_player_commit(qa_app_sim_movement_p
     player->view_angles = state.as.q1.view_angles;
   }
   qa_body_state_result read = body_of(player);
-  if (!read.has_value) qa_range_error("Player has no body during movement");
+  if (!read.has_value) qa_raise("Error", 0, 0, "Player has no body during movement");
   qa_body_state body = read.value;
   if (state.kind == QA_MOVEMENT_STATE_Q1 && player->host.netquake) player->bounds = body.bounds;
   qa_vec3 angles = (state.kind == QA_MOVEMENT_STATE_Q1) ? state.as.q1.angles
@@ -423,27 +449,33 @@ qa_movement_continuation qa_app_sim_movement_player_commit(qa_app_sim_movement_p
   if (triggers && player->host.touch_triggers) player->host.touch_triggers(player->host.ctx, player->actor);
   return application_continuation(player);
 }
+/* JS truthiness of an optional number (undefined, 0 and NaN are falsy). */
+static bool truthy(bool has, double value) { return has && value != 0 && !isnan(value); }
 static void accept_arsenal_intent(qa_app_sim_movement_player *p, const qa_arsenal_intent *intent, bool has_intent) {
-  if (p->has_arsenal_intent && p->arsenal_intent.impulse != 0
+  /* (pending.impulse ?? 0) !== 0: NaN counts as set */
+  if (p->has_arsenal_intent && p->arsenal_intent.has_impulse && p->arsenal_intent.impulse != 0
       && (!has_intent || is(intent->provider, p->arsenal_intent.provider))) {
     if (!has_intent) { p->arsenal_intent.weapon = NULL; p->arsenal_intent.use_holdable = false; }
     else {
+      /* { ...intent, impulse: intent.impulse || pending.impulse || 0 }: impulse is always defined */
       qa_arsenal_intent next = *intent;
-      next.impulse = intent->impulse != 0 ? intent->impulse : p->arsenal_intent.impulse;
+      next.impulse = truthy(intent->has_impulse, intent->impulse) ? intent->impulse
+          : truthy(p->arsenal_intent.has_impulse, p->arsenal_intent.impulse) ? p->arsenal_intent.impulse : 0;
+      next.has_impulse = true;
       p->arsenal_intent = next;
     }
   } else if (has_intent) { p->has_arsenal_intent = true; p->arsenal_intent = *intent; }
   else p->has_arsenal_intent = false;
 }
 void qa_app_sim_movement_player_receive_netquake(qa_app_sim_movement_player *player, qa_actor_command input) {
-  if (input.command.kind != QA_USER_COMMAND_Q1) qa_range_error("NetQuake client requires a NetQuake command");
+  if (input.command.kind != QA_USER_COMMAND_Q1) qa_raise("Error", 0, 0, "NetQuake client requires a NetQuake command");
   if (input.sequence <= player->last_sequence) return;
   /* TS: impulse: input.command.impulse || this.netQuakeCommand?.impulse || 0 */
   double previous_impulse = player->has_netquake_command ? player->netquake_command.impulse : 0;
   player->has_netquake_command = true;
   player->netquake_command = input.command.as.q1;
-  if (player->netquake_command.impulse == 0)
-    player->netquake_command.impulse = previous_impulse;
+  if (!truthy(true, player->netquake_command.impulse))
+    player->netquake_command.impulse = truthy(true, previous_impulse) ? previous_impulse : 0;
   accept_arsenal_intent(player, input.arsenal, input.arsenal != NULL);
   player->previous_buttons = player->buttons; player->buttons = input.command.as.q1.buttons;
   player->command_angles = input.command.as.q1.view_angles; player->view_angles = input.command.as.q1.view_angles;
@@ -451,7 +483,7 @@ void qa_app_sim_movement_player_receive_netquake(qa_app_sim_movement_player *pla
 }
 static qa_q1_movement_state read_state_q1(qa_app_sim_movement_player *p) {
   qa_movement_state state = qa_app_sim_movement_player_read_state(p);
-  if (state.kind != QA_MOVEMENT_STATE_Q1) qa_range_error("NetQuake source changed movement family");
+  if (state.kind != QA_MOVEMENT_STATE_Q1) qa_raise("Error", 0, 0, "NetQuake source changed movement family");
   return state.as.q1;
 }
 typedef struct hook_env { qa_app_sim_movement_player *player; const char *which; } hook_env;
@@ -464,17 +496,23 @@ static bool player_is_bsp(void *ctx, qa_trace_hit hit) {
 }
 static void player_body_shape(void *ctx, qa_bounds bounds) { accept_body_shape(((hook_env *)ctx)->player, bounds); }
 static qa_movement_input netquake_input(qa_app_sim_movement_player *p, qa_frame_context frame) {
-  qa_movement_environment env; qa_mod_client_movement_outputs outputs;
-  qa_combat_state_result combat = combat_of(p);
+  /* TS order: fixedEnvironment() (it may rewrite the bounds and the body) before readState, the profile and the combat read. */
+  qa_movement_environment fixed; memset(&fixed, 0, sizeof fixed); qa_mod_client_movement_outputs outputs;
+  fixed_environment(p, &fixed, &outputs);
   qa_movement_state state = qa_app_sim_movement_player_read_state(p);
   qa_movement_profile profile = qa_app_sim_selected_movement_profile(selected_view(p), NULL);
+  qa_combat_state_result combat = combat_of(p);
   if (state.kind != QA_MOVEMENT_STATE_Q1 || !is(profile.kind, "q1-netquake") || !combat.has_value)
-    qa_range_error("Missing NetQuake movement state");
-  env = qa_app_sim_player_movement_environment(environment_view(p), combat.value);
-  fixed_environment(p, &env, &outputs);
+    qa_raise("Error", 0, 0, "Missing NetQuake movement state");
+  qa_movement_environment env = qa_app_sim_player_movement_environment(environment_view(p), combat.value);
+  env.pose = fixed.pose; env.client_outputs = fixed.client_outputs;
   qa_q1_user_command command;
+  /* const effective = this.netQuakeSliceCommand ?? this.netQuakeApplication?.command */
   if (p->has_netquake_slice_command) command = p->netquake_slice_command;
-  else if (p->has_netquake_command) command = p->netquake_command;
+  else if (p->has_netquake_application_command) {
+    if (p->netquake_application_command.kind != QA_USER_COMMAND_Q1) qa_raise("Error", 0, 0, "Input output changed NetQuake command dialect");
+    command = p->netquake_application_command.as.q1;
+  } else if (p->has_netquake_command) command = p->netquake_command;
   else { memset(&command, 0, sizeof command); command.view_angles = p->view_angles; }
   qa_movement_input out; memset(&out, 0, sizeof out);
   out.kind = "q1-netquake"; out.actor = p->actor; out.command_sequence = p->last_sequence; out.frame = frame;
@@ -512,7 +550,7 @@ static void player_action_jump(void *ctx, qa_owned_actor actor, const char *acti
 static qa_trace_shape nq_shape(void *ctx) {
   qa_app_sim_movement_player *p = ((hook_env *)ctx)->player;
   qa_body_state_result body = body_of(p);
-  if (!body.has_value) qa_range_error("NetQuake client lost its authoritative body");
+  if (!body.has_value) qa_raise("Error", 0, 0, "NetQuake client lost its authoritative body");
   qa_trace_shape out; out.kind = "box"; out.bounds = body.value.bounds; return out;
 }
 static qa_q1_movement_options netquake_options(qa_app_sim_movement_player *p, qa_q1_movement_hooks *hooks, hook_env *env) {
@@ -532,62 +570,129 @@ static qa_q1_movement_options netquake_options(qa_app_sim_movement_player *p, qa
   out.hooks = hooks;
   return out;
 }
-void qa_app_sim_movement_player_prepare_netquake(qa_app_sim_movement_player *player, qa_frame_context frame,
-    const qa_arsenal_intent *(*prepare)(void *ctx, qa_q1_user_command command, const qa_arsenal_intent *arsenal, bool *out_has), void *prepare_ctx) {
-  qa_movement_input input = netquake_input(player, frame);
-  qa_user_command replaced; const qa_arsenal_intent *arsenal = NULL;
-  bool began = player->host.input_begin && player->host.input_begin(player->host.ctx, player, "client-command",
-      input.command, frame, input.state, player->has_arsenal_intent ? &player->arsenal_intent : NULL, &replaced, &arsenal);
-  player->netquake_application_open = began;
-  if (!live_of(player)) {
-    if (player->host.input_finish && began) player->host.input_finish(player->host.ctx, false);
-    player->netquake_application_open = false; return;
-  }
-  qa_q1_user_command effective = began && replaced.kind == QA_USER_COMMAND_Q1 ? replaced.as.q1 : input.command.as.q1;
-  if (began && arsenal) { player->has_arsenal_intent = true; player->arsenal_intent = *arsenal; }
-  if (prepare) {
+typedef struct nq_prepare {
+  qa_app_sim_movement_player *player; qa_frame_context frame; qa_movement_input input;
+  bool began; qa_user_command replaced; const qa_arsenal_intent *arsenal;
+  const qa_arsenal_intent *(*prepare)(void *ctx, qa_q1_user_command command, const qa_arsenal_intent *arsenal, bool *out_has); void *prepare_ctx;
+} nq_prepare;
+/* The `try` body of TS prepareNetQuake. */
+static void nq_prepare_body(void *ctx) {
+  nq_prepare *c = ctx; qa_app_sim_movement_player *player = c->player;
+  qa_user_command effective_command = c->began ? c->replaced : c->input.command;
+  if (effective_command.kind != QA_USER_COMMAND_Q1) qa_raise("Error", 0, 0, "Input output changed NetQuake command dialect");
+  qa_q1_user_command effective = effective_command.as.q1;
+  if (c->began && c->arsenal) { player->has_arsenal_intent = true; player->arsenal_intent = *c->arsenal; }
+  if (c->prepare) {
     bool has = false;
-    const qa_arsenal_intent *next = prepare(prepare_ctx, effective, player->has_arsenal_intent ? &player->arsenal_intent : NULL, &has);
+    const qa_arsenal_intent *next = c->prepare(c->prepare_ctx, effective, player->has_arsenal_intent ? &player->arsenal_intent : NULL, &has);
     player->has_arsenal_intent = has && next != NULL;
     if (player->has_arsenal_intent) player->arsenal_intent = *next;
+  }
+  /* if (this.services.inputApplication !== undefined): the owner is active now (prepare may have changed it). */
+  if (inputs_active(player)) {
+    player->netquake_slice_open = true;
+    qa_user_command command; memset(&command, 0, sizeof command);
+    command.kind = QA_USER_COMMAND_Q1; command.as.q1 = effective;
+    qa_movement_state state; memset(&state, 0, sizeof state);
+    state.kind = QA_MOVEMENT_STATE_Q1; state.as.q1 = read_state_q1(player);
+    qa_movement_input_continuation before = applied_begin(player, command, c->frame, state);
+    if (!before.is_continue) { qa_app_sim_movement_player_finish_netquake_input(player, false); return; }
+    if (before.command.kind != QA_USER_COMMAND_Q1) qa_raise("Error", 0, 0, "Input output changed NetQuake command dialect");
+    effective = before.command.as.q1;
+    player->has_netquake_slice_command = true; player->netquake_slice_command = effective;
   }
   player->buttons = effective.buttons;
   if (player->host.netquake && player->host.netquake->input) player->host.netquake->input(player->host.netquake->ctx, effective);
   qa_q1_movement_hooks hooks; hook_env env;
   qa_q1_movement_options options = netquake_options(player, &hooks, &env);
-  qa_movement_input prepared_input = input;
-  prepared_input.command.as.q1 = effective;
+  qa_movement_input prepared_input = c->input;
+  prepared_input.command.kind = QA_USER_COMMAND_Q1; prepared_input.command.as.q1 = effective;
   prepared_input.state.kind = QA_MOVEMENT_STATE_Q1; prepared_input.state.as.q1 = read_state_q1(player);
-  qa_q1_movement_state prepared = qa_prepare_netquake(prepared_input, player->services, options);
+  qa_q1_movement_state prepared = qa_prepare_netquake(prepared_input, services_now(player), options);
   qa_movement_state next; memset(&next, 0, sizeof next); next.kind = QA_MOVEMENT_STATE_Q1; next.as.q1 = prepared;
   qa_app_sim_movement_player_commit(player, next, false, false);
 }
+void qa_app_sim_movement_player_prepare_netquake(qa_app_sim_movement_player *player, qa_frame_context frame,
+    const qa_arsenal_intent *(*prepare)(void *ctx, qa_q1_user_command command, const qa_arsenal_intent *arsenal, bool *out_has), void *prepare_ctx) {
+  nq_prepare c; memset(&c, 0, sizeof c);
+  c.player = player; c.frame = frame; c.prepare = prepare; c.prepare_ctx = prepare_ctx;
+  c.input = netquake_input(player, frame);
+  bool has_application = false;
+  c.began = player->host.input_begin && player->host.input_begin(player->host.ctx, player, "client-command",
+      c.input.command, frame, c.input.state, player->has_arsenal_intent ? &player->arsenal_intent : NULL, &c.replaced, &c.arsenal,
+      &has_application);
+  player->netquake_application_open = c.began;
+  player->has_netquake_application_command = c.began && has_application;
+  if (player->has_netquake_application_command) player->netquake_application_command = c.replaced;
+  if (!live_of(player)) {
+    if (player->host.input_finish && c.began) player->host.input_finish(player->host.ctx, false);
+    player->netquake_application_open = false; player->has_netquake_application_command = false; return;
+  }
+  /* try { ... } catch (error) { this.finishNetQuakeInput(true); throw error; } */
+  qa_caught_error caught;
+  if (!qa_try(nq_prepare_body, &c, &caught)) {
+    qa_app_sim_movement_player_finish_netquake_input(player, true);
+    qa_rethrow(&caught);
+  }
+}
+typedef struct nq_finish { qa_app_sim_movement_player *player; bool failed; } nq_finish;
+static void nq_slice_end(void *ctx) {
+  nq_finish *c = ctx; qa_app_sim_movement_player *player = c->player;
+  qa_movement_state state = live_of(player) ? qa_app_sim_movement_player_read_state(player) : player->state;
+  applied_end(player, state, true, c->failed, NULL);
+}
+static void nq_application_finish(void *ctx) {
+  nq_finish *c = ctx; qa_app_sim_movement_player *player = c->player;
+  player->host.input_finish(player->host.ctx, c->failed);
+}
 void qa_app_sim_movement_player_finish_netquake_input(qa_app_sim_movement_player *player, bool failed) {
+  qa_caught_error first, second; size_t errors = 0;
   if (player->netquake_slice_open) {
     player->netquake_slice_open = false;
-    qa_movement_state state = live_of(player) ? qa_app_sim_movement_player_read_state(player) : player->state;
-    applied_end(player, state, true, failed, NULL);
+    nq_finish c = {player, failed};
+    if (!qa_try(nq_slice_end, &c, &first)) errors++;
   }
-  if (player->host.input_finish && player->netquake_application_open) player->host.input_finish(player->host.ctx, failed);
+  bool open = player->netquake_application_open;
+  /* finally: the application, slice command and parent are cleared whether finish throws or not. */
   player->netquake_application_open = false;
+  player->has_netquake_application_command = false;
   player->has_netquake_slice_command = false;
+  if (player->host.input_finish && open) {
+    nq_finish c = {player, failed || errors != 0};
+    if (!qa_try(nq_application_finish, &c, errors == 0 ? &first : &second)) errors++;
+  }
+  if (errors == 1) qa_rethrow(&first);
+  if (errors > 1) qa_raise("AggregateError", 0, 0, "NetQuake input completion failed");
 }
 static void accept_result(qa_app_sim_movement_player *p, qa_movement_result result) {
   p->state = result.state; p->view_angles = result.view_angles; p->view_height = result.view_height;
   p->bounds = result.bounds; p->ground = result.ground; p->water_level = result.water_level; p->water_type = result.water_type;
   p->arsenal = result.arsenal; p->animation = result.animation;
 }
-qa_movement_result qa_app_sim_movement_player_physics_netquake(qa_app_sim_movement_player *player, qa_frame_context frame) {
-  bool observed = player->netquake_application_open;
+typedef struct nq_physics { qa_app_sim_movement_player *player; qa_frame_context frame; qa_movement_result result; } nq_physics;
+/* The `try` body of TS physicsNetQuake: netQuakeInput(frame) is evaluated before netQuakeOptions(). */
+static void nq_physics_body(void *ctx) {
+  nq_physics *c = ctx; qa_app_sim_movement_player *player = c->player;
+  qa_movement_input input = netquake_input(player, c->frame);
   qa_q1_movement_hooks hooks; hook_env env;
   qa_q1_movement_options options = netquake_options(player, &hooks, &env);
   release_result_arrays(player);
-  qa_movement_result result = own_result_arrays(player, qa_physics_netquake(netquake_input(player, frame), player->services, options));
-  if (is(result.status, "active") && live_of(player)) {
-    accept_result(player, result);
-    qa_app_sim_movement_player_commit(player, result.state, false, false);
+  c->result = own_result_arrays(player, qa_physics_netquake(input, services_now(player), options));
+  if (is(c->result.status, "active") && live_of(player)) {
+    accept_result(player, c->result);
+    qa_app_sim_movement_player_commit(player, c->result.state, false, false);
   }
   if (player->has_netquake_command) player->netquake_command.impulse = 0;
+}
+qa_movement_result qa_app_sim_movement_player_physics_netquake(qa_app_sim_movement_player *player, qa_frame_context frame) {
+  bool observed = player->netquake_application_open;
+  nq_physics c; memset(&c, 0, sizeof c); c.player = player; c.frame = frame;
+  qa_caught_error caught;
+  if (!qa_try(nq_physics_body, &c, &caught)) {
+    qa_app_sim_movement_player_finish_netquake_input(player, true);
+    qa_rethrow(&caught);
+  }
+  qa_movement_result result = c.result;
   qa_app_sim_movement_player_finish_netquake_input(player, false);
   if (!observed) return result;
   if (!live_of(player)) {
@@ -642,7 +747,7 @@ static qa_animation_step_result q3_torso_wrap_fn(void *ctx, qa_q3_hook_context c
   return wrap->inner.torso(wrap->inner.ctx, context);
 }
 static qa_movement_result wrong_family(void) {
-  qa_range_error("Source callback changed a player's movement provider");
+  qa_raise("Error", 0, 0, "Source callback changed a player's movement provider");
 }
 static qa_movement_result apply_q3_contacts(qa_app_sim_movement_player *p, qa_movement_result moved, qa_movement_state state) {
   qa_movement_state current = state;
@@ -704,9 +809,12 @@ qa_movement_result qa_app_sim_movement_player_move_command(qa_app_sim_movement_p
   }
   player->command_angles = player->view_angles;
   qa_combat_state_result combat = combat_of(player);
-  if (!combat.has_value) qa_range_error("Player has no combat state");
+  if (!combat.has_value) qa_raise("Error", 0, 0, "Player has no combat state");
+  /* const fixed = this.fixedEnvironment() runs before playerMovementEnvironment(this, combat) builds the base. */
+  qa_movement_environment fixed; memset(&fixed, 0, sizeof fixed);
+  qa_mod_client_movement_outputs outputs; fixed_environment(player, &fixed, &outputs);
   qa_movement_environment env = qa_app_sim_player_movement_environment(environment_view(player), combat.value);
-  qa_mod_client_movement_outputs outputs; fixed_environment(player, &env, &outputs);
+  env.pose = fixed.pose; env.client_outputs = fixed.client_outputs;
   qa_movement_state state = player->state;
   qa_trace_hit prior_ground = player->ground;
   qa_movement_profile selected = qa_app_sim_selected_movement_profile(selected_view(player), NULL);
@@ -756,13 +864,13 @@ qa_movement_result qa_app_sim_movement_player_move_command(qa_app_sim_movement_p
   if (!dispatch) {
     const char *ck = command.kind == QA_USER_COMMAND_Q1 ? "q1-netquake" : command.kind == QA_USER_COMMAND_QW ? "q1-quakeworld"
         : command.kind == QA_USER_COMMAND_Q2 ? "q2-classic" : command.kind == QA_USER_COMMAND_Q2_RERELEASE ? "q2-rerelease" : "q3";
-    qa_range_error("Command %s does not match movement %s", ck, profile.kind);
+    qa_raise("Error", 0, 0, "Command %s does not match movement %s", ck, profile.kind);
   }
   base.kind = profile.kind;
   /* SV_RunCmd copies the command's angles to pmove before the axes are built; a QuakeC host already wrote v_angle into the state. */
   if (is(profile.kind, "q1-quakeworld") && !player->host.has_quakeworld) base.state.as.qw.angles = command.as.qw.angles;
   if (is(profile.kind, "q2-rerelease")) { base.view_offset = (qa_vec3){0, 0, player->view_height}; base.snap_initial = true; }
-  qa_movement_result moved = provider.move(provider.ctx, base, player->services);
+  qa_movement_result moved = provider.move(provider.ctx, base, services_now(player));
   qa_cleanup_pop(&release_node);
   release_provider(&release);
   if ((is(profile.kind, "q2-classic") || is(profile.kind, "q2-rerelease") || is(profile.kind, "q3")) && is(moved.status, "active")) {
@@ -776,7 +884,7 @@ qa_movement_result qa_app_sim_movement_player_move_command(qa_app_sim_movement_p
       qa_movement_state_kind want = is(profile.kind, "q2-classic") ? QA_MOVEMENT_STATE_Q2 : QA_MOVEMENT_STATE_Q2_RERELEASE;
       if (after.state.kind != want) return wrong_family();
       qa_movement_result with_state = moved; with_state.state = after.state;
-      result = qa_apply_q2_movement_contacts(base, player->services, with_state);
+      result = qa_apply_q2_movement_contacts(base, services_now(player), with_state);
     }
   } else result = moved;
   result = own_result_arrays(player, result);
@@ -805,13 +913,13 @@ static bool with_input(qa_app_sim_movement_player *player, qa_user_command comma
     const qa_arsenal_intent *arsenal, bool *inactive) {
   qa_arsenal_intent intent_storage;
   if (arsenal == NULL && player->has_arsenal_intent) { intent_storage = player->arsenal_intent; arsenal = &intent_storage; }
-  if (!player->host.input_applications_active || !player->host.input_begin) { operation(operation_ctx, command, arsenal); return true; }
+  if (!inputs_active(player) || !player->host.input_begin) { operation(operation_ctx, command, arsenal); return true; }
   qa_movement_state state = qa_app_sim_movement_player_read_state(player);
   qa_frame_context app_frame = qa_app_sim_movement_application_frame(command, state, qa_app_sim_movement_player_prediction_profile(player), frame);
-  qa_user_command replaced; const qa_arsenal_intent *applied = NULL;
+  qa_user_command replaced; const qa_arsenal_intent *applied = NULL; bool has_application = false;
   /* The host's begin returns false while its owner is inactive (TS owner?.active !== true); otherwise it pushes the
    * application (possibly null) as the parent of nested applications until finish pops it. */
-  if (!player->host.input_begin(player->host.ctx, player, "client-command", command, app_frame, state, arsenal, &replaced, &applied)) {
+  if (!player->host.input_begin(player->host.ctx, player, "client-command", command, app_frame, state, arsenal, &replaced, &applied, &has_application)) {
     if (inactive != NULL) *inactive = true; else operation(operation_ctx, command, arsenal);
     return true;
   }
@@ -849,7 +957,7 @@ static void move_operation_run(void *ctx, qa_user_command command, const qa_arse
   m->result = qa_app_sim_movement_player_move_command(m->player, next, m->frame, m->source_command);
 }
 qa_movement_result qa_app_sim_movement_player_move(qa_app_sim_movement_player *player, qa_actor_command input, qa_frame_context frame, const qa_qw_user_command *source_command) {
-  if (!player->host.input_applications_active || !player->host.input_begin)
+  if (!inputs_active(player) || !player->host.input_begin)
     return qa_app_sim_movement_player_move_command(player, input, frame, source_command);
   accept_arsenal_intent(player, input.arsenal, input.arsenal != NULL);
   move_operation m; memset(&m, 0, sizeof m);
@@ -867,7 +975,7 @@ qa_movement_result qa_app_sim_movement_player_move(qa_app_sim_movement_player *p
   if (is(result.status, "actor-removed")) return result;
   qa_movement_state current = qa_app_sim_movement_player_read_state(player);
   qa_body_state_result body = body_of(player);
-  if (!body.has_value) qa_range_error("Input application lost its live body");
+  if (!body.has_value) qa_raise("Error", 0, 0, "Input application lost its live body");
   player->state = current; player->bounds = body.value.bounds;
   const char *want = current.kind == QA_MOVEMENT_STATE_Q1 ? "q1-netquake" : current.kind == QA_MOVEMENT_STATE_QW ? "q1-quakeworld"
       : current.kind == QA_MOVEMENT_STATE_Q2 ? "q2-classic" : current.kind == QA_MOVEMENT_STATE_Q2_RERELEASE ? "q2-rerelease" : "q3";

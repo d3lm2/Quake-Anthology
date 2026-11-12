@@ -122,7 +122,7 @@ void qa_app_shared_sim_tick_tag(qa_app_shared_simulation *sim) {
     qa_vec3 spot; bool has_spot = qa_app_shared_sim_farthest_deathmatch_spawn(sim, &spot);
     qa_body_state body; bool has_body = qa_app_shared_sim_body(sim, sim->tag_token.id, &body);
     if (has_spot && has_body) {
-      body.origin = (qa_vec3){spot.x, spot.y, spot.z + 16}; body.velocity = qa_ss_zero;
+      body.origin = (qa_vec3){spot.x, spot.y, spot.z + 16}; body.velocity = qa_zero_vec3;
       qa_shared_body_table_write(qa_fm_bodies(sim), sim->tag_token, body);
       qa_shared_body_table_link(qa_fm_bodies(sim), sim->tag_token, NULL);
     }
@@ -140,7 +140,7 @@ void qa_app_shared_sim_tick_tag(qa_app_shared_simulation *sim) {
     if (!has_previous || previous <= 0 || health > 0) continue;
     qa_owned_actor owned; bool has_attacker = false; qa_actor_id attacker;
     if (qa_session_actor_registry_resolve_owned(sim->actors, actor, &owned)) {
-      qa_attack_provenance *attack = qa_ss_map_get(&sim->last_attack, &owned);
+      const qa_attack_provenance *attack = qa_app_shared_sim_last_attack(sim, owned);
       if (attack && attack->attacker) { has_attacker = true; attacker = *attack->attacker; }
     }
     bool has_killer = has_attacker && !qa_same_actor(attacker, actor) && qa_fm_includes(players, player_count, attacker);
@@ -160,4 +160,18 @@ void qa_app_shared_sim_tick_tag(qa_app_shared_simulation *sim) {
     }
   }
   free(players);
+}
+bool qa_app_foreign_tag_blocks_checkpoint(qa_app_shared_simulation *sim) { return qa_app_shared_sim_foreign_tag(sim); }
+void qa_app_foreign_tag_release(qa_app_shared_simulation *sim, qa_actor_id actor) { qa_ss_map_delete(&sim->tag_health, &actor); }
+/* Damage between non-owners is reduced to 3/4. */
+static void wl_tag_damage(void *ctx, const void *input, void *output) {
+  qa_app_shared_simulation *sim = ctx; const qa_damage_request *request = input; qa_damage_request *out = output;
+  *out = *request;
+  if (!sim->has_tag_owner || qa_same_actor(request->target, sim->tag_owner)
+      || (request->attack.attacker && qa_same_actor(*request->attack.attacker, sim->tag_owner))) return;
+  out->amount = trunc(request->amount * 3 / 4);
+}
+void qa_app_foreign_tag_register_combat(qa_app_shared_simulation *sim) {
+  if (!qa_app_shared_sim_foreign_tag(sim)) return;
+  qa_fm_register_transform(sim, "q2:tag", "q2:tag/damage", wl_tag_damage);
 }

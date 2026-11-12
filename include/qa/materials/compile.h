@@ -1,9 +1,9 @@
 /*
  * Port of src/materials/compile.ts. inspectShaderScript (TS owner:
  * material.ts) and finishShader/implicitShaderInput (TS owner:
- * material-finish.ts) are not ported in this slice, so compilation
- * takes inspected catalog entries plus finish/implicit preparation as
- * fn+ctx services; the compile.ts logic and defaults are ported here.
+ * material-finish.ts) reach compilation as fn+ctx services over
+ * inspected catalog entries; the compile.ts logic and defaults are
+ * ported here.
  * shader_render_material stages/modifiers are malloc'd; free with
  * qa_shader_render_material_destroy. GPL-2.0-or-later.
  */

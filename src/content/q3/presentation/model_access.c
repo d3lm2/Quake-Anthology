@@ -1,4 +1,5 @@
 /* Port of src/content/q3/presentation/model-access.ts. GPL-2.0-or-later. */
+#include "qa/foundation/js.h"
 #include "qa/content/q3/presentation/model_access.h"
 #include <math.h>
 #include <stdlib.h>
@@ -45,7 +46,7 @@ qa_bounds qa_q3_pres_model_bounds(const qa_q3_pres_scene_model *source) {
 }
 /* TS tags[Math.min(frame, frames.length - 1)]?.find(tag => tag.name === name). */
 static const qa_model_tag *find_tag(const qa_q3_mesh_model *model, const char *name, double frame) {
-  double clamped = frame < (double)model->frame_count - 1 ? frame : (double)model->frame_count - 1;
+  double clamped = qa_js_min(frame, (double)model->frame_count - 1); /* Math.min keeps a NaN frame, which has no row */
   size_t row = 0;
   if (!model_index(clamped, model->tag_row_count, &row)) return NULL;
   for (size_t i = 0; i < model->tag_row_counts[row]; i++) {

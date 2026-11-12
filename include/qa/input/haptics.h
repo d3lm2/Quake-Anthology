@@ -93,6 +93,11 @@ typedef struct qa_seat_haptics_options {
   void *load_ctx;
   double (*now)(void *ctx);
   void *now_ctx;
+  /* TS controllers is Pick<SdlControllers, "rumble">: when rumble is set it is called in place of
+   * qa_sdl_controllers_rumble(controllers, ...), as a TS caller passes any object with that method. */
+  qa_controller_operation_result (*rumble)(void *ctx, double device, double low, double high,
+                                           double duration_milliseconds);
+  void *rumble_ctx;
 } qa_seat_haptics_options;
 
 typedef struct qa_seat_haptics qa_seat_haptics;

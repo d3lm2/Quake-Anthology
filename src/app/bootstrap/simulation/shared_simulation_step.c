@@ -28,9 +28,7 @@
 #include "qa/world/actors/body.h"
 
 static noreturn void ss_fail(const char *format, ...) {
-  char message[1024];
-  va_list args; va_start(args, format); vsnprintf(message, sizeof message, format, args); va_end(args);
-  qa_raise("Error", 0, 0, "%s", message);
+  va_list args; va_start(args, format); qa_ss_raise_error(format, args);
 }
 static double ss_time_seconds(const qa_app_shared_simulation *sim) { return qa_ss_seconds(sim->source_frame.time); }
 static qa_shared_body_table *ss_bodies(qa_app_shared_simulation *sim) { return qa_app_sim_shared_physics_bodies(sim->physics); }
@@ -88,6 +86,16 @@ static bool ss_command_jump(const qa_user_command *command) {
   double up = 0; return ss_up_move(command, &up) && up > 0;
 }
 static double ss_mask_attack(double buttons) { return (double)(qa_js_to_int32(buttons) & ~1); }
+/* TS `try { ... } finally { player.gravityMultiplier = gravityMultiplier; }`: the saved multiplier, restored when
+ * the guarded call raises (the normal path pops the node and restores it inline). */
+typedef struct ss_gravity_restore { qa_app_sim_movement_player *player; double gravity_multiplier; } ss_gravity_restore;
+static void ss_restore_gravity(void *ctx) {
+  ss_gravity_restore *restore = ctx;
+  restore->player->gravity_multiplier = restore->gravity_multiplier;
+}
+static void ss_checking_q2_rules_off(void *ctx) { ((qa_app_shared_simulation *)ctx)->checking_q2_rules = false; }
+static void ss_free_turns(void *ctx) { qa_app_sim_ordered_actor_turns_destroy(ctx); }
+static void ss_free_visited(void *ctx) { free(((qa_app_sim_actor_visited *)ctx)->actors); }
 
 /* orderedActorTurns(this.actors, actor => this.sourcePosition(actor.id), visited) */
 static void ss_turn_position(void *ctx, qa_owned_actor actor, double out[2]) {
@@ -125,6 +133,7 @@ static void ss_deadline_add(ss_deadlines *set, double value) {
   }
   set->values[set->count++] = value;
 }
+static void ss_free_deadlines(void *ctx) { free(((ss_deadlines *)ctx)->values); }
 void qa_app_shared_sim_run_qvm_selected_actors(qa_app_shared_simulation *sim) {
   qa_ss_selected_weapon_source *q2 = sim->has_selected_weapon_source && qa_ss_is(sim->selected_weapon_source.kind, "q2")
       ? &sim->selected_weapon_source : NULL;
@@ -135,6 +144,7 @@ void qa_app_shared_sim_run_qvm_selected_actors(qa_app_shared_simulation *sim) {
     if (q3.kind != QA_CLOCK_Q3) ss_fail("Selected Q3 source lost its clock");
   }
   ss_deadlines deadlines = {0};
+  qa_cleanup deadlines_node; qa_cleanup_push(&deadlines_node, ss_free_deadlines, &deadlines);
   double now = ss_time_seconds(sim) * 1000;
   if (q2) for (double due = q2->next_milliseconds; due <= now; due += q2->interval_milliseconds) ss_deadline_add(&deadlines, due);
   if (has_q3) for (double due = sim->selected_q3_next; due <= now; due += q3.server_frame_milliseconds) ss_deadline_add(&deadlines, due);
@@ -164,7 +174,9 @@ void qa_app_shared_sim_run_qvm_selected_actors(qa_app_shared_simulation *sim) {
       if (sim->selected_q3_source) qa_app_q3_selected_source_synchronize(sim->selected_q3_source);
     }
     qa_app_sim_actor_visited visited = {0};
+    qa_cleanup visited_node; qa_cleanup_push(&visited_node, ss_free_visited, &visited);
     qa_app_sim_ordered_actor_turns *turns = qa_app_sim_ordered_actor_turns_create(sim->actors, ss_turn_position, sim);
+    qa_cleanup turns_node; qa_cleanup_push(&turns_node, ss_free_turns, turns);
     qa_owned_actor actor;
     while (qa_app_sim_ordered_actor_turns_next(turns, &visited, &actor)) {
       qa_app_sim_actor_execution *execution = qa_ss_map_get(&sim->actor_executions, &actor.id);
@@ -186,11 +198,13 @@ void qa_app_shared_sim_run_qvm_selected_actors(qa_app_shared_simulation *sim) {
       }
       qa_app_sim_shared_physics_commit_attachments(sim->physics);
     }
+    qa_cleanup_pop(&turns_node); qa_cleanup_pop(&visited_node);
     qa_app_sim_ordered_actor_turns_destroy(turns);
     free(visited.actors);
     for (size_t i = 0; i < sim->weapon_slots.count; i++)
       qa_app_sim_weapon_slot_reconcile(*(qa_app_sim_weapon_slot **)qa_ss_map_value_at(&sim->weapon_slots, i));
   }
+  qa_cleanup_pop(&deadlines_node);
   free(deadlines.values);
 }
 
@@ -317,17 +331,23 @@ qa_simulation_output qa_app_shared_sim_step_async(qa_app_shared_simulation *sim,
     qa_app_shared_sim_assert_open(sim);
     qa_app_shared_sim_assert_bot_restore_ready(sim);
     if (sim->stepping || sim->checkpoint_in_progress) ss_fail("Simulation step is already running or a checkpoint is active");
+    qa_app_shared_sim_release_call_storage(sim); /* C ownership: no caller holds per-call records between steps */
     return qa_app_shared_sim_step_native_q2_async(sim, input, progress, progress_ctx);
   }
   if (sim->strategy->as_q3_qvm(sim) == NULL) return qa_app_shared_sim_step(sim, input);
   qa_app_shared_sim_assert_open(sim);
   if (sim->stepping || sim->checkpoint_in_progress) ss_fail("Simulation step is already running or a checkpoint is active");
+  qa_app_shared_sim_release_call_storage(sim); /* C ownership: no caller holds per-call records between steps */
   if (!isfinite(input.elapsed_milliseconds) || input.elapsed_milliseconds < 0) qa_range_error("Host elapsed time must be finite and nonnegative");
   qa_app_q3_qvm_server_game *guest = sim->source.qvm;
   qa_app_q3_guest_records *records = qa_app_q3_qvm_server_game_records(guest);
   ss_qvm_entry *commands = calloc(input.command_count ? input.command_count : 1, sizeof *commands);
   qa_actor_id *seen = calloc(input.command_count ? input.command_count : 1, sizeof *seen);
-  if (!commands || !seen) qa_range_error("Out of memory");
+  if (!commands || !seen) { free(commands); free(seen); qa_range_error("Out of memory"); }
+  /* The command map and the run below can throw; the arrays are the GC's in TS. */
+  qa_cleanup commands_node, seen_node;
+  qa_cleanup_push(&commands_node, free, commands);
+  qa_cleanup_push(&seen_node, free, seen);
   size_t seen_count = 0;
   for (size_t i = 0; i < input.command_count; i++) {
     const qa_actor_command *command = &input.commands[i];
@@ -402,6 +422,7 @@ qa_simulation_output qa_app_shared_sim_step_async(qa_app_shared_simulation *sim,
   qa_simulation_output output = ss_output(sim, true);
   qa_cleanup_pop(&stepping);
   sim->stepping = false;
+  qa_cleanup_pop(&seen_node); qa_cleanup_pop(&commands_node);
   free(commands); free(seen);
   return output;
 }
@@ -434,7 +455,8 @@ static const qa_arsenal_intent *ss_prepare_netquake(void *ctx, qa_q1_user_comman
   qa_actor_command command = *received;
   command.command.kind = QA_USER_COMMAND_Q1; command.command.as.q1 = effective;
   if (arsenal) command.arsenal = arsenal;
-  qa_actor_command prepared = qa_app_shared_sim_prepare_arsenal_command(sim, prepare->player, command, false);
+  qa_arsenal_intent storage;
+  qa_actor_command prepared = qa_app_shared_sim_prepare_arsenal_command(sim, prepare->player, command, false, &storage);
   if (!prepared.arsenal) { *out_has = false; return NULL; }
   prepare->arsenal = *prepared.arsenal; *out_has = true;
   return &prepare->arsenal;
@@ -445,7 +467,7 @@ typedef struct ss_execute {
   qa_app_sim_movement_player *player;
   qa_actor_command command;
   qa_ss_map *pending_q1_pre_think;
-  qa_arsenal_intent arsenal_storage;
+  qa_arsenal_intent arsenal_storage, prepared_storage;
 } ss_execute;
 static void ss_execute_command(ss_execute *execute, qa_user_command effective, const qa_arsenal_intent *arsenal) {
   ss_step *step = execute->step; qa_app_shared_simulation *sim = step->sim;
@@ -457,7 +479,7 @@ static void ss_execute_command(ss_execute *execute, qa_user_command effective, c
     qa_ss_map_delete(execute->pending_q1_pre_think, &player);
     if (!sim->strategy->pre_think(sim, player, &execute->command)) return;
   }
-  execute->command = qa_app_shared_sim_prepare_arsenal_command(sim, player, execute->command, step->paused);
+  execute->command = qa_app_shared_sim_prepare_arsenal_command(sim, player, execute->command, step->paused, &execute->prepared_storage);
   if (step->paused && step->lmctf && !qa_q2_lmctf_can_move(step->lmctf, player->actor.id)) {
     player->last_sequence = execute->command.sequence;
     return;
@@ -484,6 +506,8 @@ static void ss_execute_command(ss_execute *execute, qa_user_command effective, c
       else if (player->state.kind == QA_MOVEMENT_STATE_Q2_RERELEASE) player->state.as.q2_rerelease.gravity = gravity;
       else player->state.as.q3.gravity = gravity;
     }
+    ss_gravity_restore restore = {player, gravity_multiplier};
+    qa_cleanup restore_node; qa_cleanup_push(&restore_node, ss_restore_gravity, &restore);
     qa_app_sim_relative_movement_input relative_input = {execute->command.command, execute->command.angle_space};
     qa_app_sim_relative_movement_input relative_out = qa_app_sim_relative_movement_command(relative_input, qa_app_sim_movement_player_read_state(player));
     qa_actor_command relative = execute->command;
@@ -496,6 +520,7 @@ static void ss_execute_command(ss_execute *execute, qa_user_command effective, c
         ? qa_app_sim_movement_player_move_command(player, relative, movement_frame, NULL)
         : qa_app_sim_movement_player_move(player, relative, movement_frame, NULL);
     sim->strategy->movement_applied(sim, player->actor.id, &moved);
+    qa_cleanup_pop(&restore_node);
     player->gravity_multiplier = gravity_multiplier;
   }
   if (!ss_live(sim, player->actor.id)) return;
@@ -514,7 +539,9 @@ static void ss_execute_command(ss_execute *execute, qa_user_command effective, c
     qa_app_sim_movement_environment_player environment = {player->has_source_environment, player->source_environment,
         player->gravity_multiplier, player->state, player->flight, qa_app_sim_movement_player_speed_multiplier(player)};
     weapon.environment = qa_app_sim_player_movement_environment(environment, combat.value); weapon.gauntlet_hit = false;
+    qa_cleanup release; qa_cleanup_push(&release, free, (void *)weapon.arsenal.ammo); /* freed if the step raises */
     qa_weapon_step_result result = qa_app_shared_sim_weapon_step(sim, weapon);
+    qa_cleanup_pop(&release);
     /* A selected arsenal read is malloc'd and weaponStep's selected path never returns its input arsenal; the
      * result is the player's adopted arsenal (qa_app_shared_sim_store_player_arsenal). */
     if (sim->has_selected_arsenal) free((void *)weapon.arsenal.ammo);
@@ -531,6 +558,8 @@ static void ss_execute_operation(void *ctx, qa_user_command command, const qa_ar
 
 /* TS finishFrameState(run, paused): character animation and end-of-frame hooks for the selected source after its actors have run. */
 static void ss_finish_frame_state(qa_app_shared_simulation *sim, bool run, bool paused) {
+  /* The frame's actor turns are over: no released actor's q3-source execution record is still in use. */
+  qa_app_shared_sim_free_retired_q3_executions(sim);
   sim->strategy->finish_frame(sim, run);
   for (size_t i = 0; i < sim->characters.count; i++) {
     qa_owned_actor actor = qa_ss_map_key_at(&sim->characters, i)->owned;
@@ -591,6 +620,10 @@ typedef struct ss_boundary_state {
   bool prepares_q1_clients;
 } ss_boundary_state;
 typedef enum ss_flow { SS_FLOW_GO, SS_FLOW_NEXT, SS_FLOW_BREAK } ss_flow;
+static void ss_free_boundary_maps(void *ctx) {
+  ss_boundary_state *b = ctx;
+  qa_ss_map_free(&b->pending_netquake); qa_ss_map_free(&b->pending_q1_pre_think);
+}
 #define SS_BOUNDARY_LOCALS \
   qa_app_shared_simulation *sim = step->sim; \
   bool active = qa_ss_is(step->settlement.kind, "active"); \
@@ -682,7 +715,9 @@ static ss_flow ss_admit_boundary_inputs(ss_step *step, ss_boundary_state *b) {
     }
     if (sim->strategy->intermission_fading(sim)) {
       sim->checking_q2_rules = true;
+      qa_cleanup checking; qa_cleanup_push(&checking, ss_checking_q2_rules_off, sim);
       sim->strategy->fade_intermission(sim);
+      qa_cleanup_pop(&checking);
       sim->checking_q2_rules = false;
       sim->source_frame = qa_source_clock_enter(&sim->clock, QA_FRAME_PHASE_FRAME_EXIT);
       if (qa_event_ring_pending(&sim->transitions, &sim->transitions_cursor) != 0) return SS_FLOW_BREAK;
@@ -701,7 +736,8 @@ static ss_flow ss_admit_boundary_inputs(ss_step *step, ss_boundary_state *b) {
         qa_app_shared_sim_observe_client_command(sim, command);
         if (b->applications) { qa_app_sim_movement_player_receive_netquake(player, *command); qa_ss_map_set(&b->pending_netquake, &player->actor.id, command); }
         else {
-          qa_app_sim_movement_player_receive_netquake(player, qa_app_shared_sim_prepare_arsenal_command(sim, player, *command, false));
+          qa_arsenal_intent storage;
+          qa_app_sim_movement_player_receive_netquake(player, qa_app_shared_sim_prepare_arsenal_command(sim, player, *command, false, &storage));
           if (sim->grapple) qa_app_sim_grapple_runtime_set_jump(sim->grapple, player->actor.id, (qa_js_to_int32(ss_buttons(&command->command)) & 2) != 0);
         }
         if (sim->strategy->intermission_active(sim)) sim->strategy->request_intermission_exit(sim, player->actor.id, player->buttons);
@@ -713,7 +749,10 @@ static ss_flow ss_admit_boundary_inputs(ss_step *step, ss_boundary_state *b) {
         player->gravity_multiplier *= sim->grapple ? qa_app_sim_grapple_runtime_gravity_scale(sim->grapple, player->actor.id) : 1;
         qa_frame_context frame = sim->source_frame; frame.phase = QA_FRAME_PHASE_CLIENT_COMMAND;
         ss_netquake_prepare prepare = {step, player, &b->pending_netquake, {0}};
+        ss_gravity_restore restore = {player, gravity_multiplier};
+        qa_cleanup restore_node; qa_cleanup_push(&restore_node, ss_restore_gravity, &restore);
         qa_app_sim_movement_player_prepare_netquake(player, frame, b->applications ? ss_prepare_netquake : NULL, &prepare);
+        qa_cleanup_pop(&restore_node);
         player->gravity_multiplier = gravity_multiplier;
       }
     }
@@ -723,8 +762,7 @@ static ss_flow ss_admit_boundary_inputs(ss_step *step, ss_boundary_state *b) {
   }
   if (sim->strategy->intermission_fading(sim)) return SS_FLOW_NEXT;
   if (run && !active) {
-    qa_app_shared_sim_tick_horde_wave(sim); qa_app_shared_sim_tick_tag(sim);
-    qa_app_shared_sim_tick_lmctf(sim); qa_app_shared_sim_tick_deathball(sim);
+    qa_app_foreign_match_rules_tick(sim);
   }
   if (run && !b->prepares_q1_clients && !active)
     b->bot_commands = qa_app_sim_bot_services_frame(&sim->bot_services, sim->source_frame.time.kind == QA_SOURCE_TIME_MILLISECONDS
@@ -743,7 +781,7 @@ static void ss_apply_boundary_commands(ss_step *step, ss_boundary_state *b) {
     if (!player) continue;
     if (command.sequence <= player->last_sequence) continue;
     qa_app_shared_sim_observe_client_command(sim, &command);
-    ss_execute execute = {step, player, command, b->applications ? &b->pending_q1_pre_think : NULL, {0}};
+    ss_execute execute = {step, player, command, b->applications ? &b->pending_q1_pre_think : NULL, {0}, {0}};
     if (b->applications) {
       qa_app_sim_relative_movement_input relative_input = {command.command, command.angle_space};
       qa_app_sim_relative_movement_input relative = qa_app_sim_relative_movement_command(relative_input, qa_app_sim_movement_player_read_state(player));
@@ -761,7 +799,9 @@ static void ss_advance_boundary_actors(ss_step *step, ss_boundary_state *b) {
   if (!step->paused) {
     if (run) sim->strategy->begin_actor_turns(sim, sim->source_frame);
     qa_app_sim_actor_visited visited = {0};
+    qa_cleanup visited_node; qa_cleanup_push(&visited_node, ss_free_visited, &visited);
     qa_app_sim_ordered_actor_turns *turns = qa_app_sim_ordered_actor_turns_create(sim->actors, ss_turn_position, sim);
+    qa_cleanup turns_node; qa_cleanup_push(&turns_node, ss_free_turns, turns);
     qa_owned_actor actor;
     while (qa_app_sim_ordered_actor_turns_next(turns, &visited, &actor)) {
       if (sim->grapple && qa_ss_is(qa_app_sim_grapple_runtime_source(sim->grapple)->kind, "q3-qvm")
@@ -777,7 +817,10 @@ static void ss_advance_boundary_actors(ss_step *step, ss_boundary_state *b) {
           double gravity_multiplier = client_player->gravity_multiplier;
           client_player->gravity_multiplier *= sim->grapple ? qa_app_sim_grapple_runtime_gravity_scale(sim->grapple, actor.id) : 1;
           qa_frame_context frame = sim->source_frame; frame.phase = QA_FRAME_PHASE_ENTITY_PHYSICS;
+          ss_gravity_restore restore = {client_player, gravity_multiplier};
+          qa_cleanup restore_node; qa_cleanup_push(&restore_node, ss_restore_gravity, &restore);
           qa_app_sim_movement_player_physics_netquake(client_player, frame);
+          qa_cleanup_pop(&restore_node);
           client_player->gravity_multiplier = gravity_multiplier;
           if (!ss_live(sim, actor.id)) continue;
           if (client_player->state.kind == QA_MOVEMENT_STATE_Q1)
@@ -904,6 +947,7 @@ static void ss_advance_boundary_actors(ss_step *step, ss_boundary_state *b) {
       if (ss_live(sim, actor.id)) qa_app_sim_shared_physics_step(sim->physics, actor, elapsed);
       qa_app_sim_shared_physics_commit_attachments(sim->physics);
     }
+    qa_cleanup_pop(&turns_node); qa_cleanup_pop(&visited_node);
     qa_app_sim_ordered_actor_turns_destroy(turns);
     free(visited.actors);
   }
@@ -967,6 +1011,7 @@ static void ss_step_body(void *ctx) {
   for (size_t i = 0; i < step->plan.boundary_count; i++) {
     ss_boundary_state b; memset(&b, 0, sizeof b);
     ss_begin_step_boundary(step, &step->plan.boundaries[i], &b);
+    qa_cleanup maps_node; qa_cleanup_push(&maps_node, ss_free_boundary_maps, &b);
     ss_flow flow = ss_admit_boundary_inputs(step, &b);
     bool stop = flow == SS_FLOW_BREAK;
     if (flow == SS_FLOW_GO) {
@@ -974,7 +1019,8 @@ static void ss_step_body(void *ctx) {
       ss_advance_boundary_actors(step, &b);
       stop = ss_close_step_boundary(step, &b);
     }
-    qa_ss_map_free(&b.pending_netquake); qa_ss_map_free(&b.pending_q1_pre_think);
+    qa_cleanup_pop(&maps_node);
+    ss_free_boundary_maps(&b);
     if (stop) break;
   }
   sim->strategy->after_step(sim);
@@ -985,6 +1031,7 @@ qa_simulation_output qa_app_shared_sim_step(qa_app_shared_simulation *sim, qa_in
   qa_app_shared_sim_assert_open(sim);
   qa_app_shared_sim_assert_bot_restore_ready(sim);
   if (sim->stepping || sim->checkpoint_in_progress) ss_fail("Simulation step is already running or a checkpoint is active");
+  qa_app_shared_sim_release_call_storage(sim); /* C ownership: no caller holds per-call records between steps */
   qa_app_source_step_route route = sim->strategy->step_route(sim);
   if (route == QA_APP_SOURCE_STEP_NATIVE) return qa_app_shared_sim_step_native_q2(sim, input);
   if (route == QA_APP_SOURCE_STEP_AWAITED) ss_fail("Q3 guest requires the awaited simulation step");
@@ -1143,8 +1190,10 @@ void qa_app_shared_sim_native_q2_frames(qa_app_shared_simulation *sim, qa_input_
       qa_actor_id *copy = calloc(count ? count : 1, sizeof *copy);
       if (!copy) qa_range_error("Out of memory");
       memcpy(copy, players, count * sizeof *copy);
+      qa_cleanup copy_node; qa_cleanup_push(&copy_node, free, copy);
       for (size_t i = 0; i < count; i++)
         qa_app_shared_sim_step_hand_grenade(sim, copy[i], qa_app_shared_sim_equipment_player_available(sim, copy[i]) ? "alive" : "dead");
+      qa_cleanup_pop(&copy_node);
       free(copy);
     }
     qa_app_shared_sim_run_qvm_selected_actors(sim);

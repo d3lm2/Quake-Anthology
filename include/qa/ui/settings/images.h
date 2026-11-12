@@ -6,5 +6,8 @@
 
 qa_ui_setting_bindings qa_ui_bind_image_settings(qa_cvar_registry *registry);
 qa_ui_setting_bindings qa_ui_bind_model_settings(qa_cvar_registry *registry);
+/* The two above over a SettingCvars view (read at each call). */
+qa_ui_setting_bindings qa_ui_bind_image_settings_view(qa_ui_setting_cvars cvars);
+qa_ui_setting_bindings qa_ui_bind_model_settings_view(qa_ui_setting_cvars cvars);
 
 #endif

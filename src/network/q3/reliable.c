@@ -115,7 +115,9 @@ bool qa_q3_server_reliable_commands_replace_pending(qa_q3_server_reliable_comman
   for (int64_t s = sent + 1; s <= r->current; s++) {
     const char *pending = qa_q3_reliable_ring_lookup_masked(r, s);
     if (strncmp(text, pending, 2) != 0) continue;
-    if (config_string_number(text) != config_string_number(pending)) continue;
+    /* configStringNumber(command) !== configStringNumber(pending): both can raise, command first. */
+    int64_t command_index = config_string_number(text);
+    if (command_index != config_string_number(pending)) continue;
     replace_slot(r, s, text);
     return true;
   }

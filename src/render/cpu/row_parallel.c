@@ -218,19 +218,20 @@ bool qa_row_parallel_pool_try_create(qa_row_parallel_pool *pool,qa_row_shared_fr
   bool ok=p->workers&&p->threads;
   for(size_t i=0;ok&&i<p->worker_count;i++)ok=qa_row_worker_init(&p->workers[i],shared,&p->control);
   for(size_t i=0;ok&&i<p->worker_count;i++){ ok=pthread_create(&p->threads[i],NULL,qa_row_worker_main,&p->workers[i])==0; if(ok)p->started++; }
-  /* The TS constructor waits 30s for readiness, then closes and yields null. */
+  /* The TS constructor waits 30s for readiness, then closes and throws; tryCreate reports that message. */
+  bool started=ok;
   if(ok){
     struct timespec deadline=deadline_after(30);
     pthread_mutex_lock(&p->control.lock);
     while(ok&&p->control.ready<p->worker_count)ok=pthread_cond_timedwait(&p->control.progress,&p->control.lock,&deadline)!=ETIMEDOUT||p->control.ready>=p->worker_count;
     pthread_mutex_unlock(&p->control.lock);
   }
-  if(!ok){ pool_stop_threads(p); pool_free(p); pool->failure="Row workers did not start"; return false; }
+  if(!ok){ pool_stop_threads(p); pool_free(p); pool->failure=started?"Row-parallel workers did not become ready":"Row workers did not start"; return false; }
   pool->impl=p; pool->worker_count=count; return true;
 }
 double qa_row_parallel_pool_worker_count(const qa_row_parallel_pool *pool){ return pool?pool->worker_count:0; }
 qa_row_registries qa_row_parallel_pool_registries(qa_row_parallel_pool *pool){
-  if(!pool->impl)qa_range_error("Row-parallel pool is closed");
+  if(!pool->impl)qa_raise("Error", 0, 0, "Row-parallel pool is closed");
   qa_row_registries r; r.ctx=pool->impl; r.texture_id=pool_tex_id; r.lighting_id=pool_lit_id; r.depth_id=pool_dep_id; return r;
 }
 typedef struct coordinator_job { pimpl *pool; const qa_triangle_setup *setups; size_t count; double band_rows; } coordinator_job;
@@ -244,7 +245,7 @@ static void coordinator_bands(void *ctx){
   }
 }
 void qa_row_parallel_pool_run(qa_row_parallel_pool *pool,const qa_triangle_setup *setups,size_t count){
-  pimpl *p=(pimpl*)pool->impl; if(!p)qa_range_error("Row-parallel pool is closed");
+  pimpl *p=(pimpl*)pool->impl; if(!p)qa_raise("Error", 0, 0, "Row-parallel pool is closed");
   size_t floats=count*QA_ROW_SETUP_STRIDE; double *fresh=NULL;
   if(p->job==NULL||p->job_cap<floats){
     size_t cap=floats>8192?floats:8192; double *grown=(double*)realloc(p->job,cap*sizeof *grown);
@@ -273,17 +274,17 @@ void qa_row_parallel_pool_run(qa_row_parallel_pool *pool,const qa_triangle_setup
    * the barrier: bands are row-disjoint and setups run in order within a band, so
    * the output is identical. */
   coordinator_job job; job.pool=p; job.setups=setups; job.count=count; job.band_rows=band_rows;
-  char failure[1024]; bool completed=qa_range_error_catch(coordinator_bands,&job,failure,sizeof failure);
+  qa_caught_error failure; bool completed=qa_try(coordinator_bands,&job,&failure);
   struct timespec deadline=deadline_after(120);
   pthread_mutex_lock(&control->lock);
   while(control->done<p->worker_count){
-    if(pthread_cond_timedwait(&control->progress,&control->lock,&deadline)==ETIMEDOUT&&control->done<p->worker_count)qa_range_error("Row-parallel rasterization timed out");
+    if(pthread_cond_timedwait(&control->progress,&control->lock,&deadline)==ETIMEDOUT&&control->done<p->worker_count)qa_raise("Error", 0, 0, "Row-parallel rasterization timed out");
   }
   bool worker_failed=control->failed; char worker_error[sizeof control->error]; memcpy(worker_error,control->error,sizeof worker_error);
   pthread_mutex_unlock(&control->lock);
   pool->jobs_run++;
-  if(worker_failed)qa_range_error("Row-parallel worker failed: %s",worker_error);
-  if(!completed)qa_range_error("%s",failure);
+  if(worker_failed)qa_raise("Error", 0, 0, "Row-parallel worker failed: %s",worker_error);
+  if(!completed)qa_rethrow(&failure); /* if (failure !== null) throw failure: the coordinator's own error, whatever its class */
 }
 void qa_row_parallel_pool_close(qa_row_parallel_pool *pool){
   if(!pool||!pool->impl)return;

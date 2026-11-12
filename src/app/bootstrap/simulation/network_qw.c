@@ -10,6 +10,7 @@
 #include "qa/compat/qc/program.h"
 #include "qa/content/mounts.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include "qa/network/common/session.h"
 #include "qa/network/q1/checksum.h"
@@ -476,15 +477,23 @@ static void free_phases(qw_host *h) {
   for (size_t i = 0; i < h->phase_count; i++) free(h->phases[i]);
   free(h->phases); h->phases = NULL; h->phase_count = 0;
 }
-static void refresh_authentication(qw_host *h) {
-  qa_cvar_registry *cvars = qa_app_sim_quakec_source_cvars(h->game);
-  free(h->password); free(h->spectator_password);
-  h->password = qa_cvar_registry_variable_string(cvars, "password");
-  h->spectator_password = qa_cvar_registry_variable_string(cvars, "spectator_password");
-  h->authentication.password = h->password;
-  h->authentication.spectator_password = h->spectator_password;
-  h->authentication.high_characters = cvar(h, "sv_highchars") != 0;
+/* TS authentication getters: read the cvars live; each string is kept until the next
+ * call of the same getter. */
+static const char *auth_password(void *ctx) {
+  qw_host *h = ctx;
+  char *value = qa_cvar_registry_variable_string(qa_app_sim_quakec_source_cvars(h->game), "password");
+  free(h->password);
+  h->password = value;
+  return h->password;
 }
+static const char *auth_spectator_password(void *ctx) {
+  qw_host *h = ctx;
+  char *value = qa_cvar_registry_variable_string(qa_app_sim_quakec_source_cvars(h->game), "spectator_password");
+  free(h->spectator_password);
+  h->spectator_password = value;
+  return h->spectator_password;
+}
+static bool auth_high_characters(void *ctx) { return cvar(ctx, "sv_highchars") != 0; }
 static qa_qw_user_command idle(void) { qa_qw_user_command command; memset(&command, 0, sizeof command); return command; }
 typedef struct admit_scope { qw_host *h; const qa_qw_connect_request *request; qa_client_id id; double index; bool spectator; qa_app_qw_player player; } admit_scope;
 static void admit_body(void *ctx) {
@@ -520,7 +529,6 @@ static void admit_body(void *ctx) {
 static qa_app_qw_admission host_admit(void *ctx, const void *request_value) {
   qw_host *h = ctx;
   const qa_qw_connect_request *request = request_value;
-  refresh_authentication(h);
   qa_app_qw_admission result;
   memset(&result, 0, sizeof result);
   double limit = request->spectator ? qa_js_max(0, qa_js_min(32, trunc(cvar(h, "maxspectators")))) : h->simulation->options->max_clients;
@@ -646,9 +654,8 @@ static void path_body(void *ctx) {
 static const void *host_prepare_download(void *ctx, qa_app_qw_player player, const char *requested) {
   (void)player; /* TS _player */
   qw_host *h = ctx;
-  size_t length = strlen(requested);
-  char *path = xcalloc(length + 1, 1);
-  for (size_t i = 0; i < length; i++) path[i] = requested[i] >= 'A' && requested[i] <= 'Z' ? (char)(requested[i] + 32) : requested[i];
+  char *path = qa_js_to_lower_case(requested); /* requestedPath.toLowerCase(): the whole of Unicode */
+  if (path == NULL) qa_range_error("Out of memory");
   const qa_download_source *result = NULL;
   qa_caught_error caught;
   path_scope scope = {path};
@@ -788,9 +795,15 @@ static void host_command(void *ctx, qa_app_qw_player player, const char *name, c
     message.slot = player.slot; message.key = xstrdup(key); message.str_value = xstrdup(value);
     queue_admit(h, message, destination(QA_QC_DEST_BROADCAST, true, NULL));
   } else {
-    char text_value[512];
-    snprintf(text_value, sizeof text_value, "Unhandled QW client command: %s", name);
+    /* options.print(`Unhandled QW client command: ${name}`): the whole name. */
+    size_t length = strlen(name) + sizeof "Unhandled QW client command: ";
+    char *text_value = xcalloc(length, 1);
+    snprintf(text_value, length, "Unhandled QW client command: %s", name);
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, text_value);
     print_to(h, text_value);
+    qa_cleanup_pop(&guard);
+    free(text_value);
   }
 }
 static void host_observe(void *ctx, const void *output, const void *const *events_value, size_t count) {
@@ -798,7 +811,6 @@ static void host_observe(void *ctx, const void *output, const void *const *event
   qw_host *h = ctx;
   const qa_app_sim_network_simulation *s = h->simulation;
   const qa_app_sim_presentation_event *const *events = (const qa_app_sim_presentation_event *const *)events_value;
-  refresh_authentication(h);
   free_phases(h);
   routed_clear(&h->routed);
   h->routed = h->queued; /* routed = queued.take(cursor); queued.retire() */
@@ -924,8 +936,7 @@ static const void *host_client_info(void *ctx, qa_app_qw_player player) { return
 static const void *host_supports_source_wire(void *ctx) { qw_host *h = ctx; h->support.supported = true; return &h->support; }
 static const void *const *host_masters(void *ctx, size_t *out_count) {
   qw_host *h = ctx;
-  *out_count = h->options.master_count;
-  return h->options.masters;
+  return h->options.masters(h->options.masters_ctx, out_count);
 }
 static void host_print(void *ctx, const char *text_value) { print_to(ctx, text_value); }
 
@@ -958,6 +969,10 @@ static void host_network_info(void *ctx, qa_app_qw_player player, qa_app_qw_netw
   qa_app_sim_quakec_client_network network = { info.ctx, info.address, info.ping };
   qa_app_sim_quakec_source_set_client_network(h->game, player.client, network);
 }
+static void destroy_partial(void *ctx) {
+  qa_app_qw_server_host host; memset(&host, 0, sizeof host); host.ctx = ctx;
+  qa_app_sim_qw_application_server_host_destroy(host);
+}
 qa_app_qw_server_host qa_app_sim_create_qw_application_server_host(qa_app_sim_qw_server_binding_options options) {
   const qa_app_sim_network_simulation *s = options.simulation;
   const qa_app_sim_network_content *content = options.content;
@@ -965,8 +980,9 @@ qa_app_qw_server_host qa_app_sim_create_qw_application_server_host(qa_app_sim_qw
   if (game == NULL || !is(qa_app_sim_quakec_source_kind(game), "quakeworld") || content->world.kind != QA_DECODED_WORLD_Q1)
     qa_raise("Error", 0, 0, "Native QW wire requires its admitted QuakeWorld source and 32 reserved players");
   qw_host *h = xcalloc(1, sizeof *h);
+  /* A refused setup (precache limit, checksum read, cvars) keeps nothing it built. */
   qa_cleanup guard;
-  qa_cleanup_push(&guard, free, h);
+  qa_cleanup_push(&guard, destroy_partial, h);
   h->options = options; h->simulation = s; h->game = game; h->world = content->world.as.q1;
   /* The source's name list is scratch storage the next precacheNames call replaces: keep copies (TS arrays). */
   const char *const *names = qa_app_sim_quakec_source_precache_names(game, "model", &h->model_count);
@@ -1007,6 +1023,8 @@ qa_app_qw_server_host qa_app_sim_create_qw_application_server_host(qa_app_sim_qw
   for (size_t i = 0; i < h->baseline_count; i++) h->baseline_pointers[i] = &h->baselines[i];
   message_list records;
   memset(&records, 0, sizeof records);
+  qa_cleanup records_guard;
+  qa_cleanup_push(&records_guard, (void (*)(void *))list_clear, &records);
   for (size_t i = 0; i < h->baseline_count; i++) {
     qa_quakeworld_message message = blank("baseline");
     message.state = h->baselines[i].state;
@@ -1041,10 +1059,14 @@ qa_app_qw_server_host qa_app_sim_create_qw_application_server_host(qa_app_sim_qw
     }
   }
   h->signon = encode(records.values, records.count);
+  qa_cleanup_pop(&records_guard);
   list_clear(&records);
   for (size_t i = 0; i < 64; i++) h->styles[i] = xstrdup(s->light_style(s->ctx, (double)i));
   h->previous_pause = s->q1_paused(s->ctx);
-  refresh_authentication(h);
+  h->authentication.ctx = h;
+  h->authentication.password = auth_password;
+  h->authentication.spectator_password = auth_spectator_password;
+  h->authentication.high_characters = auth_high_characters;
   qa_cleanup_pop(&guard);
   qa_app_qw_server_host host;
   memset(&host, 0, sizeof host);

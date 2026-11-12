@@ -1,5 +1,6 @@
 /* Port of src/content/held-weapon.ts. GPL-2.0-or-later. */
 #include "qa/content/held_weapon.h"
+#include "qa/content/json_text.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -80,15 +81,10 @@ bool qa_read_held_weapon_declaration(const qa_save_reader *reader,
     size_t digest_count = qa_save_reader_list_count(&digests_reader);
     const char **digests =
         (const char **)calloc(digest_count ? digest_count : 1, sizeof *digests);
-    qa_save_reader vertices_reader = field(&part, "vertices");
-    size_t vertex_count = qa_save_reader_list_count(&vertices_reader);
-    double *vertices =
-        (double *)calloc(vertex_count ? vertex_count : 1, sizeof *vertices);
     subset = (qa_held_weapon_part *)calloc(1, sizeof *subset);
-    if (digests == NULL || vertices == NULL || subset == NULL) {
-      free(digests); free(vertices); free(subset);
+    if (digests == NULL || subset == NULL) {
+      free(digests); free(subset);
       qa_save_reader_destroy(&digests_reader);
-      qa_save_reader_destroy(&vertices_reader);
       qa_save_reader_destroy(&part);
       qa_save_reader_destroy(&digest_reader);
       qa_save_reader_destroy(&model);
@@ -96,9 +92,8 @@ bool qa_read_held_weapon_declaration(const qa_save_reader *reader,
     }
     subset->digests.values = digests;
     subset->digests.count = digest_count;
-    subset->vertices.values = vertices;
-    subset->vertices.count = vertex_count;
     out->model.part = subset; /* for the OOM cleanup below */
+    /* TS order: the digests list is read in full before vertices is looked at. */
     for (size_t i = 0; i < digest_count; i++) {
       qa_save_reader element = item(&digests_reader, i);
       const char *text = read_digest(&element);
@@ -106,10 +101,20 @@ bool qa_read_held_weapon_declaration(const qa_save_reader *reader,
       qa_save_reader_destroy(&element);
       if (digests[i] == NULL) {
         qa_save_reader_destroy(&digests_reader);
-        qa_save_reader_destroy(&vertices_reader);
         goto oom_part;
       }
     }
+    qa_save_reader vertices_reader = field(&part, "vertices");
+    size_t vertex_count = qa_save_reader_list_count(&vertices_reader);
+    double *vertices =
+        (double *)calloc(vertex_count ? vertex_count : 1, sizeof *vertices);
+    if (vertices == NULL) {
+      qa_save_reader_destroy(&digests_reader);
+      qa_save_reader_destroy(&vertices_reader);
+      goto oom_part;
+    }
+    subset->vertices.values = vertices;
+    subset->vertices.count = vertex_count;
     for (size_t i = 0; i < vertex_count; i++) {
       qa_save_reader element = item(&vertices_reader, i);
       vertices[i] = qa_save_reader_integer_min(&element, 0);
@@ -165,7 +170,7 @@ oom_part:
 
 bool qa_read_held_weapon_file(const uint8_t *bytes, size_t length,
                               qa_held_weapon_declaration *out) {
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (value == NULL) return false;
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, NULL)) {

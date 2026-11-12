@@ -17,13 +17,13 @@ const char *qa_q3_pres_scoreboard_cvar_name(qa_q3_pres_scoreboard_cvar cvar) {
 void qa_q3_pres_base_scoreboard_init(qa_q3_pres_base_scoreboard *scoreboard,
     qa_q3_pres_client_game_state *state, qa_q3_pres_client_game_static_state *static_state,
     qa_q3_pres_base_scoreboard_host host) {
-  if (state->product != static_state->product) qa_range_error("Scoreboard state products differ");
+  if (state->product != static_state->product) qa_raise("Error", 0, 0, "Scoreboard state products differ");
   if (host.icons->state != state || host.icons->media.static_state != static_state ||
-      host.players->host.state != state)
-    qa_range_error("Scoreboard services must share canonical cgame state");
+      qa_q3_pres_client_info_store_state(host.clients) != state || host.players->host.state != state)
+    qa_raise("Error", 0, 0, "Scoreboard services must share canonical cgame state");
   for (int index = 0; index < 64; index++) {
     if (qa_q3_pres_client_info_store_client_info(host.clients, index) != &static_state->client_info[index])
-      qa_range_error("Scoreboard client store must use canonical client slots");
+      qa_raise("Error", 0, 0, "Scoreboard client store must use canonical client slots");
   }
   scoreboard->state = state;
   scoreboard->static_state = static_state;
@@ -40,7 +40,7 @@ static double board_cvar(qa_q3_pres_base_scoreboard *board, qa_q3_pres_scoreboar
   return value;
 }
 static qa_q3_base_source_player_state *snapshot_ps(qa_q3_pres_base_scoreboard *board) {
-  if (!board->state->snap) qa_range_error("CG_DrawOldScoreboard requires a current snapshot");
+  if (!board->state->snap) qa_raise("Error", 0, 0, "CG_DrawOldScoreboard requires a current snapshot");
   return &board->state->snap->player_state;
 }
 static qa_q3_pres_client_score *score_at(qa_q3_pres_base_scoreboard *board, double index) {

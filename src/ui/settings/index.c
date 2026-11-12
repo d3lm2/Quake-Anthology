@@ -89,7 +89,7 @@ typedef qa_ui_setting_control_storage control_ctx;
 
 static void require_seat(control_ctx *ctx, qa_seat_id actual) {
   if (!qa_same_seat(actual, ctx->seat))
-    qa_range_error("Settings control belongs to another seat");
+    qa_raise("Error", 0, 0, "Settings control belongs to another seat");
 }
 static void ctl_activate(void *v, qa_seat_id seat) {
   control_ctx *ctx = v;
@@ -174,10 +174,23 @@ qa_ui_control qa_ui_setting_control(const qa_ui_setting_binding *binding,
   return control;
 }
 
+/* ---- SettingCvars views ---------------------------------------------- */
+
+qa_ui_setting_cvars qa_ui_setting_cvars_of(qa_cvar_registry *registry) {
+  qa_ui_setting_cvars cvars = { registry, NULL, NULL };
+  return cvars;
+}
+bool qa_ui_setting_cvars_present(const qa_ui_setting_cvars *cvars) {
+  return cvars->current != NULL || cvars->registry != NULL;
+}
+qa_cvar_registry *qa_ui_setting_cvars_get(const qa_ui_setting_cvars *cvars) {
+  return cvars->current != NULL ? cvars->current(cvars->ctx) : cvars->registry;
+}
+
 /* ---- bindCvarSetting ------------------------------------------------- */
 
 typedef struct cvar_setting {
-  qa_cvar_registry *registry;
+  qa_ui_setting_cvars cvars;
   qa_restart_controls *restarts;
   qa_ui_cvar_setting_spec spec;
   char *id;
@@ -188,8 +201,8 @@ typedef struct cvar_setting {
 
 static void cvar_read_into(cvar_setting *s, char **out) {
   qa_cvar_read read;
-  if (!qa_cvar_registry_find(s->registry, s->spec.name, &read))
-    qa_range_error("Settings cvar was unregistered: %s", s->spec.name);
+  if (!qa_cvar_registry_find(qa_ui_setting_cvars_get(&s->cvars), s->spec.name, &read))
+    qa_raise("Error", 0, 0, "Settings cvar was unregistered: %s", s->spec.name);
   const char *value = read.latched_value != NULL ? read.latched_value
                                                  : read.value;
   free(*out);
@@ -198,7 +211,7 @@ static void cvar_read_into(cvar_setting *s, char **out) {
 }
 static void cvar_write(cvar_setting *s, const char *value) {
   qa_cvar_snapshot out;
-  if (qa_cvar_registry_set(s->registry, s->spec.name, value, false, &out))
+  if (qa_cvar_registry_set(qa_ui_setting_cvars_get(&s->cvars), s->spec.name, value, false, &out))
     qa_cvar_read_free(&out);
   if (s->spec.has_restart)
     qa_restart_controls_request(s->restarts, s->spec.restart);
@@ -206,8 +219,8 @@ static void cvar_write(cvar_setting *s, const char *value) {
 static bool cvar_enabled(void *v) {
   cvar_setting *s = v;
   qa_cvar_read read;
-  if (!qa_cvar_registry_find(s->registry, s->spec.name, &read)) return false;
-  qa_command_dialect dialect = qa_cvar_registry_dialect(s->registry);
+  if (!qa_cvar_registry_find(qa_ui_setting_cvars_get(&s->cvars), s->spec.name, &read)) return false;
+  qa_command_dialect dialect = qa_cvar_registry_dialect(qa_ui_setting_cvars_get(&s->cvars));
   int32_t readonly_flags =
       dialect == QA_COMMAND_DIALECT_Q3
           ? QA_CVAR_FLAG_READ_ONLY | QA_CVAR_FLAG_INIT
@@ -289,16 +302,24 @@ bool qa_ui_bind_cvar_setting(qa_cvar_registry *registry,
                              const qa_ui_cvar_setting_spec *spec,
                              qa_restart_controls *restarts,
                              qa_ui_setting_binding *out) {
+  return qa_ui_bind_cvar_setting_view(qa_ui_setting_cvars_of(registry), spec,
+                                      restarts, out);
+}
+bool qa_ui_bind_cvar_setting_view(qa_ui_setting_cvars cvars,
+                                  const qa_ui_cvar_setting_spec *spec,
+                                  qa_restart_controls *restarts,
+                                  qa_ui_setting_binding *out) {
   qa_cvar_read probe;
-  bool found = qa_cvar_registry_find(registry, spec->name, &probe);
+  bool found = qa_cvar_registry_find(qa_ui_setting_cvars_get(&cvars),
+                                     spec->name, &probe);
   if (found) qa_cvar_read_free(&probe);
-  if (!found) qa_range_error("Settings cvar has no owner: %s", spec->name);
+  if (!found) qa_raise("Error", 0, 0, "Settings cvar has no owner: %s", spec->name);
   if (spec->has_restart && restarts == NULL)
-    qa_range_error("Settings cvar needs a %s restart owner: %s",
-                   restart_name(spec->restart), spec->name);
+    qa_raise("Error", 0, 0, "Settings cvar needs a %s restart owner: %s",
+             restart_name(spec->restart), spec->name);
   cvar_setting *s = calloc(1, sizeof *s);
   if (s == NULL) return false;
-  s->registry = registry;
+  s->cvars = cvars;
   s->restarts = restarts;
   s->spec = *spec;
   size_t id_size = strlen("ui:settings:") + strlen(spec->name) + 1;
@@ -1192,13 +1213,14 @@ qa_ui_setting_bindings qa_ui_bind_mouse_motion_settings(
 
 /* music playlist / geometry (direct cvar reads, not bindCvarSetting) */
 typedef struct music_state {
-  qa_cvar_registry *registry;
+  qa_ui_setting_cvars cvars;
   const char *const *(*tracks)(void *, size_t *);
   void *tracks_ctx;
   qa_ui_setting_binding items[2];
   qa_ui_choice *choices;
   size_t choice_capacity;
-  char *scratch;
+  char *scratch;        /* the read_str result (a control's selected id) */
+  char *choice_current; /* the current track a choices() result names */
 } music_state;
 static void registry_set(qa_cvar_registry *registry, const char *name,
                          const char *value) {
@@ -1206,38 +1228,45 @@ static void registry_set(qa_cvar_registry *registry, const char *name,
   if (qa_cvar_registry_set(registry, name, value, false, &out))
     qa_cvar_read_free(&out);
 }
-static const char *registry_value(music_state *s, const char *name,
-                                  const char *fallback) {
+static char *registry_value(music_state *s, const char *name,
+                            const char *fallback) {
   qa_cvar_read read;
-  free(s->scratch);
-  if (qa_cvar_registry_find(s->registry, name, &read)) {
-    s->scratch = xstrdup(read.value);
+  char *value;
+  if (qa_cvar_registry_find(qa_ui_setting_cvars_get(&s->cvars), name, &read)) {
+    value = xstrdup(read.value);
     qa_cvar_read_free(&read);
   } else {
-    s->scratch = xstrdup(fallback);
+    value = xstrdup(fallback);
   }
-  return s->scratch;
+  return value;
 }
 static bool music_read_shuffle(void *v) {
   music_state *s = v;
-  return qa_cvar_registry_variable_value(s->registry, "music_shuffle") != 0;
+  return qa_cvar_registry_variable_value(qa_ui_setting_cvars_get(&s->cvars), "music_shuffle") != 0;
 }
 static void music_write_shuffle(void *v, bool value) {
   music_state *s = v;
-  registry_set(s->registry, "music_shuffle", value ? "1" : "0");
+  registry_set(qa_ui_setting_cvars_get(&s->cvars), "music_shuffle", value ? "1" : "0");
 }
 static const char *music_read_track(void *v) {
-  return registry_value(v, "music_menu_track", "auto");
+  music_state *s = v;
+  char *value = registry_value(s, "music_menu_track", "auto");
+  free(s->scratch);
+  s->scratch = value;
+  return s->scratch;
 }
 static void music_write_track(void *v, const char *value) {
   music_state *s = v;
-  registry_set(s->registry, "music_menu_track", value);
+  registry_set(qa_ui_setting_cvars_get(&s->cvars), "music_menu_track", value);
 }
 static const qa_ui_choice *music_choices(void *v, size_t *out_count) {
   music_state *s = v;
+  /* TS reads the current track before calling tracks(). The control built from
+     this binding keeps the read_str result as its selected id, so the choices
+     use their own copy rather than replacing it. */
+  char *current = registry_value(s, "music_menu_track", "auto");
   size_t track_count = 0;
   const char *const *tracks = s->tracks(s->tracks_ctx, &track_count);
-  char *current = xstrdup(registry_value(s, "music_menu_track", "auto"));
   /* Set semantics: tracks deduped in insertion order, then current. */
   size_t wanted = track_count + 3;
   if (s->choice_capacity < wanted) {
@@ -1260,11 +1289,9 @@ static const qa_ui_choice *music_choices(void *v, size_t *out_count) {
     for (size_t j = 2; j < at; j++)
       if (strcmp(s->choices[j].id, current) == 0) seen = true;
     if (!seen) {
-      /* The id/label borrow the registry scratch copy; keep a
-       * dedicated copy alive in the scratch slot. */
-      free(s->scratch);
-      s->scratch = current;
-      s->choices[at++] = (qa_ui_choice){ s->scratch, s->scratch };
+      free(s->choice_current);
+      s->choice_current = current;
+      s->choices[at++] = (qa_ui_choice){ s->choice_current, s->choice_current };
       current = NULL;
     }
   }
@@ -1276,18 +1303,26 @@ static void music_teardown(void *v) {
   music_state *s = v;
   free(s->choices);
   free(s->scratch);
+  free(s->choice_current);
   free(s);
 }
 qa_ui_setting_bindings qa_ui_bind_music_playlist_settings(
     qa_cvar_registry *registry,
     const char *const *(*tracks)(void *ctx, size_t *out_count),
     void *tracks_ctx) {
-  if (registry == NULL) {
+  return qa_ui_bind_music_playlist_settings_view(
+      qa_ui_setting_cvars_of(registry), tracks, tracks_ctx);
+}
+qa_ui_setting_bindings qa_ui_bind_music_playlist_settings_view(
+    qa_ui_setting_cvars cvars,
+    const char *const *(*tracks)(void *ctx, size_t *out_count),
+    void *tracks_ctx) {
+  if (!qa_ui_setting_cvars_present(&cvars)) {
     qa_ui_setting_bindings empty = { NULL, 0, NULL };
     return empty;
   }
   music_state *s = xcalloc(1, sizeof *s);
-  s->registry = registry;
+  s->cvars = cvars;
   s->tracks = tracks;
   s->tracks_ctx = tracks_ctx;
   qa_ui_setting_binding *b = s->items;
@@ -1318,26 +1353,31 @@ qa_ui_setting_bindings qa_ui_bind_music_playlist_settings(
 }
 
 typedef struct geometry_state {
-  qa_cvar_registry *registry;
+  qa_ui_setting_cvars cvars;
   qa_ui_setting_binding items[1];
 } geometry_state;
 static bool geometry_read(void *v) {
   geometry_state *s = v;
-  return qa_cvar_registry_variable_value(s->registry,
+  return qa_cvar_registry_variable_value(qa_ui_setting_cvars_get(&s->cvars),
                                          "s_geometryAcoustics") != 0;
 }
 static void geometry_write(void *v, bool value) {
   geometry_state *s = v;
-  registry_set(s->registry, "s_geometryAcoustics", value ? "1" : "0");
+  registry_set(qa_ui_setting_cvars_get(&s->cvars), "s_geometryAcoustics", value ? "1" : "0");
 }
 qa_ui_setting_bindings qa_ui_bind_audio_geometry_settings(
     qa_cvar_registry *registry) {
-  if (registry == NULL) {
+  return qa_ui_bind_audio_geometry_settings_view(
+      qa_ui_setting_cvars_of(registry));
+}
+qa_ui_setting_bindings qa_ui_bind_audio_geometry_settings_view(
+    qa_ui_setting_cvars cvars) {
+  if (!qa_ui_setting_cvars_present(&cvars)) {
     qa_ui_setting_bindings empty = { NULL, 0, NULL };
     return empty;
   }
   geometry_state *s = xcalloc(1, sizeof *s);
-  s->registry = registry;
+  s->cvars = cvars;
   qa_ui_setting_binding *b = s->items;
   b[0].id = "ui:audio:geometry";
   b[0].label = "Geometry sound obstruction";
@@ -1352,18 +1392,24 @@ qa_ui_setting_bindings qa_ui_bind_audio_geometry_settings(
 }
 
 /* audio settings */
-typedef struct audio_state {
-  qa_ui_audio_settings_service service;
-  bool has_output;
-  qa_ui_audio_output_settings output;
-  qa_ui_setting_binding items[6];
+/* One choice binding's read and choices results. The Output page builds the
+ * device and the three format controls together, and each keeps its selected
+ * id and choices until the next build, so they must not share storage. */
+typedef struct audio_pool {
   qa_ui_choice *choices;
   size_t choice_capacity;
   char **strings;
   size_t string_count, string_capacity;
   char read_buffer[512];
+} audio_pool;
+typedef struct audio_state {
+  qa_ui_audio_settings_service service;
+  bool has_output;
+  qa_ui_audio_output_settings output;
+  qa_ui_setting_binding items[6];
+  audio_pool device_pool;
 } audio_state;
-static char *audio_dup(audio_state *s, const char *text) {
+static char *audio_dup(audio_pool *s, const char *text) {
   if (s->string_count == s->string_capacity) {
     size_t cap = s->string_capacity == 0 ? 16 : s->string_capacity * 2;
     char **next = realloc(s->strings, cap * sizeof *next);
@@ -1375,11 +1421,16 @@ static char *audio_dup(audio_state *s, const char *text) {
   s->strings[s->string_count++] = copy;
   return copy;
 }
-static void audio_clear(audio_state *s) {
+static void audio_clear(audio_pool *s) {
   for (size_t i = 0; i < s->string_count; i++) free(s->strings[i]);
   s->string_count = 0;
 }
-static qa_ui_choice *audio_choice_pool(audio_state *s, size_t count) {
+static void audio_pool_free(audio_pool *s) {
+  audio_clear(s);
+  free(s->strings);
+  free(s->choices);
+}
+static qa_ui_choice *audio_choice_pool(audio_pool *s, size_t count) {
   if (s->choice_capacity < count) {
     qa_ui_choice *next = realloc(s->choices, count * sizeof *next);
     if (next == NULL) oom();
@@ -1392,17 +1443,18 @@ static const char *device_read(void *v) {
   audio_state *s = v;
   const char *selected = s->output.selected(s->output.ctx);
   if (selected == NULL) return "default";
-  snprintf(s->read_buffer, sizeof s->read_buffer, "device:%s", selected);
-  return s->read_buffer;
+  snprintf(s->device_pool.read_buffer, sizeof s->device_pool.read_buffer, "device:%s", selected);
+  return s->device_pool.read_buffer;
 }
 static const qa_ui_choice *device_choices(void *v, size_t *out_count) {
   audio_state *s = v;
-  audio_clear(s);
+  audio_pool *p = &s->device_pool;
+  audio_clear(p);
   size_t device_count = 0;
   const char *const *devices = s->output.devices(s->output.ctx,
                                                  &device_count);
   const char *current = s->output.selected(s->output.ctx);
-  qa_ui_choice *pool = audio_choice_pool(s, device_count + 2);
+  qa_ui_choice *pool = audio_choice_pool(p, device_count + 2);
   size_t at = 0;
   pool[at++] = (qa_ui_choice){ "default", "System default" };
   bool current_seen = false;
@@ -1416,17 +1468,17 @@ static const qa_ui_choice *device_choices(void *v, size_t *out_count) {
     if (seen) continue;
     char buffer[512];
     snprintf(buffer, sizeof buffer, "device:%s", devices[i]);
-    char *id = audio_dup(s, buffer);
+    char *id = audio_dup(p, buffer);
     if (current != NULL && strcmp(devices[i], current) == 0)
       current_seen = true;
-    pool[at++] = (qa_ui_choice){ id, audio_dup(s, devices[i]) };
+    pool[at++] = (qa_ui_choice){ id, audio_dup(p, devices[i]) };
   }
   if (current != NULL && !current_seen) {
     const char * id2;
     const char * label;
     char buffer[512];
     snprintf(buffer, sizeof buffer, "device:%s", current);
-    pool[at++] = (id2 = audio_dup(s, buffer), label = audio_dup(s, current), (qa_ui_choice){ id2,
+    pool[at++] = (id2 = audio_dup(p, buffer), label = audio_dup(p, current), (qa_ui_choice){ id2,
                                  label });
   }
   *out_count = at;
@@ -1450,7 +1502,7 @@ static void device_write(void *v, const char *value) {
   }
 }
 /* Format field discriminator: 0 rate, 1 bits, 2 channels. */
-typedef struct format_ctx { audio_state *state; int field; } format_ctx;
+typedef struct format_ctx { audio_state *state; int field; audio_pool pool; } format_ctx;
 static int64_t format_field(qa_audio_output_format format, int field) {
   return field == 0 ? format.sample_rate
          : field == 1 ? format.sample_bits
@@ -1461,14 +1513,15 @@ static const char *format_read(void *v) {
   audio_state *s = f->state;
   char *text = xnumber((double)format_field(
       s->output.format_read(s->output.ctx), f->field));
-  snprintf(s->read_buffer, sizeof s->read_buffer, "%s", text);
+  snprintf(f->pool.read_buffer, sizeof f->pool.read_buffer, "%s", text);
   free(text);
-  return s->read_buffer;
+  return f->pool.read_buffer;
 }
 static const qa_ui_choice *format_choices(void *v, size_t *out_count) {
   format_ctx *f = v;
   audio_state *s = f->state;
-  audio_clear(s);
+  audio_pool *p = &f->pool;
+  audio_clear(p);
   static const int64_t bits[2] = { 8, 16 };
   static const int64_t channels[2] = { 1, 2 };
   const int64_t *values = f->field == 0 ? qa_audio_output_rates
@@ -1477,7 +1530,7 @@ static const qa_ui_choice *format_choices(void *v, size_t *out_count) {
   size_t value_count = f->field == 0 ? 4 : 2;
   int64_t current = format_field(s->output.format_read(s->output.ctx),
                                  f->field);
-  qa_ui_choice *pool = audio_choice_pool(s, value_count + 1);
+  qa_ui_choice *pool = audio_choice_pool(p, value_count + 1);
   size_t at = 0;
   for (size_t i = 0; i <= value_count; i++) {
     const char * id2;
@@ -1492,7 +1545,7 @@ static const qa_ui_choice *format_choices(void *v, size_t *out_count) {
     if (f->field == 0) snprintf(label, sizeof label, "%s Hz", id_text);
     else if (f->field == 1) snprintf(label, sizeof label, "%s-bit", id_text);
     else snprintf(label, sizeof label, "%s", value == 1 ? "Mono" : "Stereo");
-    pool[at++] = (id2 = audio_dup(s, id_text), label2 = audio_dup(s, label), (qa_ui_choice){ id2,
+    pool[at++] = (id2 = audio_dup(p, id_text), label2 = audio_dup(p, label), (qa_ui_choice){ id2,
                                  label2 });
     free(id_text);
   }
@@ -1553,9 +1606,8 @@ static void audio_write_music(void *v, double value) {
 typedef struct audio_owner { audio_state state; format_ctx formats[3]; } audio_owner;
 static void audio_teardown(void *v) {
   audio_owner *o = v;
-  audio_clear(&o->state);
-  free(o->state.strings);
-  free(o->state.choices);
+  audio_pool_free(&o->state.device_pool);
+  for (int i = 0; i < 3; i++) audio_pool_free(&o->formats[i].pool);
   free(o);
 }
 qa_ui_setting_bindings qa_ui_bind_audio_settings(
@@ -1794,11 +1846,12 @@ static const char *pad_curve_read(void *v) {
 static void pad_curve_write(void *v, const char *value) {
   pad_ctx *c = v;
   if (strcmp(value, "radial") != 0 && strcmp(value, "axial") != 0)
-    qa_range_error("Unknown controller curve");
+    qa_raise("Error", 0, 0, "Unknown controller curve");
   bool look = c->field == PAD_LOOK_CURVE_TYPE;
   qa_gamepad_tuning t = pad_of(c->state)->tuning;
   qa_stick_curve previous = look ? t.look : t.move;
   qa_stick_curve curve = previous;
+  curve.parsed_order = true; /* TS builds a new literal: kind, deadzone, exponent[, outerThreshold] */
   if (strcmp(value, "radial") == 0) {
     curve.kind = QA_STICK_CURVE_RADIAL;
     curve.outer_threshold = qa_js_min(0.02, (1 - previous.deadzone) / 2);
@@ -2115,6 +2168,11 @@ static void pref_reset(void *v) {
 
 void qa_ui_seat_preferences_init(qa_ui_seat_preferences *prefs,
                                  qa_seat_id seat, qa_cvar_registry *cvars) {
+  qa_ui_seat_preferences_init_view(prefs, seat, qa_ui_setting_cvars_of(cvars));
+}
+void qa_ui_seat_preferences_init_view(qa_ui_seat_preferences *prefs,
+                                      qa_seat_id seat,
+                                      qa_ui_setting_cvars cvars) {
   memset(prefs, 0, sizeof *prefs);
   prefs->seat = seat;
   prefs->cvars = cvars;
@@ -2161,16 +2219,26 @@ void qa_ui_seat_preferences_init(qa_ui_seat_preferences *prefs,
     b->activate = pref_reset;
   }
 }
+void qa_ui_seat_preferences_destroy(qa_ui_seat_preferences *prefs) {
+  if (prefs == NULL) return;
+  for (size_t i = 0; i < QA_UI_PREFERENCE_BINDING_COUNT; i++) {
+    free(prefs->binding_ctx[i]);
+    prefs->binding_ctx[i] = NULL;
+    prefs->bindings[i].ctx = NULL;
+  }
+}
 qa_ui_preference_values qa_ui_seat_preferences_values(
     const qa_ui_seat_preferences *prefs) {
-  return prefs->cvars == NULL
+  return !qa_ui_setting_cvars_present(&prefs->cvars)
              ? prefs->local
-             : qa_ui_read_preferences(prefs->cvars, prefs->seat.index);
+             : qa_ui_read_preferences(qa_ui_setting_cvars_get(&prefs->cvars),
+                                      prefs->seat.index);
 }
 void qa_ui_seat_preferences_set_values(qa_ui_seat_preferences *prefs,
                                        qa_ui_preference_values values) {
-  if (prefs->cvars == NULL) prefs->local = values;
-  else qa_ui_write_preferences(prefs->cvars, prefs->seat.index, values);
+  if (!qa_ui_setting_cvars_present(&prefs->cvars)) prefs->local = values;
+  else qa_ui_write_preferences(qa_ui_setting_cvars_get(&prefs->cvars),
+                               prefs->seat.index, values);
 }
 const qa_ui_setting_binding *qa_ui_seat_preferences_bindings(
     qa_ui_seat_preferences *prefs, size_t *out_count) {

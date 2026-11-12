@@ -7,7 +7,7 @@
 #include "qa/foundation/support.h"
 
 const qa_mouse_tuning qa_default_mouse_tuning = {
-    3, 0, false, 0.022, 0.022, 0.8, 1, true, false, false, false};
+    3, 0, false, 0.022, 0.022, 0.8, 1, true, false, false, false, QA_MOUSE_KEYS_DEFAULT};
 
 void qa_mouse_input_init(qa_mouse_input *input, qa_mouse_tuning tuning) {
   memset(input, 0, sizeof *input);

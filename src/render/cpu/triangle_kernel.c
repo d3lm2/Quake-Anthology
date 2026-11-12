@@ -106,7 +106,8 @@ static void sample_level(const qa_texture_storage *t,qa_vec4 border,double u,dou
   }
   if(has_border){ o->r+=f32(border.x)*bw;o->g+=f32(border.y)*bw;o->b+=f32(border.z)*bw; if(t->has_alpha)o->a+=f32(border.w)*bw; }
 }
-static double dlen(double x,double y){ if(x==0)return fabs(y); if(y==0)return fabs(x); return hypot(x,y); }
+/* derivativeLength: Math.hypot, which is not the C library's correctly rounded hypot in the last bit. */
+static double dlen(double x,double y){ if(x==0)return fabs(y); if(y==0)return fabs(x); return qa_js_hypot2(x,y); }
 static void sample_components(const qa_bound_texture *t,double u,double v,bool has_rho,double rho,qa_cpu_sample *o,double xU,double xV,double yU,double yV){
   if(t->kind==QA_BOUND_TEXTURE_CONSTANT){*o=t->sample;return;}
   if(!has_rho) rho=qa_js_max(dlen(xU,xV),dlen(yU,yV));
@@ -133,12 +134,14 @@ static void sample_perspective(const qa_bound_texture *t,double u,double v,doubl
   sample_components(t,d.u_anchor+u,d.v_anchor+v,true,0,o,0,0,0,0);
 }
 void qa_cpu_sample_line_bound(const qa_bound_texture *t,qa_vec2 c,qa_line_texture_derivative d,qa_cpu_sample *o){
-  double rho=(t->kind==QA_BOUND_TEXTURE_IMAGE&&strcmp(t->mipmapping,"none"))?hypot(d.ds_per_pixel*t->levels[0].width,d.dt_per_pixel*t->levels[0].height):0;
+  double rho=(t->kind==QA_BOUND_TEXTURE_IMAGE&&strcmp(t->mipmapping,"none"))?qa_js_hypot2(d.ds_per_pixel*t->levels[0].width,d.dt_per_pixel*t->levels[0].height):0;
   qa_cpu_sample_bound(t,c.x,c.y,rho,o);
 }
 bool qa_cpu_stencil_fragment(uint32_t *stencil,size_t count,double index,bool passed,const char *fn,double cm,double wm,double mx,const char *df,const char *dp){
-  if(stencil==NULL) qa_range_error("Stencil test has no configured storage");
-  long i=(long)index; if(i<0||(size_t)i>=count) qa_range_error("Fragment is outside the stencil buffer");
+  if(stencil==NULL) qa_raise("Error",0,0,"Stencil test has no configured storage");
+  /* stencil[index] === undefined: outside the array, fractional or NaN */
+  if(!(index>=0&&index<(double)count&&index==floor(index))) qa_range_error("Fragment is outside the stencil buffer");
+  long i=(long)index;
   uint32_t prev=stencil[i];
   if(!strcmp(fn,"nonzero")&&(prev&(uint32_t)cm)==0) return false;
   const char *op=passed?dp:df;
@@ -148,7 +151,8 @@ bool qa_cpu_stencil_fragment(uint32_t *stencil,size_t count,double index,bool pa
 }
 static void write_fragment(qa_cpu_framebuffer *fb,double ab,double pixel,double r,double g,double b,double a,qa_blend_state bl,const char *mode){
   r=qa_cpu_clamp01(r);g=qa_cpu_clamp01(g);b=qa_cpu_clamp01(b);a=qa_cpu_clamp01(a);
-  long p=(long)pixel; if(p<0||(size_t)p>=fb->storage_count) qa_range_error("Fragment is outside the color buffer");
+  if(!(pixel>=0&&pixel<(double)fb->storage_count&&pixel==floor(pixel))) qa_range_error("Fragment is outside the color buffer");
+  long p=(long)pixel;
   uint32_t dest=(uint32_t)fb->color_words[p];
   double dr=(dest&255)/255.0,dg=((dest>>8)&255)/255.0,db=((dest>>16)&255)/255.0,da=ab==0?1:(dest>>24)/255.0;
   if(!strcmp(mode,"alpha")){double ia=1-a;fb->color_words[p]=(int32_t)qa_cpu_color_word(r*a+dr*ia,g*a+dg*ia,b*a+db*ia,ab==0?1:a*a+da*ia);}
@@ -177,8 +181,10 @@ static bool run_internal(const qa_triangle_setup *s,qa_cpu_framebuffer *fb,qa_cp
       double wb=(s->attribute_bx*sx+aB+s->attribute_bc)*s->inverse_area;
       double wc=(s->attribute_cx*sx+aC+s->attribute_cc)*s->inverse_area;
       double depth=s->constant_depth?s->plane_depth:qa_cpu_clamp01(qa_cpu_clamp01((s->az*wa+s->bz*wb+s->cz*wc)*0.5+0.5)*depthRange+s->depth_near+s->polygon_depth_offset);
-      double pixel=rowOff+x; long pi=(long)pixel;
-      if(pi<0||(size_t)pi>=fb->storage_count) qa_range_error("Fragment is outside the depth buffer");
+      double pixel=rowOff+x;
+      /* depths[pixel] === undefined: outside the buffer, fractional or NaN */
+      if(!(pixel>=0&&pixel<(double)fb->storage_count&&pixel==floor(pixel))) qa_range_error("Fragment is outside the depth buffer");
+      long pi=(long)pixel;
       double old=fb->depth[pi];
       bool passed=!((!strcmp(s->depth_test,"less-equal")&&depth>old)||(!strcmp(s->depth_test,"equal")&&depth!=old));
       if(!passed&&!s->stencil_enabled) continue;

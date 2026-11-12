@@ -3,10 +3,10 @@
  * DLL extensions, GPL-2.0-or-later.
  * C accommodations: Q2RereleaseEvent union is one struct on kind
  * (exact strings); Q2RereleaseHooks is fn+ctx; Q2RereleasePlayerState
- * owns dogtag/socialId/helpImage strings (fixed buffers; values are
- * short source strings) and a malloc'd helpPoints array. Plain TS
- * Errors abort via qa_q2rr_error ("Error: <msg>"); RangeErrors use
- * qa_range_error. Getters that would share a type name get _get_.
+ * owns its socialId/dogtag/helpImage strings (malloc'd, any length) and
+ * a malloc'd helpPoints array. Plain TS Errors are raised by
+ * qa_q2rr_error (qa_raise "Error"); RangeErrors use qa_range_error.
+ * Getters that would share a type name get _get_.
  */
 #ifndef QA_CONTENT_Q2_RERELEASE_TYPES_H
 #define QA_CONTENT_Q2_RERELEASE_TYPES_H
@@ -22,6 +22,8 @@
 #include "qa/text/world.h"
 
 noreturn void qa_q2rr_error(const char *format, ...);
+/* *field = copy of value (NULL is ""); frees the previous text. Aborts on OOM. */
+void qa_q2rr_set_text(char **field, const char *value);
 /* strdup; NULL only on OOM. NULL in -> NULL. */
 char *qa_q2rr_dup(const char *s);
 /* Case-insensitive ASCII compare (TS toLowerCase equality). */
@@ -56,10 +58,13 @@ typedef struct qa_q2rr_pending_landmark {
   qa_vec3 relative_origin, relative_velocity, relative_view_angles;
 } qa_q2rr_pending_landmark;
 
-/** TS Q2RereleasePlayerState (class). */
+/** TS Q2RereleasePlayerState (class). social_id, dogtag and help_image are
+ * owned (qa_q2rr_set_text; released by _destroy). A state decoded from a save
+ * borrows them and its help_points from the decoded document and is never
+ * destroyed; restore clones it. */
 typedef struct qa_q2rr_player_extra_state {
   double seat;
-  char social_id[128];
+  char *social_id;
   bool spawned;
   double game_help1_changed, game_help2_changed, help_changed, help_time;
   double invisibility_until, invisibility_fade_until, slime_debounce;
@@ -72,7 +77,7 @@ typedef struct qa_q2rr_player_extra_state {
   bool bob_skip;
   double auto_switch; /* 0|1|2|3 */
   double auto_shield;
-  char dogtag[128];
+  char *dogtag;
   double impact_delta;
   bool on_ladder;
   double grapple_released_until;
@@ -83,7 +88,7 @@ typedef struct qa_q2rr_player_extra_state {
   double respawn_timeout;
   qa_q2rr_pending_landmark pending_landmark;
   qa_vec3 help_location;
-  char help_image[128];
+  char *help_image;
   qa_vec3 *help_points; size_t help_point_count, help_point_cap;
   double help_index, help_draw_time, help_marker_until;
 } qa_q2rr_player_extra_state;

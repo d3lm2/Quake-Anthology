@@ -1,6 +1,7 @@
 /* Port of src/app/bootstrap/q3-client/qvm.ts. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "qa/app/bootstrap/q3_client/qvm.h"
+#include "qa/foundation/caught_message.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdnoreturn.h>
@@ -744,7 +745,9 @@ static int32_t proceed(qa_qvm_module_function_call *call) {
 }
 static int32_t call_word(const qa_qvm_module_function_call *call, int64_t index) {
   int64_t offset = index * 4;
-  if (offset < 0 || offset + 4 > (int64_t)call->words_length) qa_range_error("Offset is outside the bounds of the DataView");
+  /* TS call.words.getInt32(index * 4, true): a native DataView read (only the stores of a writable view have their own refusal). */
+  if (offset < 0) qa_range_error("byteOffset cannot be negative");
+  if (offset + 4 > (int64_t)call->words_length) qa_range_error("Out of bounds access");
   int32_t value;
   memcpy(&value, call->words + offset, sizeof value);
   return value;
@@ -1277,10 +1280,10 @@ void qa_app_application_qvm_client_close(qa_app_application_qvm_client *client) 
   void (*const cleanups[])(void *) = {cleanup_observers, cleanup_cgame, cleanup_ui, cleanup_cgame_files,
                                       cleanup_ui_files, cleanup_cgame_scripts, cleanup_ui_scripts, cleanup_globals};
   size_t failures = 0;
-  qa_caught_error first;
   for (size_t i = 0; i < sizeof cleanups / sizeof cleanups[0]; i++) {
     qa_caught_error error;
-    if (!qa_try(cleanups[i], client, &error) && failures++ == 0) first = error;
+    if (!qa_try(cleanups[i], client, &error)) failures++;
   }
-  if (failures > 0) qa_raise("AggregateError", 0, (long long)failures, "QVM client cleanup failed: %s", first.message);
+  /* new AggregateError(failures, "QVM client cleanup failed"): the message names no inner error. */
+  if (failures > 0) qa_raise("AggregateError", 0, (long long)failures, "QVM client cleanup failed");
 }

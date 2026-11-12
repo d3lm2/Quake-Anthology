@@ -302,6 +302,11 @@ static void write_block(struct encoder_output *output,
   if (zeroes > 0) out_symbol(output, component->ac_codes, 0);
 }
 
+static void components_release(void *arg) {
+  struct encoder_component *components = (struct encoder_component *)arg;
+  for (int i = 0; i < 3; i++) free(components[i].samples);
+}
+
 static int is_integer(double value) {
   return isfinite(value) && trunc(value) == value;
 }
@@ -399,6 +404,10 @@ uint8_t *qa_encode_jpeg(const qa_jpeg_image *image, int64_t quality,
     component->dc_codes = specs[i].sampling == 2 ? &lum_dc : &chr_dc;
     component->ac_codes = specs[i].sampling == 2 ? &lum_ac : &chr_ac;
   }
+  /* A source destination that runs out raises a RangeError mid-stream: the
+   * component strips must not leak when the caller catches it. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, components_release, components);
   int16_t block[64];
   float workspace[64];
   if (!output.oom) {
@@ -427,7 +436,8 @@ uint8_t *qa_encode_jpeg(const qa_jpeg_image *image, int64_t quality,
       }
     }
   }
-  for (int i = 0; i < 3; i++) free(components[i].samples);
+  qa_cleanup_pop(&guard);
+  components_release(components);
   out_bits(&output, 127, 7);
   out_byte(&output, 255);
   out_byte(&output, 217);

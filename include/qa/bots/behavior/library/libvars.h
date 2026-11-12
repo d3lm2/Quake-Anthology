@@ -20,13 +20,28 @@ typedef struct qa_bot_lib_string_pointer {
   qa_bot_memory_allocation allocation;
   int64_t offset;
 } qa_bot_lib_string_pointer;
+/* One TS Map entry: a pointer ID (1..0xffffffff) and its value. */
+typedef struct qa_bot_lib_record_entry {
+  uint32_t pointer;
+  qa_bot_lib_var *record;
+} qa_bot_lib_record_entry;
+typedef struct qa_bot_lib_string_entry {
+  uint32_t pointer;
+  qa_bot_lib_string_pointer cell;
+} qa_bot_lib_string_entry;
 typedef struct qa_bot_lib_vars {
   qa_bot_memory owned_memory;
   qa_bot_memory *memory;
-  qa_bot_lib_var **records; /* indexed by pointer ID; NULL is absent */
-  size_t record_capacity;
-  qa_bot_lib_string_pointer *strings; /* indexed by pointer ID */
-  size_t string_capacity;
+  /* The TS records and strings Maps: entries in insertion order, keyed by pointer ID. A saved
+   * pointer ID can be anything below 2^32, so nothing is indexed by it. While the IDs are
+   * ascending (always, except after restoring a save that lists them otherwise) lookups
+   * bisect; otherwise they scan. */
+  qa_bot_lib_record_entry *records;
+  size_t record_count, record_capacity;
+  bool records_unsorted;
+  qa_bot_lib_string_entry *strings;
+  size_t string_count, string_capacity;
+  bool strings_unsorted;
   qa_bot_lib_var **retired; /* cleared views kept readable-as-freed until destroy */
   size_t retired_count, retired_capacity;
   int64_t next_pointer;

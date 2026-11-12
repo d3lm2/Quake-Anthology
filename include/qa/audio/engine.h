@@ -102,6 +102,10 @@ qa_audio_output_format qa_unified_audio_output_format(
 int64_t qa_unified_audio_sample_clock(const qa_unified_audio *audio);
 int64_t qa_unified_audio_queued_frames(qa_unified_audio *audio);
 const char *qa_unified_audio_selected_output(const qa_unified_audio *audio);
+/* The SdlAudioUnavailableError message ("SDL_OpenAudioDevice: <SDL_GetError()>", "SDL_InitSubSystem AUDIO: ...") of
+ * the last qa_unified_audio_open_device or qa_unified_audio_select_output that returned
+ * QA_SDL_AUDIO_OPEN_UNAVAILABLE (for select, the selection's error TS rethrows); empty before any. */
+const char *qa_unified_audio_open_error(const qa_unified_audio *audio);
 /* Malloc'd copy of pendingOutput; caller frees. */
 int16_t *qa_unified_audio_pending_output(qa_unified_audio *audio,
                                          size_t *out_count);

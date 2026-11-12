@@ -1,5 +1,6 @@
 /* Port of src/app/bootstrap/network/q3-types.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/network/q3_types.h"
+#include "qa/foundation/caught_message.h"
 #include <string.h>
 #include "qa/foundation/support.h"
 void qa_app_q3_game_callback(const char *(*fn)(void *ctx), void *ctx) {
@@ -13,5 +14,5 @@ void qa_app_q3_game_call(void (*fn)(void *ctx), void *ctx) {
   qa_caught_error caught;
   if (qa_try(fn, ctx, &caught)) return;
   if (strcmp(caught.name, QA_APP_Q3_GAME_CALLBACK_ERROR) == 0) qa_rethrow(&caught);
-  qa_raise(QA_APP_Q3_GAME_CALLBACK_ERROR, 0, 0, "Q3 game callback failed: %s", caught.message);
+  qa_raise(QA_APP_Q3_GAME_CALLBACK_ERROR, 0, 0, "Q3 game callback failed: %s", qa_caught_message(&caught));
 }

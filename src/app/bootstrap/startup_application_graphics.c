@@ -15,7 +15,9 @@
 #include "qa/app/bootstrap/menu_art.h"
 #include "qa/console/draw.h"
 #include "qa/console/metrics.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/js.h"
+#include "qa/input/support.h"
 #include "qa/render/commands/frame.h"
 #include "qa/text/draw2d.h"
 #include "qa/text/layout.h"
@@ -72,6 +74,18 @@ static void menu_reset(void *ctx) {
   menu_input_record *record = ctx;
   record->reset(record->app, record->seat);
 }
+static bool menu_scope_available(void *ctx) {
+  qa_startup_application *app = ctx;
+  return app->graphics != NULL && qa_app_startup_input_profile_layered(app->graphics->input_profile);
+}
+static bool menu_scope_local(void *ctx) {
+  qa_startup_application *app = ctx;
+  return app->graphics != NULL && qa_app_startup_input_profile_bind_local(app->graphics->input_profile);
+}
+static void menu_scope_set_local(void *ctx, bool local) {
+  qa_startup_application *app = ctx;
+  if (app->graphics != NULL) qa_app_startup_input_profile_set_bind_local(app->graphics->input_profile, local);
+}
 void qa_startup_graphics_bind_menu_input(qa_startup_application *app, qa_seat_input *input, qa_seat_id seat,
     bool (*available)(void *ctx, qa_seat_id seat), void (*reset)(void *ctx, qa_seat_id seat)) {
   menu_input_record *record = calloc(1, sizeof *record);
@@ -83,7 +97,9 @@ void qa_startup_graphics_bind_menu_input(qa_startup_application *app, qa_seat_in
   record->binding_reset.ctx = record;
   record->binding_reset.available = menu_reset_available;
   record->binding_reset.reset = menu_reset;
-  qa_app_startup_menu_bind_input(app->graphics->menu, input, NULL, 0, menu_actions, record, &record->binding_reset);
+  /* { available: () => this.graphics?.inputProfile.layered === true, local: () => ...bindLocal === true, setLocal } */
+  qa_ui_binding_scope scope = {app, menu_scope_available, menu_scope_local, menu_scope_set_local, NULL};
+  qa_app_startup_menu_bind_input_scoped(app->graphics->menu, input, NULL, 0, menu_actions, record, &record->binding_reset, &scope);
   free(app->menu_input_binding_record);
   app->menu_input_binding_record = record;
 }
@@ -163,7 +179,7 @@ static void open_graphics_body(void *ctx) {
   browser_call call = {app, NULL};
   qa_caught_error caught;
   if (qa_try(browser_body, &call, &caught)) app->browser = call.browser;
-  else qa_startup_printf(app, "Server browser unavailable: %s\n", caught.message);
+  else qa_startup_printf(app, "Server browser unavailable: %s\n", qa_caught_message(&caught));
   qa_app_startup_stamp("server-browser");
   qa_startup_open_graphics(app);
   qa_app_startup_stamp("openGraphics");
@@ -247,6 +263,13 @@ void qa_startup_application_destroy(qa_startup_application *app) {
   qa_app_startup_saves_destroy(app->saves);
   for (size_t i = 0; i < app->external_directory_count; i++) free(app->external_directories[i]);
   free(app->external_directories);
+  while (app->retired_external != NULL) {
+    struct qa_startup_directory_list *retired = app->retired_external;
+    app->retired_external = retired->next;
+    for (size_t i = 0; i < retired->count; i++) free(retired->items[i]);
+    free(retired->items);
+    free(retired);
+  }
   qa_app_keys_destroy(app->keys);
   if (app->session != NULL) qa_engine_session_destroy(app->session);
   if (app->has_identity) qa_identity_owner_destroy(&app->identity);
@@ -265,7 +288,9 @@ void qa_startup_application_destroy(qa_startup_application *app) {
 typedef struct graphics_state {
   qa_startup_application *app;
   qa_scene_frame_builder builder; bool has_builder;
-  qa_image_resource_operation *drained;  /* the last drained operations (the frame borrows them) */
+  /* Every array the frame being built drained (the frame borrows them: a drained array owns what its operations
+   * point at); released when the next frame begins, after this one has executed. */
+  qa_image_resource_operation **drained; size_t drained_count, drained_capacity;
   qa_text_font_selection font;           /* activeFont.font */
   qa_seat_text_presentation console_text;
   char *provider_name;                   /* `${family}:official` */
@@ -299,6 +324,7 @@ static void print_host(qa_startup_application *app, const char *text) {
   if (app->host.base.print != NULL) app->host.base.print(app->host.base.ctx, text);
 }
 static void host_print_fn(void *ctx, const char *text) { print_host(ctx, text); }
+static void app_print_fn(void *ctx, const char *text) { qa_startup_application_print(ctx, text); }
 static void set_menu_status(qa_startup_application *app, const char *text) {
   if (app->graphics != NULL && app->graphics->menu != NULL) qa_app_startup_menu_set_status(app->graphics->menu, text, false);
 }
@@ -330,9 +356,14 @@ static void own_bindings(graphics_state *state, qa_ui_setting_bindings bindings)
   if (bindings.count != 0) memcpy(state->settings + state->setting_count, bindings.items, bindings.count * sizeof *items);
   state->setting_count += bindings.count;
 }
+static void drained_release(graphics_state *state) {
+  for (size_t i = 0; i < state->drained_count; i++) free(state->drained[i]);
+  state->drained_count = 0;
+}
 static void graphics_state_free(graphics_state *state) {
   if (state == NULL) return;
   if (state->has_builder) qa_scene_frame_builder_destroy(&state->builder);
+  drained_release(state);
   free(state->drained);
   free(state->provider_name);
   for (size_t i = 0; i < state->owner_count; i++) qa_ui_setting_bindings_free(&state->owners[i]);
@@ -346,8 +377,7 @@ static void graphics_state_free(graphics_state *state) {
   if (state->has_controller_store) qa_config_store_destroy(&state->controller_store);
   if (state->has_policy) qa_scene_image_policy_owned_destroy(&state->policy);
   for (size_t i = 0; i < state->art_pixel_count; i++) free(state->art_pixels[i]);
-  /* SeatUiPreferences binding contexts (as ui.c releases its seat preferences). */
-  for (size_t i = 0; i < QA_UI_PREFERENCE_BINDING_COUNT; i++) free(state->accessibility.binding_ctx[i]);
+  qa_ui_seat_preferences_destroy(&state->accessibility);
   free(state->capture_root);
   free(state);
 }
@@ -482,7 +512,7 @@ static void menu_load(void *ctx, const char *id) {
     qa_app_startup_action *action = qa_startup_stage(app, QA_APP_STARTUP_ACTION_LOAD);
     action->path = qa_startup_dup(call.path);
   } else {
-    qa_startup_set_text(&app->status, caught.message);
+    qa_startup_set_text(&app->status, qa_caught_message(&caught));
     set_menu_status(app, app->status);
   }
 }
@@ -508,12 +538,24 @@ static const char *const *output_devices(void *ctx, size_t *out_count) {
   return (const char *const *)state->output_names;
 }
 typedef struct output_call { qa_startup_application *app; const char *name; bool has_format; qa_audio_output_format format; } output_call;
+/* engine.selectOutput throws what the open threw (the menu reports it and skips the rest of the closure). As in
+ * audio.c check_selection: an allocation failure inside the open has no SDL text, and a selection failing only SDL2's
+ * exact-queue probe keeps the restored previous output (TS's SDL3 stream passes that probe). */
+static void check_output_selection(qa_unified_audio *output, qa_sdl_audio_open_result result) {
+  if (result == QA_SDL_AUDIO_OPEN_OK) return;
+  const char *message = result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : qa_unified_audio_open_error(output);
+  if (result == QA_SDL_AUDIO_OPEN_UNAVAILABLE
+      && strcmp(message, "SDL audio driver cannot report exact queued input frames at this sample rate") == 0)
+    return;
+  qa_raise("Error", 0, 0, "%s", message);
+}
 static void output_select_body(void *ctx) {
   output_call *call = ctx;
   qa_unified_audio *output = current_audio(call->app);
-  if (!call->has_format) (void)qa_unified_audio_select_output(output, call->name, NULL, false);
+  if (!call->has_format) check_output_selection(output, qa_unified_audio_select_output(output, call->name, NULL, false));
   else {
-    (void)qa_unified_audio_select_output(output, qa_unified_audio_selected_output(output), &call->format, false);
+    check_output_selection(output,
+        qa_unified_audio_select_output(output, qa_unified_audio_selected_output(output), &call->format, false));
     qa_app_write_audio_output_cvars(qa_app_image_settings_cvars(local_graphics(call->app)->image_settings), qa_unified_audio_output_format(output));
   }
   set_menu_status(call->app, "");
@@ -683,11 +725,19 @@ static const char *capture_root(void *ctx) {
   qa_startup_application *app = ctx;
   qa_app_client_bootstrap *client = capture_client(app);
   graphics_state *state = state_of(app);
+  /* this.captureClient().configuration.current.scripts.native?.layout.directory ?? applicationCaptureRoot(...) */
+  qa_native_config *native = qa_app_console_script_files_native(client->configuration_current.scripts);
+  if (native != NULL) return native->layout->directory;
   free(state->capture_root);
   state->capture_root = qa_app_application_capture_root(client->configuration_current.options != NULL
       ? client->configuration_current.options->user_content_root : NULL);
   if (state->capture_root == NULL) qa_range_error("Out of memory");
   return state->capture_root;
+}
+/* naming: () => this.captureClient().configuration.current.scripts.native?.layout.screenshots ?? defaultNaming */
+static const qa_screenshot_naming *capture_naming(void *ctx) {
+  qa_native_config *native = qa_app_console_script_files_native(capture_client(ctx)->configuration_current.scripts);
+  return native != NULL ? &native->layout->screenshots : &qa_app_capture_default_naming;
 }
 static const char *capture_map_name(void *ctx) { return qa_app_client_source_capture_map(capture_client(ctx)->source_current); }
 static const char *capture_write(void *ctx, const char *(*operation)(void *op_ctx), void *op_ctx) {
@@ -741,13 +791,13 @@ static void video_publish_window(void *ctx, qa_sdl_window *window) {
   attach_call rollback = {app, previous};
   qa_caught_error rollback_error;
   if (!qa_try(attach_body, &rollback, &rollback_error))
-    qa_raise("AggregateError", 2, 0, "Video input rollback failed: %s; %s", error.message, rollback_error.message);
+    qa_raise("AggregateError", 0, 2, "Video input rollback failed");
   qa_rethrow(&error);
 }
 typedef struct dump_call { qa_startup_application *app; const char *text; } dump_call;
 static void dump_body(void *ctx) {
   dump_call *call = ctx;
-  if (!qa_config_store_dump(call->app->preference_store, "renderer", call->text)) qa_raise("Error", 0, 0, "Could not write renderer");
+  if (!qa_config_store_dump(call->app->preference_store, "renderer", call->text)) qa_settings_raise_write_failure();
 }
 static void video_published(void *ctx, const char *kind) {
   qa_startup_application *app = ctx;
@@ -757,7 +807,7 @@ static void video_published(void *ctx, const char *kind) {
   snprintf(text, sizeof text, "%s\n", kind);
   dump_call call = {app, text};
   qa_caught_error caught;
-  if (!qa_try(dump_body, &call, &caught)) qa_startup_printf(app, "Renderer preference could not be saved: %s\n", caught.message);
+  if (!qa_try(dump_body, &call, &caught)) qa_startup_printf(app, "Renderer preference could not be saved: %s\n", qa_caught_message(&caught));
 }
 static void video_settled(void *ctx) { ((qa_startup_application *)ctx)->last_frame = qa_startup_now(); }
 static void video_print(void *ctx, const char *text, const qa_command_context *source) {
@@ -768,14 +818,9 @@ static void video_print(void *ctx, const char *text, const qa_command_context *s
     return;
   }
   qa_startup_application_print(app, text);
-  /* text.trim() */
-  size_t start = 0, end = strlen(text);
-  while (start < end && isspace((unsigned char)text[start])) start++;
-  while (end > start && isspace((unsigned char)text[end - 1])) end--;
-  char *trimmed = malloc(end - start + 1);
+  /* text.trim(): JS white space by code point */
+  char *trimmed = qa_input_js_trim(text);
   if (trimmed == NULL) qa_range_error("Out of memory");
-  memcpy(trimmed, text + start, end - start);
-  trimmed[end - start] = '\0';
   qa_cleanup guard;
   qa_cleanup_push(&guard, free, trimmed);
   set_menu_status(app, trimmed);
@@ -788,7 +833,7 @@ static void video_failed(void *ctx, const qa_caught_error *error) {
   app->stopping = true;
   qa_caught_error cleanup;
   if (!qa_try(close_application_body, app, &cleanup))
-    qa_raise("AggregateError", 2, 0, "Video restart and client shutdown failed: %s; %s", error->message, cleanup.message);
+    qa_raise("AggregateError", 0, 2, "Video restart and client shutdown failed");
   qa_rethrow(error);
 }
 
@@ -804,9 +849,8 @@ static const char *client_stop_recording(void *ctx, const qa_app_client_source_l
   if (app->recording_preparation.active && app->recording_preparation.source == source)
     memset(&app->recording_preparation, 0, sizeof app->recording_preparation);
   if (errors[0] == NULL && errors[1] == NULL) return NULL;
-  graphics_state *state = state_of(app);
-  snprintf(state->message, sizeof state->message, "Recording retirement failed: %s", errors[0] != NULL ? errors[0] : errors[1]);
-  return state->message;
+  /* TS AggregateError(errors, "Recording retirement failed"); the text return carries the message only. */
+  return "Recording retirement failed";
 }
 static bool client_has_pending_source(void *ctx) {
   qa_startup_application *app = ctx;
@@ -956,6 +1000,8 @@ static void prepare_initial_body(void *ctx) {
   } else args.default_capacity = 16;
   args.next_frame = next_frame; args.next_frame_ctx = app;
   args.on_prepared = on_prepared; args.on_prepared_ctx = app;
+  /* args.pending: a raise inside the preparation leaves the partial configuration for the destroy to free. */
+  args.pending = &app->initial;
   app->initial = qa_app_prepare_initial_configuration(frame->options, &args);
   if (app->initial == NULL) qa_range_error("Out of memory");
   qa_app_startup_stamp("prepare-initial-configuration");
@@ -1032,7 +1078,7 @@ static void open_graphics_owners(void *ctx) {
   audio.mounts = g->mounted;
   audio.source = (qa_app_music_source){product->id, product->expectation.family, product->expectation.edition, product->expectation.campaign};
   audio.seat = seat;
-  audio.print = host_print_fn; audio.print_ctx = app;
+  audio.print = app_print_fn; audio.print_ctx = app; /* print: text => this.print(text) */
   /* preferences: { ...audioBaseline, ...audioValues, ...readMusicSettings(cvars), outputFormat: readAudioOutputCvars(cvars) } */
   const qa_app_audio_preferences *baseline = qa_app_frontend_preferences_audio_baseline(app->preferences);
   double effects = 0, music = 0;
@@ -1057,7 +1103,7 @@ static void open_graphics_owners(void *ctx) {
   memset(&turntable, 0, sizeof turntable);
   turntable.catalog_ctx = app; turntable.catalog = turntable_catalog;
   turntable.images = g->images;
-  turntable.print_ctx = app; turntable.print = host_print_fn;
+  turntable.print_ctx = app; turntable.print = app_print_fn; /* print: text => this.print(text) */
   g->turntable = qa_app_character_turntable_create(turntable);
   if (g->turntable == NULL) qa_range_error("Out of memory");
   /* settings: accessibility, console, preferences (output + music), devices, input routing, gamepad,
@@ -1240,6 +1286,7 @@ static void open_graphics_owners(void *ctx) {
   services.input = capture_input;
   services.can_chat = capture_can_chat;
   services.root = capture_root;
+  services.naming = capture_naming;
   services.map_name = capture_map_name;
   services.write = capture_write;
   services.print = capture_print;
@@ -1315,9 +1362,17 @@ static void open_graphics_owners(void *ctx) {
 static const qa_image_resource_operation *registry_drain(void *ctx, size_t *out_count) {
   qa_startup_graphics *g = ctx;
   graphics_state *state = g->draw_state;
-  free(state->drained);
-  state->drained = qa_scene_image_registry_drain_operations(g->images, out_count);
-  return state->drained;
+  qa_image_resource_operation *drained = qa_scene_image_registry_drain_operations(g->images, out_count);
+  if (drained == NULL) return NULL;
+  if (state->drained_count == state->drained_capacity) {
+    size_t capacity = state->drained_capacity == 0 ? 4 : state->drained_capacity * 2;
+    qa_image_resource_operation **grown = realloc(state->drained, capacity * sizeof *grown);
+    if (grown == NULL) { free(drained); qa_range_error("Out of memory"); }
+    state->drained = grown;
+    state->drained_capacity = capacity;
+  }
+  state->drained[state->drained_count++] = drained;
+  return drained;
 }
 static void registry_require(void *ctx, qa_renderer_image image) {
   qa_scene_image_registry_require(((qa_startup_graphics *)ctx)->images, image);
@@ -1503,6 +1558,7 @@ void qa_startup_graphics_draw(qa_startup_application *app, const qa_app_client_s
     return;
   qa_sdl_size drawable = qa_sdl_window_drawable_size(qa_app_native_renderer_window(g->renderer));
   qa_rect viewport = {0, 0, drawable.width, drawable.height};
+  drained_release(state); /* the previous frame has executed */
   qa_scene_frame_builder_begin(&state->builder, "back", true);
   draw_sink sink = {&state->builder};
   qa_app_startup_menu_draw(g->menu, draw_context(app, viewport, qa_startup_now()), builder_emit, startup_material, &sink);
@@ -1531,13 +1587,15 @@ void qa_startup_open_graphics(qa_startup_application *app) {
       size_t length = 0;
       char *text = qa_config_store_load_text(app->preference_store, "renderer", &length);
       if (text != NULL) {
-        /* ?.trim() */
-        size_t start = 0, end = length;
-        while (start < end && isspace((unsigned char)text[start])) start++;
-        while (end > start && isspace((unsigned char)text[end - 1])) end--;
-        text[end] = '\0';
-        if (same(text + start, "cpu") || same(text + start, "gl")) qa_app_startup_selection_select(app->model, "renderer", text + start);
+        /* ?.trim(): JS white space by code point (U+FEFF, U+00A0 and the rest, not only ASCII) */
+        char *selected = qa_input_js_trim(text);
         free(text);
+        if (selected == NULL) qa_range_error("Out of memory");
+        qa_cleanup selected_guard;
+        qa_cleanup_push(&selected_guard, free, selected);
+        if (same(selected, "cpu") || same(selected, "gl")) qa_app_startup_selection_select(app->model, "renderer", selected);
+        qa_cleanup_pop(&selected_guard);
+        free(selected);
       }
     }
   }

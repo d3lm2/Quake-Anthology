@@ -1,8 +1,6 @@
 /* Port of src/app/bootstrap/remote-application.ts: the RemoteApplication class
  * (one C type, qa_remote_application), the client side for joining Q1/QW, Q2,
- * Q3 and unified servers. Built beside the old host shell in
- * remote_application.h (qa_app_remote_application, main.c and startup.c's path
- * until the connection step); the two share nothing.
+ * Q3 and unified servers. StartupApplication opens it.
  *
  * The member layout (TS member, C function, C file, status) is
  * docs/remote_application_layout.md. Every public TS member is declared here so

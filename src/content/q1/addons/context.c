@@ -411,6 +411,7 @@ void qa_q1ad_context_destroy(qa_q1ad_context *context) {
   free(context->refs);
   free(context->ticks);
   free(context->spawn_use_rows);
+  free(context->finale_text);
   free(context);
 }
 

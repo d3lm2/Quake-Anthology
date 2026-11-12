@@ -27,6 +27,7 @@ qa_q2_entity *qa_q2_entity_services_spawn_entity(qa_q2_entity_services *s, qa_q2
 qa_q2_entity *qa_q2_entity_services_create_entity(qa_q2_entity_services *s, const char *classname, const qa_q2_field_pair *v, size_t n);
 qa_q2_entity *qa_q2_entity_services_attach_player(qa_q2_entity_services *s, qa_owned_actor actor);
 qa_owned_actor qa_q2_entity_services_allocate_actor(qa_q2_entity_services *s, const qa_q2_spawn_fields *f, const char *definition);
+/* Takes ownership of f: the entity keeps it, and a refused attachment (a raise) releases it. */
 qa_q2_entity *qa_q2_entity_services_attach(qa_q2_entity_services *s, qa_owned_actor actor, qa_q2_spawn_fields f);
 void qa_q2_entity_services_run_actor(qa_q2_entity_services *s, qa_actor_id actor, void (*cb)(void *ctx), void *ctx);
 void qa_q2_entity_services_apply_projectile_behavior(qa_q2_entity_services *s, qa_actor_id actor, double seconds);
@@ -34,4 +35,9 @@ void qa_q2_entity_services_pre_physics(qa_q2_entity_services *s, qa_actor_id act
 void qa_q2_entity_services_post_physics(qa_q2_entity_services *s, qa_actor_id actor);
 double qa_q2_entity_services_source_slot(qa_q2_entity_services *s, qa_actor_id actor, bool *has);
 qa_q2_entity *const *qa_q2_entity_services_unsupported(qa_q2_entity_services *s, size_t *n);
+/* The Q2Foundation subclass fields (runtime.c: monsterAdmission and the last
+ * load report's storage). One slot owned by the services: destroy calls
+ * free_fn(extension). NULL until set. */
+void *qa_q2_entity_services_extension(qa_q2_entity_services *s);
+void qa_q2_entity_services_set_extension(qa_q2_entity_services *s, void *extension, void (*free_fn)(void *extension));
 #endif

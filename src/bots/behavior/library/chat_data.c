@@ -233,7 +233,7 @@ static const char *stored_text(const qa_bot_memory_allocation *allocation, bool 
   if (text->length >= 0) {
     if (text->offset + text->length >= (int64_t)allocation->length ||
         bytes[text->offset + text->length] != 0)
-      qa_range_error("Saved chat string is unterminated");
+      qa_raise("Error", 0, 0, "Saved chat string is unterminated");
     return (const char *)bytes + text->offset;
   }
   if (memchr(bytes + text->offset, 0, allocation->length - (size_t)text->offset) == NULL)
@@ -241,8 +241,9 @@ static const char *stored_text(const qa_bot_memory_allocation *allocation, bool 
   return (const char *)bytes + text->offset;
 }
 static uint32_t stored_u32(const qa_bot_memory_allocation *allocation, int64_t offset) {
-  if (offset < 0 || offset + 4 > (int64_t)allocation->length)
-    qa_range_error("Offset is outside the bounds of the DataView");
+  /* TS view().getUint32(offset, true): the native DataView refusals. */
+  if (offset < 0) qa_range_error("byteOffset cannot be negative");
+  if (offset + 4 > (int64_t)allocation->length) qa_range_error("Out of bounds access");
   return load_u32(qa_bot_memory_allocation_bytes(allocation) + offset);
 }
 void qa_stored_synonyms_destroy(qa_stored_synonyms *list) {
@@ -304,7 +305,7 @@ typedef struct restored_data {
 static int64_t restored_reserve(restored_data *data, int64_t bytes) {
   if (bytes < 0 || data->allocation == NULL ||
       data->cursor + bytes > (int64_t)data->allocation->length)
-    qa_range_error("Saved chat data layout exceeds allocation");
+    qa_raise("Error", 0, 0, "Saved chat data layout exceeds allocation");
   int64_t offset = data->cursor;
   data->cursor += bytes;
   return offset;
@@ -316,7 +317,7 @@ static qa_stored_text restored_string(restored_data *data, int64_t length) {
 }
 static void restored_finish(const restored_data *data) {
   if (data->cursor != (data->allocation != NULL ? (int64_t)data->allocation->length : 0))
-    qa_range_error("Saved chat layout does not cover its allocation");
+    qa_raise("Error", 0, 0, "Saved chat layout does not cover its allocation");
 }
 void qa_restore_synonyms(qa_stored_synonyms *out, const qa_bot_memory_allocation *allocation,
                          const int64_t *const *layout, const size_t *layout_counts, size_t count) {
@@ -334,7 +335,7 @@ void qa_restore_synonyms(qa_stored_synonyms *out, const qa_bot_memory_allocation
       group->entries[j].text = restored_string(&data, layout[i][j]);
     }
     if (layout_counts[i] < 2)
-      qa_range_error("Saved synonym group requires two entries");
+      qa_raise("Error", 0, 0, "Saved synonym group requires two entries");
   }
   restored_finish(&data);
   if (allocation != NULL) {
@@ -361,7 +362,7 @@ void qa_restore_randoms(qa_stored_randoms *out, const qa_bot_memory_allocation *
       list->messages[messages - 1 - j] = restored_string(&data, layout[i].message_bytes[j]);
     }
     if (stored_u32(allocation, list->record + 4) != messages)
-      qa_range_error("Saved random chat message count mismatch");
+      qa_raise("Error", 0, 0, "Saved random chat message count mismatch");
   }
   restored_finish(&data);
   if (allocation != NULL) {
@@ -520,60 +521,85 @@ qa_save_value *qa_chat_initial_checkpoint(qa_chat_initial *chat, qa_bot_memory_c
   set_field(image, "messages", messages);
   return image;
 }
+/* *out holds the list as it is read, so a cleanup node can release it when a cell raises. */
+static void read_pointer_list(const qa_save_reader *reader, const char *name, double **out, size_t *out_count) {
+  qa_save_reader list, entry;
+  field_reader(reader, name, &list);
+  size_t count = qa_save_reader_list_count(&list);
+  double *words = *out = xcalloc(count, sizeof *words);
+  for (size_t i = 0; i < count; i++) {
+    item_reader(&list, i, &entry);
+    words[i] = qa_save_reader_integer_min(&entry, 1);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&list);
+  *out_count = count;
+}
+typedef struct initial_scratch {
+  double *types, *messages;
+  qa_chat_initial *chat;
+} initial_scratch;
+static void initial_scratch_free(void *arg) {
+  initial_scratch *scratch = arg;
+  free(scratch->types);
+  free(scratch->messages);
+  qa_chat_initial_destroy(scratch->chat);
+}
 qa_chat_initial *qa_chat_initial_restore(const qa_save_value *value,
                                          qa_bot_memory_restored *restored) {
-  qa_save_reader reader, list, entry;
+  qa_save_reader reader;
   reader_init(&reader, value, "bot.chat.initial");
+  /* Released when the image raises (TS leaves them to the GC). */
+  initial_scratch scratch = {NULL, NULL, NULL};
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, initial_scratch_free, &scratch);
+  /* TS reads the whole image (a SaveFormatError for any malformed cell) before it resolves the
+   * allocation or validates a pointer. */
   double reference = field_integer(&reader, "allocation", 0);
   double pointer = field_integer(&reader, "pointer", 1);
+  size_t type_count = 0, message_count = 0;
+  read_pointer_list(&reader, "types", &scratch.types, &type_count);
+  read_pointer_list(&reader, "messages", &scratch.messages, &message_count);
+  const double *type_words = scratch.types, *message_words = scratch.messages;
+  qa_save_reader_destroy(&reader);
   qa_bot_memory_allocation allocation =
       qa_bot_memory_restored_allocation(restored, (int64_t)reference);
-  qa_chat_initial *chat = qa_chat_initial_create(&allocation, (uint32_t)pointer);
-  field_reader(&reader, "types", &list);
-  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
-    item_reader(&list, i, &entry);
-    double word = qa_save_reader_integer_min(&entry, 1);
-    qa_save_reader_destroy(&entry);
-    if (word < 1 || word >= (double)chat->mark_count ||
-        (chat->marks[(size_t)word] & INITIAL_TYPE_MARK) != 0)
-      qa_range_error(word < 1 || word >= (double)chat->mark_count
-                         ? "initial chat record exceeds its allocation"
-                         : "Invalid saved initial chat type pointer");
+  qa_chat_initial *chat = scratch.chat = qa_chat_initial_create(&allocation, (uint32_t)pointer);
+  for (size_t i = 0; i < type_count; i++) {
+    double word = type_words[i];
+    if (word < (double)chat->mark_count && (chat->marks[(size_t)word] & INITIAL_TYPE_MARK) != 0)
+      qa_raise("Error", 0, 0, "Invalid saved initial chat type pointer");
+    if (word >= (double)chat->mark_count) qa_range_error("initial chat record exceeds its allocation");
     initial_view(chat, (int64_t)word - 1, 44);
     chat->marks[(size_t)word] |= INITIAL_TYPE_MARK;
   }
-  qa_save_reader_destroy(&list);
-  field_reader(&reader, "messages", &list);
-  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
-    item_reader(&list, i, &entry);
-    double word = qa_save_reader_integer_min(&entry, 1);
-    qa_save_reader_destroy(&entry);
-    if (word < 1 || word >= (double)chat->mark_count ||
-        (chat->marks[(size_t)word] & INITIAL_MESSAGE_MARK) != 0)
-      qa_range_error(word < 1 || word >= (double)chat->mark_count
-                         ? "initial chat record exceeds its allocation"
-                         : "Invalid saved initial chat message pointer");
+  for (size_t i = 0; i < message_count; i++) {
+    double word = message_words[i];
+    if (word < (double)chat->mark_count && (chat->marks[(size_t)word] & INITIAL_MESSAGE_MARK) != 0)
+      qa_raise("Error", 0, 0, "Invalid saved initial chat message pointer");
+    if (word >= (double)chat->mark_count) qa_range_error("initial chat record exceeds its allocation");
     initial_view(chat, (int64_t)word - 1, 12);
     chat->marks[(size_t)word] |= INITIAL_MESSAGE_MARK;
   }
-  qa_save_reader_destroy(&list);
-  qa_save_reader_destroy(&reader);
   /* Bound by distinct record counts: more steps than records is a cycle. */
   size_t limit = chat->mark_count, seen_types = 0;
   for (uint32_t type = qa_chat_initial_first_type(chat); type != 0;
        type = qa_chat_initial_type_next(chat, type)) {
     if (++seen_types > limit)
-      qa_range_error("Saved initial chat type list cycles");
+      qa_raise("Error", 0, 0, "Saved initial chat type list cycles");
     int64_t messages = 0;
     for (uint32_t message = qa_chat_initial_type_first_message(chat, type); message != 0;
          message = qa_chat_initial_message_next(chat, message)) {
       if ((size_t)++messages > limit)
-        qa_range_error("Saved initial chat message list cycles");
+        qa_raise("Error", 0, 0, "Saved initial chat message list cycles");
       qa_chat_initial_message_text(chat, message);
     }
     if (messages != qa_chat_initial_type_num_messages(chat, type))
-      qa_range_error("Saved initial chat message count mismatch");
+      qa_raise("Error", 0, 0, "Saved initial chat message count mismatch");
   }
+  qa_cleanup_pop(&scratch_cleanup);
+  free(scratch.types);
+  free(scratch.messages);
   return chat;
 }
 
@@ -638,8 +664,9 @@ static qa_chat_cell *graph_at(const qa_chat_graph *graph, uint32_t pointer, qa_c
   return value;
 }
 static uint8_t *cell_view(const qa_chat_cell *cell, int64_t offset) {
-  if (offset + 4 > (int64_t)cell->allocation.length)
-    qa_range_error("Offset is outside the bounds of the DataView");
+  /* TS view().getUint32 / setUint32: the native DataView refusals. */
+  if (offset < 0) qa_range_error("byteOffset cannot be negative");
+  if (offset + 4 > (int64_t)cell->allocation.length) qa_range_error("Out of bounds access");
   return qa_bot_memory_allocation_bytes(&cell->allocation) + offset;
 }
 static uint32_t cell_u32(const qa_chat_cell *cell, int64_t offset) {
@@ -915,17 +942,29 @@ static size_t graph_cell_index(const qa_chat_graph *graph, const qa_chat_cell *c
     index++;
   return index;
 }
+static void free_pointer_slot(void *arg) { free(*(void **)arg); }
+typedef struct graph_scratch {
+  qa_chat_graph *graph;
+  uint8_t *states;
+} graph_scratch;
+static void graph_scratch_free(void *arg) {
+  graph_scratch *scratch = arg;
+  free(scratch->states);
+  if (scratch->graph != NULL) qa_chat_graph_release(scratch->graph);
+}
 static void graph_visit(const qa_chat_graph *graph, const qa_chat_cell *first, uint8_t *states) {
   /* TS recurses through every link; next chains are walked iteratively here so
    * a long list cannot exhaust the C stack. The cycle check is unchanged. */
   const qa_chat_cell **chain = NULL;
   size_t chain_count = 0;
+  qa_cleanup chain_cleanup; /* a cycle or a bad link raises with the chain held */
+  qa_cleanup_push(&chain_cleanup, free_pointer_slot, &chain);
   for (const qa_chat_cell *cell = first; cell != NULL;) {
     size_t index = graph_cell_index(graph, cell);
     if (states[index] == VISIT_DONE)
       break;
     if (states[index] == VISIT_PENDING)
-      qa_range_error("Saved chat graph contains a cycle");
+      qa_raise("Error", 0, 0, "Saved chat graph contains a cycle");
     states[index] = VISIT_PENDING;
     chain = xrealloc(chain, (chain_count + 1) * sizeof *chain);
     chain[chain_count++] = cell;
@@ -964,6 +1003,7 @@ static void graph_visit(const qa_chat_graph *graph, const qa_chat_cell *first, u
   }
   for (size_t i = 0; i < chain_count; i++)
     states[graph_cell_index(graph, chain[i])] = VISIT_DONE;
+  qa_cleanup_pop(&chain_cleanup);
   free(chain);
 }
 static qa_chat_graph *graph_restore(const qa_save_value *value, qa_bot_memory *memory,
@@ -972,7 +1012,22 @@ static qa_chat_graph *graph_restore(const qa_save_value *value, qa_bot_memory *m
                                       "key",    "message",      "reply"};
   qa_save_reader reader, entry, field;
   reader_init(&reader, value, "bot.chat.graph");
+  /* TS reads the whole list (a SaveFormatError for any malformed cell) before it validates. */
+  for (size_t i = 0, n = qa_save_reader_list_count(&reader); i < n; i++) {
+    item_reader(&reader, i, &entry);
+    (void)field_integer(&entry, "pointer", 1);
+    (void)field_integer(&entry, "allocation", 0);
+    field_reader(&entry, "kind", &field);
+    (void)qa_save_reader_choice_string(&field, kinds, 7);
+    qa_save_reader_destroy(&field);
+    (void)field_integer(&entry, "offset", 0);
+    qa_save_reader_destroy(&entry);
+  }
   qa_chat_graph *graph = graph_create(memory);
+  /* A raise below releases the half-built graph (TS leaves it to the GC). */
+  graph_scratch scratch = {graph, NULL};
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, graph_scratch_free, &scratch);
   bool sequential = true;
   for (size_t i = 0, n = qa_save_reader_list_count(&reader); i < n; i++) {
     item_reader(&reader, i, &entry);
@@ -988,19 +1043,19 @@ static qa_chat_graph *graph_restore(const qa_save_value *value, qa_bot_memory *m
     qa_save_reader_destroy(&entry);
     /* Pointer words are 32 bits; a larger saved key could never be reached. */
     if (pointer < 1 || pointer > (double)UINT32_MAX)
-      qa_range_error("Invalid saved chat graph pointer");
+      qa_raise("Error", 0, 0, "Invalid saved chat graph pointer");
     /* Images saved by this code list pointers 1..n, which cannot repeat. */
     if ((uint32_t)pointer != graph->count + 1 || !sequential) {
       sequential = false;
       for (size_t j = 0; j < graph->count; j++)
         if (graph->cells[j]->pointer == (uint32_t)pointer)
-          qa_range_error("Invalid saved chat graph pointer");
+          qa_raise("Error", 0, 0, "Invalid saved chat graph pointer");
     }
     qa_bot_memory_allocation allocation =
         qa_bot_memory_restored_allocation(restored, (int64_t)reference);
     if (kind == QA_CHAT_CELL_STRING) {
       if (offset < 0 || offset >= (double)allocation.length)
-        qa_range_error("Invalid saved chat string offset");
+        qa_raise("Error", 0, 0, "Invalid saved chat string offset");
       qa_chat_cell probe = {graph, kind, allocation, (uint32_t)pointer, (int64_t)offset};
       string_cell_text(&probe);
     }
@@ -1008,9 +1063,10 @@ static qa_chat_graph *graph_restore(const qa_save_value *value, qa_bot_memory *m
                    kind == QA_CHAT_CELL_STRING ? (int64_t)offset : 0);
   }
   qa_save_reader_destroy(&reader);
-  uint8_t *states = xcalloc(graph->count, 1);
+  uint8_t *states = scratch.states = xcalloc(graph->count, 1);
   for (size_t i = 0; i < graph->count; i++)
     graph_visit(graph, graph->cells[i], states);
+  qa_cleanup_pop(&scratch_cleanup);
   free(states);
   return graph;
 }
@@ -1022,13 +1078,17 @@ static qa_chat_cell *restore_root(const qa_save_value *value, qa_bot_memory *mem
   field_reader(&reader, "pointers", &field);
   qa_chat_graph *graph = graph_restore(field.value, memory, restored);
   qa_save_reader_destroy(&field);
+  graph_scratch scratch = {graph, NULL};
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, graph_scratch_free, &scratch);
   double root = field_integer(&reader, "root", 1);
   qa_save_reader_destroy(&reader);
   if (root > (double)UINT32_MAX)
     qa_range_error("chat pointer is outside its allocated graph");
   qa_chat_cell *cell = graph_at(graph, (uint32_t)root, kind, wrong);
   if (cell == NULL)
-    qa_range_error("%s", no_root);
+    qa_raise("Error", 0, 0, "%s", no_root);
+  qa_cleanup_pop(&scratch_cleanup);
   return cell;
 }
 qa_chat_cell *qa_chat_template_restore_graph(const qa_save_value *value, qa_bot_memory *memory,
@@ -1169,7 +1229,7 @@ static qa_ui_script_token *parser_next(qa_chat_data_parser *p) {
 }
 static void parser_unread(qa_chat_data_parser *p, const qa_ui_script_token *token) {
   if (!p->has_last_record || p->last_record.token != token)
-    qa_range_error("chat parser can only unread its last source token");
+    qa_raise("Error", 0, 0, "chat parser can only unread its last source token");
   qa_ui_script_source_reader_unread(p->source, &p->last_record);
 }
 static qa_ui_script_diagnostic *parser_add_issue(qa_chat_data_parser *p,

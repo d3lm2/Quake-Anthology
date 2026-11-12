@@ -9,9 +9,9 @@
 
 static void bonus(qa_q2mp_tag *tag, qa_q2_entity *entity, qa_q2_game_services *game) {
   double health = q2mp_health(game, entity->actor.id);
-  double maximum = entity->max_health != 0 ? entity->max_health : 100;
+  double maximum = q2mp_truthy(entity->max_health) ? entity->max_health : 100;
   if (health < maximum)
-    qa_gameplay_authority_set_health(game->host->combat, entity->actor, health + 200 < maximum ? health + 200 : maximum);
+    qa_gameplay_authority_set_health(game->host->combat, entity->actor, qa_js_min(maximum, health + 200));
   qa_q2_entity *armor = game->create(game->ctx, "item_armor_body", NULL, 0);
   armor->spawnflags = (double)(qa_js_to_int32(q2mp_u32(armor->spawnflags) | 0x10000u));
   /* TS keeps reading armor.actor.id after the touch removed the entity; the
@@ -87,7 +87,8 @@ const char *qa_q2mp_tag_dog_tag(qa_q2mp_tag *tag, qa_actor_id actor) {
 double qa_q2mp_tag_change_damage(qa_q2mp_tag *tag, qa_actor_id target, bool has_attacker, qa_actor_id attacker,
                                  double damage) {
   bool target_is_owner = tag->has_owner && qa_same_actor(target, tag->owner);
-  bool attacker_is_owner = has_attacker && tag->has_owner && qa_same_actor(attacker, tag->owner);
+  /* TS `attacker !== this.owner`: null equals null, so a world hit while nobody holds the token is not reduced. */
+  bool attacker_is_owner = has_attacker ? tag->has_owner && qa_same_actor(attacker, tag->owner) : !tag->has_owner;
   return !target_is_owner && !attacker_is_owner ? trunc(damage * 3 / 4) : damage;
 }
 void qa_q2mp_tag_player_death(qa_q2mp_tag *tag, qa_q2_entity *entity, qa_q2_game_services *game) {

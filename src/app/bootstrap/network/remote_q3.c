@@ -763,8 +763,10 @@ qa_q3_wire_user_command qa_app_q3_remote_command(qa_app_q3_remote *remote,
   double time = (double)qa_q3_client_clock_time(remote->clock);
   qa_q3_base_user_command presented = qa_app_presentation_source_command(
       *command, time, command->command.as.q3.weapon);
+  /* TS relativeQ3SourceCommand(source, kind, presented, delta): no angleSpace, so a Q3 dialect
+   * command is never made relative here whatever its angle space. */
   qa_q3_base_user_command source = qa_app_sim_relative_q3_source_command(
-      command->source, "q3", presented, snapshot->player_state.delta_angles, command->angle_space);
+      command->source, "q3", presented, snapshot->player_state.delta_angles, NULL);
   qa_q3_wire_user_command result = {0};
   /* TS keeps these as numbers and the delta writer emits their low bits; the int32
    * wire fields take ToInt32 (the old implicit conversions were undefined for NaN). */

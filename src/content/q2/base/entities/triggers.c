@@ -53,7 +53,9 @@ static void wind_release(void *ctx, qa_owned_actor actor) {
   qa_q2_environmental_triggers *t = ctx;
   for (size_t i = 0; i < t->wind_count; i++) {
     if (qa_same_actor(t->wind[i].actor, actor.id)) {
-      t->wind[i] = t->wind[--t->wind_count];
+      /* TS Map.delete keeps the remaining insertion order (capture lists it). */
+      memmove(&t->wind[i], &t->wind[i + 1], (t->wind_count - i - 1) * sizeof *t->wind);
+      t->wind_count--;
       return;
     }
   }

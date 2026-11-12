@@ -1,5 +1,6 @@
 /* Port of src/render/worker-runtime.ts. GPL-2.0-or-later. */
 #include "qa/render/worker_runtime.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/contracts/identity.h"
 #include "qa/foundation/support.h"
 #include "qa/formats/images/mip.h"
@@ -35,8 +36,8 @@ static void request_host(rimpl *p, const void *bytes, size_t size, qa_rwt_value 
   qa_rwt_failure failure; memset(&failure, 0, sizeof failure);
   qa_rwt_value reply; memset(&reply, 0, sizeof reply);
   if (!qa_rwt_worker_request(p->worker, payload, &reply, &failure)) {
-    p->thrown = failure; p->has_thrown = true;
-    qa_range_error("%s", failure.message[0] != 0 ? failure.message : "Renderer host callback failed");
+    qa_rwt_failure_move(&p->thrown, &failure); p->has_thrown = true;
+    qa_raise("Error", 0, 0, "%s", p->thrown.message != NULL && p->thrown.message[0] != 0 ? p->thrown.message : "Renderer host callback failed");
   }
   if (out != NULL) *out = reply; else qa_rwt_value_release(&reply);
 }
@@ -47,7 +48,7 @@ static qa_renderer_image reached_dynamic(void *ctx, double token, void (*apply)(
   qa_worker_host_request request; memset(&request, 0, sizeof request);
   request.kind = QA_WORKER_HOST_DYNAMIC_IMAGE; request.token = token;
   qa_rwt_value reply; request_host(p, &request, sizeof request, &reply);
-  if (reply.size != sizeof(qa_wire_image)) { qa_rwt_value_release(&reply); qa_range_error("Invalid renderer wire record"); }
+  if (reply.size != sizeof(qa_wire_image)) { qa_rwt_value_release(&reply); qa_raise("TypeError", 0, 0, "Invalid renderer wire record"); }
   qa_wire_image wire; memcpy(&wire, reply.bytes, sizeof wire);
   qa_rwt_value_release(&reply);
   return qa_wire_decoder_image(&p->decoder, wire);
@@ -81,7 +82,8 @@ static void *pixels_blob(rimpl *p, size_t *out_size, double *out_width, double *
 }
 static void svc_image(void *ctx, qa_image_resource_operation op) {
   rimpl *p = (rimpl *)ctx;
-  qa_render_image_journal_record(&p->journal, op);
+  /* Only a CPU resize replays the journal; a GL backend would hold a second copy of every texture for nothing. */
+  if (!p->is_gl) qa_render_image_journal_record(&p->journal, op);
   qa_worker_host_request request; memset(&request, 0, sizeof request);
   request.kind = QA_WORKER_HOST_IMAGE_APPLIED; request.token = qa_wire_decoder_acknowledgment(&p->decoder, &op);
   request_host(p, &request, sizeof request, NULL);
@@ -105,7 +107,10 @@ static void request_swap(rimpl *p, const double *captures, size_t count) {
   qa_rwt_value reply; memset(&reply, 0, sizeof reply);
   bool ok = qa_rwt_worker_request(p->worker, payload, &reply, &failure);
   free(blob);
-  if (!ok) { p->thrown = failure; p->has_thrown = true; qa_range_error("%s", failure.message[0] != 0 ? failure.message : "Renderer host callback failed"); }
+  if (!ok) {
+    qa_rwt_failure_move(&p->thrown, &failure); p->has_thrown = true;
+    qa_raise("Error", 0, 0, "%s", p->thrown.message != NULL && p->thrown.message[0] != 0 ? p->thrown.message : "Renderer host callback failed");
+  }
   qa_rwt_value_release(&reply);
 }
 static void svc_swap(void *ctx, const double *captures, size_t count) {
@@ -167,29 +172,40 @@ static void run_command(rimpl *p, const qa_wire_command *wire) {
   } else qa_render_executor_execute(&p->executor, command);
 }
 static void journal_apply(void *ctx, qa_image_resource_operation op) { qa_software_renderer_apply_image_resource((qa_software_renderer *)ctx, op); }
+typedef struct resize_scope { rimpl *p; qa_software_renderer *next; } resize_scope;
+static void resize_body(void *ctx) {
+  resize_scope *s = (resize_scope *)ctx;
+  qa_software_renderer_set_output_gamma(s->next, s->p->gamma);
+  qa_software_renderer_set_overdraw_measurement(s->next, s->p->overdraw);
+  qa_journal_backend journal = {s->next, journal_apply};
+  qa_render_image_journal_replay(&s->p->journal, journal);
+}
 static void resize_cpu(rimpl *p, double width, double height) {
   if (p->is_gl || (width == p->cpu.width && height == p->cpu.height)) return;
-  if (p->prepared_count != 0) qa_range_error("Cannot resize with prepared worker geometry");
+  if (p->prepared_count != 0) qa_raise("Error", 0, 0, "Cannot resize with prepared worker geometry");
   qa_software_renderer next; memset(&next, 0, sizeof next);
   if (!qa_software_renderer_init_default(&next, width, height, p->owner)) qa_range_error("Render worker allocation failed");
-  qa_software_renderer_set_output_gamma(&next, p->gamma);
-  qa_software_renderer_set_overdraw_measurement(&next, p->overdraw);
-  qa_journal_backend journal = {&next, journal_apply};
-  qa_render_image_journal_replay(&p->journal, journal);
+  resize_scope scope = {p, &next};
+  qa_caught_error caught; /* try { ... } catch (error) { next.close(); throw error } */
+  if (!qa_try(resize_body, &scope, &caught)) { qa_software_renderer_close(&next); qa_rethrow(&caught); }
   qa_software_renderer_close(&p->cpu);
   p->cpu = next;
   p->backend = qa_software_renderer_backend(&p->cpu);
   qa_render_executor_replace_backend(&p->executor, p->backend);
 }
-static double dimension(double value) {
-  if (!isfinite(value)) qa_range_error("Invalid render worker number");
-  if (value != floor(value) || value < 0 || value > (double)QA_MAX_SAFE_INTEGER) qa_range_error("Invalid render worker integer");
-  if (value == 0) qa_range_error("Empty render worker dimension");
+/* TS number(): TypeError unless finite; integer() and dimension(): RangeError. */
+static double worker_number(double value) {
+  if (!isfinite(value)) qa_raise("TypeError", 0, 0, "Invalid render worker number");
   return value;
 }
 static double worker_integer(double value) {
-  if (!isfinite(value)) qa_range_error("Invalid render worker number");
+  (void)worker_number(value);
   if (value != floor(value) || value < 0 || value > (double)QA_MAX_SAFE_INTEGER) qa_range_error("Invalid render worker integer");
+  return value;
+}
+static double dimension(double value) {
+  (void)worker_integer(value);
+  if (value == 0) qa_range_error("Empty render worker dimension");
   return value;
 }
 static void set_gamma(rimpl *p, double gamma) {
@@ -204,16 +220,16 @@ typedef struct host_opacity { rimpl *p; double callback; } host_opacity;
 static void opacity_callback(void *ctx) {
   host_opacity *s = (host_opacity *)ctx;
   qa_worker_host_request request; memset(&request, 0, sizeof request);
-  request.kind = QA_WORKER_HOST_OPACITY_CALLBACK; request.callback = s->callback;
+  request.kind = QA_WORKER_HOST_OPACITY_CALLBACK; request.callback = worker_integer(s->callback);
   request_host(s->p, &request, sizeof request, NULL);
 }
 typedef struct dispatch_scope { rimpl *p; const qa_worker_wire_request *input; qa_rwt_value *out; } dispatch_scope;
 static void dispatch_body(void *ctx) {
   dispatch_scope *s = (dispatch_scope *)ctx; rimpl *p = s->p; const qa_worker_wire_request *in = s->input; qa_rwt_value *out = s->out;
-  if (p->closed) qa_range_error("Render worker is closed");
+  if (p->closed) qa_raise("Error", 0, 0, "Render worker is closed");
   if (in->kind == QA_WORKER_OP_PARK) { if (p->has_context) p->context.park(p->context.ctx); p->parked = true; return; }
   if (in->kind == QA_WORKER_OP_RESUME) { if (p->has_context) p->context.resume(p->context.ctx); p->parked = false; return; }
-  if (p->parked) qa_range_error("Render worker is parked");
+  if (p->parked) qa_raise("Error", 0, 0, "Render worker is parked");
   refresh_backend(p);
   switch (in->kind) {
   case QA_WORKER_OP_EXECUTE:
@@ -235,13 +251,13 @@ static void dispatch_body(void *ctx) {
   case QA_WORKER_OP_BEGIN_VIEW: p->backend.begin_view(p->backend.ctx, qa_wire_decoder_view_state(&p->decoder, &in->view)); return;
   case QA_WORKER_OP_IMMEDIATE: {
     qa_execution_operation op = qa_wire_decoder_operation(&p->decoder, in->immediate);
-    if (op.kind == QA_RENDER_OP_DRAW || op.kind == QA_RENDER_OP_OBJECT_OPACITY) qa_range_error("Non-immediate render operation");
+    if (op.kind == QA_RENDER_OP_DRAW || op.kind == QA_RENDER_OP_OBJECT_OPACITY) qa_raise("Error", 0, 0, "Non-immediate render operation");
     p->backend.draw_immediate(p->backend.ctx, op);
     return;
   }
   case QA_WORKER_OP_PREPARE: {
     double id = worker_integer(in->id);
-    if (find_prepared(p, id) != NULL) qa_range_error("Duplicate prepared worker draw");
+    if (find_prepared(p, id) != NULL) qa_raise("Error", 0, 0, "Duplicate prepared worker draw");
     qa_prepared_backend_draw draw = p->backend.prepare_geometry(p->backend.ctx, qa_wire_decoder_batch(&p->decoder, in->batch));
     if (p->prepared_count == p->prepared_cap) {
       size_t cap = p->prepared_cap ? p->prepared_cap * 2 : 8;
@@ -254,7 +270,7 @@ static void dispatch_body(void *ctx) {
   }
   case QA_WORKER_OP_PREPARED: {
     prepared_entry *entry = find_prepared(p, worker_integer(in->id));
-    if (entry == NULL) qa_range_error("Unknown prepared worker draw");
+    if (entry == NULL) qa_raise("Error", 0, 0, "Unknown prepared worker draw");
     /* By value: a nested dispatch reached through a dynamic texture may grow the table. */
     qa_prepared_backend_draw draw = entry->draw; double id = entry->id;
     switch (in->phase) {
@@ -267,17 +283,16 @@ static void dispatch_body(void *ctx) {
       if (entry != NULL) { size_t i = (size_t)(entry - p->prepared); memmove(entry, entry + 1, (p->prepared_count - i - 1) * sizeof *entry); p->prepared_count--; }
       return;
     }
-    qa_range_error("Unknown prepared worker phase");
+    qa_raise("Error", 0, 0, "Unknown prepared worker phase");
   }
   case QA_WORKER_OP_OPACITY: {
-    if (!isfinite(in->opacity)) qa_range_error("Invalid render worker number");
     host_opacity scope = {p, in->callback};
-    p->backend.with_object_opacity(p->backend.ctx, in->opacity, opacity_callback, &scope);
+    p->backend.with_object_opacity(p->backend.ctx, worker_number(in->opacity), opacity_callback, &scope);
     return;
   }
   case QA_WORKER_OP_DRAW_BUFFER: {
     const char *b = in->buffer;
-    if (b == NULL || (strcmp(b, "front") && strcmp(b, "back") && strcmp(b, "back-left") && strcmp(b, "back-right"))) qa_range_error("Invalid worker draw buffer");
+    if (b == NULL || (strcmp(b, "front") && strcmp(b, "back") && strcmp(b, "back-left") && strcmp(b, "back-right"))) qa_raise("Error", 0, 0, "Invalid worker draw buffer");
     p->backend.select_draw_buffer(p->backend.ctx, b, in->flag);
     return;
   }
@@ -291,19 +306,21 @@ static void dispatch_body(void *ctx) {
     return;
   }
   case QA_WORKER_OP_DEPTH: {
-    if (!isfinite(in->x) || !isfinite(in->y)) qa_range_error("Invalid render worker number");
-    double depth = p->backend.read_depth_pixel(p->backend.ctx, in->x, in->y);
+    double x = worker_number(in->x), y = worker_number(in->y);
+    double depth = p->backend.read_depth_pixel(p->backend.ctx, x, y);
     reply_copy(out, &depth, sizeof depth);
     return;
   }
-  case QA_WORKER_OP_SHOW_IMAGE:
-    if (!isfinite(in->rect.x) || !isfinite(in->rect.y) || !isfinite(in->rect.width) || !isfinite(in->rect.height)) qa_range_error("Invalid render worker number");
-    p->backend.draw_show_image(p->backend.ctx, qa_wire_decoder_image(&p->decoder, in->image), in->rect, in->flag);
+  case QA_WORKER_OP_SHOW_IMAGE: {
+    /* Arguments in TS order: the image is decoded before the rectangle is read. */
+    qa_renderer_image image = qa_wire_decoder_image(&p->decoder, in->image);
+    qa_rect rect; rect.x = worker_number(in->rect.x); rect.y = worker_number(in->rect.y); rect.width = worker_number(in->rect.width); rect.height = worker_number(in->rect.height);
+    p->backend.draw_show_image(p->backend.ctx, image, rect, in->flag);
     return;
+  }
   case QA_WORKER_OP_CLEAR_COLOR: p->backend.clear_color_buffer(p->backend.ctx); return;
   case QA_WORKER_OP_GAMMA:
-    if (!isfinite(in->gamma)) qa_range_error("Invalid render worker number");
-    set_gamma(p, in->gamma); p->gamma = in->gamma;
+    set_gamma(p, worker_number(in->gamma)); p->gamma = in->gamma;
     return;
   case QA_WORKER_OP_RESIZE: resize_cpu(p, dimension(in->width), dimension(in->height)); reply_description(p, out); return;
   case QA_WORKER_OP_FINISH: p->backend.finish(p->backend.ctx); return;
@@ -324,30 +341,31 @@ static void dispatch_body(void *ctx) {
   }
   case QA_WORKER_OP_PARK: case QA_WORKER_OP_RESUME: return;
   }
-  qa_range_error("Unknown render worker operation: %d", (int)in->kind);
+  qa_raise("Error", 0, 0, "Unknown render worker operation: %d", (int)in->kind);
 }
 /* A throw on this thread: the carried transport failure keeps its host token. */
-static void to_failure(rimpl *p, const char *message, qa_rwt_failure *failure) {
-  if (p != NULL && p->has_thrown) { *failure = p->thrown; p->has_thrown = false; }
-  else qa_rwt_failure_set(failure, "Error", message);
+/* TS failure(error): { kind: "error", name: error.name, message: error.message }. */
+static void to_failure(rimpl *p, const qa_caught_error *caught, qa_rwt_failure *failure) {
+  if (p != NULL && p->has_thrown) { qa_rwt_failure_move(failure, &p->thrown); p->has_thrown = false; }
+  else qa_rwt_failure_set(failure, caught->name, qa_caught_message(caught));
 }
 static bool rt_dispatch(void *ctx, qa_rwt_value payload, qa_rwt_value *out, qa_rwt_failure *failure) {
   rimpl *p = (rimpl *)ctx;
   if (payload.size != sizeof(qa_worker_wire_request)) { qa_rwt_failure_set(failure, "TypeError", "Invalid render worker request"); return false; }
   qa_worker_wire_request input; memcpy(&input, payload.bytes, sizeof input);
   dispatch_scope scope = {p, &input, out};
-  char message[1024];
-  if (qa_range_error_catch(dispatch_body, &scope, message, sizeof message)) return true;
+  qa_caught_error caught;
+  if (qa_try(dispatch_body, &scope, &caught)) return true;
   qa_rwt_value_release(out);
-  to_failure(p, message, failure);
+  to_failure(p, &caught, failure);
   return false;
 }
 /* TS close: collects failures, and stays open for a retry until the backend closed. */
 typedef void (*close_step)(void *ctx);
-static bool close_try(close_step step, void *ctx, char *first, size_t capacity, bool *failed) {
-  char message[1024];
-  if (qa_range_error_catch(step, ctx, message, sizeof message)) return true;
-  if (!*failed) { (void)snprintf(first, capacity, "Render worker close failed: %.900s", message); *failed = true; }
+static bool close_try(close_step step, void *ctx, bool *failed) {
+  qa_caught_error caught;
+  if (qa_try(step, ctx, &caught)) return true;
+  *failed = true; /* failures.push(error) */
   return false;
 }
 static void step_resume(void *ctx) { rimpl *p = (rimpl *)ctx; p->context.resume(p->context.ctx); }
@@ -359,15 +377,22 @@ static void step_backend(void *ctx) {
 static void step_release(void *ctx) { rimpl *p = (rimpl *)ctx; if (p->has_context) p->context.release(p->context.ctx); }
 static bool rt_close(void *ctx, qa_rwt_failure *failure) {
   rimpl *p = (rimpl *)ctx;
-  if (p->closed) { free(p); return true; } /* retry after a close that failed late */
-  char first[1024]; first[0] = 0; bool failed = false;
-  if (p->parked && p->has_context) { if (close_try(step_resume, p, first, sizeof first, &failed)) p->parked = false; }
+  if (p->closed) { qa_rwt_failure_release(&p->thrown); free(p); return true; } /* retry after a close that failed late */
+  if (p->parked) {
+    /* Outside the collected failures: a resume that throws is close()'s own throw, and nothing else runs. */
+    if (p->has_context) {
+      qa_caught_error caught;
+      if (!qa_try(step_resume, p, &caught)) { to_failure(p, &caught, failure); return false; }
+    }
+    p->parked = false;
+  }
+  bool failed = false;
   for (size_t i = 0; i < p->prepared_count;) {
-    if (close_try(step_cleanup, &p->prepared[i], first, sizeof first, &failed)) {
+    if (close_try(step_cleanup, &p->prepared[i], &failed)) {
       memmove(&p->prepared[i], &p->prepared[i + 1], (p->prepared_count - i - 1) * sizeof *p->prepared); p->prepared_count--;
     } else i++;
   }
-  if (close_try(step_backend, p, first, sizeof first, &failed) && close_try(step_release, p, first, sizeof first, &failed)) {
+  if (close_try(step_backend, p, &failed) && close_try(step_release, p, &failed)) {
     p->closed = true;
     if (p->is_gl) qa_gl_renderer_destroy(&p->gl);
     qa_render_image_journal_destroy(&p->journal);
@@ -375,7 +400,9 @@ static bool rt_close(void *ctx, qa_rwt_failure *failure) {
     free(p->prepared);
     qa_identity_owner_destroy(&p->identity);
   }
-  if (failed) { qa_rwt_failure_set(failure, "AggregateError", first); return false; }
+  /* new AggregateError(failures, "Render worker close failed"): the collected errors do not cross the wire. */
+  if (failed) { p->has_thrown = false; qa_rwt_failure_release(&p->thrown); qa_rwt_failure_set(failure, "AggregateError", "Render worker close failed"); return false; }
+  qa_rwt_failure_release(&p->thrown);
   free(p); /* only reachable with p->closed set: the transport drops the runtime on true */
   return true;
 }
@@ -385,7 +412,12 @@ static void sdl_park(void *ctx) { qa_sdl_worker_render_context_park((qa_sdl_work
 static void sdl_resume(void *ctx) { qa_sdl_worker_render_context_resume((qa_sdl_worker_render_context *)ctx); }
 static void sdl_set_interval(void *ctx, int32_t interval) { qa_sdl_worker_render_context_set_swap_interval((qa_sdl_worker_render_context *)ctx, interval); }
 static int32_t sdl_interval(void *ctx) { return qa_sdl_worker_render_context_swap_interval((qa_sdl_worker_render_context *)ctx); }
-static void sdl_release(void *ctx) { qa_sdl_worker_render_context *c = (qa_sdl_worker_render_context *)ctx; qa_sdl_worker_render_context_release(c); free(c); }
+static void sdl_release(void *ctx) {
+  qa_sdl_worker_render_context *c = (qa_sdl_worker_render_context *)ctx; qa_sdl_worker_render_context_release(c); free(c);
+  /* SDL keeps per-thread storage for the thread that made a GL context current. It frees that at thread exit only for
+   * threads it created, and the render thread is a pthread; this thread makes no SDL call after releasing its context. */
+  SDL_TLSCleanup();
+}
 static void sdl_make_current(void *ctx) { qa_sdl_worker_render_context_make_current((qa_sdl_worker_render_context *)ctx); }
 static void sdl_drawable(void *ctx, double *width, double *height) {
   int32_t w = 0, h = 0; qa_sdl_worker_render_context_drawable_size((qa_sdl_worker_render_context *)ctx, &w, &h);
@@ -403,31 +435,38 @@ static bool sdl_adopt(const qa_sdl_render_context_transfer *transfer, qa_render_
   out->render.make_current = sdl_make_current; out->render.drawable_size = sdl_drawable; out->render.set_rendering_enabled = sdl_rendering; out->render.swap = sdl_swap;
   return true;
 }
-typedef struct create_scope { rimpl *p; const qa_render_worker_init *init; const qa_render_worker_platform *platform; bool backend_open; } create_scope;
+typedef struct create_scope { rimpl *p; const qa_render_worker_init *init; const qa_render_worker_platform *platform; } create_scope;
+/* TS: number(gamma), then the backend constructor. */
 static void create_backend(void *ctx) {
   create_scope *s = (create_scope *)ctx; rimpl *p = s->p; const qa_render_worker_init *init = s->init;
-  if (!isfinite(init->gamma)) qa_range_error("Invalid render worker number");
+  (void)worker_number(init->gamma);
   if (init->backend != NULL && !strcmp(init->backend, "cpu")) {
-    if (!qa_software_renderer_init_default(&p->cpu, dimension(init->width), dimension(init->height), p->owner)) qa_range_error("Render worker allocation failed");
-    s->backend_open = true;
+    double width = dimension(init->width), height = dimension(init->height);
+    if (!qa_software_renderer_init_default(&p->cpu, width, height, p->owner)) qa_range_error("Render worker allocation failed");
     p->backend = qa_software_renderer_backend(&p->cpu);
   } else if (init->backend != NULL && !strcmp(init->backend, "gl")) {
     bool adopted = s->platform != NULL ? s->platform->adopt(s->platform->ctx, &init->transfer, &p->context) : sdl_adopt(&init->transfer, &p->context);
     if (!adopted) qa_range_error("Render worker could not adopt its context");
     p->has_context = true; p->is_gl = true;
-    if (!qa_gl_renderer_init(&p->gl, p->context.render, p->owner)) qa_range_error("Worker GL initialization failed");
-    s->backend_open = true;
-    p->backend = qa_gl_renderer_backend(&p->gl);
-  } else qa_range_error("Unknown render worker backend");
-  set_gamma(p, p->gamma);
-  if (p->has_context) p->swap_interval = p->context.swap_interval(p->context.ctx);
+  } else qa_raise("Error", 0, 0, "Unknown render worker backend");
 }
-static void create_cleanup(void *ctx) {
-  create_scope *s = (create_scope *)ctx; rimpl *p = s->p;
-  if (s->backend_open) step_backend(p);
-  if (p->is_gl && s->backend_open) qa_gl_renderer_destroy(&p->gl);
+static void create_gl(void *ctx) {
+  rimpl *p = ((create_scope *)ctx)->p;
+  if (!qa_gl_renderer_init(&p->gl, p->context.render, p->owner)) qa_range_error("Worker GL initialization failed");
+  p->backend = qa_gl_renderer_backend(&p->gl);
+}
+static void create_gamma(void *ctx) {
+  rimpl *p = ((create_scope *)ctx)->p;
+  set_gamma(p, p->gamma);
+  p->swap_interval = p->has_context ? p->context.swap_interval(p->context.ctx) : 0;
+}
+static void create_close(void *ctx) {
+  rimpl *p = ((create_scope *)ctx)->p;
+  step_backend(p);
+  if (p->is_gl) qa_gl_renderer_destroy(&p->gl);
   step_release(p);
 }
+static void create_release(void *ctx) { step_release(((create_scope *)ctx)->p); }
 bool qa_create_render_worker_runtime(void *ctx, qa_rwt_value payload, qa_rwt_worker *worker, qa_rwt_runtime *out, qa_rwt_failure *failure) {
   if (payload.size != sizeof(qa_render_worker_init)) { qa_rwt_failure_set(failure, "TypeError", "Invalid render worker request"); return false; }
   qa_render_worker_init init; memcpy(&init, payload.bytes, sizeof init);
@@ -436,14 +475,26 @@ bool qa_create_render_worker_runtime(void *ctx, qa_rwt_value payload, qa_rwt_wor
   if (!qa_identity_owner_create(&p->identity, "render-worker")) { free(p); qa_rwt_failure_set(failure, "Error", "Render worker allocation failed"); return false; }
   p->worker = worker; p->gamma = init.gamma;
   p->owner.identity = p; p->owner.session = p->identity.session; p->owner.generation = 0;
-  create_scope scope = {p, &init, (const qa_render_worker_platform *)ctx, false};
-  char message[1024];
-  if (!qa_range_error_catch(create_backend, &scope, message, sizeof message)) {
-    /* TS tears down what opened; a teardown failure joins the startup failure. */
-    char cleanup[1024];
-    if (qa_range_error_catch(create_cleanup, &scope, cleanup, sizeof cleanup)) qa_rwt_failure_set(failure, "Error", message);
-    else { char both[1024]; (void)snprintf(both, sizeof both, "Worker initialization and close failed: %.400s; %.400s", message, cleanup); qa_rwt_failure_set(failure, "AggregateError", both); }
-    qa_identity_owner_destroy(&p->identity); free(p);
+  create_scope scope = {p, &init, (const qa_render_worker_platform *)ctx};
+  qa_caught_error caught, cleanup;
+  bool ok = qa_try(create_backend, &scope, &caught);
+  if (ok && p->is_gl && !qa_try(create_gl, &scope, &caught)) {
+    /* try { context.release() } catch (cleanup) { throw new AggregateError([error, cleanup], ...) } throw error */
+    if (qa_try(create_release, &scope, &cleanup)) qa_rwt_failure_set(failure, caught.name, qa_caught_message(&caught));
+    else qa_rwt_failure_set(failure, "AggregateError", "Worker GL initialization and release failed");
+    qa_identity_owner_destroy(&p->identity); qa_rwt_failure_release(&p->thrown); free(p);
+    return false;
+  }
+  if (ok && !qa_try(create_gamma, &scope, &caught)) {
+    /* try { backend.close(); context?.release() } catch (cleanup) { throw new AggregateError(...) } throw error */
+    if (qa_try(create_close, &scope, &cleanup)) qa_rwt_failure_set(failure, caught.name, qa_caught_message(&caught));
+    else qa_rwt_failure_set(failure, "AggregateError", "Worker gamma initialization and close failed");
+    qa_identity_owner_destroy(&p->identity); qa_rwt_failure_release(&p->thrown); free(p);
+    return false;
+  }
+  if (!ok) {
+    qa_rwt_failure_set(failure, caught.name, qa_caught_message(&caught));
+    qa_identity_owner_destroy(&p->identity); qa_rwt_failure_release(&p->thrown); free(p);
     return false;
   }
   if (!qa_render_image_journal_init(&p->journal)) qa_range_error("Render worker allocation failed");

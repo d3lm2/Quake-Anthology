@@ -17,17 +17,70 @@
 
 /* Internal error channel standing in for the BinaryError/RangeError
  * throws parseFont catches. Aborts would change observable behavior. */
+/* Scratch held across calls that can fail: a failure releases every held
+ * object, newest first, before the catch site reports (TS: garbage). */
+typedef struct tt_hold {
+  void (*release)(void *);
+  void *arg;
+} tt_hold;
+
 typedef struct tt_err {
   jmp_buf jb;
   char msg[512];
+  /* parseFont's table directory, released when a table read fails. */
+  void *directory;
+  tt_hold *holds;
+  size_t hold_count;
+  size_t hold_cap;
 } tt_err;
 
+static void tt_release_holds(tt_err *err);
+
+/* Holds are released here, while the failing frames still exist. */
 static _Noreturn void tt_fail(tt_err *err, const char *format, ...) {
   va_list ap;
   va_start(ap, format);
   vsnprintf(err->msg, sizeof err->msg, format, ap);
   va_end(ap);
+  tt_release_holds(err);
   longjmp(err->jb, 1);
+}
+
+static void tt_keep(tt_err *err, void (*release)(void *), void *arg) {
+  if (err->hold_count == err->hold_cap) {
+    size_t cap = err->hold_cap == 0 ? 16 : err->hold_cap * 2;
+    tt_hold *next = (tt_hold *)realloc(err->holds, cap * sizeof *next);
+    if (next == NULL) {
+      release(arg);
+      tt_fail(err, "out of memory");
+    }
+    err->holds = next;
+    err->hold_cap = cap;
+  }
+  err->holds[err->hold_count].release = release;
+  err->holds[err->hold_count].arg = arg;
+  err->hold_count++;
+}
+
+/* Ends the hold on `arg` (freed or handed on by its owner). */
+static void tt_let_go(tt_err *err, void *arg) {
+  for (size_t i = err->hold_count; i > 0; i--) {
+    if (err->holds[i - 1].arg != arg) continue;
+    memmove(&err->holds[i - 1], &err->holds[i],
+            (err->hold_count - i) * sizeof *err->holds);
+    err->hold_count--;
+    return;
+  }
+}
+
+static void tt_release_holds(tt_err *err) {
+  while (err->hold_count > 0) {
+    tt_hold hold = err->holds[--err->hold_count];
+    hold.release(hold.arg);
+  }
+  free(err->holds);
+  err->holds = NULL;
+  err->hold_cap = 0;
 }
 
 static void *tt_calloc(tt_err *err, size_t count, size_t size) {
@@ -55,9 +108,11 @@ typedef struct tt_slice {
 } tt_slice;
 
 static void dv_check(tt_err *err, tt_slice s, int64_t off, size_t size) {
-  if (off < 0 || (uint64_t)off > (uint64_t)s.n ||
-      (uint64_t)size > (uint64_t)s.n - (uint64_t)off) {
-    tt_fail(err, "Offset is outside the bounds of the DataView");
+  /* The native DataView refusals (JavaScriptCore words the two differently);
+   * parseFont reports the message as its reason. */
+  if (off < 0) tt_fail(err, "byteOffset cannot be negative");
+  if ((uint64_t)off > (uint64_t)s.n || (uint64_t)size > (uint64_t)s.n - (uint64_t)off) {
+    tt_fail(err, "Out of bounds access");
   }
 }
 
@@ -183,6 +238,34 @@ typedef struct tt_num_list {
   size_t cap;
 } tt_num_list;
 
+static void release_num_list(void *raw) {
+  tt_num_list *list = (tt_num_list *)raw;
+  free(list->v);
+  list->v = NULL;
+  list->n = 0;
+  list->cap = 0;
+}
+static void release_raw_contour(void *raw) {
+  tt_raw_contour *contour = (tt_raw_contour *)raw;
+  free(contour->v);
+  contour->v = NULL;
+  contour->n = 0;
+  contour->cap = 0;
+}
+static void release_raw_set(void *raw) { raw_set_free((tt_raw_set *)raw); }
+static void release_flat_contour(void *raw) {
+  qa_flattened_contour *contour = (qa_flattened_contour *)raw;
+  free(contour->points);
+  contour->points = NULL;
+  contour->count = 0;
+}
+static void release_flat_builder(void *raw) {
+  tt_flat_builder *builder = (tt_flat_builder *)raw;
+  flat_set_free(&builder->set);
+  free(builder->caps);
+  builder->caps = NULL;
+}
+
 static void num_push(tt_err *err, tt_num_list *list, double value) {
   list->v = (double *)tt_grow(err, list->v, &list->cap, list->n + 1,
                               sizeof(double));
@@ -221,6 +304,14 @@ static tt_slice slice_at(tt_err *err, const tt_slice_list *list, int64_t index,
     tt_fail(err, "Missing %s at index %lld", ctx, (long long)index);
   }
   return list->v[(size_t)index];
+}
+
+static void release_slice_list(void *raw) {
+  tt_slice_list *list = (tt_slice_list *)raw;
+  free(list->v);
+  list->v = NULL;
+  list->n = 0;
+  list->cap = 0;
 }
 
 typedef struct tt_table_record {
@@ -409,6 +500,17 @@ static tt_raw_set parse_simple_glyph(tt_err *err, tt_slice view, tt_slice buf,
                                      int64_t off, int64_t num_contours) {
   int64_t p = off;
   tt_num_list end_pts = {NULL, 0, 0};
+  tt_num_list flags = {NULL, 0, 0};
+  tt_num_list xs = {NULL, 0, 0};
+  tt_num_list ys = {NULL, 0, 0};
+  tt_raw_set contours = {NULL, 0, 0};
+  tt_raw_contour pts = {NULL, 0, 0};
+  tt_keep(err, release_num_list, &end_pts);
+  tt_keep(err, release_num_list, &flags);
+  tt_keep(err, release_num_list, &xs);
+  tt_keep(err, release_num_list, &ys);
+  tt_keep(err, release_raw_set, &contours);
+  tt_keep(err, release_raw_contour, &pts);
   for (int64_t i = 0; i < num_contours; i++) {
     num_push(err, &end_pts, (double)dv_u16(err, view, p));
     p += 2;
@@ -417,7 +519,6 @@ static tt_raw_set parse_simple_glyph(tt_err *err, tt_slice view, tt_slice buf,
       ? (int64_t)num_at(err, &end_pts, num_contours - 1, "endPts") + 1 : 0;
   int64_t instruction_length = dv_u16(err, view, p);
   p += 2 + instruction_length;
-  tt_num_list flags = {NULL, 0, 0};
   while ((int64_t)flags.n < num_points) {
     uint8_t f = at_u8(err, buf, p, "buf");
     p += 1;
@@ -431,7 +532,6 @@ static tt_raw_set parse_simple_glyph(tt_err *err, tt_slice view, tt_slice buf,
       }
     }
   }
-  tt_num_list xs = {NULL, 0, 0};
   double x = 0;
   for (int64_t i = 0; i < num_points; i++) {
     int f = (int)num_at(err, &flags, i, "flags");
@@ -445,7 +545,6 @@ static tt_raw_set parse_simple_glyph(tt_err *err, tt_slice view, tt_slice buf,
     }
     num_push(err, &xs, x);
   }
-  tt_num_list ys = {NULL, 0, 0};
   double y = 0;
   for (int64_t i = 0; i < num_points; i++) {
     int f = (int)num_at(err, &flags, i, "flags");
@@ -459,11 +558,9 @@ static tt_raw_set parse_simple_glyph(tt_err *err, tt_slice view, tt_slice buf,
     }
     num_push(err, &ys, y);
   }
-  tt_raw_set contours = {NULL, 0, 0};
   int64_t start = 0;
   for (int64_t c = 0; c < num_contours; c++) {
     int64_t end = (int64_t)num_at(err, &end_pts, c, "endPts");
-    tt_raw_contour pts = {NULL, 0, 0};
     for (int64_t i = start; i <= end; i++) {
       tt_raw_point pt;
       pt.x = num_at(err, &xs, i, "xs");
@@ -472,8 +569,17 @@ static tt_raw_set parse_simple_glyph(tt_err *err, tt_slice view, tt_slice buf,
       raw_push(err, &pts, pt);
     }
     raw_set_push(err, &contours, pts);
+    pts.v = NULL; /* now owned by contours */
+    pts.n = 0;
+    pts.cap = 0;
     start = end + 1;
   }
+  tt_let_go(err, &pts);
+  tt_let_go(err, &contours);
+  tt_let_go(err, &ys);
+  tt_let_go(err, &xs);
+  tt_let_go(err, &flags);
+  tt_let_go(err, &end_pts);
   free(end_pts.v);
   free(flags.v);
   free(xs.v);
@@ -497,6 +603,11 @@ static tt_raw_set parse_composite_glyph(tt_err *err, tt_slice view, int64_t off,
                                         int64_t depth) {
   int64_t p = off;
   tt_raw_set contours = {NULL, 0, 0};
+  tt_raw_set sub = {NULL, 0, 0};
+  tt_raw_contour mapped = {NULL, 0, 0};
+  tt_keep(err, release_raw_set, &contours);
+  tt_keep(err, release_raw_set, &sub);
+  tt_keep(err, release_raw_contour, &mapped);
   for (;;) {
     int flags = dv_u16(err, view, p);
     p += 2;
@@ -541,9 +652,8 @@ static tt_raw_set parse_composite_glyph(tt_err *err, tt_slice view, int64_t off,
       p += 8;
     }
     if (depth < 8) {
-      tt_raw_set sub = resolve(ctx, glyph_index, depth + 1);
+      sub = resolve(ctx, glyph_index, depth + 1);
       for (size_t k = 0; k < sub.n; k++) {
-        tt_raw_contour mapped = {NULL, 0, 0};
         for (size_t j = 0; j < sub.v[k].n; j++) {
           tt_raw_point pt = sub.v[k].v[j];
           tt_raw_point m;
@@ -553,6 +663,9 @@ static tt_raw_set parse_composite_glyph(tt_err *err, tt_slice view, int64_t off,
           raw_push(err, &mapped, m);
         }
         raw_set_push(err, &contours, mapped);
+        mapped.v = NULL; /* now owned by contours */
+        mapped.n = 0;
+        mapped.cap = 0;
       }
       /* Resolutions here are always depth>0, hence fresh in the TS
        * (the raw cache is only consulted at depth 0); free after copy. */
@@ -560,6 +673,9 @@ static tt_raw_set parse_composite_glyph(tt_err *err, tt_slice view, int64_t off,
     }
     if (!(flags & TT_MORE_COMPONENTS)) break;
   }
+  tt_let_go(err, &mapped);
+  tt_let_go(err, &sub);
+  tt_let_go(err, &contours);
   return contours;
 }
 
@@ -584,6 +700,10 @@ static qa_flattened_contour flatten_quadratic_contour(
   int64_t n = (int64_t)raw_points->n;
   if (n < 2) return out;
   tt_raw_contour expanded = {NULL, 0, 0};
+  tt_raw_contour ring = {NULL, 0, 0};
+  tt_keep(err, release_flat_contour, &out);
+  tt_keep(err, release_raw_contour, &expanded);
+  tt_keep(err, release_raw_contour, &ring);
   for (int64_t i = 0; i < n; i++) {
     tt_raw_point cur = raw_at(err, raw_points, i, "rawPoints");
     tt_raw_point next = raw_at(err, raw_points, (i + 1) % n, "rawPoints");
@@ -604,17 +724,19 @@ static qa_flattened_contour flatten_quadratic_contour(
     }
   }
   if (start_idx == -1) {
+    tt_let_go(err, &ring);
+    tt_let_go(err, &expanded);
+    tt_let_go(err, &out);
     free(expanded.v);
     return out;
   }
-  tt_raw_contour ring = {NULL, 0, 0};
   for (size_t i = (size_t)start_idx; i < expanded.n; i++) {
     raw_push(err, &ring, expanded.v[i]);
   }
   for (int64_t i = 0; i < start_idx; i++) {
     raw_push(err, &ring, expanded.v[i]);
   }
-  free(expanded.v);
+  release_raw_contour(&expanded);
   int64_t m = (int64_t)ring.n;
   tt_raw_point first = raw_at(err, &ring, 0, "ring");
   qa_tt_point cur = {first.x, first.y};
@@ -636,6 +758,9 @@ static qa_flattened_contour flatten_quadratic_contour(
       i += 2;
     }
   }
+  tt_let_go(err, &ring);
+  tt_let_go(err, &expanded);
+  tt_let_go(err, &out);
   free(ring.v);
   return out;
 }
@@ -668,6 +793,8 @@ static void cff_dict_free(tt_cff_dict *dict) {
   dict->n = 0;
   dict->cap = 0;
 }
+
+static void release_cff_dict(void *raw) { cff_dict_free((tt_cff_dict *)raw); }
 
 static double dict_at(tt_err *err, const tt_cff_dict_entry *entry,
                       int64_t index, const char *ctx) {
@@ -744,6 +871,8 @@ static tt_cff_index_result read_cff_index(tt_err *err, tt_slice buf,
   }
   pos += 1;
   tt_num_list offsets = {NULL, 0, 0};
+  tt_keep(err, release_num_list, &offsets);
+  tt_keep(err, release_slice_list, &result.items);
   for (int64_t i = 0; i <= count; i++) {
     double v = 0;
     for (int b = 0; b < off_size; b++) {
@@ -768,6 +897,8 @@ static tt_cff_index_result read_cff_index(tt_err *err, tt_slice buf,
     slice_push(err, &result.items, item);
   }
   result.end = data_start + (int64_t)num_at(err, &offsets, count, "offsets");
+  tt_let_go(err, &result.items);
+  tt_let_go(err, &offsets);
   free(offsets.v);
   return result;
 }
@@ -775,6 +906,8 @@ static tt_cff_index_result read_cff_index(tt_err *err, tt_slice buf,
 static tt_cff_dict parse_cff_dict(tt_err *err, tt_slice b) {
   tt_cff_dict dict = {NULL, 0, 0};
   tt_num_list operands = {NULL, 0, 0};
+  tt_keep(err, release_cff_dict, &dict);
+  tt_keep(err, release_num_list, &operands);
   int64_t i = 0;
   while (i < (int64_t)b.n) {
     int b0 = at_u8(err, b, i, "b");
@@ -793,6 +926,7 @@ static tt_cff_dict parse_cff_dict(tt_err *err, tt_slice b) {
       entry.n = operands.n;
       dict.v = (tt_cff_dict_entry *)tt_grow(err, dict.v, &dict.cap, dict.n + 1,
                                             sizeof(tt_cff_dict_entry));
+      /* The entry's operands are owned by the dict from here. */
       /* Map.set replaces an existing operator. */
       size_t slot = dict.n;
       for (size_t k = 0; k < dict.n; k++) {
@@ -832,6 +966,8 @@ static tt_cff_dict parse_cff_dict(tt_err *err, tt_slice b) {
       i += 1;
     }
   }
+  tt_let_go(err, &operands);
+  tt_let_go(err, &dict);
   free(operands.v);
   return dict;
 }
@@ -882,13 +1018,16 @@ static void parse_private_and_local_subrs(tt_err *err, tt_slice buf,
   priv.p = buf.p + off;
   priv.n = (size_t)(end - off);
   tt_cff_dict priv_dict = parse_cff_dict(err, priv);
+  tt_keep(err, release_cff_dict, &priv_dict);
   const tt_cff_dict_entry *subrs_rel = cff_dict_get(&priv_dict, 19);
   if (subrs_rel == NULL || subrs_rel->n == 0) {
+    tt_let_go(err, &priv_dict);
     cff_dict_free(&priv_dict);
     *out_bias = subr_bias(0);
     return;
   }
   double rel = dict_at(err, subrs_rel, 0, "subrsRel");
+  tt_let_go(err, &priv_dict);
   cff_dict_free(&priv_dict);
   tt_cff_index_result idx = read_cff_index(err, buf, view, cff_position(offset + rel));
   *out_subrs = idx.items;
@@ -898,6 +1037,7 @@ static void parse_private_and_local_subrs(tt_err *err, tt_slice buf,
 static uint8_t *parse_fd_select(tt_err *err, tt_slice buf, tt_slice view,
                                 int64_t offset, int64_t num_glyphs) {
   uint8_t *result = (uint8_t *)tt_calloc(err, (size_t)num_glyphs, 1);
+  tt_keep(err, free, result);
   int format = at_u8(err, buf, offset, "buf");
   if (format == 0) {
     for (int64_t i = 0; i < num_glyphs; i++) {
@@ -925,6 +1065,7 @@ static uint8_t *parse_fd_select(tt_err *err, tt_slice buf, tt_slice view,
       if (g >= 0 && g < num_glyphs) result[g] = prev_fd;
     }
   }
+  tt_let_go(err, result);
   return result;
 }
 
@@ -941,30 +1082,41 @@ static bool parse_cff(tt_err *err, tt_slice buf, int64_t table_offset,
   pos = name_idx.end;
   free(name_idx.items.v);
   tt_cff_index_result top_idx = read_cff_index(err, cff, cff, pos);
+  tt_keep(err, release_slice_list, &top_idx.items);
   pos = top_idx.end;
   tt_cff_index_result string_idx = read_cff_index(err, cff, cff, pos);
   pos = string_idx.end;
   free(string_idx.items.v);
   tt_cff_index_result global_idx = read_cff_index(err, cff, cff, pos);
+  tt_keep(err, release_slice_list, &global_idx.items);
+  tt_cff_dict top_dict = {NULL, 0, 0};
+  tt_keep(err, release_cff_dict, &top_dict);
   if (top_idx.items.n == 0) {
-    free(top_idx.items.v);
-    free(global_idx.items.v);
+    tt_let_go(err, &top_dict);
+    tt_let_go(err, &global_idx.items);
+    tt_let_go(err, &top_idx.items);
+    release_slice_list(&global_idx.items);
+    release_slice_list(&top_idx.items);
     return false;
   }
-  tt_cff_dict top_dict =
+  top_dict =
       parse_cff_dict(err, slice_at(err, &top_idx.items, 0, "topDictIdx.items"));
-  free(top_idx.items.v);
+  release_slice_list(&top_idx.items);
   const tt_cff_dict_entry *cs_off = cff_dict_get(&top_dict, 17);
   if (cs_off == NULL || cs_off->n == 0) {
+    tt_let_go(err, &top_dict);
+    tt_let_go(err, &global_idx.items);
+    tt_let_go(err, &top_idx.items);
     cff_dict_free(&top_dict);
-    free(global_idx.items.v);
+    release_slice_list(&global_idx.items);
     return false;
   }
   double cs_offset = dict_at(err, cs_off, 0, "charStringsOff");
   tt_cff_index_result cs_idx = read_cff_index(err, cff, cff, cff_position(cs_offset));
   out->char_strings = cs_idx.items;
   out->is_cid = cff_dict_get(&top_dict, 1230) != NULL;
-  out->global_subrs = global_idx.items;
+  out->global_subrs = global_idx.items; /* `out` (the font) owns it now */
+  tt_let_go(err, &global_idx.items);
   out->global_bias = subr_bias((int64_t)out->global_subrs.n);
   double psize = 0, poffset = 0;
   bool have_private = private_entry_of(err, &top_dict, &psize, &poffset);
@@ -982,13 +1134,16 @@ static bool parse_cff(tt_err *err, tt_slice buf, int64_t table_offset,
     if (have_fd_array) {
       tt_cff_index_result fd_idx =
           read_cff_index(err, cff, cff, cff_position(fd_array_offset));
+      tt_keep(err, release_slice_list, &fd_idx.items);
+      tt_cff_dict fd_dict = {NULL, 0, 0};
+      tt_keep(err, release_cff_dict, &fd_dict);
       out->fd_count = fd_idx.items.n;
       out->fd_local_subrs = (tt_slice_list *)tt_calloc(
           err, out->fd_count, sizeof(tt_slice_list));
       out->fd_local_bias =
           (int64_t *)tt_calloc(err, out->fd_count, sizeof(int64_t));
       for (size_t k = 0; k < fd_idx.items.n; k++) {
-        tt_cff_dict fd_dict = parse_cff_dict(err, fd_idx.items.v[k]);
+        fd_dict = parse_cff_dict(err, fd_idx.items.v[k]);
         double s2 = 0, o2 = 0;
         bool hp = private_entry_of(err, &fd_dict, &s2, &o2);
         cff_dict_free(&fd_dict);
@@ -996,6 +1151,8 @@ static bool parse_cff(tt_err *err, tt_slice buf, int64_t table_offset,
                                       &out->fd_local_subrs[k],
                                       &out->fd_local_bias[k]);
       }
+      tt_let_go(err, &fd_dict);
+      tt_let_go(err, &fd_idx.items);
       free(fd_idx.items.v);
     }
     if (have_fd_select) {
@@ -1004,6 +1161,8 @@ static bool parse_cff(tt_err *err, tt_slice buf, int64_t table_offset,
       out->fd_select_len = out->char_strings.n;
     }
   }
+  tt_let_go(err, &top_dict);
+  tt_let_go(err, &top_idx.items);
   cff_dict_free(&top_dict);
   return true;
 }
@@ -1422,6 +1581,15 @@ static void exec_charstring(tt_err *err, tt_slice code, tt_type2_ctx *ctx,
   }
 }
 
+static void release_type2(void *raw) {
+  tt_type2_ctx *ctx = (tt_type2_ctx *)raw;
+  free(ctx->current.points);
+  ctx->current.points = NULL;
+  free(ctx->stack.v);
+  ctx->stack.v = NULL;
+  release_flat_builder(&ctx->contours);
+}
+
 static qa_tt_contours get_cff_contours(tt_err *err, const tt_cff_font *cff,
                                        int64_t gid) {
   qa_tt_contours empty = {NULL, 0};
@@ -1443,6 +1611,7 @@ static qa_tt_contours get_cff_contours(tt_err *err, const tt_cff_font *cff,
   tt_type2_ctx ctx;
   memset(&ctx, 0, sizeof ctx);
   ctx.budget = 1000000;
+  tt_keep(err, release_type2, &ctx);
   exec_charstring(err, code, &ctx, &cff->global_subrs, cff->global_bias,
                   local_subrs, local_bias, 0);
   if (ctx.has_current && ctx.current.count > 0) {
@@ -1450,6 +1619,7 @@ static qa_tt_contours get_cff_contours(tt_err *err, const tt_cff_font *cff,
   } else {
     free(ctx.current.points);
   }
+  tt_let_go(err, &ctx);
   free(ctx.stack.v);
   free(ctx.contours.caps);
   return ctx.contours.set;
@@ -1662,6 +1832,7 @@ static const char *parse_font_data(tt_err *err, qa_parsed_font *font) {
   if (!read_sfnt_directory(err, view, &tables, &table_count)) {
     return "not a recognized sfnt file (bad signature)";
   }
+  err->directory = tables;
   const tt_table_record *head_t = find_table(tables, table_count, "head");
   const tt_table_record *hhea_t = find_table(tables, table_count, "hhea");
   const tt_table_record *maxp_t = find_table(tables, table_count, "maxp");
@@ -1806,11 +1977,13 @@ qa_parse_font_result qa_truetype_parse_font(const uint8_t *buf, size_t length) {
   }
   if (setjmp(err->jb) != 0) {
     result.reason = tt_strdup(err->msg);
+    free(err->directory);
     free(err);
     qa_parsed_font_destroy(font);
     return result;
   }
   const char *fail = parse_font_data(err, font);
+  tt_release_holds(err);
   free(err);
   if (fail != NULL) {
     result.reason = tt_strdup(fail);
@@ -1896,6 +2069,7 @@ int64_t qa_parsed_font_cmap_lookup(qa_parsed_font *font, int64_t codepoint) {
   int64_t gid = font->cmap_format == 12
       ? cmap_format12_lookup(err, view, font->cmap_offset, codepoint)
       : cmap_format4_lookup(err, view, font->cmap_offset, codepoint);
+  tt_release_holds(err);
   free(err);
   return gid;
 }
@@ -1925,15 +2099,22 @@ qa_tt_contours qa_parsed_font_contours(qa_parsed_font *font, int64_t gid) {
     ctx.font = font;
     ctx.err = err;
     ctx.resolve_budget = 0;
-    tt_raw_set raw = get_raw(&ctx, gid, 0);
     tt_flat_builder builder;
     memset(&builder, 0, sizeof builder);
+    qa_flattened_contour fc = {NULL, 0};
+    tt_keep(err, release_flat_builder, &builder);
+    tt_keep(err, release_flat_contour, &fc);
+    tt_raw_set raw = get_raw(&ctx, gid, 0);
     for (size_t i = 0; i < raw.n; i++) {
-      qa_flattened_contour fc = flatten_quadratic_contour(err, &raw.v[i]);
+      fc = flatten_quadratic_contour(err, &raw.v[i]);
       qa_flattened_contour *slot = flat_builder_new(err, &builder);
       *slot = fc;
       builder.caps[builder.set.count - 1] = fc.count;
+      fc.points = NULL; /* now owned by the builder */
+      fc.count = 0;
     }
+    tt_let_go(err, &fc);
+    tt_let_go(err, &builder);
     free(builder.caps);
     flat = builder.set;
   } else {
@@ -1941,6 +2122,7 @@ qa_tt_contours qa_parsed_font_contours(qa_parsed_font *font, int64_t gid) {
         ? get_cff_contours(err, &font->cff, gid)
         : empty;
   }
+  tt_release_holds(err);
   free(err);
   if (gid >= 0 && (uint64_t)gid < (uint64_t)font->flat_cache_len) {
     font->flat_cache[gid] = flat;
@@ -2223,16 +2405,13 @@ bool qa_truetype_rasterize_glyph(qa_parsed_font *font, int64_t gid, double px,
                                  qa_rasterized_glyph *out) {
   memset(out, 0, sizeof *out);
   double scale = px / (double)font->units_per_em;
-  /* Metrics come from the font file; a glyph cell is never legitimately many
-     times the pixel size. */
-  double limit = qa_js_max(64, ceil(px * 4));
   double w = qa_js_round((double)qa_parsed_font_advance_width(font, gid) * scale);
-  int64_t width = (int64_t)qa_js_min(limit, w > 1.0 ? w : 1.0);
+  int64_t width = (int64_t)(w > 1.0 ? w : 1.0);
   qa_tt_contours contours = qa_parsed_font_contours(font, gid);
   double bottom = contours_y_min(&contours);
   if (bottom > 0) bottom = 0;
   double h = qa_js_round(((double)font->ascent - bottom) * scale);
-  int64_t height = (int64_t)qa_js_min(limit, h > 1.0 ? h : 1.0);
+  int64_t height = (int64_t)(h > 1.0 ? h : 1.0);
   if (contours.count == 0) {
     size_t total = (size_t)width * (size_t)height;
     uint8_t *bytes = (uint8_t *)calloc(total == 0 ? 1 : total, 1);
@@ -2292,9 +2471,8 @@ bool qa_truetype_rasterize_color_glyph(qa_parsed_font *font, int64_t base_gid,
     return false;
   }
   double scale = px / (double)font->units_per_em;
-  double limit = qa_js_max(64, ceil(px * 4));
   double w = qa_js_round((double)qa_parsed_font_advance_width(font, base_gid) * scale);
-  int64_t width = (int64_t)qa_js_min(limit, w > 1.0 ? w : 1.0);
+  int64_t width = (int64_t)(w > 1.0 ? w : 1.0);
   /* Resolved layers borrow contour caches; colors are copied. */
   qa_tt_color *colors = NULL;
   int64_t *layer_gids = NULL;
@@ -2311,6 +2489,12 @@ bool qa_truetype_rasterize_color_glyph(qa_parsed_font *font, int64_t base_gid,
     }
   }
   double y_min = 0;
+  /* A hostile layer outline raises RangeError (buildFontAtlas skips the
+     glyph): the layer scratch is released on the way out. */
+  qa_cleanup layers_node, colors_node, gids_node;
+  qa_cleanup_push(&layers_node, free, layers);
+  qa_cleanup_push(&colors_node, free, colors);
+  qa_cleanup_push(&gids_node, free, layer_gids);
   for (size_t i = 0; i < layer_count; i++) {
     qa_tt_color color;
     if (layers[i].palette_index == 0xffff) {
@@ -2326,10 +2510,13 @@ bool qa_truetype_rasterize_color_glyph(qa_parsed_font *font, int64_t base_gid,
     layer_gids[resolved] = layers[i].gid;
     resolved += 1;
   }
+  qa_cleanup_pop(&gids_node);
+  qa_cleanup_pop(&colors_node);
+  qa_cleanup_pop(&layers_node);
   free(layers);
   double bottom = y_min < 0 ? y_min : 0;
   double h = qa_js_round(((double)font->ascent - bottom) * scale);
-  int64_t height = (int64_t)qa_js_min(limit, h > 1.0 ? h : 1.0);
+  int64_t height = (int64_t)(h > 1.0 ? h : 1.0);
   size_t total = (size_t)width * (size_t)height;
   uint8_t *pixels = (uint8_t *)calloc(total == 0 ? 1 : total * 4, 1);
   if (pixels == NULL) {
@@ -2460,9 +2647,6 @@ static void atlas_cell_run(void *ctx) {
   job->status = ATLAS_CELL_READY;
 }
 
-/* 4096 x 4096 texels, the practical GL texture ceiling for UI atlases. */
-#define MAX_ATLAS_PIXELS ((int64_t)4096 * 4096)
-
 bool qa_truetype_build_font_atlas(qa_parsed_font *font,
                                   const int64_t *codepoints, size_t count,
                                   double px, int64_t max_width,
@@ -2560,15 +2744,6 @@ bool qa_truetype_build_font_atlas(qa_parsed_font *font,
       if (cell->height > shelf_height) shelf_height = cell->height;
     }
     atlas_height = cursor_y + shelf_height + gap;
-    if (atlas_width * atlas_height > MAX_ATLAS_PIXELS) {
-      for (size_t i = 0; i < cell_count; i++) free(cells[i].data);
-      free(cells);
-      free(order);
-      free(place_x);
-      free(place_y);
-      free(place_cp);
-      qa_range_error("Font atlas exceeds the size limit");
-    }
     pixels = (uint8_t *)calloc(
         (size_t)(atlas_width * atlas_height) == 0
             ? 1

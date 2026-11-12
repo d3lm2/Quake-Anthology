@@ -1,4 +1,5 @@
 /* Port of src/app/bootstrap/ui.ts (ApplicationSeatUi). GPL-2.0-or-later. */
+#include "qa/formats/text_decoder.h"
 #include "qa/app/bootstrap/ui.h"
 #include <math.h>
 #include <stdio.h>
@@ -20,6 +21,7 @@
 #include "qa/content/q2/rerelease/types.h"
 #include "qa/app/bootstrap/simulation/q3/host.h"
 #include "qa/core/commands/text.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/network/common/js_number.h"
@@ -82,6 +84,15 @@ enum { SETTING_BINDINGS, SETTING_GYRO, SETTING_SERVER, SETTING_RANKING, SETTING_
 typedef struct ui_button { qa_app_seat_ui *ui; int which; } ui_button;
 typedef struct wheel_icon { char *item; char *resource; } wheel_icon;
 typedef struct owned_bindings { qa_ui_setting_bindings bindings; } owned_bindings;
+/* prepareNativeQ2Hud's environment closures. TS builds a fresh environment per prepare and each renderer keeps the one
+ * its last prepare received (a relayout after a failed first prepare reads it), so the C keeps one ctx per renderer,
+ * owned by the UI (the HUD copies the rendering, which points at it, past the prepare). */
+typedef struct native_environment {
+  qa_app_q2_native_hud *renderer;
+  qa_app_rerelease_localizer *localizer;
+  qa_text_font_selection font;
+  char *localized; /* the borrowed localize result */
+} native_environment;
 
 struct qa_app_seat_ui {
   qa_app_seat_ui_options options;
@@ -121,6 +132,8 @@ struct qa_app_seat_ui {
   char *native_item; qa_provider_reference native_source; char *native_source_content, *native_source_provider;
   char *native_label, *native_localized_label; bool native_has_icon; qa_resource_id native_icon; double native_aspect;
   qa_app_rerelease_presentation *native_hud_localizations;
+  native_environment **native_environments; size_t native_environment_count, native_environment_capacity;
+  qa_ui_setting_cvars shared; /* input.sharedSettings() at construction (a view following publishSharedCvars) */
   qa_text_font_selection font;
   const qa_app_menu_typography *typography;
   /* closure state */
@@ -144,7 +157,7 @@ struct qa_app_seat_ui {
   qa_app_q1_wheel_items_result q1_items; bool has_q1_items;
   char **output_names; size_t output_name_count;
   qa_controller_device *devices; size_t device_count;
-  char *language_text, *localized_text, *prompt_language, *clipboard_text;
+  char *language_text, *prompt_language, *clipboard_text;
   qa_app_q2_match_setting match_settings[8]; char match_setting_text[3][32];
   bool closed;
 };
@@ -263,10 +276,12 @@ static const char *controller_clipboard(void *ctx) {
   size_t length = 0;
   uint8_t *bytes = qa_read_sdl_clipboard(&length);
   if (bytes == NULL) return NULL;
-  free(ui->clipboard_text);
-  ui->clipboard_text = xcalloc(length + 1, 1);
-  memcpy(ui->clipboard_text, bytes, length);
+  /* new TextDecoder().decode(bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD. */
+  char *text = qa_text_decoder_decode(bytes, length, NULL);
   free(bytes);
+  if (text == NULL) qa_range_error("Out of memory");
+  free(ui->clipboard_text);
+  ui->clipboard_text = text;
   return ui->clipboard_text;
 }
 static void controller_sound(void *ctx, qa_ui_sound sound, qa_seat_id owner) {
@@ -391,8 +406,9 @@ static bool setting_enabled(void *ctx) {
     }
     case SETTING_RANKING: return ui->options.rankings->current(ui->options.rankings->ctx) != NULL;
     case SETTING_JOIN: {
-      double capacity = qa_app_application_input_local_player_capacity(ui->input);
-      return (double)qa_app_application_input_local_count(ui->input) < (capacity < 4 ? capacity : 4);
+      /* input.locals.length < Math.min(4, input.localPlayerCapacity): a NaN capacity disables it. */
+      double capacity = qa_js_min(4, qa_app_application_input_local_player_capacity(ui->input));
+      return (double)qa_app_application_input_local_count(ui->input) < capacity;
     }
     case SETTING_DROP: return qa_app_application_input_can_remove_local_player(ui->input, ui->seat);
     default: return true;
@@ -491,12 +507,12 @@ static const char *renderer_current(void *ctx) {
 }
 static bool worker_read(void *ctx) {
   qa_app_seat_ui *ui = ctx;
-  return qa_cvar_registry_variable_value(qa_app_application_input_shared_settings(ui->input), "r_smp") != 0;
+  return qa_cvar_registry_variable_value(qa_ui_setting_cvars_get(&ui->shared), "r_smp") != 0;
 }
 static const char *worker_write(void *ctx, bool value) {
   qa_app_seat_ui *ui = ctx;
   qa_cvar_snapshot snapshot;
-  if (qa_cvar_registry_set(qa_app_application_input_shared_settings(ui->input), "r_smp", value ? "1" : "0", false, &snapshot))
+  if (qa_cvar_registry_set(qa_ui_setting_cvars_get(&ui->shared), "r_smp", value ? "1" : "0", false, &snapshot))
     qa_cvar_read_free(&snapshot);
   return NULL;
 }
@@ -618,15 +634,23 @@ static void append_owned(qa_app_seat_ui *ui, qa_ui_setting_binding **items, size
   append_items(items, count, capacity, bindings.items, bindings.count);
 }
 
+/* A constructor that raises drops what it built (TS: the half-built object is garbage). */
+static void abandon_ui(void *ui) { qa_app_seat_ui_destroy(ui); }
+
 qa_app_seat_ui *qa_app_seat_ui_create(const qa_app_seat_ui_options *options) {
   qa_app_seat_ui *ui = xcalloc(1, sizeof *ui);
+  ui->dispose_menu = -1;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, abandon_ui, ui);
   ui->options = *options;
   ui->local = options->local; ui->art = options->art; ui->input = options->input;
   ui->seat = qa_session_seat_id(options->local->player.seat);
   ui->native_q2_hud = qa_app_q2_native_hud_create();
   ui->authored_wheel = qa_app_application_q1_wheel_create();
   ui->font = options->font; ui->typography = options->typography;
-  qa_ui_seat_preferences_init(&ui->preferences, ui->seat, qa_app_application_input_shared_settings(ui->input));
+  /* new SeatUiPreferences(seat, input.sharedSettings()): a view that follows publishSharedCvars. */
+  ui->shared = qa_app_application_input_shared_settings_view(ui->input);
+  qa_ui_seat_preferences_init_view(&ui->preferences, ui->seat, ui->shared);
   ui->messages = qa_seat_hud_messages_create(ui->seat);
   qa_ui_text_renderer_init(&ui->text, ui->seat);
   if (!qa_ui_text_renderer_bind(&ui->text, ui->art->skin.font, ui->font)) qa_range_error("Out of memory");
@@ -666,7 +690,10 @@ qa_app_seat_ui *qa_app_seat_ui_create(const qa_app_seat_ui_options *options) {
   if (ui->sound_captions == NULL || ui->source_hud == NULL || ui->prompt == NULL || ui->match == NULL || ui->weapon_wheel == NULL)
     qa_range_error("Out of memory");
   ui->binding_reset.ctx = ui; ui->binding_reset.available = reset_available; ui->binding_reset.reset = reset_apply;
-  ui->bindings = qa_ui_register_binding_menus(ui->controller, ui->local->input, NULL, 0, binding_source, ui, &ui->binding_reset);
+  qa_ui_binding_scope binding_scope;
+  bool has_binding_scope = qa_app_application_input_binding_scope(ui->input, &binding_scope); /* input.bindingScope?.() */
+  ui->bindings = qa_ui_register_binding_menus_scoped(ui->controller, ui->local->input, NULL, 0, binding_source, ui,
+      &ui->binding_reset, has_binding_scope ? &binding_scope : NULL);
   qa_ui_setting_binding binding_menu = setting_button(ui, SETTING_BINDINGS, "ui:input:bindings", "Key and controller bindings", "input");
   ui->audio_service.ctx = ui; ui->audio_service.read = audio_read; ui->audio_service.write = audio_write;
   ui->audio_output.ctx = ui; ui->audio_output.has_format = true;
@@ -674,23 +701,27 @@ qa_app_seat_ui *qa_app_seat_ui_create(const qa_app_seat_ui_options *options) {
   ui->audio_output.selected = output_selected; ui->audio_output.devices = output_devices;
   ui->audio_output.select = output_select; ui->audio_output.report = console_line;
   qa_ui_setting_bindings volumes = qa_ui_bind_audio_settings(&ui->audio_service, &ui->audio_output);
-  qa_cvar_registry *shared = qa_app_application_input_shared_settings(ui->input);
-  ui->renderer.ctx = ui; ui->renderer.current = renderer_current; ui->renderer.has_worker = shared != NULL;
+  own_bindings(ui, volumes);
+  /* const shared = input.sharedSettings(): the same view. */
+  qa_ui_setting_cvars shared = ui->shared;
+  bool has_shared = qa_ui_setting_cvars_present(&shared);
+  ui->renderer.ctx = ui; ui->renderer.current = renderer_current; ui->renderer.has_worker = has_shared;
   ui->renderer.worker_read = worker_read; ui->renderer.worker_write = worker_write;
   ui->renderer.apply = renderer_apply; ui->renderer.report = console_line;
-  qa_ui_setting_binding *items = NULL;
-  size_t count = 0, capacity = 0;
-  append_owned(ui, &items, &count, &capacity, qa_ui_bind_renderer_settings(&ui->renderer));
-  append_owned(ui, &items, &count, &capacity,
-               qa_ui_bind_native_video_settings(current_window, ui, shared, console_line, ui, mutate_window, ui));
-  if (options->view_setting != NULL) append_items(&items, &count, &capacity, options->view_setting, 1);
-  if (shared != NULL) {
-    append_owned(ui, &items, &count, &capacity, qa_ui_bind_image_settings(shared));
-    append_owned(ui, &items, &count, &capacity, qa_ui_bind_model_settings(shared));
-    append_owned(ui, &items, &count, &capacity, qa_ui_bind_console_settings(shared));
+  /* The settings rows build in the UI, so a raise frees them. */
+  qa_ui_setting_binding **items = &ui->settings_items;
+  size_t *count = &ui->settings_item_count, capacity = 0;
+  append_owned(ui, items, count, &capacity, qa_ui_bind_renderer_settings(&ui->renderer));
+  append_owned(ui, items, count, &capacity,
+               qa_ui_bind_native_video_settings_view(current_window, ui, shared, console_line, ui, mutate_window, ui));
+  if (options->view_setting != NULL) append_items(items, count, &capacity, options->view_setting, 1);
+  if (has_shared) {
+    append_owned(ui, items, count, &capacity, qa_ui_bind_image_settings_view(shared));
+    append_owned(ui, items, count, &capacity, qa_ui_bind_model_settings_view(shared));
+    append_owned(ui, items, count, &capacity, qa_ui_bind_console_settings_view(shared));
   }
-  if (options->language != NULL) append_items(&items, &count, &capacity, options->language, 1);
-  append_items(&items, &count, &capacity, &binding_menu, 1);
+  if (options->language != NULL) append_items(items, count, &capacity, options->language, 1);
+  append_items(items, count, &capacity, &binding_menu, 1);
   if (options->rankings != NULL) {
     ui->ranking_menu = qa_ui_register_ranking_account_menu(ui->controller, ranking_current, ui);
     ui->has_ranking_menu = true;
@@ -703,31 +734,30 @@ qa_app_seat_ui *qa_app_seat_ui_create(const qa_app_seat_ui_options *options) {
                                           qa_seat_input_seat(ui->local->input));
   ui->gyro_settings = qa_ui_register_gyro_settings_menu(ui->controller, &ui->gyro, NULL);
   qa_ui_setting_binding gyro = setting_button(ui, SETTING_GYRO, "ui:settings:gyro", "Gyro controls", "input");
-  append_items(&items, &count, &capacity, &gyro, 1);
+  append_items(items, count, &capacity, &gyro, 1);
   if (ui->has_server_settings) {
     qa_ui_setting_binding server = setting_button(ui, SETTING_SERVER, "ui:network:server-settings", "Server settings", "network");
-    append_items(&items, &count, &capacity, &server, 1);
+    append_items(items, count, &capacity, &server, 1);
   }
   if (ui->has_ranking_menu) {
     qa_ui_setting_binding ranking = setting_button(ui, SETTING_RANKING, "ui:network:rankings", "Ranking account", "network");
-    append_items(&items, &count, &capacity, &ranking, 1);
+    append_items(items, count, &capacity, &ranking, 1);
   }
-  append_owned(ui, &items, &count, &capacity, qa_app_input_devices_bindings(qa_app_application_input_input_devices(ui->input)));
-  append_owned(ui, &items, &count, &capacity, qa_ui_bind_input_routing_settings(routing_router, ui, routing_devices, ui));
+  append_owned(ui, items, count, &capacity, qa_app_input_devices_bindings(qa_app_application_input_input_devices(ui->input)));
+  append_owned(ui, items, count, &capacity, qa_ui_bind_input_routing_settings(routing_router, ui, routing_devices, ui));
   qa_ui_setting_binding join = setting_button(ui, SETTING_JOIN, "ui:input:local-join", "Add local player", "input");
   qa_ui_setting_binding drop = setting_button(ui, SETTING_DROP, "ui:input:local-drop", "Remove this player", "input");
-  append_items(&items, &count, &capacity, &join, 1);
-  append_items(&items, &count, &capacity, &drop, 1);
+  append_items(items, count, &capacity, &join, 1);
+  append_items(items, count, &capacity, &drop, 1);
   ui->vibration.ctx = ui; ui->vibration.read = vibration_read; ui->vibration.write = vibration_write;
-  append_owned(ui, &items, &count, &capacity, qa_ui_bind_input_settings(ui->local->input, ui->local->builder, &ui->vibration));
-  append_owned(ui, &items, &count, &capacity, volumes);
-  append_owned(ui, &items, &count, &capacity, qa_ui_bind_audio_geometry_settings(shared));
-  append_owned(ui, &items, &count, &capacity, qa_ui_bind_music_playlist_settings(shared, NULL, NULL));
+  append_owned(ui, items, count, &capacity, qa_ui_bind_input_settings(ui->local->input, ui->local->builder, &ui->vibration));
+  append_items(items, count, &capacity, volumes.items, volumes.count); /* owned above */
+  append_owned(ui, items, count, &capacity, qa_ui_bind_audio_geometry_settings_view(shared));
+  append_owned(ui, items, count, &capacity, qa_ui_bind_music_playlist_settings_view(shared, NULL, NULL));
   size_t preference_count = 0;
   const qa_ui_setting_binding *preference_items = qa_ui_seat_preferences_bindings(&ui->preferences, &preference_count);
-  append_items(&items, &count, &capacity, preference_items, preference_count);
-  if (options->gameplay != NULL) append_owned(ui, &items, &count, &capacity, qa_ui_bind_gameplay_settings(options->gameplay));
-  ui->settings_items = items; ui->settings_item_count = count;
+  append_items(items, count, &capacity, preference_items, preference_count);
+  if (options->gameplay != NULL) append_owned(ui, items, count, &capacity, qa_ui_bind_gameplay_settings(options->gameplay));
   qa_ui_menu_id llm_root = NULL;
   if (options->llm != NULL) {
     ui->llm_menu = qa_ui_register_llm_settings_menu(ui->controller, options->llm);
@@ -735,7 +765,7 @@ qa_app_seat_ui *qa_app_seat_ui_create(const qa_app_seat_ui_options *options) {
     llm_root = ui->llm_menu.root;
   }
   ui->settings_reset.ctx = ui; ui->settings_reset.label = "Reset player preferences..."; ui->settings_reset.apply = gameplay_reset;
-  ui->settings = qa_ui_register_settings_menus(ui->controller, items, count, llm_root,
+  ui->settings = qa_ui_register_settings_menus(ui->controller, *items, *count, llm_root,
       ui->has_llm_menu ? &ui->llm_menu : NULL, ui->has_llm_menu ? llm_dispose : NULL,
       options->gameplay != NULL ? &ui->settings_reset : NULL);
   ui->saves = qa_ui_register_saved_game_menus(ui->controller, options->saves);
@@ -744,6 +774,7 @@ qa_app_seat_ui *qa_app_seat_ui_create(const qa_app_seat_ui_options *options) {
   qa_app_input_ui input_ui = {ui, input_ui_input, input_ui_close_menus, input_ui_clear_prompt, input_ui_sample,
                               input_ui_wheel, input_ui_cycle, input_ui_switch};
   ui->dispose_input = qa_app_application_input_attach_ui(ui->input, ui->seat, input_ui);
+  qa_cleanup_pop(&guard);
   return ui;
 }
 
@@ -782,6 +813,11 @@ qa_app_seat_ui_image_refresh *qa_app_seat_ui_prepare_image_refresh(qa_app_seat_u
 void qa_app_seat_ui_image_refresh_commit(qa_app_seat_ui_image_refresh *refresh) {
   if (refresh->weapon != NULL) qa_app_weapon_hud_refresh_publish(refresh->weapon);
   qa_app_q2_native_hud_clear(refresh->ui->native_q2_hud);
+  free(refresh);
+}
+void qa_app_seat_ui_image_refresh_discard(qa_app_seat_ui_image_refresh *refresh) {
+  if (refresh == NULL) return;
+  qa_app_weapon_hud_refresh_discard(refresh->weapon);
   free(refresh);
 }
 
@@ -1188,6 +1224,21 @@ static void weapon_hud(qa_app_seat_ui *ui, const qa_weapon_hud_status *status, q
   out->measure_text = measure_hud_text; out->measure_ctx = ui;
 }
 
+static void hud_commands_release(void *commands) { qa_ui_hud_commands_free(commands); }
+/* The non-guest HUD's allocations, freed on a raise from the draw or a sink. */
+typedef struct hud_draw_storage {
+  qa_active_caption *captions; size_t caption_count;
+  qa_ui_hud_prompt *prompts;
+  qa_ui_hud_commands commands; bool has_commands;
+} hud_draw_storage;
+static void hud_draw_release(void *storage) {
+  hud_draw_storage *s = storage;
+  if (s->has_commands) qa_ui_hud_commands_free(&s->commands);
+  free(s->prompts);
+  qa_active_captions_free(s->captions, s->caption_count);
+  s->has_commands = false; s->prompts = NULL; s->captions = NULL; s->caption_count = 0;
+}
+
 void qa_app_seat_ui_draw(qa_app_seat_ui *ui, qa_ui_draw_context context, const qa_scene_camera *camera,
                          qa_app_seat_ui_sinks sinks, qa_app_seat_ui_draw_flags flags,
                          const qa_app_seat_ui_source_status *source_status) {
@@ -1208,7 +1259,10 @@ void qa_app_seat_ui_draw(qa_app_seat_ui *ui, qa_ui_draw_context context, const q
       qa_ui_common_hud_draw_options options = hud_options(ui, camera);
       qa_ui_hud_commands commands;
       if (!qa_ui_draw_common_hud(context, &hud, &options, &commands)) qa_range_error("Out of memory");
+      qa_cleanup guard;
+      qa_cleanup_push(&guard, hud_commands_release, &commands);
       render(&state, &ui->text, context, commands.commands, commands.count);
+      qa_cleanup_pop(&guard);
       qa_ui_hud_commands_free(&commands);
     }
   }
@@ -1232,13 +1286,16 @@ void qa_app_seat_ui_draw(qa_app_seat_ui *ui, qa_ui_draw_context context, const q
     hud.has_help_path = source.has_help_path;
     hud.help_path_origin = source.help_path_origin; hud.help_path_direction = source.help_path_direction;
     qa_caption_preferences caption_preferences = {true, preferences(ui).captions, true};
-    size_t caption_count = 0;
-    qa_active_caption *captions = qa_app_seat_sound_captions_active(ui->sound_captions, caption_preferences, &caption_count);
-    hud.captions = captions; hud.caption_count = caption_count;
+    hud_draw_storage storage;
+    memset(&storage, 0, sizeof storage);
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, hud_draw_release, &storage);
+    storage.captions = qa_app_seat_sound_captions_active(ui->sound_captions, caption_preferences, &storage.caption_count);
+    hud.captions = storage.captions; hud.caption_count = storage.caption_count;
     hud.powerups = player.powerups; hud.powerup_count = player.powerup_count;
     size_t match_count = 0;
     const qa_ui_hud_prompt *match_prompts = qa_app_q2_match_ui_prompts(ui->match, &match_count);
-    qa_ui_hud_prompt *prompts = xcalloc(match_count + source.prompt_count + 1, sizeof *prompts);
+    qa_ui_hud_prompt *prompts = storage.prompts = xcalloc(match_count + source.prompt_count + 1, sizeof *prompts);
     size_t prompt_count = 0;
     for (size_t i = 0; i < match_count; i++) prompts[prompt_count++] = match_prompts[i];
     for (size_t i = 0; i < source.prompt_count; i++) prompts[prompt_count++] = source.prompts[i];
@@ -1269,27 +1326,35 @@ void qa_app_seat_ui_draw(qa_app_seat_ui *ui, qa_ui_draw_context context, const q
       hud.vitals = values; hud.vital_count = 2;
     } else { hud.vitals = NULL; hud.vital_count = 0; }
     qa_ui_common_hud_draw_options options = hud_options(ui, camera);
-    qa_ui_hud_commands commands;
-    if (!qa_ui_draw_common_hud(context, &hud, &options, &commands)) qa_range_error("Out of memory");
-    render(&state, &ui->text, context, commands.commands, commands.count);
-    qa_ui_hud_commands_free(&commands);
-    free(prompts);
-    qa_active_captions_free(captions, caption_count);
+    if (!qa_ui_draw_common_hud(context, &hud, &options, &storage.commands)) qa_range_error("Out of memory");
+    storage.has_commands = true;
+    render(&state, &ui->text, context, storage.commands.commands, storage.commands.count);
+    qa_cleanup_pop(&guard);
+    hud_draw_release(&storage);
   }
   qa_ui_draw_command panel = qa_ui_menu_panel_scaled(context, false, preferences(ui).menu_scale);
   qa_ui_draw_command backdrop = panel;
   if (is(qa_native_ui_controller_active_menu(ui->controller), qa_app_player_death_menu) && panel.kind == QA_UI_DRAW_FILL)
     backdrop.color.w = 0.45;
-  if (qa_native_ui_controller_active_menu(ui->controller) == NULL) return;
-  qa_ui_draw_context menu_context = context;
-  menu_context.time_milliseconds = controller_now(ui);
-  size_t menu_count = 0;
-  const qa_ui_draw_command *menu = qa_native_ui_controller_draw(ui->controller, menu_context, &menu_count);
-  qa_ui_draw_command *commands = xcalloc(menu_count + 1, sizeof *commands);
-  commands[0] = backdrop;
-  if (menu_count != 0) memcpy(commands + 1, menu, menu_count * sizeof *menu);
+  /* renderUiCommands(context, activeMenu === null ? [] : [backdrop, ...controller.draw(...)]): an empty list still
+   * ends with its white set-color. */
+  qa_ui_draw_command *commands = NULL;
+  size_t command_count = 0;
+  if (qa_native_ui_controller_active_menu(ui->controller) != NULL) {
+    qa_ui_draw_context menu_context = context;
+    menu_context.time_milliseconds = controller_now(ui);
+    size_t menu_count = 0;
+    const qa_ui_draw_command *menu = qa_native_ui_controller_draw(ui->controller, menu_context, &menu_count);
+    commands = xcalloc(menu_count + 1, sizeof *commands);
+    commands[0] = backdrop;
+    if (menu_count != 0) memcpy(commands + 1, menu, menu_count * sizeof *menu);
+    command_count = menu_count + 1;
+  }
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, commands);
   render_ctx menus = {ui, sinks, NULL, true, NULL, 0, 0};
-  render(&menus, &ui->menu_text, context, commands, menu_count + 1);
+  render(&menus, &ui->menu_text, context, commands, command_count);
+  qa_cleanup_pop(&guard);
   free(commands);
 }
 
@@ -1331,21 +1396,22 @@ static bool native_q2_arsenal(qa_app_seat_ui *ui, qa_native_q2_hud_arsenal *out)
   return true;
 }
 
-/* TS nativeSourceLocalizer(content, assets) applied to (text, args). */
-static void ensure_native_localizer(qa_app_seat_ui *ui, qa_app_application_assets *assets) {
-  if (ui->options.native_hud_localizer != NULL || ui->native_hud_localizations != NULL) return;
-  qa_app_rerelease_seat seat = {ui->seat, ui->local->player.actor, NULL};
-  ui->native_hud_localizations = qa_app_rerelease_presentation_create(assets, &seat, 1,
-                                                                      qa_app_application_input_shared_settings(ui->input));
-  if (ui->native_hud_localizations == NULL) qa_range_error("Out of memory");
-}
-static char *native_localize(qa_app_seat_ui *ui, qa_app_application_assets *assets, qa_content_id content, const char *text,
-    const char *const *args, size_t count) {
-  ensure_native_localizer(ui, assets);
+/* TS nativeSourceLocalizer(content, assets): the content's localizer, its catalog resolved now (a later language change
+ * does not reach it), as the awaited closure. */
+static qa_app_rerelease_localizer *native_source_localizer(qa_app_seat_ui *ui, qa_content_id content,
+                                                           qa_app_application_assets *assets) {
   if (ui->options.native_hud_localizer != NULL)
-    return ui->options.native_hud_localizer(ui->options.native_hud_localizer_ctx, content, text, args, count);
-  return qa_app_rerelease_source_localize(ui->native_hud_localizations, ui->seat, content, text, args, count);
+    return ui->options.native_hud_localizer(ui->options.native_hud_localizer_ctx, content);
+  if (ui->native_hud_localizations == NULL) {
+    /* TS passes this.nativeHudSettings(): input.sharedSettings(), a view following publishSharedCvars. */
+    qa_app_rerelease_seat seat = {ui->seat, ui->local->player.actor, NULL};
+    ui->native_hud_localizations = qa_app_rerelease_presentation_create(assets, &seat, 1,
+                                                                        qa_app_application_input_shared_settings_view(ui->input));
+    if (ui->native_hud_localizations == NULL) qa_range_error("Out of memory");
+  }
+  return qa_app_rerelease_source_localizer(ui->native_hud_localizations, ui->seat, content);
 }
+static void icons_release(void *icons) { qa_weapon_hud_icons_free(icons); }
 
 /* TS prepareNativeInventory(assets). */
 static void prepare_native_inventory(qa_app_seat_ui *ui, qa_app_application_assets *assets) {
@@ -1366,6 +1432,8 @@ static void prepare_native_inventory(qa_app_seat_ui *ui, qa_app_application_asse
   if (!is(presentation->kind, "item")
       && !qa_weapon_hud_icons_for(presentation->source, product, presentation->weapon, &icons, &found))
     qa_range_error("Out of memory");
+  qa_cleanup icons_guard;
+  qa_cleanup_push(&icons_guard, icons_release, &icons);
   const qa_weapon_hud_icon *icon = NULL;
   if (is(presentation->kind, "item")) icon = presentation->has_icon ? presentation->icon : NULL;
   else if (found && is(presentation->kind, "weapon"))
@@ -1373,9 +1441,11 @@ static void prepare_native_inventory(qa_app_seat_ui *ui, qa_app_application_asse
   else if (found) icon = icons.has_ammo ? &icons.ammo : NULL;
   qa_app_weapon_hud_assets *owner = weapon_assets(ui, assets);
   qa_resource_id resource = icon == NULL ? NULL : qa_app_weapon_hud_assets_load(owner, *icon);
+  qa_cleanup_pop(&icons_guard);
   qa_weapon_hud_icons_free(&icons);
   char *localized = is(product->edition, "rerelease")
-      ? native_localize(ui, assets, presentation->source.content, item->label, NULL, 0) : xdup(item->label);
+      ? qa_app_rerelease_localizer_text(native_source_localizer(ui, presentation->source.content, assets), item->label, NULL, 0)
+      : xdup(item->label);
   ui->has_native_item = true;
   ui->native_item = xdup(item->item);
   ui->native_source_content = xdup(presentation->source.content);
@@ -1387,17 +1457,31 @@ static void prepare_native_inventory(qa_app_seat_ui *ui, qa_app_application_asse
   ui->native_aspect = resource != NULL ? qa_app_weapon_hud_assets_aspect(owner, &resource) : 1;
 }
 
-typedef struct native_environment { qa_app_seat_ui *ui; qa_app_application_assets *assets; qa_content_id content; qa_text_font_selection font; } native_environment;
 static qa_vec2 native_measure(void *ctx, const char *text) {
   native_environment *environment = ctx;
   return measure(environment->font, text, 1.25);
 }
 static const char *native_environment_localize(void *ctx, const char *text, const char *const *args, size_t count) {
   native_environment *environment = ctx;
-  qa_app_seat_ui *ui = environment->ui;
-  free(ui->localized_text);
-  ui->localized_text = native_localize(ui, environment->assets, environment->content, text, args, count);
-  return ui->localized_text;
+  char *localized = qa_app_rerelease_localizer_text(environment->localizer, text, args, count);
+  free(environment->localized);
+  environment->localized = localized;
+  return environment->localized;
+}
+/* The environment ctx the renderer's last prepare received (one per renderer, see native_environment). */
+static native_environment *renderer_environment(qa_app_seat_ui *ui, qa_app_q2_native_hud *renderer) {
+  for (size_t i = 0; i < ui->native_environment_count; i++)
+    if (ui->native_environments[i]->renderer == renderer) return ui->native_environments[i];
+  if (ui->native_environment_count == ui->native_environment_capacity) {
+    size_t next = ui->native_environment_capacity == 0 ? 2 : ui->native_environment_capacity * 2;
+    native_environment **grown = realloc(ui->native_environments, next * sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    ui->native_environments = grown; ui->native_environment_capacity = next;
+  }
+  native_environment *environment = xcalloc(1, sizeof *environment);
+  environment->renderer = renderer;
+  ui->native_environments[ui->native_environment_count++] = environment;
+  return environment;
 }
 
 static bool rerelease_protocol(qa_q2_protocol_identity protocol) {
@@ -1409,7 +1493,6 @@ void qa_app_seat_ui_prepare_native_q2_hud(qa_app_seat_ui *ui, const qa_native_q2
   if (component == NULL) prepare_native_inventory(ui, assets);
   qa_app_native_q2_hud_rendering rendering;
   memset(&rendering, 0, sizeof rendering);
-  native_environment environment = {ui, assets, content, hud_font(ui)};
   bool has_environment = false;
   if (rerelease_protocol(frame->protocol)) {
     qa_cvar_registry *registry = qa_app_application_input_cvars(ui->input);
@@ -1417,14 +1500,22 @@ void qa_app_seat_ui_prepare_native_q2_hud(qa_app_seat_ui *ui, const qa_native_q2
     if (!qa_cvar_registry_find(registry, "scr_usekfont", &use_font)
         && !qa_cvar_registry_register(registry, "scr_usekfont", "1", 0, &use_font))
       qa_raise("Error", 0, 0, "Could not register rerelease HUD font setting");
-    ensure_native_localizer(ui, assets);
-    if (component != NULL && component->assert_current != NULL) component->assert_current(component->assert_ctx);
-    rendering.font = ui->art->skin.font; rendering.font_scale = 1.25;
-    rendering.environment.use_font = use_font.integer_value != 0;
-    rendering.environment.font_line_height = 8 * 1.25;
-    rendering.environment.ctx = &environment;
-    rendering.environment.measure = native_measure; rendering.environment.localize = native_environment_localize;
+    bool use_kfont = use_font.integer_value != 0;
     qa_cvar_read_free(&use_font);
+    /* const localize = await this.nativeSourceLocalizer(content, assets): the catalog loads (or raises) here,
+     * before assertCurrent, even when no text of the frame is localized. */
+    qa_app_rerelease_localizer *localizer = native_source_localizer(ui, content, assets);
+    if (component != NULL && component->assert_current != NULL) component->assert_current(component->assert_ctx);
+    /* environment = { ..., measure: the font now, localize }: this renderer's ctx only (another renderer's prepare
+     * leaves it as this prepare set it). */
+    native_environment *environment = renderer_environment(ui, component != NULL ? component->renderer : ui->native_q2_hud);
+    environment->localizer = localizer;
+    environment->font = hud_font(ui);
+    rendering.font = ui->art->skin.font; rendering.font_scale = 1.25;
+    rendering.environment.use_font = use_kfont;
+    rendering.environment.font_line_height = 8 * 1.25;
+    rendering.environment.ctx = environment;
+    rendering.environment.measure = native_measure; rendering.environment.localize = native_environment_localize;
     has_environment = true;
   }
   qa_native_q2_hud_arsenal arsenal;
@@ -1444,8 +1535,11 @@ void qa_app_seat_ui_draw_native_q2_hud(qa_app_seat_ui *ui, const qa_native_q2_hu
   qa_ui_draw_command *commands = NULL;
   size_t count = qa_app_q2_native_hud_commands(renderer, frame, context, preferences(ui).hud_scale * context.binding.hud_scale,
       binding, binding_ctx, component != NULL ? component->mode : NULL, has_arsenal ? &arsenal : NULL, &commands);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, commands);
   render_ctx state = {ui, sinks, renderer, false, NULL, 0, 0};
   render(&state, &ui->text, context, commands, count);
+  qa_cleanup_pop(&guard);
   free(commands);
 }
 
@@ -1463,6 +1557,13 @@ static void caption_emit(void *ctx, const qa_render_command *command) {
 static void caption_material(void *ctx, const qa_material_text_draw *draw) {
   (void)ctx; (void)draw;
   qa_raise("Error", 0, 0, "Caption text requested a material draw");
+}
+
+typedef struct caption_scope { qa_ui_caption_commands *draws; render_ctx *state; } caption_scope;
+static void caption_release(void *scope) {
+  caption_scope *c = scope;
+  qa_ui_caption_commands_free(c->draws);
+  free(c->state->collected);
 }
 
 qa_render_command *qa_app_seat_ui_caption_commands(qa_app_seat_ui *ui, const qa_active_caption *captions,
@@ -1484,29 +1585,37 @@ qa_render_command *qa_app_seat_ui_caption_commands(qa_app_seat_ui *ui, const qa_
   memset(&services, 0, sizeof services);
   services.ctx = &state; services.text = &ui->menu_text; services.white = image_asset(ui->art->white);
   services.picture = render_picture; services.emit = caption_emit; services.material = caption_material;
+  /* A raise (the material sink raises) drops the draws and what was collected. */
+  caption_scope scope = {&draws, &state};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, caption_release, &scope);
   qa_ui_render_commands(context, draws.commands, draws.count, &services);
+  qa_cleanup_pop(&guard);
   qa_ui_caption_commands_free(&draws);
   *out_count = state.collected_count;
   return state.collected;
 }
 
 /* ---- close ---- */
+/* Every step tolerates a member the constructor never reached (a raising constructor drops the UI through destroy). */
 void qa_app_seat_ui_close(qa_app_seat_ui *ui) {
   if (ui->closed) return;
   ui->closed = true;
   qa_ui_settings_menus_dispose(&ui->inventory_menu);
-  qa_app_seat_sound_captions_close(ui->sound_captions);
+  if (ui->sound_captions != NULL) qa_app_seat_sound_captions_close(ui->sound_captions);
   if (ui->has_match_menu) qa_ui_settings_menus_dispose(&ui->match_menu);
   if (ui->base_arena != NULL) qa_app_base_arena_menus_close(ui->base_arena);
   if (ui->team_arena != NULL) qa_app_team_arena_results_close(ui->team_arena);
   qa_app_seat_player_death_close(ui->death); /* frees the death owner */
   ui->death = NULL;
   qa_app_seat_game_prompt_close(ui->prompt);
-  qa_app_q2_match_ui_close(ui->match);
+  if (ui->match != NULL) qa_app_q2_match_ui_close(ui->match);
   qa_app_input_ui_attachment_detach(ui->dispose_input);
   ui->dispose_input = NULL;
-  qa_native_ui_controller_close_all(ui->controller);
-  qa_native_ui_controller_unregister(ui->controller, ui->dispose_menu);
+  if (ui->controller != NULL) {
+    qa_native_ui_controller_close_all(ui->controller);
+    qa_native_ui_controller_unregister(ui->controller, ui->dispose_menu);
+  }
   qa_ui_saved_game_menus_dispose(&ui->saves);
   qa_ui_settings_menus_dispose(&ui->settings);
   qa_ui_settings_menus_dispose(&ui->gyro_settings);
@@ -1515,7 +1624,7 @@ void qa_app_seat_ui_close(qa_app_seat_ui *ui) {
   qa_ui_settings_menus_dispose(&ui->bindings);
   qa_ui_text_renderer_clear(&ui->text);
   qa_ui_text_renderer_clear(&ui->menu_text);
-  qa_seat_hud_messages_clear(ui->messages);
+  if (ui->messages != NULL) qa_seat_hud_messages_clear(ui->messages);
 }
 
 void qa_app_seat_ui_destroy(qa_app_seat_ui *ui) {
@@ -1531,7 +1640,12 @@ void qa_app_seat_ui_destroy(qa_app_seat_ui *ui) {
   for (size_t i = 0; i < ui->wheel_icon_count; i++) { free(ui->wheel_icons[i].item); free(ui->wheel_icons[i].resource); }
   free(ui->wheel_icons);
   clear_native_item(ui);
-  free(ui->language_text); free(ui->localized_text); free(ui->prompt_language); free(ui->clipboard_text);
+  for (size_t i = 0; i < ui->native_environment_count; i++) {
+    free(ui->native_environments[i]->localized);
+    free(ui->native_environments[i]);
+  }
+  free(ui->native_environments);
+  free(ui->language_text); free(ui->prompt_language); free(ui->clipboard_text);
   if (ui->native_hud_localizations != NULL) qa_app_rerelease_presentation_destroy(ui->native_hud_localizations);
   if (ui->weapon_assets != NULL) qa_app_weapon_hud_assets_destroy(ui->weapon_assets);
   qa_app_q2_match_ui_destroy(ui->match);
@@ -1544,8 +1658,7 @@ void qa_app_seat_ui_destroy(qa_app_seat_ui *ui) {
   qa_app_application_q1_wheel_destroy(ui->authored_wheel);
   qa_app_q2_native_hud_destroy(ui->native_q2_hud);
   qa_seat_hud_messages_destroy(ui->messages);
-  /* SeatUiPreferences binding contexts (ui/settings has no destroy for them). */
-  for (size_t i = 0; i < QA_UI_PREFERENCE_BINDING_COUNT; i++) free(ui->preferences.binding_ctx[i]);
+  qa_ui_seat_preferences_destroy(&ui->preferences);
   qa_ui_text_renderer_destroy(&ui->text);
   qa_ui_text_renderer_destroy(&ui->menu_text);
   qa_native_ui_controller_destroy(ui->controller);

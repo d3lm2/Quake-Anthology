@@ -44,7 +44,10 @@ bool qa_scene_image_registry_is_resident(qa_scene_image_registry *r, qa_renderer
 typedef struct qa_scene_animation_token { qa_scene_image_registry *registry; double ordinal; } qa_scene_animation_token;
 qa_scene_animation_token qa_scene_image_registry_track_animation(qa_scene_image_registry *r, qa_renderer_image image, qa_scene_animation_fn update, void *ctx, qa_scene_animation_stop_fn on_stop, void *stop_ctx);
 void qa_scene_animation_token_stop(qa_scene_animation_token token);
-/* Drained array malloc'd; caller frees array only. */
+/* The drained array is one malloc'd allocation that also holds everything its operations point at (a create's
+ * levels, pixels, palette colours, fullbright range and translation; an update's level and pixels). The caller keeps
+ * it until the operations have been applied (a frame built from several drains keeps every array until the frame
+ * has executed), then frees the array only. The registry keeps no copy of a drained operation. */
 qa_image_resource_operation *qa_scene_image_registry_drain_operations(qa_scene_image_registry *r, size_t *out_count);
 qa_image_resource_operation *qa_scene_image_registry_drain_pending(qa_scene_image_registry *r, size_t *out_count);
 typedef void (*qa_scene_isolated_fn)(void *ctx);

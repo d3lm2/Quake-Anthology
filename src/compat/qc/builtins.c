@@ -114,6 +114,7 @@ static void b_objerror(void *_ctx, qa_compat_qc_machine *m) {
   const char *name = current >= 0 && (size_t)current < m->program->function_count && m->program->functions[current].name != NULL
       ? m->program->functions[current].name : "?";
   char *message = qa_compat_qc_machine_var_string(m, 0);
+  qa_cleanup scope; qa_cleanup_push(&scope, free_cleanup, message); /* released as the raise unwinds */
   qa_compat_qc_machine_fail(m, "OBJECT ERROR in %s: %s", name, message != NULL ? message : "");
 }
 static void b_diagnostic(void *_ctx, qa_compat_qc_machine *m) { (void)_ctx; (void)m; }

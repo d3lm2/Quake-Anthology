@@ -150,6 +150,31 @@ static const char *geometry_entities(qa_decoded_world geometry) {
   }
   return "";
 }
+typedef struct {
+  qa_aas_setting_rec *settings;
+  qa_aas_reachability_entities *entities; bool entities_ready;
+  qa_aas_linked_reachability **heads; size_t head_count;
+  qa_aas_reachability_context *context;
+  qa_aas_reach_rec *reachability;
+} BuildGuard;
+static void free_links(qa_aas_linked_reachability *link) {
+  while (link) { qa_aas_linked_reachability *next = link->next; free(link); link = next; }
+}
+/* Everything buildAasReachability allocates; a raise anywhere in the build (RangeError from an
+ * index, Error from the prediction owner) releases it, as the TS garbage would be. */
+static void build_release(void *arg) {
+  BuildGuard *g = arg;
+  if (g->heads) for (size_t i = 0; i < g->head_count; i++) free_links(g->heads[i]);
+  free(g->heads); g->heads = NULL;
+  if (g->context) {
+    free_links(g->context->free_list); g->context->free_list = NULL;
+    qa_aas_reachability_debug_state_destroy(&g->context->debug_state);
+  }
+  if (g->entities_ready) qa_aas_reachability_entities_destroy(g->entities);
+  g->entities_ready = false;
+  free(g->settings); g->settings = NULL;
+  free(g->reachability); g->reachability = NULL;
+}
 bool qa_build_aas_reachability(qa_aas_asset *out, bool *out_reused, qa_aas_reachability_options options) {
   *out_reused = false;
   const qa_aas_asset *asset = options.asset;
@@ -162,6 +187,11 @@ bool qa_build_aas_reachability(qa_aas_asset *out, bool *out_reused, qa_aas_reach
     if (!settings) return false;
     memcpy(settings, asset->settings, asset->setting_count * sizeof *settings);
   }
+  qa_aas_reachability_entities bsp_entities;
+  qa_aas_reachability_context context; memset(&context, 0, sizeof context);
+  BuildGuard guard_state = {settings, &bsp_entities, false, NULL, 0, &context, NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, build_release, &guard_state);
   qa_aas_reachability_world world;
   world.asset = *asset;
   world.asset.settings = settings;
@@ -171,20 +201,22 @@ bool qa_build_aas_reachability(qa_aas_asset *out, bool *out_reused, qa_aas_reach
   qa_aas_movement_settings movement_settings;
   if (options.has_settings) movement_settings = options.settings;
   else qa_init_aas_movement_settings(&movement_settings, variable_ctx, variable);
-  qa_aas_reachability_entities bsp_entities;
   if (!qa_aas_reachability_entities_init(&bsp_entities, geometry_entities(options.geometry))) {
-    free(settings);
+    qa_cleanup_pop(&guard);
+    build_release(&guard_state);
     return false;
   }
+  guard_state.entities_ready = true;
   qa_aas_reachability_spatial spatial;
   qa_aas_reachability_spatial_init(&spatial, options, &world, &bsp_entities, &movement_settings);
   qa_aas_linked_reachability **heads = calloc(asset->area_count ? asset->area_count : 1, sizeof *heads);
   if (!heads) {
-    qa_aas_reachability_entities_destroy(&bsp_entities);
-    free(settings);
+    qa_cleanup_pop(&guard);
+    build_release(&guard_state);
     return false;
   }
-  qa_aas_reachability_context context; memset(&context, 0, sizeof context);
+  guard_state.heads = heads;
+  guard_state.head_count = asset->area_count;
   context.world = &world;
   context.spatial = &spatial;
   context.bsp_entities = &bsp_entities;
@@ -235,17 +267,11 @@ bool qa_build_aas_reachability(qa_aas_asset *out, bool *out_reused, qa_aas_reach
     for (qa_aas_linked_reachability *link = heads[i]; link; link = link->next) total++;
   qa_aas_reach_rec *reachability = calloc(total, sizeof *reachability);
   if (!reachability) {
-    for (size_t i = 0; i < asset->area_count; i++) {
-      qa_aas_linked_reachability *link = heads[i];
-      while (link) { qa_aas_linked_reachability *next = link->next; free(link); link = next; }
-    }
-    while (context.free_list) { qa_aas_linked_reachability *next = context.free_list->next; free(context.free_list); context.free_list = next; }
-    free(heads);
-    qa_aas_reachability_debug_state_destroy(&context.debug_state);
-    qa_aas_reachability_entities_destroy(&bsp_entities);
-    free(settings);
+    qa_cleanup_pop(&guard);
+    build_release(&guard_state);
     return false;
   }
+  guard_state.reachability = reachability;
   size_t at = 1;
   for (int64_t area = 0; area < (int64_t)asset->area_count; area++) {
     qa_aas_setting_rec *setting = qa_aas_at_setting_mut(&world.asset, area);
@@ -264,14 +290,10 @@ bool qa_build_aas_reachability(qa_aas_asset *out, bool *out_reused, qa_aas_reach
       setting->reach_count++;
     }
   }
-  for (size_t i = 0; i < asset->area_count; i++) {
-    qa_aas_linked_reachability *link = heads[i];
-    while (link) { qa_aas_linked_reachability *next = link->next; free(link); link = next; }
-  }
-  while (context.free_list) { qa_aas_linked_reachability *next = context.free_list->next; free(context.free_list); context.free_list = next; }
-  free(heads);
-  qa_aas_reachability_debug_state_destroy(&context.debug_state);
-  qa_aas_reachability_entities_destroy(&bsp_entities);
+  qa_cleanup_pop(&guard);
+  guard_state.settings = NULL; /* published below */
+  guard_state.reachability = NULL;
+  build_release(&guard_state);
   *out = *asset;
   out->settings = settings;
   out->reachability = reachability;

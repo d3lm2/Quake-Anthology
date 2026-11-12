@@ -90,63 +90,37 @@ static size_t wrap_lines(server_state *s, const char *text, size_t first_slot,
   return made;
 }
 
-/* parseServerSetting's RangeError messages, checked non-fatally so
- * Apply can show them (the landed qa_write_server_setting aborts). */
-static bool validate_value(const qa_server_setting_definition *def,
-                           const char *input, char *message, size_t size) {
-  switch (def->kind) {
-    case QA_SERVER_SETTING_TOGGLE:
-      if (strcmp(input, "1") == 0 || strcmp(input, "true") == 0
-          || strcmp(input, "0") == 0 || strcmp(input, "false") == 0)
-        return true;
-      snprintf(message, size, "%s requires a boolean", def->label);
-      return false;
-    case QA_SERVER_SETTING_SLIDER: {
-      char *trimmed = qa_input_js_trim(input);
-      if (trimmed == NULL) qa_range_error("Out of memory");
-      bool empty = trimmed[0] == '\0';
-      free(trimmed);
-      double value = qa_input_js_parse_number(input);
-      bool safe = value == trunc(value) && fabs(value) <= 9007199254740991.0;
-      if (empty || !isfinite(value) || (def->integer && !safe)
-          || value < def->minimum || value > def->maximum) {
-        snprintf(message, size, "%s is outside its allowed range",
-                 def->label);
-        return false;
-      }
-      return true;
-    }
-    case QA_SERVER_SETTING_CHOICE:
-      for (size_t i = 0; i < def->choice_count; i++)
-        if (strcmp(def->choices[i].id, input) == 0) return true;
-      snprintf(message, size, "Unknown %s choice", def->label);
-      return false;
-    case QA_SERVER_SETTING_TEXT_ENTRY:
-      if ((double)strlen(input) > def->maximum_length
-          || strchr(input, '\r') != NULL || strchr(input, '\n') != NULL) {
-        snprintf(message, size, "%s contains invalid text", def->label);
-        return false;
-      }
-      return true;
-  }
-  return true;
+/* TS apply(): writeServerSetting inside try/catch; the parser's RangeError (and
+ * any owner failure) becomes the error line. */
+typedef struct apply_job {
+  const qa_bound_server_setting *binding;
+  const char *draft;
+  qa_server_setting_status status;
+  bool written;
+} apply_job;
+static void apply_run(void *v) {
+  apply_job *job = v;
+  job->status = qa_write_server_setting(job->binding, job->draft);
+  job->written = true;
 }
-
 static void apply_draft(server_state *s) {
   const qa_bound_server_setting *current = find_binding(s, s->selected, NULL);
   if (current == NULL) {
     set_str(&s->error, "This setting is no longer available.");
     return;
   }
-  char message[512];
-  if (!validate_value(current->definition, s->draft, message,
-                      sizeof message)) {
-    set_str(&s->error, message);
+  apply_job job;
+  memset(&job, 0, sizeof job);
+  job.binding = current;
+  job.draft = s->draft;
+  qa_caught_error caught;
+  if (!qa_try(apply_run, &job, &caught)) {
+    if (job.written) qa_server_setting_status_free(&job.status);
+    set_str(&s->error, caught.message);
     return;
   }
-  qa_server_setting_status status = qa_write_server_setting(current, s->draft);
-  set_str(&s->draft, status.desired != NULL ? status.desired : "");
-  qa_server_setting_status_free(&status);
+  set_str(&s->draft, job.status.desired != NULL ? job.status.desired : "");
+  qa_server_setting_status_free(&job.status);
   set_str(&s->error, "");
 }
 
@@ -161,6 +135,48 @@ static bool profile_name_valid(const char *name) {
   return true;
 }
 
+/* TS profile(): the save/load body runs in try/catch/finally. A profile whose
+ * settings this source does not own, or whose values its parser refuses, is a
+ * message, not a crash. Temporaries live here so a raise cannot leak them. */
+typedef struct profile_job {
+  server_state *state;
+  bool save;
+  const char *name;
+  const char *path;
+  const qa_server_setting_definition **defs;
+  qa_server_profile profile;
+  bool has_profile;
+  const char *message; /* set when the TS throws its own Error */
+  bool ok;
+} profile_job;
+static void profile_run(void *v) {
+  profile_job *job = v;
+  server_state *s = job->state;
+  size_t count = 0;
+  const qa_bound_server_setting *bindings =
+      s->host.bindings(s->host.bindings_ctx, &count);
+  job->defs = calloc(count == 0 ? 1 : count, sizeof *job->defs);
+  if (job->defs == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < count; i++) job->defs[i] = bindings[i].definition;
+  if (job->save) {
+    job->has_profile = true;
+    qa_capture_server_profile(bindings, count, &job->profile);
+    job->ok = qa_save_server_profile(s->host.store, job->path, &job->profile,
+                                     job->defs, count);
+    return;
+  }
+  job->has_profile = qa_load_server_profile(s->host.store, job->path, job->defs,
+                                            count, &job->profile);
+  if (!job->has_profile) {
+    job->message = "missing";
+    return;
+  }
+  size_t fresh_count = 0;
+  const qa_bound_server_setting *fresh =
+      s->host.bindings(s->host.bindings_ctx, &fresh_count);
+  qa_apply_server_profile(&job->profile, fresh, fresh_count);
+  job->ok = true;
+}
 static void profile_action(server_state *s, bool save) {
   if (s->busy) return;
   if (!profile_name_valid(s->profile_name)) {
@@ -174,46 +190,26 @@ static void profile_action(server_state *s, bool save) {
   if (name == NULL) qa_range_error("Out of memory");
   char path[512];
   snprintf(path, sizeof path, "servers/%s.json", name);
-  size_t count = 0;
-  const qa_bound_server_setting *bindings =
-      s->host.bindings(s->host.bindings_ctx, &count);
-  const qa_server_setting_definition **defs = calloc(
-      count == 0 ? 1 : count, sizeof *defs);
-  if (defs == NULL) qa_range_error("Out of memory");
-  for (size_t i = 0; i < count; i++) defs[i] = bindings[i].definition;
-  if (save) {
-    qa_server_profile captured;
-    memset(&captured, 0, sizeof captured);
-    qa_capture_server_profile(bindings, count, &captured);
-    bool ok = qa_save_server_profile(s->host.store, path, &captured, defs,
-                                     count);
-    qa_server_profile_free(&captured);
-    if (ok) {
-      char text[600];
-      snprintf(text, sizeof text, "Saved %s.", name);
-      set_str(&s->profile_message, text);
-    } else {
-      set_str(&s->profile_message, "Profile operation failed.");
-    }
-  } else {
-    qa_server_profile loaded;
-    memset(&loaded, 0, sizeof loaded);
-    if (!qa_load_server_profile(s->host.store, path, defs, count, &loaded)) {
-      char text[600];
-      snprintf(text, sizeof text, "Profile %s does not exist.", name);
-      set_str(&s->profile_message, text);
-    } else {
-      size_t fresh_count = 0;
-      const qa_bound_server_setting *fresh =
-          s->host.bindings(s->host.bindings_ctx, &fresh_count);
-      qa_apply_server_profile(&loaded, fresh, fresh_count);
-      qa_server_profile_free(&loaded);
-      char text[600];
-      snprintf(text, sizeof text, "Loaded %s.", name);
-      set_str(&s->profile_message, text);
-    }
-  }
-  free(defs);
+  profile_job job;
+  memset(&job, 0, sizeof job);
+  job.state = s;
+  job.save = save;
+  job.name = name;
+  job.path = path;
+  qa_caught_error caught;
+  bool ran = qa_try(profile_run, &job, &caught);
+  char *text = malloc(strlen(name) + 40);
+  if (text == NULL) qa_range_error("Out of memory");
+  if (!ran) snprintf(text, strlen(name) + 40, "%s", "");
+  else if (job.message != NULL)
+    sprintf(text, "Profile %s does not exist.", name);
+  else if (!job.ok)
+    sprintf(text, "Profile operation failed.");
+  else sprintf(text, "%s %s.", save ? "Saved" : "Loaded", name);
+  set_str(&s->profile_message, ran ? text : caught.message);
+  free(text);
+  if (job.has_profile) qa_server_profile_free(&job.profile);
+  free(job.defs);
   free(name);
   s->busy = false;
 }

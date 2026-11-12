@@ -1,5 +1,6 @@
 /* Port of src/render/worker.ts. GPL-2.0-or-later. */
 #include "qa/render/worker.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/render/worker_entry.h"
 #include <math.h>
@@ -30,12 +31,18 @@ typedef struct wimpl {
   wprep *draws;
   qa_wire_arena *inflight; /* backs the issued packet until the next barrier */
   bool parked, closed, registered;
-  char last_error[1024];
+  char *last_error; const char *last_error_name; /* the whole message (heap) and its class, static text */
   struct wimpl *next_context;
 } wimpl;
 static wimpl *W(const qa_worker_renderer *r) { return (wimpl *)r->impl; }
 /* TS static contexts Set; frontend-thread state, as SDL window changes are. */
 static wimpl *contexts;
+/* A Set iterates in insertion order. */
+static void contexts_add(wimpl *p) {
+  wimpl **link = &contexts;
+  while (*link != NULL) link = &(*link)->next_context;
+  p->next_context = NULL; *link = p; p->registered = true;
+}
 static void contexts_remove(wimpl *p) {
   for (wimpl **link = &contexts; *link != NULL; link = &(*link)->next_context) if (*link == p) { *link = p->next_context; p->next_context = NULL; break; }
   p->registered = false;
@@ -44,9 +51,9 @@ static void contexts_remove(wimpl *p) {
 /* --- description --- */
 static double desc_integer(double v) { if (v != floor(v) || v < 0 || v > (double)QA_MAX_SAFE_INTEGER) qa_range_error("Invalid render worker integer"); return v; }
 static qa_worker_wire_description decode_description(const void *bytes, size_t size) {
-  if (bytes == NULL || size != sizeof(qa_worker_wire_description)) qa_range_error("Invalid render worker response");
+  if (bytes == NULL || size != sizeof(qa_worker_wire_description)) qa_raise("TypeError", 0, 0, "Invalid render worker response");
   qa_worker_wire_description d; memcpy(&d, bytes, sizeof d);
-  if (d.swap_interval != -1 && d.swap_interval != 0 && d.swap_interval != 1) qa_range_error("Invalid render worker swap interval");
+  if (d.swap_interval != -1 && d.swap_interval != 0 && d.swap_interval != 1) qa_raise("TypeError", 0, 0, "Invalid render worker swap interval");
   (void)desc_integer(d.width); (void)desc_integer(d.height); (void)desc_integer(d.stencil_bits);
   if (d.has_gl_config) { (void)desc_integer(d.gl_config.max_texture_size); (void)desc_integer(d.gl_config.texture_units); (void)desc_integer(d.gl_config.color_bits); (void)desc_integer(d.gl_config.depth_bits); }
   return d;
@@ -57,7 +64,7 @@ static void set_metadata(wimpl *p, const void *bytes, size_t size) {
 }
 qa_worker_description qa_worker_renderer_description(qa_worker_renderer *r, qa_gl_driver_info *driver, qa_worker_gl_config *config) {
   wimpl *p = W(r);
-  if (p == NULL || !p->has_metadata) qa_range_error("Render worker is not initialized");
+  if (p == NULL || !p->has_metadata) qa_raise("Error", 0, 0, "Render worker is not initialized");
   qa_worker_description d; memset(&d, 0, sizeof d);
   d.backend = p->metadata.is_gl ? "gl" : "cpu"; d.width = p->metadata.width; d.height = p->metadata.height;
   d.stencil_bits = p->metadata.stencil_bits; d.swap_interval = p->metadata.swap_interval;
@@ -71,15 +78,19 @@ qa_worker_description qa_worker_renderer_description(qa_worker_renderer *r, qa_g
 
 /* --- connection --- */
 static qa_rwt_transport *connection(wimpl *p) {
-  if (p == NULL || p->closed || p->transport == NULL) qa_range_error("Render worker is not open");
+  if (p == NULL || p->closed || p->transport == NULL) qa_raise("Error", 0, 0, "Render worker is not open");
   return p->transport;
 }
-static void raise_error(const qa_rwt_error *error) { qa_range_error("%s", error != NULL ? error->message : "Render worker failed"); }
+/* TS restoreFailure: the error keeps the name it had in the worker, whatever that name is. */
+static void raise_error(const qa_rwt_error *error) {
+  if (error == NULL) qa_raise("Error", 0, 0, "Render worker failed");
+  qa_raise(qa_rwt_error_class(error->name), 0, 0, "%s", error->message);
+}
 static void request_init(qa_worker_wire_request *request, qa_worker_op kind) { memset(request, 0, sizeof *request); request->kind = kind; }
 static qa_rwt_value request_value(const qa_worker_wire_request *request) { qa_rwt_value v; v.bytes = request; v.size = sizeof *request; v.owned = NULL; return v; }
 /* TS private call(): a callback's own operation may run at its suspended parent. */
 static qa_rwt_value call(wimpl *p, const qa_worker_wire_request *request) {
-  if (p != NULL && p->parked) qa_range_error("Render context is parked for an SDL window change");
+  if (p != NULL && p->parked) qa_raise("Error", 0, 0, "Render context is parked for an SDL window change");
   qa_rwt_transport *t = connection(p);
   qa_rwt_value out; memset(&out, 0, sizeof out); qa_rwt_error *error = NULL;
   if (!qa_rwt_callback_call(t, request_value(request), &out, &error)) raise_error(error);
@@ -112,7 +123,7 @@ static void apply_forward(void *ctx, qa_image_resource_operation op) { worker_ap
 typedef struct host_scope { wimpl *p; const unsigned char *bytes; size_t size; qa_rwt_value *out; } host_scope;
 static void dispatch_host(void *ctx) {
   host_scope *s = (host_scope *)ctx; wimpl *p = s->p;
-  if (s->size < sizeof(qa_worker_host_request)) qa_range_error("Invalid render worker response");
+  if (s->size < sizeof(qa_worker_host_request)) qa_raise("TypeError", 0, 0, "Invalid render worker response");
   qa_worker_host_request request; memcpy(&request, s->bytes, sizeof request);
   switch (request.kind) {
   case QA_WORKER_HOST_IMAGE_APPLIED: {
@@ -135,36 +146,40 @@ static void dispatch_host(void *ctx) {
     return;
   case QA_WORKER_HOST_OPACITY_CALLBACK:
     for (size_t i = 0; i < p->callback_count; i++) if (p->callbacks[i].id == request.callback) { wcallback callback = p->callbacks[i]; callback.draw(callback.ctx); return; }
-    qa_range_error("Unknown render worker opacity callback");
+    qa_raise("Error", 0, 0, "Unknown render worker opacity callback");
   case QA_WORKER_HOST_SWAP: {
     size_t captures_bytes = request.capture_count * sizeof(double);
-    if (s->size != sizeof request + captures_bytes + request.image_length) qa_range_error("Invalid render worker response");
-    double *captures = NULL;
-    if (request.capture_count != 0) {
-      captures = (double *)malloc(captures_bytes);
-      if (captures == NULL) qa_range_error("Render worker allocation failed");
-      memcpy(captures, s->bytes + sizeof request, captures_bytes);
-      for (size_t i = 0; i < request.capture_count; i++) (void)desc_integer(captures[i]);
-    }
+    if (s->size != sizeof request + captures_bytes + request.image_length) qa_raise("TypeError", 0, 0, "Invalid render worker response");
+    /* TS order: the frame is decoded, then the captures. */
     qa_image_level level; memset(&level, 0, sizeof level);
     if (request.has_image) {
       level.width = request.width; level.height = request.height;
       level.pixels.bytes = s->bytes + sizeof request + captures_bytes; level.pixels.length = request.image_length;
       level = qa_decode_wire_image_level(level);
     }
+    double *captures = NULL;
+    if (request.capture_count != 0) {
+      captures = (double *)malloc(captures_bytes);
+      if (captures == NULL) qa_range_error("Render worker allocation failed");
+      memcpy(captures, s->bytes + sizeof request, captures_bytes);
+      for (size_t i = 0; i < request.capture_count; i++) if (captures[i] != floor(captures[i]) || captures[i] < 0 || captures[i] > (double)QA_MAX_SAFE_INTEGER) { free(captures); qa_range_error("Invalid render worker integer"); }
+    }
+    /* The swap callback may raise: the captures go either way. */
+    qa_cleanup guard; qa_cleanup_push(&guard, free, captures);
     p->swap(p->swap_ctx, request.has_image ? &level : NULL, captures, request.capture_count);
+    qa_cleanup_pop(&guard);
     free(captures);
     return;
   }
   }
-  qa_range_error("Unknown render worker host request");
+  qa_raise("Error", 0, 0, "Unknown render worker host request");
 }
-typedef struct host_run { wimpl *p; host_scope *scope; bool ok; char *message; size_t capacity; } host_run;
+typedef struct host_run { wimpl *p; host_scope *scope; bool ok; qa_caught_error caught; } host_run;
 /* TS try/finally around dispatchHost, with the throw kept for the transport. */
 static void host_execute(void *ctx) {
   host_run *run = (host_run *)ctx;
   run->p->callback_depth++;
-  run->ok = qa_range_error_catch(dispatch_host, run->scope, run->message, run->capacity);
+  run->ok = qa_try(dispatch_host, run->scope, &run->caught);
   run->p->callback_depth--;
 }
 static void collect_operations(void *ctx, qa_image_resource_operation *operations, size_t count) {
@@ -175,11 +190,11 @@ static void collect_operations(void *ctx, qa_image_resource_operation *operation
 static bool host_request(void *ctx, qa_rwt_value payload, qa_rwt_value *out, qa_rwt_error **error) {
   wimpl *p = (wimpl *)ctx;
   host_scope scope = {p, (const unsigned char *)payload.bytes, payload.size, out};
-  char message[1024]; message[0] = 0;
-  host_run run = {p, &scope, false, message, sizeof message};
+  host_run run; memset(&run, 0, sizeof run);
+  run.p = p; run.scope = &scope;
   if (p->callback_depth == 0 && p->images != NULL) qa_scene_image_registry_isolate(p->images, host_execute, &run, collect_operations, p);
   else host_execute(&run);
-  if (!run.ok) { *error = qa_rwt_error_new(p->transport, "Error", message); return false; }
+  if (!run.ok) { *error = qa_rwt_error_new(p->transport, run.caught.name, qa_caught_message(&run.caught)); return false; } /* failure(error): its own name */
   return true;
 }
 static bool host_completed(void *ctx, qa_rwt_value payload, qa_rwt_error **error) {
@@ -188,9 +203,18 @@ static bool host_completed(void *ctx, qa_rwt_value payload, qa_rwt_error **error
   set_metadata(p, payload.bytes, payload.size);
   return true;
 }
+/* Keeps the whole message: TS holds the error object itself. */
+static void set_last_error(wimpl *p, const char *text) {
+  size_t length = strlen(text);
+  char *copy = (char *)malloc(length + 1);
+  if (copy == NULL) qa_range_error("Render worker allocation failed");
+  memcpy(copy, text, length + 1);
+  free(p->last_error); p->last_error = copy;
+}
 static void host_failed(void *ctx, qa_rwt_error *error) {
   wimpl *p = (wimpl *)ctx;
-  (void)snprintf(p->last_error, sizeof p->last_error, "%s", error->message);
+  set_last_error(p, error->message);
+  p->last_error_name = qa_rwt_error_class(error->name);
   if (p->failed != NULL) p->failed(p->failed_ctx, error->message);
 }
 
@@ -202,6 +226,7 @@ static void free_impl(wimpl *p, qa_worker_renderer *r) {
   free(p->suffix); free(p->callbacks);
   for (wprep *d = p->draws; d != NULL;) { wprep *next = d->next; qa_wire_arena_destroy(d->arena); free(d); d = next; }
   qa_wire_arena_destroy(p->inflight);
+  free(p->last_error);
   free(p); r->impl = NULL;
 }
 typedef struct restore_scope { qa_worker_window window; } restore_scope;
@@ -228,19 +253,18 @@ bool qa_worker_renderer_open(qa_worker_renderer *r, qa_worker_window window, qa_
   if (ok) {
     qa_rwt_value description = qa_rwt_description(p->transport);
     set_metadata(p, description.bytes, description.size);
-    if (window.is_gl) { p->next_context = contexts; contexts = p; p->registered = true; }
+    if (window.is_gl) contexts_add(p);
     return true;
   }
-  (void)snprintf(p->last_error, sizeof p->last_error, "%s", error != NULL ? error->message : "Render worker failed to start");
+  set_last_error(p, error != NULL ? error->message : "Render worker failed to start");
   qa_rwt_destroy(p->transport); p->transport = NULL;
   if (window.is_gl) {
     restore_scope scope = {window};
-    char cleanup[1024];
-    if (!qa_range_error_catch(restore_body, &scope, cleanup, sizeof cleanup)) {
-      /* TS AggregateError: the worker kept the context. */
-      char startup[1024]; (void)snprintf(startup, sizeof startup, "%s", p->last_error);
+    qa_caught_error cleanup;
+    if (!qa_try(restore_body, &scope, &cleanup)) {
+      /* throw new AggregateError([error, cleanup], "Render worker startup failed while retaining its context") */
       free_impl(p, r);
-      qa_range_error("Render worker startup failed while retaining its context: %.400s; %.400s", startup, cleanup);
+      qa_raise("AggregateError", 0, 0, "Render worker startup failed while retaining its context");
     }
   }
   free_impl(p, r);
@@ -261,7 +285,7 @@ static void park_body(void *ctx) {
   park_scope *s = (park_scope *)ctx;
   for (wimpl *p = contexts; p != NULL; p = p->next_context) {
     if (p->parked) continue;
-    if (p->callback_depth != 0) qa_range_error("Cannot change SDL windows during a render callback");
+    if (p->callback_depth != 0) qa_raise("Error", 0, 0, "Cannot change SDL windows during a render callback");
     qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_PARK);
     qa_rwt_value out; memset(&out, 0, sizeof out); qa_rwt_error *error = NULL;
     if (!qa_rwt_call(connection(p), request_value(&request), &out, &error)) raise_error(error);
@@ -277,24 +301,22 @@ void qa_worker_renderer_with_parked_contexts(void (*operation)(void *ctx), void 
   if (parked == NULL) qa_range_error("Render worker allocation failed");
   park_scope scope = {operation, ctx, parked, &count, park_scopes};
   park_scopes = &scope;
-  char message[1024]; message[0] = 0;
-  bool ok = qa_range_error_catch(park_body, &scope, message, sizeof message);
+  qa_caught_error caught; caught.message[0] = 0;
+  bool ok = qa_try(park_body, &scope, &caught);
   park_scopes = scope.previous;
-  char resume_failure[1024]; resume_failure[0] = 0;
+  bool resume_failed = false;
   for (size_t i = count; i-- > 0;) {
     wimpl *p = parked[i];
     if (p == NULL || p->closed) continue;
     qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_RESUME);
     qa_rwt_value out; memset(&out, 0, sizeof out); qa_rwt_error *error = NULL;
     if (qa_rwt_call(p->transport, request_value(&request), &out, &error)) { qa_rwt_value_release(&out); p->parked = false; }
-    else if (resume_failure[0] == 0) (void)snprintf(resume_failure, sizeof resume_failure, "%s", error != NULL ? error->message : "resume failed");
+    else resume_failed = true; /* failures.push(error) */
   }
   free(parked);
-  if (resume_failure[0] != 0) {
-    if (!ok) qa_range_error("SDL window change could not resume its render workers: %.400s; %.400s", message, resume_failure);
-    qa_range_error("SDL window change could not resume its render workers: %.800s", resume_failure);
-  }
-  if (!ok) qa_range_error("%s", message);
+  /* throw new AggregateError(failure === null ? failures : [failure.error, ...failures], "SDL window change could not resume its render workers") */
+  if (resume_failed) qa_raise("AggregateError", 0, 0, "SDL window change could not resume its render workers");
+  if (!ok) qa_rethrow(&caught);
 }
 
 /* --- execute --- */
@@ -346,6 +368,7 @@ static size_t command_bytes(const qa_render_command *c) {
   return bytes;
 }
 typedef struct packet { wimpl *p; qa_wire_arena *arena; qa_wire_command *pending; size_t count, cap, bytes; } packet;
+static void packet_free(void *arg) { packet *pk = (packet *)arg; qa_wire_arena_destroy(pk->arena); pk->arena = NULL; free(pk->pending); pk->pending = NULL; }
 static void packet_issue(packet *pk, bool final) {
   wimpl *p = pk->p;
   qa_rwt_transport *t = connection(p);
@@ -354,20 +377,18 @@ static void packet_issue(packet *pk, bool final) {
   request.commands = (qa_wire_command *)qa_wire_arena_copy(pk->arena, pk->pending, pk->count * sizeof *pk->pending);
   request.command_count = pk->count; request.final = final;
   qa_rwt_error *error = NULL;
-  if (!qa_rwt_issue(t, request_value(&request), &error)) {
-    /* Both failure paths in issue precede the send, so the worker never saw it. */
-    qa_wire_arena_destroy(pk->arena); free(pk->pending);
-    raise_error(error);
-  }
+  /* Both failure paths in issue precede the send, so the worker never saw it: the caller's guard frees the packet. */
+  if (!qa_rwt_issue(t, request_value(&request), &error)) raise_error(error);
   /* issue's own barrier retired the previous packet. */
   release_inflight(p);
   p->inflight = pk->arena;
+  pk->arena = NULL; /* owned by inflight before create can raise */
   pk->arena = qa_wire_arena_create(); pk->count = 0; pk->bytes = 0;
 }
 void qa_worker_renderer_execute(qa_worker_renderer *r, const qa_render_command *commands, size_t command_count,
     const double *captures, size_t capture_count, const qa_image_resource_operation *suffix, size_t suffix_count) {
   wimpl *p = W(r);
-  if (p != NULL && p->callback_depth != 0) qa_range_error("Cannot submit a frame during a render callback");
+  if (p != NULL && p->callback_depth != 0) qa_raise("Error", 0, 0, "Cannot submit a frame during a render callback");
   qa_worker_renderer_synchronize(r);
   if (p->draws == NULL) qa_wire_encoder_clear_sources(&p->encoder);
   for (size_t i = 0; i < suffix_count; i++) suffix_push(p, qa_wire_encoder_image_operation(&p->encoder, suffix[i]));
@@ -375,7 +396,9 @@ void qa_worker_renderer_execute(qa_worker_renderer *r, const qa_render_command *
   packet pk; memset(&pk, 0, sizeof pk); pk.p = p; pk.arena = qa_wire_arena_create();
   pk.cap = command_count ? command_count : 1;
   pk.pending = (qa_wire_command *)malloc(pk.cap * sizeof *pk.pending);
-  if (pk.pending == NULL) qa_range_error("Render worker allocation failed");
+  if (pk.pending == NULL) { qa_wire_arena_destroy(pk.arena); qa_range_error("Render worker allocation failed"); }
+  /* A raise below (a failed worker at a barrier, a full encoder) abandons this frame: its packet goes with it. */
+  qa_cleanup guard; qa_cleanup_push(&guard, packet_free, &pk);
   for (size_t i = 0; i < command_count; i++) {
     size_t size = command_bytes(&commands[i]);
     if (pk.count != 0 && pk.bytes + size > PACKET_LIMIT) packet_issue(&pk, false);
@@ -387,13 +410,14 @@ void qa_worker_renderer_execute(qa_worker_renderer *r, const qa_render_command *
     if (pk.bytes > PACKET_LIMIT) { packet_issue(&pk, false); qa_worker_renderer_synchronize(r); }
   }
   packet_issue(&pk, true);
-  qa_wire_arena_destroy(pk.arena); free(pk.pending);
+  qa_cleanup_pop(&guard);
+  packet_free(&pk);
 }
 
 /* --- synchronous calls --- */
 void qa_worker_renderer_resize(qa_worker_renderer *r, double width, double height) {
   wimpl *p = W(r);
-  if (p == NULL || !p->has_metadata) qa_range_error("Render worker is not initialized");
+  if (p == NULL || !p->has_metadata) qa_raise("Error", 0, 0, "Render worker is not initialized");
   if (width == p->metadata.width && height == p->metadata.height) return;
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_RESIZE); request.width = width; request.height = height;
   qa_rwt_value out = call(p, &request);
@@ -414,16 +438,21 @@ void qa_worker_renderer_set_swap_interval(qa_worker_renderer *r, double interval
 void qa_worker_renderer_read_pixels(qa_worker_renderer *r, qa_image_level *level) {
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_PIXELS);
   qa_rwt_value out = call(W(r), &request);
-  if (out.size < sizeof(qa_worker_wire_pixels)) { qa_rwt_value_release(&out); qa_range_error("Invalid renderer RGBA readback"); }
-  qa_worker_wire_pixels header; memcpy(&header, out.bytes, sizeof header);
-  if (out.size != sizeof header + header.length) { qa_rwt_value_release(&out); qa_range_error("Invalid renderer RGBA readback"); }
+  /* decodeImageLevel over the reply; the copy is made once it is known to be a level. */
+  qa_worker_wire_pixels header; memset(&header, 0, sizeof header);
+  bool shaped = out.size >= sizeof header;
+  if (shaped) { memcpy(&header, out.bytes, sizeof header); shaped = out.size == sizeof header + header.length; }
+  bool whole = shaped && header.width == floor(header.width) && header.width >= 0 && header.width <= (double)QA_MAX_SAFE_INTEGER
+    && header.height == floor(header.height) && header.height >= 0 && header.height <= (double)QA_MAX_SAFE_INTEGER;
+  if (!shaped) { qa_rwt_value_release(&out); qa_raise("TypeError", 0, 0, "Invalid renderer wire record"); }
+  if (!whole) { qa_rwt_value_release(&out); qa_range_error("Invalid renderer wire integer"); }
+  if ((double)header.length != header.width * header.height * 4) { qa_rwt_value_release(&out); qa_raise("TypeError", 0, 0, "Invalid renderer RGBA readback"); }
   uint8_t *pixels = (uint8_t *)malloc(header.length ? header.length : 1);
-  if (pixels == NULL) qa_range_error("Render worker allocation failed");
+  if (pixels == NULL) { qa_rwt_value_release(&out); qa_range_error("Render worker allocation failed"); }
   memcpy(pixels, (const unsigned char *)out.bytes + sizeof header, header.length);
   qa_rwt_value_release(&out);
   memset(level, 0, sizeof *level);
   level->width = header.width; level->height = header.height; level->pixels.bytes = pixels; level->pixels.length = header.length;
-  *level = qa_decode_wire_image_level(*level);
 }
 
 /* --- RendererBackend --- */
@@ -445,14 +474,14 @@ static void be_overdraw(void *ctx, bool enabled) {
 static void be_stencil(void *ctx, uint8_t *destination, size_t length) {
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_STENCIL); request.length = (double)length;
   qa_rwt_value out = call(W((qa_worker_renderer *)ctx), &request);
-  if (out.size != length) { qa_rwt_value_release(&out); qa_range_error("Invalid worker stencil readback"); }
+  if (out.size != length) { qa_rwt_value_release(&out); qa_raise("Error", 0, 0, "Invalid worker stencil readback"); }
   if (length != 0) memcpy(destination, out.bytes, length);
   qa_rwt_value_release(&out);
 }
 static double be_depth(void *ctx, double x, double y) {
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_DEPTH); request.x = x; request.y = y;
   qa_rwt_value out = call(W((qa_worker_renderer *)ctx), &request);
-  if (out.size != sizeof(double)) { qa_rwt_value_release(&out); qa_range_error("Invalid render worker number"); }
+  if (out.size != sizeof(double)) { qa_rwt_value_release(&out); qa_raise("TypeError", 0, 0, "Invalid render worker number"); }
   double depth; memcpy(&depth, out.bytes, sizeof depth);
   qa_rwt_value_release(&out);
   return depth;
@@ -466,7 +495,7 @@ typedef struct opacity_scope { wimpl *p; const qa_worker_wire_request *request; 
 static void opacity_body(void *ctx) { opacity_scope *s = (opacity_scope *)ctx; call_void(s->p, s->request); }
 static void be_opacity(void *ctx, double opacity, void (*draw)(void *), void *draw_ctx) {
   wimpl *p = W((qa_worker_renderer *)ctx);
-  if (p == NULL) qa_range_error("Render worker is not open");
+  if (p == NULL) qa_raise("Error", 0, 0, "Render worker is not open");
   double id = p->next_callback++;
   if (p->callback_count == p->callback_cap) {
     size_t cap = p->callback_cap ? p->callback_cap * 2 : 4;
@@ -477,24 +506,24 @@ static void be_opacity(void *ctx, double opacity, void (*draw)(void *), void *dr
   p->callbacks[p->callback_count].id = id; p->callbacks[p->callback_count].draw = draw; p->callbacks[p->callback_count].ctx = draw_ctx; p->callback_count++;
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_OPACITY); request.opacity = opacity; request.callback = id;
   opacity_scope scope = {p, &request};
-  char message[1024];
-  bool ok = qa_range_error_catch(opacity_body, &scope, message, sizeof message);
+  qa_caught_error caught; /* rethrown unchanged */
+  bool ok = qa_try(opacity_body, &scope, &caught);
   for (size_t i = 0; i < p->callback_count; i++) if (p->callbacks[i].id == id) { /* TS finally */
     memmove(&p->callbacks[i], &p->callbacks[i + 1], (p->callback_count - i - 1) * sizeof *p->callbacks); p->callback_count--; break;
   }
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) qa_rethrow(&caught);
 }
 static void be_immediate(void *ctx, qa_render_operation op) {
   wimpl *p = W((qa_worker_renderer *)ctx);
-  if (p == NULL) qa_range_error("Render worker is not open");
+  if (p == NULL) qa_raise("Error", 0, 0, "Render worker is not open");
   qa_wire_arena *arena = qa_wire_arena_create();
   qa_wire_operation wire = qa_wire_encoder_operation(&p->encoder, arena, op);
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_IMMEDIATE); request.immediate = &wire;
   opacity_scope scope = {p, &request};
-  char message[1024];
-  bool ok = qa_range_error_catch(opacity_body, &scope, message, sizeof message);
+  qa_caught_error caught; /* rethrown unchanged */
+  bool ok = qa_try(opacity_body, &scope, &caught);
   qa_wire_arena_destroy(arena);
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) qa_rethrow(&caught);
 }
 static void wp_call(wprep *pr, qa_worker_phase phase, double unit, qa_wire_binding *texture) {
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_PREPARED);
@@ -506,7 +535,7 @@ static void wp_begin(void *ctx) { wp_call((wprep *)ctx, QA_WORKER_PHASE_BEGIN, 0
 static void wp_texture(void *ctx, double unit, qa_texture_binding binding) {
   wprep *pr = (wprep *)ctx;
   wimpl *p = W(pr->r);
-  if (p == NULL) qa_range_error("Render worker is not open");
+  if (p == NULL) qa_raise("Error", 0, 0, "Render worker is not open");
   qa_wire_binding wire = qa_wire_encoder_binding(&p->encoder, binding);
   wp_call(pr, QA_WORKER_PHASE_TEXTURE, unit, &wire);
 }
@@ -520,7 +549,7 @@ static void wp_cleanup(void *ctx) {
 }
 static qa_prepared_backend_draw be_prepare(void *ctx, qa_draw_batch batch) {
   qa_worker_renderer *r = (qa_worker_renderer *)ctx; wimpl *p = W(r);
-  if (p == NULL) qa_range_error("Render worker is not open");
+  if (p == NULL) qa_raise("Error", 0, 0, "Render worker is not open");
   wprep *pr = (wprep *)calloc(1, sizeof *pr);
   if (pr == NULL) qa_range_error("Render worker allocation failed");
   pr->r = r; pr->id = p->next_draw++; pr->arena = qa_wire_arena_create();
@@ -529,10 +558,10 @@ static qa_prepared_backend_draw be_prepare(void *ctx, qa_draw_batch batch) {
   qa_wire_batch *wire = (qa_wire_batch *)qa_wire_arena_copy(pr->arena, &encoded, sizeof encoded);
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_PREPARE); request.id = pr->id; request.batch = wire;
   opacity_scope scope = {p, &request};
-  char message[1024];
-  if (!qa_range_error_catch(opacity_body, &scope, message, sizeof message)) {
+  qa_caught_error caught;
+  if (!qa_try(opacity_body, &scope, &caught)) {
     qa_wire_arena_destroy(pr->arena); free(pr);
-    qa_range_error("%s", message);
+    qa_rethrow(&caught);
   }
   pr->next = p->draws; if (p->draws != NULL) p->draws->prev = pr; p->draws = pr;
   qa_prepared_backend_draw o; memset(&o, 0, sizeof o);
@@ -542,7 +571,7 @@ static qa_prepared_backend_draw be_prepare(void *ctx, qa_draw_batch batch) {
 static void be_clear(void *ctx) { qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_CLEAR_COLOR); call_void(W((qa_worker_renderer *)ctx), &request); }
 static void be_show(void *ctx, qa_renderer_image image, qa_rect rect, bool proportional) {
   wimpl *p = W((qa_worker_renderer *)ctx);
-  if (p == NULL) qa_range_error("Render worker is not open");
+  if (p == NULL) qa_raise("Error", 0, 0, "Render worker is not open");
   qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_SHOW_IMAGE);
   request.image = qa_wire_encoder_image(&p->encoder, image); request.rect = rect; request.flag = proportional;
   call_void(p, &request);
@@ -550,7 +579,7 @@ static void be_show(void *ctx, qa_renderer_image image, qa_rect rect, bool propo
 static void be_finish(void *ctx) { qa_worker_wire_request request; request_init(&request, QA_WORKER_OP_FINISH); call_void(W((qa_worker_renderer *)ctx), &request); }
 static void be_close(void *ctx) {
   qa_worker_renderer *r = (qa_worker_renderer *)ctx;
-  if (!qa_worker_renderer_close(r)) qa_range_error("%s", qa_worker_renderer_last_error(r));
+  if (!qa_worker_renderer_close(r)) { wimpl *p = W(r); qa_raise(p != NULL && p->last_error_name != NULL ? p->last_error_name : "Error", 0, 0, "%s", qa_worker_renderer_last_error(r)); }
 }
 qa_renderer_backend qa_worker_renderer_backend(qa_worker_renderer *r) {
   qa_renderer_backend b; memset(&b, 0, sizeof b);
@@ -568,7 +597,10 @@ bool qa_worker_renderer_close(qa_worker_renderer *r) {
   qa_rwt_transport *t = connection(p);
   qa_rwt_error *error = NULL;
   bool ok = qa_rwt_close(t, &error);
-  if (!ok) (void)snprintf(p->last_error, sizeof p->last_error, "%s", error != NULL ? error->message : "Render worker close failed");
+  if (!ok) {
+    set_last_error(p, error != NULL ? error->message : "Render worker close failed");
+    p->last_error_name = qa_rwt_error_class(error != NULL ? error->name : "Error");
+  }
   if (qa_rwt_retired(t)) {
     p->closed = true;
     qa_wire_encoder_clear(&p->encoder);
@@ -580,7 +612,7 @@ bool qa_worker_renderer_close(qa_worker_renderer *r) {
   return ok;
 }
 bool qa_worker_renderer_closed(const qa_worker_renderer *r) { wimpl *p = W(r); return p == NULL || p->closed; }
-const char *qa_worker_renderer_last_error(const qa_worker_renderer *r) { wimpl *p = W(r); return p != NULL ? p->last_error : ""; }
+const char *qa_worker_renderer_last_error(const qa_worker_renderer *r) { wimpl *p = W(r); return p != NULL && p->last_error != NULL ? p->last_error : ""; }
 void qa_worker_renderer_destroy(qa_worker_renderer *r) {
   wimpl *p = W(r);
   if (p == NULL) return;

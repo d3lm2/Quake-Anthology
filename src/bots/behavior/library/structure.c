@@ -107,17 +107,19 @@ bool qa_structure_reader_next_field(qa_structure_reader *r, qa_structure_field *
 bool qa_structure_reader_reject_field(qa_structure_reader *r, const qa_structure_field *field) {
   return fail(r, field->location, "unknown structure field %s", field->name);
 }
-/* structureFloat with its RangeError routed per capture_range_errors. */
+/* A TS RangeError thrown from inside a read, routed per capture_range_errors: a caller whose TS
+ * catches every error (the weapon setup) takes it as a false return with the text in range_error. */
+static bool range_failure(qa_structure_reader *r, const char *message) {
+  if (r == NULL || !r->capture_range_errors) qa_range_error("%s", message);
+  free(r->range_error);
+  r->range_error = lib_strdup(message);
+  r->failed = true;
+  return false;
+}
 static bool structure_float(qa_structure_reader *r, double value, float *out) {
   float result = (float)value;
-  if (isfinite(value) && !isfinite(result)) {
-    const char *message = "structure value exceeds the source float conversion range";
-    if (r == NULL || !r->capture_range_errors) qa_range_error("%s", message);
-    free(r->range_error);
-    r->range_error = lib_strdup(message);
-    r->failed = true;
-    return false;
-  }
+  if (isfinite(value) && !isfinite(result))
+    return range_failure(r, "structure value exceeds the source float conversion range");
   *out = result;
   return true;
 }
@@ -149,8 +151,10 @@ static bool read_number(qa_structure_reader *r, bool float_field, double *out_va
     return false;
   }
   double value = is_float ? token->float_value : (double)(int32_t)token->integer_value;
-  if (!is_float && negative && value == -2147483648.0)
-    qa_range_error("structure negation exceeds the source signed-long range");
+  if (!is_float && negative && value == -2147483648.0) {
+    qa_ui_script_token_release(token);
+    return range_failure(r, "structure negation exceeds the source signed-long range");
+  }
   *out_value = negative ? -value : value;
   *out_token = token;
   return true;
@@ -276,8 +280,10 @@ static bool read_number_field(qa_structure_reader *r, const qa_structure_field_d
     return false;
   }
   double raw = is_float ? token->float_value : (double)(int32_t)token->integer_value;
-  if (!is_float && negative && raw == -2147483648.0)
-    qa_range_error("structure negation exceeds the source signed-long range");
+  if (!is_float && negative && raw == -2147483648.0) {
+    qa_ui_script_token_release(token);
+    return range_failure(r, "structure negation exceeds the source signed-long range");
+  }
   double value = negative ? -raw : raw;
   double minimum = (float)field->floatmin, maximum = (float)field->floatmax;
   if (type == QA_STRUCT_CHAR || type == QA_STRUCT_INT) {

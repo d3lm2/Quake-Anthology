@@ -84,7 +84,7 @@ static int32_t slot_index_of(pool_t *pool, qa_q3_pres_local_entity *entity) {
 }
 static void free_slot(pool_t *pool, int32_t index) {
   le_slot *slot = slot_at(pool, index);
-  if (!slot->active) qa_range_error("CG_FreeLocalEntity: not active");
+  if (!slot->active) qa_raise("Error", 0, 0, "CG_FreeLocalEntity: not active");
   if (slot->prev == -1) pool->head = slot->next; else slot_at(pool, slot->prev)->next = slot->next;
   if (slot->next == -1) pool->tail = slot->prev; else slot_at(pool, slot->next)->prev = slot->prev;
   slot->active = false;
@@ -147,17 +147,17 @@ qa_q3_pres_local_entity *qa_q3_pres_local_entity_pool_allocate(pool_t *pool,
   if (pool->product == QA_Q3_BASE_PRODUCT_BASEQ3 &&
       (type == QA_Q3_PRES_LE_KAMIKAZE || type == QA_Q3_PRES_LE_INVUL_IMPACT ||
        type == QA_Q3_PRES_LE_INVUL_JUICED || type == QA_Q3_PRES_LE_SHOW_REF_ENTITY)) {
-    qa_range_error("%s requires missionpack local entities", name);
+    qa_raise("Error", 0, 0, "%s requires missionpack local entities", name);
   }
   if (is_sprite_type(type) && ref_entity.kind != QA_Q3_PRES_REF_SPRITE) {
-    qa_range_error("%s requires a sprite", name);
+    qa_raise("TypeError", 0, 0, "%s requires a sprite", name);
   }
   if (is_model_type(type) && ref_entity.kind != QA_Q3_PRES_REF_MODEL) {
-    qa_range_error("%s requires a model", name);
+    qa_raise("TypeError", 0, 0, "%s requires a model", name);
   }
   if ((type == QA_Q3_PRES_LE_FADE_RGB || type == QA_Q3_PRES_LE_EXPLOSION) &&
       ref_entity.kind == QA_Q3_PRES_REF_PORTAL) {
-    qa_range_error("%s requires a shaded entity", name);
+    qa_raise("TypeError", 0, 0, "%s requires a shaded entity", name);
   }
   if (pool->free_head == -1) free_slot(pool, pool->tail);
   int32_t index = pool->free_head;
@@ -181,7 +181,7 @@ bool qa_q3_pres_local_entity_pool_is_active(pool_t *pool, qa_q3_pres_local_entit
 void qa_q3_pres_local_entity_pool_free(pool_t *pool, qa_q3_pres_local_entity *entity) {
   int32_t index = slot_index_of(pool, entity);
   if (index == -1 || !qa_q3_pres_local_entity_pool_is_active(pool, entity)) {
-    qa_range_error("CG_FreeLocalEntity: not active");
+    qa_raise("Error", 0, 0, "CG_FreeLocalEntity: not active");
   }
   free_slot(pool, index);
 }
@@ -412,7 +412,7 @@ static void fragment(system_t *system, qa_q3_pres_local_entity *entity,
   /* CM allsolid leaves the zero-initialized source plane untouched. */
   qa_vec3 normal = trace.result.has_plane ? trace.result.plane.normal : qa_math_vec3(0, 0, 0);
   if (!trace.result.has_plane && strcmp(trace.result.solidity, "all-solid") != 0) {
-    qa_range_error("Fragment impact has no trace plane");
+    qa_raise("Error", 0, 0, "Fragment impact has no trace plane");
   }
   bounce_mark(system, entity, trace.result.end, normal);
   bounce_sound(system, entity, trace.result.end);
@@ -463,7 +463,7 @@ static void score_plum(system_t *system, qa_q3_pres_local_entity *entity, visit_
 static void shockwave(system_t *system, qa_q3_pres_local_entity *entity, qa_axis axis, double time,
     double start, double end, double fade, double radius, visit_state *visit) {
   if (system->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) {
-    qa_range_error("Shockwave requires missionpack media");
+    qa_raise("Error", 0, 0, "Shockwave requires missionpack media");
   }
   qa_q3_pres_ref_model_entity model =
       qa_q3_pres_create_model_entity(system->host.mission_media->kamikaze_shock_wave);
@@ -480,7 +480,7 @@ static void shockwave(system_t *system, qa_q3_pres_local_entity *entity, qa_axis
 }
 static void kamikaze(system_t *system, qa_q3_pres_local_entity *entity, visit_state *visit) {
   if (system->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) {
-    qa_range_error("Kamikaze requires missionpack media");
+    qa_raise("Error", 0, 0, "Kamikaze requires missionpack media");
   }
   qa_q3_pres_local_entity_frame *frame = &visit->frame;
   int32_t t = to_int32(frame->time - entity->start_time);
@@ -595,7 +595,7 @@ void qa_q3_pres_local_entity_system_init(system_t *system, qa_q3_pres_client_eff
   system->pool = effects.pool;
   system->host = host;
   if (qa_q3_pres_local_entity_pool_product(system->pool) != host.product) {
-    qa_range_error("Local entity media product differs from its pool");
+    qa_raise("Error", 0, 0, "Local entity media product differs from its pool");
   }
 }
 void qa_q3_pres_local_entity_system_add_entities(system_t *system, qa_q3_pres_local_entity_frame frame,

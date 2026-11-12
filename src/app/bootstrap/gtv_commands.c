@@ -31,9 +31,9 @@ bool qa_app_parse_gtv_connect(const char *const *args, size_t arg_count, const c
     bool is_user = strcmp(option, "-u") == 0 || strcmp(option, "--user") == 0;
     bool is_pass = strcmp(option, "-p") == 0 || strcmp(option, "--pass") == 0;
     bool is_name = strcmp(option, "-n") == 0 || strcmp(option, "--name") == 0;
-    if (!is_user && !is_pass && !is_name) qa_range_error("Unknown mvdconnect option: %s", option);
+    if (!is_user && !is_pass && !is_name) qa_raise("Error", 0, 0, "Unknown mvdconnect option: %s", option);
     const char *value = ++index < arg_count ? args[index] : NULL;
-    if (!value) qa_range_error("Missing value for %s", option);
+    if (!value) qa_raise("Error", 0, 0, "Missing value for %s", option);
     /* TS: no NUL (impossible in C strings) and single-byte text; UTF-8
      * lead/continuation bytes above 127 are bytes here, matching the
      * byte-string reading for ASCII input. */
@@ -43,17 +43,17 @@ bool qa_app_parse_gtv_connect(const char *const *args, size_t arg_count, const c
   }
   const char *address = index < arg_count ? args[index] : NULL;
   if (!address || address[0] == '\0' || index + 1 != arg_count)
-    qa_range_error("Usage: mvdconnect [-u user] [-p password] [-n name] <address[:port]>");
+    qa_raise("Error", 0, 0, "Usage: mvdconnect [-u user] [-p password] [-n name] <address[:port]>");
   *out = (qa_app_gtv_connect_request){address, username, password, label};
   return true;
 }
 bool qa_app_matches_gtv_disconnect(const char *const *args, size_t arg_count, const qa_app_gtv_current *current) {
-  if (arg_count > 1) qa_range_error("Usage: mvdisconnect [-a|--all] [conn_id]");
+  if (arg_count > 1) qa_raise("Error", 0, 0, "Usage: mvdisconnect [-a|--all] [conn_id]");
   const char *selected = arg_count > 0 ? args[0] : NULL;
   if (selected && (strcmp(selected, "-h") == 0 || strcmp(selected, "--help") == 0)) return false;
-  if (!current) qa_range_error("No GTV connections.");
+  if (!current) qa_raise("Error", 0, 0, "No GTV connections.");
   if (!selected || strcmp(selected, "-a") == 0 || strcmp(selected, "--all") == 0) return true;
   char id[64]; snprintf(id, sizeof id, "%s", QA_JS_NUMBER(current->id));
   if (strcmp(selected, id) == 0 || (current->label && strcmp(selected, current->label) == 0)) return true;
-  qa_range_error("No such connection ID: %s", selected);
+  qa_raise("Error", 0, 0, "No such connection ID: %s", selected);
 }

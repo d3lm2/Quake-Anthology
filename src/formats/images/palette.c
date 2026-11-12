@@ -119,7 +119,8 @@ int qa_expand_indexed_image(const qa_indexed_render_image *image, int64_t level,
     }
     if ((size_t)(index * 3 + 2) >= color_length) {
       free(pixels);
-      qa_range_error("Offset is outside the bounds of the DataView");
+      /* TS colors.getUint8(index * 3 ...): the native DataView refusal. */
+      qa_range_error("Out of bounds access");
     }
     int transparent = image->transparency.kind != NULL &&
                       strcmp(image->transparency.kind, "opaque") != 0 &&
@@ -197,9 +198,6 @@ int qa_apply_image_gamma(const qa_image_level *level,
     qa_range_error("Gamma input must be RGBA8");
   }
   size_t length = level->pixels.length;
-  uint8_t *pixels = length == 0 ? NULL : (uint8_t *)malloc(length);
-  if (length != 0 && pixels == NULL) return 0;
-  if (length != 0) memcpy(pixels, level->pixels.bytes, length);
   struct gamma_cache_entry *cached = NULL;
   for (size_t i = 0; i < gamma_cache_count; i++) {
     const qa_gamma_profile *key = &gamma_cache[i].key;
@@ -225,7 +223,6 @@ int qa_apply_image_gamma(const qa_image_level *level,
                                : profile->intensity == profile->intensity ? 1.0
                                                                            : NAN;
     if (!isfinite(intensity)) {
-      free(pixels);
       qa_range_error("Intensity must be finite");
     }
     float fi = (float)intensity;
@@ -255,6 +252,10 @@ int qa_apply_image_gamma(const qa_image_level *level,
       entry->identity = local_identity;
     }
   }
+  /* The copy is taken after the table so a raising profile leaves nothing behind. */
+  uint8_t *pixels = length == 0 ? NULL : (uint8_t *)malloc(length);
+  if (length != 0 && pixels == NULL) return 0;
+  if (length != 0) memcpy(pixels, level->pixels.bytes, length);
   if (!identity) {
     for (size_t offset = 0; offset < length; offset += 4) {
       pixels[offset] = composed[pixels[offset]];

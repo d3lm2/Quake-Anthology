@@ -67,7 +67,7 @@ typedef struct qa_app_sim_actor_execution {
   qa_actor_id owner;
   qa_provider_id provider;
   void *ctx;
-  qa_q2m_state *(*read_monster)(void *ctx);
+  qa_q2m_state *(*read_monster)(void *ctx, qa_actor_id actor); /* TS readMonster(entity.actor.id): actor is entry.actor.id */
   void (*step)(void *ctx, double previous_milliseconds, double milliseconds);
   qa_q2_motion (*motion)(void *ctx, qa_body_state body);
   qa_app_sim_shared_solid (*collision)(void *ctx);

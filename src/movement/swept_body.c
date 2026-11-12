@@ -3,9 +3,9 @@
 
 #include <stdlib.h>
 
+#include "qa/core/math.h"
 #include "qa/foundation/support.h"
 
-static const qa_vec3 swept_zero = {0, 0, 0};
 
 qa_sweep_stop qa_sweep_body(const qa_swept_body_services *services, double elapsed) {
   void *ctx = services->ctx;
@@ -39,7 +39,7 @@ qa_sweep_stop qa_sweep_body(const qa_swept_body_services *services, double elaps
         zero_z.z = 0;
         services->write_velocity(ctx, zero_z, QA_SWEPT_VELOCITY_VERTICAL);
       } else {
-        services->write_velocity(ctx, swept_zero, QA_SWEPT_VELOCITY_ALL);
+        services->write_velocity(ctx, qa_zero_vec3, QA_SWEPT_VELOCITY_ALL);
       }
       if (services->solid != NULL) services->solid(ctx, &trace);
       stop = QA_SWEEP_SOLID;
@@ -57,7 +57,7 @@ qa_sweep_stop qa_sweep_body(const qa_swept_body_services *services, double elaps
     if (paired) {
       remaining = math->remaining(math->ctx, remaining, trace.fraction);
       if (plane_count >= 5) {
-        services->write_velocity(ctx, swept_zero, QA_SWEPT_VELOCITY_ALL);
+        services->write_velocity(ctx, qa_zero_vec3, QA_SWEPT_VELOCITY_ALL);
         stop = QA_SWEEP_PLANE_LIMIT;
         break;
       }
@@ -73,7 +73,7 @@ qa_sweep_stop qa_sweep_body(const qa_swept_body_services *services, double elaps
     if (!paired) {
       remaining = math->remaining(math->ctx, remaining, trace.fraction);
       if (plane_count >= 5) {
-        services->write_velocity(ctx, swept_zero, QA_SWEPT_VELOCITY_ALL);
+        services->write_velocity(ctx, qa_zero_vec3, QA_SWEPT_VELOCITY_ALL);
         stop = QA_SWEEP_PLANE_LIMIT;
         break;
       }
@@ -94,7 +94,7 @@ qa_sweep_stop qa_sweep_body(const qa_swept_body_services *services, double elaps
     identities[plane_count] = identity;
     planes[plane_count++] = normal;
     bool has_velocity = false;
-    qa_vec3 velocity = swept_zero;
+    qa_vec3 velocity = qa_zero_vec3;
     qa_vec3 last_candidate = current.velocity;
     for (size_t index = 0; index < plane_count && !done; index++) {
       const qa_vec3 plane = planes[index];
@@ -124,7 +124,7 @@ qa_sweep_stop qa_sweep_body(const qa_swept_body_services *services, double elaps
             }
           }
           if (blocked) {
-            services->write_velocity(ctx, swept_zero, QA_SWEPT_VELOCITY_ALL);
+            services->write_velocity(ctx, qa_zero_vec3, QA_SWEPT_VELOCITY_ALL);
             stop = QA_SWEEP_CREASE_BLOCKED;
             done = true;
             break;
@@ -166,7 +166,7 @@ qa_sweep_stop qa_sweep_body(const qa_swept_body_services *services, double elaps
     }
     if (!has_velocity) {
       if (plane_count != 2) {
-        services->write_velocity(ctx, swept_zero, QA_SWEPT_VELOCITY_ALL);
+        services->write_velocity(ctx, qa_zero_vec3, QA_SWEPT_VELOCITY_ALL);
         stop = QA_SWEEP_CREASE_BLOCKED;
         break;
       }
@@ -179,7 +179,7 @@ qa_sweep_stop qa_sweep_body(const qa_swept_body_services *services, double elaps
                                            : current.velocity));
     }
     if (math->dot(math->ctx, velocity, primal) <= 0) {
-      services->write_velocity(ctx, swept_zero, QA_SWEPT_VELOCITY_ALL);
+      services->write_velocity(ctx, qa_zero_vec3, QA_SWEPT_VELOCITY_ALL);
       stop = QA_SWEEP_REVERSED;
       break;
     }

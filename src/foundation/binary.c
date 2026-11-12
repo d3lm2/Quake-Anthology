@@ -1,6 +1,7 @@
 /* Port of src/foundation/binary.ts. GPL-2.0-or-later. */
 #include "qa/foundation/binary.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "qa/foundation/support.h"
@@ -12,16 +13,19 @@ uint32_t qa_float32_bits(double value) {
   return bits;
 }
 
+/* A NaN read out of bytes is the canonical quiet NaN (0x7ff8000000000000 as binary64,
+ * 0x7fc00000 as binary32): JavaScriptCore purifies every double a DataView or typed array
+ * load returns, so float32Bits(float32FromBits(0xffc00001)) is 0x7fc00000 in TS. */
 float qa_float32_from_bits(uint32_t bits) {
   float value;
   memcpy(&value, &bits, sizeof value);
-  return value;
+  return isnan(value) ? (float)NAN : value;
 }
 
 double qa_float64_from_bits(uint64_t bits) {
   double value;
   memcpy(&value, &bits, sizeof value);
-  return value;
+  return isnan(value) ? (double)NAN : value;
 }
 
 uint64_t qa_float64_bits(double value) {

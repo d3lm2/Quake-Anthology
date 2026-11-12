@@ -135,9 +135,10 @@ qa_q2_base_player_view qa_q2_build_view(qa_q2_character_context *context, double
   else if (powers.enviro_until > now) { power_item = "q2:item_enviro"; power_until = powers.enviro_until; power_sound = "items/airout.wav"; power_color = (qa_vec3){0, 1, 0}; power_alpha = 0.08; }
   else if (powers.breather_until > now) { power_item = "q2:item_breather"; power_until = powers.breather_until; power_sound = "items/airout.wav"; power_color = (qa_vec3){0.4, 1, 0.4}; power_alpha = 0.04; }
   if (power_item) {
-    int64_t remaining = (int64_t)qa_js_round((power_until - now) * 10);
+    /* A JS number throughout: a non-finite timer is never cast to an integer. */
+    double remaining = qa_js_round((power_until - now) * 10);
     if (remaining == 30) game->sound(game->ctx, entity, power_sound, 3, 1, 1);
-    if (remaining > 30 || (qa_js_to_int32((double)remaining) & 4) != 0) blend = qa_q2_add_blend(blend, power_color, power_alpha);
+    if (remaining > 30 || (qa_js_to_int32(remaining) & 4) != 0) blend = qa_q2_add_blend(blend, power_color, power_alpha);
   }
   blend = qa_q2_add_blend(blend, state->damage_blend, state->damage_alpha);
   blend = qa_q2_add_blend(blend, (qa_vec3){0.85, 0.7, 0.3}, state->bonus_alpha);

@@ -218,10 +218,22 @@ static size_t curl_header(void *data, size_t size, size_t count, void *ctx) {
   curl_body *body = ctx;
   size_t length = size * count;
   const char *line = data;
-  if (length == 2 && line[0] == '\r' && line[1] == '\n') body->headers_done = true;
-  /* Header names are case-insensitive; final response headers win by
-   * only recording before body arrival on the last header block is
-   * approximated by overwriting (redirects are errors here). */
+  /* Each status line starts a new header block: an informational (1xx)
+   * response's block is not the response fetch resolves with. */
+  if (length >= 5 && memcmp(line, "HTTP/", 5) == 0) {
+    body->headers_done = false;
+    free(body->response->content_type);
+    body->response->content_type = NULL;
+    return length;
+  }
+  if ((length == 2 && line[0] == '\r' && line[1] == '\n') || (length == 1 && line[0] == '\n')) {
+    long status = 0;
+    curl_easy_getinfo(body->easy, CURLINFO_RESPONSE_CODE, &status);
+    if (status >= 200 || status == 0) body->headers_done = true;
+    return length;
+  }
+  /* Header names are case-insensitive; Headers.get joins repeated values
+   * with ", ", each value stripped of HTTP whitespace. */
   const char *name = "content-type:";
   size_t name_len = strlen(name);
   if (length > name_len) {
@@ -233,9 +245,17 @@ static size_t curl_header(void *data, size_t size, size_t count, void *ctx) {
       const char *value = line + name_len;
       size_t value_len = length - name_len;
       while (value_len > 0 && (*value == ' ' || *value == '\t')) { value++; value_len--; }
-      while (value_len > 0 && (value[value_len - 1] == '\r' || value[value_len - 1] == '\n' || value[value_len - 1] == ' ')) value_len--;
+      while (value_len > 0 && (value[value_len - 1] == '\r' || value[value_len - 1] == '\n' ||
+                               value[value_len - 1] == ' ' || value[value_len - 1] == '\t')) value_len--;
+      qa_llm_strbuf joined;
+      qa_llm_strbuf_init(&joined);
+      if (body->response->content_type != NULL) {
+        qa_llm_strbuf_append(&joined, body->response->content_type);
+        qa_llm_strbuf_append(&joined, ", ");
+      }
+      qa_llm_strbuf_append_n(&joined, value, value_len);
       free(body->response->content_type);
-      body->response->content_type = qa_llm_strndup(value, value_len);
+      body->response->content_type = qa_llm_strbuf_steal(&joined);
     }
   }
   return length;
@@ -337,6 +357,9 @@ bool qa_llm_curl_fetch(void *ctx, const char *url, const qa_llm_http_init *init,
     body->headers = curl_slist_append(body->headers, qa_llm_strbuf_text(&line));
     qa_llm_strbuf_free(&line);
   }
+  /* Bun's fetch never sends "Expect: 100-continue"; libcurl adds it to large
+   * POST bodies, and the 100 response it invites is not the fetch result. */
+  if (strcmp(method, "POST") == 0) body->headers = curl_slist_append(body->headers, "Expect:");
   if (body->headers != NULL) curl_easy_setopt(easy, CURLOPT_HTTPHEADER, body->headers);
   curl_multi_add_handle(body->multi, easy);
   /* Run until response headers are known (fetch resolves then). */

@@ -224,8 +224,14 @@ static struct account_record *find_account(qa_local_authorization *a, const char
   for (size_t i = 0; i < a->account_count; i++) if (strcmp(a->names[i], name) == 0) return &a->accounts[i];
   return NULL;
 }
+/* text.trim().length === 0: JS white space and line terminators, including U+00A0, U+2028,
+ * U+3000 and U+FEFF, not only ASCII. */
 static bool trimmed_empty(const char *s) {
-  for (; *s; s++) if (!isspace((unsigned char)*s)) return false;
+  while (*s) {
+    size_t n = qa_js_white_space_length(s);
+    if (n == 0) return false;
+    s += n;
+  }
   return true;
 }
 void qa_local_authorization_register(qa_local_authorization *a, const char *name, const char *password, qa_online_account *out) {
@@ -282,18 +288,26 @@ void qa_local_authorization_revoke(qa_local_authorization *a, const char *token)
     a->token_count--; return;
   }
 }
+static void cat_raw(char **buf, size_t *len, size_t *cap, const char *text);
+/* JSON.stringify string contents: quote, backslash, the short escapes and \u00XX for the other
+ * control characters. Account names and ranking keys are arbitrary text. */
 static void json_escape_cat(char **buf, size_t *len, size_t *cap, const char *text) {
-  /* Append raw text (ids/names here are hex/simple; escape quotes/backslash). */
-  for (const char *p = text; *p; p++) {
-    char tmp[2] = { *p, '\0' };
-    if (*p == '"' || *p == '\\') {
-      if (*len + 3 > *cap) { size_t nc = *cap ? *cap * 2 : 256; *buf = realloc(*buf, nc); *cap = nc; }
-      (*buf)[(*len)++] = '\\';
+  for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+    char piece[8];
+    switch (*p) {
+      case '"': cat_raw(buf, len, cap, "\\\""); continue;
+      case '\\': cat_raw(buf, len, cap, "\\\\"); continue;
+      case '\b': cat_raw(buf, len, cap, "\\b"); continue;
+      case '\f': cat_raw(buf, len, cap, "\\f"); continue;
+      case '\n': cat_raw(buf, len, cap, "\\n"); continue;
+      case '\r': cat_raw(buf, len, cap, "\\r"); continue;
+      case '\t': cat_raw(buf, len, cap, "\\t"); continue;
+      default: break;
     }
-    if (*len + 2 > *cap) { size_t nc = *cap ? *cap * 2 : 256; *buf = realloc(*buf, nc); *cap = nc; }
-    (*buf)[(*len)++] = tmp[0];
+    if (*p < 0x20) snprintf(piece, sizeof piece, "\\u%04x", *p);
+    else { piece[0] = (char)*p; piece[1] = '\0'; }
+    cat_raw(buf, len, cap, piece);
   }
-  (*buf)[*len] = '\0';
 }
 static void cat_raw(char **buf, size_t *len, size_t *cap, const char *text) {
   size_t n = strlen(text);
@@ -528,9 +542,10 @@ void qa_local_ranking_service_destroy(qa_local_ranking_service *s) {
   free(s->reports); memset(s, 0, sizeof *s);
 }
 bool qa_local_ranking_service_submit(qa_local_ranking_service *s, const qa_online_ranking_report *report) {
-  size_t klen = strlen(report->rules) + strlen(report->match) + 8;
+  /* JSON.stringify([rules, match]): a length prefix keeps the pair unambiguous for any text. */
+  size_t klen = strlen(report->rules) + strlen(report->match) + 32;
   char *key = malloc(klen);
-  snprintf(key, klen, "%s\001%s", report->rules, report->match);
+  snprintf(key, klen, "%zu:%s%s", strlen(report->rules), report->rules, report->match);
   for (size_t i = 0; i < s->count; i++) if (strcmp(s->reports[i].key, key) == 0) { free(key); return false; }
   bool bad = report->match[0] == '\0';
   for (size_t i = 0; i < report->player_count && !bad; i++) {
@@ -570,10 +585,11 @@ void qa_ranking_entries_destroy(qa_ranking_entry *entries, size_t count) {
 }
 static int cmp_ranking(const void *a, const void *b) {
   const qa_ranking_entry *x = a, *y = b;
+  /* right.score - left.score || ...: NaN (Infinity - Infinity) is falsy and falls through. */
   double ds = y->score - x->score;
-  if (ds != 0) return ds > 0 ? 1 : -1;
+  if (ds != 0 && !isnan(ds)) return ds > 0 ? 1 : -1;
   double dw = y->wins - x->wins;
-  if (dw != 0) return dw > 0 ? 1 : -1;
+  if (dw != 0 && !isnan(dw)) return dw > 0 ? 1 : -1;
   return strcmp(x->account, y->account);
 }
 qa_ranking_entry *qa_local_ranking_service_standings(qa_local_ranking_service *s, qa_provider_id rules, size_t *out_count) {

@@ -68,7 +68,7 @@ void qa_render_image_journal_record(qa_render_image_journal *j,qa_image_resource
     }
     return; }
   case QA_IMAGE_OP_UPDATE: {
-    resident *r=find_res(p,op.image.ordinal); if(!r) qa_range_error("Renderer update has no resident image");
+    resident *r=find_res(p,op.image.ordinal); if(!r) qa_raise("Error", 0, 0, "Renderer update has no resident image");
     update *u=NULL;
     for(size_t i=0;i<r->update_count;i++)if(r->updates[i].level==op.level)u=&r->updates[i];
     if(!u){ if(r->update_count==r->update_cap){ size_t nc=r->update_cap?r->update_cap*2:4; update *n=(update*)realloc(r->updates,nc*sizeof *n); if(!n)qa_range_error("image journal allocation failed"); r->updates=n;r->update_cap=nc; }

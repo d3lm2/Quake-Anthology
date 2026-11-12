@@ -6,15 +6,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
+
+/* TS `throw new Error(...)` while a save is read: catchable, never a process abort (a crafted save
+ * names any schema and owner). */
 static noreturn void qa_error(const char *format, const char *argument) {
-  fprintf(stderr, "Error: ");
-  fprintf(stderr, format, argument);
-  fputc('\n', stderr);
-  abort();
+  qa_raise("Error", 0, 0, format, argument);
 }
 
 const qa_provider_checkpoint_ref qa_campaign_unit_checkpoint = {
     "session:campaign-unit", "session:campaign-unit", 1};
+
+bool qa_save_provider_version_supported(const char *schema, double version, double current) {
+  return version == current ||
+         ((strcmp(schema, "q2:classic-native-original") == 0 || strcmp(schema, "q2:rerelease-native-original") == 0) &&
+          version == 1);
+}
 
 qa_provider_checkpoint_ref qa_save_provider_contract(const char *schema, qa_provider_id source) {
   if (strcmp(schema, "world:source-slots") == 0)
@@ -26,6 +33,8 @@ qa_provider_checkpoint_ref qa_save_provider_contract(const char *schema, qa_prov
     return qa_campaign_unit_checkpoint;
   if (strcmp(schema, "app:component-clients") == 0)
     return (qa_provider_checkpoint_ref){"app:component-clients", schema, 1};
+  if (strcmp(schema, "q2:classic-native-original") == 0 || strcmp(schema, "q2:rerelease-native-original") == 0)
+    return (qa_provider_checkpoint_ref){source, schema, QA_NATIVE_Q2_ORIGINAL_VERSION};
   if (strncmp(schema, "session:", 8) == 0)
     qa_error("Unsupported session checkpoint %s", schema);
   return (qa_provider_checkpoint_ref){source, schema,
@@ -36,6 +45,6 @@ void qa_validate_save_provider_owner(qa_provider_checkpoint record, qa_provider_
   qa_provider_checkpoint_ref expected = qa_save_provider_contract(record.schema, source);
   if (strcmp(record.provider, expected.provider) != 0)
     qa_error("Saved provider %s has a different owner", record.schema);
-  if (record.version != expected.version)
+  if (!qa_save_provider_version_supported(record.schema, record.version, expected.version))
     qa_error("Unsupported saved provider version %s", record.schema);
 }

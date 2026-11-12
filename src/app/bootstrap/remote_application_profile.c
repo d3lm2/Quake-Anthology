@@ -322,7 +322,8 @@ void qa_remote_application_adopt_unified_profile(qa_remote_application *app, qa_
       && has_dialect && qa_cvar_registry_dialect(state.previous->source) == qa_remote_dialect_for_clock(source_dialect)
       && qa_cvar_registry_dialect(qa_app_prepared_profile_movement(state.previous->profile)) == movement
       && previous_options->character == state.options.character
-      && strcmp(previous_options->character_model, state.options.character_model) == 0) {
+      && (previous_options->character_model == NULL ? state.options.character_model == NULL
+          : state.options.character_model != NULL && strcmp(previous_options->character_model, state.options.character_model) == 0)) {
     qa_cleanup_pop(&options_guard);
     qa_app_options_for_recipe_free(&app->launch_options);
     app->launch_options = state.options;
@@ -536,9 +537,13 @@ static void peer_body(void *ctx) {
   if (profile_options == NULL) qa_range_error("Out of memory");
   qa_remote_arena_add(arena, free, profile_options);
   *profile_options = request->options;
+  /* args.pending: a raise inside the preparation leaves the partial profile in the arena. */
+  qa_app_prepared_profile **profile_slot = calloc(1, sizeof *profile_slot);
+  if (profile_slot == NULL) qa_range_error("Out of memory");
+  qa_remote_arena_add(arena, qa_remote_release_profile_slot, profile_slot);
+  args->pending = profile_slot;
   state->profile = qa_app_prepare_profile_configuration(profile_options, args);
   if (state->profile == NULL) qa_range_error("Out of memory");
-  qa_remote_arena_add(arena, qa_remote_release_profile, state->profile);
   peer_assert(state);
   qa_remote_configuration *configuration = calloc(1, sizeof *configuration);
   if (configuration == NULL) qa_range_error("Out of memory");

@@ -33,6 +33,8 @@ qa_app_q3_projectile_state *qa_app_read_q3_projectile_states(const qa_save_reade
   size_t count = qa_save_reader_list_count(reader);
   qa_app_q3_projectile_state *states = calloc(count ? count : 1, sizeof *states);
   if (!states) qa_range_error("Out of memory");
+  qa_cleanup cleanup; /* a refused row drops the list */
+  qa_cleanup_push(&cleanup, free, states);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader value;
     if (!qa_save_reader_item(reader, i, &value)) qa_range_error("Out of memory");
@@ -89,6 +91,7 @@ qa_app_q3_projectile_state *qa_app_read_q3_projectile_states(const qa_save_reade
     r = field(&trajectory, "delta"); state->saved_trajectory.delta = qa_read_vector(&r); qa_save_reader_destroy(&r);
     qa_save_reader_destroy(&trajectory); qa_save_reader_destroy(&phase); qa_save_reader_destroy(&value);
   }
+  qa_cleanup_pop(&cleanup);
   *out_count = count;
   return states;
 }
@@ -98,6 +101,8 @@ qa_app_q3_weapon_statistics *qa_app_read_q3_weapon_statistics(const qa_save_read
   size_t count = qa_save_reader_list_count(reader);
   qa_app_q3_weapon_statistics *stats = calloc(count ? count : 1, sizeof *stats);
   if (!stats) qa_range_error("Out of memory");
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, free, stats);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader value;
     if (!qa_save_reader_item(reader, i, &value)) qa_range_error("Out of memory");
@@ -109,13 +114,17 @@ qa_app_q3_weapon_statistics *qa_app_read_q3_weapon_statistics(const qa_save_read
     r = field(&value, "rewardUntil"); stats[i].rail.reward_until = qa_save_reader_integer(&r); qa_save_reader_destroy(&r);
     qa_save_reader_destroy(&value);
   }
+  qa_cleanup_pop(&cleanup);
   *out_count = count;
   return stats;
 }
 
+static void legacy_source_release(void *arg) { qa_app_legacy_q3_source_destroy(arg); }
 qa_app_legacy_q3_source qa_app_read_legacy_q3_source(const qa_save_reader *reader,
     qa_app_saved_actor_fn owner, void *owner_ctx, qa_app_saved_reference_fn reference, void *reference_ctx) {
   qa_app_legacy_q3_source source; memset(&source, 0, sizeof source);
+  qa_cleanup cleanup; /* the lists read so far go with a refused save */
+  qa_cleanup_push(&cleanup, legacy_source_release, &source);
   qa_save_reader r = field(reader, "milliseconds"); source.milliseconds = qa_save_reader_finite(&r); qa_save_reader_destroy(&r);
   r = field(reader, "randomSeed"); source.random_seed = qa_save_reader_integer(&r); qa_save_reader_destroy(&r);
   r = field(reader, "projectiles");
@@ -138,6 +147,7 @@ qa_app_legacy_q3_source qa_app_read_legacy_q3_source(const qa_save_reader *reade
     source.hook_held_count = count;
   }
   qa_save_reader_destroy(&r);
+  qa_cleanup_pop(&cleanup);
   return source;
 }
 void qa_app_legacy_q3_source_destroy(qa_app_legacy_q3_source *source) {
@@ -152,7 +162,7 @@ qa_app_q3_selected_arsenal_checkpoint qa_app_migrate_legacy_q3_arsenal(qa_app_q3
       ? &QA_COMPOSITION_Q1_Q3_SUPPLY_PROFILE : &QA_COMPOSITION_Q2_Q3_SUPPLY_PROFILE;
   if (!checkpoint.runtime.product || strcmp(checkpoint.runtime.product, "baseq3") != 0
       || !checkpoint.supply_profile || strcmp(checkpoint.supply_profile, profile->id) != 0)
-    qa_range_error("Legacy Q3 arsenal does not match its original base supply profile");
+    qa_raise("Error", 0, 0, "Legacy Q3 arsenal does not match its original base supply profile");
   if (!qa_composition_expansion_source_supply(profile, out_profile)) qa_range_error("Out of memory");
   checkpoint.supply_profile = out_profile->id;
   return checkpoint;
@@ -198,12 +208,27 @@ static bool has_body(qa_app_q3_selected_source *source, qa_actor_id actor) {
   return qa_shared_body_table_read(source->host.bodies, actor).has_value;
 }
 
+/* The restore's scratch, freed when a check raises (TS drops its locals). */
+typedef struct restore_scratch {
+  actor_set hooks, references; double *slots; qa_q3_game_entity **entities; qa_save_value *continuations;
+} restore_scratch;
+static void restore_scratch_free(void *arg) {
+  restore_scratch *scratch = arg;
+  free(scratch->hooks.items); free(scratch->references.items); free(scratch->slots); free(scratch->entities);
+  qa_save_value_free(scratch->continuations);
+  memset(scratch, 0, sizeof *scratch);
+}
 void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa_app_legacy_q3_source *saved,
     qa_q3_game_entity *(*project)(void *ctx, qa_actor_id actor), void *project_ctx) {
   qa_session_actor_registry *actors = source->host.actors;
   qa_q3_entity_pool *pool = &source->pool;
-  if (source->host.product != QA_Q3_BASE_PRODUCT_BASEQ3) qa_range_error("Legacy ballistics require the base Q3 source");
-  actor_set hooks = {0}, references = {0};
+  if (source->host.product != QA_Q3_BASE_PRODUCT_BASEQ3) qa_raise("Error", 0, 0, "Legacy ballistics require the base Q3 source");
+  restore_scratch scratch; memset(&scratch, 0, sizeof scratch);
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, restore_scratch_free, &scratch);
+  actor_set *hooks_set = &scratch.hooks, *references_set = &scratch.references;
+#define hooks (*hooks_set)
+#define references (*references_set)
   for (size_t i = 0; i < saved->projectile_count; i++) {
     const qa_app_q3_projectile_state *state = &saved->projectiles[i];
     qa_session_actor_registry_assert_owned(actors, state->base.actor);
@@ -211,14 +236,14 @@ void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa
     for (size_t j = 0; j < i; j++) if (qa_same_owned_actor(saved->projectiles[j].base.actor, state->base.actor)) duplicate = true;
     if (state->base.actor.owner == NULL || source->host.provider == NULL || strcmp(state->base.actor.owner, source->host.provider) != 0
         || duplicate || native(source, true, state->base.actor.id) != NULL || !has_body(source, state->base.actor.id))
-      qa_range_error("Legacy projectile has no unique owned body");
+      qa_raise("Error", 0, 0, "Legacy projectile has no unique owned body");
     set_add(&references, state->base.owner);
     if (state->base.has_pass) set_add(&references, state->base.pass);
     if (state->phase == QA_APP_Q3_PROJECTILE_ATTACHED && state->base.weapon != 10)
-      qa_range_error("Only a legacy grappling hook can be attached");
+      qa_raise("Error", 0, 0, "Only a legacy grappling hook can be attached");
     if (state->base.weapon == 10) {
       if (set_has(&hooks, state->base.owner) || !has_player(source, state->base.owner))
-        qa_range_error("Legacy grappling hook has no unique live player");
+        qa_raise("Error", 0, 0, "Legacy grappling hook has no unique live player");
       set_add(&hooks, state->base.owner);
     }
     if (state->phase == QA_APP_Q3_PROJECTILE_ATTACHED && state->has_attached_target) set_add(&references, state->attached_target);
@@ -230,12 +255,12 @@ void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa
       qa_owned_actor actor = group == 0 ? saved->statistics[i].actor : saved->hook_held[i];
       for (size_t j = 0; j < i; j++) {
         qa_owned_actor other = group == 0 ? saved->statistics[j].actor : saved->hook_held[j];
-        if (qa_same_owned_actor(other, actor)) qa_range_error("Legacy Q3 client continuation has no unique live player");
+        if (qa_same_owned_actor(other, actor)) qa_raise("Error", 0, 0, "Legacy Q3 client continuation has no unique live player");
       }
     }
     for (size_t i = 0; i < count; i++) {
       qa_owned_actor actor = group == 0 ? saved->statistics[i].actor : saved->hook_held[i];
-      if (!has_player(source, actor.id)) qa_range_error("Legacy Q3 client continuation has no unique live player");
+      if (!has_player(source, actor.id)) qa_raise("Error", 0, 0, "Legacy Q3 client continuation has no unique live player");
     }
     for (size_t i = 0; i < count; i++) set_add(&references, group == 0 ? saved->statistics[i].actor.id : saved->hook_held[i].id);
   }
@@ -245,20 +270,20 @@ void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa
     bool owned_projectile = false;
     for (size_t j = 0; j < saved->projectile_count; j++) if (qa_same_actor(saved->projectiles[j].base.actor.id, actor)) owned_projectile = true;
     if (!qa_session_actor_registry_is_live(actors, actor) || native(source, true, actor) != NULL || owned_projectile) continue;
-    if (!has_body(source, actor)) qa_range_error("Legacy Q3 reference has no body");
+    if (!has_body(source, actor)) qa_raise("Error", 0, 0, "Legacy Q3 reference has no body");
     if (!has_player(source, actor)) foreign_non_players++;
   }
   size_t slot_count = 0;
-  double *slots = calloc(1022 - QA_Q3_MAX_CLIENTS, sizeof *slots);
+  double *slots = scratch.slots = calloc(1022 - QA_Q3_MAX_CLIENTS, sizeof *slots);
   if (slots == NULL) qa_range_error("Out of memory");
   for (double slot = QA_Q3_MAX_CLIENTS; slot < 1022; slot++)
     if (!qa_q3_game_entity_inuse(qa_q3_entity_pool_at(pool, slot))) slots[slot_count++] = slot;
   if (slot_count < saved->projectile_count + foreign_non_players)
-    qa_range_error("Legacy Q3 projectiles exceed original source entity capacity");
-  qa_q3_game_entity **entities = calloc(saved->projectile_count ? saved->projectile_count : 1, sizeof *entities);
+    qa_raise("Error", 0, 0, "Legacy Q3 projectiles exceed original source entity capacity");
+  qa_q3_game_entity **entities = scratch.entities = calloc(saved->projectile_count ? saved->projectile_count : 1, sizeof *entities);
   if (entities == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < saved->projectile_count; i++) {
-    if (i >= slot_count) qa_range_error("Legacy Q3 entity slot is missing");
+    if (i >= slot_count) qa_raise("Error", 0, 0, "Legacy Q3 entity slot is missing");
     double slot = slots[i];
     entities[i] = qa_q3_base_entity_records_adopt(source->records, slot, saved->projectiles[i].base.actor);
     if (slot >= pool->num_entities) {
@@ -266,14 +291,14 @@ void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa
       qa_q3_entity_pool_restore_counts(pool, counts);
     }
   }
-  free(slots);
+  free(slots); scratch.slots = NULL;
   for (size_t i = 0; i < references.count; i++) (void)project(project_ctx, references.items[i]);
-  qa_save_value *continuations = qa_save_value_array();
+  qa_save_value *continuations = scratch.continuations = qa_save_value_array();
   if (continuations == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < saved->projectile_count; i++) {
     const qa_app_q3_projectile_state *state = &saved->projectiles[i];
     qa_q3_game_entity *entity = entities[i];
-    if (entity == NULL) qa_range_error("Legacy Q3 entity is missing");
+    if (entity == NULL) qa_raise("Error", 0, 0, "Legacy Q3 entity is missing");
     qa_q3_game_entity *owner = native(source, true, state->base.owner);
     double weapon = state->base.weapon;
     qa_q3_game_entity_set_classname(entity, weapon == 4 ? "grenade" : weapon == 5 ? "rocket" : weapon == 8 ? "plasma"
@@ -289,7 +314,7 @@ void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa
         weapon == 10 ? "q3.base.game.missile.fireGrapple.think" : "q3.base.game.missile.launch.think");
     qa_q3_game_entity_set_nextthink(entity, state->expires);
     if (weapon == 10) {
-      if (owner == NULL || owner->client == NULL) qa_range_error("Legacy hook owner lost its source client");
+      if (owner == NULL || owner->client == NULL) qa_raise("Error", 0, 0, "Legacy hook owner lost its source client");
       entity->parent = owner; entity->s.other_entity_num = owner->slot; owner->client->hook = entity;
       if (state->phase == QA_APP_Q3_PROJECTILE_ATTACHED) {
         entity->s.e_type = QA_Q3_BASE_ET_GRAPPLE;
@@ -308,7 +333,7 @@ void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa
       entity->s.other_entity_num = target != NULL ? target->slot : QA_Q3_BASE_ENTITYNUM_NONE;
     }
     qa_save_value *row = qa_save_value_object(), *attachment = qa_save_value_object();
-    if (row == NULL || attachment == NULL) qa_range_error("Out of memory");
+    if (row == NULL || attachment == NULL) { qa_save_value_free(row); qa_save_value_free(attachment); qa_range_error("Out of memory"); }
     set_field(row, "entity", qa_save_value_number(entity->slot));
     set_field(row, "actor", saved_value(state->base.actor.id));
     set_field(row, "owner", saved_value(state->base.owner));
@@ -323,15 +348,15 @@ void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa
     set_field(row, "attachment", attachment);
     if (!qa_save_value_push(continuations, row)) qa_range_error("Out of memory");
   }
-  free(entities);
+  free(entities); scratch.entities = NULL;
   qa_q3_missile_runtime_restore_save_state(&source->missiles, continuations, reference_saved, source);
-  qa_save_value_free(continuations);
+  qa_save_value_free(continuations); scratch.continuations = NULL;
   qa_game_random_reset(&source->random, (int64_t)saved->random_seed);
   for (size_t i = 0; i < saved->statistics_count; i++) {
     const qa_app_q3_weapon_statistics *state = &saved->statistics[i];
     qa_q3_game_entity *entity = native(source, true, state->actor.id);
     qa_q3_game_client *client = entity != NULL ? entity->client : NULL;
-    if (client == NULL) qa_range_error("Legacy statistics lost their source client");
+    if (client == NULL) qa_raise("Error", 0, 0, "Legacy statistics lost their source client");
     client->accuracy_shots = state->shots; client->accuracy_hits = state->rail.hits; client->accurate_count = state->rail.streak;
     qa_q3_base_player_state_slots_set(&client->ps.persistant, QA_Q3_BASE_PERS_IMPRESSIVE_COUNT, state->rail.impressive_count);
     client->reward_time = state->rail.reward_until;
@@ -340,8 +365,11 @@ void qa_app_restore_legacy_q3_source(qa_app_q3_selected_source *source, const qa
   for (size_t i = 0; i < saved->hook_held_count; i++) {
     qa_q3_game_entity *entity = native(source, true, saved->hook_held[i].id);
     qa_q3_game_client *client = entity != NULL ? entity->client : NULL;
-    if (client == NULL) qa_range_error("Legacy hook latch lost its source client");
+    if (client == NULL) qa_raise("Error", 0, 0, "Legacy hook latch lost its source client");
     client->fire_held = true;
   }
-  free(hooks.items); free(references.items);
+#undef hooks
+#undef references
+  qa_cleanup_pop(&cleanup);
+  restore_scratch_free(&scratch);
 }

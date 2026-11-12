@@ -312,14 +312,29 @@ static void validate_references(const qa_q1_map *map) {
 }
 
 typedef struct bsp_readers {
-  qa_binary_reader reader, lump, directory;
+  qa_binary_reader reader, lump, directory, section, entity;
+  qa_q1_texture_lump *textures;
+  uint8_t *stored_lighting;
+  qa_q1_map *out;
 } bsp_readers;
 
-static void bsp_readers_release(void *raw) {
-  bsp_readers *readers = raw;
+static void bsp_readers_free(bsp_readers *readers) {
   qa_binary_reader_destroy(&readers->reader);
   qa_binary_reader_destroy(&readers->lump);
   qa_binary_reader_destroy(&readers->directory);
+  qa_binary_reader_destroy(&readers->section);
+  qa_binary_reader_destroy(&readers->entity);
+}
+
+/* TS: a throw leaves no map behind. A caught BinaryError from malformed input
+ * releases the readers and everything read into `out` so far (callers set their
+ * ownership flags only after a successful read). */
+static void bsp_readers_release(void *raw) {
+  bsp_readers *readers = raw;
+  bsp_readers_free(readers);
+  if (readers->textures != NULL) qa_q1_texture_lump_destroy(readers->textures);
+  free(readers->stored_lighting);
+  qa_q1_map_destroy(readers->out);
 }
 
 void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_options *options_in,
@@ -330,12 +345,12 @@ void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_opt
   memset(out, 0, sizeof *out);
   const char *source = options->source != NULL ? options->source : "<Quake BSP>";
   out->source = xstrdup(source);
-  /* A caught BinaryError releases the readers; the caller destroys `out`. */
   bsp_readers readers;
   memset(&readers, 0, sizeof readers);
-  readers.reader = make_reader(data, data_length, source);
+  readers.out = out;
   qa_cleanup readers_node;
   qa_cleanup_push(&readers_node, bsp_readers_release, &readers);
+  readers.reader = make_reader(data, data_length, source);
 #define reader readers.reader
 #define lump readers.lump
   uint32_t version = qa_binary_reader_u32(&reader);
@@ -344,7 +359,9 @@ void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_opt
   out->version = version;
 #define directory readers.directory
   section_or_die(&reader, 4, 120, &directory);
-  out->lumps = xmalloc(15 * sizeof *out->lumps);
+  /* Zeroed: a raise partway through the directory leaves the later slots empty. */
+  out->lumps = calloc(15, sizeof *out->lumps);
+  if (out->lumps == NULL) qa_range_error("Out of memory");
   out->lump_count = 15;
   for (int i = 0; i < 15; i++) {
     int32_t offset = qa_binary_reader_i32(&directory);
@@ -353,11 +370,10 @@ void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_opt
     out->lumps[i].name = lump_names[i];
     out->lumps[i].offset = offset;
     out->lumps[i].length = length;
-    qa_binary_reader section;
-    section_or_die(&reader, offset, length, &section);
-    out->lumps[i].data = qa_binary_reader_bytes(&section, length);
+    section_or_die(&reader, offset, length, &readers.section);
+    out->lumps[i].data = qa_binary_reader_bytes(&readers.section, length);
     out->lumps[i].data_length = length > 0 ? (size_t)length : 0;
-    qa_binary_reader_destroy(&section);
+    qa_binary_reader_destroy(&readers.section);
   }
   qa_binary_reader_destroy(&directory);
   out->bspx = qa_q1_read_bspx(&reader, out->lumps, 15, &out->bspx_count);
@@ -374,6 +390,7 @@ void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_opt
   qa_q1_read_textures(&lump, format == QA_Q1_FORMAT_QUAKE64, &textures);
   qa_binary_reader_destroy(&lump);
   world->textures = (const qa_q1_mip_texture *const *)textures.textures;
+  /* Attached to `out` below; the map's destroy owns them from here. */
   world->texture_count = textures.texture_count;
   out->texture_offsets = textures.offsets;
   out->texture_offset_count = textures.offset_count;
@@ -403,9 +420,9 @@ void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_opt
   if (options->has_entities) {
     char entity_source[1024];
     snprintf(entity_source, sizeof entity_source, "%s:.ent", source);
-    qa_binary_reader entity_reader = make_reader(options->entities, options->entities_length, entity_source);
-    entities = qa_binary_reader_fixed_byte_string(&entity_reader, (int64_t)options->entities_length);
-    qa_binary_reader_destroy(&entity_reader);
+    readers.entity = make_reader(options->entities, options->entities_length, entity_source);
+    entities = qa_binary_reader_fixed_byte_string(&readers.entity, (int64_t)options->entities_length);
+    qa_binary_reader_destroy(&readers.entity);
   } else {
     lump = lump_reader(out, 0);
     entities = qa_binary_reader_fixed_byte_string(&lump, (int64_t)lump.length);
@@ -448,6 +465,7 @@ void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_opt
   lump = lump_reader(out, 8);
   size_t stored_length = qa_binary_reader_remaining(&lump);
   uint8_t *stored_lighting = qa_binary_reader_bytes(&lump, (int64_t)stored_length);
+  readers.stored_lighting = stored_lighting;
   qa_binary_reader_destroy(&lump);
   bool quake64 = format == QA_Q1_FORMAT_QUAKE64;
   if (quake64) {
@@ -461,6 +479,7 @@ void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_opt
   }
   world->lighting = select_lighting(out->monochrome_lighting.bytes, out->monochrome_lighting.length,
                                     &out->bspx_metadata, options, quake64, stored_lighting, stored_length);
+  readers.stored_lighting = NULL;
   free(stored_lighting);
   const uint8_t *bspx_data = NULL;
   size_t bspx_length = 0;
@@ -488,12 +507,12 @@ void qa_q1_read_bsp(const uint8_t *data, size_t data_length, const qa_q1_map_opt
   }
   world->extensions = extensions;
   world->extension_count = out->bspx_count;
-  qa_cleanup_pop(&readers_node);
-  bsp_readers_release(&readers);
+  bsp_readers_free(&readers);
 #undef reader
 #undef lump
 #undef directory
   validate_references(out);
+  qa_cleanup_pop(&readers_node);
 }
 
 void qa_q1_map_destroy(qa_q1_map *map) {

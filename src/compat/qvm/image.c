@@ -6,17 +6,23 @@
 #include <string.h>
 
 #include "qa/core/binary/index.h"
+#include "qa/foundation/support.h"
 
 #define QVM_MAGIC 0x12721444
 #define HEADER_LENGTH 32
-/* Retail modules need a few MiB; the source allocates module data from a hunk of 56 to 128 MiB. */
-#define MAX_DATA_LENGTH 0x4000000LL
+/* The source allocation and next-power-of-two loop use positive signed ints. */
+#define MAX_DATA_LENGTH 0x40000000LL
 #define MAX_CODE_LENGTH 0x1fffffffLL
 
+/* A QVM file is untrusted input: the error is raised, so a caller's catch sees
+ * it as TS callers do, and only an uncaught one prints and aborts. */
 noreturn void qa_qvm_header_error(const char *source) {
-  fprintf(stderr, "QvmHeaderError: %s has bad header\n", source != NULL ? source : "<qvm>");
-  abort();
+  qa_raise("QvmHeaderError", 0, 0, "%s has bad header", source != NULL ? source : "<qvm>");
 }
+
+/* The reader owns a copy of its source name and decoding raises on malformed
+ * bytes, so each reader and half-built table is released on that path too. */
+static void destroy_reader(void *arg) { qa_binary_reader_destroy(arg); }
 
 static char *dup_str(const char *s) {
   size_t n = strlen(s) + 1;
@@ -30,6 +36,8 @@ bool qa_qvm_read_source_header(const uint8_t *bytes, size_t length, const char *
   const char *src = source != NULL ? source : "<qvm>";
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, src)) return false;
+  qa_cleanup reader_cleanup;
+  qa_cleanup_push(&reader_cleanup, destroy_reader, &reader);
   int32_t magic = qa_binary_reader_i32(&reader);
   qa_binary_reader_skip(&reader, 8);
   int32_t code_length = qa_binary_reader_i32(&reader);
@@ -37,6 +45,7 @@ bool qa_qvm_read_source_header(const uint8_t *bytes, size_t length, const char *
   int32_t data_length = qa_binary_reader_i32(&reader);
   int32_t literal_length = qa_binary_reader_i32(&reader);
   int32_t bss_length = qa_binary_reader_i32(&reader);
+  qa_cleanup_pop(&reader_cleanup);
   qa_binary_reader_destroy(&reader);
   if (magic != QVM_MAGIC || bss_length < 0 || data_length < 0 || literal_length < 0 ||
       code_length <= 0)
@@ -56,13 +65,16 @@ bool qa_qvm_parse_restart(const uint8_t *bytes, size_t length, const char *sourc
   int64_t initialized_length = header.data_length + header.literal_length;
   int64_t total = initialized_length + header.bss_length;
   if (total > MAX_DATA_LENGTH)
-    qa_binary_error(src, 28, "QVM data exceeds the supported hunk allocation");
+    qa_binary_error(src, 28, "QVM data exceeds positive signed power-of-two allocation range");
   int64_t allocated = 1;
   while (allocated < total) allocated *= 2;
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, src)) return false;
+  qa_cleanup reader_cleanup;
+  qa_cleanup_push(&reader_cleanup, destroy_reader, &reader);
   qa_binary_reader_seek(&reader, header.data_offset);
   uint8_t *data = qa_binary_reader_bytes(&reader, initialized_length);
+  qa_cleanup_pop(&reader_cleanup);
   qa_binary_reader_destroy(&reader);
   if (data == NULL && initialized_length > 0) return false;
   out->initialized_data = data;
@@ -141,6 +153,8 @@ bool qa_qvm_parse(const uint8_t *bytes, size_t length, const char *source, qa_qv
   const char *src = source != NULL ? source : "<qvm>";
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, src)) return false;
+  qa_cleanup reader_cleanup;
+  qa_cleanup_push(&reader_cleanup, destroy_reader, &reader);
   if (qa_binary_reader_i32(&reader) != QVM_MAGIC) qa_binary_error(src, 0, "invalid QVM magic");
   int32_t instruction_count = qa_binary_reader_i32(&reader);
   int32_t code_offset = qa_binary_reader_i32(&reader);
@@ -160,7 +174,7 @@ bool qa_qvm_parse(const uint8_t *bytes, size_t length, const char *source, qa_qv
   int64_t initialized_length = (int64_t)data_length + literal_length;
   int64_t total = initialized_length + bss_length;
   if (total > MAX_DATA_LENGTH)
-    qa_binary_error(src, 28, "QVM data exceeds the supported hunk allocation");
+    qa_binary_error(src, 28, "QVM data exceeds positive signed power-of-two allocation range");
   check_section(&reader, code_offset, code_length, 8);
   check_section(&reader, data_offset, initialized_length, 16);
   if (initialized_length > 0 && code_offset < (int64_t)data_offset + initialized_length &&
@@ -170,13 +184,21 @@ bool qa_qvm_parse(const uint8_t *bytes, size_t length, const char *source, qa_qv
   while (allocated < total) allocated *= 2;
   qa_qvm_instruction *instructions =
       malloc(sizeof(*instructions) * (size_t)instruction_count);
-  if (instructions == NULL) { qa_binary_reader_destroy(&reader); return false; }
+  if (instructions == NULL) {
+    qa_cleanup_pop(&reader_cleanup);
+    qa_binary_reader_destroy(&reader);
+    return false;
+  }
+  qa_cleanup instructions_cleanup;
+  qa_cleanup_push(&instructions_cleanup, free, instructions);
   qa_binary_reader_seek(&reader, code_offset);
   for (int32_t i = 0; i < instruction_count; i++)
     instructions[i] = decode_instruction(&reader, code_offset,
                                          (int64_t)code_offset + code_length, instruction_count);
   qa_binary_reader_seek(&reader, data_offset);
   uint8_t *data = qa_binary_reader_bytes(&reader, initialized_length);
+  qa_cleanup_pop(&instructions_cleanup);
+  qa_cleanup_pop(&reader_cleanup);
   qa_binary_reader_destroy(&reader);
   if (data == NULL && initialized_length > 0) { free(instructions); return false; }
   char *source_copy = dup_str(src);

@@ -1,5 +1,6 @@
 /* Port of src/app/bootstrap/frame-time.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/frame_time.h"
+#include "qa/app/bootstrap/console_log.h"
 #include <math.h>
 #include <stdlib.h>
 #include "qa/core/commands/text.h"
@@ -8,16 +9,16 @@
 
 static bool reg_cvar(qa_cvar_registry *r, const char *name, const char *value, double flags, void *unused) {
   (void)unused;
-  qa_cvar_snapshot snapshot;
+  qa_cvar_snapshot snapshot = {0};
   bool ok = qa_cvar_registry_register(r, name, value, flags, &snapshot);
-  qa_cvar_read_free(&snapshot);
+  if (ok) qa_cvar_read_free(&snapshot);
   return ok;
 }
 static bool set_cvar(qa_cvar_registry *r, const char *name, const char *value, bool force, void *unused) {
   (void)unused;
-  qa_cvar_snapshot snapshot;
+  qa_cvar_snapshot snapshot = {0};
   bool ok = qa_cvar_registry_set(r, name, value, force, &snapshot);
-  qa_cvar_read_free(&snapshot);
+  if (ok) qa_cvar_read_free(&snapshot);
   return ok;
 }
 
@@ -86,6 +87,7 @@ void qa_app_register_frame_time_cvars(qa_cvar_registry *cvars) {
     if (exists) qa_cvar_read_free(&read);
     if (!q1 || !exists) reg_cvar(cvars, rows[i].name, rows[i].value, rows[i].flags, NULL);
   }
+  qa_app_register_console_log_cvar(cvars);
 }
 static double numeric_or(qa_cvar_registry *cvars, const char *name, double fallback, bool integer) {
   qa_cvar_read read;

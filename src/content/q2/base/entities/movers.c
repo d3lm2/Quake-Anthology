@@ -12,18 +12,26 @@
 
 #include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/fields.h"
+#include "../diagnostic.h"
 #include "qa/content/q2/foundation/scenery.h"
 #include "qa/core/math.h"
 #include "qa/foundation/support.h"
 
-typedef struct plat_entry { qa_q2_entity *e; qa_q2_base_platform_state state; } plat_entry;
-typedef struct secret_entry { qa_q2_entity *e; qa_q2_base_secret_state state; } secret_entry;
+/* TS WeakMap<Q2Entity, ...>: an entry dies with its entity. C keys by pointer, and a
+ * freed entity's address can be given to a later entity, so an entry counts only while
+ * the actor recorded with it is still that entity's. */
+typedef struct plat_entry { qa_q2_entity *e; qa_actor_id actor; qa_q2_base_platform_state state; } plat_entry;
+typedef struct secret_entry { qa_q2_entity *e; qa_actor_id actor; qa_q2_base_secret_state state; } secret_entry;
 
 struct qa_q2_base_mover_entities {
   qa_q2_base_entity_hooks hooks;
   qa_q2_linear_motion *linear;
   plat_entry *platforms; size_t platform_count, platform_cap;
   secret_entry *secrets; size_t secret_count, secret_cap;
+  /* TS WeakMap entries end with their entity: C drops them when the actor is released. */
+  bool connected;
+  qa_session_actor_registry *registry;
+  int64_t subscription;
   qa_q2_named_think *thinks; size_t think_count;
   qa_q2_named_use uses[6];
   qa_q2_named_touch touches[3];
@@ -67,45 +75,73 @@ static void secret_blocked_fn(void *, qa_q2_entity *, qa_q2_game_services *, qa_
 /* TS `spawnflags & x` applies ToInt32: the int32 view of the number. */
 static int32_t sf(const qa_q2_entity *e) { return qa_js_to_int32(e->spawnflags); }
 
-static qa_q2_base_platform_state *find_platform(qa_q2_base_mover_entities *m, qa_q2_entity *e) {
-  for (size_t i = 0; i < m->platform_count; i++) if (m->platforms[i].e == e) return &m->platforms[i].state;
+static plat_entry *platform_slot(qa_q2_base_mover_entities *m, qa_q2_entity *e) {
+  for (size_t i = 0; i < m->platform_count; i++) if (m->platforms[i].e == e) return &m->platforms[i];
   return NULL;
 }
-static qa_q2_base_secret_state *find_secret(qa_q2_base_mover_entities *m, qa_q2_entity *e) {
-  for (size_t i = 0; i < m->secret_count; i++) if (m->secrets[i].e == e) return &m->secrets[i].state;
+static secret_entry *secret_slot(qa_q2_base_mover_entities *m, qa_q2_entity *e) {
+  for (size_t i = 0; i < m->secret_count; i++) if (m->secrets[i].e == e) return &m->secrets[i];
   return NULL;
+}
+static qa_q2_base_platform_state *find_platform(qa_q2_base_mover_entities *m, qa_q2_entity *e) {
+  plat_entry *slot = platform_slot(m, e);
+  return slot && qa_same_actor(slot->actor, e->actor.id) ? &slot->state : NULL;
+}
+static qa_q2_base_secret_state *find_secret(qa_q2_base_mover_entities *m, qa_q2_entity *e) {
+  secret_entry *slot = secret_slot(m, e);
+  return slot && qa_same_actor(slot->actor, e->actor.id) ? &slot->state : NULL;
 }
 static qa_q2_base_platform_state *platform_of(qa_q2_base_mover_entities *m, qa_q2_entity *e) {
   qa_q2_base_platform_state *s = find_platform(m, e);
-  if (!s) qa_range_error("Platform callback without platform state");
+  if (!s) qa_raise("Error", 0, 0, "Platform callback without platform state");
   return s;
 }
 static qa_q2_base_secret_state *secret_of(qa_q2_base_mover_entities *m, qa_q2_entity *e) {
   qa_q2_base_secret_state *s = find_secret(m, e);
-  if (!s) qa_range_error("Secret door callback without source state");
+  if (!s) qa_raise("Error", 0, 0, "Secret door callback without source state");
   return s;
 }
 static void set_platform(qa_q2_base_mover_entities *m, qa_q2_entity *e, qa_q2_base_platform_state state) {
-  qa_q2_base_platform_state *existing = find_platform(m, e);
-  if (existing) { *existing = state; return; }
+  plat_entry *existing = platform_slot(m, e);
+  if (existing) { existing->actor = e->actor.id; existing->state = state; return; }
   if (m->platform_count == m->platform_cap) {
     size_t cap = m->platform_cap ? m->platform_cap * 2 : 8;
     plat_entry *grown = realloc(m->platforms, cap * sizeof *grown);
     if (!grown) qa_range_error("Out of memory");
     m->platforms = grown; m->platform_cap = cap;
   }
-  m->platforms[m->platform_count++] = (plat_entry){e, state};
+  m->platforms[m->platform_count++] = (plat_entry){e, e->actor.id, state};
 }
 static void set_secret(qa_q2_base_mover_entities *m, qa_q2_entity *e, qa_q2_base_secret_state state) {
-  qa_q2_base_secret_state *existing = find_secret(m, e);
-  if (existing) { *existing = state; return; }
+  secret_entry *existing = secret_slot(m, e);
+  if (existing) { existing->actor = e->actor.id; existing->state = state; return; }
   if (m->secret_count == m->secret_cap) {
     size_t cap = m->secret_cap ? m->secret_cap * 2 : 8;
     secret_entry *grown = realloc(m->secrets, cap * sizeof *grown);
     if (!grown) qa_range_error("Out of memory");
     m->secrets = grown; m->secret_cap = cap;
   }
-  m->secrets[m->secret_count++] = (secret_entry){e, state};
+  m->secrets[m->secret_count++] = (secret_entry){e, e->actor.id, state};
+}
+
+static void movers_release(void *ctx, qa_owned_actor actor) {
+  qa_q2_base_mover_entities *m = ctx;
+  for (size_t i = 0; i < m->platform_count; i++)
+    if (qa_same_actor(m->platforms[i].actor, actor.id)) {
+      memmove(&m->platforms[i], &m->platforms[i + 1], (m->platform_count - i - 1) * sizeof *m->platforms);
+      m->platform_count--; i--;
+    }
+  for (size_t i = 0; i < m->secret_count; i++)
+    if (qa_same_actor(m->secrets[i].actor, actor.id)) {
+      memmove(&m->secrets[i], &m->secrets[i + 1], (m->secret_count - i - 1) * sizeof *m->secrets);
+      m->secret_count--; i--;
+    }
+}
+static void movers_connect(qa_q2_base_mover_entities *m, qa_q2_game_services *game) {
+  if (m->connected) return;
+  m->registry = game->host->actors;
+  m->subscription = qa_session_actor_registry_on_release(game->host->actors, movers_release, m);
+  m->connected = true;
 }
 
 static void loop_sound(qa_q2_entity *entity, qa_q2_game_services *game, const char *path, bool start) {
@@ -188,6 +224,7 @@ qa_q2_base_mover_entities *qa_q2_base_mover_entities_create(qa_q2_base_entity_ho
 }
 void qa_q2_base_mover_entities_destroy(qa_q2_base_mover_entities *m) {
   if (!m) return;
+  if (m->connected) qa_session_actor_registry_off_release(m->registry, m->subscription);
   qa_q2_linear_motion_destroy(m->linear);
   free(m->platforms); free(m->secrets); free(m->thinks); free(m);
 }
@@ -220,10 +257,11 @@ qa_q2_base_movers_checkpoint qa_q2_base_mover_entities_capture(qa_q2_base_mover_
 static qa_q2_entity *saved_entity(qa_q2_game_services *game, qa_saved_actor_id actor) {
   qa_owned_actor owner = qa_q2_restore_actor(game, actor);
   qa_q2_entity *entity = game->entity(game->ctx, &owner.id);
-  if (!entity) qa_range_error("Missing saved Q2 base mover");
+  if (!entity) qa_raise("Error", 0, 0, "Missing saved Q2 base mover");
   return entity;
 }
 void qa_q2_base_mover_entities_restore(qa_q2_base_mover_entities *m, qa_q2_game_services *game, qa_q2_base_movers_checkpoint checkpoint) {
+  movers_connect(m, game);
   m->platform_count = 0; m->secret_count = 0;
   for (size_t i = 0; i < checkpoint.platform_count; i++) set_platform(m, saved_entity(game, checkpoint.platforms[i].actor), checkpoint.platforms[i].state);
   for (size_t i = 0; i < checkpoint.secret_count; i++) set_secret(m, saved_entity(game, checkpoint.secrets[i].actor), checkpoint.secrets[i].state);
@@ -262,14 +300,16 @@ static void top_fn(void *c, qa_q2_entity *entity, qa_q2_game_services *game) {
 static void down_fn(void *c, qa_q2_entity *entity, qa_q2_game_services *game) {
   qa_q2_base_platform_state *state = platform_of(c, entity);
   state->phase = "down";
+  qa_vec3 bottom = state->bottom; /* the table can move during the sound and move callbacks */
   platform_sound(entity, game, true);
-  qa_q2_linear_motion_move_to(((qa_q2_base_mover_entities *)c)->linear, entity, game, state->bottom, TCB(c, bottom_fn));
+  qa_q2_linear_motion_move_to(((qa_q2_base_mover_entities *)c)->linear, entity, game, bottom, TCB(c, bottom_fn));
 }
 static void up_fn(void *c, qa_q2_entity *entity, qa_q2_game_services *game) {
   qa_q2_base_platform_state *state = platform_of(c, entity);
   state->phase = "up";
+  qa_vec3 top = state->top;
   platform_sound(entity, game, true);
-  qa_q2_linear_motion_move_to(((qa_q2_base_mover_entities *)c)->linear, entity, game, state->top, TCB(c, top_fn));
+  qa_q2_linear_motion_move_to(((qa_q2_base_mover_entities *)c)->linear, entity, game, top, TCB(c, top_fn));
 }
 
 static void platform_use_fn(void *c, qa_q2_entity *self, qa_q2_game_services *game, const qa_actor_id *o, const qa_actor_id *a) {
@@ -357,9 +397,7 @@ static void secret_blocked_fn(void *c, qa_q2_entity *self, qa_q2_game_services *
 static void elevator_init_fn(void *c, qa_q2_entity *self, qa_q2_game_services *game) {
   qa_q2_entity *train = game->pick_target(game->ctx, self->target);
   if (!train || strcmp(train->classname, "func_train") != 0) {
-    char message[512];
-    (void)snprintf(message, sizeof message, "trigger_elevator has invalid train %s", self->target);
-    game->host->diagnostic(game->host->ctx, message);
+    q2b_diagnosticf(game, "trigger_elevator has invalid train %s", self->target);
     return;
   }
   self->has_enemy = true; self->enemy = train->actor.id;
@@ -376,9 +414,7 @@ static void elevator_use_fn(void *c, qa_q2_entity *self, qa_q2_game_services *ga
   if (!path) path = "";
   qa_q2_entity *corner = game->pick_target(game->ctx, path);
   if (!corner) {
-    char message[512];
-    (void)snprintf(message, sizeof message, "trigger_elevator used with invalid pathtarget %s", path);
-    game->host->diagnostic(game->host->ctx, message);
+    q2b_diagnosticf(game, "trigger_elevator used with invalid pathtarget %s", path);
     return;
   }
   qa_q2_mover_module_resume_train_at(m->hooks.movers, train, game, corner);
@@ -496,6 +532,7 @@ static void spawn_secret(qa_q2_base_mover_entities *m, qa_q2_entity *entity, qa_
 }
 
 bool qa_q2_base_mover_entities_spawn(qa_q2_base_mover_entities *m, qa_q2_entity *entity, qa_q2_game_services *game) {
+  movers_connect(m, game);
   const char *classname = entity->classname;
   if (strcmp(classname, "func_plat") == 0) { spawn_platform(m, entity, game); return true; }
   if (strcmp(classname, "func_door_secret") == 0) { spawn_secret(m, entity, game); return true; }

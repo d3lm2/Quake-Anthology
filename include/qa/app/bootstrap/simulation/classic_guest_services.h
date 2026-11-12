@@ -116,7 +116,10 @@ double qa_app_sim_classic_guest_services_resource_index(qa_app_sim_classic_guest
 void qa_app_sim_classic_guest_services_set_configstring(qa_app_sim_classic_guest_services *services, double index, const char *value);
 qa_compat_q2_classic_world_link qa_app_sim_classic_guest_services_world_link(qa_app_sim_classic_guest_services *services, qa_bounds bounds);
 qa_q2_entity_state qa_app_sim_classic_guest_services_entity_state(qa_app_sim_classic_guest_services *services, double slot);
-/* stats view is services-owned scratch, valid until the next call. */
+/* stats view is services-owned scratch, valid until the next call. Every caller copies the stats (or reads the
+ * scalar fields) before another playerState call (audited by gate-simB2: match_results, q2_match_reports,
+ * native_q2_client via application_graphical, native_mod_host/native_mod_presentation, network_q2_guest(_core),
+ * and the shared_simulation access, arsenal, players, core, worlds and step readers). */
 qa_q2_player_state qa_app_sim_classic_guest_services_player_state(qa_app_sim_classic_guest_services *services, double slot);
 qa_app_sim_model_appearance qa_app_sim_classic_guest_services_model_appearance(qa_app_sim_classic_guest_services *services, double slot);
 /* -1 is the TS null. */

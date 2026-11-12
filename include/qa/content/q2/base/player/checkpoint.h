@@ -20,7 +20,8 @@ typedef struct qa_q2_base_player_state_checkpoint {
   double slot, entered_at;
   bool use_q2_weapons, use_q2_inventory;
   qa_inventory_entry *spawn_inventory; size_t spawn_inventory_count;
-  char userinfo[2048], name[32], skin[2048];
+  /* userinfo, name and skin: malloc'd in a captured value (freed by _clear); borrowed from the decoded owner in a read one. */
+  const char *userinfo; const char *name; const char *skin;
   const char *gender;
   double fov;
   const char *hand;

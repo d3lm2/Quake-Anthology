@@ -175,10 +175,17 @@ typedef struct qa_shader_definitions {
 void qa_parse_shader_script(const char *text, const char *source,
                             qa_shader_definitions *out);
 void qa_shader_definitions_free(qa_shader_definitions *definitions);
-/* TS inspectShaderScript (registration_name NULL = TS null). */
+/* TS inspectShaderScript (registration_name NULL = TS null). `text` is decoded
+ * UTF-8 (qa_text_decoder_decode): positions, the token limit and lengths count
+ * UTF-16 code units and names lower with full Unicode. */
 void qa_inspect_shader_script(const char *text, const char *source,
                               const char *registration_name,
                               qa_shader_script_inspection *out);
+/* The same over a byte string (TS byteText: one code unit per byte, Latin-1
+ * lowering), for callers that hand the parser byteText(bytes). */
+void qa_inspect_shader_byte_script(const char *text, const char *source,
+                                   const char *registration_name,
+                                   qa_shader_script_inspection *out);
 void qa_shader_script_inspection_free(qa_shader_script_inspection *inspection);
 
 /* Malloc'd; caller frees. */
@@ -187,6 +194,13 @@ char *qa_normalize_shader_name(const char *name);
 /* size is 1024 or 2048 (TS literal union; used as size-1 mask). */
 int64_t qa_shader_name_hash(const char *name, int64_t size);
 bool qa_same_shader_name(const char *first, const char *second);
+/* A decoded-text shader name (script entry, UTF-8) in the C form of the same
+ * TS string where it meets byte-string names (BSP, model and configstring
+ * names are TS Latin-1 strings, held as one byte per code unit): malloc'd
+ * code-unit bytes when every unit is below 0x100. A name with a higher unit
+ * equals no byte-string name in TS; it is returned as its UTF-8 copy, which
+ * only an exotic byte name spelled with those very bytes can equal. */
+char *qa_shader_text_name_code_units(const char *text);
 
 /* TS evaluateWaveform. Aborts for none/noise kinds and for table
  * indices outside the defined float-to-int range. */

@@ -9,6 +9,7 @@
 #include "qa/compat/q2/native_mod_entries.h"
 #include "qa/compat/q2/native_throw.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 
 typedef struct { qa_item_id item; double index; qa_guest_address address; bool weapon, ammunition; const char *icon; qa_item_id ammo; } source_item;
 typedef struct { qa_compat_q2_native_primary_commands *s; const char *category; } give_observe;
@@ -28,6 +29,7 @@ struct qa_compat_q2_native_primary_commands {
   command_entry entries[2]; qa_compat_q2_native_entry *bindings[2];
   give_observe observes[2]; uint64_t observe_handles[2];
   uint64_t unknown_region, drop_region; uint64_t *ammo_regions; ammo_region *ammo_ctx;
+  size_t observe_count, ammo_region_count; bool has_unknown_region, has_drop_region; /* what the constructor bound so far */
   bool closed;
 };
 static const qa_guest_value_layout pointer_layout = {.is_aggregate = false, .storage = "pointer"};
@@ -84,15 +86,6 @@ static char *q2_name(qa_compat_q2_native_primary_commands *s, const char *classn
   snprintf(out, length, "q2:%s", classname);
   return keep(s, out);
 }
-static bool ascii_iequal(const char *a, const char *b) {
-  for (;; a++, b++) {
-    unsigned char x = (unsigned char)*a, y = (unsigned char)*b;
-    if (x >= 'A' && x <= 'Z') x = (unsigned char)(x + 32);
-    if (y >= 'A' && y <= 'Z') y = (unsigned char)(y + 32);
-    if (x != y) return false;
-    if (x == 0) return true;
-  }
-}
 typedef struct { qa_item_id item; qa_guest_address address; const char *icon; bool ammunition, weapon; const char *label; } source_row;
 static void read_items(qa_compat_q2_native_primary_commands *s) {
   const qa_compat_q2_native_primary_command_profile *table = s->profile;
@@ -101,6 +94,7 @@ static void read_items(qa_compat_q2_native_primary_commands *s) {
   source_row *source = calloc(count ? count : 1, sizeof *source);
   s->items = calloc(count ? count : 1, sizeof *s->items);
   if (source == NULL || s->items == NULL) qa_range_error("Native commands out of memory");
+  qa_cleanup source_node; qa_cleanup_push(&source_node, free, source);
   bool by_name = strcmp(table->ammo_kind, "name") == 0;
   for (size_t index = 0; index < count; index++) {
     source_row *row = &source[index];
@@ -115,8 +109,8 @@ static void read_items(qa_compat_q2_native_primary_commands *s) {
   }
   for (size_t index = 0; index < count; index++) {
     const source_row *value = &source[index];
-    if (value->item == NULL) { if (value->weapon) qa_range_error("Original weapon has no qualified classname"); continue; }
-    for (size_t other = 0; other < s->item_count; other++) if (strcmp(s->items[other].item, value->item) == 0) qa_range_error("Original item table has duplicate classnames");
+    if (value->item == NULL) { if (value->weapon) qa_raise("Error", 0, 0, "Original weapon has no qualified classname"); continue; }
+    for (size_t other = 0; other < s->item_count; other++) if (strcmp(s->items[other].item, value->item) == 0) qa_raise("Error", 0, 0, "Original item table has duplicate classnames");
     qa_item_id ammo = NULL;
     if (value->weapon) {
       qa_guest_address field = qa_compat_q2_mem_offset(memory, value->address, (int64_t)table->ammo_offset);
@@ -124,21 +118,21 @@ static void read_items(qa_compat_q2_native_primary_commands *s) {
         const char *name = read_string(s, field);
         if (name[0] != 0) {
           const source_row *found = NULL;
-          for (size_t row = 0; row < count && found == NULL; row++) if (ascii_iequal(source[row].label, name)) found = &source[row];
-          if (found == NULL || found->item == NULL) qa_range_error("Original weapon ammo name has no source item");
+          for (size_t row = 0; row < count && found == NULL; row++) if (qa_js_latin1_equals_ignore_case(source[row].label, name)) found = &source[row]; /* toLowerCase() over API 3 text */
+          if (found == NULL || found->item == NULL) qa_raise("Error", 0, 0, "Original weapon ammo name has no source item");
           ammo = found->item;
         }
       } else {
         int32_t ammo_index = qa_compat_q2_mem_read_i32(memory, field);
         if (ammo_index != 0) {
-          if (ammo_index < 0 || (size_t)ammo_index >= count || source[ammo_index].item == NULL) qa_range_error("Original weapon ammo index has no source item");
+          if (ammo_index < 0 || (size_t)ammo_index >= count || source[ammo_index].item == NULL) qa_raise("Error", 0, 0, "Original weapon ammo index has no source item");
           ammo = source[ammo_index].item;
         }
       }
     }
     s->items[s->item_count++] = (source_item){value->item, (double)index, value->address, value->weapon, value->ammunition, value->icon, ammo};
   }
-  free(source);
+  qa_cleanup_pop(&source_node); free(source);
   s->slots = calloc(s->item_count ? s->item_count : 1, sizeof *s->slots);
   s->weapons = calloc(s->item_count ? s->item_count : 1, sizeof *s->weapons);
   if (s->slots == NULL || s->weapons == NULL) qa_range_error("Native commands out of memory");
@@ -154,23 +148,26 @@ static const source_item *find_item(const qa_compat_q2_native_primary_commands *
 }
 static qa_guest_call_result imported(const qa_compat_q2_native_primary_commands *s, double offset, const qa_guest_value_layout *parameters, size_t parameter_count, const qa_guest_value_layout *result, const qa_guest_call_value *values, size_t count) {
   qa_guest_address address;
-  if (!qa_compat_q2_mem_read_pointer(s->host.memory, at(s, offset), &address)) qa_range_error("Original command import is null");
+  if (!qa_compat_q2_mem_read_pointer(s->host.memory, at(s, offset), &address)) qa_raise("Error", 0, 0, "Original command import is null");
   qa_compat_q2_guest_call_signature signature = {s->profile->abi, parameters, parameter_count, false, *result, false};
   return s->host.invoke(s->host.ctx, address, signature, values, count);
 }
-/* TS arguments(): malloc'd array of malloc'd strings. */
+static void release_arguments(void *v) { char **args = v; for (size_t i = 0; args[i] != NULL; i++) free(args[i]); free(args); }
+/* TS arguments(): malloc'd, NULL terminated array of malloc'd strings. */
 static char **arguments(const qa_compat_q2_native_primary_commands *s, size_t *out_count) {
   qa_guest_call_result count = imported(s, s->profile->give_argc, NULL, 0, &integer_layout, NULL, 0);
-  if (count.kind != QA_GUEST_VALUE_INT32 || count.number_value < 0 || count.number_value > 1024) qa_range_error("Original command argc is invalid");
+  if (count.kind != QA_GUEST_VALUE_INT32 || count.number_value < 0 || count.number_value > 1024) qa_raise("Error", 0, 0, "Original command argc is invalid");
   size_t length = count.number_value > 1 ? (size_t)count.number_value - 1 : 0;
-  char **args = calloc(length ? length : 1, sizeof *args);
+  char **args = calloc(length + 1, sizeof *args); /* NULL terminated for release_arguments */
   if (args == NULL) qa_range_error("Native commands out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, release_arguments, args);
   for (size_t index = 0; index < length; index++) {
     qa_guest_call_value argument = qa_compat_q2_call_int32((double)index + 1);
     qa_guest_call_result value = imported(s, s->profile->give_argv, argv_parameters, 1, &pointer_layout, &argument, 1);
-    if (value.kind != QA_GUEST_VALUE_POINTER || !value.pointer_value.has_value) qa_range_error("Original command argv is null");
+    if (value.kind != QA_GUEST_VALUE_POINTER || !value.pointer_value.has_value) qa_raise("Error", 0, 0, "Original command argv is null");
     args[index] = qa_compat_q2_read_classic_string(s->host.memory, true, value.pointer_value.value, 65536);
   }
+  qa_cleanup_pop(&node);
   *out_count = length;
   return args;
 }
@@ -198,9 +195,9 @@ static void unknown_region(void *v, qa_compat_q2_inline_continuation *continuati
   qa_compat_q2_native_primary_commands *s = v; qa_actor_id actor;
   if (stack_top(&s->giving, &actor) && current(s, actor)) {
     size_t count = 0; char **args = arguments(s, &count);
+    qa_cleanup node; qa_cleanup_push(&node, release_arguments, args);
     bool handled = s->hooks.give_item(s->hooks.ctx, actor, (const char *const *)args, count);
-    for (size_t i = 0; i < count; i++) free(args[i]);
-    free(args);
+    qa_cleanup_pop(&node); release_arguments(args);
     if (handled) { continuation->skip(continuation->ctx); return; }
   }
   continuation->execute(continuation->ctx);
@@ -213,9 +210,9 @@ static void ammo_grant_region(void *v, qa_compat_q2_inline_continuation *continu
   const source_item *item = NULL;
   for (size_t i = 0; i < s->item_count && item == NULL; i++) if ((uint64_t)s->items[i].address.byte_offset == descriptor) item = &s->items[i];
   qa_raw_entity_view record;
-  if (item == NULL || !s->host.record_for(s->host.ctx, actor, &record)) qa_range_error("Original ammo command lacks its source item");
+  if (item == NULL || !s->host.record_for(s->host.ctx, actor, &record)) qa_raise("Error", 0, 0, "Original ammo command lacks its source item");
   qa_guest_address client;
-  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, record.address, (int64_t)s->profile->client_pointer), &client)) qa_range_error("Original ammo command lost its client");
+  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, record.address, (int64_t)s->profile->client_pointer), &client)) qa_raise("Error", 0, 0, "Original ammo command lost its client");
   qa_guest_address address = qa_compat_q2_mem_offset(memory, client, (int64_t)(s->profile->client_inventory + item->index * 4));
   int32_t before = qa_compat_q2_mem_read_i32(memory, address);
   continuation->execute(continuation->ctx);
@@ -227,8 +224,15 @@ static void ammo_grant_region(void *v, qa_compat_q2_inline_continuation *continu
   }
 }
 typedef struct { qa_guest_address address; uint8_t bytes[8]; size_t length; } saved_word;
-typedef struct { qa_compat_q2_inline_continuation *continuation; } execute_scope;
-static void execute_body(void *v) { execute_scope *e = v; e->continuation->execute(e->continuation->ctx); }
+typedef struct { qa_compat_q2_inline_continuation *continuation; qa_compat_q2_memory *memory; qa_guest_address weapon; bool has_item; qa_guest_address item;
+  const qa_guest_address *words; const int32_t *values; size_t word_count; } execute_scope;
+/* The TS try block: the projected weapon and counters are written inside it, so the finally restores them. */
+static void execute_body(void *v) {
+  execute_scope *e = v;
+  qa_compat_q2_mem_write_pointer(e->memory, e->weapon, e->has_item, e->item);
+  for (size_t i = 0; i < e->word_count; i++) qa_compat_q2_mem_write_i32(e->memory, e->words[i], e->values[i]);
+  e->continuation->execute(e->continuation->ctx);
+}
 static void drop_region(void *v, qa_compat_q2_inline_continuation *continuation) {
   qa_compat_q2_native_primary_commands *s = v; qa_actor_id actor;
   bool has_actor = stack_top(&s->dropping, &actor);
@@ -237,11 +241,11 @@ static void drop_region(void *v, qa_compat_q2_inline_continuation *continuation)
   if (!has_projection) { continuation->execute(continuation->ctx); return; }
   qa_compat_q2_memory *memory = s->host.memory;
   qa_raw_entity_view record;
-  if (!s->host.record_for(s->host.ctx, actor, &record)) qa_range_error("Original death drop lost its actor");
+  if (!s->host.record_for(s->host.ctx, actor, &record)) qa_raise("Error", 0, 0, "Original death drop lost its actor");
   qa_guest_address client;
-  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, record.address, (int64_t)s->profile->client_pointer), &client)) qa_range_error("Original death drop lost its client");
+  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, record.address, (int64_t)s->profile->client_pointer), &client)) qa_raise("Error", 0, 0, "Original death drop lost its client");
   const source_item *item = projected == NULL ? NULL : find_item(s, projected, true);
-  if ((projected != NULL && item == NULL) || ammo_amount != trunc(ammo_amount) || ammo_amount < -2147483648.0 || ammo_amount > 2147483647.0) qa_range_error("Selected death drop lacks an original weapon or int32 ammunition");
+  if ((projected != NULL && item == NULL) || ammo_amount != trunc(ammo_amount) || ammo_amount < -2147483648.0 || ammo_amount > 2147483647.0) qa_raise("Error", 0, 0, "Selected death drop lacks an original weapon or int32 ammunition");
   const source_item *ammo = item == NULL || item->ammo == NULL ? NULL : find_item(s, item->ammo, false);
   qa_guest_address weapon = qa_compat_q2_mem_offset(memory, client, (int64_t)s->profile->client_weapon);
   saved_word saved[3]; size_t saved_count = 0;
@@ -254,9 +258,7 @@ static void drop_region(void *v, qa_compat_q2_inline_continuation *continuation)
     saved[saved_count].address = words[i]; saved[saved_count].length = 4;
     memory->copy(memory->ctx, words[i], saved[saved_count].bytes, 4); saved_count++;
   }
-  qa_compat_q2_mem_write_pointer(memory, weapon, item != NULL, item != NULL ? item->address : (qa_guest_address){0});
-  for (size_t i = 0; i < word_count; i++) qa_compat_q2_mem_write_i32(memory, words[i], values[i]);
-  execute_scope scope = {continuation};
+  execute_scope scope = {continuation, memory, weapon, item != NULL, item != NULL ? item->address : (qa_guest_address){0}, words, values, word_count};
   qa_compat_q2_native_thrown thrown;
   bool completed = qa_compat_q2_native_try(execute_body, &scope, &thrown);
   qa_raw_entity_view after;
@@ -264,33 +266,51 @@ static void drop_region(void *v, qa_compat_q2_inline_continuation *continuation)
     for (size_t i = saved_count; i-- > 0;) memory->write(memory->ctx, saved[i].address, saved[i].bytes, saved[i].length);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
 }
-qa_compat_q2_native_primary_commands *qa_compat_q2_native_primary_commands_create(qa_compat_q2_native_primary_weapon_host host, const qa_compat_q2_native_primary_command_profile *profile, qa_compat_q2_native_primary_command_hooks hooks) {
-  if (strcmp(host.memory->module.digest, profile->digest) != 0) qa_range_error("Native command profile belongs to another artifact");
-  qa_compat_q2_native_primary_commands *s = calloc(1, sizeof *s);
-  if (s == NULL) qa_range_error("Native commands out of memory");
-  s->host = host; s->profile = profile; s->hooks = hooks;
+/* `${host.memory.module.id}:primary-${name}` with no length limit; the entry binding copies the id. */
+static char *entry_id(const qa_compat_q2_native_primary_commands *s, const char *name) {
+  const char *module = s->host.memory->module.id != NULL ? s->host.memory->module.id : "";
+  size_t need = strlen(module) + strlen(name) + 10;
+  char *id = malloc(need); if (id == NULL) qa_range_error("Native commands out of memory");
+  snprintf(id, need, "%s:primary-%s", module, name);
+  return id;
+}
+static void create_body(void *v) {
+  qa_compat_q2_native_primary_commands *s = v; const qa_compat_q2_native_primary_command_profile *profile = s->profile;
   read_items(s);
   qa_compat_q2_guest_call_signature signature = {profile->abi, command_parameters, 1, true, {0}, false};
   const char *names[2] = {"give", "drop"}; const double entries[2] = {profile->give_entry, profile->drop_entry};
   actor_stack *stacks[2] = {&s->giving, &s->dropping};
-  qa_compat_q2_runner *runner = host.runner;
+  qa_compat_q2_runner *runner = s->host.runner;
   for (size_t i = 0; i < 2; i++) {
-    char id[320]; snprintf(id, sizeof id, "%s:primary-%s", host.memory->module.id, names[i]);
+    char *id = entry_id(s, names[i]); qa_cleanup node; qa_cleanup_push(&node, free, id);
     s->entries[i] = (command_entry){s, stacks[i]};
-    s->bindings[i] = qa_compat_q2_native_entry_bind(host.memory, runner, host.ctx, host.invoke, at(s, entries[i]), id, signature, &s->entries[i], command_execute, NULL, NULL);
+    s->bindings[i] = qa_compat_q2_native_entry_bind(s->host.memory, runner, s->host.ctx, s->host.invoke, at(s, entries[i]), id, signature, &s->entries[i], command_execute, NULL, NULL);
+    qa_cleanup_pop(&node); free(id);
   }
   s->observes[0] = (give_observe){s, "weapons"}; s->observes[1] = (give_observe){s, "ammo"};
-  s->observe_handles[0] = runner->observe_entry(runner->ctx, at(s, profile->give_weapons), &s->observes[0], give_observed);
-  s->observe_handles[1] = runner->observe_entry(runner->ctx, at(s, profile->give_ammo), &s->observes[1], give_observed);
+  s->observe_handles[0] = runner->observe_entry(runner->ctx, at(s, profile->give_weapons), &s->observes[0], give_observed); s->observe_count = 1;
+  s->observe_handles[1] = runner->observe_entry(runner->ctx, at(s, profile->give_ammo), &s->observes[1], give_observed); s->observe_count = 2;
   s->unknown_region = runner->bind_inline_region(runner->ctx, at(s, profile->give_unknown_entry), at(s, profile->give_unknown_join), profile->abi, s, unknown_region);
+  s->has_unknown_region = true;
   s->ammo_regions = calloc(profile->ammo_grant_count ? profile->ammo_grant_count : 1, sizeof *s->ammo_regions);
   s->ammo_ctx = calloc(profile->ammo_grant_count ? profile->ammo_grant_count : 1, sizeof *s->ammo_ctx);
   if (s->ammo_regions == NULL || s->ammo_ctx == NULL) qa_range_error("Native commands out of memory");
   for (size_t i = 0; i < profile->ammo_grant_count; i++) {
     s->ammo_ctx[i] = (ammo_region){s, &profile->ammo_grants[i]};
     s->ammo_regions[i] = runner->bind_inline_region(runner->ctx, at(s, profile->ammo_grants[i].entry), at(s, profile->ammo_grants[i].join), profile->abi, &s->ammo_ctx[i], ammo_grant_region);
+    s->ammo_region_count = i + 1;
   }
   s->drop_region = runner->bind_inline_region(runner->ctx, at(s, profile->drop_elig_entry), at(s, profile->drop_elig_join), profile->abi, s, drop_region);
+  s->has_drop_region = true;
+}
+qa_compat_q2_native_primary_commands *qa_compat_q2_native_primary_commands_create(qa_compat_q2_native_primary_weapon_host host, const qa_compat_q2_native_primary_command_profile *profile, qa_compat_q2_native_primary_command_hooks hooks) {
+  if (strcmp(host.memory->module.digest, profile->digest) != 0) qa_raise("Error", 0, 0, "Native command profile belongs to another artifact");
+  qa_compat_q2_native_primary_commands *s = calloc(1, sizeof *s);
+  if (s == NULL) qa_range_error("Native commands out of memory");
+  s->host = host; s->profile = profile; s->hooks = hooks;
+  /* TS: a throwing readItems leaves nothing behind, and the catch around the bindings closes the ones made. */
+  qa_caught_error caught;
+  if (!qa_try(create_body, s, &caught)) { qa_compat_q2_native_primary_commands_destroy(s); qa_rethrow(&caught); }
   return s;
 }
 bool qa_compat_q2_native_primary_commands_source_item(const qa_compat_q2_native_primary_commands *s, qa_item_id item, qa_compat_q2_native_source_item *out) {
@@ -307,13 +327,13 @@ qa_item_id qa_compat_q2_native_primary_commands_item_at(const qa_compat_q2_nativ
 const qa_compat_q2_native_inventory_slot *qa_compat_q2_native_primary_commands_inventory_slots(const qa_compat_q2_native_primary_commands *s, size_t *out_count) { *out_count = s->item_count; return s->slots; }
 const qa_compat_q2_native_source_weapon *qa_compat_q2_native_primary_commands_weapons(const qa_compat_q2_native_primary_commands *s, size_t *out_count) { *out_count = s->weapon_count; return s->weapons; }
 void qa_compat_q2_native_primary_commands_with_weapon(qa_compat_q2_native_primary_commands *s, qa_actor_id actor, qa_item_id item, void *ctx, void (*run)(void *ctx)) {
-  if (!current(s, actor)) qa_range_error("Original weapon projection lost its actor");
+  if (!current(s, actor)) qa_raise("Error", 0, 0, "Original weapon projection lost its actor");
   if (item == NULL) { run(ctx); return; }
   const source_item *descriptor = find_item(s, item, true);
   qa_raw_entity_view record;
-  if (descriptor == NULL || !s->host.record_for(s->host.ctx, actor, &record)) qa_range_error("Selected weapon has no original descriptor");
+  if (descriptor == NULL || !s->host.record_for(s->host.ctx, actor, &record)) qa_raise("Error", 0, 0, "Selected weapon has no original descriptor");
   qa_compat_q2_memory *memory = s->host.memory; qa_guest_address client;
-  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, record.address, (int64_t)s->profile->client_pointer), &client)) qa_range_error("Original weapon projection lost its client");
+  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, record.address, (int64_t)s->profile->client_pointer), &client)) qa_raise("Error", 0, 0, "Original weapon projection lost its client");
   qa_guest_address address = qa_compat_q2_mem_offset(memory, client, (int64_t)s->profile->client_weapon), previous = {0};
   bool has_previous = qa_compat_q2_mem_read_pointer(memory, address, &previous);
   qa_compat_q2_mem_write_pointer(memory, address, true, descriptor->address);
@@ -327,14 +347,16 @@ void qa_compat_q2_native_primary_commands_with_weapon(qa_compat_q2_native_primar
 void qa_compat_q2_native_primary_commands_close(qa_compat_q2_native_primary_commands *s) {
   if (s->closed) return;
   s->closed = true;
+  /* removals.runReverse(): the stack is emptied, then whatever was bound is removed, newest first. */
   qa_compat_q2_runner *runner = s->host.runner;
-  runner->remove_inline_region(runner->ctx, s->drop_region);
-  for (size_t i = s->profile->ammo_grant_count; i-- > 0;) runner->remove_inline_region(runner->ctx, s->ammo_regions[i]);
-  runner->remove_inline_region(runner->ctx, s->unknown_region);
-  runner->remove_entry(runner->ctx, s->observe_handles[1]);
-  runner->remove_entry(runner->ctx, s->observe_handles[0]);
-  qa_compat_q2_native_entry_close(s->bindings[1]);
-  qa_compat_q2_native_entry_close(s->bindings[0]);
+  bool drop = s->has_drop_region, unknown = s->has_unknown_region; size_t ammo = s->ammo_region_count, observes = s->observe_count;
+  qa_compat_q2_native_entry *bindings[2] = {s->bindings[0], s->bindings[1]};
+  s->has_drop_region = false; s->has_unknown_region = false; s->ammo_region_count = 0; s->observe_count = 0; s->bindings[0] = s->bindings[1] = NULL;
+  if (drop) runner->remove_inline_region(runner->ctx, s->drop_region);
+  for (size_t i = ammo; i-- > 0;) runner->remove_inline_region(runner->ctx, s->ammo_regions[i]);
+  if (unknown) runner->remove_inline_region(runner->ctx, s->unknown_region);
+  for (size_t i = observes; i-- > 0;) runner->remove_entry(runner->ctx, s->observe_handles[i]);
+  for (size_t i = 2; i-- > 0;) if (bindings[i] != NULL) qa_compat_q2_native_entry_close(bindings[i]);
 }
 void qa_compat_q2_native_primary_commands_destroy(qa_compat_q2_native_primary_commands *s) {
   if (s == NULL) return;

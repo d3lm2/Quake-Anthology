@@ -29,7 +29,8 @@ struct qa_media_input {
 /* TS mediaBytes; `source` NULL means "<media>". NULL only on OOM. */
 qa_media_input *qa_media_bytes(const uint8_t *bytes, size_t length,
                                const char *source);
-/* TS openMediaFile; NULL only on OOM (OS errors abort as thrown). */
+/* TS openMediaFile; NULL only on OOM. OS failures raise the Error Bun
+ * reports (qa_content_fs_error: open, fstat, read). */
 qa_media_input *qa_open_media_file(const char *path);
 /* Heap input over caller callbacks; copies `source`. NULL on OOM. */
 qa_media_input *qa_media_input_create(void *ctx, const char *source,

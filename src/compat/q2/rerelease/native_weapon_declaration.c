@@ -90,14 +90,14 @@ static bool read_entry(const qa_save_reader *reader, qa_native_weapon_entry *out
   if (!is_null) {
     qa_native_weapon_registration *reg = calloc(1, sizeof *reg);
     if (!reg) { qa_save_reader_destroy(&registered); return false; }
+    out->registration = reg; /* released with the entry when a later field is refused */
     reg->rva = uint_field(&registered, "rva", 1);
     reg->name = text_field_dup(&registered, "name", false);
     reg->tag = uint_field(&registered, "tag", 0);
     qa_save_reader layout; field_reader(&registered, "layout", &layout);
     bool ok = read_registration_layout(&layout, &reg->layout);
     qa_save_reader_destroy(&layout);
-    if (!ok || !reg->name) { free((void *)reg->name); free(reg); qa_save_reader_destroy(&registered); return false; }
-    out->registration = reg;
+    if (!ok || !reg->name) { free_entry(out); qa_save_reader_destroy(&registered); return false; }
   }
   qa_save_reader_destroy(&registered);
   return true;
@@ -120,25 +120,24 @@ static bool read_command(const qa_save_reader *reader, qa_native_weapon_command 
   size_t n = qa_save_reader_list_count(&args);
   const char **values = calloc(n ? n : 1, sizeof *values);
   if (!values) { qa_save_reader_destroy(&args); return false; }
+  out->arguments.values = values; out->arguments.count = 0; /* released with the command when a later field is refused */
   for (size_t i = 0; i < n; i++) {
     qa_save_reader item; item_reader(&args, i, &item);
     values[i] = xstrdup(text_of(&item, true));
     qa_save_reader_destroy(&item);
-    if (!values[i]) { for (size_t j = 0; j < i; j++) free((void *)values[j]); free(values); qa_save_reader_destroy(&args); return false; }
+    if (!values[i]) { qa_save_reader_destroy(&args); return false; }
+    out->arguments.count = i + 1;
   }
   qa_save_reader_destroy(&args);
-  if (n == 0 || values[0][0] == 0) {
-    for (size_t i = 0; i < n; i++) { free((void *)values[i]); }
-    free(values);
-    qa_save_reader_fail(reader, "command requires a name");
-  }
-  out->arguments.values = values; out->arguments.count = n;
+  if (n == 0 || values[0][0] == 0) qa_save_reader_fail(reader, "command requires a name");
   out->tail = text_field_dup(reader, "tail", true);
   return out->tail != NULL;
 }
+/* /^[A-Za-z_][A-Za-z0-9_]*$/: ASCII only, whatever the C locale. */
+static bool ascii_alpha(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
 static bool valid_cvar_name(const char *s) {
-  if (!(isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
-  for (size_t i = 1; s[i]; i++) if (!(isalnum((unsigned char)s[i]) || s[i] == '_')) return false;
+  if (!(ascii_alpha(s[0]) || s[0] == '_')) return false;
+  for (size_t i = 1; s[i]; i++) if (!(ascii_alpha(s[i]) || (s[i] >= '0' && s[i] <= '9') || s[i] == '_')) return false;
   return true;
 }
 static bool read_cvars(const qa_save_reader *reader, qa_native_weapon_cvar **out, size_t *out_count) {
@@ -146,28 +145,24 @@ static bool read_cvars(const qa_save_reader *reader, qa_native_weapon_cvar **out
   size_t n = qa_save_reader_list_count(reader);
   qa_native_weapon_cvar *list = calloc(n ? n : 1, sizeof *list);
   if (!list) return false;
+  *out = list; *out_count = 0; /* released with the declaration when a later row is refused */
   for (size_t i = 0; i < n; i++) {
     qa_save_reader item; item_reader(reader, i, &item);
     keys(&item, allowed, 2);
     char *name = text_field_dup(&item, "name", false);
+    if (!name) { qa_save_reader_destroy(&item); return false; }
+    list[i].name = name; *out_count = i + 1;
     bool dup = false;
-    if (name) for (size_t j = 0; j < i; j++) {
+    for (size_t j = 0; j < i; j++) {
       const char *a = list[j].name, *b = name; bool same = true;
       size_t k = 0; while (a[k] && b[k]) { if (tolower((unsigned char)a[k]) != tolower((unsigned char)b[k])) same = false; k++; }
       if (same && a[k] == b[k]) dup = true;
     }
-    if (!name || !valid_cvar_name(name) || dup) {
-      if (name && (!valid_cvar_name(name) || dup)) { qa_save_reader_fail(&item, "invalid or duplicate cvar name"); }
-      free(name); qa_save_reader_destroy(&item);
-      for (size_t j = 0; j < i; j++) { free((void *)list[j].name); free((void *)list[j].value); } free(list);
-      return false;
-    }
-    list[i].name = name;
+    if (!valid_cvar_name(name) || dup) qa_save_reader_fail(&item, "invalid or duplicate cvar name");
     list[i].value = text_field_dup(&item, "value", true);
     qa_save_reader_destroy(&item);
-    if (!list[i].value) { for (size_t j = 0; j <= i; j++) { free((void *)list[j].name); free((void *)list[j].value); } free(list); return false; }
+    if (!list[i].value) return false;
   }
-  *out = list; *out_count = n;
   return true;
 }
 static bool read_calls(const qa_save_reader *reader, qa_native_weapon_call_list *out) {
@@ -180,20 +175,17 @@ static bool read_calls(const qa_save_reader *reader, qa_native_weapon_call_list 
   size_t n = qa_save_reader_list_count(&calls);
   qa_native_weapon_entry *list = calloc(n ? n : 1, sizeof *list);
   if (!list) { qa_save_reader_destroy(&calls); return false; }
+  out->calls = list; out->call_count = 0; /* released with the declaration when a later call is refused */
   for (size_t i = 0; i < n; i++) {
     qa_save_reader item; item_reader(&calls, i, &item);
+    out->call_count = i + 1;
     bool ok = read_entry(&item, &list[i]);
     qa_save_reader_destroy(&item);
-    if (!ok) { for (size_t j = 0; j < i; j++) free_entry(&list[j]); free(list); qa_save_reader_destroy(&calls); return false; }
+    if (!ok) { qa_save_reader_destroy(&calls); return false; }
   }
   qa_save_reader_destroy(&calls);
-  if (n == 0 || n > 64) {
-    for (size_t i = 0; i < n; i++) { free_entry(&list[i]); }
-    free(list);
-    qa_save_reader_fail(reader, "expected 1\xe2\x80\x93"
-                                 "64 source calls");
-  }
-  out->calls = list; out->call_count = n;
+  if (n == 0 || n > 64) qa_save_reader_fail(reader, "expected 1\xe2\x80\x93"
+                                                     "64 source calls");
   return true;
 }
 static bool digest_valid(const char *s) {
@@ -222,6 +214,7 @@ void qa_compat_q2_native_weapon_declaration_free(qa_native_weapon_behavior_decla
   free((void *)d->provisioning_cvars);
   memset(d, 0, sizeof *d);
 }
+static void declaration_release(void *v) { qa_compat_q2_native_weapon_declaration_free(v); }
 #define ROOT_KEYS "version", "kind", "abi", "artifactPath", "artifactDigest", "id", "title", "role", "aspect", "entity", "client", \
   "equippedWeapon", "time", "think", "allocate", "free", "projectileTouch", "equip", "launch", "activateRva", "fireRva", \
   "initializationClasses", "equipment", "ammunition", "initialCvars", "provisioningCvars"
@@ -230,6 +223,8 @@ bool qa_compat_q2_read_native_weapon_declaration(const qa_save_value *value, con
   memset(out, 0, sizeof *out);
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, "native-weapon-profile")) return false;
+  /* A declaration that is refused (a file is the input) keeps nothing of what was read before the refusal. */
+  qa_cleanup refused; qa_cleanup_push(&refused, declaration_release, out);
   static const char *const root_keys[] = {ROOT_KEYS};
   keys(&reader, root_keys, sizeof root_keys / sizeof root_keys[0]);
   qa_save_reader entity_r, client_r, weapon_r, time_r, think_r, alloc_r, free_r;
@@ -286,13 +281,13 @@ bool qa_compat_q2_read_native_weapon_declaration(const qa_save_value *value, con
     size_t class_count = qa_save_reader_list_count(&classes);
     const char **class_names = calloc(class_count ? class_count : 1, sizeof *class_names);
     if (!class_names) { qa_save_reader_destroy(&classes); goto done; }
+    out->initialization_classes.values = class_names; out->initialization_classes.count = class_count;
     for (size_t i = 0; i < class_count; i++) {
       qa_save_reader item; item_reader(&classes, i, &item);
       class_names[i] = xstrdup(text_of(&item, false));
       qa_save_reader_destroy(&item);
     }
     qa_save_reader_destroy(&classes);
-    out->initialization_classes.values = class_names; out->initialization_classes.count = class_count;
     {
       size_t worldspawn = 0; bool unique = true;
       for (size_t i = 0; i < class_count; i++) {
@@ -382,6 +377,7 @@ bool qa_compat_q2_read_native_weapon_declaration(const qa_save_value *value, con
   }
   ok = true;
 done:
+  qa_cleanup_pop(&refused);
   qa_save_reader_destroy(&entity_r); qa_save_reader_destroy(&client_r); qa_save_reader_destroy(&weapon_r);
   qa_save_reader_destroy(&time_r); qa_save_reader_destroy(&think_r); qa_save_reader_destroy(&alloc_r); qa_save_reader_destroy(&free_r);
   qa_save_reader_destroy(&reader);
@@ -568,37 +564,32 @@ bool qa_compat_q2_same_native_weapon_declaration(const qa_native_weapon_behavior
 static void fmt_double(char *out, size_t cap, double v) {
   qa_net_js_number(v, out, cap);
 }
-void qa_compat_q2_validate_native_weapon_image(const qa_native_weapon_behavior_declaration *profile,
-                                               const char *image_abi_kind, qa_compat_q2_pe_file image) {
-  if (strcmp(image_abi_kind, profile->abi) != 0) qa_range_error("Native weapon declaration ABI differs from its PE image");
-  struct range { double rva, size; const char *access; };
-  qa_native_weapon_entry entries[68 + 4];
-  size_t count = 0;
-  for (size_t i = 0; i < profile->equip.call_count && count < 72; i++) entries[count++] = profile->equip.calls[i];
-  for (size_t i = 0; i < profile->launch.call_count && count < 72; i++) entries[count++] = profile->launch.calls[i];
-  if (count < 72) entries[count++] = profile->allocate.entry;
-  if (count < 72) entries[count++] = profile->free.entry;
-  if (count < 72) entries[count++] = profile->projectile_touch;
-  if (count < 72) entries[count++] = profile->equipped_weapon.expected;
-  struct range ranges[72 + 73];
-  size_t range_count = 0;
-  for (size_t i = 0; i < count; i++) {
-    ranges[range_count++] = (struct range){entries[i].rva, 1, "execute"};
-    if (entries[i].registration) ranges[range_count++] = (struct range){entries[i].registration->rva, entries[i].registration->layout.byte_length, "read"};
+static void check_range(double rva, double size, const char *access, qa_compat_q2_pe_file image) {
+  bool inside = false;
+  for (size_t j = 0; j < image.section_count && !inside; j++) {
+    const qa_compat_q2_pe_section *s = &image.sections[j];
+    inside = rva >= s->rva && rva + size <= s->rva + s->mapped_size && s->permissions && strstr(s->permissions, access);
   }
-  ranges[range_count++] = (struct range){profile->time.rva, 8, "write"};
-  for (size_t i = 0; i < range_count; i++) {
-    double rva = ranges[i].rva, size = ranges[i].size;
-    bool inside = false;
-    for (size_t j = 0; j < image.section_count; j++) {
-      const qa_compat_q2_pe_section *s = &image.sections[j];
-      if (rva >= s->rva && rva + size <= s->rva + s->mapped_size && s->permissions && strstr(s->permissions, ranges[i].access)) inside = true;
-    }
-    if (rva + size > image.image_size || !inside) {
-      char a[64], b[64]; fmt_double(a, sizeof a, rva); fmt_double(b, sizeof b, size);
-      qa_range_error("Native weapon %s range is outside its PE section: %s+%s", ranges[i].access, a, b);
-    }
+  if (rva + size > image.image_size || !inside) {
+    char a[64], b[64]; fmt_double(a, sizeof a, rva); fmt_double(b, sizeof b, size);
+    qa_raise("Error", 0, 0, "Native weapon %s range is outside its PE section: %s+%s", access, a, b);
   }
 }
-
-
+static void check_entry(const qa_native_weapon_entry *entry, qa_compat_q2_pe_file image) {
+  check_range(entry->rva, 1, "execute", image);
+  if (entry->registration) check_range(entry->registration->rva, entry->registration->layout.byte_length, "read", image);
+}
+void qa_compat_q2_validate_native_weapon_image(const qa_native_weapon_behavior_declaration *profile,
+                                               const char *image_abi_kind, qa_compat_q2_pe_file image) {
+  if (strcmp(image_abi_kind, profile->abi) != 0) qa_raise("Error", 0, 0, "Native weapon declaration ABI differs from its PE image");
+  /* [...equip.calls, ...launch.calls, allocate.entry, free.entry, projectileTouch, equippedWeapon.expected]: each
+   * entry's code, then its registration record; the clock last. (A list of 72 dropped the entries past it: two
+   * lists of 64 calls are valid.) */
+  for (size_t i = 0; i < profile->equip.call_count; i++) check_entry(&profile->equip.calls[i], image);
+  for (size_t i = 0; i < profile->launch.call_count; i++) check_entry(&profile->launch.calls[i], image);
+  check_entry(&profile->allocate.entry, image);
+  check_entry(&profile->free.entry, image);
+  check_entry(&profile->projectile_touch, image);
+  check_entry(&profile->equipped_weapon.expected, image);
+  check_range(profile->time.rva, 8, "write", image);
+}

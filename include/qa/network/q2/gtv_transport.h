@@ -42,6 +42,8 @@ typedef struct qa_q2_gtv_connection {
   bool closed;
   bool opened;
   double next_ping_ms; /* 0 when no keepalive is armed */
+  double activity_ms;  /* last read or write: TS socket.setTimeout counts both */
+  double timeout_ms;
   qa_q2_gtv_connection_options options;
 } qa_q2_gtv_connection;
 

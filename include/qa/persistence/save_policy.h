@@ -71,10 +71,19 @@ char *qa_save_command_path(const char *directory, const char *name);
  * path escapes the directory, uses a reserved "current" part, or
  * does not end in .sav. */
 char *qa_contained_save_name(const char *directory, const char *path);
+/* containedSaveName(directory, path, extension): `extension` is lowercase, with its dot. */
+char *qa_contained_save_name_extension(const char *directory, const char *path, const char *extension);
 
 /* TS writeContainedSave (synchronous). False only on I/O failure. */
 bool qa_write_contained_save(const char *directory, const char *path,
                              const uint8_t *bytes, size_t length);
+/* writeContainedSave(directory, path, bytes, extension). */
+bool qa_write_contained_save_extension(const char *directory, const char *path, const uint8_t *bytes, size_t length,
+                                       const char *extension);
+/* TS writeContainedNativeFile (synchronous): a file of a native save folder, contained like any save but with no
+ * fixed extension, and allowed inside the `current` working folder. False only on I/O failure; a path outside
+ * the directory (or the directory itself) RangeErrors. */
+bool qa_write_contained_native_file(const char *directory, const char *path, const uint8_t *bytes, size_t length);
 
 /* TS assertLoadPathAllowed. source NULL is TS undefined; RangeErrors (the
  * exact TS message) unless the path is inside the save directory or a

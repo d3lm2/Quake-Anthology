@@ -101,6 +101,7 @@ static double world_leaf_count(qa_app_loaded_content *content) {
 typedef struct application_bots {
   qa_application *app;
   qa_command_buffer *commands; /* TS commands (null = NULL) */
+  qa_command_buffer *(*commands_fn)(void *ctx); void *commands_ctx; /* a resolver in place of `commands` */
   qa_session_client *(*resolve_client)(void *ctx, double slot, double generation); void *resolve_ctx;
   qa_app_sim_bot_simulation simulation;
   qa_app_sim_application_bot_assets *assets;
@@ -120,6 +121,10 @@ static void bots_print(void *ctx, const char *text) {
 }
 static void bots_insert_console_command(void *ctx, const char *text) {
   application_bots *bots = ctx;
+  if (bots->commands_fn != NULL) {
+    qa_command_buffer_insert(bots->commands_fn(bots->commands_ctx), text, NULL, -1);
+    return;
+  }
   if (bots->commands == NULL) qa_raise("Error", 0, 0, "Bot console has no source command buffer");
   qa_command_buffer_insert(bots->commands, text, NULL, -1);
 }
@@ -211,6 +216,8 @@ qa_app_sim_bot_service *qa_application_create_bots(qa_application *app, qa_app_l
   application_bots *bots = checked(calloc(1, sizeof *bots));
   bots->app = app;
   bots->commands = setup->has_commands ? setup->commands : app->source_commands;
+  bots->commands_fn = setup->commands_fn;
+  bots->commands_ctx = setup->commands_ctx;
   bots->resolve_client = setup->resolve_client;
   bots->resolve_ctx = setup->resolve_ctx;
   bots->simulation = qa_app_shared_sim_bot_simulation(simulation);

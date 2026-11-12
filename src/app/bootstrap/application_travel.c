@@ -13,6 +13,12 @@
 #include "qa/app/bootstrap/loading.h"
 #include "qa/app/bootstrap/component_client_save.h"
 #include "qa/app/bootstrap/original_save.h"
+#include "qa/app/bootstrap/q2_native_saves.h"
+#include "qa/formats/q2_map.h"
+#include "qa/formats/q2_map/reader.h"
+#include "qa/persistence/q2_save_store.h"
+#include "qa/persistence/save_policy.h"
+#include <time.h>
 #include "qa/app/bootstrap/simulation/q3/runtime.h"
 #include "qa/content/mounts.h"
 #include "qa/core/q3_product_policy.h"
@@ -112,74 +118,80 @@ static const qa_active_mod_presentation **source_pointers(const qa_active_mod_pr
 
 /* writeSavedGame(saveDirectory, path, save): the C writer reports failure as
  * false; the Node error text it would carry is the errno description. */
-static void write_saved_game(qa_application *app, const char *path, const qa_saved_game *save) {
+static void write_saved_game(const char *directory, const char *path, const qa_saved_game *save, const qa_save_image *sidecar) {
   errno = 0;
-  if (!qa_write_saved_game(qa_application_save_directory(app), path, save))
+  if (!qa_write_saved_game_sidecar(directory, path, save, sidecar))
     qa_raise("Error", 0, 0, "%s, open '%s'", errno == 0 ? "save write failed" : strerror(errno), path);
 }
 
-/* ---- saveGame(path, format = "shared") ---- */
+/* ---- saveGame(path, format = "shared", saving = {}) ---- */
+static void native_layout_cleanup(void *layout) { qa_native_save_layout_destroy(layout); }
+/* new Date().getTime() */
+static double qa_application_date_now(void) {
+  struct timespec now;
+  (void)clock_gettime(CLOCK_REALTIME, &now);
+  return (double)now.tv_sec * 1000.0 + floor((double)now.tv_nsec / 1e6);
+}
 typedef struct save_run {
   qa_application *app;
   const char *path;
   qa_app_save_format format;
+  bool autosave;
+  char *written_path; /* the TS return value (owned) */
+  bool has_native; qa_native_save_layout native;
+  char *slot, *located;
+  /* captureSharedImage's storage: the image borrows all of it. */
   qa_app_shared_sim_save captured; bool has_captured;
-  qa_q1_save_data data; bool has_data;
   qa_save_value *component; uint8_t *component_bytes;
   qa_save_image teams; bool has_teams;
   uint8_t *campaign_bytes;
-  qa_provider_checkpoint *providers;
+  qa_provider_checkpoint *providers, *attached;
   qa_app_viewing_seat *seats; const qa_active_mod_presentation **sources;
+  qa_save_image image;
+  qa_q1_save_data data; bool has_data;
 } save_run;
-static void save_run_release(void *ctx) {
-  save_run *run = ctx;
+static void shared_image_release(save_run *run) {
   if (run->has_captured) qa_app_shared_sim_save_free(&run->captured);
-  if (run->has_data) qa_q1_save_data_free(&run->data);
+  run->has_captured = false;
   if (run->component != NULL) qa_save_value_free(run->component);
-  free(run->component_bytes);
+  run->component = NULL;
+  free(run->component_bytes); run->component_bytes = NULL;
   if (run->has_teams) {
     free((void *)run->teams.providers[run->teams.provider_count - 1].bytes.bytes);
     free((void *)run->teams.providers);
   }
-  free(run->campaign_bytes);
-  free(run->providers);
-  free(run->seats);
-  free(run->sources);
-  memset(run, 0, sizeof *run);
+  run->has_teams = false;
+  free(run->campaign_bytes); run->campaign_bytes = NULL;
+  free(run->providers); run->providers = NULL;
+  free(run->attached); run->attached = NULL;
+  free(run->seats); run->seats = NULL;
+  free(run->sources); run->sources = NULL;
 }
-/* TS serviceLoading(nextFrame => this.simulation.checkpointLoading(nextFrame), ...). */
+static void save_run_release(void *ctx) {
+  save_run *run = ctx;
+  shared_image_release(run);
+  if (run->has_data) qa_q1_save_data_free(&run->data);
+  if (run->has_native) qa_native_save_layout_destroy(&run->native);
+  free(run->slot); free(run->located);
+  char *written = run->written_path;
+  memset(run, 0, sizeof *run);
+  run->written_path = written;
+}
+/* TS serviceLoading(nextFrame => this.simulation.checkpointLoading(nextFrame, { autosave }), ...). */
 static void checkpoint_operation(void *ctx, qa_app_loading_frame *frame) {
   save_run *run = ctx;
-  qa_app_shared_sim_checkpoint_loading(run->app->world_simulation, loading_next_frame, frame, &run->captured);
+  qa_app_sim_save_capture_options options = {run->autosave};
+  qa_app_shared_sim_checkpoint_loading_with(run->app->world_simulation, loading_next_frame, frame, options, &run->captured);
   run->has_captured = true;
 }
-static void save_body(void *ctx) {
-  save_run *run = ctx;
+/* TS captureSharedImage(autosave = false): fills run->image, which borrows the run's capture storage. */
+static void capture_shared_image(save_run *run, bool autosave) {
   qa_application *app = run->app;
-  if (strcmp(run->format, "shared") != 0) {
-    if (qa_application_campaign_movie(app) != NULL) qa_raise("Error", 0, 0, "Active component cinematics require a shared save");
-    const qa_catalog_discovered_product *product = qa_content_catalog_product(qa_app_loaded_content_catalog(app->loaded_content),
-        qa_app_loaded_content_recipe(app->loaded_content)->map.entities.content);
-    char *comment = node_basename(run->path, ".sav");
-    char *directories = strcmp(run->format, "v5") == 0 ? NULL : node_basename(product->expectation.content_directory, NULL);
-    qa_cleanup comment_cleanup, directory_cleanup;
-    qa_cleanup_push(&comment_cleanup, free, comment);
-    qa_cleanup_push(&directory_cleanup, free, directories);
-    if (!qa_app_shared_sim_capture_original_save(app->world_simulation, directories == NULL ? 5 : 6, directories, comment, &run->data))
-      qa_range_error("Out of memory");
-    run->has_data = true;
-    qa_cleanup_pop(&directory_cleanup);
-    qa_cleanup_pop(&comment_cleanup);
-    free(directories);
-    free(comment);
-    qa_saved_game save;
-    memset(&save, 0, sizeof save);
-    save.kind = QA_SAVED_GAME_Q1_SOURCE;
-    save.data = run->data;
-    write_saved_game(app, run->path, &save);
-    return;
-  }
+  shared_image_release(run);
+  bool requested = run->autosave;
+  run->autosave = autosave;
   qa_app_service_loading(checkpoint_operation, run, poll_loading_events, app);
+  run->autosave = requested;
   if (pending_component_requests(app)) qa_raise("Error", 0, 0, "Component commands changed during checkpoint capture");
   size_t source_count = 0;
   const qa_active_mod_presentation *sources = qa_app_shared_sim_mod_presentation_sources(app->world_simulation, &source_count);
@@ -222,27 +234,148 @@ static void save_body(void *ctx) {
   /* this.campaignUnit.attach(image): worldOnly(image) plus the unit checkpoint. */
   size_t campaign_length = 0;
   qa_provider_checkpoint campaign = qa_app_campaign_unit_attach(app->campaign_unit, &overridden, &run->campaign_bytes, &campaign_length);
-  qa_provider_checkpoint *attached = checked(calloc(overridden.provider_count + 1, sizeof *attached));
-  qa_cleanup attached_cleanup;
-  qa_cleanup_push(&attached_cleanup, free, attached);
+  run->attached = checked(calloc(overridden.provider_count + 1, sizeof *run->attached));
   size_t attached_count = 0;
   for (size_t i = 0; i < overridden.provider_count; i++) {
     const char *schema = overridden.providers[i].schema;
     if (schema != NULL && strcmp(schema, qa_campaign_unit_checkpoint.schema) == 0) continue;
-    attached[attached_count++] = overridden.providers[i];
+    run->attached[attached_count++] = overridden.providers[i];
   }
-  attached[attached_count++] = campaign;
+  run->attached[attached_count++] = campaign;
+  run->image = overridden;
+  run->image.providers = run->attached;
+  run->image.provider_count = attached_count;
+}
+/* TS nativeQ2Original(native): whether the game module that runs the world is the original one whose files the
+ * native save folder holds. */
+bool qa_application_native_q2_original(qa_application *app, const qa_native_save_layout *native) {
+  qa_app_sim_classic_guest_world *classic = NULL;
+  qa_app_sim_rerelease_guest_world *rerelease = NULL;
+  if (!qa_app_shared_sim_q2_native(app->world_simulation, &classic, &rerelease)) return false;
+  return (native->original == QA_NATIVE_SAVE_Q2_FOLDER && classic != NULL) ||
+         (native->original == QA_NATIVE_SAVE_Q2_PAK && rerelease != NULL);
+}
+/* TS savePath(name). Malloc'd. */
+char *qa_application_save_path(qa_application *app, const char *name) {
+  qa_native_save_layout native;
+  bool has_native = qa_application_native_saves(app, &native);
+  if (has_native && strpbrk(name, "\\/") == NULL) {
+    qa_cleanup native_guard;
+    qa_cleanup_push(&native_guard, native_layout_cleanup, &native);
+    char *path = qa_native_save_layout_locate(&native, name);
+    qa_cleanup_pop(&native_guard);
+    qa_native_save_layout_destroy(&native);
+    return path;
+  }
+  if (has_native) qa_native_save_layout_destroy(&native);
+  return checked(qa_save_command_path(qa_application_save_directory(app), name));
+}
+/* TS rereleasePortalCount(map). */
+static double rerelease_portal_count(void *ctx, const char *map) {
+  qa_application *app = ctx;
+  qa_app_application_world world = qa_app_loaded_content_world(app->loaded_content);
+  if (strcmp(map, qa_app_loaded_content_recipe(app->loaded_content)->map.geometry.requested_path) == 0 &&
+      strcmp(world.kind, "q2-bsp") == 0)
+    return (double)((const qa_q2_decoded_map *)world.value)->world.area_portal_count;
+  size_t length = 0;
+  /* mounts.read raises TS's "Resource not found"; NULL bytes are an empty resource (readQ2Bsp refuses it). */
+  uint8_t *bytes = qa_content_mounted_read_path((qa_content_mounted *)qa_app_loaded_content_mounts(app->loaded_content), map, &length);
+  static const uint8_t empty[1] = {0};
+  qa_cleanup bytes_guard;
+  qa_cleanup_push(&bytes_guard, free, bytes);
+  qa_q2_bsp bsp;
+  qa_read_q2_bsp(bytes != NULL ? bytes : empty, length, map, &bsp);
+  double count = (double)bsp.area_portal_count;
+  qa_q2_bsp_destroy(&bsp);
+  qa_cleanup_pop(&bytes_guard);
+  free(bytes);
+  return count;
+}
+/* The try block of saveGame's original-format branch. */
+typedef struct original_attempt { save_run *run; bool in_native; const char *directory; bool returned; bool written; } original_attempt;
+static void original_run(void *ctx) {
+  original_attempt *attempt = ctx;
+  save_run *run = attempt->run;
+  qa_application *app = run->app;
+  const char *original = strcmp(run->format, "shared") != 0 ? run->format : qa_native_save_original_name(run->native.original);
+  if (qa_application_campaign_movie(app) != NULL) qa_raise("Error", 0, 0, "Active component cinematics require a shared save");
+  const qa_catalog_discovered_product *product = qa_content_catalog_product(qa_app_loaded_content_catalog(app->loaded_content),
+      qa_app_loaded_content_recipe(app->loaded_content)->map.entities.content);
+  char *comment = node_basename(run->path, ".sav");
+  char *directories = strcmp(original, "v5") == 0 ? NULL : node_basename(product->expectation.content_directory, NULL);
+  qa_cleanup comment_cleanup, directory_cleanup;
+  qa_cleanup_push(&comment_cleanup, free, comment);
+  qa_cleanup_push(&directory_cleanup, free, directories);
+  if (run->has_data) { qa_q1_save_data_free(&run->data); run->has_data = false; }
+  if (!qa_app_shared_sim_capture_original_save(app->world_simulation, directories == NULL ? 5 : 6, directories, comment, &run->data))
+    qa_range_error("Out of memory");
+  run->has_data = true;
+  qa_cleanup_pop(&directory_cleanup);
+  qa_cleanup_pop(&comment_cleanup);
+  free(directories);
+  free(comment);
+  qa_saved_game save;
+  memset(&save, 0, sizeof save);
+  save.kind = QA_SAVED_GAME_Q1_SOURCE;
+  save.data = run->data;
+  if (!attempt->in_native) {
+    write_saved_game(attempt->directory, run->path, &save, NULL);
+    attempt->returned = true;
+    return;
+  }
+  capture_shared_image(run, false);
+  write_saved_game(attempt->directory, run->path, &save, &run->image);
+  attempt->written = true;
+}
+static void save_body(void *ctx) {
+  save_run *run = ctx;
+  qa_application *app = run->app;
+  run->has_native = qa_application_native_saves(app, &run->native);
+  bool in_native = run->has_native && qa_inside_native_saves(&run->native, run->path);
+  const char *directory = in_native ? run->native.root : qa_application_save_directory(app);
+  bool shared = strcmp(run->format, "shared") == 0;
+  /* A stock game's own saves are written in the original format where the engine can produce one the original reads. */
+  bool has_original = !shared || (in_native && run->native.original != QA_NATIVE_SAVE_ENGINE_ONLY);
+  if (has_original) {
+    original_attempt attempt = {run, in_native, directory, false, false};
+    qa_caught_error caught;
+    if (!qa_try(original_run, &attempt, &caught)) {
+      /* An explicit v5/v6 request reports the failure; a native location falls back to the engine format. */
+      if (!in_native || !shared) qa_rethrow(&caught);
+    }
+    if (attempt.returned || attempt.written) {
+      run->written_path = checked(strdup(run->path));
+      return;
+    }
+  }
+  capture_shared_image(run, run->autosave);
+  if (in_native) run->slot = qa_native_save_layout_slot(&run->native, run->path);
+  bool q2_slot = in_native && run->slot != NULL &&
+      (run->native.original == QA_NATIVE_SAVE_Q2_FOLDER || run->native.original == QA_NATIVE_SAVE_Q2_PAK);
+  if (q2_slot && shared && qa_application_native_q2_original(app, &run->native)) {
+    qa_app_q2_native_save_request request = {&run->native, run->slot, run->image, qa_application_date_now(), app, rerelease_portal_count};
+    if (qa_app_write_q2_native_save(&request)) {
+      /* return native.originalPath(slot) ?? path */
+      run->written_path = qa_native_save_layout_original_path(&run->native, run->slot);
+      if (run->written_path == NULL) run->written_path = checked(strdup(run->path));
+      return;
+    }
+  }
+  const char *path = run->path;
+  /* The engine's own game logic cannot produce the original's files, and a slot keeps one kind of save. */
+  if (q2_slot) {
+    qa_app_clear_q2_original_files(&run->native, run->slot);
+    run->located = qa_native_save_layout_locate(&run->native, run->slot);
+    path = run->located;
+  }
   qa_saved_game save;
   memset(&save, 0, sizeof save);
   save.kind = QA_SAVED_GAME_SHARED;
-  save.image = overridden;
-  save.image.providers = attached;
-  save.image.provider_count = attached_count;
-  write_saved_game(app, run->path, &save);
-  qa_cleanup_pop(&attached_cleanup);
-  free(attached);
+  save.image = run->image;
+  write_saved_game(directory, path, &save, NULL);
+  run->written_path = checked(strdup(path));
 }
-void qa_application_save_game(qa_application *app, const char *path, qa_app_save_format format) {
+char *qa_application_save_game_at(qa_application *app, const char *path, qa_app_save_format format, bool autosave) {
   if (format == NULL) format = "shared";
   if (app->closed) qa_raise("Error", 0, 0, "Application is closed");
   const char *unavailable = qa_application_save_unavailable(app, QA_SAVE_PURPOSE_MANUAL);
@@ -259,14 +392,18 @@ void qa_application_save_game(qa_application *app, const char *path, qa_app_save
   app->world_operation_completion = true;
   save_run run;
   memset(&run, 0, sizeof run);
-  run.app = app; run.path = path; run.format = format;
+  run.app = app; run.path = path; run.format = format; run.autosave = autosave;
   qa_caught_error caught;
   bool ok = qa_try(save_body, &run, &caught);
   save_run_release(&run);
   app->world_operation = QA_APPLICATION_IDLE;
   app->world_operation_completion = false;
   qa_application_resume_input(app);
-  if (!ok) qa_rethrow(&caught);
+  if (!ok) { free(run.written_path); qa_rethrow(&caught); }
+  return run.written_path;
+}
+void qa_application_save_game(qa_application *app, const char *path, qa_app_save_format format) {
+  free(qa_application_save_game_at(app, path, format, false));
 }
 
 /* ---- loadGame(path, sourceProduct?) ---- */
@@ -285,7 +422,11 @@ static void restored_save_release(void *record) {
   restored_save *save = record;
   qa_app_prepared_application_save_free(&save->prepared, save->backing);
 }
-typedef struct restore_run { qa_application *app; const char *path; const char *source_product; } restore_run;
+typedef struct restore_run {
+  qa_application *app; const char *path; const char *source_product;
+  /* TS loadedFolder: the prepared save's original Quake II files (borrowed from the kept record). */
+  const qa_q2_save_files *loaded_folder;
+} restore_run;
 static void campaign_unit_cleanup(void *unit) { qa_app_campaign_unit_destroy(unit); }
 static void restore_operation(void *ctx, qa_app_loading_frame *frame) {
   restore_run *run = ctx;
@@ -293,8 +434,9 @@ static void restore_operation(void *ctx, qa_app_loading_frame *frame) {
   restored_save *save = checked(calloc(1, sizeof *save));
   /* The image stays referenced by the restored world (TS GC): the application keeps it. */
   keep_record(app, save, restored_save_release);
-  qa_app_prepare_application_save_native(&app->launch_options, qa_app_loaded_content_catalog(app->loaded_content), run->path,
-      run->source_product, &save->prepared, &save->backing);
+  qa_app_prepare_application_save_loading(&app->launch_options, qa_app_loaded_content_catalog(app->loaded_content), run->path,
+      run->source_product, loading_next_frame, frame, &save->prepared, &save->backing);
+  run->loaded_folder = save->prepared.has_folder ? &save->prepared.folder : NULL;
   qa_app_campaign_unit *unit = qa_app_campaign_unit_create((qa_app_campaign_codec){ NULL, NULL, NULL });
   if (unit == NULL) qa_range_error("Out of memory");
   qa_cleanup unit_cleanup;
@@ -329,22 +471,49 @@ static void clear_pending_world(qa_application *app, bool clear_save) {
     app->has_pending_save = false;
   }
 }
+/* TS adoptQ2Current: SV_Loadgame copies the slot to `current`, where the level files of the running unit live. A
+ * folder that cannot be written leaves the load intact. */
+typedef struct adopt_run { const qa_native_save_layout *native; const qa_q2_save_files *files; } adopt_run;
+static void adopt_store_cleanup(void *store) { qa_q2_save_store_destroy(store); }
+static void adopt_body(void *ctx) {
+  adopt_run *run = ctx;
+  qa_q2_save_store store;
+  qa_q2_save_store_init(&store, run->native->root);
+  qa_cleanup store_guard;
+  qa_cleanup_push(&store_guard, adopt_store_cleanup, &store);
+  qa_q2_save_store_wipe(&store, QA_Q2_CURRENT_SAVE);
+  qa_q2_save_store_write(&store, QA_Q2_CURRENT_SAVE, run->files);
+  qa_cleanup_pop(&store_guard);
+  qa_q2_save_store_destroy(&store);
+}
+static void adopt_q2_current(qa_application *app, const qa_q2_save_files *files) {
+  qa_native_save_layout native;
+  if (!qa_application_native_saves(app, &native)) return;
+  if (native.original == QA_NATIVE_SAVE_Q2_FOLDER) {
+    adopt_run run = {&native, files};
+    qa_caught_error caught;
+    if (!qa_try(adopt_body, &run, &caught))
+      qa_application_printf(app, "Could not update the current save folder: %s\n", caught.message);
+  }
+  qa_native_save_layout_destroy(&native);
+}
 static void restore_body(void *ctx) {
   restore_run *run = ctx;
   qa_app_service_loading(restore_operation, run, poll_loading_events, run->app);
   clear_pending_world(run->app, true);
+  if (run->loaded_folder != NULL) adopt_q2_current(run->app, run->loaded_folder);
 }
 void qa_application_restore_saved_game(qa_application *app, const char *path, const char *source_product) {
   if (qa_application_campaign_movie(app) != NULL) qa_raise("Error", 0, 0, "Finish or skip the campaign cinematic before loading a save");
   if (app->world_operation != QA_APPLICATION_IDLE) qa_raise("Error", 0, 0, "Another world operation is in progress");
   app->world_operation = QA_APPLICATION_LOADING;
   app->world_operation_completion = true;
-  restore_run run = { app, path, source_product };
+  restore_run run = { app, path, source_product, NULL };
   qa_caught_error caught;
   bool ok = qa_try(restore_body, &run, &caught);
+  /* TS restoreSavedGame's finally does not count a world operation (replaceWorld does). */
   app->world_operation = QA_APPLICATION_IDLE;
   app->world_operation_completion = false;
-  app->world_operations++;
   if (!app->closed) qa_application_resume_input(app);
   if (!ok) {
     if (app->fatal_world_failure && !app->stepping) qa_application_close_failed_world(app, &caught);
@@ -477,7 +646,6 @@ qa_q3_base_user_command qa_application_round_prediction_command(void *ctx, qa_ac
  * source.settings.definitions.some(definition => definition.name === variable.name)). */
 qa_cvar_snapshot *qa_application_round_server_settings(void *ctx, size_t *out_count) {
   round_binding *binding = ctx;
-  round_settings_free(binding);
   size_t count = 0, name_count = 0;
   qa_cvar_snapshot *snapshots = qa_cvar_registry_snapshots(qa_app_q3_source_runtime_host(binding->source)->cvars, 0, &count);
   const char *const *names = qa_app_q3_source_runtime_setting_names(binding->source, &name_count);
@@ -488,8 +656,7 @@ qa_cvar_snapshot *qa_application_round_server_settings(void *ctx, size_t *out_co
     if (defined) snapshots[kept++] = snapshots[i];
     else qa_cvar_read_free(&snapshots[i]);
   }
-  binding->settings = snapshots;
-  binding->setting_count = kept;
+  /* The caller frees the array (q3_client.h serverSettings contract); the binding keeps no copy. */
   *out_count = kept;
   return snapshots;
 }
@@ -1465,6 +1632,9 @@ typedef struct retire_call {
   qa_application *app;
   qa_application_graphical *graphical;
   qa_session_seat **seats; size_t seat_count;
+  /* The retired seats' ids: retire_close_client frees a client's seats (TS keeps the objects), so the filters after
+   * it compare these instead of reading the seats. */
+  qa_seat_id *seat_ids;
   qa_app_viewing_seat *kept; size_t kept_count;
   qa_application_q3_seat_client source; bool has_source;
   qa_application_local_q3_guest_seat guest; bool has_guest;
@@ -1537,14 +1707,14 @@ static void retire_dispose(retire_failures *failures, void (*run)(void *ctx), re
   qa_caught_error caught;
   if (!qa_try(run, call, &caught)) retire_failure(failures, &caught);
 }
-static bool seat_listed(qa_session_seat *const *seats, size_t count, qa_seat_id id) {
-  for (size_t i = 0; i < count; i++) if (qa_same_seat(qa_session_seat_id(seats[i]), id)) return true;
+static bool seat_listed(const qa_seat_id *seats, size_t count, qa_seat_id id) {
+  for (size_t i = 0; i < count; i++) if (qa_same_seat(seats[i], id)) return true;
   return false;
 }
 static bool request_kept(const void *record, void *ctx) {
   const qa_application_command_request *request = record;
   retire_call *call = ctx;
-  if (!(request->has_seat && seat_listed(call->seats, call->seat_count, request->seat))) return true;
+  if (!(request->has_seat && seat_listed(call->seat_ids, call->seat_count, request->seat))) return true;
   /* The dropped request's storage is released with it (TS GC). */
   qa_application_command_request_free((qa_application_command_request *)record);
   return false;
@@ -1560,10 +1730,14 @@ static void repoint_q3_clients(qa_application_graphical *graphical) {
       if (qa_same_seat(graphical->q3_seats[j], id)) presentation->q3_client = &graphical->q3[j];
   }
 }
-static size_t filter_input_events(qa_seat_input_event *events, size_t count, qa_session_seat *const *seats, size_t seat_count) {
+/* `owned`: the deferred input owns each event's text (qa_application_input); client inputs borrow theirs. */
+static size_t filter_input_events(qa_seat_input_event *events, size_t count, const qa_seat_id *seats, size_t seat_count,
+                                  bool owned) {
   size_t kept = 0;
-  for (size_t i = 0; i < count; i++)
+  for (size_t i = 0; i < count; i++) {
     if (!seat_listed(seats, seat_count, events[i].seat)) events[kept++] = events[i];
+    else if (owned) qa_application_deferred_input_release(&events[i]);
+  }
   return kept;
 }
 void qa_application_retire_removed_local_players(qa_application *app) {
@@ -1580,6 +1754,10 @@ void qa_application_retire_removed_local_players(qa_application *app) {
   if (seat_count == 0) { free(seats); return; }
   qa_cleanup seats_cleanup;
   qa_cleanup_push(&seats_cleanup, free, seats);
+  qa_seat_id *seat_ids = checked(calloc(seat_count + 1, sizeof *seat_ids));
+  qa_cleanup ids_cleanup;
+  qa_cleanup_push(&ids_cleanup, free, seat_ids);
+  for (size_t i = 0; i < seat_count; i++) seat_ids[i] = qa_session_seat_id(seats[i]);
   qa_session_client **clients = checked(calloc(seat_count + 1, sizeof *clients));
   qa_cleanup clients_cleanup;
   qa_cleanup_push(&clients_cleanup, free, clients);
@@ -1594,7 +1772,7 @@ void qa_application_retire_removed_local_players(qa_application *app) {
   qa_application_seat_presentation *kept = checked(calloc(graphical->presentation_count + 1, sizeof *kept));
   size_t kept_count = 0;
   for (size_t i = 0; i < graphical->presentation_count; i++)
-    if (!seat_listed(seats, seat_count, qa_session_seat_id(graphical->presentations[i].local->player.seat)))
+    if (!seat_listed(seat_ids, seat_count, qa_session_seat_id(graphical->presentations[i].local->player.seat)))
       kept[kept_count++] = graphical->presentations[i];
   free(graphical->presentations);
   graphical->presentations = kept;
@@ -1603,7 +1781,7 @@ void qa_application_retire_removed_local_players(qa_application *app) {
   memset(&failures, 0, sizeof failures);
   retire_call call;
   memset(&call, 0, sizeof call);
-  call.app = app; call.graphical = graphical; call.seats = seats; call.seat_count = seat_count;
+  call.app = app; call.graphical = graphical; call.seats = seats; call.seat_ids = seat_ids; call.seat_count = seat_count;
   call.kept = viewing_seats(graphical); call.kept_count = kept_count;
   qa_cleanup kept_cleanup;
   qa_cleanup_push(&kept_cleanup, free, call.kept);
@@ -1691,8 +1869,8 @@ void qa_application_retire_removed_local_players(qa_application *app) {
     retire_dispose(&failures, retire_close_client, &call);
   }
   qa_event_ring_filter_live(&app->requested_commands, request_kept, &call);
-  app->client_input_count = filter_input_events(app->client_inputs, app->client_input_count, seats, seat_count);
-  app->deferred_input_count = filter_input_events(app->deferred_input, app->deferred_input_count, seats, seat_count);
+  app->client_input_count = filter_input_events(app->client_inputs, app->client_input_count, seat_ids, seat_count, true);
+  app->deferred_input_count = filter_input_events(app->deferred_input, app->deferred_input_count, seat_ids, seat_count, true);
   retire_dispose(&failures, retire_publish_seats, &call);
   for (size_t i = 0; i < kept_count; i++) { call.index = i; retire_dispose(&failures, retire_publish_layout, &call); }
   if (kept_count == 0) qa_application_request_quit(app);
@@ -1701,6 +1879,8 @@ void qa_application_retire_removed_local_players(qa_application *app) {
   free(call.kept);
   qa_cleanup_pop(&clients_cleanup);
   free(clients);
+  qa_cleanup_pop(&ids_cleanup);
+  free(seat_ids);
   qa_cleanup_pop(&seats_cleanup);
   free(seats);
   if (failures.count != 0) qa_raise("AggregateError", 0, (long long)failures.count, "Retired local player cleanup failed");

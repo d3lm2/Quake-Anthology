@@ -259,11 +259,10 @@ void qa_app_mod_choices_destroy(qa_app_mod_choices *choices) {
 
 /* ---------------- applyApplicationMods ---------------- */
 static noreturn void unavailable_selection(qa_mod_selection selection) {
-  char key[512];
-  char *text = qa_mod_selection_key(selection);
-  snprintf(key, sizeof key, "%s", text != NULL ? text : "");
-  free(text);
-  qa_raise("Error", 0, 0, "Selected mod is unavailable: %s", key);
+  char *text = checked(qa_mod_selection_key(selection));
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, text);
+  qa_raise("Error", 0, 0, "Selected mod is unavailable: %s", text);
 }
 qa_app_applied_mods qa_app_apply_application_mods(const qa_executable_recipe *recipe,
     const qa_app_mod_choice *choices, size_t choice_count,
@@ -330,6 +329,13 @@ qa_app_applied_mods qa_app_apply_application_mods(const qa_executable_recipe *re
   out.recipe.mod_count = out.mod_count;
   out.recipe.weapon_behaviors = out.weapon_behaviors;
   out.recipe.weapon_behavior_count = out.weapon_behavior_count;
+  /* { ...recipe, mods, weaponBehaviors }: both keys present even when empty; one the
+   * recipe already has (a non-empty list or a read key) keeps its place. */
+  if (recipe->mods_key == QA_RECIPE_KEY_IF_ANY && recipe->mod_count == 0) out.recipe.mods_key = QA_RECIPE_KEY_LAST;
+  else if (recipe->mods_key == QA_RECIPE_KEY_IF_ANY) out.recipe.mods_key = QA_RECIPE_KEY_FIRST;
+  if (recipe->weapon_behaviors_key == QA_RECIPE_KEY_IF_ANY && recipe->weapon_behavior_count == 0)
+    out.recipe.weapon_behaviors_key = QA_RECIPE_KEY_LAST;
+  else if (recipe->weapon_behaviors_key == QA_RECIPE_KEY_IF_ANY) out.recipe.weapon_behaviors_key = QA_RECIPE_KEY_FIRST;
   return out;
 }
 void qa_app_applied_mods_destroy(qa_app_applied_mods *applied) {
@@ -353,11 +359,10 @@ static bool key_in(const char *const *keys, size_t count, qa_mod_selection selec
   return found;
 }
 static noreturn void raise_key(const char *prefix, const char *middle, qa_mod_selection selection) {
-  char key[512];
-  char *text = qa_mod_selection_key(selection);
-  snprintf(key, sizeof key, "%s", text != NULL ? text : "");
-  free(text);
-  qa_raise("Error", 0, 0, "%s%s%s", prefix, middle, key);
+  char *text = checked(qa_mod_selection_key(selection));
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, text);
+  qa_raise("Error", 0, 0, "%s%s%s", prefix, middle, text);
 }
 static void prepared_free_one(qa_prepared_mod *mod, qa_mod_declaration_runtime runtime) {
   switch (runtime) {

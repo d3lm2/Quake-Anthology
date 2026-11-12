@@ -2,9 +2,13 @@
  * Port of src/core/common-parse.ts: Q3 COM_Parse/COM_Compress, the
  * general Tokenizer and parseEntities, and the Q1/Q2 donor token
  * parsers. C accommodations:
- *  - Source text is ptr+length bytes; the TS Latin-1 charCode checks
- *    are inherent, and offsets/lengths count bytes (UTF-16 units in
- *    TS; identical for Latin-1 input).
+ *  - Source text is ptr+length bytes. COM_Parse cursors, the Q1/Q2 donor
+ *    parsers and a byte-mode Tokenizer hold code-unit bytes (one byte per
+ *    TS code unit, the C convention for Latin-1 strings), so the TS
+ *    Latin-1 charCode checks are inherent and offsets count bytes. A
+ *    text-mode Tokenizer (qa_tokenizer_init_text) reads decoded text
+ *    (UTF-8, qa_text_decoder_decode) and counts its columns and token
+ *    limit in UTF-16 code units, as TS does over the decoded string.
  *  - CommonParseCursor.offset null becomes has_offset == false.
  *  - Prints are fn ptr + ctx; CommonError raises through
  *    qa_common_error; TextParseError aborts with its TS string form.
@@ -108,13 +112,22 @@ typedef struct qa_tokenizer {
   char *source; /* owned */
   size_t length;
   char *name; /* owned */
-  size_t offset;
-  int64_t line, column;
+  size_t offset; /* bytes */
+  int64_t line, column; /* column in TS code units */
+  bool text; /* decoded UTF-8 text (columns and the token limit in UTF-16 units) */
 } qa_tokenizer;
 
-/* `name` NULL means "<text>". False only on OOM. */
+/* `name` NULL means "<text>". False only on OOM. `source` is code-unit bytes
+ * (a TS string whose units are all below 0x100: network strings, BSP entity
+ * lumps, configstrings). */
 bool qa_tokenizer_init(qa_tokenizer *tokenizer, const char *source, size_t length,
                        const char *name);
+/* The same over decoded text (TS `new TextDecoder().decode(bytes)`, held as
+ * UTF-8 with a decoded U+0000 as C0 80; see qa_text_decoder_decode): a
+ * supplementary character is two units, U+0000 is one unit of white space,
+ * and a byte that does not start valid UTF-8 counts as one unit. */
+bool qa_tokenizer_init_text(qa_tokenizer *tokenizer, const char *source, size_t length,
+                            const char *name);
 void qa_tokenizer_destroy(qa_tokenizer *tokenizer);
 /* False is TS undefined (also false on OOM, with out->value NULL). */
 bool qa_tokenizer_next(qa_tokenizer *tokenizer, bool allow_line_breaks, qa_text_token *out);

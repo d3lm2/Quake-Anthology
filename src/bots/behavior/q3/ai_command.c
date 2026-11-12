@@ -800,7 +800,7 @@ QA_BOT_MATCH_FN(qa_bot_match_check_point_bots_a) {
     char *text = qa_q3_game_format("%1.0f %1.0f %1.0f", args, 3, 256);
     if (text == NULL)
       qa_range_error("Bot format allocation failed");
-    const char *variables[] = {checkpoint->name, text};
+    const char *variables[] = {qa_bot_waypoint_name_bots_a(checkpoint), text};
     qa_bot_initial_chat_bots_a(ctx, state, "checkpoint_confirm", variables, 2);
     free(text);
     enter_chat(ctx, state, client, QA_CHAT_TELL);
@@ -1021,7 +1021,7 @@ QA_BOT_MATCH_FN(qa_bot_match_where_are_you_bots_a) {
   bool obelisks = missionpack && (gt == GT_OBELISK || gt == GT_HARVESTER);
   if (flags || obelisks) {
     if (!qa_ai_navigation_ready_bots_a(ctx))
-      qa_range_error("BotMatch_WhereAreYou requires loaded AAS routing");
+      qa_raise("Error", 0, 0, "BotMatch_WhereAreYou requires loaded AAS routing");
     const qa_game_ai_deathmatch_state_bots_a *goals = &ctx->deathmatch;
     qa_vec3 origin = qa_bot_v3(state->src->origin);
     red = qa_ai_area_travel_time_bots_a(ctx, state->src->area_num, origin,
@@ -1074,7 +1074,7 @@ QA_BOT_MATCH_FN(qa_bot_match_lead_the_way_bots_a) {
   /* Source checks teamgoal here, after writing lead_teamgoal. */
   if (state->src->team_goal.entity < 0) {
     if (other ? !has_teammate : !has_netname)
-      qa_range_error("BotMatch_LeadTheWay reads an uninitialized source teammate name");
+      qa_raise("Error", 0, 0, "BotMatch_LeadTheWay reads an uninitialized source teammate name");
     chat1(ctx, state, other ? "whereis" : "whereareyou", other ? teammate : netname);
     enter_chat(ctx, state, state->src->client, QA_CHAT_TEAM);
     return;

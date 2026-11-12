@@ -78,15 +78,23 @@ static ptr_entry *map_get(ptr_map *map, int64_t offset) {
     if (map->entries[i].offset == offset) return &map->entries[i];
   return NULL;
 }
+/* String and allocation entries hold a reference, as the TS Map keeps the
+   object alive; the entry is removed before its value is released. */
+static void entry_value_release(ptr_kind kind, void *value) {
+  if (kind == PTR_STRING) qa_ui_string_reference_release(value);
+  else if (kind == PTR_ALLOCATION) qa_ui_memory_allocation_destroy(value);
+}
+static void entry_value_retain(ptr_kind kind, void *value);
 static void map_delete(ptr_map *map, int64_t offset) {
   if (map == NULL) return;
   for (size_t i = 0; i < map->count; i++) {
     if (map->entries[i].offset == offset) {
-      if (map->entries[i].kind == PTR_STRING)
-        qa_ui_string_reference_release(map->entries[i].value);
+      ptr_kind kind = map->entries[i].kind;
+      void *value = map->entries[i].value;
       memmove(&map->entries[i], &map->entries[i + 1],
               (map->count - i - 1) * sizeof(ptr_entry));
       map->count--;
+      entry_value_release(kind, value);
       return;
     }
   }
@@ -94,6 +102,8 @@ static void map_delete(ptr_map *map, int64_t offset) {
 static void map_set(ptr_map *map, int64_t offset, ptr_kind kind, void *value,
                     bool has_handle, int32_t handle) {
   ptr_entry *entry = map_get(map, offset);
+  ptr_kind old_kind = PTR_SCRIPT;
+  void *old_value = NULL;
   if (entry == NULL) {
     if (map->count == map->cap) {
       size_t cap = map->cap == 0 ? 8 : map->cap * 2;
@@ -104,22 +114,34 @@ static void map_set(ptr_map *map, int64_t offset, ptr_kind kind, void *value,
     }
     entry = &map->entries[map->count++];
     entry->offset = offset;
-    entry->value = NULL;
-    entry->kind = kind;
-  } else if (entry->kind == PTR_STRING) {
-    qa_ui_string_reference_release(entry->value);
+  } else {
+    old_kind = entry->kind;
+    old_value = entry->value;
   }
+  entry_value_retain(kind, value);
   entry->kind = kind;
   entry->value = value;
   entry->has_handle = has_handle;
   entry->handle = handle;
-  if (kind == PTR_STRING) qa_ui_string_reference_retain(value);
+  entry_value_release(old_kind, old_value);
+}
+/* Drops every entry. Entries can hold allocations and references that hold
+   the map itself, so an owner clears its map before releasing it. */
+static void map_clear(ptr_map *map) {
+  if (map == NULL) return;
+  map->refs++;
+  while (map->count > 0) {
+    ptr_entry entry = map->entries[--map->count];
+    entry_value_release(entry.kind, entry.value);
+  }
+  map_release(map);
 }
 static void map_release(ptr_map *map) {
   if (map == NULL || --map->refs > 0) return;
-  for (size_t i = 0; i < map->count; i++)
-    if (map->entries[i].kind == PTR_STRING)
-      qa_ui_string_reference_release(map->entries[i].value);
+  while (map->count > 0) {
+    ptr_entry entry = map->entries[--map->count];
+    entry_value_release(entry.kind, entry.value);
+  }
   free(map->entries);
   free(map);
 }
@@ -200,7 +222,14 @@ struct qa_ui_memory_allocation {
   ptr_map *pointers;
   int64_t offset;
   int64_t size;
+  size_t refs; /* the owner's handle plus each pointer-map entry */
 };
+
+static void entry_value_retain(ptr_kind kind, void *value) {
+  if (kind == PTR_STRING) qa_ui_string_reference_retain(value);
+  else if (kind == PTR_ALLOCATION && value != NULL)
+    ((qa_ui_memory_allocation *)value)->refs++;
+}
 
 static qa_ui_memory_allocation *allocation_new(byte_storage *storage,
                                                ptr_map *pointers,
@@ -215,6 +244,7 @@ static qa_ui_memory_allocation *allocation_new(byte_storage *storage,
   allocation->pointers = map_retain(pointers);
   allocation->offset = offset;
   allocation->size = size;
+  allocation->refs = 1;
   return allocation;
 }
 
@@ -236,7 +266,7 @@ qa_ui_memory_allocation *qa_ui_memory_allocation_zeroed(int64_t size) {
 }
 
 void qa_ui_memory_allocation_destroy(qa_ui_memory_allocation *allocation) {
-  if (allocation == NULL) return;
+  if (allocation == NULL || --allocation->refs > 0) return;
   storage_release(allocation->storage);
   map_release(allocation->pointers);
   free(allocation);
@@ -541,9 +571,9 @@ struct qa_ui_team_arena_memory {
   byte_storage *strings;
   ptr_map *pointers;
   qa_ui_memory_allocation *menus;
+  /* Each bucket head holds a reference; later nodes are held by the
+     pointer-map entry of the node before them, as in TS. */
   qa_ui_memory_allocation *buckets[BUCKET_COUNT];
-  qa_ui_memory_allocation **owned_handles; /* stringDef borrows */
-  size_t owned_count, owned_cap;
   qa_ui_string_reference *empty_string;
   int64_t string_point;
   int64_t allocation_point;
@@ -578,9 +608,12 @@ qa_ui_team_arena_memory *qa_ui_team_arena_memory_create(
 
 void qa_ui_team_arena_memory_destroy(qa_ui_team_arena_memory *memory) {
   if (memory == NULL) return;
-  for (size_t i = 0; i < memory->owned_count; i++)
-    qa_ui_memory_allocation_destroy(memory->owned_handles[i]);
-  free(memory->owned_handles);
+  for (int i = 0; i < BUCKET_COUNT; i++) {
+    qa_ui_memory_allocation_destroy(memory->buckets[i]);
+    memory->buckets[i] = NULL;
+  }
+  map_clear(memory->pointers);
+  if (memory->menus != NULL) map_clear(memory->menus->pointers);
   qa_ui_memory_allocation_destroy(memory->menus);
   qa_ui_string_reference_release(memory->empty_string);
   storage_release(memory->bytes);
@@ -669,7 +702,11 @@ void qa_ui_team_arena_memory_report(qa_ui_team_arena_memory *memory) {
 
 void qa_ui_team_arena_memory_initialize_strings(
     qa_ui_team_arena_memory *memory) {
-  for (int i = 0; i < BUCKET_COUNT; i++) memory->buckets[i] = NULL;
+  for (int i = 0; i < BUCKET_COUNT; i++) {
+    qa_ui_memory_allocation *head = memory->buckets[i];
+    memory->buckets[i] = NULL;
+    qa_ui_memory_allocation_destroy(head);
+  }
   memory->string_point = 0;
   qa_ui_team_arena_memory_initialize_memory(memory);
 }
@@ -693,6 +730,10 @@ char *qa_ui_team_arena_memory_string_alloc(qa_ui_team_arena_memory *memory,
   qa_ui_string_reference *reference =
       qa_ui_team_arena_memory_string_alloc_reference(memory, input);
   return reference == NULL ? NULL : qa_ui_string_reference_read(reference);
+}
+
+static void release_allocation(void *allocation) {
+  qa_ui_memory_allocation_destroy(allocation);
 }
 
 qa_ui_string_reference *qa_ui_team_arena_memory_string_alloc_reference(
@@ -737,15 +778,10 @@ qa_ui_string_reference *qa_ui_team_arena_memory_string_alloc_reference(
   qa_ui_memory_allocation *allocation =
       qa_ui_team_arena_memory_borrow(memory, offset, 8);
   if (allocation == NULL) qa_range_error("UI memory allocation failed");
-  if (memory->owned_count == memory->owned_cap) {
-    size_t cap = memory->owned_cap == 0 ? 8 : memory->owned_cap * 2;
-    qa_ui_memory_allocation **grown =
-        realloc(memory->owned_handles, cap * sizeof *grown);
-    if (grown == NULL) qa_range_error("UI memory allocation failed");
-    memory->owned_handles = grown;
-    memory->owned_cap = cap;
-  }
-  memory->owned_handles[memory->owned_count++] = allocation;
+  /* Freed if a step below raises; otherwise the bucket or the tail's link
+     takes over the handle. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_allocation, allocation);
   qa_ui_memory_allocation_set_allocation_pointer(allocation, 0, NULL);
   qa_ui_memory_allocation_set_string_reference(allocation, 4, reference);
   qa_ui_string_reference_release(reference); /* the map retains it */
@@ -761,8 +797,13 @@ qa_ui_string_reference *qa_ui_team_arena_memory_string_alloc_reference(
     if (next == NULL) break;
     tail = next;
   }
-  if (tail != NULL)
+  if (tail != NULL) {
     qa_ui_memory_allocation_set_allocation_pointer(tail, 0, allocation);
-  else memory->buckets[hash] = allocation;
+    qa_cleanup_pop(&guard);
+    qa_ui_memory_allocation_destroy(allocation); /* the link holds it */
+  } else {
+    qa_cleanup_pop(&guard);
+    memory->buckets[hash] = allocation;
+  }
   return stored;
 }

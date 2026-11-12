@@ -5,6 +5,7 @@
 #include "qa/content/q2/base/monsters/boss_common.h"
 #include "qa/content/q2/base/monsters/common.h"
 #include "qa/content/q2/base/monsters/tables/boss32.h"
+#include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/monsters/ai.h"
 #include "qa/content/q2/foundation/monsters/gibs.h"
 #include "qa/content/q2/foundation/monsters/muzzle.h"
@@ -64,7 +65,9 @@ void qa_q2bm_makron_toss(qa_q2m_context *context, qa_q2m_monsters *monsters) {
   qa_q2_entity *entity = context->entity;
   qa_q2_game_services *game = context->game;
   qa_q2_entity *child = game->create(game->ctx, "monster_makron", NULL, 0);
-  child->target = entity->target;
+  /* TS strings are values. Jorg's text is owned by Jorg's spawn fields and Jorg is
+   * freed as a gib head long before the Makron dies and fires this target. */
+  child->target = qa_q2_intern(entity->target ? entity->target : "");
   qa_q2_body_changes changes;
   memset(&changes, 0, sizeof changes);
   changes.has_origin = true; changes.origin = q2bm_body(game, entity).origin;

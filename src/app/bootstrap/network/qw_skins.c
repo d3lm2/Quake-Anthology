@@ -12,6 +12,8 @@ typedef struct cache_entry {
 struct qa_app_qw_player_skins {
   qa_app_qw_skin_options options;
   cache_entry *entries; size_t count, capacity;
+  /* name/pixels pairs of cleared entries, kept for selections made before the clear. */
+  void **retired; size_t retired_count, retired_capacity;
 };
 static bool skin_name_charset_ok(const char *value) {
   if (!*value) return false;
@@ -45,15 +47,35 @@ qa_app_qw_player_skins *qa_app_qw_player_skins_create(qa_app_qw_skin_options opt
   s->options = options;
   return s;
 }
-void qa_app_qw_player_skins_clear(qa_app_qw_player_skins *skins) {
-  for (size_t i = 0; i < skins->count; i++) {
-    free(skins->entries[i].key); free(skins->entries[i].name); free(skins->entries[i].pixels);
+void qa_app_qw_player_skins_release_retired(qa_app_qw_player_skins *skins) {
+  for (size_t i = 0; i < skins->retired_count; i++) free(skins->retired[i]);
+  skins->retired_count = 0;
+}
+static void retire(qa_app_qw_player_skins *skins, void *block) {
+  if (!block) return;
+  if (skins->retired_count == skins->retired_capacity) {
+    size_t capacity = skins->retired_capacity ? skins->retired_capacity * 2 : 32;
+    void **grown = realloc(skins->retired, capacity * sizeof *grown);
+    if (!grown) { free(block); qa_range_error("out of memory"); }
+    skins->retired = grown;
+    skins->retired_capacity = capacity;
   }
+  skins->retired[skins->retired_count++] = block;
+}
+void qa_app_qw_player_skins_clear(qa_app_qw_player_skins *skins) {
+  size_t count = skins->count;
   skins->count = 0;
+  for (size_t i = 0; i < count; i++) {
+    free(skins->entries[i].key);
+    retire(skins, skins->entries[i].name);
+    retire(skins, skins->entries[i].pixels);
+  }
 }
 void qa_app_qw_player_skins_destroy(qa_app_qw_player_skins *skins) {
   if (!skins) return;
   qa_app_qw_player_skins_clear(skins);
+  qa_app_qw_player_skins_release_retired(skins);
+  free(skins->retired);
   free(skins->entries); free(skins);
 }
 char *qa_app_qw_player_skins_name(qa_app_qw_player_skins *skins, const char *userinfo_skin) {

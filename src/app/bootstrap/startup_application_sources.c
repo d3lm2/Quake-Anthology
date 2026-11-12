@@ -7,12 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 
-static char error_text[sizeof ((qa_caught_error *)0)->message];
+static char *error_text; /* the whole caught message, valid until the next one */
 static const char *caught_text(const qa_caught_error *caught) {
-  snprintf(error_text, sizeof error_text, "%s", caught->message);
-  return error_text;
+  return qa_startup_keep_text(&error_text, qa_caught_message(caught));
 }
 
 /* The recorder and demo-command hosts' ctx: the application and the prepared
@@ -276,7 +276,8 @@ static char *demo_take_completion(void *ctx, const char *family) {
   const char *name = strcmp(family, "q2") == 0 ? "nextserver" : "nextdemo";
   qa_cvar_registry *cvars = qa_app_prepared_startup_source(binding->prepared);
   char *command = qa_cvar_registry_variable_string(cvars, name);
-  qa_cvar_registry_set(cvars, name, "", true, NULL);
+  qa_cvar_snapshot cleared; /* set fills its snapshot: it takes no NULL */
+  if (qa_cvar_registry_set(cvars, name, "", true, &cleared)) qa_cvar_read_free(&cleared);
   return command;
 }
 

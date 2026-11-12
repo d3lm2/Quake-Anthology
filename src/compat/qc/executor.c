@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/content/json_text.h"
 #include "qa/core/binary/index.h"
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
@@ -11,10 +12,14 @@ static bool same_module(qa_module_identity a, qa_module_identity b) {
   return strcmp(a.id ? a.id : "", b.id ? b.id : "") == 0 && strcmp(a.artifact_path ? a.artifact_path : "", b.artifact_path ? b.artifact_path : "") == 0
       && strcmp(a.digest ? a.digest : "", b.digest ? b.digest : "") == 0 && strcmp(a.revision ? a.revision : "", b.revision ? b.revision : "") == 0;
 }
+static void snapshot_destroy_cleanup(void *arg) { qa_compat_qc_machine_snapshot_destroy(arg); }
 bool qa_compat_qc_capture_checkpoint(qa_compat_qc_machine *m, qa_module_identity module, qa_compat_qc_executor_host host_adapter, qa_guest_checkpoint *out, qa_compat_qc_machine_snapshot *snap, uint8_t **out_host_bytes) {
   if (!qa_compat_qc_machine_get_snapshot(m, snap)) return false;
+  /* The caller owns the snapshot only once this returns: a raise from the host releases it. */
+  qa_cleanup snapshot_scope; qa_cleanup_push(&snapshot_scope, snapshot_destroy_cleanup, snap);
   qa_compat_qc_host_saved_state host = host_adapter.checkpoint(host_adapter.ctx);
   if (!same_module(host.state.module, module)) qa_compat_qc_machine_fail(m, "host checkpoint belongs to another module");
+  qa_cleanup_pop(&snapshot_scope);
   size_t format_len = strlen(host.state.format);
   qa_binary_writer w;
   if (!qa_binary_writer_init(&w, (int64_t)(24 + snap->profiling_count * 4 + format_len + host.state.bytes.length))) return false;
@@ -38,6 +43,25 @@ bool qa_compat_qc_capture_checkpoint(qa_compat_qc_machine *m, qa_module_identity
   out->host_state.module = module; out->host_state.format = "quakec:host-v1";
   out->host_state.bytes.bytes = *out_host_bytes; out->host_state.bytes.length = host_len;
   return true;
+}
+/* TS new TextDecoder("utf-8", { fatal: true }).decode(reader.bytes(length)): the whole field, a leading byte order
+ * mark dropped, invalid UTF-8 a TypeError. A NUL is part of the TS string; it becomes 0xff here (a byte no UTF-8
+ * text holds) so the C string keeps its length and no host format equals it, as none equals the TS string. */
+static char *decode_host_format(qa_binary_reader *reader, uint32_t length) {
+  uint8_t *bytes = qa_binary_reader_bytes(reader, length);
+  if (!bytes && length != 0) return NULL;
+  size_t start = length >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf ? 3 : 0;
+  if (!qa_content_utf8_valid(bytes + start, length - start)) {
+    free(bytes);
+    qa_raise("TypeError", 0, 0, "Invalid byte sequence");
+  }
+  char *text = malloc(length - start + 1);
+  if (text) {
+    for (size_t i = start; i < length; i++) text[i - start] = bytes[i] == 0 ? (char)0xff : (char)bytes[i];
+    text[length - start] = 0;
+  }
+  free(bytes);
+  return text;
 }
 typedef struct { qa_binary_reader reader; double *profiling; char *format; uint8_t *state_bytes; } RestoreScope;
 static void restore_scope_free(void *arg) {
@@ -64,7 +88,7 @@ static bool restore_impl(qa_compat_qc_machine *m, qa_module_identity module, con
   if (ok) {
     for (uint32_t i = 0; i < count; i++) r.profiling[i] = (double)qa_binary_reader_u32(&r.reader);
     uint32_t format_length = qa_binary_reader_u32(&r.reader);
-    r.format = qa_binary_reader_fixed_string(&r.reader, format_length);
+    r.format = decode_host_format(&r.reader, format_length);
     uint32_t state_len = qa_binary_reader_u32(&r.reader);
     r.state_bytes = qa_binary_reader_bytes(&r.reader, state_len);
     uint32_t var_off = qa_binary_reader_u32(&r.reader);
@@ -76,7 +100,8 @@ static bool restore_impl(qa_compat_qc_machine *m, qa_module_identity module, con
       qa_compat_qc_machine_snapshot snap; memset(&snap, 0, sizeof snap);
       snap.globals = (uint8_t *)cp->globals.bytes; snap.globals_length = cp->globals.length;
       snap.entities = (uint8_t *)cp->entities.bytes; snap.entities_length = cp->entities.length;
-      snap.entity_count = (int64_t)cp->entity_count;
+      /* TS validateSnapshot refuses a count that is not an integer in 1..capacity; 0 is refused at that check. */
+      snap.entity_count = cp->entity_count == trunc(cp->entity_count) && fabs(cp->entity_count) < 9007199254740992.0 ? (int64_t)cp->entity_count : 0;
       snap.strings = (uint8_t *)cp->strings.bytes; snap.strings_length = cp->strings.length;
       snap.statement = (int64_t)cp->statement; snap.function_index = (int64_t)cp->function_index; snap.argument_count = (int64_t)cp->argument_count;
       snap.profiling = r.profiling; snap.profiling_count = count; snap.trace_enabled = trace;

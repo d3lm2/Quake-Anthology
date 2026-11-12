@@ -28,6 +28,16 @@ typedef struct read_ctx {
   const qa_app_q3_product_host *host;
   const qa_catalog_discovered_product *selected;
 } read_ctx;
+/* The policy registry and its identity are TS garbage; a raise (an invalid product id) frees them here. */
+typedef struct policy_owners { qa_identity_owner identity; qa_cvar_registry *cvars; qa_app_startup_phases phases; bool has_phases; } policy_owners;
+static void policy_owners_free(void *ctx) {
+  policy_owners *owners = ctx;
+  if (owners->has_phases) qa_app_startup_phases_free(&owners->phases);
+  owners->has_phases = false;
+  if (owners->cvars != NULL) qa_cvar_registry_destroy(owners->cvars);
+  owners->cvars = NULL;
+  qa_identity_owner_destroy(&owners->identity);
+}
 static bool read_product_id(void *ctx, const uint8_t **out, size_t *out_length) {
   read_ctx *read = ctx;
   const uint8_t *bytes = read->host->product_id_bytes(read->host->ctx, read->selected, out_length);
@@ -46,17 +56,22 @@ qa_app_prepared_q3_product qa_app_prepare_q3_application_product(
   if (has_product) {
     product = options->q3_product;
   } else {
-    qa_identity_owner identity = {0};
-    if (!qa_identity_owner_create(&identity, "q3-product-policy")) qa_range_error("Out of memory");
+    policy_owners owners;
+    memset(&owners, 0, sizeof owners);
+    if (!qa_identity_owner_create(&owners.identity, "q3-product-policy")) qa_range_error("Out of memory");
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, policy_owners_free, &owners);
     qa_cvar_registry_options cvar_options = {0};
     cvar_options.dialect = QA_COMMAND_DIALECT_Q3;
-    cvar_options.context.session = identity.session;
+    cvar_options.context.session = owners.identity.session;
     cvar_options.context.origin.kind = QA_COMMAND_ORIGIN_SERVER_CONSOLE;
-    qa_cvar_registry *cvars = qa_cvar_registry_create(&cvar_options);
+    qa_cvar_registry *cvars = owners.cvars = qa_cvar_registry_create(&cvar_options);
     if (cvars == NULL) qa_range_error("Out of memory");
     const char *const *lines = options != NULL ? (const char *const *)options->startup_commands : NULL;
     size_t line_count = options != NULL ? options->startup_command_count : 0;
-    qa_app_startup_phases phases = qa_app_startup_command_phases(lines, line_count, QA_COMMAND_DIALECT_Q3);
+    owners.phases = qa_app_startup_command_phases(lines, line_count, QA_COMMAND_DIALECT_Q3);
+    owners.has_phases = true;
+    const qa_app_startup_phases phases = owners.phases;
     for (size_t i = 0; i < phases.variable_count; i++) {
       const char *name = phases.variables[i].name;
       if (name_is_ci(name, "com_prereleasedemo") || name_is_ci(name, "com_prereleaseteamarenademo")
@@ -65,7 +80,8 @@ qa_app_prepared_q3_product qa_app_prepare_q3_application_product(
         if (qa_cvar_registry_set(cvars, name, phases.variables[i].value, true, &snap)) qa_cvar_read_free(&snap);
       }
     }
-    qa_app_startup_phases_free(&phases);
+    qa_app_startup_phases_free(&owners.phases);
+    owners.has_phases = false;
     registrar_ctx registrar = {cvars};
     qa_q3_cvar_registrar adapter = {&registrar, registrar_register};
     qa_q3_product_policy policy = qa_register_q3_product_policy(&adapter);
@@ -74,8 +90,8 @@ qa_app_prepared_q3_product qa_app_prepare_q3_application_product(
     bool forced = (forced_snapshot ? forced_value : 0) != 0;
     read_ctx read = {host, selected};
     qa_q3_mount_restriction restriction = qa_q3_resolve_mount_restriction(policy, forced, read_product_id, &read);
-    qa_cvar_registry_destroy(cvars);
-    qa_identity_owner_destroy(&identity);
+    qa_cleanup_pop(&guard);
+    policy_owners_free(&owners);
     product.policy = policy;
     product.restriction = restriction;
     has_product = true;

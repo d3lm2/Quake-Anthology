@@ -3,6 +3,7 @@
 #include "qa/content/q2/missionpacks/monsters/hints.h"
 #include "qa/network/common/js_number.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,11 +168,30 @@ void qa_q2mpm_hint_init_free(qa_q2mpm_hint_initialization *report) {
   free(report->issues);
   memset(report, 0, sizeof *report);
 }
-static char *duplicate_text(const char *text) {
-  char *copy = malloc(strlen(text) + 1);
-  if (!copy) qa_raise("Error", 0, 0, "Out of memory recording hint issue");
-  strcpy(copy, text);
-  return copy;
+/* A TS template string: sized to the text (target and targetname are map strings of any length). */
+static char *format_text(const char *format, ...) {
+  va_list args, copy;
+  va_start(args, format);
+  va_copy(copy, args);
+  int need = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *text = need < 0 ? NULL : malloc((size_t)need + 1);
+  if (!text) { va_end(args); qa_raise("Error", 0, 0, "Out of memory recording hint issue"); }
+  (void)vsnprintf(text, (size_t)need + 1, format, args);
+  va_end(args);
+  return text;
+}
+/* TS report(message): issues.push(message), then the diagnostic. Owns `message`. */
+static void report_issue(qa_q2mpm_hint_initialization *out, size_t *issue_cap, qa_q2_game_services *game, char *message) {
+  if (out->issue_count == *issue_cap) {
+    size_t cap = *issue_cap ? *issue_cap * 2 : 4;
+    char **grown = realloc(out->issues, cap * sizeof *grown);
+    if (!grown) { free(message); qa_raise("Error", 0, 0, "Out of memory recording hint issue"); }
+    out->issues = grown;
+    *issue_cap = cap;
+  }
+  out->issues[out->issue_count++] = message;
+  game->host->diagnostic(game->host->ctx, message);
 }
 static int compare_entities(const void *left, const void *right) {
   const double *slots = NULL;
@@ -219,19 +239,10 @@ bool qa_q2mpm_hints_finalize(qa_q2mpm_hints *hints, qa_q2_game_services *game, q
     if ((qa_js_to_uint32(hint->spawnflags) & HINT_ENDPOINT) == 0 || target[0] == '\0') continue;
     if (targetname[0] != '\0') {
       char position[96];
-      char message[512];
       position_text(hint, game, position, sizeof position);
-      snprintf(message, sizeof message,
-               "Hint path at %s marked as endpoint with both target (%s) and targetname (%s)",
-               position, target, targetname);
-      if (out->issue_count == issue_cap) {
-        issue_cap = issue_cap ? issue_cap * 2 : 4;
-        char **grown = realloc(out->issues, issue_cap * sizeof *grown);
-        if (!grown) { free(sorted); qa_q2mpm_hint_init_free(out); return false; }
-        out->issues = grown;
-      }
-      out->issues[out->issue_count++] = duplicate_text(message);
-      game->host->diagnostic(game->host->ctx, message);
+      report_issue(out, &issue_cap, game,
+                   format_text("Hint path at %s marked as endpoint with both target (%s) and targetname (%s)",
+                               position, target, targetname));
     } else if (hints->start_count < MAX_HINT_CHAINS) {
       starts_push(hints, hint->actor.id);
     }
@@ -254,18 +265,10 @@ bool qa_q2mpm_hints_finalize(qa_q2mpm_hints *hints, qa_q2_game_services *game, q
       qa_q2_entity *next = match_count ? matches[0] : NULL;
       if (match_count > 1) {
         char position[96];
-        char message[512];
         position_text(current, game, position, sizeof position);
-        snprintf(message, sizeof message, "Forked hint path at %s detected for chain %zu, target %s",
-                 position, hints->start_count, current_target);
-        if (out->issue_count == issue_cap) {
-          issue_cap = issue_cap ? issue_cap * 2 : 4;
-          char **grown = realloc(out->issues, issue_cap * sizeof *grown);
-          if (!grown) { free(visited); free(sorted); qa_q2mpm_hint_init_free(out); return false; }
-          out->issues = grown;
-        }
-        out->issues[out->issue_count++] = duplicate_text(message);
-        game->host->diagnostic(game->host->ctx, message);
+        report_issue(out, &issue_cap, game,
+                     format_text("Forked hint path at %s detected for chain %zu, target %s", position, hints->start_count,
+                                 current_target));
         root->has_next = false;
         break;
       }
@@ -275,18 +278,10 @@ bool qa_q2mpm_hints_finalize(qa_q2mpm_hints *hints, qa_q2_game_services *game, q
       qa_q2mpm_hint_node *previous = node_of(hints, next->actor.id);
       if (seen || (previous && previous->has_next)) {
         char position[96];
-        char message[512];
         position_text(next, game, position, sizeof position);
-        snprintf(message, sizeof message, "Circular hint path at %s detected for chain %zu, targetname %s",
-                 position, hints->start_count, next->targetname ? next->targetname : "");
-        if (out->issue_count == issue_cap) {
-          issue_cap = issue_cap ? issue_cap * 2 : 4;
-          char **grown = realloc(out->issues, issue_cap * sizeof *grown);
-          if (!grown) { free(visited); free(sorted); qa_q2mpm_hint_init_free(out); return false; }
-          out->issues = grown;
-        }
-        out->issues[out->issue_count++] = duplicate_text(message);
-        game->host->diagnostic(game->host->ctx, message);
+        report_issue(out, &issue_cap, game,
+                     format_text("Circular hint path at %s detected for chain %zu, targetname %s", position,
+                                 hints->start_count, next->targetname ? next->targetname : ""));
         root->has_next = false;
         break;
       }
@@ -318,24 +313,32 @@ bool qa_q2mpm_hints_finalize(qa_q2mpm_hints *hints, qa_q2_game_services *game, q
   out->chains = hints->start_count;
   return true;
 }
-static size_t chain_collect(qa_q2mpm_hints *hints, qa_q2_game_services *game, qa_actor_id start, qa_q2_entity **buffer,
-                            size_t capacity) {
-  size_t count = 0;
+/* TS chain(): the entities of one chain from `start`, each once, appended to
+ * *list (malloc'd, grown here). The visited test reads the entries this call
+ * appended, so it never looks past what it stored. */
+static void chain_collect(qa_q2mpm_hints *hints, qa_q2_game_services *game, qa_actor_id start, qa_q2_entity ***list,
+                          size_t *count, size_t *cap) {
+  size_t first = *count;
   bool has_actor = true;
   qa_actor_id actor = start;
   while (has_actor) {
     bool seen = false;
-    for (size_t i = 0; i < count; i++) if (qa_same_actor(buffer[i]->actor.id, actor)) seen = true;
+    for (size_t i = first; i < *count; i++) if (qa_same_actor((*list)[i]->actor.id, actor)) seen = true;
     if (seen) break;
     qa_q2_entity *entity = game->entity(game->ctx, &actor);
     if (!entity) break;
-    if (count < capacity) buffer[count] = entity;
-    count++;
+    if (*count == *cap) {
+      size_t grown_cap = *cap ? *cap * 2 : 16;
+      qa_q2_entity **grown = realloc(*list, grown_cap * sizeof *grown);
+      if (!grown) { free(*list); *list = NULL; qa_raise("Error", 0, 0, "Out of memory walking a hint chain"); }
+      *list = grown;
+      *cap = grown_cap;
+    }
+    (*list)[(*count)++] = entity;
     qa_q2mpm_hint_node *node = node_of(hints, actor);
     has_actor = node && node->has_next;
     if (has_actor) actor = node->next;
   }
-  return count;
 }
 qa_q2_entity *qa_q2mpm_hints_find_start(qa_q2mpm_hints *hints, qa_q2_entity *entity, qa_q2_game_services *game) {
   (void)hints;
@@ -409,16 +412,9 @@ bool qa_q2mpm_hints_check(qa_q2mpm_hints *hints, qa_q2m_context *context) {
   qa_body_state_result enemy = qa_shared_body_table_read(game->host->bodies, enemy_actor);
   if (!enemy.has_value) return false;
   qa_vec3 origin = q2mpm_body(game, entity).origin;
-  size_t total = 0;
-  for (size_t i = 0; i < hints->start_count; i++) {
-    qa_q2_entity *scratch[1];
-    total += chain_collect(hints, game, hints->starts[i], scratch, 0);
-  }
-  qa_q2_entity **all = malloc((total ? total : 1) * sizeof *all);
-  if (!all) qa_raise("Error", 0, 0, "Out of memory in hint check");
-  size_t all_count = 0;
-  for (size_t i = 0; i < hints->start_count; i++)
-    all_count += chain_collect(hints, game, hints->starts[i], all + all_count, total - all_count);
+  qa_q2_entity **all = NULL;
+  size_t all_count = 0, all_cap = 0;
+  for (size_t i = 0; i < hints->start_count; i++) chain_collect(hints, game, hints->starts[i], &all, &all_count, &all_cap);
   qa_q2_entity *start = NULL;
   qa_q2_entity *destination = NULL;
   /* Monster-side nodes near and visible; represented chains. */
@@ -570,10 +566,9 @@ void qa_q2mpm_hints_touch(qa_q2mpm_hints *hints, qa_q2_entity *hint, qa_q2_game_
   bool goal_found = false;
   if (node && node->chain >= 0 && (size_t)node->chain < hints->start_count) {
     qa_actor_id start = hints->starts[(size_t)node->chain];
-    size_t capacity = chain_collect(hints, game, start, NULL, 0);
-    qa_q2_entity **chain = malloc((capacity ? capacity : 1) * sizeof *chain);
-    if (!chain) qa_raise("Error", 0, 0, "Out of memory in hint touch");
-    size_t count = chain_collect(hints, game, start, chain, capacity);
+    qa_q2_entity **chain = NULL;
+    size_t count = 0, capacity = 0;
+    chain_collect(hints, game, start, &chain, &count, &capacity);
     for (size_t i = 0; i < count; i++) {
       qa_q2_entity *entry = chain[i];
       qa_q2mpm_hint_node *entry_node = node_of(hints, entry->actor.id);
@@ -671,16 +666,20 @@ void qa_q2mpm_hints_restore(qa_q2mpm_hints *hints, qa_q2_game_services *game, co
   }
   for (size_t i = 0; i < checkpoint->monster_count; i++) {
     const qa_q2mpm_hint_monster_checkpoint *saved = &checkpoint->monsters[i];
-    if (hints->pursuer_count == hints->pursuer_cap) {
+    qa_actor_id pursuer = restore_reference(game, saved->actor);
+    qa_q2mpm_hint_monster *existing = NULL; /* Map.set: a repeated actor keeps its place and takes the later value */
+    for (size_t j = 0; j < hints->pursuer_count && !existing; j++)
+      if (qa_same_actor(hints->pursuers[j].actor, pursuer)) existing = &hints->pursuers[j];
+    if (!existing && hints->pursuer_count == hints->pursuer_cap) {
       size_t cap = hints->pursuer_cap ? hints->pursuer_cap * 2 : 8;
       qa_q2mpm_hint_monster *grown = realloc(hints->pursuers, cap * sizeof *grown);
       if (!grown) qa_raise("Error", 0, 0, "Out of memory restoring hint pursuers");
       hints->pursuers = grown;
       hints->pursuer_cap = cap;
     }
-    qa_q2mpm_hint_monster *monster = &hints->pursuers[hints->pursuer_count++];
+    qa_q2mpm_hint_monster *monster = existing ? existing : &hints->pursuers[hints->pursuer_count++];
     memset(monster, 0, sizeof *monster);
-    monster->actor = restore_reference(game, saved->actor);
+    monster->actor = pursuer;
     monster->has_goal = saved->has_goal;
     if (saved->has_goal) monster->goal = restore_reference(game, saved->goal);
     monster->last_time = saved->last_time;

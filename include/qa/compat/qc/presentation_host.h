@@ -36,7 +36,8 @@ typedef struct qa_compat_qc_netquake_message_services {
   void *ctx; const char *message_dialect; bool has_message_dialect;
   bool (*native)(void *ctx); bool (*local)(void *ctx); /* local nullable */
   bool (*loading)(void *ctx); bool (*client)(void *ctx, qa_actor_id actor);
-  /* view_targets: parallel arrays index->actor (has_actor flags), may be NULL */
+  /* view_targets/view_has: parallel arrays index->actor, may be NULL. TS viewTargets: view_has[i] is
+   * Map.has(i); a present entry whose actor token is NULL is a null view target. */
   void (*route)(void *ctx, const qa_netquake_message *messages, size_t count, qa_compat_qc_message_destination destination, const qa_actor_id *view_targets, const bool *view_has, size_t view_count);
 } qa_compat_qc_netquake_message_services;
 typedef struct qa_compat_qc_quakeworld_message_services {

@@ -1,6 +1,5 @@
-/* Port of src/render/commands/material2d.ts. currentRemap
- * (render/scene/material-registrations.ts, sibling slice) is treated as
- * no-remap until that slice lands. GPL-2.0-or-later. */
+/* Port of src/render/commands/material2d.ts; a MaterialHandle draws its
+ * currentRemap (render/scene/material-registrations.ts). GPL-2.0-or-later. */
 #ifndef QA_RENDER_COMMANDS_MATERIAL2D_H
 #define QA_RENDER_COMMANDS_MATERIAL2D_H
 #include <stddef.h>

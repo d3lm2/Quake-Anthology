@@ -9,16 +9,77 @@
 
 #include "qa/foundation/support.h"
 
-static void *xmalloc(size_t size) {
+static _Thread_local qa_pe_scope *active_scope;
+static void scope_track(void *p) {
+  qa_pe_scope *scope = active_scope;
+  if (scope == NULL) return;
+  if (scope->count == scope->cap) {
+    size_t cap = scope->cap == 0 ? 64 : scope->cap * 2;
+    void **items = realloc(scope->items, cap * sizeof *items);
+    if (items == NULL) { free(p); qa_range_error("PE: out of memory"); }
+    scope->items = items; scope->cap = cap;
+  }
+  scope->items[scope->count++] = p;
+}
+static void scope_replace(uintptr_t old, void *next) {
+  qa_pe_scope *scope = active_scope;
+  if (scope == NULL || old == (uintptr_t)next) return;
+  for (size_t i = scope->count; i-- > 0;)
+    if ((uintptr_t)scope->items[i] == old) {
+      if (next != NULL) scope->items[i] = next;
+      else scope->items[i] = scope->items[--scope->count];
+      return;
+    }
+}
+static void scope_abandon(void *arg) {
+  qa_pe_scope *scope = arg;
+  if (scope->abandon != NULL) scope->abandon(scope->ctx);
+  for (size_t i = 0; i < scope->count; i++) free(scope->items[i]);
+  free(scope->items);
+  active_scope = scope->previous;
+}
+void qa_pe_scope_begin(qa_pe_scope *scope, void (*abandon)(void *ctx), void *ctx) {
+  memset(scope, 0, sizeof *scope);
+  scope->previous = active_scope;
+  scope->abandon = abandon;
+  scope->ctx = ctx;
+  qa_cleanup_push(&scope->node, scope_abandon, scope);
+  active_scope = scope;
+}
+void qa_pe_scope_commit(qa_pe_scope *scope) {
+  qa_cleanup_pop(&scope->node);
+  active_scope = scope->previous;
+  /* An enclosing operation can still raise: its scope takes the blocks over. */
+  for (size_t i = 0; active_scope != NULL && i < scope->count; i++) scope_track(scope->items[i]);
+  free(scope->items);
+}
+void *qa_pe_xmalloc(size_t size) {
   void *p = malloc(size == 0 ? 1 : size);
-  if (p == NULL) qa_range_error("PE headers: out of memory");
+  if (p == NULL) qa_range_error("PE: out of memory");
+  scope_track(p);
   return p;
 }
-static void *xcalloc(size_t count, size_t size) {
+void *qa_pe_xcalloc(size_t count, size_t size) {
   void *p = calloc(count == 0 ? 1 : count, size == 0 ? 1 : size);
-  if (p == NULL) qa_range_error("PE headers: out of memory");
+  if (p == NULL) qa_range_error("PE: out of memory");
+  scope_track(p);
   return p;
 }
+void *qa_pe_xrealloc(void *p, size_t size) {
+  const uintptr_t old = (uintptr_t)p; /* the address only: realloc may have released the block */
+  void *next = realloc(p, size == 0 ? 1 : size);
+  if (next == NULL) qa_range_error("PE: out of memory");
+  if (old == 0) scope_track(next);
+  else scope_replace(old, next);
+  return next;
+}
+void qa_pe_xfree(void *p) {
+  if (p == NULL) return;
+  scope_replace((uintptr_t)p, NULL);
+  free(p);
+}
+static void *xmalloc(size_t size) { return qa_pe_xmalloc(size); }
+static void *xcalloc(size_t count, size_t size) { return qa_pe_xcalloc(count, size); }
 
 const char *qa_pe_stage_name(qa_pe_stage stage) {
   switch (stage) {
@@ -34,12 +95,12 @@ const char *qa_pe_stage_name(qa_pe_stage stage) {
   return "";
 }
 void qa_pe_error(qa_pe_stage stage, const char *format, ...) {
-  char detail[512];
+  char detail[QA_CAUGHT_MESSAGE_CAPACITY];
   va_list args;
   va_start(args, format);
   (void)vsnprintf(detail, sizeof detail, format, args);
   va_end(args);
-  qa_range_error("PE %s: %s", qa_pe_stage_name(stage), detail);
+  qa_raise("PeError", (int)stage, 0, "PE %s: %s", qa_pe_stage_name(stage), detail); /* TS PeError (error.name) */
 }
 
 void qa_pe_checked_range(size_t offset, size_t length, size_t limit, qa_pe_stage stage) {
@@ -97,8 +158,31 @@ char *qa_pe_reader_text(const qa_pe_reader *reader, size_t offset, size_t limit)
 static bool power_of_two(uint32_t value) {
   return value > 0 && floor(log2((double)value)) == log2((double)value);
 }
-static uint32_t align32(uint32_t value, uint32_t alignment) {
-  return (uint32_t)(ceil((double)value / (double)alignment) * (double)alignment);
+/* TS Math.ceil(value / alignment) * alignment as a number: it can reach 2^32, past a uint32. */
+static uint64_t align_up(uint32_t value, uint32_t alignment) {
+  return ((uint64_t)value + alignment - 1u) / alignment * alignment;
+}
+/* TS `new TextDecoder("utf-8", { fatal: true }).decode(...)`: well-formed UTF-8 only. */
+static bool valid_utf8(const uint8_t *bytes, size_t length) {
+  for (size_t i = 0; i < length;) {
+    const uint8_t lead = bytes[i];
+    size_t need;
+    uint32_t minimum;
+    if (lead < 0x80) { i++; continue; }
+    if (lead >= 0xc2 && lead <= 0xdf) { need = 1; minimum = 0x80; }
+    else if (lead >= 0xe0 && lead <= 0xef) { need = 2; minimum = 0x800; }
+    else if (lead >= 0xf0 && lead <= 0xf4) { need = 3; minimum = 0x10000; }
+    else return false;
+    if (length - i <= need) return false;
+    uint32_t code = lead & (0xffu >> (need + 2));
+    for (size_t k = 1; k <= need; k++) {
+      if ((bytes[i + k] & 0xc0u) != 0x80u) return false;
+      code = (code << 6) | (bytes[i + k] & 0x3fu);
+    }
+    if (code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return false;
+    i += need + 1;
+  }
+  return true;
 }
 static qa_guest_permissions section_permissions(uint32_t flags) {
   bool read = (flags & 0x40000000u) != 0;
@@ -109,8 +193,12 @@ static qa_guest_permissions section_permissions(uint32_t flags) {
   return read ? QA_PERM_READ : QA_PERM_NONE;
 }
 
+static void parse_abandon(void *ctx) { memset(ctx, 0, sizeof(qa_pe_file)); }
+
 void qa_parse_pe(qa_pe_file *out, const uint8_t *bytes, size_t len) {
   memset(out, 0, sizeof *out);
+  qa_pe_scope scope;
+  qa_pe_scope_begin(&scope, parse_abandon, out);
   qa_pe_reader reader = {(uint8_t *)bytes, len, QA_PE_STAGE_HEADERS};
   if (qa_pe_reader_u16(&reader, 0) != 0x5a4d) qa_pe_error(QA_PE_STAGE_HEADERS, "missing MZ signature");
   uint32_t pe = qa_pe_reader_u32(&reader, 0x3c);
@@ -174,28 +262,34 @@ void qa_parse_pe(qa_pe_file *out, const uint8_t *bytes, size_t len) {
   qa_pe_section *sections = xcalloc(section_count, sizeof(qa_pe_section));
   size_t table = optional + optional_size;
   qa_pe_checked_range(table, (size_t)section_count * 40, header_size, QA_PE_STAGE_HEADERS);
-  uint32_t end = align32(header_size, section_alignment);
+  uint64_t end = align_up(header_size, section_alignment);
   for (int i = 0; i < section_count; i++) {
     size_t at = table + (size_t)i * 40;
     size_t name_len = 0;
     while (name_len < 8 && bytes[at + name_len] != 0) name_len++;
+    if (!valid_utf8(bytes + at, name_len)) qa_raise("TypeError", 0, 0, "Invalid byte sequence");
+    const uint8_t *name_bytes = bytes + at;
+    if (name_len >= 3 && name_bytes[0] == 0xef && name_bytes[1] == 0xbb && name_bytes[2] == 0xbf) {
+      name_bytes += 3; /* the decoder drops a leading byte-order mark */
+      name_len -= 3;
+    }
     char *name = xmalloc(name_len + 1);
-    memcpy(name, bytes + at, name_len);
+    memcpy(name, name_bytes, name_len);
     name[name_len] = '\0';
     uint32_t virtual_size = qa_pe_reader_u32(&reader, at + 8);
     uint32_t rva = qa_pe_reader_u32(&reader, at + 12);
     uint32_t raw_size = qa_pe_reader_u32(&reader, at + 16);
     uint32_t raw_offset = qa_pe_reader_u32(&reader, at + 20);
     uint32_t flags = qa_pe_reader_u32(&reader, at + 36);
-    uint32_t mapped_size = align32(virtual_size > raw_size ? virtual_size : raw_size, section_alignment);
+    const uint64_t mapped_size = align_up(virtual_size > raw_size ? virtual_size : raw_size, section_alignment);
     if (rva % section_alignment != 0 || rva < end
         || (raw_size > 0 && (raw_offset < header_size || raw_offset % file_alignment != 0
                              || raw_size % file_alignment != 0)))
       qa_pe_error(QA_PE_STAGE_HEADERS, "overlapping/misaligned section %s", name);
     qa_pe_checked_range(raw_offset, raw_size, len, QA_PE_STAGE_HEADERS);
-    qa_pe_checked_range(rva, mapped_size, image_size, QA_PE_STAGE_HEADERS);
-    end = rva + mapped_size;
-    sections[i] = (qa_pe_section){name, rva, virtual_size, mapped_size, raw_offset, raw_size,
+    qa_pe_checked_range(rva, (size_t)mapped_size, image_size, QA_PE_STAGE_HEADERS);
+    end = (uint64_t)rva + mapped_size;
+    sections[i] = (qa_pe_section){name, rva, virtual_size, (uint32_t)mapped_size, raw_offset, raw_size,
                                    flags, section_permissions(flags)};
   }
   out->abi = abi;
@@ -209,6 +303,7 @@ void qa_parse_pe(qa_pe_file *out, const uint8_t *bytes, size_t len) {
   out->dll_characteristics = qa_pe_reader_u16(&reader, optional + 70);
   out->sections = sections;
   out->section_count = section_count;
+  qa_pe_scope_commit(&scope);
 }
 
 void qa_pe_file_free(qa_pe_file *file) {

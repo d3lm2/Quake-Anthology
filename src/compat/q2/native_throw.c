@@ -1,36 +1,38 @@
 /* Recoverable throw channel for the Q2 native bindings. See the header.
  * GPL-2.0-or-later. */
 #include "qa/compat/q2/native_throw.h"
-#include <setjmp.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
-typedef struct try_frame {
-  struct try_frame *previous;
-  jmp_buf jump;
-  qa_compat_q2_native_thrown thrown;
-} try_frame;
-static try_frame *top = NULL;
+/* qa_caught_error.code of a sentinel; detail is its token. */
+#define NATIVE_THROW_CODE 0x51324e54 /* "Q2NT" */
+/* The token reported for an error that is not a sentinel: no caller compares equal to it. */
+static const char foreign_error = 0;
+/* The thrower's own message pointer (callers keep it, and a caught message is a copy in the catch buffer). */
+static _Thread_local const void *last_token;
+static _Thread_local const char *last_message;
 
 bool qa_compat_q2_native_try(void (*body)(void *ctx), void *ctx, qa_compat_q2_native_thrown *thrown) {
-  try_frame frame;
-  frame.previous = top;
-  frame.thrown.token = NULL; frame.thrown.message = NULL;
-  top = &frame;
-  if (setjmp(frame.jump) == 0) {
-    body(ctx);
-    top = frame.previous;
-    return true;
+  qa_compat_q2_native_thrown local;
+  qa_compat_q2_native_thrown *out = thrown != NULL ? thrown : &local;
+  out->token = NULL; out->message = NULL;
+  if (qa_try(body, ctx, &out->caught)) return true;
+  if (out->caught.code == NATIVE_THROW_CODE && strcmp(out->caught.name, "Error") == 0) {
+    out->token = (const void *)(intptr_t)out->caught.detail;
+    out->message = last_token == out->token ? last_message : NULL;
+  } else {
+    out->token = &foreign_error;
+    out->message = NULL;
   }
-  top = frame.previous;
-  if (thrown != NULL) *thrown = frame.thrown;
   return false;
 }
 noreturn void qa_compat_q2_native_throw(const void *token, const char *message) {
-  if (top == NULL) qa_range_error("%s", message != NULL ? message : "Uncaught native control throw");
-  top->thrown.token = token; top->thrown.message = message;
-  longjmp(top->jump, 1);
+  last_token = token; last_message = message;
+  qa_raise("Error", NATIVE_THROW_CODE, (long long)(intptr_t)token, "%s", message != NULL ? message : "Uncaught native control throw");
 }
 noreturn void qa_compat_q2_native_rethrow(const qa_compat_q2_native_thrown *thrown) {
+  if (thrown->token == &foreign_error) qa_rethrow(&thrown->caught);
   qa_compat_q2_native_throw(thrown->token, thrown->message);
 }
 double qa_compat_q2_native_depth(const qa_compat_q2_runner *runner) {

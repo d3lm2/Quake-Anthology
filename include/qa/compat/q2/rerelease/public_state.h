@@ -28,6 +28,8 @@ qa_body_state qa_compat_q2_rerelease_public_edict_body(qa_compat_q2_rerelease_pu
 void qa_compat_q2_rerelease_public_edict_set_vector(const qa_compat_q2_rerelease_public_edict *e, const char *name, qa_vec3 value);
 qa_guest_address qa_compat_q2_rerelease_public_edict_client(const qa_compat_q2_rerelease_public_edict *e);
 qa_q2_rerelease_player_state qa_compat_q2_rerelease_public_edict_player_state(const qa_compat_q2_rerelease_public_edict *e);
+/* The same state with its stats in the caller's own 64 numbers (see player_state.h). */
+qa_q2_rerelease_player_state qa_compat_q2_rerelease_public_edict_player_state_into(const qa_compat_q2_rerelease_public_edict *e, double *stats);
 qa_vec3 qa_compat_q2_rerelease_public_edict_player_velocity(const qa_compat_q2_rerelease_public_edict *e);
 double qa_compat_q2_rerelease_public_edict_player_movement_flags(const qa_compat_q2_rerelease_public_edict *e);
 typedef struct qa_compat_q2_rerelease_player_view { qa_vec3 view_offset; double view_height, movement_flags; } qa_compat_q2_rerelease_player_view;

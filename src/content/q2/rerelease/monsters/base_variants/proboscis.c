@@ -168,8 +168,7 @@ static void think_fn(void *ctx, qa_q2_entity *tip, qa_q2_game_services *game) {
     if (tip->timestamp <= q2rm_now(game)) {
       qa_vec3 normal = trace.contact.has_plane ? trace.contact.plane.normal : q2rm_zero();
       (void)q2rm_damage(game, tip->enemy, tip, tip->has_owner ? &tip->owner : NULL, 2, 0, normal, trace.end, normal, 0, false, 0);
-      double hp = qa_q2m_health(game, &owner->entity->actor.id) + 2;
-      if (hp > owner->entity->max_health) hp = owner->entity->max_health;
+      double hp = qa_js_min(owner->entity->max_health, qa_q2m_health(game, &owner->entity->actor.id) + 2);
       qa_gameplay_authority_set_health(game->host->combat, owner->entity->actor, hp);
       owner->entity->skin = hp < owner->entity->max_health / 2 ? 1 : 0;
       tip->timestamp = q2rm_now(game) + 0.1;

@@ -64,21 +64,10 @@ static void json_escape(buffer *b, const char *text) {
 /* Number::toString: shortest digits that round-trip, then the ECMAScript layout. */
 static void json_number(buffer *b, double value) {
   if (value == 0) { buffer_adds(b, "0"); return; }
-  char scientific[40];
-  int precision = 0;
-  for (; precision < 17; precision++) {
-    snprintf(scientific, sizeof scientific, "%.*e", precision, value);
-    if (strtod(scientific, NULL) == value) break;
-  }
-  const char *cursor = scientific;
-  if (*cursor == '-') { buffer_adds(b, "-"); cursor++; }
+  if (value < 0) buffer_adds(b, "-");
   char digits[24];
-  int k = 0;
-  for (; *cursor && *cursor != 'e'; cursor++)
-    if (*cursor != '.') digits[k++] = *cursor;
-  int n = atoi(cursor + 1) + 1; /* value = 0.digits x 10^n */
-  while (k > 1 && digits[k - 1] == '0') k--;
-  digits[k] = '\0';
+  int n = qa_js_shortest_digits(value, digits) + 1; /* value = 0.digits x 10^n */
+  int k = (int)strlen(digits);
   char text[64];
   if (k <= n && n <= 21) {
     buffer_add(b, digits, (size_t)k);
@@ -240,7 +229,7 @@ qa_save_value **qa_app_unified_decode_presentation_events(
     const uint8_t *bytes, size_t length,
     const qa_app_unified_identity_decoder *identity, size_t *out_count) {
   if (length > MAX_EVENT_BYTES) qa_range_error("Unified presentation events exceed byte limit");
-  if (!utf8_valid(bytes, length)) qa_raise("TypeError", 0, 0, "The encoded data was not valid for encoding utf-8");
+  if (!utf8_valid(bytes, length)) qa_raise("TypeError", 0, 0, "%s", "Invalid byte sequence"); /* Bun 1.3.14 */
   /* TextDecoder drops a leading byte order mark. */
   if (length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) { bytes += 3; length -= 3; }
   decoded_events owned = {NULL, NULL, 0};

@@ -122,6 +122,8 @@ static double field_integer(const qa_save_reader *reader, const char *name) {
   return result;
 }
 static void q1_free_decoded_save(void *value) { qa_save_value_free(value); }
+/* A controller not yet in the map when its saved state raises (TS leaves it to the GC). */
+static void q1_free_unset_monster(void *monster) { qa_q1_base_monster_destroy(monster); }
 static void restore(void *ctx, const uint8_t *bytes, size_t length) {
   qa_q1am_boss_registry *r = ctx;
   qa_q1_services *game = r->game;
@@ -143,9 +145,12 @@ static void restore(void *ctx, const uint8_t *bytes, size_t length) {
                               ? qa_q1_get_entity(game, &actor.id) : NULL;
     if (entity == NULL) qa_save_reader_fail(&reader, "missing MG3 boss actor");
     qa_q1_base_monster *monster = create(r, entity);
+    qa_cleanup monster_cleanup;
+    qa_cleanup_push(&monster_cleanup, q1_free_unset_monster, monster);
     must(qa_save_reader_field(&reader, "state", &state));
     qa_q1_base_monster_restore(monster, &state);
     qa_save_reader_destroy(&state);
+    qa_cleanup_pop(&monster_cleanup);
     entry_set(r, entity->actor, monster);
     qa_save_reader_destroy(&reader);
   }

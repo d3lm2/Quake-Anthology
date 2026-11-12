@@ -16,6 +16,8 @@
 #include "qa/app/bootstrap/config_scripts.h"
 #include "qa/app/bootstrap/configuration.h"
 #include "qa/app/bootstrap/console.h"
+#include "qa/app/bootstrap/console_log.h"
+#include "qa/app/bootstrap/native_settings.h"
 #include "qa/app/bootstrap/controller_settings.h"
 #include "qa/app/bootstrap/demo_commands.h"
 #include "qa/app/bootstrap/demo_recording_commands.h"
@@ -130,11 +132,15 @@ struct qa_startup_application {
   void *menu_input_binding_record;
   bool has_pending; qa_app_startup_action pending;
   bool stopping, closed;
+  qa_app_console_log console_log; /* TS consoleLog: the front end's own console output, kept as the selected game would keep it */
   double frames;
   char *status;
   bool refresh_saves;
   qa_app_startup_saves *saves;
   char **external_directories; size_t external_directory_count; /* saves.externalDirectories */
+  /* Directory lists an add-on change replaced: a launched application borrows the list it was given, so a replaced one
+   * stays allocated until close. */
+  struct qa_startup_directory_list { char **items; size_t count; struct qa_startup_directory_list *next; } *retired_external;
   qa_app_addon_library *addons;
   qa_app_frontend_preferences *preferences;
   char *baseline_product;  /* NULL is TS null */
@@ -210,6 +216,9 @@ struct qa_startup_application {
 char *qa_startup_dup(const char *text);
 char *qa_startup_settings_directory(const char *save_directory);
 void qa_startup_set_text(char **slot, const char *text);
+/* qa_startup_set_text into a static slot, returning the copy: an error text a callback returns stays whole and valid
+ * until the slot's next use. */
+const char *qa_startup_keep_text(char **slot, const char *text);
 double qa_startup_now(void);
 void qa_startup_printf(qa_startup_application *app, const char *format, ...);
 void qa_startup_clear_pending_all(qa_startup_application *app);
@@ -265,6 +274,8 @@ void qa_startup_open_graphics(qa_startup_application *app);
 void qa_startup_graphics_draw(qa_startup_application *app, const qa_app_client_source_lifetime *loading_owner, bool has_loading_owner);
 void qa_startup_graphics_close(qa_startup_application *app);
 /* graphics.menu.bindInput(input, () => sharedBindingActions(...), { available, reset }). */
+/* Sets up the consoleLog field (TS field initializer). */
+void qa_startup_console_log_init(qa_startup_application *app);
 void qa_startup_graphics_bind_menu_input(qa_startup_application *app, qa_seat_input *input, qa_seat_id seat,
     bool (*available)(void *ctx, qa_seat_id seat), void (*reset)(void *ctx, qa_seat_id seat));
 #endif

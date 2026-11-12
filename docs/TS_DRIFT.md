@@ -52,3 +52,65 @@ ui/common/legacy/script/* -> content/legacy-script/*.
 | D6 | compat, guest | 8.1k |
 | D7 | network, render, world, movement | 9.5k |
 | D8 | ui, core, formats, persistence, contracts, audio, materials, text, console, settings, input, llm, platform, media, camera, capture, debug, foundation | 6.5k |
+
+## Second drift round (D9, 2026-11-10)
+
+TS moved from `87e98c5c` (the state the D1-D8 packets and the sim_verify oracles were
+checked against) to release 1.2.7 plus uncommitted work: 23 commits, 102 src files with
+code changes, 14 added src files, 2 removed, 35 changed and 11 added tests. The list is
+`docs/ts_semantic_drift_d9.tsv` (same columns as ts_semantic_drift.tsv). To see the diffs:
+
+    TS_BASELINE=87e98c5c TS_DRIFT_TSV=$PWD/docs/ts_semantic_drift_d9.tsv \
+      tools/ts_semantic_diff.sh --module app/bootstrap
+
+| Packet | Scope | Diff lines |
+|---|---|---|
+| D9a | settings, persistence, core, compat, guest, world, formats, input, text, ui, render, movement, network (everything outside app/bootstrap) | ~1.4k + 9 new files |
+| D9b | app/bootstrap except simulation | ~6.6k + 5 new files |
+| D9c | app/bootstrap/simulation (after the SourceStrategy work) | ~0.9k + 1 new file |
+
+D9a is done (2026-11-10): see the `drift-done (d9a)` rows of docs/port_review.tsv and the D9a entry in the open
+items of docs/PORT_COMPLETION.md. Oracle generators for its tests: tests/settings/oracles/layers_steps.ts and
+tests/persistence/oracles/q2_save_folder.ts (run under bun from the TS repository).
+
+Themes: stock Quake II saves and loads in the original formats (persistence/q2-save-*,
+q2-selection, app q2-native-saves); stock games read and write native config files and
+keep demos, screenshots, saves and logs in their own folders (settings/native-*, app
+native-settings, native-migration, console-log, seat-profile); engine/game settings
+layering on the cvar alias layer (settings/layers, setting-spellings,
+core/cvars/setting-declarations); cap removals (392943c8, and 14c69e49 removes the guest
+mapped-memory quota and TagMalloc limit that D6 ported, so those come out of C).
+
+### D9c status (2026-11-10, build/agents/d9c): done
+
+Every code/types-only/added/removed file under src/app/bootstrap/simulation in docs/ts_semantic_drift_d9.tsv has a
+`drift-done (d9c)` row in docs/port_review.tsv. Ported: native-q2-rerelease-pak.ts (new), the version 2
+rerelease native-original record with an absent level, SourceStrategy importLoading/importOriginal (228 members),
+SimulationOptions.nativeImport, SaveCaptureOptions (autosave), the classic guest file cap removal, the classic
+linkableClientPrefix, and the removal of vec.ts. Forced edit outside the packet: `logfile` in
+src/app/bootstrap/q3_common_cvars.c (TS 9542c329), which the q3 and q3qvm sim_verify oracles record.
+
+sim_verify oracles regenerated from TS 6103bb46 (frames 0 1 10 100). Lines that changed against the 87e98c5c oracles:
+q2nc 8 (the four `q2:classic-native-original` provider lines, version 1 -> 2, and the four checkpoint-image lines;
+TS e06fcfff), q3 6 (the `q3:native` provider line and the checkpoint-image line at frames 1, 10 and 100: the saved
+cvar list gains `logfile`; TS 9542c329), q3qvm 4 (the checkpoint-image line at frames 0, 1, 10 and 100: the guest
+host state gains `logfile` and the guest's vmCvar handles shift by one; TS 9542c329). The other seven are unchanged.
+C: 10 cases, 0 mismatches. New: `test_sim_verify --diagnostics` (tests/app/oracles/sim_diagnostics_<case>.txt).
+
+Not done here: no C test starts a world from options.nativeImport (the TS test is
+tests/first-playable/application/q2-native-original-saves.test.ts, an Application test that needs D9b's q2-native-saves).
+
+
+## Final TS state (2026-11-10 21:35)
+
+The TypeScript project is final at tag `v1.2.7` (HEAD `6f93620c`, which only bumps the
+version to 1.2.8-dev after the tag; the tree is clean). `docs/ts_semantic_drift_final.tsv`
+lists what changed between `03a43888` (the D9 baseline's HEAD) and that HEAD: 8 src files
+and 13 test files. Checked hunk by hunk on 2026-11-10: C already has every src change
+(the `nativeConfigCarries` rule in configuration and prepared-startup, the write redirect
+keyed by install root only, the download directory without the user root), because D9a
+and D9b read the TS tree after those edits were made. `src/version.c` stays "1.2.7", the
+released version. The test changes are timeouts, the hermetic preload and download tests
+expecting the game folder; they belong to the remaining test ports. No further TS drift
+is expected; rerun `bun tools/ts_semantic_drift.ts ../quake-anthology-ts 6f93620c` to
+confirm before the gate closes.

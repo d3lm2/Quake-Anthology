@@ -104,10 +104,10 @@ static bool model_string(const qa_llm_json *value, char **out, qa_llm_error *err
   bool bad = value == NULL || value->kind != QA_LLM_JSON_STRING || qa_llm_trim_is_empty(value->string) || qa_llm_utf16_length(value->string) > 256;
   if (!bad) {
     for (const uint8_t *p = (const uint8_t *)value->string; *p != '\0'; p++) {
-      if (*p <= 0x1f || *p == 0x7f) bad = true;
+      if (*p <= 0x1f || *p == 0x7f || (p[0] == 0xc0 && p[1] == 0x80)) bad = true;
     }
   }
-  /* \x00 cannot appear in a C string; TS rejects it via the same class. */
+  /* U+0000 is held as C0 80 in decoded text; TS rejects it via the same class. */
   if (bad) {
     qa_llm_error_set(error, "The service returned invalid model metadata.");
     return false;
@@ -459,6 +459,9 @@ static bool model_json(qa_llm_http_response *response, qa_llm_abort_signal *sign
   bool internal_error = false; /* LlmSettingsError raised inside: rethrow */
   size_t size = 0;
   uint8_t chunk[8192];
+  /* TextDecoder("utf-8", {fatal: true}) strips a leading byte order mark; Bun
+     only when the first decode() call's bytes hold the whole mark (as sse.c). */
+  bool bom_checked = false;
   for (;;) {
     if (!qa_llm_check_request_abort(signal, error)) { ok = false; internal_error = true; break; }
     size_t length = 0;
@@ -481,8 +484,13 @@ static bool model_json(qa_llm_http_response *response, qa_llm_abort_signal *sign
       bool partial = valid < raw.length && qa_llm_utf8_incomplete_tail(raw.data + valid, raw.length - valid);
       if (!partial) { ok = false; break; } /* decoder fatal: generic */
     }
+    size_t skip = 0;
+    if (!bom_checked && length > 0) {
+      bom_checked = true;
+      if (valid >= 3 && raw.data[0] == 0xef && raw.data[1] == 0xbb && raw.data[2] == 0xbf) skip = 3;
+    }
     if (valid > 0) {
-      qa_llm_strbuf_append_n(&text, raw.data, valid);
+      qa_llm_strbuf_append_n(&text, raw.data + skip, valid - skip);
       memmove(raw.data, raw.data + valid, raw.length - valid);
       raw.length -= valid;
     }
@@ -492,10 +500,12 @@ static bool model_json(qa_llm_http_response *response, qa_llm_abort_signal *sign
   qa_llm_cancel_response_body(response);
   qa_llm_bytes_free(&raw);
   qa_llm_strbuf_free(&text);
-  if (!ok && !internal_error) {
+  if (!ok) {
+    /* catch: checkRequestAbort first (it also overrides the size-limit error),
+     * then an LlmSettingsError rethrows, else the generic message. */
     qa_llm_error abort_error;
     if (!qa_llm_check_request_abort(signal, &abort_error)) *error = abort_error;
-    else qa_llm_error_set(error, "The service returned an invalid model list response.");
+    else if (!internal_error) qa_llm_error_set(error, "The service returned an invalid model list response.");
   }
   return ok;
 }

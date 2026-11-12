@@ -43,7 +43,7 @@ qa_vec4 qa_q3_pres_get_color_for_health(double health_value, double armor_value)
   return c;
 }
 qa_vec4 qa_q3_pres_color_for_health(qa_q3_pres_client_game_state *state) {
-  if (!state->snap) qa_range_error("CG_ColorForHealth requires a current snapshot");
+  if (!state->snap) qa_raise("Error", 0, 0, "CG_ColorForHealth requires a current snapshot");
   const qa_q3_base_player_state_slots *stats = &state->snap->player_state.stats;
   const qa_q3_base_stat_schema *schema =
       qa_q3_base_stat_schema_for(qa_q3_base_player_state_record_product(&state->snap->player_state));
@@ -53,7 +53,7 @@ qa_vec4 qa_q3_pres_color_for_health(qa_q3_pres_client_game_state *state) {
 }
 void qa_q3_pres_client_draw_tools_init(qa_q3_pres_client_draw_tools *tools, qa_draw2d draw,
                                        qa_q3_pres_draw_tools_media media) {
-  if (draw.space != QA_COORD_STRETCH_640) qa_range_error("Cgame drawing requires stretch-640 coordinates");
+  if (draw.space != QA_COORD_STRETCH_640) qa_raise("Error", 0, 0, "Cgame drawing requires stretch-640 coordinates");
   tools->draw = draw;
   tools->media = media;
 }

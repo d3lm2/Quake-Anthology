@@ -218,18 +218,18 @@ bool qa_q2_ctf_match_begin_election(qa_q2_ctf_match *m, qa_q2_entity *entity, qa
   double percentage = m->context->rules.election_percentage;
   if (ms(m)->election != NULL || percentage <= 0 || count < 2) return false;
   for (size_t i = 0; i < m->context->state_count; i++) m->context->states[i].state.voted = false;
-  char message[1024];
+  char *message; /* the player name and the map have no length limit */
   if (strcmp(kind, "map") == 0)
-    snprintf(message, sizeof message, "%s requested warping to %s.", qa_ctf_name(m->context, entity->actor.id), map);
+    message = qa_q2mp_format("%s requested warping to %s.", qa_ctf_name(m->context, entity->actor.id), map);
   else if (strcmp(kind, "admin") == 0)
-    snprintf(message, sizeof message, "%s requested admin rights.", qa_ctf_name(m->context, entity->actor.id));
+    message = qa_q2mp_format("%s requested admin rights.", qa_ctf_name(m->context, entity->actor.id));
   else
-    snprintf(message, sizeof message, "%s requested match mode.", qa_ctf_name(m->context, entity->actor.id));
+    message = qa_q2mp_format("%s requested match mode.", qa_ctf_name(m->context, entity->actor.id));
   qa_q2_ctf_election *election = qa_q2mp_xalloc(calloc(1, sizeof *election));
   election->kind = kind;
   election->target = entity->actor.id;
   election->map = qa_q2mp_dup(map);
-  election->message = qa_q2mp_dup(message);
+  election->message = message; /* owned by the election */
   election->votes = 0;
   double needed = trunc(count * percentage / 100);
   election->needed = needed < 1 ? 1 : needed;
@@ -301,8 +301,7 @@ bool qa_q2_ctf_match_check_rules(qa_q2_ctf_match *m, qa_q2_game_services *g) {
       qa_q2_ctf_match_end(m, g);
     }
   }
-  double remaining = trunc(ms(m)->match_time - now);
-  if (remaining < 0) remaining = 0;
+  double remaining = qa_js_max(0, trunc(ms(m)->match_time - now)); /* Math.max(0, -0) is 0, and lastTime is saved */
   if (remaining != ms(m)->last_time) {
     ms(m)->last_time = remaining;
     char *status = qa_q2_ctf_match_status(m, g);
@@ -417,13 +416,16 @@ bool qa_q2_ctf_match_warp(qa_q2_ctf_match *m, qa_q2_entity *entity, qa_q2_game_s
   for (size_t i = 0; i < m->context->rules.warp_count; i++)
     if (eq_ci(m->context->rules.warp_list[i], requested)) { map = m->context->rules.warp_list[i]; break; }
   if (map == NULL) {
-    char list[1024];
+    size_t length = 1; /* warpList.join(" "), however long the list is */
+    for (size_t i = 0; i < m->context->rules.warp_count; i++) length += strlen(m->context->rules.warp_list[i]) + 1;
+    char *list = qa_q2mp_xalloc(malloc(length));
     list[0] = '\0';
     for (size_t i = 0; i < m->context->rules.warp_count; i++) {
-      if (i > 0) strncat(list, " ", sizeof list - strlen(list) - 1);
-      strncat(list, m->context->rules.warp_list[i], sizeof list - strlen(list) - 1);
+      if (i > 0) strcat(list, " ");
+      strcat(list, m->context->rules.warp_list[i]);
     }
     qa_ctf_print(g, &entity->actor.id, NULL, "Available levels: %s\n", list);
+    free(list);
     return false;
   }
   if (qa_ctf_player(m->context, entity->actor.id)->admin) {

@@ -1,6 +1,7 @@
 /* Port of src/content/archive/types.ts. GPL-2.0-or-later. */
 #include "qa/content/archive/types.h"
 
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,48 @@ noreturn void qa_archive_error(const char *source, int64_t offset,
   va_end(args);
   qa_raise("ArchiveError", 0, (long long)offset, "%s:%lld: %s",
            source ? source : "", (long long)offset, message);
+}
+
+noreturn void qa_content_fs_error(int error_number, const char *syscall,
+                                  const char *path) {
+  /* libuv's names and descriptions, which Bun and Node print. */
+  static const struct { int code; const char *name, *text; } known[] = {
+      {ENOENT, "ENOENT", "no such file or directory"},
+      {ENOTDIR, "ENOTDIR", "not a directory"},
+      {EACCES, "EACCES", "permission denied"},
+      {EPERM, "EPERM", "operation not permitted"},
+      {EISDIR, "EISDIR", "illegal operation on a directory"},
+      {ELOOP, "ELOOP", "too many symbolic links encountered"},
+      {ENAMETOOLONG, "ENAMETOOLONG", "name too long"},
+      {EEXIST, "EEXIST", "file already exists"},
+      {EMFILE, "EMFILE", "too many open files"},
+      {ENFILE, "ENFILE", "file table overflow"},
+      {EIO, "EIO", "i/o error"},
+      {ENOSPC, "ENOSPC", "no space left on device"},
+      {EROFS, "EROFS", "read-only file system"},
+      {EBUSY, "EBUSY", "resource busy or locked"},
+      {EINVAL, "EINVAL", "invalid argument"},
+      {ENOTEMPTY, "ENOTEMPTY", "directory not empty"},
+      {EXDEV, "EXDEV", "cross-device link not permitted"},
+      {ENOMEM, "ENOMEM", "not enough memory"},
+      {EBADF, "EBADF", "bad file descriptor"},
+      {EFBIG, "EFBIG", "file too large"},
+      {ENXIO, "ENXIO", "no such device or address"},
+      {ETXTBSY, "ETXTBSY", "text file is busy"},
+      {EOVERFLOW, "EOVERFLOW", "value too large for defined data type"},
+      {ENODEV, "ENODEV", "no such device"},
+      {EAGAIN, "EAGAIN", "resource temporarily unavailable"},
+      {EINTR, "EINTR", "interrupted system call"},
+  };
+  const char *name = "UNKNOWN", *text = strerror(error_number);
+  for (size_t i = 0; i < sizeof known / sizeof known[0]; i++)
+    if (known[i].code == error_number) {
+      name = known[i].name;
+      text = known[i].text;
+      break;
+    }
+  if (path == NULL) qa_raise("Error", error_number, 0, "%s: %s, %s", name, text, syscall);
+  qa_raise("Error", error_number, 0, "%s: %s, %s '%s'", name, text, syscall, path);
 }
 
 void qa_archive_check_range(const char *source, int64_t size, int64_t offset,
@@ -67,6 +110,8 @@ static char *json_stringify(const char *value) {
 
 static noreturn void unsafe_path(const char *path) {
   char *json = json_stringify(path != NULL ? path : "");
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, json);
   qa_range_error("Unsafe archive member path: %s", json != NULL ? json : "\"\"");
 }
 

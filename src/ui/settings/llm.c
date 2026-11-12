@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/llm/errors.h"
@@ -32,10 +33,13 @@ struct llm_state {
   int handles[2];
   qa_ui_control controls[20];
   lctx ctxs[20];
-  qa_ui_choice effort_choices[40];
+  /* The effort choices and owned strings grow with the model catalog, which
+     comes from the provider's server. */
+  qa_ui_choice *effort_choices;
+  size_t effort_capacity;
   char model_label[640];
-  char *owned[48];
-  size_t owned_count;
+  char **owned;
+  size_t owned_count, owned_capacity;
   char *signin_selected_model; /* factory-time snapshot for L_SIGNIN */
   char title[64];
 };
@@ -171,12 +175,14 @@ static void run(llm_state *s, run_args *args, enum success_kind success) {
   }
 }
 
+/* text.trim() === "": JS white space over UTF-8 code points. */
 static bool blank_trim(const char *text) {
-  char *trimmed = qa_input_js_trim(text);
-  if (trimmed == NULL) qa_range_error("Out of memory");
-  bool empty = trimmed[0] == '\0';
-  free(trimmed);
-  return empty;
+  for (const char *p = text; *p != '\0';) {
+    size_t space = qa_js_white_space_length(p);
+    if (space == 0) return false;
+    p += space;
+  }
+  return true;
 }
 
 static void on_activate(void *v, qa_seat_id seat) {
@@ -340,7 +346,13 @@ static void clear_owned(llm_state *s) {
   s->owned_count = 0;
 }
 static char *own(llm_state *s, const char *text) {
-  if (s->owned_count >= 48) qa_range_error("Out of memory");
+  if (s->owned_count == s->owned_capacity) {
+    size_t capacity = s->owned_capacity == 0 ? 48 : s->owned_capacity * 2;
+    char **grown = realloc(s->owned, capacity * sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    s->owned = grown;
+    s->owned_capacity = capacity;
+  }
   char *copy = qa_input_dup(text);
   if (copy == NULL) qa_range_error("Out of memory");
   s->owned[s->owned_count++] = copy;
@@ -417,7 +429,7 @@ static qa_ui_menu factory(void *v) {
   const qa_llm_model_catalog *catalog = &snap.catalogs[provider];
   const char *chosen = s->model != NULL ? s->model : selected_model;
   const qa_llm_model *metadata = NULL;
-  for (size_t i = 0; i < catalog->models.count; i++)
+  for (size_t i = 0; metadata == NULL && i < catalog->models.count; i++)
     if (strcmp(catalog->models.items[i].id, chosen) == 0)
       metadata = &catalog->models.items[i];
   qa_ui_control *controls = s->controls;
@@ -467,9 +479,15 @@ static qa_ui_menu factory(void *v) {
   const char *current_effort = !s->has_effort ? snap.reasoning_effort
                                               : s->effort;
   effort.selected = current_effort != NULL ? own(s, current_effort) : "";
+  if (s->effort_capacity < effort_count + 1) {
+    qa_ui_choice *grown = realloc(s->effort_choices, (effort_count + 1) * sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    s->effort_choices = grown;
+    s->effort_capacity = effort_count + 1;
+  }
   size_t ec = 0;
   s->effort_choices[ec++] = (qa_ui_choice){ "", "Model default" };
-  for (size_t i = 0; i < effort_count && ec < 40; i++) {
+  for (size_t i = 0; i < effort_count; i++) {
     char *id = own(s, metadata->reasoning_efforts[i]);
     s->effort_choices[ec++] = (qa_ui_choice){ id, id };
   }
@@ -551,7 +569,7 @@ static qa_ui_menu factory(void *v) {
   size_t line_count = 0;
   char **lines = qa_ui_wrap_words(message_buffer, 54, &line_count);
   for (int line = 0; line < 2 && (size_t)line < line_count && at < 19; line++) {
-    char *trimmed = qa_input_js_trim(lines[line]);
+    char *trimmed = qa_ui_js_trim(lines[line]);
     if (trimmed == NULL) qa_range_error("Out of memory");
     char id[48];
     snprintf(id, sizeof id, "ui:llm:message:%d", line);
@@ -643,6 +661,8 @@ static void llm_dispose(qa_ui_settings_menus *menus) {
   qa_llm_settings_cancel_sign_in(s->service);
   clear_drafts(s);
   clear_owned(s);
+  free(s->owned);
+  free(s->effort_choices);
   free(s->key);
   free(s->model);
   free(s->base_url);

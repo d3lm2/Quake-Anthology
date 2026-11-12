@@ -44,7 +44,7 @@ static void finale_check(void *ctx, qa_q1_services *g, qa_q1_actor *e) {
 static int finale(qa_q1_services *game, const char *key, double track, qa_q1_intermission_result *out) {
   memset(out, 0, sizeof *out);
   out->kind = "finale";
-  (void)snprintf(out->text, sizeof out->text, "%s", qa_q1mp_mission_finale_text(game->options.edition, key));
+  out->text = qa_q1mp_mission_finale_text(game->options.edition, key);
   out->track = track;
   return 1;
 }
@@ -142,6 +142,13 @@ static void effect_finale_use(void *ctx, qa_q1_services *g, qa_q1_actor *e, cons
     qa_q1mp_world_later(g, e, e->wait, "hip:finale_callback");
   }
 }
+/* TS `finally { if (g.entity(e.actor.id) !== null) e.classname = previous }`: also runs when the spawn raises. */
+typedef struct finale_classname { qa_q1_services *game; qa_q1_actor *entity; qa_actor_id id; char *previous; } finale_classname;
+static void restore_finale_classname(void *arg) {
+  const finale_classname *restore = arg;
+  if (qa_q1_get_entity(restore->game, &restore->id) != NULL) { free(restore->entity->classname); restore->entity->classname = restore->previous; }
+  else free(restore->previous);
+}
 static void finale_callback(void *ctx, qa_q1_services *g, qa_q1_actor *e) {
   const char *callback = qa_q1_actor_text(e, "hip:finale_callback");
   if (qa_q1mp_streq(callback, "info_startendtext_use")) { end_text(ctx, g); return; }
@@ -149,13 +156,14 @@ static void finale_callback(void *ctx, qa_q1_services *g, qa_q1_actor *e) {
   if (qa_q1mp_streq(callback, "SUB_Remove")) { qa_q1_remove(g, e); return; }
   if (qa_q1mp_streq(callback, "SUB_Null")) return;
   /* Quake map function fields also name spawn routines. */
-  char *previous = e->classname;
+  finale_classname restore = {g, e, e->actor.id, e->classname};
   e->classname = NULL;
   qa_q1mp_set_string(&e->classname, callback);
-  const qa_actor_id id = e->actor.id;
+  qa_cleanup node; /* an unknown spawn function raises out of spawnEntity */
+  qa_cleanup_push(&node, restore_finale_classname, &restore);
   qa_q1_spawn_entity(g, e);
-  if (qa_q1_get_entity(g, &id) != NULL) { free(e->classname); e->classname = previous; }
-  else free(previous);
+  qa_cleanup_pop(&node);
+  restore_finale_classname(&restore);
 }
 static void effect_finale_spawn(void *ctx, qa_q1_services *g, qa_q1_actor *e) {
   (void)ctx;

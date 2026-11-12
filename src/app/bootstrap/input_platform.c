@@ -5,10 +5,14 @@
 #include "input_internal.h"
 #include <math.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qa/app/bootstrap/audio.h"
 #include "qa/app/bootstrap/cvar_archives.h"
+#include "qa/app/bootstrap/native_settings.h"
+#include "qa/app/bootstrap/seat_profile.h"
+#include "qa/input/bindings.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/network/common/js_number.h"
@@ -153,7 +157,8 @@ void qa_app_application_input_retire_local_seats(qa_app_application_input *input
   step.kind = 8; dispose(&step, &failures, &first);
   free(ids); free(next); free(removed);
   if (failures != 0)
-    qa_raise("AggregateError", 0, 0, "Local input retirement failed (%zu errors; first %s: %s)", failures, first.name, first.message);
+    /* new AggregateError(failures, "Local input retirement failed"): the message names no inner error */
+    qa_raise("AggregateError", 0, (long long)failures, "Local input retirement failed");
 }
 
 /* ---- startup publication shared by prepareLocalSeats ---- */
@@ -338,6 +343,30 @@ void qa_app_application_input_sound_haptics(qa_app_application_input *input, qa_
 }
 
 /* ---- build ---- */
+/* A built command's arsenal provider and weapon: TS holds the selection's strings for as long as the command lives
+ * (a command is kept past the next build or selection change, e.g. the unified client's unacknowledged inputs and
+ * predictions), so the C hands out interned copies that live for the process. Provider and item ids are a closed
+ * vocabulary. */
+static pthread_mutex_t arsenal_intern_lock = PTHREAD_MUTEX_INITIALIZER;
+static char **arsenal_interned; static size_t arsenal_interned_count, arsenal_interned_capacity;
+static const char *arsenal_intern(const char *text) {
+  if (text == NULL) return NULL;
+  pthread_mutex_lock(&arsenal_intern_lock);
+  for (size_t i = 0; i < arsenal_interned_count; i++)
+    if (strcmp(arsenal_interned[i], text) == 0) { pthread_mutex_unlock(&arsenal_intern_lock); return arsenal_interned[i]; }
+  if (arsenal_interned_count == arsenal_interned_capacity) {
+    size_t next = arsenal_interned_capacity == 0 ? 16 : arsenal_interned_capacity * 2;
+    char **grown = realloc(arsenal_interned, next * sizeof *grown);
+    if (grown == NULL) { pthread_mutex_unlock(&arsenal_intern_lock); qa_range_error("Out of memory"); }
+    arsenal_interned = grown; arsenal_interned_capacity = next;
+  }
+  char *copy = strdup(text);
+  if (copy == NULL) { pthread_mutex_unlock(&arsenal_intern_lock); qa_range_error("Out of memory"); }
+  arsenal_interned[arsenal_interned_count++] = copy;
+  pthread_mutex_unlock(&arsenal_intern_lock);
+  return copy;
+}
+
 static qa_actor_command build_one(qa_app_application_input *input, qa_seat_id seat, double elapsed, double server_ms,
     double server_frame, double wall_elapsed) {
   input_local *local = qa_app_input_internal_find_local(input, seat);
@@ -385,8 +414,8 @@ static qa_actor_command build_one(qa_app_application_input *input, qa_seat_id se
   if (has_impulse_provider || selected != NULL) {
     qa_arsenal_intent *arsenal = INPUT_PUSH(input->arsenal_out, input->arsenal_out_count, input->arsenal_out_capacity);
     memset(arsenal, 0, sizeof *arsenal);
-    arsenal->provider = has_impulse_provider ? impulse_provider : selected->provider;
-    arsenal->weapon = has_impulse_provider ? NULL : selected->weapon;
+    arsenal->provider = arsenal_intern(has_impulse_provider ? impulse_provider : selected->provider);
+    arsenal->weapon = has_impulse_provider ? NULL : arsenal_intern(selected->weapon);
     if (has_impulse_provider && sample.impulse != 0) { arsenal->has_impulse = true; arsenal->impulse = sample.impulse; }
     bool use = false;
     for (size_t b = 0; b < sample.button_count && !use; b++) {
@@ -836,6 +865,84 @@ static void save_archive(qa_app_application_input *input, const char *kind, cons
   qa_app_save_cvar_archive(input->settings, owner, extra != NULL ? 3 : 2, registry, NULL, 0);
 }
 
+/* ---- saveNativeConfig: a stock game writes its own configuration file the way the original does at quit. ---- */
+typedef struct native_save {
+  qa_app_application_input *input;
+  qa_native_config *native;
+  qa_game_layers *layers;
+  qa_command_context source;
+} native_save;
+static char *native_reset_value(void *ctx, const char *name) {
+  /* this.commands.findCvar(name, source)?.resetValue */
+  native_save *save = ctx;
+  qa_cvar_read found;
+  if (!qa_command_buffer_find_cvar(save->input->commands, name, &save->source, &found)) return NULL;
+  char *value = found.reset_value;
+  found.reset_value = NULL;
+  qa_cvar_read_free(&found);
+  return value;
+}
+/* What native_save_run builds; a raise from the write (or the absorb) frees it as the normal path does. */
+typedef struct native_save_parts {
+  qa_binding_pair *pairs; size_t pair_count;
+  qa_layer_pair *view;
+  char **commands; size_t command_count;
+} native_save_parts;
+static void native_save_parts_free(void *value) {
+  native_save_parts *parts = value;
+  for (size_t i = 0; i < parts->command_count; i++) free(parts->commands[i]);
+  free(parts->commands);
+  free(parts->view);
+  qa_binding_pairs_free(parts->pairs, parts->pair_count);
+  memset(parts, 0, sizeof *parts);
+}
+static const char *native_save_run(void *ctx) {
+  native_save *save = ctx;
+  qa_app_application_input *input = save->input;
+  native_save_parts parts;
+  memset(&parts, 0, sizeof parts);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, native_save_parts_free, &parts);
+  size_t binding_count = 0, pair_count = 0, command_count = 0;
+  const qa_input_binding *bindings = qa_seat_input_bindings(input->locals[0]->pub.input, &binding_count);
+  qa_binding_pair *pairs = qa_archived_binding_pairs(bindings, binding_count, false, &pair_count);
+  if (pairs == NULL && pair_count > 0) qa_range_error("Out of memory");
+  parts.pairs = pairs; parts.pair_count = pair_count;
+  qa_layer_pair *view = parts.view = xcalloc(pair_count + 1, sizeof *view);
+  for (size_t i = 0; i < pair_count; i++) view[i] = (qa_layer_pair){pairs[i].key, pairs[i].command};
+  char **commands = qa_command_buffer_archive_commands(input->commands, &save->source, &command_count);
+  parts.commands = commands; parts.command_count = command_count;
+  qa_native_write_context context = {native_reset_value, save};
+  if (save->native != NULL) {
+    qa_native_config_write(save->native, view, pair_count, (const char *const *)commands, command_count, &context);
+  } else {
+    /* A mixed combination has no file to write, but its changes reach the high level through the same layers. */
+    qa_native_session session;
+    qa_absorb_session(save->layers, save->layers->format, view, pair_count, (const char *const *)commands, command_count,
+                      true, &context, &session);
+    qa_native_session_free(&session);
+  }
+  qa_cleanup_pop(&guard);
+  native_save_parts_free(&parts);
+  return NULL;
+}
+static void save_native_config(qa_app_application_input *input) {
+  qa_native_config *native = qa_app_console_script_files_native(input->script_owner);
+  qa_game_layers *layers = qa_app_console_script_files_layers(input->script_owner);
+  if (input->local_count == 0) return;
+  qa_session_seat *seat = input->locals[0]->pub.player.seat;
+  native_save save;
+  memset(&save, 0, sizeof save);
+  save.input = input; save.native = native; save.layers = layers;
+  save.source.session = qa_session_seat_id(seat).session;
+  save.source.origin.kind = QA_COMMAND_ORIGIN_LOCAL_SEAT;
+  save.source.origin.seat = qa_session_seat_id(seat);
+  save.source.origin.client = qa_session_client_id(qa_session_seat_client(seat));
+  if (native == NULL && !(layers != NULL && qa_game_layers_is_ready(layers))) return;
+  const char *error = qa_app_console_script_files_write(input->script_owner, native_save_run, &save);
+  if (error != NULL) qa_input_error("%s", error);
+}
+
 void qa_app_application_input_save_settings(qa_app_application_input *input) {
   if (input->startup != NULL && qa_app_prepared_startup_pending(input->startup)) return;
   qa_app_input_devices_save(input->input_devices);
@@ -869,14 +976,28 @@ void qa_app_application_input_save_settings(qa_app_application_input *input) {
     snprintf(name, sizeof name, "input/seat-%lld.json", (long long)(seat.index + 1));
     bool saved = qa_config_store_save_seat(input->settings, name, &settings);
     free(saved_bindings); free(history);
-    if (!saved) qa_input_error("Could not write %s", name);
+    if (!saved) qa_settings_raise_write_failure();
     qa_app_controller_settings_save(input->controller_settings, seat);
+  }
+  if (input->local_count > 0 && local_seat(input->locals[0]).index == 0) {
+    input_local *first = input->locals[0];
+    qa_seat_settings shared;
+    memset(&shared, 0, sizeof shared);
+    shared.version = 1;
+    shared.has_always_run = true;
+    shared.always_run = qa_input_command_builder_tuning(first->pub.builder).always_run;
+    shared.gamepad = qa_seat_input_gamepad(first->pub.input)->tuning;
+    shared.mouse = qa_mouse_input_tuning(qa_input_command_builder_mouse(first->pub.builder));
+    shared.rumble = qa_seat_haptics_enabled(first->pub.haptics);
+    shared.rumble_strength = qa_seat_haptics_strength(first->pub.haptics);
+    shared.controller.kind = QA_CONTROLLER_AUTOMATIC;
+    qa_app_save_shared_tuning(input->options->user_content_root, &shared);
   }
   qa_seat_id keyboard;
   bool has_keyboard = qa_input_router_keyboard_seat(input->router, &keyboard);
   double index = has_keyboard ? (double)keyboard.index : -1;
   if (!qa_config_store_save_input_routing(input->settings, "input/routing.json", index < 0 ? -1 : index, index >= 0))
-    qa_input_error("Could not write input/routing.json");
+    qa_settings_raise_write_failure();
   if (input->archive_persistence && !(input->startup != NULL && qa_app_prepared_startup_pending(input->startup))) {
     save_archive(input, "movement", NULL, input->cvar_owner);
     if (input->console_cvars != input->cvar_owner) save_archive(input, "fallback", NULL, input->console_cvars);
@@ -885,6 +1006,7 @@ void qa_app_application_input_save_settings(qa_app_application_input *input) {
       snprintf(seat_index, sizeof seat_index, "%s", QA_JS_NUMBER((double)input->mice[i].seat.index));
       save_archive(input, "input", seat_index, input->mice[i].settings.cvars);
     }
+    save_native_config(input);
   }
 }
 

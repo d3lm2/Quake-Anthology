@@ -1,6 +1,5 @@
 /* Port of src/formats/images/jpeg.ts. GPL-2.0-or-later. */
 #include "qa/formats/images/jpeg.h"
-#include "qa/formats/images/limits.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -372,11 +371,6 @@ static struct frame *prepare_frame(struct input *input,
   if (width > 65500 || height > 65500) {
     qa_jpeg_source_error(input->source, (int64_t)input->offset,
                          "Maximum supported image dimension is 65500 pixels");
-  }
-  if (!qa_image_size_allowed((double)width, (double)height)) {
-    qa_jpeg_source_error(input->source, (int64_t)input->offset,
-                         "JPEG dimensions %lldx%lld exceed the decoder limit", (long long)width,
-                         (long long)height);
   }
   if (header->precision != 8) {
     qa_jpeg_source_error(input->source, (int64_t)input->offset,

@@ -39,7 +39,7 @@ qa_compat_q2_native_mod_invocation_kind qa_compat_q2_native_mod_invocations_run(
     }
   }
   if (runner->free_processor != NULL) runner->free_processor(runner->ctx, before);
-  if (s->scope_count == 0 || s->scopes[--s->scope_count] != &scope) qa_range_error("Native source invocation ownership changed");
+  if (s->scope_count == 0 || s->scopes[--s->scope_count] != &scope) qa_raise("Error", 0, 0, "Native source invocation ownership changed");
   if (s->scope_count == 0) s->retired_count = 0;
   if (rethrow) qa_compat_q2_native_rethrow(&thrown);
   return kind;
@@ -51,7 +51,7 @@ static void guard_body(void *value) {
   state->invoke(state->ctx);
 }
 void qa_compat_q2_native_mod_invocations_guard(invocations *s, const qa_compat_q2_native_mod_region_authority *authority, void *invoke_ctx, void (*invoke)(void *)) {
-  if (s->scope_count == 0) qa_range_error("Native donor has no owning source invocation");
+  if (s->scope_count == 0) qa_raise("Error", 0, 0, "Native donor has no owning source invocation");
   const qa_compat_q2_native_mod_invocation_scope *scope = s->scopes[s->scope_count - 1];
   retirement *entry = find_retirement(s, authority);
   if (entry == NULL) entry = qa_compat_q2_grow((void **)&s->retired, &s->retired_count, &s->retired_capacity, sizeof *entry);

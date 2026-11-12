@@ -50,6 +50,9 @@ static void image_teardown(void *v) {
 }
 
 qa_ui_setting_bindings qa_ui_bind_image_settings(qa_cvar_registry *registry) {
+  return qa_ui_bind_image_settings_view(qa_ui_setting_cvars_of(registry));
+}
+qa_ui_setting_bindings qa_ui_bind_image_settings_view(qa_ui_setting_cvars cvars) {
   static const qa_ui_choice replacement_choices[3] = {
     { "0", "Disabled" }, { "1", "Replace classic formats" },
     { "2", "Replace all formats" }
@@ -63,6 +66,9 @@ qa_ui_setting_bindings qa_ui_bind_image_settings(qa_cvar_registry *registry) {
   };
   image_owner *o = calloc(1, sizeof *o);
   if (o == NULL) qa_range_error("Out of memory");
+  /* A bind that raises (no owner) leaves the owner to TS's GC. */
+  qa_cleanup owner_node;
+  qa_cleanup_push(&owner_node, image_teardown, o);
   qa_ui_cvar_setting_spec spec;
   memset(&spec, 0, sizeof spec);
   spec.category = "video";
@@ -71,7 +77,7 @@ qa_ui_setting_bindings qa_ui_bind_image_settings(qa_cvar_registry *registry) {
   spec.kind = "choice";
   spec.choices = replacement_choices;
   spec.choice_count = 3;
-  if (!qa_ui_bind_cvar_setting(registry, &spec, NULL, &o->items[0]))
+  if (!qa_ui_bind_cvar_setting_view(cvars, &spec, NULL, &o->items[0]))
     qa_range_error("Out of memory");
   memset(&spec, 0, sizeof spec);
   spec.category = "video";
@@ -79,7 +85,7 @@ qa_ui_setting_bindings qa_ui_bind_image_settings(qa_cvar_registry *registry) {
   spec.label = "Formats (source = default)";
   spec.kind = "text-entry";
   spec.maximum_length = 128;
-  if (!qa_ui_bind_cvar_setting(registry, &spec, NULL, &o->items[1]))
+  if (!qa_ui_bind_cvar_setting_view(cvars, &spec, NULL, &o->items[1]))
     qa_range_error("Out of memory");
   memset(&spec, 0, sizeof spec);
   spec.category = "video";
@@ -87,10 +93,10 @@ qa_ui_setting_bindings qa_ui_bind_image_settings(qa_cvar_registry *registry) {
   spec.label = "Image types";
   spec.kind = "text-entry";
   spec.maximum_length = 12;
-  if (!qa_ui_bind_cvar_setting(registry, &spec, NULL, &o->items[2]))
+  if (!qa_ui_bind_cvar_setting_view(cvars, &spec, NULL, &o->items[2]))
     qa_range_error("Out of memory");
   if (strcmp(o->items[2].kind, "text-entry") != 0)
-    qa_range_error("Image mask requires a numeric text binding");
+    qa_raise("Error", 0, 0, "Image mask requires a numeric text binding");
   for (int i = 0; i < 5; i++) {
     o->usages[i].mask = &o->items[2];
     o->usages[i].bit = usages[i].bit;
@@ -109,6 +115,7 @@ qa_ui_setting_bindings qa_ui_bind_image_settings(qa_cvar_registry *registry) {
     b->read_bool = usage_read;
     b->write_bool = usage_write;
   }
+  qa_cleanup_pop(&owner_node);
   return qa_ui_setting_bindings_own(o->items, 8, o, image_teardown);
 }
 
@@ -120,6 +127,9 @@ static void model_teardown(void *v) {
   free(o);
 }
 qa_ui_setting_bindings qa_ui_bind_model_settings(qa_cvar_registry *registry) {
+  return qa_ui_bind_model_settings_view(qa_ui_setting_cvars_of(registry));
+}
+qa_ui_setting_bindings qa_ui_bind_model_settings_view(qa_ui_setting_cvars cvars) {
   static const struct { const char *name, *label; } controls[3] = {
     { "r_enhancedmodels", "Q1 enhanced models" },
     { "gl_md5_load", "Load Q2 enhanced models" },
@@ -127,6 +137,8 @@ qa_ui_setting_bindings qa_ui_bind_model_settings(qa_cvar_registry *registry) {
   };
   model_owner *o = calloc(1, sizeof *o);
   if (o == NULL) qa_range_error("Out of memory");
+  qa_cleanup owner_node;
+  qa_cleanup_push(&owner_node, model_teardown, o);
   for (int i = 0; i < 3; i++) {
     qa_ui_cvar_setting_spec spec;
     memset(&spec, 0, sizeof spec);
@@ -134,7 +146,7 @@ qa_ui_setting_bindings qa_ui_bind_model_settings(qa_cvar_registry *registry) {
     spec.label = controls[i].label;
     spec.category = "video";
     spec.kind = "toggle";
-    if (!qa_ui_bind_cvar_setting(registry, &spec, NULL, &o->items[i]))
+    if (!qa_ui_bind_cvar_setting_view(cvars, &spec, NULL, &o->items[i]))
       qa_range_error("Out of memory");
   }
   qa_ui_cvar_setting_spec spec;
@@ -145,7 +157,8 @@ qa_ui_setting_bindings qa_ui_bind_model_settings(qa_cvar_registry *registry) {
   spec.kind = "text-entry";
   spec.maximum_length = 16;
   spec.submit_only = true;
-  if (!qa_ui_bind_cvar_setting(registry, &spec, NULL, &o->items[3]))
+  if (!qa_ui_bind_cvar_setting_view(cvars, &spec, NULL, &o->items[3]))
     qa_range_error("Out of memory");
+  qa_cleanup_pop(&owner_node);
   return qa_ui_setting_bindings_own(o->items, 4, o, model_teardown);
 }

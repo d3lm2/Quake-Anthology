@@ -129,6 +129,7 @@ static void close_q3_client(void *ctx) {
 static void close_release_settings(void *ctx) { qa_remote_application_release_settings(((close_state *)ctx)->app); }
 static void close_clear_presentation(void *ctx) { qa_remote_application_clear_source_presentation(((close_state *)ctx)->app); }
 static void close_disconnect(void *ctx) { qa_remote_application_disconnect_source(((close_state *)ctx)->app); }
+static void close_console_log(void *ctx) { qa_app_console_log_close(&((close_state *)ctx)->app->console_log); }
 static void close_remote_content(void *ctx) {
   qa_remote_application *app = ((close_state *)ctx)->app;
   if (app->remote_content != NULL) qa_app_remote_content_mounts_close(app->remote_content);
@@ -172,6 +173,10 @@ static void close_frontend_art(void *ctx) {
 static void close_frontend_assets(void *ctx) {
   close_state *state = ctx;
   if (state->frontend != NULL) qa_app_application_assets_close(state->frontend->assets);
+}
+static void close_initial_components(void *ctx) {
+  qa_remote_application *app = ((close_state *)ctx)->app;
+  if (app->initial_components != NULL) qa_app_remote_component_view_close(app->initial_components);
 }
 static void close_retire_frontends(void *ctx) { qa_remote_application_retire_frontends(((close_state *)ctx)->app); }
 static void close_execute(void *ctx) { qa_remote_renderer_execute(((close_state *)ctx)->app, NULL, 0); }
@@ -250,11 +255,13 @@ void qa_remote_application_close_owned(qa_remote_application *app) {
   app->world_load_generation++;
   app->client_input_count = 0;
   /* TS initialComponents?.close(): only the unified replica builds one (the application frees it at destroy). */
-  if (app->initial_components != NULL) qa_app_remote_component_view_close(app->initial_components);
-  app->initial_components = NULL;
+  /* try { initialComponents?.close(); initialComponents = null } catch (error) { errors.push(error) } */
+  qa_caught_error components_error;
+  if (qa_try(close_initial_components, &state, &components_error)) app->initial_components = NULL;
+  else failed = true;
   state.frontend = app->frontend;
   app->frontend = NULL;
-  void (*closes[])(void *) = {close_remote_content, close_qw_downloads, close_q3_downloads, close_source, close_transport,
+  void (*closes[])(void *) = {close_console_log, close_remote_content, close_qw_downloads, close_q3_downloads, close_source, close_transport,
       close_controls, close_frontend_audio, close_frontend_effects, close_frontend_art, close_frontend_assets};
   for (size_t i = 0; i < sizeof closes / sizeof closes[0]; i++) step(closes[i], &state, &failed);
   app->closed_frontend = state.frontend;

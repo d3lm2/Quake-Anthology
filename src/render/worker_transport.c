@@ -36,14 +36,36 @@ typedef struct channel {
 static void *xmalloc(size_t n) { void *m = malloc(n ? n : 1); if (m == NULL) qa_range_error("Render thread allocation failed"); return m; }
 static void *copy_bytes(const void *bytes, size_t size) { if (bytes == NULL || size == 0) return NULL; void *m = xmalloc(size); memcpy(m, bytes, size); return m; }
 static void copy_text(char *destination, size_t capacity, const char *text) { (void)snprintf(destination, capacity, "%s", text); }
+/* Whole message text: TS error.message has no length limit. */
+static char *copy_message(const char *text) {
+  if (text == NULL) return NULL;
+  size_t length = strlen(text);
+  char *m = (char *)xmalloc(length + 1);
+  memcpy(m, text, length + 1);
+  return m;
+}
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6; }
 
 void qa_rwt_value_release(qa_rwt_value *value) { if (value == NULL) return; free(value->owned); value->owned = NULL; value->bytes = NULL; value->size = 0; }
+void qa_rwt_failure_release(qa_rwt_failure *failure) { free(failure->message); memset(failure, 0, sizeof *failure); }
 void qa_rwt_failure_set(qa_rwt_failure *failure, const char *name, const char *message) {
-  failure->is_host = false; failure->token = 0;
-  copy_text(failure->name, sizeof failure->name, name); copy_text(failure->message, sizeof failure->message, message);
+  char *text = copy_message(message != NULL ? message : "");
+  qa_rwt_failure_release(failure);
+  copy_text(failure->name, sizeof failure->name, name); failure->message = text;
+}
+void qa_rwt_failure_move(qa_rwt_failure *to, qa_rwt_failure *from) {
+  if (to == from) return;
+  qa_rwt_failure_release(to);
+  *to = *from; memset(from, 0, sizeof *from);
+}
+void qa_rwt_failure_copy(qa_rwt_failure *to, const qa_rwt_failure *from) {
+  if (to == from) return;
+  char *text = copy_message(from->message);
+  qa_rwt_failure_release(to);
+  *to = *from; to->message = text;
 }
 
+/* The message takes r's payload and failure text; the sender forgets them. */
 static void send_message(channel *c, queue *q, msg_kind kind, int64_t sequence, bool has_parent, int64_t parent, const response *r) {
   message *m = (message *)xmalloc(sizeof *m);
   memset(m, 0, sizeof *m);
@@ -94,7 +116,8 @@ static const char *invalid_message(const message *m) {
     && m->response.failure.is_host && !valid_sequence(m->response.failure.token)) return "Invalid render thread message sequence";
   return NULL;
 }
-static void free_message(message *m) { if (m) { free(m->response.payload); free(m); } }
+static void free_message(message *m) { if (m) { free(m->response.payload); qa_rwt_failure_release(&m->response.failure); free(m); } }
+static void free_event(event *e) { if (e) { qa_rwt_failure_release(&e->failure); free(e); } }
 
 /* --- worker (servePort) --- */
 typedef struct cb_frame { int64_t sequence, parent; } cb_frame;
@@ -133,7 +156,7 @@ bool qa_rwt_worker_request(qa_rwt_worker *w, qa_rwt_value payload, qa_rwt_value 
       if (reply->kind != MSG_REPLY || reply->sequence != id || !reply->has_parent || reply->parent != parent) {
         free_message(reply); qa_rwt_failure_set(failure, "Error", "Unexpected render worker callback reply"); break;
       }
-      if (reply->response.is_failure) { *failure = reply->response.failure; free_message(reply); break; }
+      if (reply->response.is_failure) { qa_rwt_failure_move(failure, &reply->response.failure); free_message(reply); break; }
       out->owned = reply->response.payload; out->bytes = reply->response.payload; out->size = reply->response.size;
       reply->response.payload = NULL; free_message(reply); result = true; break;
     }
@@ -168,7 +191,7 @@ static void execute(qa_rwt_worker *w, message *m) {
   } else if (m->has_parent != has_callback || (has_callback && m->parent != callback)) {
     qa_rwt_failure_set(&failure, "Error", "Render worker dispatch has an invalid callback parent"); thrown = true;
   } else if (w->has_terminal) {
-    r.is_failure = true; r.failure = w->terminal;
+    r.is_failure = true; qa_rwt_failure_copy(&r.failure, &w->terminal);
   } else if (m->kind == MSG_INITIALIZE && !w->has_runtime && !m->has_parent) {
     qa_rwt_runtime runtime; memset(&runtime, 0, sizeof runtime);
     if (w->initialize(w->initialize_ctx, payload, w, &runtime, &failure)) {
@@ -185,10 +208,11 @@ static void execute(qa_rwt_worker *w, message *m) {
     qa_rwt_failure_set(&failure, "Error", "Unexpected render worker lifecycle command"); thrown = true;
   }
   if (thrown) {
-    if (!w->has_terminal) { w->terminal = failure; w->has_terminal = true; }
-    free(r.payload); memset(&r, 0, sizeof r);
-    r.is_failure = true; r.failure = w->terminal;
+    if (!w->has_terminal) { qa_rwt_failure_move(&w->terminal, &failure); w->has_terminal = true; }
+    free(r.payload); qa_rwt_failure_release(&r.failure); memset(&r, 0, sizeof r);
+    r.is_failure = true; qa_rwt_failure_copy(&r.failure, &w->terminal);
   }
+  qa_rwt_failure_release(&failure);
   w->operation_count--;
   atomic_store(&w->channel->signal1, w->operation_count != 0 ? 1 : 0);
   bool closing = m->kind == MSG_CLOSE && !r.is_failure;
@@ -204,7 +228,7 @@ static void *worker_main(void *arg) {
     const char *invalid = invalid_message(m);
     if (invalid != NULL) {
       /* An uncaught throw in the port listener reaches worker.on("error"), then exit. */
-      qa_rwt_failure f; qa_rwt_failure_set(&f, "Error", invalid);
+      qa_rwt_failure f; memset(&f, 0, sizeof f); qa_rwt_failure_set(&f, "Error", invalid);
       free_message(m);
       post_event(w->channel, EVENT_ERROR, 0, &f);
       post_event(w->channel, EVENT_EXIT, 1, NULL);
@@ -238,19 +262,40 @@ struct qa_rwt_transport {
   int wait_depth;
 };
 
+typedef struct class_name { struct class_name *next; char text[]; } class_name;
+static pthread_mutex_t class_lock = PTHREAD_MUTEX_INITIALIZER;
+static class_name *class_names;
+const char *qa_rwt_error_class(const char *name) {
+  static const char *const COMMON[] = {"Error", "RangeError", "TypeError", "AggregateError"};
+  if (name == NULL) return "Error";
+  for (size_t i = 0; i < sizeof COMMON / sizeof COMMON[0]; i++) if (strcmp(name, COMMON[i]) == 0) return COMMON[i];
+  pthread_mutex_lock(&class_lock);
+  class_name *found = NULL;
+  for (class_name *c = class_names; c != NULL; c = c->next) if (strcmp(c->text, name) == 0) { found = c; break; }
+  if (found == NULL) {
+    size_t length = strlen(name);
+    found = (class_name *)malloc(sizeof *found + length + 1);
+    if (found != NULL) { memcpy(found->text, name, length + 1); found->next = class_names; class_names = found; }
+  }
+  pthread_mutex_unlock(&class_lock);
+  return found != NULL ? found->text : "Error";
+}
 qa_rwt_error *qa_rwt_error_new(qa_rwt_transport *t, const char *name, const char *text) {
   qa_rwt_error *e = (qa_rwt_error *)xmalloc(sizeof *e);
   memset(e, 0, sizeof *e);
-  copy_text(e->name, sizeof e->name, name); copy_text(e->message, sizeof e->message, text);
+  copy_text(e->name, sizeof e->name, name); e->message = copy_message(text != NULL ? text : "");
   e->next = t->errors; t->errors = e;
   return e;
 }
+typedef struct failed_call { qa_rwt_transport *transport; } failed_call;
+static void failed_body(void *ctx) { qa_rwt_transport *t = ((failed_call *)ctx)->transport; t->host.failed(t->host.ctx, t->fault); }
 static qa_rwt_error *fail(qa_rwt_transport *t, qa_rwt_error *error) {
   if (t->notified == NULL) t->notified = error;
   if (t->fault == NULL) t->fault = t->notified;
   if (t->failure_delivered) return t->fault;
   t->failure_delivered = true;
-  if (t->host.failed != NULL) t->host.failed(t->host.ctx, t->fault);
+  /* try { this.host.failed?.(error) } catch { }: notification cannot replace the original terminal failure. */
+  if (t->host.failed != NULL) { failed_call call = {t}; qa_caught_error ignored; (void)qa_try(failed_body, &call, &ignored); }
   return t->fault;
 }
 static qa_rwt_error *host_failure_for(qa_rwt_transport *t, int64_t token) {
@@ -280,7 +325,7 @@ static void sweep_pending(qa_rwt_transport *t) {
   pending **link = &t->all;
   while (*link != NULL) {
     pending *p = *link;
-    if (p != t->current && p != t->close_pending && !p->outstanding) { *link = p->next; free(p->response.payload); free(p); }
+    if (p != t->current && p != t->close_pending && !p->outstanding) { *link = p->next; free(p->response.payload); qa_rwt_failure_release(&p->response.failure); free(p); }
     else link = &p->next;
   }
 }
@@ -327,7 +372,7 @@ static qa_rwt_error *accept_message(qa_rwt_transport *t, message *m) {
   for (pending *c = t->all; c != NULL; c = c->next) if (c->outstanding && c->sequence == m->sequence) { p = c; break; }
   if (p == NULL || m->has_parent || p->has_response)
     return qa_rwt_error_new(t, "Error", "Renderer completed an unowned command buffer");
-  p->response = m->response; m->response.payload = NULL;
+  p->response = m->response; m->response.payload = NULL; memset(&m->response.failure, 0, sizeof m->response.failure);
   p->has_response = true; p->armed = false; p->outstanding = false;
   if (p->response.is_failure) (void)fail(t, resolve_failure(t, &p->response.failure));
   if (p->publish && !p->response.is_failure) {
@@ -501,7 +546,7 @@ void qa_rwt_pump(qa_rwt_transport *t) {
         (void)fail(t, qa_rwt_error_new(t, "Error", text));
       }
     }
-    free(e);
+    free_event(e);
   }
   if (t->closed) return;
   (void)drain(t);
@@ -558,12 +603,13 @@ void qa_rwt_destroy(qa_rwt_transport *t) {
     message *m;
     while ((m = receive_message(t->channel, &t->channel->to_worker)) != NULL) free_message(m);
     while ((m = receive_message(t->channel, &t->channel->to_main)) != NULL) free_message(m);
-    for (event *e = t->channel->events; e != NULL;) { event *next = e->next; free(e); e = next; }
+    for (event *e = t->channel->events; e != NULL;) { event *next = e->next; free_event(e); e = next; }
     pthread_mutex_destroy(&t->channel->lock); pthread_cond_destroy(&t->channel->wake);
     free(t->channel);
+    qa_rwt_failure_release(&t->worker->terminal);
     free(t->worker->operations); free(t->worker->callbacks); free(t->worker);
   }
-  for (pending *p = t->all; p != NULL;) { pending *next = p->next; free(p->response.payload); free(p); p = next; }
-  for (qa_rwt_error *e = t->errors; e != NULL;) { qa_rwt_error *next = e->next; free(e); e = next; }
+  for (pending *p = t->all; p != NULL;) { pending *next = p->next; free(p->response.payload); qa_rwt_failure_release(&p->response.failure); free(p); p = next; }
+  for (qa_rwt_error *e = t->errors; e != NULL;) { qa_rwt_error *next = e->next; free(e->message); free(e); e = next; }
   free(t->host_failures); free(t->callbacks); free(t->description); free(t);
 }

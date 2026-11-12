@@ -63,10 +63,12 @@ bool qa_q3_discovery_wire_init(qa_discovery_wire *wire, qa_q3_discovery_wire_sta
   memset(state, 0, sizeof *state);
   if (!(protocol == trunc(protocol) && fabs(protocol) <= 9007199254740991.0) || protocol <= 0 || protocol > 0x7fffffff)
     qa_raise("RangeError", 0, 0, "Invalid Q3 master protocol");
-  /* /\s|\0/: C strings cannot hold NUL; whitespace is tested bytewise (ASCII). */
+  /* /\s|\0/: C strings cannot hold NUL. Keywords are source bytes (one byte per UTF-16 unit), and
+   * the only JS \s character in that range beyond ASCII whitespace is U+00A0. */
   for (size_t i = 0; i < keyword_count; i++)
     for (const char *p = keywords[i]; *p; p++)
-      if (isspace((unsigned char)*p)) qa_raise("RangeError", 0, 0, "Q3 master keywords must be source words");
+      if (isspace((unsigned char)*p) || (unsigned char)*p == 0xa0)
+        qa_raise("RangeError", 0, 0, "Q3 master keywords must be source words");
   state->keywords = calloc(keyword_count ? keyword_count : 1, sizeof *state->keywords);
   if (!state->keywords) return false;
   for (size_t i = 0; i < keyword_count; i++) {

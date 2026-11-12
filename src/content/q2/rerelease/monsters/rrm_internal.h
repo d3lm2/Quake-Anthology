@@ -8,6 +8,7 @@
 #include "qa/content/q2/foundation/monsters/types.h"
 #include "qa/content/q2/missionpacks/monsters/types.h"
 #include "qa/core/math.h"
+#include "qa/foundation/js.h"
 
 static inline qa_vec3 q2rm_v3(double x, double y, double z) { qa_vec3 v = {x, y, z}; return v; }
 static inline qa_vec3 q2rm_zero(void) { return q2rm_v3(0, 0, 0); }
@@ -82,9 +83,11 @@ static inline qa_damage_outcome q2rm_damage(qa_q2_game_services *g, qa_actor_id 
                    means, has_flags ? flags : 0, NULL); /* TS flags = 0, weapon = null */
 }
 /* JS bitwise ops on doubles go through int32. */
-static inline double q2rm_or(double value, int32_t bits) { return (double)((int32_t)value | bits); }
-static inline double q2rm_and(double value, int32_t bits) { return (double)((int32_t)value & bits); }
-static inline bool q2rm_has(double value, int32_t bits) { return ((int32_t)value & bits) != 0; }
+static inline double q2rm_or(double value, int32_t bits) { return (double)(qa_js_to_int32(value) | bits); }
+static inline double q2rm_and(double value, int32_t bits) { return (double)(qa_js_to_int32(value) & bits); }
+static inline bool q2rm_has(double value, int32_t bits) { return (qa_js_to_int32(value) & bits) != 0; }
+/* TS `value || fallback` on a number: 0, -0 and NaN take the fallback. */
+static inline double q2rm_else(double value, double fallback) { return value == 0 || isnan(value) ? fallback : value; }
 static inline qa_vec3 q2rm_at_v(const qa_vec3 *values, size_t count, double index) {
   return values[qa_q2m_record_at(count, index)];
 }

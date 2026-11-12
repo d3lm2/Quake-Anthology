@@ -111,7 +111,8 @@ void qa_q2w_weapons_set_fallback_order(qa_q2w_weapons *w, const qa_q2w_name *ord
   if (count) {
     w->fallback_order = malloc(count * sizeof *w->fallback_order);
     if (!w->fallback_order) return;
-    memcpy(w->fallback_order, order, count * sizeof *order);
+    /* TS [...order] copies the strings: keep the registered names, not the caller's pointers. */
+    for (size_t i = 0; i < count; i++) w->fallback_order[i] = qa_q2w_weapons_definition(w, order[i])->name;
     w->fallback_count = count;
   }
 }
@@ -151,7 +152,7 @@ qa_q2w_selection qa_q2w_weapons_request_weapon(qa_q2w_weapons *w, qa_q2w_owner s
     if (ammo == 0) return QA_Q2W_SEL_NO_AMMO;
     if (ammo < definition->quantity) return QA_Q2W_SEL_NOT_ENOUGH_AMMO;
   }
-  state->pending = name;
+  state->pending = definition->name; /* the registered name: the caller's string may not outlive the call */
   return QA_Q2W_SEL_SELECTED;
 }
 void qa_q2w_weapons_request_holster(qa_q2w_weapons *w, qa_q2w_owner self) {
@@ -554,12 +555,23 @@ static void hyperblaster_fire(qa_q2w_weapons *w, qa_q2w_context *c) {
     }
   }
 }
-static void *lag_begin_if(qa_q2w_weapons *w, qa_q2w_context *c, qa_q2w_projection p, bool *active) {
-  *active = c->rerelease && w->base.hooks.lag_is_history;
-  return *active ? w->base.hooks.lag_begin(w->base.hooks.ctx, c->self.actor.id, p.start, p.direction) : NULL;
+/* TS `const restore = ...begin(); try { fire } finally { restore?.() }`: the
+ * cleanup node rewinds the lag history when the shot raises. */
+typedef struct lag_scope { qa_q2w_weapons *w; bool active; void *token; qa_cleanup node; } lag_scope;
+static void lag_finally(void *arg) {
+  lag_scope *scope = arg;
+  if (scope->active && scope->w->base.hooks.lag_end) scope->w->base.hooks.lag_end(scope->w->base.hooks.ctx, scope->token);
+  scope->active = false;
 }
-static void lag_end_if(qa_q2w_weapons *w, bool active, void *token) {
-  if (active && w->base.hooks.lag_end) w->base.hooks.lag_end(w->base.hooks.ctx, token);
+static void lag_begin_if(qa_q2w_weapons *w, qa_q2w_context *c, qa_q2w_projection p, lag_scope *scope) {
+  scope->w = w;
+  scope->active = c->rerelease && w->base.hooks.lag_is_history;
+  scope->token = scope->active ? w->base.hooks.lag_begin(w->base.hooks.ctx, c->self.actor.id, p.start, p.direction) : NULL;
+  qa_cleanup_push(&scope->node, lag_finally, scope);
+}
+static void lag_end_if(lag_scope *scope) {
+  qa_cleanup_pop(&scope->node);
+  lag_finally(scope);
 }
 static void machinegun_fire(qa_q2w_weapons *w, qa_q2w_context *c) {
   qa_q2w_state *state = c->state;
@@ -586,7 +598,7 @@ static void machinegun_fire(qa_q2w_weapons *w, qa_q2w_context *c) {
   qa_q2w_weapons_kick_default(w, c, origin, angles);
   qa_q2w_projection p = qa_q2w_weapons_project(w, c, v3(0, c->rerelease ? 0 : 8, -8),
                                                 c->rerelease ? c->input.angles : qa_add3_double(c->input.angles, angles));
-  bool active; void *token = lag_begin_if(w, c, p, &active);
+  lag_scope lag; lag_begin_if(w, c, p, &lag);
   qa_q2w_ballistics * b = &w->base;
   qa_owned_actor self2 = c->self.actor;
   qa_vec3 start2 = p.start;
@@ -595,7 +607,7 @@ static void machinegun_fire(qa_q2w_weapons *w, qa_q2w_context *c) {
   double kick = 2 * qa_q2w_weapons_multiplier(w, c);
   qa_q2w_ballistics_fire_bullet(b, self2, g, start2, direction2,
                                 damage, kick, 300, 500, QA_Q2W_MOD_MACHINEGUN);
-  lag_end_if(w, active, token);
+  lag_end_if(&lag);
   if (c->rerelease) qa_q2w_weapons_powerup_sound(w, c);
   qa_q2w_weapons_flash(w, c, 1);
   qa_q2w_ballistics_player_noise(&w->base, c->self.actor, g, p.start, "weapon");
@@ -642,7 +654,7 @@ static void chaingun_fire(qa_q2w_weapons *w, qa_q2w_context *c) {
   }
   qa_q2w_weapons_kick_default(w, c, origin, angles);
   qa_q2w_projection p = qa_q2w_weapons_project_default(w, c, v3(0, 0, -8));
-  bool active; void *token = lag_begin_if(w, c, p, &active);
+  lag_scope lag; lag_begin_if(w, c, p, &lag);
   for (double shot = 0; shot < shots; shot++) {
     double py = (c->rerelease ? 0 : 7) + (rnd_of(g) * 2 - 1) * 4, pz = (rnd_of(g) * 2 - 1) * 4 - 8;
     p = qa_q2w_weapons_project_default(w, c, v3(0, py, pz));
@@ -656,7 +668,7 @@ static void chaingun_fire(qa_q2w_weapons *w, qa_q2w_context *c) {
                                   damage,
                                   kick, 300, 500, QA_Q2W_MOD_CHAINGUN);
   }
-  lag_end_if(w, active, token);
+  lag_end_if(&lag);
   if (c->rerelease) qa_q2w_weapons_powerup_sound(w, c);
   qa_q2w_weapons_flash(w, c, 3 + shots - 1);
   qa_q2w_ballistics_player_noise(&w->base, c->self.actor, g, p.start, "weapon");
@@ -667,7 +679,7 @@ static void shotgun_fire(qa_q2w_weapons *w, qa_q2w_context *c, bool super) {
   if (!super && state->frame == 9) { if (!c->rerelease) state->frame++; return; }
   qa_q2w_projection start = qa_q2w_weapons_project_default(w, c, v3(0, c->rerelease ? 0 : 8, -8));
   qa_q2w_weapons_kick_default(w, c, qa_scale3_double(qa_math_angle_vectors_rule(c->input.angles, QA_ANGLE_RULE_NATIVE).forward, -2), v3(-2, 0, 0));
-  bool active; void *token = lag_begin_if(w, c, start, &active);
+  lag_scope lag; lag_begin_if(w, c, start, &lag);
   qa_vec3 noise_origin = start.start;
   if (super) {
     const double yaws[2] = {-5, 5};
@@ -699,7 +711,7 @@ static void shotgun_fire(qa_q2w_weapons *w, qa_q2w_context *c, bool super) {
     qa_q2w_ballistics_fire_shotgun(b, self2, game2, start2, direction2,
                                    damage, kick, 500, 500, 12, QA_Q2W_MOD_SHOTGUN);
   }
-  lag_end_if(w, active, token);
+  lag_end_if(&lag);
   qa_q2w_weapons_flash(w, c, super ? 13 : 2);
   if (!c->rerelease) state->frame++;
   qa_q2w_ballistics_player_noise(&w->base, c->self.actor, c->game, noise_origin, "weapon");
@@ -747,7 +759,7 @@ static void railgun_fire(qa_q2w_weapons *w, qa_q2w_context *c) {
   qa_q2w_projection p = qa_q2w_weapons_project_default(w, c, v3(0, 7, -8));
   bool dm = c->game->options.mode == QA_Q2_MODE_DEATHMATCH;
   qa_q2w_weapons_kick_default(w, c, qa_scale3_double(qa_math_angle_vectors_rule(c->input.angles, QA_ANGLE_RULE_NATIVE).forward, -3), v3(-3, 0, 0));
-  bool active; void *token = lag_begin_if(w, c, p, &active);
+  lag_scope lag; lag_begin_if(w, c, p, &lag);
   qa_q2w_ballistics * b = &w->base;
   qa_owned_actor self2 = c->self.actor;
   qa_q2_game_services * game2 = c->game;
@@ -756,7 +768,7 @@ static void railgun_fire(qa_q2w_weapons *w, qa_q2w_context *c) {
   double damage = (dm ? 100 : c->rerelease ? 125 : 150) * qa_q2w_weapons_multiplier(w, c);
   double kick = (dm ? 200 : c->rerelease ? 225 : 250) * qa_q2w_weapons_multiplier(w, c);
   qa_q2w_ballistics_fire_rail(b, self2, game2, start2, direction2, damage, kick);
-  lag_end_if(w, active, token);
+  lag_end_if(&lag);
   qa_q2w_weapons_flash(w, c, 6);
   if (!c->rerelease) c->state->frame++;
   qa_q2w_ballistics_player_noise(&w->base, c->self.actor, c->game, p.start, "weapon");
@@ -1148,8 +1160,11 @@ void qa_q2w_weapons_restore(qa_q2w_weapons *w, qa_q2_game_services *game, const 
     if (state->last_weapon) state->last_weapon = qa_q2w_weapons_definition(w, state->last_weapon)->name;
     state->loop_sound = qa_q2_intern(state->loop_sound);
     state->view_model = qa_q2_intern(state->view_model);
-    qa_q2w_owner self = {actor, 0};
-    (void)qa_q2w_weapons_bind(w, self.actor, game, state);
+    /* bind raises for an actor that is already bound: the state is freed then. */
+    qa_cleanup state_cleanup;
+    qa_cleanup_push(&state_cleanup, free, state);
+    (void)qa_q2w_weapons_bind(w, actor, game, state);
+    qa_cleanup_pop(&state_cleanup);
   }
   for (size_t i = 0; i < cp->silencer_charge_count; i++)
     qa_q2w_ballistics_grant_silencer(b, qa_q2_restore_actor(game, cp->silencer_charges[i].actor).id, game, cp->silencer_charges[i].charges);

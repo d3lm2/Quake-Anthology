@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "qa/app/bootstrap/console_log.h"
+#include "qa/app/bootstrap/native_settings.h"
 #include "qa/app/bootstrap/remote_application_class.h"
 #include "qa/app/bootstrap/assets.h"
 #include "qa/app/bootstrap/audio.h"
@@ -281,7 +283,13 @@ struct qa_remote_application {
   qa_app_configuration_content *mounted_content;
   qa_engine_session *session;
   qa_app_native_renderer *renderer;
-  qa_remote_application_host host;
+  qa_remote_application_host host;              /* base.print wrapped by hostWithConsoleLog */
+  qa_application_host unlogged_host;            /* the host hostWithConsoleLog wraps */
+  qa_app_console_log console_log;               /* TS consoleLog */
+  bool console_log_attached;                    /* the TS `application` of hostWithConsoleLog's closure is assigned */
+  /* TS loadedServerCount: Q2 servercount of the world the primary last loaded; secondary seats wait for the same
+   * level spawn. */
+  bool has_loaded_server_count; double loaded_server_count;
   qa_app_image_settings *image_settings;
   const qa_identity_owner *identity;
   qa_remote_browser browser;
@@ -369,6 +377,7 @@ struct qa_remote_application {
   /* C storage the constructor's closures return or hold (TS GC lifetimes) */
   qa_collision_map_settings collision;           /* Q3 bindCollisionSettings */
   char *q1_seat_name;                            /* Q1ClientNetwork seat.name */
+  qa_cvar_registry *construct_source;            /* the constructor's configuration.source (Q2 userinfo closure) */
   char *returned_text;                           /* userinfo/baseskin results, until the next call */
   qa_remote_launch launch_storage;               /* the RemoteLaunch the constructor read */
   bool key_profile_published;                    /* keys.publish took key_profile */
@@ -527,8 +536,14 @@ bool qa_remote_presentation_admitted_player(const qa_remote_presentation *remote
 /* config.c pieces shared with the profile members. */
 void qa_remote_release_transfer(void *object);
 void qa_remote_release_profile(void *object);
+/* A malloc'd slot passed as qa_app_prepare_profile_args.pending: the profile a raise left partly built is
+ * destroyed with the arena too. */
+void qa_remote_release_profile_slot(void *object);
 void qa_remote_release_configuration_record(void *object);
 void qa_remote_host_print(void *host, const char *text);
+/* TS gameFolder(): where the original keeps what it writes while connected: the stock game's own folder, else the
+ * content's write root. Malloc'd. */
+char *qa_remote_application_game_folder(qa_remote_application *app);
 void qa_remote_next_frame(void *ctx);
 bool qa_remote_network_is(const qa_app_options *options, const char *kind);
 qa_command_dialect qa_remote_dialect_for_clock(qa_clock_profile_kind kind);

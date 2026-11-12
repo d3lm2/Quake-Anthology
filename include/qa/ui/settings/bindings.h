@@ -23,6 +23,16 @@ typedef struct qa_ui_binding_reset {
   void (*reset)(void *ctx);
 } qa_ui_binding_reset;
 
+/** TS BindingScope: whether binding edits stay with the running game instead of reaching the engine's high
+ * level and so every game. note_local (NULL when absent) is told of each key a local edit touches. */
+typedef struct qa_ui_binding_scope {
+  void *ctx;
+  bool (*available)(void *ctx);
+  bool (*local)(void *ctx);
+  void (*set_local)(void *ctx, bool local);
+  void (*note_local)(void *ctx, const qa_physical_input *input);
+} qa_ui_binding_scope;
+
 /** TS BindingAction. matches NULL when absent. */
 typedef struct qa_ui_binding_action {
   const char *id;
@@ -44,5 +54,12 @@ qa_ui_settings_menus qa_ui_register_binding_menus(
     const qa_ui_binding_action *source, size_t source_count,
     const qa_ui_binding_action *(*get_source)(void *ctx, size_t *out_count),
     void *source_ctx, const qa_ui_binding_reset *reset);
+/** registerBindingMenus(controller, input, source, reset, scope): scope NULL omits the
+ * "Keep bindings to this game" toggle and reports no local edits. */
+qa_ui_settings_menus qa_ui_register_binding_menus_scoped(
+    qa_native_ui_controller *controller, qa_seat_input *input,
+    const qa_ui_binding_action *source, size_t source_count,
+    const qa_ui_binding_action *(*get_source)(void *ctx, size_t *out_count),
+    void *source_ctx, const qa_ui_binding_reset *reset, const qa_ui_binding_scope *scope);
 
 #endif

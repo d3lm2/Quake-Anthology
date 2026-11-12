@@ -2,9 +2,9 @@
  * synchronous and return an error message (borrowed) or NULL,
  * mirroring rankings.h; busy/generation guards are kept.
  * ApplicationLocalLobby / LocalLobbySelection
- * (src/app/bootstrap/local-lobby.ts, not yet ported) are mirrored
- * here as a fn+ctx vtable over the landed qa_lobby type; the
- * mirror goes away when app/bootstrap lands.
+ * (src/app/bootstrap/local-lobby.ts) are reached here through a
+ * fn+ctx vtable over the qa_lobby type (app/bootstrap/local_lobby.c
+ * implements it).
  * GPL-2.0-or-later. */
 #ifndef QA_UI_SETTINGS_LOCAL_LOBBY_H
 #define QA_UI_SETTINGS_LOCAL_LOBBY_H

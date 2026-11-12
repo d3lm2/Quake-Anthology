@@ -52,6 +52,13 @@ typedef enum qa_archive_path_comparison {
 noreturn void qa_archive_error(const char *source, int64_t offset,
                                const char *format, ...);
 
+/* A failed node:fs call as Bun reports it: Error
+ * `${code}: ${description}, ${syscall} '${path}'` (no path part when `path`
+ * is NULL), with the errno as the raised code. Syscall names are Bun's:
+ * "open", "scandir", "statx" (stat), "lstat" (realpath), "mkdir", "read". */
+noreturn void qa_content_fs_error(int error_number, const char *syscall,
+                                  const char *path);
+
 /* TS checkRange: aborts with ArchiveError when the range is invalid. */
 void qa_archive_check_range(const char *source, int64_t size, int64_t offset,
                             int64_t length);

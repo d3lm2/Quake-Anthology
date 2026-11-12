@@ -6,43 +6,47 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/foundation/support.h"
 
-typedef struct admission_entry { qa_q2_foundation *f; qa_q2_monster_admission a; } admission_entry;
-static admission_entry *admissions;
-static size_t admission_count, admission_cap;
-static const qa_q2_monster_admission *find_admission(qa_q2_foundation *f) {
-  for (size_t i = 0; i < admission_count; i++) if (admissions[i].f == f) return &admissions[i].a;
-  return NULL;
-}
-void qa_q2_foundation_set_monster_admission(qa_q2_foundation *f, const qa_q2_monster_admission *a) {
-  for (size_t i = 0; i < admission_count; i++)
-    if (admissions[i].f == f) {
-      if (a) admissions[i].a = *a;
-      else { memmove(&admissions[i], &admissions[i + 1], (admission_count - i - 1) * sizeof *admissions); admission_count--; }
-      return;
-    }
-  if (!a) return;
-  if (admission_count == admission_cap) { admission_cap = admission_cap ? admission_cap * 2 : 8; admissions = realloc(admissions, admission_cap * sizeof *admissions); if (!admissions) qa_range_error("out of memory"); }
-  admissions[admission_count++] = (admission_entry){f, *a};
-}
-
+/* TS Q2Foundation fields: monsterAdmission, and the storage behind the last
+ * load() report. They live in the services' extension slot, so they end with
+ * the foundation instead of a process-wide table keyed by its address (a later
+ * foundation at the same address would inherit the admission). */
 typedef struct report_store {
-  qa_q2_foundation *f;
   const qa_q2_spawn_fields **inhibited, **removed;
   qa_q2_entity **spawned;
   qa_owned_actor *replaced;
   qa_q2_spawn_fields *fields; size_t field_count;
 } report_store;
-static report_store *stores;
-static size_t store_count, store_cap;
-static report_store *store_for(qa_q2_foundation *f) {
-  for (size_t i = 0; i < store_count; i++) if (stores[i].f == f) return &stores[i];
-  if (store_count == store_cap) { store_cap = store_cap ? store_cap * 2 : 8; stores = realloc(stores, store_cap * sizeof *stores); if (!stores) qa_range_error("out of memory"); }
-  stores[store_count] = (report_store){0};
-  stores[store_count].f = f;
-  return &stores[store_count++];
+typedef struct foundation_state {
+  bool has_admission;
+  qa_q2_monster_admission admission;
+  report_store store;
+} foundation_state;
+static void report_store_free(report_store *st) {
+  qa_q2_entities_free(st->fields, st->field_count);
+  free(st->inhibited); free(st->removed); free(st->spawned); free(st->replaced);
+  *st = (report_store){0};
+}
+static void foundation_state_free(void *extension) {
+  foundation_state *state = extension;
+  report_store_free(&state->store);
+  free(state);
+}
+static foundation_state *state_for(qa_q2_foundation *f) {
+  foundation_state *state = qa_q2_entity_services_extension(f);
+  if (state != NULL) return state;
+  state = calloc(1, sizeof *state);
+  if (!state) qa_range_error("out of memory");
+  qa_q2_entity_services_set_extension(f, state, foundation_state_free);
+  return state;
+}
+void qa_q2_foundation_set_monster_admission(qa_q2_foundation *f, const qa_q2_monster_admission *a) {
+  foundation_state *state = state_for(f);
+  state->has_admission = a != NULL;
+  if (a) state->admission = *a;
 }
 
 static bool kept(const double *keep, size_t n, double ordinal) {
@@ -113,15 +117,14 @@ static void find_teams(qa_q2_foundation *f) {
 
 qa_q2_spawn_report qa_q2_foundation_load(qa_q2_foundation *f, const char *source, const double *keep, size_t keep_count) {
   qa_q2_game_services *g = qa_q2_entity_services_game(f);
-  report_store *st = store_for(f);
-  qa_q2_entities_free(st->fields, st->field_count);
-  free(st->inhibited); free(st->removed); free(st->spawned); free(st->replaced);
-  *st = (report_store){.f = f};
+  foundation_state *state = state_for(f);
+  report_store *st = &state->store;
+  report_store_free(st);
   qa_q2_spawn_fields *fields = NULL;
   size_t count = 0;
   if (!qa_q2_parse_entities(source, g->options.edition, &fields, &count)) qa_range_error("out of memory");
   st->fields = fields; st->field_count = count;
-  const qa_q2_monster_admission *admission = find_admission(f);
+  const qa_q2_monster_admission *admission = state->has_admission ? &state->admission : NULL;
   qa_monster_definition_reference *replacements = NULL;
   bool *has_replacement = NULL;
   if (count) {
@@ -147,10 +150,16 @@ qa_q2_spawn_report qa_q2_foundation_load(qa_q2_foundation *f, const char *source
     if (qa_q2_inhibit_spawn(&fields[i], g->options)) { st->inhibited[inh_n++] = &fields[i]; continue; }
     if (has_replacement[i] && admission) {
       qa_monster_definition_reference def = replacements[i];
-      char buf[512];
-      snprintf(buf, sizeof buf, "%s/%s", def.source.provider ? def.source.provider : "", def.classname);
-      /* definition string must outlive allocate call only (registry copies per landed impl contract use) */
-      qa_owned_actor actor = qa_q2_entity_services_allocate_actor(f, &fields[i], buf);
+      /* The registry borrows the definition for the actor's lifetime: an
+       * interned copy, not this frame's buffer. */
+      const char *provider = def.source.provider ? def.source.provider : "";
+      size_t definition_size = strlen(provider) + strlen(def.classname) + 2;
+      char *definition_text = malloc(definition_size);
+      if (!definition_text) qa_range_error("out of memory");
+      snprintf(definition_text, definition_size, "%s/%s", provider, def.classname);
+      const char *definition = qa_q2_intern(definition_text);
+      free(definition_text);
+      qa_owned_actor actor = qa_q2_entity_services_allocate_actor(f, &fields[i], definition);
       qa_combat_state initial = {0};
       initial.health = 0; initial.mass = 100; initial.can_take_damage = false;
       initial.armor.regular.kind = QA_REGULAR_ARMOR_NONE; initial.armor.powered.kind = "none";

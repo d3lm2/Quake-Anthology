@@ -36,7 +36,8 @@ int64_t qa_nav_contents(const qa_navigation_world *world, const qa_navigation_pr
   if (sample.kind && !strcmp(sample.kind, "q1"))
     return sample.contents == -3 ? 1 : sample.contents == -4 ? 2 : sample.contents == -5 ? 4 : 0;
   bool q2 = sample.kind && !strcmp(sample.kind, "q2");
-  int64_t value = (int64_t)(q2 ? sample.merged : sample.contents);
+  /* JS `&` reads ToInt32 of the number; a C cast of NaN or a value past int64 is undefined. */
+  int64_t value = qa_js_to_int32(q2 ? sample.merged : sample.contents);
   return ((value & 32) != 0 ? 1 : 0) | ((value & 16) != 0 ? 2 : 0) | ((value & 8) != 0 ? 4 : 0)
        | (q2 && (value & 0x20000000) != 0 ? 8 : 0);
 }
@@ -74,5 +75,5 @@ void qa_nav_validate_profile(const qa_navigation_profile *profile) {
   const char *kind = profile->movement.kind ? profile->movement.kind : "";
   const char *family = !strncmp(kind, "q1", 2) ? "q1" : !strncmp(kind, "q2", 2) ? "q2" : "q3";
   if (!profile->policy.kind || strcmp(profile->policy.kind, family))
-    qa_range_error("Navigation collision policy must follow selected movement, independently of BSP format");
+    qa_raise("TypeError", 0, 0, "Navigation collision policy must follow selected movement, independently of BSP format");
 }

@@ -9,6 +9,10 @@
 
 #include "qa/persistence/value.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
+
+static void free_json(void *arg) { qa_save_json_free(arg); }
+static void free_text(void *arg) { free(*(char **)arg); }
 
 static qa_save_json *shallow_copy(const qa_save_json *object) {
   qa_save_json *copy = qa_save_json_object();
@@ -62,28 +66,39 @@ static qa_save_json *array_of(qa_save_json **nodes, size_t count) {
 static qa_save_json *root_of(const char *text) {
   qa_save_json *root = qa_parse_source_json(text);
   if (root == NULL) return NULL;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_json, root);
   (void)qa_source_object(root, "q2-rerelease");
-  if (qa_source_number(qa_save_json_get_const(root, "save_version"), "save_version") != 1) {
-    qa_save_json_free(root);
+  if (qa_source_number(qa_save_json_get_const(root, "save_version"), "save_version") != 1)
     qa_save_format_error("q2-rerelease", "unsupported game save version");
-  }
+  qa_cleanup_pop(&guard);
   return root;
 }
 bool qa_decode_q2_rerelease_game(const char *text, qa_q2_rerelease_game_save *out) {
   qa_save_json *root = root_of(text);
   if (root == NULL) return false;
+  qa_cleanup root_guard; /* a malformed save raises with its tree released */
+  qa_cleanup_push(&root_guard, free_json, root);
   qa_save_json *game = qa_source_object(qa_save_json_get(root, "game"), "game");
   qa_save_json *clients = qa_save_json_get(root, "clients");
   if (clients == NULL || clients->kind != QA_SAVE_JSON_ARRAY)
     qa_save_format_error("clients", "expected client array");
   qa_save_json **values = clients->item_count > 0
       ? (qa_save_json **)malloc(clients->item_count * sizeof *values) : NULL;
-  if (clients->item_count > 0 && values == NULL) { qa_save_json_free(root); return false; }
+  if (clients->item_count > 0 && values == NULL) {
+    qa_cleanup_pop(&root_guard);
+    qa_save_json_free(root);
+    return false;
+  }
+  qa_cleanup values_guard;
+  qa_cleanup_push(&values_guard, free, values);
   for (size_t i = 0; i < clients->item_count; i++) {
     char path[64];
     (void)snprintf(path, sizeof path, "clients[%zu]", i);
     values[i] = qa_source_object(clients->items[i], path);
   }
+  qa_cleanup_pop(&values_guard);
+  qa_cleanup_pop(&root_guard);
   out->root = root;
   out->game = game;
   out->clients = values;
@@ -108,11 +123,22 @@ char *qa_encode_q2_rerelease_game(const qa_q2_rerelease_game_save *save) {
 bool qa_decode_q2_rerelease_level(const char *text, qa_q2_rerelease_level_save *out) {
   qa_save_json *root = root_of(text);
   if (root == NULL) return false;
+  qa_cleanup root_guard;
+  qa_cleanup_push(&root_guard, free_json, root);
   qa_save_json *level = qa_source_object(qa_save_json_get(root, "level"), "level");
   qa_save_json *records = qa_source_object(qa_save_json_get(root, "entities"), "entities");
   qa_q2_rerelease_entity *values = records->entry_count > 0
       ? (qa_q2_rerelease_entity *)malloc(records->entry_count * sizeof *values) : NULL;
-  if (records->entry_count > 0 && values == NULL) { qa_save_json_free(root); return false; }
+  if (records->entry_count > 0 && values == NULL) {
+    qa_cleanup_pop(&root_guard);
+    qa_save_json_free(root);
+    return false;
+  }
+  qa_cleanup values_guard;
+  qa_cleanup_push(&values_guard, free, values);
+  char *path = NULL; /* `entities.${key}`, whatever the key's length */
+  qa_cleanup path_guard;
+  qa_cleanup_push(&path_guard, free_text, &path);
   for (size_t i = 0; i < records->entry_count; i++) {
     const char *key = records->entries[i].key;
     double slot = qa_js_string_to_number(key); /* Number(key) */
@@ -121,14 +147,21 @@ bool qa_decode_q2_rerelease_level(const char *text, qa_q2_rerelease_level_save *
       (void)snprintf(canonical, sizeof canonical, "%lld", (long long)slot);
     else
       (void)snprintf(canonical, sizeof canonical, "%s", QA_JS_NUMBER(slot));
-    char path[128];
-    (void)snprintf(path, sizeof path, "entities.%s", key);
+    free(path);
+    size_t size = strlen(key) + sizeof "entities.";
+    path = (char *)malloc(size);
+    if (path == NULL) qa_save_format_error("entities", "out of memory");
+    (void)snprintf(path, size, "entities.%s", key);
     if (!(slot == trunc(slot) && fabs(slot) <= 9007199254740991.0) || slot < 0 ||
         strcmp(canonical, key) != 0)
       qa_save_format_error(path, "invalid source entity index");
     values[i].slot = slot;
     values[i].record = qa_source_object(records->entries[i].value, path);
   }
+  qa_cleanup_pop(&path_guard);
+  free(path);
+  qa_cleanup_pop(&values_guard);
+  qa_cleanup_pop(&root_guard);
   out->root = root;
   out->level = level;
   out->entities = values;
@@ -382,11 +415,14 @@ double *qa_read_q2_ammo_capacity(const qa_save_json *persistent, size_t *out_cou
   double *out = values->item_count > 0
       ? (double *)malloc(values->item_count * sizeof *out) : NULL;
   if (values->item_count > 0 && out == NULL) { *out_count = (size_t)-1; return NULL; }
+  qa_cleanup guard; /* a non-number raises with the list released */
+  qa_cleanup_push(&guard, free, out);
   for (size_t i = 0; i < values->item_count; i++) {
     char path[64];
     (void)snprintf(path, sizeof path, "max_ammo[%zu]", i);
     out[i] = qa_source_number(values->items[i], path);
   }
+  qa_cleanup_pop(&guard);
   *out_count = values->item_count;
   return out;
 }

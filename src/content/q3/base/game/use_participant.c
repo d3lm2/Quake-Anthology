@@ -3,16 +3,16 @@
 #include "qa/foundation/support.h"
 qa_actor_id qa_q3_use_actor(qa_q3_use_participant p) { return p.entity ? qa_q3_game_entity_actor(p.entity).id : p.actor; }
 qa_q3_use_participant qa_q3_require_use_participant(const qa_q3_use_participant *p) {
-  if (!p) qa_range_error("Target handler requires an activator");
+  if (!p) qa_raise("Error", 0, 0, "Target handler requires an activator");
   return *p;
 }
 qa_q3_game_entity *qa_q3_use_client(const qa_q3_use_participant *participant, const qa_q3_use_participant_services *services) {
   if (!participant) return NULL;
   qa_q3_use_participant p = *participant;
   if (p.entity) return p.entity->client == NULL ? NULL : p.entity;
-  if (!services) qa_range_error("Shared target activator requires actor observations");
+  if (!services) qa_raise("Error", 0, 0, "Shared target activator requires actor observations");
   if (!services->live(services->ctx, p.actor) || !services->is_player(services->ctx, p.actor)) return NULL;
   qa_q3_game_entity *e = services->native(services->ctx, p.actor);
-  if (!e || !e->client) qa_range_error("Admitted Q3 map player has no native client behavior record");
+  if (!e || !e->client) qa_raise("Error", 0, 0, "Admitted Q3 map player has no native client behavior record");
   return e;
 }

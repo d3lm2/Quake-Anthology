@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "qa/persistence/save_image.h"
 
 static const char *const schema_name = "world:primary-protection";
@@ -166,10 +167,31 @@ void qa_primary_protection_free(qa_primary_protection *protection) {
   memset(protection, 0, sizeof *protection);
 }
 
+static void free_partial(void *arg) { qa_primary_protection_free(arg); }
+static void free_value(void *arg) { qa_save_value_free(arg); }
+static bool read_primary_protection(const qa_save_image *save, const qa_session_actor_registry *actors,
+                                    qa_primary_protection *out, const qa_save_value *none);
+/* A malformed record raises with what was read released (TS discards it). */
 bool qa_read_primary_protection(const qa_save_image *save,
                                 const qa_session_actor_registry *actors,
                                 qa_primary_protection *out) {
   memset(out, 0, sizeof *out);
+  qa_save_value *none = qa_save_value_object();
+  if (none == NULL || !qa_save_value_set(none, "kind", qa_save_value_string("none"))) {
+    qa_save_value_free(none);
+    return false;
+  }
+  qa_cleanup none_guard, guard;
+  qa_cleanup_push(&none_guard, free_value, none);
+  qa_cleanup_push(&guard, free_partial, out);
+  bool ok = read_primary_protection(save, actors, out, none);
+  qa_cleanup_pop(&guard);
+  qa_cleanup_pop(&none_guard);
+  qa_save_value_free(none);
+  return ok;
+}
+static bool read_primary_protection(const qa_save_image *save, const qa_session_actor_registry *actors,
+                                    qa_primary_protection *out, const qa_save_value *none) {
   const qa_provider_checkpoint *record = NULL;
   size_t record_count = 0;
   for (size_t i = 0; i < save->provider_count; i++) {
@@ -227,20 +249,24 @@ bool qa_read_primary_protection(const qa_save_image *save,
     bool has_powered = !qa_save_reader_is_undefined(&powered);
     if (!has_regular && !has_powered)
       qa_save_reader_fail(&value, "empty hidden primary armor");
-    /* TS reads readArmor over {regular ?? none, powered ?? none},
-     * which takes the modern branch; replicate it on the fields. */
+    /* TS: readArmor(new SaveReader({ regular: regular.value ?? none, powered: powered.value ?? none })),
+     * a fresh reader rooted at "save" (its errors read "save.regular...", whatever the entry), over
+     * the modern branch; null as well as an absent channel reads as { kind: "none" }. */
     qa_armor_state armor;
     memset(&armor, 0, sizeof armor);
-    armor.regular.kind = QA_REGULAR_ARMOR_NONE;
-    armor.powered.kind = "none";
-    if (has_regular) armor.regular = qa_read_regular_armor(&regular);
-    if (has_powered) {
+    qa_save_reader channel;
+    bool regular_given = has_regular && !qa_save_reader_is_null(&regular);
+    qa_save_reader_init(&channel, regular_given ? regular.value : none, "save.regular");
+    armor.regular = qa_read_regular_armor(&channel);
+    {
       static const char *const kinds[] = {"none", "screen", "shield"};
-      qa_save_reader kind = field(&powered, "kind");
+      bool powered_given = has_powered && !qa_save_reader_is_null(&powered);
+      qa_save_reader_init(&channel, powered_given ? powered.value : none, "save.powered");
+      qa_save_reader kind = field(&channel, "kind");
       armor.powered.kind = qa_save_reader_choice_string(&kind, kinds, 3);
       qa_save_reader_destroy(&kind);
       if (strcmp(armor.powered.kind, "none") != 0) {
-        qa_save_reader cells = field(&powered, "cells");
+        qa_save_reader cells = field(&channel, "cells");
         armor.powered.cells = qa_save_reader_number(&cells);
         qa_save_reader_destroy(&cells);
       }

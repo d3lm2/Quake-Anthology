@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
 typedef qa_compat_qc_spatial_world W;
 static void check(W *w, qa_compat_qc_machine *m) { if (m->entities != w->entities || m->program != w->program) qa_compat_qc_machine_fail(m, "world builtin belongs to another QC machine"); }
 static void set_size(W *w, qa_compat_qc_machine *m, int64_t slot, qa_bounds b) {
@@ -41,9 +42,11 @@ static void b_setmodel(void *ctx, qa_compat_qc_machine *m) { W *w=ctx; check(w,m
   const char *name0 = qa_compat_qc_machine_arg_string(m,1); size_t name_length = strlen(name0) + 1;
   char *name = malloc(name_length); if (!name) qa_compat_qc_machine_fail(m, "model name allocation failed");
   memcpy(name, name0, name_length); /* arg_string's buffer is reused by later string reads */
+  qa_cleanup name_scope; qa_cleanup_push(&name_scope, free, name); /* released when the lookup or the refusal raises */
   qa_compat_qc_spatial_model model; if (!w->model(w->ctx, name, &model)) { qa_compat_qc_machine_fail(m, "no precache: %s", name); }
   /* QuakeWorld sizes only inline models; any other model leaves the box to a later setsize. */
   const bool sized = w->program->api.kind != QA_QUAKEC_API_Q1_QUAKEWORLD || name[0] == '*';
+  qa_cleanup_pop(&name_scope);
   free(name);
   int64_t slot = qa_compat_qc_entity_memory_slot(w->entities, qa_compat_qc_machine_arg_int(m,0));
   qa_compat_qc_machine_set_entity_int(m, qa_compat_qc_machine_arg_int(m,0), "model", qa_compat_qc_machine_arg_int(m,1));

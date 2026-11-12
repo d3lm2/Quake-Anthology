@@ -18,6 +18,11 @@
  *  - Plan structs are copied at open; mount identity/path strings
  *    stay borrowed from the caller's plan mounts, as the TS retains
  *    the mount objects. Resolved order arrays are owned copies.
+ *  - Loose lookups ask the instance's cached directory listings first
+ *    and the disk on a miss, as the TS does: a cached hit is taken as
+ *    it is until qa_content_mounted_invalidate_listings. A directory
+ *    that cannot be read raises Bun's fs Error, and raises it again
+ *    from the cache.
  *  - The digest disk cache saves synchronously (best-effort) where
  *    the TS defers 250 ms on a timer; cache contents and hit rules
  *    are identical. QTS_NO_DIGEST_CACHE is read per call.

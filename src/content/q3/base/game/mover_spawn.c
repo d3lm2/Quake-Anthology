@@ -16,22 +16,23 @@ static double comp(qa_vec3 v, int axis) {
   if (axis == 0) return v.x;
   if (axis == 1) return v.y;
   if (axis == 2) return v.z;
-  qa_range_error("Door trigger axis is not a source vector index");
+  qa_raise("Error", 0, 0, "Door trigger axis is not a source vector index");
 }
 static qa_vec3 with_comp(qa_vec3 v, int axis, double amount) {
-  if (axis == 0) return (qa_vec3){amount, v.y, v.z};
-  if (axis == 1) return (qa_vec3){v.x, amount, v.z};
-  if (axis == 2) return (qa_vec3){v.x, v.y, amount};
-  qa_range_error("Door trigger axis is not a source vector index");
+  /* TS rebuilds the vector with vec3(), which stores binary32 components. */
+  if (axis == 0) return qa_math_vec3(amount, v.y, v.z);
+  if (axis == 1) return qa_math_vec3(v.x, amount, v.z);
+  if (axis == 2) return qa_math_vec3(v.x, v.y, amount);
+  qa_raise("Error", 0, 0, "Door trigger axis is not a source vector index");
 }
 static qa_q3_entity_callback mkcb(const void *fn, void *ctx) { qa_q3_entity_callback cb; memcpy(&cb.fn, fn, sizeof cb.fn); cb.ctx = ctx; return cb; }
 typedef qa_q3_mover_spawn_runtime RT;
 static double now(RT *r) { return r->host.time(r->host.ctx); }
 static void owned(RT *r, qa_q3_game_entity *e) {
-  if (qa_q3_entity_pool_get(r->host.pool, e->slot) != e) qa_range_error("Mover spawn entity belongs to another pool");
+  if (qa_q3_entity_pool_get(r->host.pool, e->slot) != e) qa_raise("Error", 0, 0, "Mover spawn entity belongs to another pool");
 }
 static qa_q3_game_entity *parent_of(qa_q3_game_entity *e) {
-  if (!e->parent) qa_range_error("Mover trigger has no parent");
+  if (!e->parent) qa_raise("Error", 0, 0, "Mover trigger has no parent");
   return e->parent;
 }
 static void set_direction(qa_q3_game_entity *e) {
@@ -90,11 +91,11 @@ static void reached_train(RT *r, qa_q3_game_entity *e) {
   uc.pool = r->host.pool; uc.time = now(r); uc.ctx = r->host.ctx; uc.remap_shader = r->host.remap_shader; uc.warn = r->host.warn;
   qa_q3_use_targets(uc, next, NULL);
   qa_q3_game_entity *dest = next->next_train;
-  if (!dest) qa_range_error("Train path was removed during target dispatch");
+  if (!dest) qa_raise("Error", 0, 0, "Train path was removed during target dispatch");
   e->next_train = dest; e->pos1 = next->s.origin; e->pos2 = dest->s.origin;
   double speed = next->speed != 0 ? next->speed : e->speed; if (speed < 1) speed = 1;
   /* A leg shorter than one millisecond would give setState an infinite delta (0 * Infinity is NaN); ioquake3 clamps the same way. */
-  e->s.pos.duration = qa_js_max(1, float_int(f32(f32(qa_length3(qa_sub3(e->pos2, e->pos1)) * 1000) / (float)speed)));
+  e->s.pos.duration = qa_js_max(1, float_int(f32((double)f32(qa_length3(qa_sub3(e->pos2, e->pos1)) * 1000) / speed)));
   e->s.loop_sound = next->sound_loop;
   r->host.set_state(r->host.ctx, e, QA_Q3_MOVER_ONE_TO_TWO, now(r));
   if (next->wait != 0) {
@@ -110,7 +111,7 @@ static void setup_train(RT *r, qa_q3_game_entity *e) {
   if (!start) { snprintf(buf, sizeof buf, "func_train at %s with an unfound target\n", vtos(r, qa_q3_base_entity_shared_absmin(&e->r))); r->host.warn(r->host.ctx, buf); return; }
   qa_q3_game_entity *visited[1024]; size_t nv = 0; qa_q3_game_entity *path = start;
   for (;;) {
-    for (size_t i = 0; i < nv; i++) if (visited[i] == path) qa_range_error("Train path cycle does not return to its first corner");
+    for (size_t i = 0; i < nv; i++) if (visited[i] == path) qa_raise("Error", 0, 0, "Train path cycle does not return to its first corner");
     if (nv < 1024) visited[nv++] = path;
     if (!path->target) { snprintf(buf, sizeof buf, "Train corner at %s without a target\n", vtos(r, path->s.origin)); r->host.warn(r->host.ctx, buf); return; }
     qa_q3_game_entity *next = NULL;
@@ -161,7 +162,7 @@ static void spawn_plat(RT *r, qa_q3_game_entity *e, const qa_q3_spawn_variables 
   r->host.set_brush_model(r->host.ctx, e, e->model);
   qa_q3_spawn_value_number height = qa_q3_spawn_variables_float(v, "height", "0");
   double dist = height.present ? height.value : f32(f32((left = qa_q3_base_entity_shared_maxs(&e->r).z, right = qa_q3_base_entity_shared_mins(&e->r).z, left - right)) - lip);
-  e->pos2 = e->s.origin; e->pos1 = (qa_vec3){e->pos2.x, e->pos2.y, e->pos2.z - dist};
+  e->pos2 = e->s.origin; e->pos1 = qa_math_vec3(e->pos2.x, e->pos2.y, e->pos2.z - dist); /* TS vec3(): binary32 */
   r->host.initialize_binary(r->host.ctx, e, v);
   e->touch = qa_q3_callback_family_resolve(&r->host.pool->callbacks.touch, "q3.base.game.mover-spawn.plat.touch");
   e->blocked = qa_q3_callback_family_resolve(&r->host.pool->callbacks.blocked, "q3.base.game.mover-spawn.door.blocked");
@@ -217,7 +218,7 @@ static void spawn_bobbing(RT *r, qa_q3_game_entity *e, const qa_q3_spawn_variabl
   qa_q3_base_entity_shared_set_current_origin(&e->r, e->s.origin);
   double duration = float_int(f32(e->speed * 1000));
   int axis = (qa_js_to_int32(e->spawnflags) & 1) != 0 ? 0 : (qa_js_to_int32(e->spawnflags) & 2) != 0 ? 1 : 2;
-  e->s.pos.base = e->s.origin; e->s.pos.duration = duration; e->s.pos.time = float_int(f32(f32(duration) * (float)phase));
+  e->s.pos.base = e->s.origin; e->s.pos.duration = duration; e->s.pos.time = float_int(f32((double)f32(duration) * phase));
   e->s.pos.type = QA_Q3_BASE_TR_SINE; e->s.pos.delta = with_comp(e->s.pos.delta, axis, height);
 }
 static void spawn_pendulum(RT *r, qa_q3_game_entity *e, const qa_q3_spawn_variables *v) {
@@ -228,7 +229,7 @@ static void spawn_pendulum(RT *r, qa_q3_game_entity *e, const qa_q3_spawn_variab
   double duration = float_int(f32(1000 / freq)); e->s.pos.duration = duration;
   r->host.initialize_binary(r->host.ctx, e, v);
   e->s.pos.base = e->s.origin; qa_q3_base_entity_shared_set_current_origin(&e->r, e->s.origin);
-  e->s.apos.base = e->s.angles; e->s.apos.duration = duration; e->s.apos.time = float_int(f32(f32(duration) * (float)phase));
+  e->s.apos.base = e->s.angles; e->s.apos.duration = duration; e->s.apos.time = float_int(f32((double)f32(duration) * phase));
   e->s.apos.type = QA_Q3_BASE_TR_SINE; e->s.apos.delta = with_comp(e->s.apos.delta, 2, speed);
 }
 /* Save callbacks. */

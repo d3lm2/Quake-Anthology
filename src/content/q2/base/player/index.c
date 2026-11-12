@@ -29,7 +29,6 @@
 #include "qa/foundation/js_case.h"
 
 typedef struct player_entry {
-  char model[600];
   qa_actor_id actor;
   qa_q2_base_player_state *state;
   qa_q2_entity *entity;
@@ -62,6 +61,7 @@ struct qa_q2_players {
   const qa_q2_players_vtable *vtable;
   void *self;
   char *intermission_map; /* owned copy behind intermission.map */
+  char *connection_text; /* owned text behind the last connect() result */
   qa_q2_base_player_rules rules;
   const char **owned_map_list;
   qa_q2_intermission intermission;
@@ -72,7 +72,6 @@ struct qa_q2_players {
   qa_q2_named_die dies[2];
   qa_q2_callback_definitions defs, spawn_defs;
   qa_q2_spawn_module spawn;
-  qa_actor_id chase_scratch[64];
   attack_record *attacks;
 };
 
@@ -154,26 +153,44 @@ bool qa_q2_players_state_at(qa_q2_players *players, size_t index, qa_actor_id *o
   return true;
 }
 
-const char *qa_q2_userinfo_get(const char *source, const char *key, char *scratch, size_t scratch_size) {
-  const char *cursor = source && source[0] == '\\' ? source + 1 : source;
-  if (!cursor) return NULL;
-  /* Tokens alternate key/value; the first occurrence wins. */
-  for (;;) {
-    const char *key_end = strchr(cursor, '\\');
-    if (!key_end) return NULL;
-    size_t key_length = (size_t)(key_end - cursor);
-    const char *value = key_end + 1;
-    const char *value_end = strchr(value, '\\');
-    size_t value_length = value_end ? (size_t)(value_end - value) : strlen(value);
-    if (key_length == strlen(key) && strncmp(cursor, key, key_length) == 0) {
-      if (value_length >= scratch_size) value_length = scratch_size - 1;
-      memcpy(scratch, value, value_length);
-      scratch[value_length] = '\0';
-      return scratch;
+/* TS q2Userinfo token walk: the key/value pairs of source.split("\\") in order.
+ * A trailing key with no value is not a pair. */
+typedef struct info_pair { const char *key; size_t key_length; const char *value; size_t value_length; } info_pair;
+static const char *info_begin(const char *source) { return source[0] == '\\' ? source + 1 : source; }
+static bool info_next(const char **cursor, info_pair *pair) {
+  const char *key_end = strchr(*cursor, '\\');
+  if (!key_end) return false;
+  pair->key = *cursor;
+  pair->key_length = (size_t)(key_end - *cursor);
+  pair->value = key_end + 1;
+  const char *value_end = strchr(pair->value, '\\');
+  pair->value_length = value_end ? (size_t)(value_end - pair->value) : strlen(pair->value);
+  *cursor = value_end ? value_end + 1 : pair->value + pair->value_length;
+  return true;
+}
+/* TS q2Userinfo(source).get(key): the first pair with that key; NULL = undefined.
+ * The value is not NUL-terminated; its length is *out_length. */
+static const char *info_find(const char *source, const char *key, size_t *out_length) {
+  size_t key_length = strlen(key);
+  const char *cursor = info_begin(source);
+  info_pair pair;
+  while (info_next(&cursor, &pair)) {
+    if (pair.key_length == key_length && memcmp(pair.key, key, key_length) == 0) {
+      *out_length = pair.value_length;
+      return pair.value;
     }
-    if (!value_end) return NULL;
-    cursor = value_end + 1;
   }
+  return NULL;
+}
+const char *qa_q2_userinfo_get(const char *source, const char *key, char *scratch, size_t scratch_size) {
+  if (!source) return NULL;
+  size_t value_length = 0;
+  const char *value = info_find(source, key, &value_length);
+  if (!value) return NULL;
+  if (value_length >= scratch_size) value_length = scratch_size - 1;
+  memcpy(scratch, value, value_length);
+  scratch[value_length] = '\0';
+  return scratch;
 }
 static double info_number(const char *value) {
   if (!value) return 0;
@@ -228,6 +245,7 @@ void qa_q2_players_destroy(qa_q2_players *players) {
   free(players->releases);
   free(players->owned_map_list);
   free(players->intermission_map);
+  free(players->connection_text);
   while (players->attacks) { attack_record *next = players->attacks->next; free(players->attacks); players->attacks = next; }
   free(players);
 }
@@ -246,6 +264,9 @@ void qa_q2_players_set_intermission(qa_q2_players *players, qa_q2_intermission i
   free(players->intermission_map);
   players->intermission_map = map;
   intermission.map = map;
+  /* TS keeps the landmark object; its name belongs to the caller (an entity's text) and
+   * is read again at the level change, so this keeps an interned copy. */
+  if (intermission.has_landmark && intermission.landmark.name) intermission.landmark.name = qa_q2_intern(intermission.landmark.name);
   players->intermission = intermission;
 }
 qa_q2_spawn_module qa_q2_players_as_spawn(qa_q2_players *players) {
@@ -264,7 +285,7 @@ qa_q2_callback_definitions qa_q2_players_super_callbacks(qa_q2_players *players)
 
 qa_q2_player_context qa_q2_players_context(qa_q2_players *players, qa_q2_entity *entity, qa_q2_game_services *game) {
   qa_q2_base_player_state *state = qa_q2_players_get_state(players, entity->actor.id);
-  if (!state) qa_range_error("Q2 player has not been admitted");
+  if (!state) qa_raise("Error", 0, 0, "Q2 player has not been admitted");
   qa_q2_player_context context = {0};
   context.entity = entity;
   context.game = game;
@@ -411,8 +432,11 @@ void qa_q2_players_restore(qa_q2_players *players, qa_q2_game_services *game, qa
     const qa_q2_base_player_checkpoint_entry *saved = &checkpoint.players[i];
     qa_owned_actor owner = qa_q2_restore_actor(game, saved->actor);
     qa_q2_entity *entity = game->entity(game->ctx, &owner.id);
-    if (!entity) qa_range_error("Q2 player checkpoint references missing source wrapper");
-    player_entry *entry = add_entry(players, owner.id, entity);
+    if (!entity) qa_raise("Error", 0, 0, "Q2 player checkpoint references missing source wrapper");
+    /* TS states.set(owner.id, state): a repeated actor replaces its state in place. */
+    player_entry *entry = find_entry(players, owner.id);
+    if (entry) { entry->entity = entity; qa_q2_base_player_state_destroy(entry->state); }
+    else entry = add_entry(players, owner.id, entity);
     qa_q2_base_player_state_init(entry->state, saved->state.slot, saved->state.entered_at);
     qa_q2_base_player_state_checkpoint_restore(entry->state, &saved->state, resolve_saved_reference, &resolver);
   }
@@ -425,18 +449,74 @@ static void player_die_fn(void *c, qa_q2_entity *entity, qa_q2_game_services *ga
   qa_q2_players_death(c, entity, game, reaction);
 }
 
+/* A connect() result's userinfo lives in the players object: TS strings have no
+ * length limit, and callers read result.userinfo after releasing their own copy.
+ * The new text is complete before the previous one is released, so a caller may
+ * pass a previous result back in. */
+static const char *connection_text_take(qa_q2_players *players, char *text) {
+  free(players->connection_text);
+  players->connection_text = text;
+  return text;
+}
+qa_q2_connection_result qa_q2_players_connection_allowed(qa_q2_players *players, const char *userinfo) {
+  size_t length = strlen(userinfo);
+  char *text = malloc(length + 1);
+  if (!text) qa_range_error("Out of memory");
+  memcpy(text, userinfo, length + 1);
+  qa_q2_connection_result result = {true, connection_text_take(players, text), ""};
+  return result;
+}
+qa_q2_connection_result qa_q2_players_connection_refused(qa_q2_players *players, const char *userinfo, const char *reason) {
+  /* TS [...info] without rejmsg, then the reason: the Map keeps each key once, at
+   * its first position with its first value, so a repeated key is not written again.
+   * A pair costs its own bytes plus two separators, which the source also holds
+   * except for a missing leading one. */
+  static const char tail[] = "\\rejmsg\\";
+  size_t reason_length = strlen(reason), used = 0;
+  char *text = malloc(strlen(userinfo) + 1 + sizeof tail + reason_length);
+  if (!text) qa_range_error("Out of memory");
+  const char *cursor = info_begin(userinfo);
+  info_pair pair;
+  while (info_next(&cursor, &pair)) {
+    if (pair.key_length == 6 && memcmp(pair.key, "rejmsg", 6) == 0) continue;
+    bool repeated = false;
+    const char *earlier_cursor = info_begin(userinfo);
+    info_pair earlier;
+    while (info_next(&earlier_cursor, &earlier) && earlier.key != pair.key)
+      if (earlier.key_length == pair.key_length && memcmp(earlier.key, pair.key, pair.key_length) == 0) { repeated = true; break; }
+    if (repeated) continue;
+    text[used++] = '\\'; memcpy(text + used, pair.key, pair.key_length); used += pair.key_length;
+    text[used++] = '\\'; memcpy(text + used, pair.value, pair.value_length); used += pair.value_length;
+  }
+  memcpy(text + used, tail, sizeof tail - 1); used += sizeof tail - 1;
+  memcpy(text + used, reason, reason_length + 1);
+  qa_q2_connection_result result = {false, connection_text_take(players, text), reason};
+  return result;
+}
+const char *qa_q2_userinfo_find(const char *source, const char *key, size_t *out_length) {
+  return source ? info_find(source, key, out_length) : NULL;
+}
 qa_q2_connection_result qa_q2_players_super_connect(qa_q2_players *players, qa_q2_game_services *game, const char *userinfo) {
-  qa_q2_connection_result result = {0};
-  char spectator_value[512], password_value[512], ip_value[512];
-  const char *spectator_info = qa_q2_userinfo_get(userinfo, "spectator", spectator_value, sizeof spectator_value);
-  bool spectator = game->options.mode == QA_Q2_MODE_DEATHMATCH && spectator_info && spectator_info[0] != '\0' && strcmp(spectator_info, "0") != 0;
+  /* The userinfo is client text of any length: values are compared in place, never through a fixed copy. */
+  size_t spectator_length = 0, ip_length = 0;
+  const char *spectator_info = info_find(userinfo, "spectator", &spectator_length);
+  bool spectator = game->options.mode == QA_Q2_MODE_DEATHMATCH && spectator_info && spectator_length != 0 &&
+                   !(spectator_length == 1 && spectator_info[0] == '0');
   const char *pass = spectator ? players->rules.spectator_password : players->rules.password;
   const char *reason = "";
-  const char *ip = qa_q2_userinfo_get(userinfo, "ip", ip_value, sizeof ip_value);
-  if (players->hooks.banned(players->hooks.ctx, ip ? ip : "")) reason = "Banned.";
+  const char *ip = info_find(userinfo, "ip", &ip_length);
+  char ip_short[256];
+  char *ip_text = ip_length < sizeof ip_short ? ip_short : malloc(ip_length + 1);
+  if (!ip_text) qa_range_error("Out of memory");
+  if (ip) memcpy(ip_text, ip, ip_length);
+  ip_text[ip_length] = '\0';
+  bool banned = players->hooks.banned(players->hooks.ctx, ip_text);
+  if (ip_text != ip_short) free(ip_text);
+  if (banned) reason = "Banned.";
   else if (pass[0] != '\0' && strcmp(pass, "none") != 0) {
-    const char *supplied = qa_q2_userinfo_get(userinfo, spectator ? "spectator" : "password", password_value, sizeof password_value);
-    if (!supplied || strcmp(pass, supplied) != 0)
+    size_t supplied_length = 0;
+    const char *supplied = info_find(userinfo, spectator ? "spectator" : "password", &supplied_length);
+    if (!supplied || strlen(pass) != supplied_length || memcmp(pass, supplied, supplied_length) != 0)
       reason = spectator ? "Spectator password required or incorrect." : "Password required or incorrect.";
   }
   if (reason[0] == '\0' && spectator) {
@@ -445,34 +525,8 @@ qa_q2_connection_result qa_q2_players_super_connect(qa_q2_players *players, qa_q
       if (players->entries[i].state->connected && players->entries[i].state->requested_spectator) spectators++;
     if ((double)spectators >= players->rules.max_spectators) reason = "Server spectator limit is full.";
   }
-  if (reason[0] != '\0') {
-    /* Rebuild the userinfo without rejmsg, then append the reason. */
-    result.allowed = false;
-    (void)snprintf(result.reason, sizeof result.reason, "%s", reason);
-    result.userinfo[0] = '\0';
-    const char *cursor = userinfo[0] == '\\' ? userinfo + 1 : userinfo;
-    while (*cursor) {
-      const char *key_end = strchr(cursor, '\\');
-      if (!key_end) break;
-      const char *value = key_end + 1;
-      const char *value_end = strchr(value, '\\');
-      size_t key_length = (size_t)(key_end - cursor);
-      size_t value_length = value_end ? (size_t)(value_end - value) : strlen(value);
-      if (!(key_length == 6 && strncmp(cursor, "rejmsg", 6) == 0)) {
-        size_t used = strlen(result.userinfo);
-        (void)snprintf(result.userinfo + used, sizeof result.userinfo - used, "\\%.*s\\%.*s",
-                       (int)key_length, cursor, (int)value_length, value);
-      }
-      if (!value_end) break;
-      cursor = value_end + 1;
-    }
-    size_t used = strlen(result.userinfo);
-    (void)snprintf(result.userinfo + used, sizeof result.userinfo - used, "\\rejmsg\\%s", reason);
-    return result;
-  }
-  result.allowed = true;
-  (void)snprintf(result.userinfo, sizeof result.userinfo, "%s", userinfo);
-  return result;
+  if (reason[0] != '\0') return qa_q2_players_connection_refused(players, userinfo, reason);
+  return qa_q2_players_connection_allowed(players, userinfo);
 }
 
 static void attach_release(void *ctx, qa_owned_actor actor) {
@@ -493,7 +547,7 @@ static void attach_release(void *ctx, qa_owned_actor actor) {
 
 qa_q2_base_player_state *qa_q2_players_super_attach(qa_q2_players *players, qa_q2_entity *entity, qa_q2_game_services *game, qa_q2_player_admission admission) {
   qa_session_actor_registry_assert_owned(game->host->actors, entity->actor);
-  if (find_entry(players, entity->actor.id)) qa_range_error("Q2 player lifecycle already bound");
+  if (find_entry(players, entity->actor.id)) qa_raise("Error", 0, 0, "Q2 player lifecycle already bound");
   if (admission.slot != trunc(admission.slot) || admission.slot < 0 || admission.slot >= game->options.max_clients)
     qa_range_error("Q2 player slot is outside maxclients");
   player_entry *entry = add_entry(players, entity->actor.id, entity);
@@ -556,25 +610,34 @@ qa_q2_base_player_state *qa_q2_players_super_attach(qa_q2_players *players, qa_q
 
 void qa_q2_players_super_userinfo_changed(qa_q2_players *players, qa_q2_entity *entity, qa_q2_game_services *game, const char *source) {
   qa_q2_base_player_state *state = qa_q2_players_get_state(players, entity->actor.id);
-  if (!state) qa_range_error("Q2 userinfo requires an admitted player");
+  if (!state) qa_raise("Error", 0, 0, "Q2 userinfo requires an admitted player");
   bool valid = !strchr(source, '"') && !strchr(source, ';');
-  /* TS slice(0, 511): the fixed buffer holds 511 chars + NUL. */
-  (void)snprintf(state->userinfo, sizeof state->userinfo, "%s", valid ? source : "\\name\\badinfo\\skin\\male/grunt");
-  if (strlen(state->userinfo) > 511) state->userinfo[511] = '\0';
-  char value[512];
-  const char *name = qa_q2_userinfo_get(state->userinfo, "name", value, sizeof value);
-  (void)snprintf(state->name, sizeof state->name, "%.15s", name ? name : "");
-  const char *skin = qa_q2_userinfo_get(state->userinfo, "skin", value, sizeof value);
-  (void)snprintf(state->skin, sizeof state->skin, "%s", skin ? skin : "");
-  const char *gender = qa_q2_userinfo_get(state->userinfo, "gender", value, sizeof value);
+  /* TS slice(0, 511) and slice(0, 15) count UTF-16 units. */
+  const char *kept = valid ? source : "\\name\\badinfo\\skin\\male/grunt";
+  char *userinfo = qa_q2_text_slice_units(kept, strlen(kept), 511);
+  free(state->userinfo);
+  state->userinfo = userinfo;
+  size_t length = 0;
+  const char *name = info_find(state->userinfo, "name", &length);
+  char *short_name = qa_q2_text_slice_units(name ? name : "", name ? length : 0, 15);
+  qa_q2_base_player_state_set_name(state, short_name);
+  free(short_name);
+  const char *skin = info_find(state->userinfo, "skin", &length);
+  qa_q2_base_player_state_set_skin(state, skin ? skin : "", skin ? length : 0);
+  /* A value is never longer than the userinfo, so none is cut. */
+  size_t value_size = strlen(state->userinfo) + 1;
+  char *value = malloc(value_size);
+  if (!value) qa_range_error("Out of memory");
+  const char *gender = qa_q2_userinfo_get(state->userinfo, "gender", value, value_size);
   char gender_letter = gender && gender[0] ? (char)tolower((unsigned char)gender[0]) : '\0';
   state->gender = gender_letter == 'f' ? "female" : gender_letter == 'm' ? "male" : "neutral";
-  const char *spectator = qa_q2_userinfo_get(state->userinfo, "spectator", value, sizeof value);
+  const char *spectator = qa_q2_userinfo_get(state->userinfo, "spectator", value, value_size);
   state->requested_spectator = game->options.mode == QA_Q2_MODE_DEATHMATCH && spectator && spectator[0] != '\0' && strcmp(spectator, "0") != 0;
-  double fov = info_number(qa_q2_userinfo_get(state->userinfo, "fov", value, sizeof value));
+  double fov = info_number(qa_q2_userinfo_get(state->userinfo, "fov", value, value_size));
   state->fov = game->options.mode == QA_Q2_MODE_DEATHMATCH && (qa_js_to_int32(qa_q2_options_deathmatch_flags(&game->options)) & 32768) != 0 ? 90
       : fov < 1 ? 90 : qa_js_min(160, fov);
-  double hand = info_number(qa_q2_userinfo_get(state->userinfo, "hand", value, sizeof value));
+  double hand = info_number(qa_q2_userinfo_get(state->userinfo, "hand", value, value_size));
+  free(value);
   state->hand = hand == 1 ? "left" : hand == 2 ? "center" : "right";
   qa_q2_player_event event = {0};
   event.kind = "userinfo";
@@ -589,7 +652,7 @@ qa_q2_base_player_carry qa_q2_players_super_save_carry(qa_q2_players *players, q
   qa_q2_player_context context = qa_q2_players_context(players, entity, game);
   qa_q2_base_player_state *state = context.state;
   qa_combat_state_result combat = qa_gameplay_authority_read(game->host->combat, entity->actor.id);
-  if (!combat.has_value) qa_range_error("Q2 carry requires shared combat state");
+  if (!combat.has_value) qa_raise("Error", 0, 0, "Q2 carry requires shared combat state");
   qa_q2_base_player_carry carry = {0};
   carry.health = combat.value.health;
   carry.maximum_health = entity->max_health;
@@ -673,7 +736,8 @@ void qa_q2_players_consumed_key(qa_q2_players *players, qa_q2_entity *entity, qa
         qa_inventory_entry saved = state->coop_respawn.inventory[i];
         if (saved.item && strncmp(saved.item, "q2:key_", 7) == 0) {
           const qa_inventory_entry *found = NULL;
-          for (size_t j = 0; j < count; j++) if (current[j].item && strcmp(current[j].item, saved.item) == 0) found = &current[j];
+          /* TS current.find(...): the first match. */
+          for (size_t j = 0; j < count && !found; j++) if (current[j].item && strcmp(current[j].item, saved.item) == 0) found = &current[j];
           if (found) saved = *found;
           else saved.count = 0;
         }
@@ -771,14 +835,17 @@ void qa_q2_players_super_put_in_server(qa_q2_players *players, qa_q2_entity *ent
   entity->render_flags = game->options.edition == QA_Q2_EDITION_RERELEASE ? 32768 : 0;
   entity->visible = !state->spectator;
   if (old.movement.animate_q2) {
-    /* TS `players/${skin.split("/")[0] || "male"}/tris.md2`, stored
-     * per entry because entity strings are borrowed. */
-    player_entry *entry = find_entry(players, entity->actor.id);
+    /* TS `players/${skin.split("/")[0] || "male"}/tris.md2`. The text is interned:
+     * entity strings are borrowed, the entry table moves when players join or leave,
+     * and a body-queue corpse keeps the model after its player is gone. */
     const char *slash = strchr(state->skin, '/');
     size_t model_length = slash ? (size_t)(slash - state->skin) : strlen(state->skin);
-    if (model_length == 0) (void)snprintf(entry->model, sizeof entry->model, "players/male/tris.md2");
-    else (void)snprintf(entry->model, sizeof entry->model, "players/%.*s/tris.md2", (int)model_length, state->skin);
-    entity->model = entry->model;
+    char *model = malloc(model_length + 32);
+    if (!model) qa_range_error("Out of memory");
+    if (model_length == 0) (void)snprintf(model, model_length + 32, "players/male/tris.md2");
+    else (void)snprintf(model, model_length + 32, "players/%.*s/tris.md2", (int)model_length, state->skin);
+    entity->model = qa_q2_intern(model);
+    free(model);
   }
   qa_combat_trait_changes traits = {0};
   traits.has_can_take_damage = true; traits.can_take_damage = !state->spectator;
@@ -850,7 +917,7 @@ void qa_q2_players_copy_to_body_queue(qa_q2_players *players, qa_q2_entity *enti
   qa_q2_entity *corpse = (size_t)players->corpse_index < count ? corpses[(size_t)players->corpse_index] : NULL;
   if (!corpse) {
     free(corpses);
-    qa_range_error("Q2 corpse reuse requires worldspawn's eight reserved body slots");
+    qa_raise("Error", 0, 0, "Q2 corpse reuse requires worldspawn's eight reserved body slots");
   }
   players->corpse_index = fmod(players->corpse_index + 1, 8);
   qa_shared_body_table_unlink(game->host->bodies, entity->actor);
@@ -1008,7 +1075,7 @@ void qa_q2_players_apply_score(qa_q2_players *players, qa_q2_entity *victim, qa_
   const qa_attack_cause *cause = victim->last_attack ? &victim->last_attack->cause : NULL;
   qa_q2_entity *scorer = recipient == qa_q2_players_get_state(players, victim->actor.id)
       ? victim : (reaction.pain.attacker ? game->entity(game->ctx, reaction.pain.attacker) : NULL);
-  if (!scorer) qa_range_error("Q2 obituary score recipient has no live source actor");
+  if (!scorer) qa_raise("Error", 0, 0, "Q2 obituary score recipient has no live source actor");
   qa_q2_entity *attacker = reaction.pain.attacker ? game->entity(game->ctx, reaction.pain.attacker) : NULL;
   players->hooks.score(players->hooks.ctx, victim, attacker, game, change,
                        cause && cause->kind == QA_ATTACK_CAUSE_Q2 ? cause->means_of_death : 0, scorer);
@@ -1098,7 +1165,8 @@ bool qa_q2_players_super_record_death(qa_q2_players *players, qa_q2_entity *enti
           qa_inventory_entry saved = state->coop_respawn.inventory[i];
           if (saved.item && strncmp(saved.item, "q2:key_", 7) == 0) {
             const qa_inventory_entry *found = NULL;
-            for (size_t j = 0; j < count; j++) if (current[j].item && strcmp(current[j].item, saved.item) == 0) found = &current[j];
+            /* TS current.find(...): the first match. */
+            for (size_t j = 0; j < count && !found; j++) if (current[j].item && strcmp(current[j].item, saved.item) == 0) found = &current[j];
             if (found) saved = *found;
           }
           next.inventory[i] = saved;
@@ -1385,7 +1453,7 @@ static void spectator_respawn_fn(qa_q2_players *players, qa_q2_entity *entity, q
   if (!result.allowed) {
     state->requested_spectator = state->spectator;
     qa_q2_player_event print = {0};
-    char text[sizeof result.reason + 1];
+    char text[96]; /* the reasons are the fixed texts connect() returns */
     (void)snprintf(text, sizeof text, "%s\n", result.reason);
     print.kind = "print"; print.has_target = true; print.target = entity->actor.id;
     print.level = "high"; print.text = text;
@@ -1479,11 +1547,11 @@ void qa_q2_players_chase_from(qa_q2_players *players, qa_q2_entity *entity, qa_q
   qa_q2_base_player_state *state = qa_q2_players_context(players, entity, game).state;
   if (toggle && state->has_chase_target) state->has_chase_target = false;
   else {
-    /* Candidates in slot order, gathered in the fixed scratch. */
+    /* Candidates in slot order: every connected non-spectator (TS has no cap). */
     size_t count = 0;
-    qa_actor_id *candidates = players->chase_scratch;
-    size_t capacity = sizeof players->chase_scratch / sizeof players->chase_scratch[0];
-    for (size_t i = 0; i < players->entry_count && count < capacity; i++) {
+    qa_actor_id *candidates = malloc((players->entry_count ? players->entry_count : 1) * sizeof *candidates);
+    if (!candidates) qa_range_error("Out of memory");
+    for (size_t i = 0; i < players->entry_count; i++) {
       if (players->entries[i].state->connected && !players->entries[i].state->spectator) {
         /* Insertion sort by slot. */
         qa_actor_id actor = players->entries[i].actor;
@@ -1517,6 +1585,7 @@ void qa_q2_players_chase_from(qa_q2_players *players, qa_q2_entity *entity, qa_q
     const qa_actor_id *chosen = has_slot && next != NULL ? next : wrap;
     state->has_chase_target = chosen != NULL;
     if (chosen != NULL) state->chase_target = *chosen;
+    free(candidates);
     if (!state->has_chase_target && from == NULL) {
       qa_q2_presentation_event centerprint = {0};
       centerprint.kind = "centerprint"; centerprint.has_actor = true; centerprint.actor = entity->actor.id;
@@ -1639,7 +1708,7 @@ void qa_q2_players_super_begin_intermission(qa_q2_players *players, qa_q2_game_s
   }
   if (!spot) {
     free(authored); free(fallback);
-    qa_range_error("Q2 intermission has no authored camera or player spawn");
+    qa_raise("Error", 0, 0, "Q2 intermission has no authored camera or player spawn");
   }
   qa_body_state camera = qa_q2_game_body(game, spot);
   free(authored); free(fallback);
@@ -1703,24 +1772,31 @@ void qa_q2_players_super_check_rules(qa_q2_players *players, qa_q2_game_services
       if (health > entity->max_health) qa_gameplay_authority_set_health(game->host->combat, entity->actor, entity->max_health);
     }
     game->host->prepare_level_change(game->host->ctx, map, has_landmark ? &landmark : NULL, game->counters->server_flags);
+    /* TS [destination, spawn] = unitMap.split("$"): the first two pieces, of any length. */
     const char *unit_map = map[0] == '*' ? map + 1 : map;
     const char *dollar = strchr(unit_map, '$');
-    char destination[512];
     size_t destination_length = dollar ? (size_t)(dollar - unit_map) : strlen(unit_map);
-    if (destination_length >= sizeof destination) destination_length = sizeof destination - 1;
-    memcpy(destination, unit_map, destination_length);
-    destination[destination_length] = '\0';
-    if (destination[0] == '\0') qa_range_error("Q2 transition has no map destination");
-    char full_map[560];
-    (void)snprintf(full_map, sizeof full_map, "q2:%s", destination);
+    if (destination_length == 0) qa_raise("Error", 0, 0, "Q2 transition has no map destination");
+    const char *spawn = dollar ? dollar + 1 : "";
+    const char *spawn_end = strchr(spawn, '$');
+    size_t spawn_length = spawn_end ? (size_t)(spawn_end - spawn) : strlen(spawn);
+    char *full_map = malloc(3 + destination_length + 1 + spawn_length + 1);
+    if (!full_map) qa_range_error("Out of memory");
+    memcpy(full_map, "q2:", 3);
+    memcpy(full_map + 3, unit_map, destination_length);
+    full_map[3 + destination_length] = '\0';
+    char *spawn_point = full_map + 3 + destination_length + 1;
+    memcpy(spawn_point, spawn, spawn_length);
+    spawn_point[spawn_length] = '\0';
     qa_transition_intent intent = {0};
     intent.kind = "campaign-level";
     intent.campaign = game->options.campaign;
     intent.map = full_map;
-    intent.spawn_point = dollar ? dollar + 1 : "";
+    intent.spawn_point = spawn_point;
     intent.gates = NULL; intent.gate_count = 0;
     intent.cause = NULL;
     game->host->transition(game->host->ctx, intent);
+    free(full_map);
     free(owned_map);
     return;
   }

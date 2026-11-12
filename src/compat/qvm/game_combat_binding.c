@@ -83,7 +83,7 @@ static bool owned_equal(qa_owned_actor a, qa_owned_actor b) {
 static int32_t call_word(qa_qvm_module_function_call *call, double word_index) {
   int64_t offset = (int64_t)word_index * 4;
   if (offset < 0 || offset > (int64_t)call->words_length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   const uint8_t *p = call->words + offset;
   uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
                   ((uint32_t)p[3] << 24);
@@ -92,7 +92,7 @@ static int32_t call_word(qa_qvm_module_function_call *call, double word_index) {
 static void set_call_word(qa_qvm_module_function_call *call, double word_index, int32_t value) {
   int64_t offset = (int64_t)word_index * 4;
   if (offset < 0 || offset > (int64_t)call->words_length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   uint8_t *p = (uint8_t *)call->words + offset;
   uint32_t bits = (uint32_t)value;
   p[0] = (uint8_t)bits; p[1] = (uint8_t)(bits >> 8); p[2] = (uint8_t)(bits >> 16); p[3] = (uint8_t)(bits >> 24);
@@ -185,15 +185,15 @@ static bool armor_write_compute(qa_qvm_combat_bindings *bindings, double slot, q
                                 armor_write *out) {
   if (strcmp(armor.powered.kind, "none") != 0 ||
       (armor.regular.kind != QA_REGULAR_ARMOR_NONE && armor.regular.kind != QA_REGULAR_ARMOR_Q3))
-    qa_range_error("Native Q3 armor requires Q3 armor values");
+    qa_raise("Error", 0, 0, "Native Q3 armor requires Q3 armor values");
   if (slot >= qa_qvm_game_data_get_num_clients(&bindings->options.game->data)) {
     if (armor.regular.kind != QA_REGULAR_ARMOR_NONE)
-      qa_range_error("Source non-client has no player armor");
+      qa_raise("Error", 0, 0, "Source non-client has no player armor");
     return false;
   }
   double points = armor.regular.kind == QA_REGULAR_ARMOR_NONE ? 0 : armor.regular.points;
   if (!is_integer(points) || points < 0 || points > 2147483647.0)
-    qa_range_error("Source armor points require a nonnegative signed integer");
+    qa_raise("Error", 0, 0, "Source armor points require a nonnegative signed integer");
   out->points = points;
   out->has_tier = false;
   if (armor.regular.kind == QA_REGULAR_ARMOR_NONE) return true;
@@ -207,9 +207,12 @@ static bool armor_write_compute(qa_qvm_combat_bindings *bindings, double slot, q
   const qa_qvm_armor_tier_value *selected = NULL;
   if (tiers != NULL)
     for (size_t i = 0; i < tiers->value_count; i++)
-      if (tiers->values[i].protection == requested) selected = &tiers->values[i];
+      if (tiers->values[i].protection == requested) {
+        selected = &tiers->values[i]; /* TS find: the first tier with this protection */
+        break;
+      }
   if (tiers == NULL || selected == NULL)
-    qa_range_error("Requested protection is not representable by the source armor mode");
+    qa_raise("Error", 0, 0, "Requested protection is not representable by the source armor mode");
   out->has_tier = true;
   out->tier_stat = tiers->stat;
   out->tier_value = selected->tier;
@@ -221,7 +224,7 @@ qa_armor_state qa_qvm_combat_bindings_normalize_legacy_armor(qa_qvm_combat_bindi
                                                              qa_armor_state saved) {
   double slot = 0;
   bool has_slot = bindings->options.slot(bindings->options.ctx, actor, &slot);
-  if (!has_slot || slot >= 1022) qa_range_error("Legacy QVM armor has no source actor");
+  if (!has_slot || slot >= 1022) qa_raise("Error", 0, 0, "Legacy QVM armor has no source actor");
   bool matches;
   if (slot < qa_qvm_game_data_get_num_clients(&bindings->options.game->data)) {
     qa_q3_player_state player;
@@ -234,7 +237,7 @@ qa_armor_state qa_qvm_combat_bindings_normalize_legacy_armor(qa_qvm_combat_bindi
     matches = saved.regular.kind == QA_REGULAR_ARMOR_NONE;
   }
   if (!matches || strcmp(saved.powered.kind, "none") != 0)
-    qa_range_error("Legacy QVM armor disagrees with the original source projection");
+    qa_raise("Error", 0, 0, "Legacy QVM armor disagrees with the original source projection");
   return bindings_armor(bindings, slot);
 }
 
@@ -273,7 +276,7 @@ static qa_combat_state admit_read(void *ctx) {
                 : strcmp(declared->storage, "float32") == 0
                     ? qa_qvm_writable_view_get_float32(&view, (int64_t)declared->offset, true)
                     : qa_qvm_writable_view_get_int32(&view, (int64_t)declared->offset, true);
-  if (!isfinite(mass) || mass < 0) qa_range_error("Source mass is not representable by shared combat");
+  if (!isfinite(mass) || mass < 0) qa_raise("Error", 0, 0, "Source mass is not representable by shared combat");
   const char *team_name = NULL;
   if (has_team)
     for (size_t i = 0; i < definition->state.team.value_count; i++)
@@ -344,7 +347,7 @@ static void admit_write_traits(void *ctx, qa_combat_traits traits) {
   const qa_qvm_combat_mass *declared = &definition->state.mass;
   if (declared->is_constant) {
     if (traits.mass != declared->value)
-      qa_range_error("Source mass is constant in the guest profile");
+      qa_raise("Error", 0, 0, "Source mass is constant in the guest profile");
   } else if (strcmp(declared->storage, "float32") == 0) {
     qa_qvm_writable_view_set_float32(&view, (int64_t)declared->offset, qa_float32(traits.mass), true);
   } else {
@@ -361,8 +364,10 @@ static void admit_write_traits(void *ctx, qa_combat_traits traits) {
     const qa_qvm_combat_team *team = NULL;
     if (traits.team != NULL)
       for (size_t i = 0; i < definition->state.team.value_count; i++)
-        if (strcmp(definition->state.team.values[i].team, traits.team) == 0)
-          team = &definition->state.team.values[i];
+        if (strcmp(definition->state.team.values[i].team, traits.team) == 0) {
+          team = &definition->state.team.values[i]; /* TS find: the first value of this team */
+          break;
+        }
     if (team != NULL) {
       qa_qvm_writable_view player;
       qa_qvm_game_data_public_player_bytes(&bindings->options.game->data, admit->slot, &player);
@@ -370,10 +375,10 @@ static void admit_write_traits(void *ctx, qa_combat_traits traits) {
           &player, 248 + (int64_t)definition->state.team.persistent_stat * 4, qa_int32(team->value),
           true);
     } else if (traits.team != NULL) {
-      qa_range_error("Source team is not representable in the guest profile");
+      qa_raise("Error", 0, 0, "Source team is not representable in the guest profile");
     }
   } else if (traits.team != NULL) {
-    qa_range_error("Source team is not representable for a non-client guest entity");
+    qa_raise("Error", 0, 0, "Source team is not representable for a non-client guest entity");
   }
 }
 
@@ -412,6 +417,8 @@ static qa_source_armor_stage make_armor_stage(qa_qvm_combat_bindings *bindings,
   return result;
 }
 
+static void vacate_intercept(void *arg) { ((intercept_entry *)arg)->occupied = false; }
+
 static qa_armor_stage_removal armor_stage_bind(void *ctx, qa_armor_stage_intercept_fn intercept,
                                                void *intercept_ctx) {
   stage_ctx *stage = ctx;
@@ -419,10 +426,10 @@ static qa_armor_stage_removal armor_stage_bind(void *ctx, qa_armor_stage_interce
   intercept_entry *entries = stage->channel == QA_PROTECTION_POWERED
                                  ? bindings->protection_powered
                                  : bindings->protection_regular;
-  if (!profile_live(bindings, stage->actor)) qa_range_error("Source armor owner is retired");
+  if (!profile_live(bindings, stage->actor)) qa_raise("Error", 0, 0, "Source armor owner is retired");
   for (size_t i = 0; i < QA_PROTECTION_CAPACITY; i++)
     if (entries[i].occupied && owned_equal(entries[i].actor, stage->actor))
-      qa_range_error("Source %s armor stage already has an owner",
+      qa_raise("Error", 0, 0, "Source %s armor stage already has an owner",
                      stage->channel == QA_PROTECTION_POWERED ? "powered" : "regular");
   size_t slot = QA_PROTECTION_CAPACITY;
   for (size_t i = 0; i < QA_PROTECTION_CAPACITY; i++)
@@ -432,6 +439,9 @@ static qa_armor_stage_removal armor_stage_bind(void *ctx, qa_armor_stage_interce
   entries[slot].intercept = intercept;
   entries[slot].intercept_ctx = intercept_ctx;
   entries[slot].occupied = true;
+  /* TS catch: a refused hook leaves the stage unowned. */
+  qa_cleanup unbound;
+  qa_cleanup_push(&unbound, vacate_intercept, &entries[slot]);
   if (!bindings->has_armor_hook) {
     qa_guest_callback_reference reference;
     memset(&reference, 0, sizeof reference);
@@ -442,6 +452,7 @@ static qa_armor_stage_removal armor_stage_bind(void *ctx, qa_armor_stage_interce
                                                           &reference, check_armor_hook, bindings);
     bindings->has_armor_hook = true;
   }
+  qa_cleanup_pop(&unbound);
   stage_ctx *removal = owned_context(bindings, sizeof *removal);
   *removal = *stage;
   removal->intercept = intercept;
@@ -557,8 +568,11 @@ static int32_t check_armor_hook(void *ctx, qa_qvm_module_function_call *call) {
   geometry_input.flags.energy = originating.flags.energy;
   double saved = power == NULL ? 0 : power->intercept(power->intercept_ctx, geometry_input, zero_original, NULL);
   if (!profile_live(bindings, frame->actor)) qa_qvm_damage_scopes_cancel(bindings->scopes, frame, call);
+  /* TS looks the regular stage up here, after the powered stage ran: a stage
+   * the powered intercept removed is not called. */
+  regular = find_intercept(bindings->protection_regular, frame->actor);
   if (!isfinite(saved) || saved < 0 || saved > (amount > 0 ? amount : 0))
-    qa_range_error("QVM powered armor savings exceed the current source damage");
+    qa_raise("Error", 0, 0, "QVM powered armor savings exceed the current source damage");
   int32_t power_saved = (int32_t)trunc(saved);
   int32_t remaining = amount - power_saved;
   set_call_word(call, role_index_of(roles, "amount"), remaining);
@@ -590,7 +604,7 @@ static int32_t check_armor_hook(void *ctx, qa_qvm_module_function_call *call) {
   set_call_word(call, role_index_of(roles, "amount"), amount);
   if (!profile_live(bindings, frame->actor)) qa_qvm_damage_scopes_cancel(bindings->scopes, frame, call);
   if (!isfinite(regular_saved) || regular_saved < 0 || regular_saved > (remaining > 0 ? remaining : 0))
-    qa_range_error("QVM regular armor savings exceed the current source damage");
+    qa_raise("Error", 0, 0, "QVM regular armor savings exceed the current source damage");
   return power_saved + (int32_t)trunc(regular_saved);
 }
 
@@ -745,13 +759,18 @@ static void enter_damage_invoke(void *ctx, const double *words, size_t count) {
   invoke_words_ctx *invoke = ctx;
   qa_qvm_combat_bindings *bindings = invoke->bindings;
   qa_qvm_combat_call roles = bindings->options.definition.base.damage_call;
-  saved_word saved[16];
+  saved_word saved[QA_QVM_MAX_PRIVATE_ARGUMENT_WORDS];
   size_t saved_count = 0;
-  for (size_t i = 0; i < roles.role_count; i++) {
+  for (size_t i = 0; i < roles.role_count && saved_count < QA_QVM_MAX_PRIVATE_ARGUMENT_WORDS; i++) {
     saved[saved_count].index = roles.roles[i].index;
     saved[saved_count].word = call_word(invoke->call, roles.roles[i].index);
     saved_count++;
   }
+  /* TS try { rewrite the words; run } finally { restore every saved word }: a
+   * role that lost its argument restores the words already rewritten. */
+  saved_words restore = {invoke->call, saved, saved_count};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, restore_saved_words, &restore);
   for (size_t i = 0; i < saved_count; i++) {
     double index = saved[i].index;
     if ((index == role_index_of(roles, "direction") &&
@@ -770,12 +789,9 @@ static void enter_damage_invoke(void *ctx, const double *words, size_t count) {
            actor_id_equal(*invoke->effective.attack.inflictor, *invoke->original.attack.inflictor)))))
       continue;
     if (index < 0 || index >= (double)count)
-      qa_range_error("Source damage role lost its declared argument");
+      qa_raise("Error", 0, 0, "Source damage role lost its declared argument");
     set_call_word(invoke->call, index, qa_int32(words[(size_t)index]));
   }
-  saved_words restore = {invoke->call, saved, saved_count};
-  qa_cleanup guard;
-  qa_cleanup_push(&guard, restore_saved_words, &restore);
   invoke->result = qa_qvm_damage_scopes_run(bindings->scopes, invoke->call, invoke->actor, invoke->slot,
                                             invoke->effective, invoke->observer);
   qa_cleanup_pop(&guard);
@@ -985,13 +1001,13 @@ static void release_listener(void *ctx, qa_owned_actor actor) {
 }
 
 double qa_qvm_combat_bindings_spawn_proxy_entity(qa_qvm_combat_bindings *bindings) {
-  if (bindings->closed) qa_range_error("Source combat bindings are retired");
+  if (bindings->closed) qa_raise("Error", 0, 0, "Source combat bindings are retired");
   int32_t pointer = qa_qvm_module_call(&bindings->options.game->module, NULL, 0,
                                        (int64_t)bindings->options.definition.base.callback_allocate);
   double slot = qa_qvm_game_data_number_from_pointer(&bindings->options.game->data, pointer);
   if (slot < 0 || slot >= 1022 || bindings->proxies_present[(size_t)slot] ||
       bindings->admitted_present[(size_t)slot])
-    qa_range_error("Source proxy allocation returned an unusable slot");
+    qa_raise("Error", 0, 0, "Source proxy allocation returned an unusable slot");
   qa_qvm_writable_view view;
   qa_qvm_game_data_entity_bytes(&bindings->options.game->data, slot, &view);
   qa_qvm_writable_view_set_int32(&view, (int64_t)bindings->options.definition.base.field_takedamage, 1, true);
@@ -1001,11 +1017,13 @@ double qa_qvm_combat_bindings_spawn_proxy_entity(qa_qvm_combat_bindings *binding
 void qa_qvm_combat_bindings_bind_proxy(qa_qvm_combat_bindings *bindings, double slot,
                                        qa_owned_actor actor) {
   if (slot >= 0 && slot < 1024 && bindings->proxies_present[(size_t)slot])
-    qa_range_error("Source proxy slot is already bound");
+    qa_raise("Error", 0, 0, "Source proxy slot is already bound");
   double actor_slot = 0;
   if (!bindings->options.slot(bindings->options.ctx, actor.id, &actor_slot) || actor_slot != slot)
-    qa_range_error("Source proxy actor has no matching guest slot");
+    qa_raise("Error", 0, 0, "Source proxy actor has no matching guest slot");
   qa_combat_state_result current = qa_gameplay_authority_read(bindings->options.combat, actor.id);
+  /* The slot table covers every guest entity; nothing outside it is stored. */
+  if (!(slot >= 0 && slot < 1024)) qa_range_error("Source proxy slot is outside the guest entity table");
   bindings->proxies[(size_t)slot] = actor;
   bindings->proxies_present[(size_t)slot] = true;
   qa_qvm_combat_bindings_admit(bindings, actor);
@@ -1058,25 +1076,42 @@ void qa_qvm_combat_bindings_close(qa_qvm_combat_bindings *bindings) {
 
 static void check_stat(double index) {
   if (!is_integer(index) || index < 0 || index >= 16)
-    qa_range_error("Source armor stat is outside the public player record");
+    qa_raise("Error", 0, 0, "Source armor stat is outside the public player record");
 }
 static void check_protection(double value) {
   if (!isfinite(value) || value < 0 || value > 1 || qa_float32(value) != value)
-    qa_range_error("Source armor protection must be a binary32 fraction");
+    qa_raise("Error", 0, 0, "Source armor protection must be a binary32 fraction");
 }
 static void check_mask(double value) {
   if (!is_integer(value) || value <= 0 || value > 4294967295.0 ||
       ((uint32_t)value & ((uint32_t)value - 1)) != 0)
-    qa_range_error("Source combat flags require individual 32-bit masks");
+    qa_raise("Error", 0, 0, "Source combat flags require individual 32-bit masks");
 }
+
+/* TS /^[^:]+:.+$/ after its colon: one or more characters up to the end of the
+ * text, none of them a line terminator. */
+static bool identity_tail(const char *text) {
+  if (text[0] == '\0') return false;
+  for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++) {
+    if (*p == '\n' || *p == '\r') return false;
+    if (p[0] == 0xE2 && p[1] == 0x80 && (p[2] == 0xA8 || p[2] == 0xA9)) return false;
+  }
+  return true;
+}
+
+static void destroy_on_raise(void *arg) { qa_qvm_combat_bindings_destroy(arg); }
 
 qa_qvm_combat_bindings *qa_qvm_combat_bindings_create(qa_qvm_combat_bindings_options options) {
   qa_qvm_combat_bindings *bindings = calloc(1, sizeof *bindings);
   if (bindings == NULL) return NULL;
   bindings->options = options;
+  /* TS: a refused declaration goes to the GC, and a failed hook closes what was bound. */
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, destroy_on_raise, bindings);
   qa_qvm_primary_combat_profile *definition = &options.definition;
   qa_qvm_game_combat_definition base = definition->base;
   if (!qa_qvm_game_combat_init(&bindings->source_combat, options.game, options.artifact, base)) {
+    qa_cleanup_pop(&refused);
     free(bindings);
     return NULL;
   }
@@ -1084,18 +1119,18 @@ qa_qvm_combat_bindings *qa_qvm_combat_bindings_create(qa_qvm_combat_bindings_opt
                               definition->reactions.die};
   for (size_t i = 0; i < 3; i++)
     if (!is_integer(reaction_fields[i]) || reaction_fields[i] < 0 ||
-        (int64_t)reaction_fields[i] % 4 != 0 || reaction_fields[i] + 4 > definition->base.entity_stride)
-      qa_range_error("Source combat reaction field is outside its entity record");
+        fmod(reaction_fields[i], 4) != 0 || reaction_fields[i] + 4 > definition->base.entity_stride)
+      qa_raise("Error", 0, 0, "Source combat reaction field is outside its entity record");
   const qa_qvm_image *image = &options.artifact->image;
   double check_armor = definition->armor.check_armor;
   if (!is_integer(check_armor) || check_armor < 0 || check_armor >= (double)image->instruction_count ||
       image->instructions[(size_t)check_armor].opcode != QA_QVM_OP_ENTER)
-    qa_range_error("Source CheckArmor declaration is not a function entry");
+    qa_raise("Error", 0, 0, "Source CheckArmor declaration is not a function entry");
   double client = definition->field_client;
-  if (!is_integer(client) || (int64_t)client % 4 != 0 ||
+  if (!is_integer(client) || fmod(client, 4) != 0 ||
       client < qa_qvm_shared_entity_bytes(definition->base.abi_profile) ||
       client + 4 > definition->base.entity_stride)
-    qa_range_error("Source combat requires its declared Q3 client pointer");
+    qa_raise("Error", 0, 0, "Source combat requires its declared Q3 client pointer");
   qa_qvm_validate_combat_call(definition->armor.call,
                               (double)(image->data_length + image->literal_length + image->bss_length));
   qa_qvm_reaction_call reaction_calls[] = {definition->reactions.pain_call, definition->reactions.die_call};
@@ -1115,12 +1150,12 @@ qa_qvm_combat_bindings *qa_qvm_combat_bindings_create(qa_qvm_combat_bindings_opt
        definition->damage_flags.no_team_protection}};
   size_t flag_counts[2] = {3, 5};
   for (int group = 0; group < 2; group++) {
-    for (size_t i = 0; i < flag_counts[group]; i++) {
-      check_mask(flag_groups[group][i]);
+    /* TS checks every mask of the group before it looks for an overlap. */
+    for (size_t i = 0; i < flag_counts[group]; i++) check_mask(flag_groups[group][i]);
+    for (size_t i = 0; i < flag_counts[group]; i++)
       for (size_t j = i + 1; j < flag_counts[group]; j++)
         if (flag_groups[group][i] == flag_groups[group][j])
-          qa_range_error("Source combat flags overlap");
-    }
+          qa_raise("Error", 0, 0, "Source combat flags overlap");
   }
   for (size_t i = 0; i < definition->state.team.value_count; i++) {
     const qa_qvm_combat_team *value = &definition->state.team.values[i];
@@ -1128,17 +1163,17 @@ qa_qvm_combat_bindings *qa_qvm_combat_bindings_create(qa_qvm_combat_bindings_opt
     for (size_t j = 0; j < i; j++) duplicate = duplicate || definition->state.team.values[j].value == value->value;
     const char *colon = strchr(value->team, ':');
     if (!is_integer(value->value) || value->value < -2147483648.0 || value->value > 2147483647.0 ||
-        duplicate || colon == NULL || colon == value->team || colon[1] == '\0')
-      qa_range_error("Source team mappings require unique values and explicit identities");
+        duplicate || colon == NULL || colon == value->team || !identity_tail(colon + 1))
+      qa_raise("Error", 0, 0, "Source team mappings require unique values and explicit identities");
   }
   const qa_qvm_combat_mass *mass = &definition->state.mass;
   if (mass->is_constant) {
     if (!isfinite(mass->value) || mass->value < 0)
-      qa_range_error("Source mass must be finite and nonnegative");
-  } else if (!is_integer(mass->offset) || (int64_t)mass->offset % 4 != 0 ||
+      qa_raise("Error", 0, 0, "Source mass must be finite and nonnegative");
+  } else if (!is_integer(mass->offset) || fmod(mass->offset, 4) != 0 ||
              mass->offset < qa_qvm_shared_entity_bytes(definition->base.abi_profile) ||
              mass->offset + 4 > definition->base.entity_stride) {
-    qa_range_error("Source mass field is outside its entity record");
+    qa_raise("Error", 0, 0, "Source mass field is outside its entity record");
   }
   if (definition->armor.has_tiers) {
     const qa_qvm_armor_tiers *tiers = &definition->armor.tiers;
@@ -1146,23 +1181,23 @@ qa_qvm_combat_bindings *qa_qvm_combat_bindings_create(qa_qvm_combat_bindings_opt
     check_protection(tiers->fallback);
     if (tiers->stat == definition->armor.points_stat || tiers->when_any_count == 0 ||
         tiers->value_count == 0)
-      qa_range_error("Source armor tier declaration is incomplete or aliases its points");
+      qa_raise("Error", 0, 0, "Source armor tier declaration is incomplete or aliases its points");
     for (size_t i = 0; i < tiers->value_count; i++) {
       bool duplicate = false;
       for (size_t j = 0; j < i; j++) duplicate = duplicate || tiers->values[j].tier == tiers->values[i].tier;
       if (!is_integer(tiers->values[i].tier) || tiers->values[i].tier < -2147483648.0 ||
           tiers->values[i].tier > 2147483647.0 || duplicate)
-        qa_range_error("Source armor tiers require unique signed integer values");
+        qa_raise("Error", 0, 0, "Source armor tiers require unique signed integer values");
       check_protection(tiers->values[i].protection);
     }
     double total = (double)(image->data_length + image->literal_length + image->bss_length);
     for (size_t i = 0; i < tiers->when_any_count; i++) {
       if (!is_integer(tiers->when_any[i].offset) || tiers->when_any[i].offset < 0 ||
-          (int64_t)tiers->when_any[i].offset % 4 != 0 || tiers->when_any[i].offset + 4 > total)
-        qa_range_error("Source armor mode word is outside source data");
+          fmod(tiers->when_any[i].offset, 4) != 0 || tiers->when_any[i].offset + 4 > total)
+        qa_raise("Error", 0, 0, "Source armor mode word is outside source data");
       if (!is_integer(tiers->when_any[i].value) || tiers->when_any[i].value < -2147483648.0 ||
           tiers->when_any[i].value > 2147483647.0)
-        qa_range_error("Source armor mode comparison requires a signed integer");
+        qa_raise("Error", 0, 0, "Source armor mode comparison requires a signed integer");
     }
   }
   qa_qvm_damage_scope_options scope_options;
@@ -1189,6 +1224,7 @@ qa_qvm_combat_bindings *qa_qvm_combat_bindings_create(qa_qvm_combat_bindings_opt
   scope_options.live = live_cb;
   bindings->scopes = qa_qvm_damage_scopes_create(scope_options);
   if (bindings->scopes == NULL) {
+    qa_cleanup_pop(&refused);
     qa_qvm_game_combat_destroy(&bindings->source_combat);
     free(bindings->mode_words);
     free(bindings);
@@ -1208,6 +1244,7 @@ qa_qvm_combat_bindings *qa_qvm_combat_bindings_create(qa_qvm_combat_bindings_opt
     bindings->release_subscription = qa_session_actor_registry_on_release(
         options.source->actors, release_listener, bindings);
   }
+  qa_cleanup_pop(&refused);
   return bindings;
 }
 

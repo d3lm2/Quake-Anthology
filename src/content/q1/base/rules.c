@@ -811,7 +811,7 @@ qa_q1_intermission_result qa_q1_level_rules_request_exit(qa_q1_level_rules *rule
                        : strcmp(map, "e4m7") == 0 ? "$qc_finale_e4" : NULL;
     if (text != NULL) {
       qa_q1_intermission_result result = {.kind = "finale", .track = 2};
-      (void)snprintf(result.text, sizeof result.text, "%s", qa_q1_finale_text(game->options.edition, text));
+      result.text = qa_q1_finale_text(game->options.edition, text);
       return result;
     }
     return rules_travel(rules, seconds, same_level);
@@ -823,8 +823,7 @@ qa_q1_intermission_result qa_q1_level_rules_request_exit(qa_q1_level_rules *rule
     }
     if ((qa_js_to_int32(rules->campaign.read_flags(rules->campaign.ctx)) & 15) == 15) {
       qa_q1_intermission_result result = {.kind = "finale", .track = 2};
-      (void)snprintf(result.text, sizeof result.text, "%s",
-                     qa_q1_finale_text(game->options.edition, "$qc_finale_all_runes"));
+      result.text = qa_q1_finale_text(game->options.edition, "$qc_finale_all_runes");
       return result;
     }
   }

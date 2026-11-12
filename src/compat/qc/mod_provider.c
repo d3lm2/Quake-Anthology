@@ -4,6 +4,7 @@
 #include "qa/compat/qc/mod_provider.h"
 #include "qa/network/common/js_number.h"
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,59 @@ static void *xrealloc(void *ptr, size_t size) {
   if (!next) qa_range_error("mod provider allocation failed");
   return next;
 }
+/* A formatted text of any length (TS template strings have no limit). */
+static char *format_text(const char *format, ...) {
+  va_list args, measure;
+  va_start(args, format);
+  va_copy(measure, args);
+  int needed = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  if (needed < 0) {
+    va_end(args);
+    qa_range_error("mod provider text formatting failed");
+  }
+  char *text = malloc((size_t)needed + 1);
+  if (!text) {
+    va_end(args);
+    qa_range_error("mod provider allocation failed");
+  }
+  vsnprintf(text, (size_t)needed + 1, format, args);
+  va_end(args);
+  return text;
+}
+/* An engine-string key and the value it names, released on refusal (cleanup arg). */
+typedef struct {
+  char *value;
+  char *name;
+} EngineText;
+static void engine_text_free(void *arg) {
+  EngineText *text = arg;
+  free(text->value);
+  free(text->name);
+  text->value = NULL;
+  text->name = NULL;
+}
+/* TS entries.find(entry => entry.item === item): the first match. */
+static const qa_inventory_entry *inventory_find(const qa_inventory_entry *entries, size_t count,
+                                                const char *item) {
+  for (size_t i = 0; i < count; i++)
+    if (text_eq(entries[i].item, item)) return &entries[i];
+  return NULL;
+}
+/* A lowered console call and its label, released on refusal (cleanup arg). */
+typedef struct {
+  qa_mod_callback_value *args;
+  qa_mod_named_value *globals;
+  char *label;
+} ConsoleCall;
+static void console_call_free(void *arg) {
+  ConsoleCall *call = arg;
+  qa_compat_qc_console_call_destroy(call->args, call->globals);
+  free(call->label);
+  call->args = NULL;
+  call->globals = NULL;
+  call->label = NULL;
+}
 static const qa_mod_actor_field *actor_field_named(
     qa_mod_callback_declaration decl, const char *name) {
   if (!name) return NULL;
@@ -65,7 +119,7 @@ static void output_field(OutCtx *c, const char *name, bool vector) {
                          text_eq(binding->binding, "bounds-max"))) ||
              (!vector && text_eq(binding->binding, "client-flags")));
   if (!ok)
-    qa_range_error("QC client outputs require declared private fields or "
+    qa_raise("Error", 0, 0, "QC client outputs require declared private fields or "
                    "the explicit view-offset field");
 }
 static void out_scalar(void *ctx, const void *field) {
@@ -108,7 +162,7 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
                                qa_mod_callback_declaration decl) {
   if (!decl.program.digest ||
       strcmp(program->digest, decl.program.digest) != 0)
-    qa_range_error(
+    qa_raise("Error", 0, 0, 
         "Gameplay mod program differs from its declared artifact digest");
   const qa_mod_client_output_declaration *outputs =
       decl.clients ? decl.clients->outputs : NULL;
@@ -125,7 +179,7 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
           actor_field_named(decl, (const char *)output->max_vector);
       if (!mn || !text_eq(mn->binding, "bounds-min") || !mx ||
           !text_eq(mx->binding, "bounds-max"))
-        qa_range_error("Client body shape must name its declared source "
+        qa_raise("Error", 0, 0, "Client body shape must name its declared source "
                        "mins/maxs");
       continue;
     }
@@ -139,7 +193,7 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
          (qa_js_to_int32(output->mask) &
           ~qa_js_to_int32(binding->has_private_mask ? binding->private_mask
                                                     : 0)) != 0))
-      qa_range_error("QC client flag outputs must name an explicit mask of "
+      qa_raise("Error", 0, 0, "QC client flag outputs must name an explicit mask of "
                      "source-private bits");
   }
   size_t region_count = 0;
@@ -190,11 +244,11 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
             bad = true;
     }
     if (bad)
-      qa_range_error("QC pickups require clients, unique rule ids and "
+      qa_raise("Error", 0, 0, "QC pickups require clients, unique rule ids and "
                      "distinct offered items");
     for (size_t wi = 0; wi < pickup->writes.count; wi++)
       if (!pickup_storage_ok(decl, &pickup->writes.values[wi]))
-        qa_range_error("QC pickup resource requires its declared source "
+        qa_raise("Error", 0, 0, "QC pickup resource requires its declared source "
                        "storage");
     qa_mod_callback_input avail[7] = {"self", "other", "item", "time",
                                       "pickup-count", "pickup-has-count",
@@ -213,7 +267,7 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
     for (size_t i = 0; i < decl.actor_field_count; i++)
       if (text_eq(decl.actor_fields[i].binding, binding)) n++;
     if (n > 1)
-      qa_range_error("Duplicate original %s authority field", binding);
+      qa_raise("Error", 0, 0, "Duplicate original %s authority field", binding);
   }
   size_t think_n = 0, nextthink_n = 0;
   for (size_t i = 0; i < decl.actor_field_count; i++) {
@@ -221,7 +275,7 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
     if (text_eq(decl.actor_fields[i].binding, "nextthink")) nextthink_n++;
   }
   if (think_n != nextthink_n || think_n > 1)
-    qa_range_error("Mod source scheduling requires one think and one "
+    qa_raise("Error", 0, 0, "Mod source scheduling requires one think and one "
                    "nextthink binding together");
   int64_t *used_words = NULL;
   size_t used_count = 0, used_capacity = 0;
@@ -235,29 +289,29 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
         (!decl.clients || decl.clients->input_count == 0 ||
          (text_eq(entry->update, "nonzero") &&
           text_eq(entry->input, "view-angles"))))
-      qa_range_error("Mod client input fields require declared applications "
+      qa_raise("Error", 0, 0, "Mod client input fields require declared applications "
                      "and scalar nonzero updates");
     if (text_eq(entry->binding, "client-flags") && entry->has_private_mask &&
         (entry->private_mask != trunc(entry->private_mask) ||
          entry->private_mask < 0 || entry->private_mask > 0x7fffff ||
          (((int64_t)entry->private_mask) &
           (8 | 128 | (entry->has_grounded ? 512 : 0))) != 0))
-      qa_range_error("Mod private client flags overlap canonical flags or "
+      qa_raise("Error", 0, 0, "Mod private client flags overlap canonical flags or "
                      "exceed the source flag word");
     if (text_eq(entry->binding, "userinfo") &&
         (!decl.clients || !entry->key || !entry->key[0] ||
          strchr(entry->key, '\\')))
-      qa_range_error("Mod userinfo field requires a declared client and "
+      qa_raise("Error", 0, 0, "Mod userinfo field requires a declared client and "
                      "valid info key");
     if (text_eq(entry->binding, "client-input") && entry->has_scale &&
         (!isfinite(entry->scale) || entry->scale == 0 ||
          text_eq(entry->input, "view-angles")))
-      qa_range_error("QC input scale requires a finite nonzero scalar "
+      qa_raise("Error", 0, 0, "QC input scale requires a finite nonzero scalar "
                      "encoding");
     const qa_compat_qc_definition *field =
         qa_compat_qc_program_field_named(program, entry->field);
     if (!field)
-      qa_range_error("Missing mod actor field %s", entry->field);
+      qa_raise("Error", 0, 0, "Missing mod actor field %s", entry->field);
     const char *type;
     if (text_eq(entry->binding, "private"))
       type = field->type;
@@ -280,13 +334,13 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
     else
       type = "vector";
     if (!text_eq(field->type, type))
-      qa_range_error("Mod actor field %s requires %s, found %s", entry->field,
+      qa_raise("Error", 0, 0, "Mod actor field %s requires %s, found %s", entry->field,
                      type, field->type);
     int64_t width = strcmp(type, "vector") == 0 ? 3 : 1;
     for (int64_t w = field->offset; w < field->offset + width; w++) {
       for (size_t u = 0; u < used_count; u++)
         if (used_words[u] == w)
-          qa_range_error("Overlapping mod actor field %s", entry->field);
+          qa_raise("Error", 0, 0, "Overlapping mod actor field %s", entry->field);
       if (used_count == used_capacity) {
         used_capacity = used_capacity ? used_capacity * 2 : 16;
         used_words = xrealloc(used_words, used_capacity * sizeof *used_words);
@@ -297,14 +351,14 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
   free(used_words);
   if (decl.client_presentation) {
     if (!decl.clients)
-      qa_range_error("QC client presentation requires declared clients");
+      qa_raise("Error", 0, 0, "QC client presentation requires declared clients");
     if (!text_eq(decl.client_presentation->hud, "none"))
       for (int i = 0; i < 2; i++) {
         const char *n = i ? "armorvalue" : "health";
         const qa_compat_qc_definition *f =
             qa_compat_qc_program_field_named(program, n);
         if (!f || !text_eq(f->type, "float"))
-          qa_range_error("QC status requires original %s", n);
+          qa_raise("Error", 0, 0, "QC status requires original %s", n);
       }
     if (!text_eq(decl.client_presentation->view, "none"))
       for (int i = 0; i < 3; i++) {
@@ -313,13 +367,13 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
         const qa_compat_qc_definition *f =
             qa_compat_qc_program_field_named(program, n);
         if (!f || !text_eq(f->type, "vector"))
-          qa_range_error("QC view requires original %s", n);
+          qa_raise("Error", 0, 0, "QC view requires original %s", n);
       }
   }
   if (decl.clients) {
     double maximum = decl.clients->maximum;
     if (maximum != trunc(maximum) || maximum < 1 || maximum >= 8191)
-      qa_range_error("Mod client capacity must fit reserved QuakeC edicts");
+      qa_raise("Error", 0, 0, "Mod client capacity must fit reserved QuakeC edicts");
     for (size_t i = 0; i < decl.clients->admit_count; i++)
       qa_compat_qc_validate_source_call(program, decl.clients->admit[i],
                                         self_time, 2, "client lifecycle");
@@ -345,7 +399,7 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
                                             : outs[oi].field,
                         outs[oj].is_handler ? outs[oj].function
                                             : outs[oj].field))
-              qa_range_error("QC input output declaration is duplicated");
+              qa_raise("Error", 0, 0, "QC input output declaration is duplicated");
           if (!outs[oi].is_handler) {
             bool stored = false;
             for (size_t j = 0; j < decl.actor_field_count; j++)
@@ -353,12 +407,12 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
                   text_eq(decl.actor_fields[j].field, outs[oi].field))
                 stored = true;
             if (!stored)
-              qa_range_error(
+              qa_raise("Error", 0, 0, 
                   "QC output requires declared client input storage");
           } else {
+            /* TS program.functionNamed: a missing function raises QcProgramError. */
             const qa_compat_qc_function *fn =
-                qa_compat_qc_program_function_named_map(program,
-                                                        outs[oi].function);
+                qa_compat_qc_program_function_named(program, outs[oi].function);
             const qa_compat_qc_definition *self =
                 qa_compat_qc_program_global_named(program, "self");
             bool distinct = outs[oi].input_count != 0;
@@ -366,10 +420,10 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
               for (size_t b = a + 1; b < outs[oi].input_count; b++)
                 if (strcmp(outs[oi].inputs[a], outs[oi].inputs[b]) == 0)
                   distinct = false;
-            if (!fn || fn->index == 0 || fn->first_statement <= 0 ||
+            if (fn->index == 0 || fn->first_statement <= 0 ||
                 fn->named_builtin || !self || !text_eq(self->type, "entity") ||
                 !distinct)
-              qa_range_error("QC output requires an original actor handler "
+              qa_raise("Error", 0, 0, "QC output requires an original actor handler "
                              "and distinct controls");
           }
         }
@@ -431,17 +485,22 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
     qa_command_tokens_destroy(&tok);
     free(folded);
     if (bad)
-      qa_range_error("Invalid or duplicate mod command %s", command->name);
+      qa_raise("Error", 0, 0, "Invalid or duplicate mod command %s", command->name);
     qa_mod_source_call call;
-    qa_mod_callback_value *args = NULL;
-    qa_mod_named_value *globals = NULL;
-    if (!qa_compat_qc_console_call(*command, NULL, 0, "", &call, &args,
-                                   &globals))
+    ConsoleCall owned = {NULL, NULL, NULL};
+    if (!qa_compat_qc_console_call(*command, NULL, 0, "", &call, &owned.args,
+                                   &owned.globals))
       qa_range_error("mod command allocation failed");
-    char label[256];
-    snprintf(label, sizeof label, "console command %s", command->name);
-    qa_compat_qc_validate_source_call(program, call, NULL, 0, label);
-    qa_compat_qc_console_call_destroy(args, globals);
+    /* The label carries the whole command name (TS template string); the
+     * call is released when validation refuses it. */
+    size_t label_length = strlen("console command ") + strlen(command->name) + 1;
+    owned.label = xrealloc(NULL, label_length);
+    snprintf(owned.label, label_length, "console command %s", command->name);
+    qa_cleanup scope;
+    qa_cleanup_push(&scope, console_call_free, &owned);
+    qa_compat_qc_validate_source_call(program, call, NULL, 0, owned.label);
+    qa_cleanup_pop(&scope);
+    console_call_free(&owned);
   }
   for (size_t i = 0; i < decl.initialize_count; i++)
     qa_compat_qc_validate_source_call(program, decl.initialize[i], self_time, 2,
@@ -451,15 +510,16 @@ void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
     qa_compat_qc_validate_source_call(program, *decl.frame, avail, 3,
                                       "source frame");
   }
+  /* TS refuses at the first repeated name in declaration order. */
   for (size_t i = 0; i < decl.cvar_count; i++)
-    for (size_t j = i + 1; j < decl.cvar_count; j++)
+    for (size_t j = 0; j < i; j++)
       if (strcmp(decl.cvars[i].name, decl.cvars[j].name) == 0)
-        qa_range_error("Duplicate mod cvar %s", decl.cvars[i].name);
+        qa_raise("Error", 0, 0, "Duplicate mod cvar %s", decl.cvars[i].name);
   for (size_t i = 0; i < decl.callback_count; i++) {
     const qa_mod_callback *call = &decl.callbacks[i];
     for (size_t j = 0; j < i; j++)
       if (strcmp(decl.callbacks[j].binding.id, call->binding.id) == 0)
-        qa_range_error("Duplicate mod callback %s", call->binding.id);
+        qa_raise("Error", 0, 0, "Duplicate mod callback %s", call->binding.id);
     qa_mod_callback_input avail[16];
     size_t an = 0;
     avail[an++] = "self";
@@ -512,13 +572,13 @@ static int64_t projection_slot(P *p, qa_actor_id actor) {
     if (actor_eq(p->projections[i].actor, actor)) return p->projections[i].slot;
   return -1;
 }
+/* TS projections.set: a Map keeps the first insertion position. */
 static void projection_set(P *p, qa_actor_id actor, int64_t slot) {
-  int64_t existing = projection_slot(p, actor);
-  if (existing >= 0) {
-    for (size_t i = 0; i < p->projection_count; i++)
-      if (actor_eq(p->projections[i].actor, actor)) p->projections[i].slot = slot;
-    return;
-  }
+  for (size_t i = 0; i < p->projection_count; i++)
+    if (actor_eq(p->projections[i].actor, actor)) {
+      p->projections[i].slot = slot;
+      return;
+    }
   if (p->projection_count == p->projection_capacity) {
     p->projection_capacity = p->projection_capacity ? p->projection_capacity * 2 : 16;
     p->projections = xrealloc(p->projections,
@@ -537,10 +597,22 @@ static void projection_delete(P *p, qa_actor_id actor) {
       return;
     }
 }
+/* TS actorsBySlot.get/set/delete/clear. */
 static bool projection_actor_at(P *p, int64_t slot, qa_actor_id *out) {
-  for (size_t i = 0; i < p->projection_count; i++)
-    if (p->projections[i].slot == slot) { *out = p->projections[i].actor; return true; }
-  return false;
+  if (slot < 0 || slot >= p->entities.capacity || !p->actors_by_slot[slot].has) return false;
+  *out = p->actors_by_slot[slot].actor;
+  return true;
+}
+static void slot_set(P *p, int64_t slot, qa_actor_id actor) {
+  if (slot < 0 || slot >= p->entities.capacity) qa_range_error("QuakeC actor slot outside entity memory");
+  p->actors_by_slot[slot].has = true;
+  p->actors_by_slot[slot].actor = actor;
+}
+static void slot_delete(P *p, int64_t slot) {
+  if (slot >= 0 && slot < p->entities.capacity) p->actors_by_slot[slot].has = false;
+}
+static void slots_clear(P *p) {
+  for (int64_t slot = 0; slot < p->entities.capacity; slot++) p->actors_by_slot[slot].has = false;
 }
 static void retired_add(P *p, qa_actor_id actor) {
   for (size_t i = 0; i < p->retired_count; i++)
@@ -563,14 +635,14 @@ qa_actor_id qa_compat_qc_mod_provider_actor(P *p, int64_t reference) {
     qa_actor_id world;
     if (!world_actor(p, &world) ||
         !qa_session_actor_registry_is_live(p->services->actors, world))
-      qa_range_error("Mod source world has no canonical actor");
+      qa_raise("Error", 0, 0, "Mod source world has no canonical actor");
     return world;
   }
   qa_actor_id actor;
   int64_t slot = qa_compat_qc_entity_memory_slot(&p->entities, reference);
   if (!projection_actor_at(p, slot, &actor) ||
       !qa_session_actor_registry_is_live(p->services->actors, actor))
-    qa_range_error(
+    qa_raise("Error", 0, 0, 
         "Gameplay mod references an absent or expired actor projection");
   return actor;
 }
@@ -590,7 +662,7 @@ int64_t qa_compat_qc_mod_provider_reference(P *p, const qa_actor_id *actor) {
   qa_owned_actor owned;
   if (!qa_session_actor_registry_resolve_owned(p->services->actors, *actor,
                                                &owned))
-    qa_range_error("Gameplay mod cannot project a stale actor");
+    qa_raise("Error", 0, 0, "Gameplay mod cannot project a stale actor");
   qa_actor_id current = owned.id;
   int64_t existing = projection_slot(p, current);
   if (existing >= 0)
@@ -614,6 +686,7 @@ int64_t qa_compat_qc_mod_provider_reference(P *p, const qa_actor_id *actor) {
     memset(words->bytes, 0, words->byte_length);
   }
   projection_set(p, current, slot);
+  slot_set(p, slot, current);
   qa_compat_qc_words *words = qa_compat_qc_entity_memory_at(&p->entities, slot);
   for (size_t i = 0; i < p->field_count; i++) {
     const qa_compat_qc_mod_provider_field *field = &p->fields[i];
@@ -725,41 +798,46 @@ static void refresh(P *p, qa_actor_id actor, int64_t slot, int64_t word,
       continue;
     } else if (text_eq(binding, "userinfo")) {
       if (!p->has_clients)
-        qa_range_error("Mod userinfo field requires client services");
+        qa_raise("Error", 0, 0, "Mod userinfo field requires client services");
       int64_t client_slot;
       if (!client_slot_of(p, actor, &client_slot)) continue;
       char *value = qa_compat_qc_mod_client_bindings_userinfo(&p->clients,
                                                               actor,
                                                               declared->key);
       if (!value) qa_range_error("mod provider allocation failed");
-      char engine_name[256];
-      snprintf(engine_name, sizeof engine_name, "mod-userinfo:%lld:%s",
-               (long long)slot, declared->key);
+      /* The engine-string key carries the whole info key (TS template string). */
+      EngineText text = {value, format_text("mod-userinfo:%lld:%s", (long long)slot, declared->key)};
       int64_t capacity = (int64_t)strlen(value) + 1;
       if (capacity < 128) capacity = 128;
+      qa_cleanup scope;
+      qa_cleanup_push(&scope, engine_text_free, &text);
       qa_compat_qc_words_set_int(
           words, field->offset,
           (double)qa_compat_qc_strings_set_engine(&p->machine.strings,
-                                                  engine_name, value,
+                                                  text.name, value,
                                                   capacity));
-      free(value);
+      qa_cleanup_pop(&scope);
+      engine_text_free(&text);
     } else if (text_eq(binding, "classname")) {
       const qa_session_mod_engine_services *engine = p->services->engine;
       const char *name =
           engine && engine->classname ? engine->classname(engine->ctx, actor)
                                       : NULL;
       if (!name)
-        qa_range_error(
+        qa_raise("Error", 0, 0,
             "Mod classname field requires canonical actor metadata");
-      char engine_name[256];
-      snprintf(engine_name, sizeof engine_name, "mod-classname:%s", name);
+      EngineText text = {NULL, format_text("mod-classname:%s", name)};
       int64_t capacity = (int64_t)strlen(name) + 1;
       if (capacity < 128) capacity = 128;
+      qa_cleanup scope;
+      qa_cleanup_push(&scope, engine_text_free, &text);
       qa_compat_qc_words_set_int(
           words, field->offset,
           (double)qa_compat_qc_strings_set_engine(&p->machine.strings,
-                                                  engine_name, name,
+                                                  text.name, name,
                                                   capacity));
+      qa_cleanup_pop(&scope);
+      engine_text_free(&text);
     } else if (text_eq(binding, "client-flags")) {
       qa_q1_visibility_client client;
       bool has_client = p->environment.clients &&
@@ -772,7 +850,7 @@ static void refresh(P *p, qa_actor_id actor, int64_t slot, int64_t word,
         if (!clients || !clients->for_actor ||
             !clients->for_actor(clients->ctx, actor, &identity) ||
             !clients->grounded)
-          qa_range_error("Mod grounded flags require canonical client "
+          qa_raise("Error", 0, 0, "Mod grounded flags require canonical client "
                          "movement state");
         if (clients->grounded(clients->ctx, identity)) canonical |= 512;
       }
@@ -807,10 +885,8 @@ static void refresh(P *p, qa_actor_id actor, int64_t slot, int64_t word,
       size_t entry_count = 0;
       const qa_inventory_entry *entries = qa_shared_inventory_table_entries(
           p->services->inventory, actor, &entry_count);
-      double value = 0;
-      for (size_t e = 0; e < entry_count; e++)
-        if (text_eq(entries[e].item, declared->item)) value = entries[e].count;
-      qa_compat_qc_words_set_float(words, field->offset, value);
+      const qa_inventory_entry *entry = inventory_find(entries, entry_count, declared->item);
+      qa_compat_qc_words_set_float(words, field->offset, entry ? entry->count : 0);
     } else {
       /* origin | angles | velocity | bounds-min | bounds-max */
       if (output_field_owned(p, actor, declared->field)) continue;
@@ -847,13 +923,44 @@ static void publish_client_outputs(P *p) {
   }
 }
 typedef struct {
+  P *p;
+  qa_owned_actor actor;
   qa_compat_qc_words *words;
-  int64_t offset;
-} PickupCommit;
+  qa_original_pickup_execution execution;
+  struct { const char *item; int64_t offset; double count; } *writes;
+  size_t count, cursor;
+} PickupChain;
+typedef struct {
+  PickupChain *chain;
+  size_t index;
+} PickupLink;
+static void pickup_chain_commit(PickupChain *chain);
 static void pickup_committed(void *ctx, qa_inventory_committed_change change) {
-  PickupCommit *commit = ctx;
-  qa_compat_qc_words_set_float(commit->words, commit->offset,
+  PickupLink *link = ctx;
+  qa_compat_qc_words_set_float(link->chain->words, link->chain->writes[link->index].offset,
                                change.after.count);
+  pickup_chain_commit(link->chain);
+}
+/* TS commit(): takes the next write; a configure that never commits ends the chain. */
+static void pickup_chain_commit(PickupChain *chain) {
+  if (chain->cursor >= chain->count) return;
+  PickupLink link = {chain, chain->cursor++};
+  P *p = chain->p;
+  if (!chain->execution.current(chain->execution.current_ctx))
+    qa_raise("Error", 0, 0, "Original pickup resource binding is no longer current");
+  size_t entry_count = 0;
+  const qa_inventory_entry *entries = qa_shared_inventory_table_entries(
+      p->services->inventory, chain->actor.id, &entry_count);
+  const qa_inventory_entry *entry =
+      inventory_find(entries, entry_count, chain->writes[link.index].item);
+  if (!entry)
+    qa_raise("Error", 0, 0, "Mod inventory store requires %s", chain->writes[link.index].item);
+  qa_inventory_entry next = *entry;
+  next.count = chain->writes[link.index].count;
+  qa_shared_inventory_table_configure(p->services->inventory, chain->actor, next,
+                                      pickup_committed, &link);
+  if (!chain->execution.current(chain->execution.current_ctx))
+    qa_raise("Error", 0, 0, "Original pickup resource binding is no longer current");
 }
 static bool pickup_scope(P *p, size_t *out_index) {
   if (p->pickup_scope_count == 0) return false;
@@ -869,7 +976,7 @@ static void validate_pickup_store(P *p,
   qa_original_pickup_execution *execution =
       &p->pickup_scopes[scope_index].execution;
   if (!execution->current(execution->current_ctx))
-    qa_range_error("Original pickup resource binding is no longer current");
+    qa_raise("Error", 0, 0, "Original pickup resource binding is no longer current");
   qa_actor_id actor = qa_compat_qc_mod_provider_actor(p, store.reference);
   int64_t store_words = (int64_t)(store.after_length / 4);
   for (size_t i = 0; i < p->field_count; i++) {
@@ -891,7 +998,7 @@ static void validate_pickup_store(P *p,
     }
     if (!actor_eq(actor, p->pickup_scopes[scope_index].actor) ||
         !text_eq(declaration->binding, "inventory") || !written)
-      qa_range_error("Original pickup changed an undeclared resource");
+      qa_raise("Error", 0, 0, "Original pickup changed an undeclared resource");
   }
 }
 static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
@@ -899,7 +1006,7 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
   qa_owned_actor actor;
   if (!qa_session_actor_registry_resolve_owned(p->services->actors, actor_id,
                                                &actor))
-    qa_range_error("Mod actor was released before its source store");
+    qa_raise("Error", 0, 0, "Mod actor was released before its source store");
   qa_compat_qc_words *words =
       qa_compat_qc_entity_memory_from_reference(&p->entities, store.reference);
   int64_t store_words = (int64_t)(store.after_length / 4);
@@ -919,35 +1026,31 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
   size_t scope_index;
   bool has_pickup = pickup_scope(p, &scope_index);
   if (has_pickup) {
-    qa_original_pickup_execution *execution =
-        &p->pickup_scopes[scope_index].execution;
+    /* TS reads every declared inventory count first, then commits them in a chain: each configure's
+     * commit callback stores the committed count and commits the next write. */
+    PickupChain chain;
+    memset(&chain, 0, sizeof chain);
+    chain.p = p;
+    chain.actor = actor;
+    chain.words = words;
+    chain.execution = p->pickup_scopes[scope_index].execution;
+    chain.writes = xrealloc(NULL, (p->field_count ? p->field_count : 1) * sizeof *chain.writes);
     for (size_t i = 0; i < p->field_count; i++) {
       const qa_compat_qc_mod_provider_field *field = &p->fields[i];
       if (!text_eq(field->declaration.binding, "inventory") ||
           store.word >= field->offset + field->words ||
           store.word + store_words <= field->offset)
         continue;
-      if (!execution->current(execution->current_ctx))
-        qa_range_error("Original pickup resource binding is no longer "
-                       "current");
-      size_t entry_count = 0;
-      const qa_inventory_entry *entries = qa_shared_inventory_table_entries(
-          p->services->inventory, actor.id, &entry_count);
-      const qa_inventory_entry *entry = NULL;
-      for (size_t e = 0; e < entry_count; e++)
-        if (text_eq(entries[e].item, field->declaration.item)) entry = &entries[e];
-      if (!entry)
-        qa_range_error("Mod inventory store requires %s",
-                       field->declaration.item);
-      qa_inventory_entry next = *entry;
-      next.count = qa_compat_qc_words_float(words, field->offset);
-      PickupCommit commit = {words, field->offset};
-      qa_shared_inventory_table_configure(p->services->inventory, actor, next,
-                                          pickup_committed, &commit);
-      if (!execution->current(execution->current_ctx))
-        qa_range_error("Original pickup resource binding is no longer "
-                       "current");
+      chain.writes[chain.count].item = field->declaration.item;
+      chain.writes[chain.count].offset = field->offset;
+      chain.writes[chain.count].count = qa_compat_qc_words_float(words, field->offset);
+      chain.count++;
     }
+    qa_cleanup scope;
+    qa_cleanup_push(&scope, free, chain.writes);
+    pickup_chain_commit(&chain);
+    qa_cleanup_pop(&scope);
+    free(chain.writes);
   }
   for (size_t i = 0; i < p->field_count; i++) {
     const qa_compat_qc_mod_provider_field *field = &p->fields[i];
@@ -961,7 +1064,7 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
       continue;
     } else if (text_eq(binding, "userinfo")) {
       if (!p->has_clients)
-        qa_range_error("Mod userinfo field requires client services");
+        qa_raise("Error", 0, 0, "Mod userinfo field requires client services");
       int64_t client_slot;
       if (client_slot_of(p, actor.id, &client_slot))
         qa_compat_qc_mod_client_bindings_set_userinfo(
@@ -982,12 +1085,12 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
           (qa_js_to_int32((double)before_bits) ^ next) & ~private_mask;
       if (changed != 0) {
         if (!declared->has_grounded || changed != 512 || (next & 512) != 0)
-          qa_range_error("Mod client-flags store requires its canonical "
+          qa_raise("Error", 0, 0, "Mod client-flags store requires its canonical "
                          "owner");
         qa_body_state_result body =
             qa_shared_body_table_read(p->services->bodies, actor.id);
         if (!body.has_value)
-          qa_range_error("Mod ground detachment requires a live body");
+          qa_raise("Error", 0, 0, "Mod ground detachment requires a live body");
         body.value.ground = NULL;
         qa_shared_body_table_write(p->services->bodies, actor, body.value);
       }
@@ -1004,10 +1107,10 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
             owned_output = true;
         }
       if (!(owned_output && client_slot_of(p, actor.id, &client_slot)))
-        qa_range_error("Mod view-offset store requires its declared client "
+        qa_raise("Error", 0, 0, "Mod view-offset store requires its declared client "
                        "output owner");
     } else if (text_eq(binding, "classname")) {
-      qa_range_error("Mod %s store requires its canonical owner", binding);
+      qa_raise("Error", 0, 0, "Mod %s store requires its canonical owner", binding);
     } else if (text_eq(binding, "think") || text_eq(binding, "nextthink")) {
       int64_t maximum = p->declaration.clients
                             ? (int64_t)p->declaration.clients->maximum : 0;
@@ -1024,7 +1127,7 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
                                        match_field(declared)));
     } else if (text_eq(binding, "health")) {
       if (!qa_gameplay_authority_read(p->services->combat, actor.id).has_value)
-        qa_range_error("Mod health store requires a combat actor");
+        qa_raise("Error", 0, 0, "Mod health store requires a combat actor");
       qa_gameplay_authority_set_health(
           p->services->combat, actor,
           qa_compat_qc_words_float(words, field->offset));
@@ -1033,11 +1136,9 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
       size_t entry_count = 0;
       const qa_inventory_entry *entries = qa_shared_inventory_table_entries(
           p->services->inventory, actor.id, &entry_count);
-      const qa_inventory_entry *entry = NULL;
-      for (size_t e = 0; e < entry_count; e++)
-        if (text_eq(entries[e].item, declared->item)) entry = &entries[e];
+      const qa_inventory_entry *entry = inventory_find(entries, entry_count, declared->item);
       if (!entry)
-        qa_range_error("Mod inventory store requires %s", declared->item);
+        qa_raise("Error", 0, 0, "Mod inventory store requires %s", declared->item);
       qa_inventory_entry next = *entry;
       next.count = qa_compat_qc_words_float(words, field->offset);
       qa_shared_inventory_table_configure(p->services->inventory, actor, next,
@@ -1046,7 +1147,7 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
                text_eq(binding, "velocity")) {
       qa_body_state_result body =
           qa_shared_body_table_read(p->services->bodies, actor.id);
-      if (!body.has_value) qa_range_error("Mod body binding disappeared");
+      if (!body.has_value) qa_raise("Error", 0, 0, "Mod body binding disappeared");
       qa_vec3 value = qa_compat_qc_words_vector(words, field->offset);
       if (text_eq(binding, "origin"))
         body.value.origin = value;
@@ -1061,7 +1162,7 @@ static void write_through(P *p, qa_compat_qc_entity_store_observation store) {
       qa_body_state_result body =
           qa_shared_body_table_read(p->services->bodies, actor.id);
       if (!body.has_value)
-        qa_range_error("Mod bounds store requires a physical actor");
+        qa_raise("Error", 0, 0, "Mod bounds store requires a physical actor");
       if (text_eq(binding, "bounds-min"))
         body.value.bounds.min = qa_compat_qc_words_vector(words, field->offset);
       else
@@ -1110,7 +1211,7 @@ static void validate_entity_access(void *ctx, int64_t reference, int64_t word,
           offset < p->fields[i].offset + p->fields[i].words)
         mapped = true;
     if (!mapped)
-      qa_range_error("Mod %s accessed unmapped actor field word %lld",
+      qa_raise("Error", 0, 0, "Mod %s accessed unmapped actor field word %lld",
                      p->module.id, (long long)offset);
   }
   if (strcmp(kind, "read") == 0)
@@ -1135,12 +1236,13 @@ static void observe_entity_store(void *ctx,
   validate_pickup_store(p, store);
   if (p->has_protection) qa_compat_qc_mod_protection_observe(&p->protection, store);
   if (p->has_items) {
+    /* TS pickup?.actor.equals(this.actor(store.reference)) === true && pickup.depth === this.depth: the
+     * stored reference resolves (and may refuse) whenever a pickup scope is open, before the depth test. */
     const qa_original_pickup_execution *execution = NULL;
     if (p->pickup_scope_count > 0) {
       size_t top = p->pickup_scope_count - 1;
-      if (p->pickup_scopes[top].depth == p->depth &&
-          actor_eq(p->pickup_scopes[top].actor,
-                   qa_compat_qc_mod_provider_actor(p, store.reference)))
+      qa_actor_id stored = qa_compat_qc_mod_provider_actor(p, store.reference);
+      if (actor_eq(p->pickup_scopes[top].actor, stored) && p->pickup_scopes[top].depth == p->depth)
         execution = &p->pickup_scopes[top].execution;
     }
     qa_compat_qc_mod_items_observe(&p->items, store, execution);
@@ -1197,38 +1299,55 @@ static void unwind_depth(void *arg) {
   p->depth--;
   drain_retired_projections(p);
 }
+static void flush_objectives(void *arg) {
+  P *p = arg;
+  if (p->objectives) qa_mod_source_objectives_flush(p->objectives);
+}
 static void end_loading(void *arg) { ((P *)arg)->loading = false; }
 static void pop_pickup_scope(void *arg) { ((P *)arg)->pickup_scope_count--; }
+typedef struct {
+  ExecCtx exec;
+  const qa_compat_qc_mod_input_entry *inputs;
+  size_t input_count;
+  double result;
+} InvokeJob;
+static void invoke_body(void *ctx) {
+  InvokeJob *job = ctx;
+  job->result = qa_compat_qc_with_source_call(
+      &job->exec.p->machine, job->exec.call, job->inputs, job->input_count,
+      (qa_compat_qc_actor_reference){job->exec.p, reference_actor},
+      (qa_compat_qc_source_execute){&job->exec, exec_fn});
+}
 double qa_compat_qc_mod_provider_invoke(
     P *p, qa_mod_source_call call,
     const qa_compat_qc_mod_input_entry *inputs, size_t input_count,
     const qa_q1qc_armor_stage *region) {
-  if (p->closed) qa_range_error("Gameplay mod is closed");
+  if (p->closed) qa_raise("Error", 0, 0, "Gameplay mod is closed");
   if (p->depth >= 64)
-    qa_range_error("Gameplay mod callback recursion exceeded 64 calls");
+    qa_raise("Error", 0, 0, "Gameplay mod callback recursion exceeded 64 calls");
   if (p->objectives) {
     qa_mod_source_objectives_flush(p->objectives);
     qa_mod_source_objectives_refresh(p->objectives);
   }
   p->depth++;
-  qa_cleanup scope;
-  qa_cleanup_push(&scope, unwind_depth, p);
-  ExecCtx exec = {p, call, region};
-  double result = qa_compat_qc_with_source_call(
-      &p->machine, call, inputs, input_count,
-      (qa_compat_qc_actor_reference){p, reference_actor},
-      (qa_compat_qc_source_execute){&exec, exec_fn});
-  if (p->objectives) qa_mod_source_objectives_flush(p->objectives);
-  qa_cleanup_pop(&scope);
-  unwind_depth(p);
-  return result;
+  /* TS try { call } finally { try { objectives.flush() } finally { depth--; drain } }: every step runs,
+   * and the latest failure is the one that propagates. */
+  InvokeJob job = {{p, call, region}, inputs, input_count, 0};
+  qa_caught_error caught, flush_error, unwind_error;
+  bool called = qa_try(invoke_body, &job, &caught);
+  bool flushed = qa_try(flush_objectives, p, &flush_error);
+  bool unwound = qa_try(unwind_depth, p, &unwind_error);
+  if (!unwound) qa_rethrow(&unwind_error);
+  if (!flushed) qa_rethrow(&flush_error);
+  if (!called) qa_rethrow(&caught);
+  return job.result;
 }
 static void invoke_owned(P *p, int64_t index, qa_actor_id actor,
                          const qa_actor_id *other, qa_source_time time) {
   const qa_compat_qc_function *fn =
       qa_compat_qc_program_function_at(p->program, index);
   if (fn->parameter_size_count != 0 || fn->index == 0)
-    qa_range_error("Mod actor callback must be a no-argument source "
+    qa_raise("Error", 0, 0, "Mod actor callback must be a no-argument source "
                    "function");
   qa_actor_id self_copy = actor;
   qa_actor_id other_copy;
@@ -1294,12 +1413,33 @@ static void run_client_think(void *ctx, qa_actor_id actor,
     if (!quakeworld) return;
   }
 }
+typedef struct {
+  P *p;
+  qa_actor_id actor;
+} BindingStep;
+static void release_pickups_step(void *ctx) {
+  BindingStep *s = ctx;
+  if (s->p->has_pickups) qa_compat_qc_mod_pickups_release(&s->p->pickups, s->actor);
+}
+static void release_items_step(void *ctx) {
+  BindingStep *s = ctx;
+  if (s->p->has_items) qa_compat_qc_mod_items_release(&s->p->items, s->actor);
+}
+static void release_protection_step(void *ctx) {
+  BindingStep *s = ctx;
+  if (s->p->has_protection) qa_compat_qc_mod_protection_release(&s->p->protection, s->actor);
+}
+/* TS releaseClientBindings: the outputs release first, then every binding in its own try. */
 static void release_client_bindings(P *p, qa_actor_id actor) {
   if (p->client_outputs)
     qa_source_mod_client_outputs_release(p->client_outputs, actor);
-  if (p->has_pickups) qa_compat_qc_mod_pickups_release(&p->pickups, actor);
-  if (p->has_items) qa_compat_qc_mod_items_release(&p->items, actor);
-  if (p->has_protection) qa_compat_qc_mod_protection_release(&p->protection, actor);
+  BindingStep step = {p, actor};
+  qa_caught_error caught;
+  size_t errors = 0;
+  if (!qa_try(release_pickups_step, &step, &caught)) errors++;
+  if (!qa_try(release_items_step, &step, &caught)) errors++;
+  if (!qa_try(release_protection_step, &step, &caught)) errors++;
+  if (errors != 0) qa_raise("AggregateError", 0, 0, "QC client binding release failed");
 }
 static const char *release_client_projection(P *p, qa_actor_id actor) {
   if (p->depth != 0 || qa_compat_qc_mod_input_get_active(&p->input)) {
@@ -1309,6 +1449,7 @@ static const char *release_client_projection(P *p, qa_actor_id actor) {
   int64_t slot = projection_slot(p, actor);
   if (slot >= 0) {
     projection_delete(p, actor);
+    slot_delete(p, slot);
     /* Foreign edicts keep their last words, as a freed edict does; clients are zeroed because their slots are reserved. */
     if (slot > client_maximum(p)) free_slot_push(p, slot);
     else {
@@ -1318,36 +1459,66 @@ static const char *release_client_projection(P *p, qa_actor_id actor) {
   }
   return "released";
 }
+/* TS for (actor of retiredProjections) { forget; release; delete }: an actor leaves the set only after
+ * its release completes, and actors added meanwhile are visited too. */
 static void drain_retired_projections(P *p) {
   if (p->depth != 0 || qa_compat_qc_mod_input_get_active(&p->input)) return;
   while (p->retired_count > 0) {
     qa_actor_id actor = p->retired[0];
-    memmove(&p->retired[0], &p->retired[1],
-            (p->retired_count - 1) * sizeof *p->retired);
-    p->retired_count--;
     if (p->has_clients) qa_compat_qc_mod_client_bindings_forget(&p->clients,
                                                                  actor);
     release_client_projection(p, actor);
+    for (size_t i = 0; i < p->retired_count; i++)
+      if (actor_eq(p->retired[i], actor)) {
+        memmove(&p->retired[i], &p->retired[i + 1],
+                (p->retired_count - i - 1) * sizeof *p->retired);
+        p->retired_count--;
+        break;
+      }
   }
 }
+static void release_bindings_step(void *ctx) {
+  BindingStep *s = ctx;
+  release_client_bindings(s->p, s->actor);
+}
+/* TS onRelease: try { releaseClientBindings } finally { retire the projection and drain }. */
 static void on_actor_release(void *ctx, qa_owned_actor actor) {
   P *p = ctx;
-  release_client_bindings(p, actor.id);
+  BindingStep step = {p, actor.id};
+  qa_caught_error caught;
+  bool released = qa_try(release_bindings_step, &step, &caught);
   retired_add(p, actor.id);
   drain_retired_projections(p);
+  if (!released) qa_rethrow(&caught);
 }
-static void source_physics_release_all(P *p);
+static size_t source_physics_release_all(P *p);
+static void close_pickups_step(void *ctx) {
+  P *p = ctx;
+  if (p->has_pickups) qa_compat_qc_mod_pickups_close(&p->pickups);
+}
+static void close_items_step(void *ctx) {
+  P *p = ctx;
+  if (p->has_items) qa_compat_qc_mod_items_close(&p->items);
+}
+static void close_protection_step(void *ctx) {
+  P *p = ctx;
+  if (p->has_protection) qa_compat_qc_mod_protection_close(&p->protection);
+}
+/* TS closeClientBindings: the outputs close first, then every binding in its own try. */
 static void close_client_bindings(P *p) {
   if (p->client_outputs) qa_source_mod_client_outputs_close(p->client_outputs);
-  if (p->has_pickups) qa_compat_qc_mod_pickups_close(&p->pickups);
-  if (p->has_items) qa_compat_qc_mod_items_close(&p->items);
-  if (p->has_protection) qa_compat_qc_mod_protection_close(&p->protection);
+  qa_caught_error caught;
+  size_t errors = 0;
+  if (!qa_try(close_pickups_step, p, &caught)) errors++;
+  if (!qa_try(close_items_step, p, &caught)) errors++;
+  if (!qa_try(close_protection_step, p, &caught)) errors++;
+  if (errors != 0) qa_raise("AggregateError", 0, 0, "QC client binding close failed");
 }
 /* Objectives storage (TS ModSourceObjectives options). */
 static void objective_current(void *ctx, bool has_reference,
                               int64_t reference) {
   P *p = ctx;
-  if (p->closed) qa_range_error("QuakeC objective source is closed");
+  if (p->closed) qa_raise("Error", 0, 0, "QuakeC objective source is closed");
   if (has_reference) qa_compat_qc_mod_provider_actor(p, reference);
 }
 static qa_compat_qc_objective_resolved objective_storage(
@@ -1504,11 +1675,21 @@ typedef struct {
   P *p;
   qa_compat_qc_mod_input_cleanup inner;
 } InputCleanupCell;
+static void input_close_step(void *ctx) {
+  qa_compat_qc_mod_input_cleanup *inner = ctx;
+  inner->fn(inner->ctx);
+}
+/* TS () => { try { close() } finally { this.drainRetiredProjections() } }; the cell is released first so
+ * neither raise leaks it. */
 static void input_cleanup(void *ctx) {
   InputCleanupCell *cell = ctx;
-  cell->inner.fn(cell->inner.ctx);
-  drain_retired_projections(cell->p);
+  P *p = cell->p;
+  qa_compat_qc_mod_input_cleanup inner = cell->inner;
   free(cell);
+  qa_caught_error caught;
+  bool closed = qa_try(input_close_step, &inner, &caught);
+  drain_retired_projections(p);
+  if (!closed) qa_rethrow(&caught);
 }
 static void input_open(void *ctx, qa_mod_client_application *application,
                        void (**cleanup)(void *), void **cleanup_ctx) {
@@ -1710,19 +1891,26 @@ static qa_actor_id resolve_saved(P *p, qa_saved_actor_id saved) {
 static qa_actor_id resolve_saved_fn(void *ctx, qa_saved_actor_id saved) {
   return resolve_saved(ctx, saved);
 }
+static void free_save_tree(void *arg) { qa_save_value_free(arg); }
 static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
   P *p = ctx;
   if (!text_eq(saved.state.format, "quakec:mod-host-v3") ||
       saved.random_count != 1)
-    qa_range_error("Invalid gameplay mod host state");
-  if (!saved.random) qa_range_error("Missing gameplay mod random state");
+    qa_raise("Error", 0, 0, "Invalid gameplay mod host state");
+  if (!saved.random) qa_raise("Error", 0, 0, "Missing gameplay mod random state");
   p->random->restore(p->random->source.ctx, saved.random[0]);
   p->projection_count = 0;
+  slots_clear(p);
+  p->free_slot_count = 0; /* TS this.freeSlots = [] before the state is decoded */
   qa_save_value *root = qa_decode_checkpoint_value(saved.state.bytes.bytes,
                                                    saved.state.bytes.length);
   if (!root) qa_range_error("mod host checkpoint allocation failed");
+  /* A saved checkpoint is file input: the decoded tree is released by every refusal below. */
+  qa_cleanup root_scope;
+  qa_cleanup_push(&root_scope, free_save_tree, root);
   qa_save_reader reader;
-  if (!qa_save_reader_init(&reader, root, "mod-host"))
+  /* TS new SaveReader(value): the default path, "save". */
+  if (!qa_save_reader_init(&reader, root, "save"))
     qa_range_error("mod host checkpoint allocation failed");
   qa_save_reader field_reader;
   if (!qa_save_reader_field(&reader, "projections", &field_reader))
@@ -1738,8 +1926,9 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
     qa_actor_id existing;
     if (slot >= p->entities.count || projection_actor_at(p, slot, &existing) ||
         projection_slot(p, actor) >= 0)
-      qa_range_error("Invalid gameplay mod actor projection");
+      qa_raise("Error", 0, 0, "Invalid gameplay mod actor projection");
     projection_set(p, actor, slot);
+    slot_set(p, slot, actor);
     qa_save_reader_destroy(&actor_reader);
     qa_save_reader_destroy(&slot_reader);
     qa_save_reader_destroy(&entry);
@@ -1754,6 +1943,13 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
   p->precached_count = 0;
   if (!qa_save_reader_field(&reader, "precached", &field_reader))
     qa_range_error("mod host checkpoint allocation failed");
+  /* TS list(entry => entry.string()) reads every key before the first is resolved. */
+  for (size_t i = 0; i < qa_save_reader_list_count(&field_reader); i++) {
+    qa_save_reader entry;
+    if (!qa_save_reader_item(&field_reader, i, &entry))
+      qa_range_error("mod host checkpoint allocation failed");
+    (void)qa_save_reader_string(&entry);
+  }
   for (size_t i = 0; i < qa_save_reader_list_count(&field_reader); i++) {
     qa_save_reader entry;
     if (!qa_save_reader_item(&field_reader, i, &entry))
@@ -1769,7 +1965,7 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
     if (!kind || duplicate ||
         !qa_compat_qc_mod_provider_lookup(p, kind, key + strlen(kind) + 1,
                                           &found))
-      qa_range_error("Saved mod resource no longer resolves");
+      qa_raise("Error", 0, 0, "Saved mod resource no longer resolves");
     qa_save_reader_destroy(&entry);
   }
   qa_save_reader_destroy(&field_reader);
@@ -1777,7 +1973,7 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
     qa_range_error("mod host checkpoint allocation failed");
   if (p->has_messages ? qa_save_reader_is_null(&field_reader)
                       : !qa_save_reader_is_null(&field_reader))
-    qa_range_error("Saved mod message services differ");
+    qa_raise("Error", 0, 0, "Saved mod message services differ");
   if (p->has_messages)
     qa_compat_qc_mod_messages_restore(&p->messages, &field_reader,
                                       (qa_compat_qc_actor_resolver){p, resolve_saved_fn});
@@ -1795,7 +1991,7 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
   }
   if ((!p->environment.visibility && !visibility_null) ||
       (p->environment.visibility && visibility_null))
-    qa_range_error("Saved mod client visibility differs");
+    qa_raise("Error", 0, 0, "Saved mod client visibility differs");
   if (p->environment.visibility)
     qa_q1_client_visibility_restore(p->environment.visibility, visibility);
   if (!qa_save_reader_field(&reader, "initialized", &field_reader))
@@ -1809,6 +2005,8 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
     size_t count = qa_save_reader_list_count(&field_reader);
     qa_compat_qc_mod_client_slot *entries =
         count ? xrealloc(NULL, count * sizeof *entries) : NULL;
+    qa_cleanup entries_scope;
+    qa_cleanup_push(&entries_scope, free, entries);
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry, actor_reader, slot_reader, admitted_reader;
       if (!qa_save_reader_item(&field_reader, i, &entry) ||
@@ -1825,6 +2023,7 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
       qa_save_reader_destroy(&entry);
     }
     qa_compat_qc_mod_client_bindings_restore(&p->clients, entries, count);
+    qa_cleanup_pop(&entries_scope);
     free(entries);
     int64_t maximum =
         p->declaration.clients ? (int64_t)p->declaration.clients->maximum : 0;
@@ -1833,21 +2032,22 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
       if (projection_slot(p, p->clients.entries[i].actor) !=
           p->clients.entries[i].slot)
         bad = true;
-    for (size_t i = 0; i < p->projection_count && !bad; i++)
-      if (p->projections[i].slot <= maximum) {
-        bool projected = false;
-        for (size_t j = 0; j < p->clients.entry_count; j++)
-          if (p->clients.entries[j].slot == p->projections[i].slot &&
-              actor_eq(p->clients.entries[j].actor, p->projections[i].actor))
-            projected = true;
-        if (!projected) bad = true;
-      }
+    /* TS [...this.actorsBySlot].some(([slot, actor]) => slot <= maximum && ...) */
+    for (int64_t slot = 0; slot <= maximum && slot < p->entities.capacity && !bad; slot++) {
+      qa_actor_id held;
+      if (!projection_actor_at(p, slot, &held)) continue;
+      bool projected = false;
+      for (size_t j = 0; j < p->clients.entry_count; j++)
+        if (p->clients.entries[j].slot == slot && actor_eq(p->clients.entries[j].actor, held))
+          projected = true;
+      if (!projected) bad = true;
+    }
     if (bad)
-      qa_range_error("Saved QuakeC client projection differs from its "
+      qa_raise("Error", 0, 0, "Saved QuakeC client projection differs from its "
                      "reserved slot");
   } else if (!qa_save_reader_is_undefined(&field_reader) &&
              !qa_save_reader_is_null(&field_reader)) {
-    qa_range_error("Saved QuakeC clients require the declared lifecycle "
+    qa_raise("Error", 0, 0, "Saved QuakeC clients require the declared lifecycle "
                    "service");
   }
   qa_save_reader_destroy(&field_reader);
@@ -1861,6 +2061,7 @@ static void host_restore(void *ctx, qa_compat_qc_host_saved_state saved) {
     }
   if (p->has_clients) qa_compat_qc_mod_client_bindings_start(&p->clients);
   qa_save_reader_destroy(&reader);
+  qa_cleanup_pop(&root_scope);
   qa_save_value_free(root);
 }
 /* Match players (TS matchPlayer closures). */
@@ -1887,7 +2088,7 @@ static qa_compat_qc_words *match_current(MatchCell *cell) {
                                                cell->actor, &owned) ||
       !qa_same_owned_actor(owned, cell->owned) || !source.has_value ||
       source.slot != cell->slot)
-    qa_range_error("QuakeC match actor was retired");
+    qa_raise("Error", 0, 0, "QuakeC match actor was retired");
   return qa_compat_qc_entity_memory_at(&p->entities, cell->slot);
 }
 static const char *match_team(void *ctx) {
@@ -1904,14 +2105,14 @@ static double match_score(void *ctx) {
   MatchCell *cell = ctx;
   const qa_compat_qc_mod_provider_field *score =
       match_bound_field(cell->p, "score");
-  if (!score) qa_range_error("QuakeC match actor has no score field");
+  if (!score) qa_raise("Error", 0, 0, "QuakeC match actor has no score field");
   return qa_compat_qc_words_float(match_current(cell), score->offset);
 }
 static void match_set_team(void *ctx, const char *value) {
   MatchCell *cell = ctx;
   const qa_compat_qc_mod_provider_field *team =
       match_bound_field(cell->p, "team");
-  if (!team) qa_range_error("QuakeC match actor has no team field");
+  if (!team) qa_raise("Error", 0, 0, "QuakeC match actor has no team field");
   qa_compat_qc_words * w = match_current(cell);
   int64_t word = team->offset;
   double value2 = qa_original_team(team->declaration.team_values,
@@ -1924,7 +2125,7 @@ static void match_set_score(void *ctx, double value) {
   const qa_compat_qc_mod_provider_field *score =
       match_bound_field(cell->p, "score");
   if (!score || !isfinite(value))
-    qa_range_error("QuakeC match actor has no finite score field");
+    qa_raise("Error", 0, 0, "QuakeC match actor has no finite score field");
   qa_compat_qc_words_set_float(match_current(cell), score->offset, value);
 }
 static qa_source_match_player_result match_resolve(void *ctx,
@@ -1933,16 +2134,18 @@ static qa_source_match_player_result match_resolve(void *ctx,
   qa_source_match_player_result result;
   memset(&result, 0, sizeof result);
   qa_owned_actor owned;
-  qa_actor_source_result source =
-      qa_session_actor_registry_source_of(p->services->actors, actor);
   bool has_owned = qa_session_actor_registry_resolve_owned(p->services->actors,
                                                            actor, &owned);
+  qa_actor_source_result source =
+      qa_session_actor_registry_source_of(p->services->actors, actor);
   if (p->closed || !has_owned || !text_eq(owned.owner, p->module.id) ||
       !source.has_value || !text_eq(source.provider, p->module.id))
     return result;
+  /* TS returns a new closure set per resolve; C keeps one cell per actor, each its own allocation so a
+   * player resolved earlier keeps a valid ctx while the table grows. */
   MatchCell *cell = NULL;
   for (size_t i = 0; i < p->match_cell_count; i++)
-    if (actor_eq(p->match_cells[i].actor, actor)) cell = &p->match_cells[i];
+    if (actor_eq(p->match_cells[i]->actor, actor)) cell = p->match_cells[i];
   if (!cell) {
     if (p->match_cell_count == p->match_cell_capacity) {
       p->match_cell_capacity =
@@ -1950,9 +2153,11 @@ static qa_source_match_player_result match_resolve(void *ctx,
       p->match_cells = xrealloc(p->match_cells,
                                 p->match_cell_capacity * sizeof *p->match_cells);
     }
-    cell = &p->match_cells[p->match_cell_count++];
+    cell = xrealloc(NULL, sizeof *cell);
+    memset(cell, 0, sizeof *cell);
     cell->p = p;
     cell->actor = actor;
+    p->match_cells[p->match_cell_count++] = cell;
   }
   cell->owned = owned;
   cell->slot = source.slot;
@@ -1971,7 +2176,7 @@ void qa_compat_qc_mod_provider_activate_match(P *p) {
       (!match_bound_field(p, "team") && !match_bound_field(p, "score")))
     return;
   if (!p->services->match)
-    qa_range_error("Declared match fields require destination match "
+    qa_raise("Error", 0, 0, "Declared match fields require destination match "
                    "services");
   p->release_match = p->services->match->bind_source(
       p->services->match->ctx, p->module.id, match_resolve, p);
@@ -1980,7 +2185,7 @@ void qa_compat_qc_mod_provider_activate_match(P *p) {
 /* Lifecycle. */
 void qa_compat_qc_mod_provider_bind_commands(P *p,
                                              qa_mod_command_port *commands) {
-  if (p->commands) qa_range_error("Mod commands are already bound");
+  if (p->commands) qa_raise("Error", 0, 0, "Mod commands are already bound");
   p->commands = commands;
 }
 bool qa_compat_qc_mod_provider_console_command(P *p,
@@ -1992,20 +2197,23 @@ bool qa_compat_qc_mod_provider_console_command(P *p,
   for (size_t i = 0; i < p->declaration.command_count; i++) {
     char *candidate = qa_ascii_fold(p->declaration.commands[i].name);
     if (!candidate) qa_range_error("mod command allocation failed");
-    if (strcmp(candidate, name) == 0) found = &p->declaration.commands[i];
+    if (!found && strcmp(candidate, name) == 0) found = &p->declaration.commands[i]; /* TS find: first */
     free(candidate);
   }
   free(name);
   if (!found) return false;
   qa_mod_source_call call;
-  qa_mod_callback_value *args = NULL;
-  qa_mod_named_value *globals = NULL;
+  ConsoleCall owned = {NULL, NULL, NULL};
   if (!qa_compat_qc_console_call(*found, (const char *const *)inv->argv,
-                                 inv->argc, inv->args_text, &call, &args,
-                                 &globals))
+                                 inv->argc, inv->args_text, &call, &owned.args,
+                                 &owned.globals))
     qa_range_error("mod command allocation failed");
+  /* The lowered call is released when the source call raises. */
+  qa_cleanup scope;
+  qa_cleanup_push(&scope, console_call_free, &owned);
   qa_compat_qc_mod_provider_invoke(p, call, NULL, 0, NULL);
-  qa_compat_qc_console_call_destroy(args, globals);
+  qa_cleanup_pop(&scope);
+  console_call_free(&owned);
   return true;
 }
 qa_cvar_registry *qa_compat_qc_mod_provider_get_cvars(P *p) {
@@ -2013,16 +2221,17 @@ qa_cvar_registry *qa_compat_qc_mod_provider_get_cvars(P *p) {
 }
 void qa_compat_qc_mod_provider_initialize(P *p) {
   if (p->initialized || p->depth != 0)
-    qa_range_error("Mod source initialization must run once at an idle "
+    qa_raise("Error", 0, 0, "Mod source initialization must run once at an idle "
                    "boundary");
   p->loading = true;
   qa_cleanup loading_scope;
   qa_cleanup_push(&loading_scope, end_loading, p);
-  if (p->services->clients && p->has_protection) {
+  if (p->services->clients) {
+    /* TS for (const client of services.clients?.clients() ?? []) this.protection?.reserve(...) */
     size_t client_count = 0;
     const qa_mod_client_identity *current =
         p->services->clients->clients(p->services->clients->ctx, &client_count);
-    for (size_t i = 0; i < client_count; i++)
+    for (size_t i = 0; i < client_count && p->has_protection; i++)
       qa_compat_qc_mod_protection_reserve(&p->protection, current[i].actor);
   }
   qa_compat_qc_mod_input_entry inputs[2];
@@ -2073,7 +2282,7 @@ void qa_compat_qc_mod_provider_advance(P *p, qa_frame_context frame) {
 const qa_guest_checkpoint *qa_compat_qc_mod_provider_checkpoint(P *p) {
   if (p->has_protection) qa_compat_qc_mod_protection_assert_idle(&p->protection);
   if (p->depth != 0 || qa_compat_qc_mod_input_get_active(&p->input))
-    qa_range_error("Mod checkpoint requires an idle callback boundary");
+    qa_raise("Error", 0, 0, "Mod checkpoint requires an idle callback boundary");
   if (p->has_messages) qa_compat_qc_broadcast_messages_flush(&p->messages.messages);
   if (p->has_checkpoint) {
     qa_compat_qc_machine_snapshot_destroy(&p->snapshot);
@@ -2093,12 +2302,31 @@ void qa_compat_qc_mod_provider_restore(P *p, const qa_guest_checkpoint *saved) {
   p->presentation_generation++;
   if (p->has_protection) qa_compat_qc_mod_protection_assert_idle(&p->protection);
   if (p->depth != 0 || qa_compat_qc_mod_input_get_active(&p->input))
-    qa_range_error("Mod restore requires an idle callback boundary");
+    qa_raise("Error", 0, 0, "Mod restore requires an idle callback boundary");
   qa_compat_qc_preflight_checkpoint(&p->machine, p->module, saved);
   close_client_bindings(p);
   if (!qa_compat_qc_restore_checkpoint(&p->machine, p->module, p->host_state,
                                        saved))
     qa_compat_qc_machine_fail(&p->machine, "checkpoint restore failed");
+}
+static void close_bindings_step(void *ctx) { close_client_bindings(ctx); }
+static void close_clients_step(void *ctx) {
+  P *p = ctx;
+  if (p->has_clients) qa_compat_qc_mod_client_bindings_close(&p->clients);
+}
+static void close_actors_step(void *ctx) {
+  P *p = ctx;
+  if (p->has_owned_actors) qa_compat_qc_mod_actors_close(&p->owned_actors);
+}
+static void close_release_step(void *ctx) {
+  P *p = ctx;
+  if (!p->has_release_subscription) return;
+  p->has_release_subscription = false;
+  qa_session_actor_registry_off_release(p->services->actors, p->release_subscription);
+}
+static void close_messages_step(void *ctx) {
+  P *p = ctx;
+  if (p->has_messages) qa_compat_qc_mod_messages_close(&p->messages);
 }
 void qa_compat_qc_mod_provider_close(P *p) {
   if (p->objectives) qa_mod_source_objectives_close(p->objectives);
@@ -2109,17 +2337,20 @@ void qa_compat_qc_mod_provider_close(P *p) {
   }
   if (p->closed) return;
   p->closed = true;
-  close_client_bindings(p);
-  if (p->has_clients) qa_compat_qc_mod_client_bindings_close(&p->clients);
-  if (p->has_owned_actors) qa_compat_qc_mod_actors_close(&p->owned_actors);
-  if (p->has_release_subscription) {
-    qa_session_actor_registry_off_release(p->services->actors,
-                                          p->release_subscription);
-    p->has_release_subscription = false;
-  }
-  if (p->has_messages) qa_compat_qc_mod_messages_close(&p->messages);
-  source_physics_release_all(p);
+  /* TS runs every step in its own try and throws one AggregateError once the
+   * provider is fully closed; the source physics unbinds are the bindings
+   * held when close began (an unbind is idempotent). */
+  qa_caught_error caught;
+  size_t errors = 0;
+  if (!qa_try(close_bindings_step, p, &caught)) errors++;
+  if (!qa_try(close_clients_step, p, &caught)) errors++;
+  if (!qa_try(close_actors_step, p, &caught)) errors++;
+  if (!qa_try(close_release_step, p, &caught)) errors++;
+  if (!qa_try(close_messages_step, p, &caught)) errors++;
+  errors += source_physics_release_all(p);
   p->projection_count = 0;
+  slots_clear(p);
+  if (errors != 0) qa_raise("AggregateError", 0, 0, "QC component close failed");
 }
 /* ---------------- engine views ---------------- */
 static const qa_session_mod_engine_scene *engine_scene(P *p) {
@@ -2175,7 +2406,7 @@ static qa_owned_actor owned_of_slot(P *p, int64_t slot, const char *message) {
       p, qa_compat_qc_entity_memory_reference(&p->entities, slot));
   qa_owned_actor owned;
   if (!qa_session_actor_registry_resolve_owned(p->services->actors, id, &owned))
-    qa_range_error("%s", message);
+    qa_raise("Error", 0, 0, "%s", message); /* TS throw new Error(message) */
   return owned;
 }
 static void host_set(P *p, const char *name, qa_compat_qc_builtin fn) {
@@ -2334,9 +2565,9 @@ static void pusher_invoke(void *ctx, qa_owned_actor actor, const char *callback,
   const qa_compat_qc_words * w;
   int64_t word;
   P *p = ctx;
-  if (!p->has_frame) qa_range_error("Mod pusher callback needs an active source frame");
+  if (!p->has_frame) qa_raise("Error", 0, 0, "Mod pusher callback needs an active source frame");
   if (strcmp(callback, "think") == 0) {
-    if (!p->services->callbacks) qa_range_error("Mod pusher think requires shared callbacks");
+    if (!p->services->callbacks) qa_raise("Error", 0, 0, "Mod pusher think requires shared callbacks");
     qa_actor_callback_table_think(p->services->callbacks, actor, p->frame);
     return;
   }
@@ -2372,8 +2603,8 @@ static void water_transition(P *p, qa_actor_id actor) {
   qa_actor_source_result source = qa_session_actor_registry_source_of(p->services->actors, actor);
   if (!engine || !source.has_value) return;
   qa_compat_qc_words *words = qa_compat_qc_entity_memory_at(&p->entities, source.slot);
-  int64_t watertype = qa_compat_qc_machine_field_offset(&p->machine, "watertype");
-  int64_t waterlevel = qa_compat_qc_machine_field_offset(&p->machine, "waterlevel");
+  /* TS field(name) lookups run where each word is used: origin, the query, watertype, the splash,
+   * then waterlevel. */
   qa_point_contents_query query;
   memset(&query, 0, sizeof query);
   query.point = qa_compat_qc_words_vector(words, qa_compat_qc_machine_field_offset(&p->machine, "origin"));
@@ -2385,7 +2616,8 @@ static void water_transition(P *p, qa_actor_id actor) {
   const qa_session_mod_engine_scene *scene = engine_scene(p);
   qa_point_contents_result contents = scene->queries.point_contents(scene->queries.ctx, query);
   if (!text_eq(contents.kind, "q1"))
-    qa_range_error("QC mod water transition requires source Q1 contents");
+    qa_raise("Error", 0, 0, "QC mod water transition requires source Q1 contents");
+  int64_t watertype = qa_compat_qc_machine_field_offset(&p->machine, "watertype");
   qa_q1_water_transition_result decision =
       qa_q1_water_transition(qa_compat_qc_words_float(words, watertype), contents.contents);
   if (decision.splash && p->media) {
@@ -2410,6 +2642,7 @@ static void water_transition(P *p, qa_actor_id actor) {
     }
   }
   qa_compat_qc_words_set_float(words, watertype, decision.water_type);
+  int64_t waterlevel = qa_compat_qc_machine_field_offset(&p->machine, "waterlevel");
   qa_compat_qc_words_set_float(words, waterlevel, decision.water_level);
 }
 
@@ -2517,9 +2750,24 @@ static void source_physics_unbind(P *p, qa_actor_id actor) {
       return;
     }
 }
-static void source_physics_release_all(P *p) {
-  while (p->source_physics_count > 0)
-    source_physics_unbind(p, p->source_physics[0]->actor.id);
+static void physics_unbind_step(void *ctx) {
+  PhysicsCell *cell = ctx;
+  const qa_session_mod_engine_physics *physics = engine_physics(cell->p);
+  if (physics) physics->unbind_source(physics->ctx, cell->handle);
+}
+/* TS close(): each held unbind is its own close step; returns the failures. */
+static size_t source_physics_release_all(P *p) {
+  size_t errors = 0;
+  while (p->source_physics_count > 0) {
+    PhysicsCell *cell = p->source_physics[0];
+    memmove(&p->source_physics[0], &p->source_physics[1],
+            (p->source_physics_count - 1) * sizeof *p->source_physics);
+    p->source_physics_count--;
+    qa_caught_error caught;
+    if (!qa_try(physics_unbind_step, cell, &caught)) errors++;
+    free(cell);
+  }
+  return errors;
 }
 
 /* ---------------- owned actors ---------------- */
@@ -2556,7 +2804,10 @@ static void actors_admitted(void *ctx, qa_owned_actor actor, int64_t slot) {
   cell->actor = actor;
   qa_app_sim_source_body_physics source = {cell, physics_collision, physics_motion, physics_flags,
                                            physics_write_flags, physics_write_angular, physics_water};
+  qa_cleanup scope; /* a refused bind keeps no cell */
+  qa_cleanup_push(&scope, free, cell);
   cell->handle = physics->bind_source(physics->ctx, actor, source);
+  qa_cleanup_pop(&scope);
   if (p->source_physics_count == p->source_physics_capacity) {
     p->source_physics_capacity = p->source_physics_capacity ? p->source_physics_capacity * 2 : 16;
     p->source_physics = xrealloc(p->source_physics,
@@ -2621,6 +2872,7 @@ static void actors_remember(void *ctx, qa_actor_id actor, int64_t slot) {
   qa_actor_id previous;
   if (projection_actor_at(p, slot, &previous)) projection_delete(p, previous);
   projection_set(p, actor, slot);
+  slot_set(p, slot, actor);
 }
 static void actors_invoke(void *ctx, qa_owned_actor actor, int64_t function_index, qa_frame_context frame) {
   invoke_owned(ctx, function_index, actor.id, NULL, frame.time);
@@ -2646,7 +2898,7 @@ static void execute_physics(P *p, qa_owned_actor actor, double move, qa_frame_co
     return;
   }
   if (move != 0 && move != 5 && move != 6 && move != 8 && move != 9 && move != 10)
-    qa_range_error("Unsupported nonclient QuakeC movetype %s", QA_JS_NUMBER(move));
+    qa_raise("Error", 0, 0, "Unsupported nonclient QuakeC movetype %s", QA_JS_NUMBER(move));
   think(think_ctx);
   if (!qa_session_actor_registry_is_live(p->services->actors, actor.id) || move == 0) return;
   if (move == 8) {
@@ -2655,13 +2907,14 @@ static void execute_physics(P *p, qa_owned_actor actor, double move, qa_frame_co
     if (!body.has_value ||
         !qa_compat_qc_actor_state_motion(&p->actor_state, actor, body.value, &motion))
       return;
+    /* TS moveQ1Noclip: add() stores Math.fround(a + b) per component. */
     qa_body_state next = body.value;
-    next.origin.x += body.value.velocity.x * elapsed;
-    next.origin.y += body.value.velocity.y * elapsed;
-    next.origin.z += body.value.velocity.z * elapsed;
-    next.angles.x += motion.angular_velocity.x * elapsed;
-    next.angles.y += motion.angular_velocity.y * elapsed;
-    next.angles.z += motion.angular_velocity.z * elapsed;
+    next.origin.x = qa_float32(body.value.origin.x + body.value.velocity.x * elapsed);
+    next.origin.y = qa_float32(body.value.origin.y + body.value.velocity.y * elapsed);
+    next.origin.z = qa_float32(body.value.origin.z + body.value.velocity.z * elapsed);
+    next.angles.x = qa_float32(body.value.angles.x + motion.angular_velocity.x * elapsed);
+    next.angles.y = qa_float32(body.value.angles.y + motion.angular_velocity.y * elapsed);
+    next.angles.z = qa_float32(body.value.angles.z + motion.angular_velocity.z * elapsed);
     qa_shared_body_table_write(p->services->bodies, actor, next);
     qa_shared_body_table_link(p->services->bodies, actor, NULL);
     return;
@@ -2685,7 +2938,7 @@ static void actors_step(void *ctx, qa_owned_actor actor, qa_frame_context frame,
       think(think_ctx);
     } else {
       if (!engine_physics(p) || !p->has_pusher)
-        qa_range_error("Moving mod actors require destination source physics");
+        qa_raise("Error", 0, 0, "Moving mod actors require destination source physics");
       execute_physics(p, actor, move, frame, think_ctx, think);
     }
   }
@@ -2725,18 +2978,21 @@ typedef struct {
   qa_owned_actor actor;
   int64_t id;
 } PickupBindCell;
+/* The remove closure owns its cell: one per binding, released when the binding is removed. */
 static void pickup_bind_remove(void *ctx) {
-  PickupBindCell *cell = ctx;
-  qa_shared_inventory_table_unbind_pickup(cell->table, cell->actor, cell->id);
+  PickupBindCell cell = *(PickupBindCell *)ctx;
+  free(ctx);
+  qa_shared_inventory_table_unbind_pickup(cell.table, cell.actor, cell.id);
 }
 static bool pickups_bind(void *ctx, qa_owned_actor actor, const qa_original_pickup_rule *rules,
                          size_t rule_count, void (**remove)(void *), void **remove_ctx) {
   P *p = ctx;
-  PickupBindCell *cell = owned_cell(p, sizeof *cell);
+  int64_t id = qa_shared_inventory_table_bind_pickup(
+      p->services->inventory, actor, (qa_inventory_pickup_binding){p->module.id, rules, rule_count});
+  PickupBindCell *cell = xrealloc(NULL, sizeof *cell);
   cell->table = p->services->inventory;
   cell->actor = actor;
-  cell->id = qa_shared_inventory_table_bind_pickup(
-      p->services->inventory, actor, (qa_inventory_pickup_binding){p->module.id, rules, rule_count});
+  cell->id = id;
   *remove = pickup_bind_remove;
   *remove_ctx = cell;
   return true;
@@ -2828,6 +3084,10 @@ static bool items_client_current(void *ctx, qa_actor_id actor) {
   qa_actor_id back;
   return ops_client_of(ctx, actor, &client) && ops_actor_of_client(ctx, client, &back) &&
          actor_eq(back, actor);
+}
+static bool items_has_client(void *ctx, qa_actor_id actor) {
+  qa_client_id client;
+  return ops_client_of(ctx, actor, &client);
 }
 static bool items_weapon_bind(void *ctx, qa_owned_actor actor, qa_source_weapon_binding binding,
                               void (**remove)(void *), void **remove_ctx) {
@@ -3140,7 +3400,7 @@ static const char *message_resource_name(void *ctx, const char *kind, double ind
     if (strncmp(p->precached[i].key, kind, kind_length) == 0 &&
         p->precached[i].key[kind_length] == ':' && p->precached[i].value.index == index)
       return p->precached[i].key + kind_length + 1;
-  qa_range_error("Unknown mod %s index %s", kind, QA_JS_NUMBER(index));
+  qa_raise("Error", 0, 0, "Unknown mod %s index %s", kind, QA_JS_NUMBER(index));
 }
 static bool message_body_origin(void *ctx, qa_actor_id actor, qa_vec3 *out) {
   qa_body_state_result body = qa_shared_body_table_read(((P *)ctx)->services->bodies, actor);
@@ -3152,7 +3412,7 @@ static void read_camera(P *p, qa_actor_id actor, qa_vec3 *origin, qa_vec3 *angle
   const qa_session_mod_engine_services *engine = p->services->engine;
   const qa_session_mod_engine_camera *camera =
       engine ? engine->presentation_camera : NULL;
-  if (!camera) qa_range_error("Source mod messages require destination presentation services");
+  if (!camera) qa_raise("Error", 0, 0, "Source mod messages require destination presentation services");
   camera->read(camera->ctx, actor, origin, angles);
 }
 static bool message_camera_angles(void *ctx, qa_actor_id actor, qa_vec3 *out) {
@@ -3195,7 +3455,7 @@ static void host_message(void *ctx, qa_network_event event, const qa_actor_id *t
   P *p = ctx;
   const qa_session_mod_engine_services *engine = p->services->engine;
   if (!engine || !engine->message)
-    qa_range_error("Source mod message requires a destination message sink");
+    qa_raise("Error", 0, 0, "Source mod message requires a destination message sink");
   engine->message(engine->ctx, event, target);
 }
 static bool host_muzzle(void *ctx, qa_actor_id actor, qa_vec3 *out_origin, qa_vec3 *out_angles) {
@@ -3325,7 +3585,7 @@ static void host_present_local(void *ctx, qa_netquake_message message, const qa_
   const qa_actor_id *players = message_players(p, &count);
   const qa_session_mod_engine_services *engine = p->services->engine;
   if (!engine || !engine->presentation_map)
-    qa_range_error("Source mod messages require destination presentation services");
+    qa_raise("Error", 0, 0, "Source mod messages require destination presentation services");
   p->message_host.has_fixed = fixed_actor != NULL;
   if (fixed_actor) p->message_host.fixed = *fixed_actor;
   qa_app_sim_quakec_local_message_host host;
@@ -3353,6 +3613,11 @@ static void host_present_local(void *ctx, qa_netquake_message message, const qa_
   qa_app_sim_present_quakec_local_message(message, target, p->local_messages, host);
   p->message_host.has_fixed = false;
 }
+static void message_require_presentation(void *ctx) {
+  const qa_session_mod_engine_services *engine = ((P *)ctx)->services->engine;
+  if (!engine || !engine->presentation_map)
+    qa_raise("Error", 0, 0, "Source mod messages require destination presentation services");
+}
 static qa_compat_qc_local_message_host message_host_of(void *ctx, const qa_actor_id *target, double seconds,
                                                        const qa_actor_id *recipients, size_t recipient_count,
                                                        qa_actor_id source_actor) {
@@ -3360,7 +3625,7 @@ static qa_compat_qc_local_message_host message_host_of(void *ctx, const qa_actor
   P *p = ctx;
   const qa_session_mod_engine_services *engine = p->services->engine;
   if (!engine || !engine->presentation_map)
-    qa_range_error("Source mod messages require destination presentation services");
+    qa_raise("Error", 0, 0, "Source mod messages require destination presentation services");
   p->message_host.has_target = target != NULL;
   if (target) p->message_host.target = *target;
   qa_compat_qc_local_message_host host;
@@ -3380,7 +3645,7 @@ static qa_compat_qc_local_message_host message_host_of(void *ctx, const qa_actor
 static qa_compat_qc_precached_resource presentation_precache(void *ctx, const char *kind, const char *name) {
   qa_compat_qc_precached_resource resource;
   if (!qa_compat_qc_mod_provider_lookup(ctx, kind, name, &resource))
-    qa_range_error("Mod resource was not prepared: %s/%s", kind, name);
+    qa_raise("Error", 0, 0, "Mod resource was not prepared: %s/%s", kind, name);
   return resource;
 }
 static bool presentation_lookup(void *ctx, const char *kind, const char *name, qa_compat_qc_precached_resource *out) {
@@ -3443,12 +3708,15 @@ static void builtin_infokey(void *ctx, qa_compat_qc_machine *vm) {
       value = owned;
     }
   }
-  char name[256];
-  snprintf(name, sizeof name, "mod-infokey:%d:%s", reference, key);
+  /* The engine-string key carries the whole info key (TS template string). */
+  EngineText text = {owned, format_text("mod-infokey:%d:%s", reference, key)};
   int64_t capacity = (int64_t)strlen(value) + 1;
   if (capacity < 1024) capacity = 1024;
-  qa_compat_qc_machine_return_int(vm, (double)qa_compat_qc_strings_set_engine(&vm->strings, name, value, capacity));
-  free(owned);
+  qa_cleanup scope;
+  qa_cleanup_push(&scope, engine_text_free, &text);
+  qa_compat_qc_machine_return_int(vm, (double)qa_compat_qc_strings_set_engine(&vm->strings, text.name, value, capacity));
+  qa_cleanup_pop(&scope);
+  engine_text_free(&text);
 }
 typedef struct { P *p; const char *name; } ClientMessageWrap;
 static void builtin_client_message(void *ctx, qa_compat_qc_machine *vm) {
@@ -3479,7 +3747,10 @@ static void builtin_client_message(void *ctx, qa_compat_qc_machine *vm) {
   } else {
     event.kind = strcmp(wrap->name, "centerprint") == 0 ? QA_NETWORK_EVENT_CENTER_PRINT : QA_NETWORK_EVENT_COMMAND_TEXT;
   }
+  qa_cleanup scope;
+  qa_cleanup_push(&scope, free, text);
   engine->message(engine->ctx, event, &actor);
+  qa_cleanup_pop(&scope);
   free(text);
 }
 
@@ -3504,13 +3775,13 @@ static qa_vec3 view_offset(void *ctx, qa_actor_id actor) {
 static bool client_frame(void *ctx, qa_actor_id actor, qa_mod_client_presentation_frame *out) {
   P *p = ctx;
   if (p->closed || p->depth != 0)
-    qa_range_error("QC client presentation requires an idle live source");
+    qa_raise("Error", 0, 0, "QC client presentation requires an idle live source");
   const qa_qc_mod_client_presentation *declaration = p->declaration.client_presentation;
   int64_t slot = projection_slot(p, actor);
   if (!declaration || slot < 0 || !qa_session_actor_registry_is_live(p->services->actors, actor) ||
       !p->has_clients || !qa_compat_qc_mod_client_bindings_admitted(&p->clients, actor))
     return false;
-  if (!p->has_messages) qa_range_error("QC client presentation has no source messages");
+  if (!p->has_messages) qa_raise("Error", 0, 0, "QC client presentation has no source messages");
   qa_compat_qc_words *words = qa_compat_qc_entity_memory_at(&p->entities, slot);
   memset(out, 0, sizeof *out);
   out->kind = QA_MOD_CLIENT_PRESENTATION_QUAKEC;
@@ -3527,7 +3798,7 @@ static bool client_frame(void *ctx, qa_actor_id actor, qa_mod_client_presentatio
   return true;
 }
 static void client_assert_current(void *ctx) {
-  if (((P *)ctx)->closed) qa_range_error("QC client presentation is retired");
+  if (((P *)ctx)->closed) qa_raise("Error", 0, 0, "QC client presentation is retired");
 }
 qa_mod_client_presentation_source qa_compat_qc_mod_provider_client_presentation(P *p) {
   p->client_source.ctx = p;
@@ -3558,7 +3829,7 @@ const qa_app_simulation_presentation *qa_compat_qc_mod_provider_presentations(P 
         qa_compat_qc_words_int(words, qa_compat_qc_machine_field_offset(&p->machine, "model")));
     if (path[0] == '\0') continue;
     const qa_compat_qc_mod_media_resource *asset = media_find(p, path);
-    if (!asset || !p->media) qa_range_error("Mod model was not prepared: %s", path);
+    if (!asset || !p->media) qa_raise("Error", 0, 0, "Mod model was not prepared: %s", path);
     engine_register_resource(p, p->media->content, asset->resource.requested_path, asset->resource);
     double frame = optional_scalar(p, words, "frame");
     double alpha = optional_scalar(p, words, "alpha");
@@ -3625,7 +3896,7 @@ bool qa_compat_qc_mod_provider_init(
     for (size_t i = 0; i < p->field_count; i++) {
       const qa_compat_qc_definition *field =
           qa_compat_qc_program_field_named(program, declaration.actor_fields[i].field);
-      if (!field) qa_range_error("Missing validated actor field %s", declaration.actor_fields[i].field);
+      if (!field) qa_raise("Error", 0, 0, "Missing validated actor field %s", declaration.actor_fields[i].field);
       p->fields[i].declaration = declaration.actor_fields[i];
       p->fields[i].offset = field->offset;
       p->fields[i].words = text_eq(field->type, "vector") ? 3 : 1;
@@ -3644,12 +3915,13 @@ bool qa_compat_qc_mod_provider_init(
       }
   }
   if (declaration.clients && !services->clients)
-    qa_range_error("QuakeC component clients require destination client services");
+    qa_raise("Error", 0, 0, "QuakeC component clients require destination client services");
   qa_compat_qc_entity_layout layout = qa_compat_qc_classic_entity_layout(program);
   int64_t maximum = declaration.clients ? (int64_t)declaration.clients->maximum : 0;
   if (!qa_compat_qc_entity_memory_init(&p->entities, layout, 8192, maximum + 1)) return false;
   p->body_states = calloc((size_t)p->entities.capacity, sizeof *p->body_states);
-  if (!p->body_states || !build_qprogram(p)) return false;
+  p->actors_by_slot = calloc((size_t)p->entities.capacity, sizeof *p->actors_by_slot);
+  if (!p->body_states || !p->actors_by_slot || !build_qprogram(p)) return false;
   const qa_session_mod_engine_services *engine = services->engine;
   if (!env_clients && engine && engine->has_clients && engine->clients_visibility) {
     p->engine_clients.ctx = p;
@@ -3702,6 +3974,7 @@ bool qa_compat_qc_mod_provider_init(
     ops.body_origin = message_body_origin;
     ops.camera_angles = message_camera_angles;
     ops.host_ctx = p;
+    ops.require_presentation = message_require_presentation;
     ops.host = message_host_of;
     ops.emit = message_emit;
     ops.clients_for_actor = message_clients_for_actor;
@@ -3751,7 +4024,7 @@ bool qa_compat_qc_mod_provider_init(
   for (size_t i = 0; i < extra_host_count; i++) host_set(p, extra_host[i].name, extra_host[i].fn);
   p->presentation_world.host_count = p->host_count;
   if (declaration.items && !media)
-    qa_range_error("QC source items require their prepared content owner");
+    qa_raise("Error", 0, 0, "QC source items require their prepared content owner");
   if (declaration.items) {
     qa_compat_qc_mod_items_operations ops;
     memset(&ops, 0, sizeof ops);
@@ -3762,6 +4035,8 @@ bool qa_compat_qc_mod_provider_init(
     ops.invoke = combat_invoke;
     ops.bind_items = items_bind;
     ops.client_is_current = items_client_current;
+    /* TS weapon stage: services.clients?.forActor(actor) == null || selected. */
+    ops.has_client = items_has_client;
     ops.weapon_bind = services->weapons ? items_weapon_bind : NULL;
     ops.weapon_selected = items_weapon_selected;
     ops.inventory_count = items_count;
@@ -3982,9 +4257,11 @@ void qa_compat_qc_mod_provider_destroy(P *p) {
   free(p->fields);
   free(p->input_fields);
   free(p->projections);
+  free(p->actors_by_slot);
   free(p->free_slots);
   free(p->retired);
   free(p->pickup_scopes);
+  for (size_t i = 0; i < p->match_cell_count; i++) free(p->match_cells[i]);
   free(p->match_cells);
   for (size_t i = 0; i < p->precached_count; i++) free(p->precached[i].key);
   free(p->precached);

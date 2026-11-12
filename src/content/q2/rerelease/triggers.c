@@ -36,13 +36,24 @@ static void toggle_use(void *c, qa_q2_entity *e, qa_q2_game_services *g, const q
   g->solid(g->ctx, e, (e->solid && strcmp(e->solid, "none") == 0) ? "trigger" : "none");
   g->link(g->ctx, e);
 }
+/* TS killboxUse `finally`: the box goes back to non-solid and the deadly flag clears
+ * also when the kill box throws. */
+typedef struct killbox_scope { qa_q2_rerelease_triggers *t; qa_q2_entity *e; qa_q2_game_services *g; } killbox_scope;
+static void killbox_finally(void *arg) {
+  killbox_scope *scope = arg;
+  scope->g->solid(scope->g->ctx, scope->e, "none"); scope->g->link(scope->g->ctx, scope->e);
+  scope->t->players->deadly_kill_box = false;
+}
 static void killbox_use(void *c, qa_q2_entity *e, qa_q2_game_services *g, const qa_actor_id *o, const qa_actor_id *a) {
   (void)o; (void)a; qa_q2_rerelease_triggers *t = c;
   t->players->deadly_kill_box = rr_band(e->spawnflags, 2) != 0;
   g->solid(g->ctx, e, "trigger"); g->link(g->ctx, e);
+  killbox_scope scope = {t, e, g};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, killbox_finally, &scope);
   qa_q2_kill_rerelease_box(e, g, t->players, false, rr_band(e->spawnflags, 4) != 0);
-  g->solid(g->ctx, e, "none"); g->link(g->ctx, e);
-  t->players->deadly_kill_box = false;
+  qa_cleanup_pop(&guard);
+  killbox_finally(&scope);
 }
 static void hurt_use(void *c, qa_q2_entity *e, qa_q2_game_services *g, const qa_actor_id *o, const qa_actor_id *a) {
   toggle_use(c, e, g, o, a);
@@ -182,14 +193,14 @@ bool qa_q2_rerelease_triggers_spawn(qa_q2_rerelease_triggers *t, qa_q2_entity *e
     g->solid(g->ctx, e, "none"); e->use = t->killbox_use; return true;
   }
   if (strcmp(cn, "trigger_push") == 0) {
-    trig_init(e, g); if (e->speed == 0) e->speed = 1000; e->touch = t->push_touch;
-    if (rr_band(e->spawnflags, 2) != 0) { if (e->wait == 0) e->wait = 10; e->delay = rr_now(g) + 0.1 + e->wait; g->schedule(g->ctx, e, 0.1, t->push_active); }
+    trig_init(e, g); e->speed = rr_or(e->speed, 1000); e->touch = t->push_touch;
+    if (rr_band(e->spawnflags, 2) != 0) { e->wait = rr_or(e->wait, 10); e->delay = rr_now(g) + 0.1 + e->wait; g->schedule(g->ctx, e, 0.1, t->push_active); }
     if (e->targetname && e->targetname[0]) { e->use = t->toggle_use; if (rr_band(e->spawnflags, 8) != 0) g->solid(g->ctx, e, "none"); }
     else if (rr_band(e->spawnflags, 8) != 0) { e->server_flags = 0; e->touch = (qa_q2_touch){0}; e->visible = true; g->solid(g->ctx, e, "brush"); g->motion(g->ctx, e, "push"); }
     g->link(g->ctx, e); return true;
   }
   if (strcmp(cn, "trigger_hurt") == 0) {
-    trig_init(e, g); if (e->damage == 0) e->damage = 5; e->touch = t->hurt_touch; e->noise = "world/electro.wav";
+    trig_init(e, g); e->damage = rr_or(e->damage, 5); e->touch = t->hurt_touch; e->noise = "world/electro.wav";
     if (rr_band(e->spawnflags, 1) != 0) g->solid(g->ctx, e, "none");
     if (rr_band(e->spawnflags, 2) != 0) e->use = t->hurt_use;
     g->link(g->ctx, e); return true;
@@ -207,9 +218,8 @@ bool qa_q2_rerelease_triggers_spawn(qa_q2_rerelease_triggers *t, qa_q2_entity *e
       qa_q2_body_changes ch; memset(&ch, 0, sizeof ch); ch.has_angles = true; ch.angles = angles; ch.angles.y = 360;
       g->move(g->ctx, e, ch, false);
     }
-    trig_init(e, g); if (e->speed == 0) e->speed = 200;
-    double h = qa_q2_number_field(&e->spawn, "height", 0);
-    e->movedir.z = h != 0 ? h : 200;
+    trig_init(e, g); e->speed = rr_or(e->speed, 200);
+    e->movedir.z = rr_or(qa_q2_number_field(&e->spawn, "height", 0), 200);
     e->touch = t->monster_jump_touch;
     if (rr_band(e->spawnflags, 3) != 0) e->use = t->toggle_use;
     if (rr_band(e->spawnflags, 2) != 0) g->solid(g->ctx, e, "none");
@@ -219,15 +229,14 @@ bool qa_q2_rerelease_triggers_spawn(qa_q2_rerelease_triggers *t, qa_q2_entity *e
     e->gravity = qa_q2_number_field(&e->spawn, "gravity", 0); e->use = t->world_gravity_use; return true;
   }
   if (strcmp(cn, "target_soundfx") == 0) {
-    if (e->volume == 0) e->volume = 1;
-    e->attenuation = e->attenuation == -1 ? 0 : (e->attenuation != 0 ? e->attenuation : 1);
+    e->volume = rr_or(e->volume, 1);
+    e->attenuation = e->attenuation == -1 ? 0 : rr_or(e->attenuation, 1);
     double key = qa_q2_number_field(&e->spawn, "noise", 0);
     const char *sound = key == 1 ? "world/x_alarm.wav" : key == 2 ? "world/flyby1.wav" : key == 4 ? "world/amb12.wav"
                       : key == 5 ? "world/amb17.wav" : key == 7 ? "world/bigpump2.wav" : NULL;
     if (!sound) {
-      char b[512]; const char *nv = qa_q2_spawn_get(&e->spawn, "noise");
-      snprintf(b, sizeof b, "target_soundfx: unknown noise %s", nv ? nv : "0");
-      rr_diag(g, b); return true;
+      const char *nv = qa_q2_spawn_get(&e->spawn, "noise");
+      rr_diagf(g, "target_soundfx: unknown noise %s", nv ? nv : "0"); return true;
     }
     e->noise = sound; e->use = t->sound_fx_use; return true;
   }

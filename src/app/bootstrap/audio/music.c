@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/app/bootstrap/audio/playlist.h"
+#include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 static bool is(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 static void *xmalloc(size_t n) { void *p = malloc(n == 0 ? 1 : n); if (p == NULL) qa_range_error("Out of memory"); return p; }
@@ -93,12 +95,23 @@ struct qa_app_application_music {
   double gain;
 };
 static double default_random(void *ctx) { (void)ctx; return (double)rand() / ((double)RAND_MAX + 1.0); }
+/* The printed template string, whole (TS strings have no cap). */
+static void print_f(qa_app_application_music *m, qa_app_music_print_fn print, void *pctx, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
 static void print_f(qa_app_application_music *m, qa_app_music_print_fn print, void *pctx, const char *fmt, ...) {
-  char buf[1024];
   va_list ap; va_start(ap, fmt);
-  vsnprintf(buf, sizeof buf, fmt, ap);
+  va_list again; va_copy(again, ap);
+  int length = vsnprintf(NULL, 0, fmt, ap);
   va_end(ap);
+  if (length < 0) { va_end(again); qa_range_error("Out of memory"); }
+  char *buf = xmalloc((size_t)length + 1);
+  vsnprintf(buf, (size_t)length + 1, fmt, again);
+  va_end(again);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, buf);
   (print != NULL ? print : m->print)(print != NULL ? pctx : m->print_ctx, buf);
+  qa_cleanup_pop(&guard);
+  free(buf);
 }
 /* JS String(number) for the gain/track values printed here. */
 static void number_text(double value, char *buf, size_t size) {
@@ -234,10 +247,16 @@ static bool ends_with_ci(const char *v, const char *suffix) {
     if (tolower((unsigned char)v[a - b + i]) != tolower((unsigned char)suffix[i])) return false;
   return true;
 }
+/* String.prototype.trim: JS white space (Unicode spaces and line terminators included). */
 static char *trimmed(const char *v) {
-  while (isspace((unsigned char)*v)) v++;
-  size_t len = strlen(v);
-  while (len > 0 && isspace((unsigned char)v[len - 1])) len--;
+  for (size_t space; (space = qa_js_white_space_length(v)) > 0;) v += space;
+  size_t len = 0;
+  for (size_t at = 0; v[at] != '\0';) {
+    size_t space = qa_js_white_space_length(v + at);
+    if (space > 0) { at += space; continue; }
+    at++;
+    len = at;
+  }
   char *out = xmalloc(len + 1);
   memcpy(out, v, len); out[len] = '\0';
   return out;
@@ -257,44 +276,54 @@ static qa_pcm_stream *open_named(qa_app_application_music *m, current_track *c, 
     free(normalized);
   }
   bool family_q3 = c->source.family == QA_GAME_FAMILY_Q3;
-  char cand0[1024], cand1[1024];
+  size_t path_length = strlen(path);
+  char *cand0 = xmalloc(path_length + 5), *cand1 = xmalloc(path_length + 5);
   const char *candidates[2];
   size_t candidate_count;
   if (ends_with_ci(path, ".wav") || ends_with_ci(path, ".ogg")) {
-    snprintf(cand0, sizeof cand0, "%s", path);
+    snprintf(cand0, path_length + 5, "%s", path);
     candidates[0] = cand0; candidate_count = 1;
   } else if (family_q3) {
-    snprintf(cand0, sizeof cand0, "%s.wav", path);
-    snprintf(cand1, sizeof cand1, "%s.ogg", path);
+    snprintf(cand0, path_length + 5, "%s.wav", path);
+    snprintf(cand1, path_length + 5, "%s.ogg", path);
     candidates[0] = cand0; candidates[1] = cand1; candidate_count = 2;
   } else {
-    snprintf(cand0, sizeof cand0, "%s.ogg", path);
-    snprintf(cand1, sizeof cand1, "%s.wav", path);
+    snprintf(cand0, path_length + 5, "%s.ogg", path);
+    snprintf(cand1, path_length + 5, "%s.wav", path);
     candidates[0] = cand0; candidates[1] = cand1; candidate_count = 2;
   }
+  free(path);
+  qa_cleanup guard0, guard1; /* an opener can raise */
+  qa_cleanup_push(&guard0, free, cand0);
+  qa_cleanup_push(&guard1, free, cand1);
   qa_pcm_stream *stream = NULL;
-  for (int which = 0; which < 2 && stream == NULL; which++) {
+  bool stopped = false;
+  for (int which = 0; which < 2 && stream == NULL && !stopped; which++) {
     if (which == 1 && (family_q3 || c->fallback.open == NULL)) continue;
     for (size_t i = 0; i < candidate_count; i++) {
       stream = which == 0 ? opener_open(candidates[i], c)
                           : c->fallback.open(c->fallback.ctx, candidates[i]);
       if (stream != NULL) break;
-      if (request != m->request || !m->controls->enabled || !active(active_ctx)) { free(path); return NULL; }
+      if (request != m->request || !m->controls->enabled || !active(active_ctx)) { stopped = true; break; }
     }
   }
-  free(path);
+  qa_cleanup_pop(&guard1);
+  qa_cleanup_pop(&guard0);
+  free(cand0); free(cand1);
   return stream;
 }
-/* Split selected on the TS /"[^"]*"|\S+/g tokens, quotes stripped. */
+/* Split selected on the TS /"[^"]*"|\S+/g tokens, quotes stripped. \s is JS white space; a quote with no closing
+ * quote is no "[^"]*" match, so \S+ takes it from the quote. */
 static size_t split_cue(const char *selected, char *tokens[2]) {
   size_t n = 0;
   const char *p = selected;
   while (*p != '\0' && n < 2) {
-    while (isspace((unsigned char)*p)) p++;
+    for (size_t space; (space = qa_js_white_space_length(p)) > 0;) p += space;
     if (*p == '\0') break;
     const char *start = p;
-    if (*p == '"') { p++; while (*p != '\0' && *p != '"') p++; if (*p == '"') p++; }
-    else while (*p != '\0' && !isspace((unsigned char)*p)) p++;
+    const char *close = *p == '"' ? strchr(p + 1, '"') : NULL;
+    if (close != NULL) p = close + 1;
+    else while (*p != '\0' && qa_js_white_space_length(p) == 0) p++;
     size_t len = (size_t)(p - start);
     char *token = xmalloc(len + 1);
     memcpy(token, start, len); token[len] = '\0';
@@ -316,7 +345,8 @@ static void start_track(qa_app_application_music *m, const char *selected, bool 
   bool has_mapped = numeric;
   int64_t mapped = 0;
   if (numeric) {
-    double value = strtod(bare, NULL);
+    /* Number(bare); a value past the CD range only reaches cd.play's RangeError, so a cap keeps the cast defined. */
+    double value = qa_js_min(strtod(bare, NULL), 1e15);
     mapped = c->source.family == QA_GAME_FAMILY_Q2
       ? qa_remap_q2_music_track((int64_t)value,
           is(c->source.edition, "rerelease")
@@ -331,8 +361,8 @@ static void start_track(qa_app_application_music *m, const char *selected, bool 
     qa_cd_music_remapped_tracks(&c->cd, remapped);
     int64_t expect = mapped >= 1 && mapped <= 99 ? remapped[mapped - 1] : mapped;
     int64_t playing = 0;
+    /* cd.playingTrack === (remappedTracks[mapped - 1] ?? mapped): a null playing track restarts */
     if (qa_cd_music_playing_track(&c->cd, &playing) && playing == expect) return;
-    if (!qa_cd_music_playing_track(&c->cd, &playing)) return;
   }
   clear_playback(m);
   int64_t request = m->request;
@@ -440,9 +470,10 @@ void qa_app_application_music_music_command(qa_app_application_music *music,
     free(first);
   }
 }
+/* String.prototype.toLowerCase (Unicode). */
 static char *lowered(const char *v) {
-  char *out = xstrdup(v);
-  for (char *p = out; *p != '\0'; p++) *p = (char)tolower((unsigned char)*p);
+  char *out = qa_js_to_lower_case(v);
+  if (out == NULL) qa_range_error("Out of memory");
   return out;
 }
 void qa_app_application_music_cd_command(qa_app_application_music *music,
@@ -459,13 +490,14 @@ void qa_app_application_music_cd_command(qa_app_application_music *music,
     else if (c != NULL && qa_music_player_playing(&c->player)) {
       int64_t mapped = 0;
       bool has_mapped = qa_cd_music_playing_track(&c->cd, &mapped);
-      char mapped_text[32], track_text[1100];
+      char mapped_text[32];
       snprintf(mapped_text, sizeof mapped_text, "%lld", (long long)mapped);
       if (has_mapped && !is(mapped_text, c->track))
-        snprintf(track_text, sizeof track_text, "%s (mapped to %lld)", c->track, (long long)mapped);
-      else snprintf(track_text, sizeof track_text, "%s", c->track);
-      print_f(music, print, print_ctx, "%s %s track %s\n",
-              c->player.paused ? "Paused" : "Currently", c->looping ? "looping" : "playing", track_text);
+        print_f(music, print, print_ctx, "%s %s track %s (mapped to %lld)\n", c->player.paused ? "Paused" : "Currently",
+                c->looping ? "looping" : "playing", c->track, (long long)mapped);
+      else
+        print_f(music, print, print_ctx, "%s %s track %s\n", c->player.paused ? "Paused" : "Currently",
+                c->looping ? "looping" : "playing", c->track);
     } else print_f(music, print, print_ctx, "Not playing.\n");
     char gain[32]; number_text(music->gain, gain, sizeof gain);
     print_f(music, print, print_ctx, "Volume is %s\n", gain);

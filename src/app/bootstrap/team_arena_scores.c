@@ -26,11 +26,26 @@ qa_app_team_arena_postgame qa_app_parse_team_arena_postgame(const char *const *a
   r.end_time = arg_at(args, count, 12); r.captures = arg_at(args, count, 13);
   return r;
 }
+/* Math.imul: the low 32 bits of the product, wrapping (C signed overflow is undefined). */
+static int32_t imul(int32_t a, int32_t b) { return (int32_t)((uint32_t)a * (uint32_t)b); }
+/* Bytes of the first `units` UTF-16 units of UTF-8 text (a surrogate pair cut in half is dropped whole). */
+static size_t utf16_prefix(const char *text, size_t units) {
+  const unsigned char *p = (const unsigned char *)text;
+  size_t used = 0, at = 0;
+  while (p[at] != '\0') {
+    size_t width = p[at] >= 0xf0 ? 4 : p[at] >= 0xe0 ? 3 : p[at] >= 0xc0 ? 2 : 1;
+    size_t cost = width == 4 ? 2 : 1;
+    if (used + cost > units) break;
+    for (size_t i = 1; i < width; i++) if (p[at + i] == '\0') { width = i; break; }
+    used += cost; at += width;
+  }
+  return at;
+}
 qa_app_team_arena_score_result qa_app_calculate_team_arena_score(qa_app_team_arena_score_input input, qa_app_team_arena_score previous) {
   /* Math.fround staging: fround(fround(fround(end)-fround(start))/1000) */
   float diff = (float)((float)input.stats.end_time - (float)input.match_start_time);
   double time = qa_qvm_float_to_int((float)(diff / 1000.0f));
-  double time_bonus = time < input.time_to_beat ? (double)(qa_js_to_int32(input.time_to_beat - time) * 10) : 0;
+  double time_bonus = time < input.time_to_beat ? (double)imul(qa_js_to_int32(input.time_to_beat - time), 10) : 0;
   bool won = input.stats.red_score > input.stats.blue_score;
   double shutout = won && input.stats.blue_score <= 0 ? 100 : 0;
   double sb = qa_qvm_float_to_int(input.skill);
@@ -43,15 +58,16 @@ qa_app_team_arena_score_result qa_app_calculate_team_arena_score(qa_app_team_are
   s.red_score = input.stats.red_score; s.blue_score = input.stats.blue_score;
   s.captures = input.stats.captures;
   s.time = time; s.time_bonus = time_bonus; s.shutout_bonus = shutout; s.skill_bonus = skill_bonus;
-  s.score = (double)(qa_js_to_int32(s.base_score + shutout + time_bonus) * qa_js_to_int32(skill_bonus));
+  s.score = (double)imul(qa_js_to_int32(s.base_score + shutout + time_bonus), qa_js_to_int32(skill_bonus));
   qa_app_team_arena_score_result r = {s, previous, won && s.score > previous.score, time < previous.time, won};
   return r;
 }
 char *qa_app_team_arena_score_path(const char *map, double game_type) {
+  /* `games/${map.slice(0, 63)}_${gameType | 0}.game`.slice(0, 63), both slices in UTF-16 units. */
   char buf[512];
-  char m[64]; size_t n = strlen(map); if (n > 63) n = 63; memcpy(m, map, n); m[n] = '\0';
+  char m[256]; size_t n = utf16_prefix(map, 63); memcpy(m, map, n); m[n] = '\0';
   snprintf(buf, sizeof buf, "games/%s_%d.game", m, (int)qa_int32(game_type));
-  if (strlen(buf) > 63) buf[63] = '\0';
+  buf[utf16_prefix(buf, 63)] = '\0';
   char *r = qa_input_dup(buf);
   if (!r) qa_range_error("Out of memory");
   return r;
@@ -84,10 +100,13 @@ qa_app_team_arena_score qa_app_decode_team_arena_score(const uint8_t *bytes, siz
 }
 qa_app_team_arena_score_result qa_app_record_team_arena_score(qa_app_team_arena_score_input input, const char *map, double game_type, qa_app_team_arena_score_files files) {
   char *path = qa_app_team_arena_score_path(map, game_type);
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, path);
   size_t len = 0; uint8_t *bytes = files.read_file(files.ctx, path, &len);
   qa_app_team_arena_score_result r = qa_app_calculate_team_arena_score(input, qa_app_decode_team_arena_score(bytes, len));
   free(bytes);
   if (r.new_high_score) { uint8_t enc[68]; qa_app_encode_team_arena_score(r.score, enc); files.write_file(files.ctx, path, enc, 68); }
+  qa_cleanup_pop(&node);
   free(path);
   return r;
 }

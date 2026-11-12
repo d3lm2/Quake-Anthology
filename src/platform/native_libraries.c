@@ -13,6 +13,7 @@
 #include <mach-o/dyld.h>
 #endif
 
+#include "qa/foundation/node_path.h"
 #include "qa/foundation/support.h"
 
 static const char *const kind_names[] = {"sdl2", "sdl3", "gl", "vorbisfile", "theoradec", "freetype"};
@@ -52,7 +53,7 @@ const char *qa_default_open_gl_driver(const char *platform) {
     return "/System/Library/Frameworks/OpenGL.framework/Libraries/libGL.dylib";
   }
   if (strcmp(name, "win32") == 0) return "opengl32.dll";
-  qa_range_error("OpenGL is unsupported on %s", name);
+  qa_raise("Error", 0, 0, "OpenGL is unsupported on %s", name);
 }
 
 static char *xstrdup(const char *text) {
@@ -64,6 +65,7 @@ static char *xstrdup(const char *text) {
 
 /* Node path dirname for the separator of the target platform. */
 static char *path_dirname(const char *path, bool windows) {
+  if (!windows) return qa_node_path_dirname(path);
   size_t length = strlen(path);
   while (length > 1 && (path[length - 1] == '/' || (windows && path[length - 1] == '\\'))) {
     length--;
@@ -81,8 +83,10 @@ static char *path_dirname(const char *path, bool windows) {
   return out;
 }
 
-/* Node path join: a plain concatenation (no absolute reset). */
+/* Node path join. POSIX paths use node:path's posix.join (normalized: a "."
+ * directory joins to the bare name); win32 keeps the plain concatenation. */
 static char *path_join(const char *directory, const char *name, bool windows) {
+  if (!windows) return qa_node_path_join2(directory, name);
   char separator = windows ? '\\' : '/';
   size_t dir_length = strlen(directory);
   size_t name_length = strlen(name);
@@ -162,7 +166,7 @@ bool qa_native_library_candidates_of(qa_native_library kind,
   if (override != NULL) {
     /* A C string cannot contain NUL; the nonempty half is checked. */
     if (override[0] == '\0') {
-      qa_range_error("%s must be nonempty and contain no NUL", variable);
+      qa_raise("Error", 0, 0, "%s must be nonempty and contain no NUL", variable);
     }
     char **items = (char **)malloc(sizeof *items);
     if (items == NULL) return false;
@@ -248,8 +252,8 @@ bool qa_native_library_candidates_of(qa_native_library kind,
     }
   } else {
     free(directory);
-    qa_range_error("Native %s libraries are unsupported on %s",
-                   qa_native_library_kind_name(kind), platform);
+    qa_raise("Error", 0, 0, "Native %s libraries are unsupported on %s",
+             qa_native_library_kind_name(kind), platform);
   }
   string_list result = {NULL, 0, 0};
   for (size_t n = 0; ok && n < name_count; n++) {
@@ -301,6 +305,10 @@ bool qa_open_native_library(qa_native_library kind, qa_native_library_open_fn op
     }
   }
   qa_native_library_candidates_free(&candidates);
-  qa_range_error("Could not load %s; attempted %s", qa_native_library_kind_name(kind),
-                 joined == NULL ? "" : joined);
+  /* TS AggregateError(failures, message); the joined text is released by the
+   * raise. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, joined);
+  qa_raise("AggregateError", 0, 0, "Could not load %s; attempted %s",
+           qa_native_library_kind_name(kind), joined == NULL ? "" : joined);
 }

@@ -83,7 +83,7 @@ const char *qa_q3_pres_reward_medal_name(qa_q3_pres_reward_medal medal) {
 typedef qa_q3_pres_player_state_runtime runtime_t;
 static qa_q3_pres_retail_snapshot *snapshot_of(runtime_t *runtime) {
   qa_q3_pres_retail_snapshot *snapshot = runtime->state->snap;
-  if (snapshot == NULL) qa_range_error("Player-state transition requires cg.snap");
+  if (snapshot == NULL) qa_raise("Error", 0, 0, "Player-state transition requires cg.snap");
   return snapshot;
 }
 static double pers_get(const qa_q3_base_source_player_state *ps, qa_q3_base_persistent_index index) {
@@ -102,7 +102,7 @@ static void buffered(runtime_t *runtime, qa_q3_pres_player_state_sound key) {
 void qa_q3_pres_player_state_runtime_init(runtime_t *runtime, qa_q3_pres_client_game_state *state,
     qa_q3_pres_player_state_host host) {
   if (state->product != host.product || state->product != host.static_state->product) {
-    qa_range_error("Player-state transition product mismatch");
+    qa_raise("Error", 0, 0, "Player-state transition product mismatch");
   }
   runtime->state = state;
   runtime->host = host;
@@ -361,7 +361,7 @@ void qa_q3_pres_player_state_runtime_check_local_sounds(runtime_t *runtime,
   if (cgs->timelimit > 0) {
     int32_t msec = to_int32(state->time - cgs->level_start_time);
     if ((to_int32(state->timelimit_warnings) & 4) == 0 &&
-        msec > imul(to_int32(imul(cgs->timelimit, 60) + 2), 1000)) {
+        msec > imul(to_int32((double)imul(cgs->timelimit, 60) + 2), 1000)) {
       state->timelimit_warnings = to_int32(state->timelimit_warnings) | 7;
       local_sound(runtime, QA_Q3_PRES_SUDDEN_DEATH_SOUND, ANNOUNCER);
     } else if ((to_int32(state->timelimit_warnings) & 2) == 0 &&

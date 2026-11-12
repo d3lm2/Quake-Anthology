@@ -68,46 +68,70 @@ static bool lump_reader(qa_binary_reader *r, qa_aas_asset *a, int lump, int stri
     if ((n) > 0) {                                                                                 \
       (p) = malloc((n) * sizeof *(p));                                                             \
       if (!(p)) {                                                                                  \
-        qa_aas_asset_destroy(out);                                                                 \
-        return false;                                                                              \
+        goto fail;                                                                                 \
       }                                                                                            \
     }                                                                                              \
   } while (0)
+/* A raise (BinaryError, RangeError) frees what the parse holds, as TS leaves it to the GC. */
+typedef struct parse_guard {
+  qa_aas_asset *out;
+  qa_binary_reader r, h, d;
+  uint8_t *decoded, *marks;
+} parse_guard;
+static void parse_release(void *arg) {
+  parse_guard *g = arg;
+  qa_binary_reader_destroy(&g->d);
+  qa_binary_reader_destroy(&g->h);
+  qa_binary_reader_destroy(&g->r);
+  free(g->decoded);
+  free(g->marks);
+  g->decoded = g->marks = NULL;
+  qa_aas_asset_destroy(g->out);
+}
 bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *source,
                   bool has_expected, int64_t expected) {
   memset(out, 0, sizeof *out);
   const char *src = source ? source : "<aas>";
-  qa_binary_reader r;
+  parse_guard g;
+  memset(&g, 0, sizeof g);
+  g.out = out;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, parse_release, &g);
+#define r g.r
+#define h g.h
+#define d g.d
+#define decoded g.decoded
+#define marks g.marks
   if (!qa_binary_reader_init(&r, bytes, length, src))
-    return false;
+    goto fail;
   if (qa_binary_reader_u32(&r) != 0x53414145u)
     qa_binary_error(src, 0, "expected EAAS magic");
   int64_t version = qa_binary_reader_i32(&r);
   out->version = version;
   if (version != 4 && version != 5)
     qa_binary_error(src, 4, "unsupported AAS version %lld", (long long)version);
-  uint8_t *decoded = qa_binary_reader_bytes(&r, 116);
-  if (!decoded && length >= 124) {
-    qa_binary_reader_destroy(&r);
-    return false;
-  }
+  decoded = qa_binary_reader_bytes(&r, 116);
+  if (!decoded && length >= 124)
+    goto fail;
   if (version == 5)
     for (int o = 0; o < 116; o++)
       decoded[o] = (uint8_t)(decoded[o] ^ (uint8_t)(o * 119 & 255));
-  char hsrc[1024];
-  snprintf(hsrc, sizeof hsrc, "%s:header", src);
-  qa_binary_reader h;
-  if (!qa_binary_reader_init(&h, decoded, 116, hsrc)) {
-    free(decoded);
-    qa_binary_reader_destroy(&r);
-    return false;
-  }
+  /* TS `${source}:header`, whole at any length; the reader keeps its own copy of the name. */
+  size_t hsrc_size = strlen(src) + sizeof ":header";
+  char *hsrc = malloc(hsrc_size);
+  if (!hsrc)
+    goto fail;
+  snprintf(hsrc, hsrc_size, "%s:header", src);
+  int header_ready = qa_binary_reader_init(&h, decoded, 116, hsrc);
+  free(hsrc);
+  if (!header_ready)
+    goto fail;
   out->bsp_checksum = qa_binary_reader_i32(&h);
   if (has_expected && out->bsp_checksum != (int32_t)expected)
     qa_binary_error(src, 8, "AAS belongs to a different BSP checksum");
   out->source = malloc(strlen(src) + 1);
   if (!out->source)
-    return false;
+    goto fail;
   strcpy(out->source, src);
   out->lump_count = 14;
   ALLOC(out->lumps, 14);
@@ -117,10 +141,9 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
       qa_binary_error(src, 12 + i * 8, "invalid AAS lump range");
     out->lumps[i] = (qa_aas_lump){off, len};
   }
-  qa_binary_reader d;
   size_t n = 0;
   if (!lump_reader(&r, out, 0, 32, &d, &n))
-    return false;
+    goto fail;
   out->bbox_count = n;
   ALLOC(out->bboxes, n);
   for (size_t i = 0; i < n; i++) {
@@ -131,7 +154,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 1, 12, &d, &n))
-    return false;
+    goto fail;
   out->vertex_count = n;
   ALLOC(out->vertices, n);
   for (size_t i = 0; i < n; i++)
@@ -139,7 +162,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 2, 20, &d, &n))
-    return false;
+    goto fail;
   out->plane_count = n;
   ALLOC(out->planes, n);
   for (size_t i = 0; i < n; i++) {
@@ -150,7 +173,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 3, 8, &d, &n))
-    return false;
+    goto fail;
   out->edge_count = n;
   ALLOC(out->edges, n);
   for (size_t i = 0; i < n; i++) {
@@ -160,7 +183,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 4, 4, &d, &n))
-    return false;
+    goto fail;
   out->edge_index_count = n;
   ALLOC(out->edge_indexes, n);
   for (size_t i = 0; i < n; i++)
@@ -168,7 +191,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 5, 24, &d, &n))
-    return false;
+    goto fail;
   out->face_count = n;
   ALLOC(out->faces, n);
   for (size_t i = 0; i < n; i++) {
@@ -183,7 +206,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 6, 4, &d, &n))
-    return false;
+    goto fail;
   out->face_index_count = n;
   ALLOC(out->face_indexes, n);
   for (size_t i = 0; i < n; i++)
@@ -191,7 +214,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 7, 48, &d, &n))
-    return false;
+    goto fail;
   out->area_count = n;
   ALLOC(out->areas, n);
   for (size_t i = 0; i < n; i++) {
@@ -205,7 +228,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 8, 28, &d, &n))
-    return false;
+    goto fail;
   out->setting_count = n;
   ALLOC(out->settings, n);
   for (size_t i = 0; i < n; i++) {
@@ -221,7 +244,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 9, 44, &d, &n))
-    return false;
+    goto fail;
   out->reachability_count = n;
   ALLOC(out->reachability, n);
   for (size_t i = 0; i < n; i++) {
@@ -238,7 +261,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 10, 12, &d, &n))
-    return false;
+    goto fail;
   out->node_count = n;
   ALLOC(out->nodes, n);
   for (size_t i = 0; i < n; i++) {
@@ -249,7 +272,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 11, 20, &d, &n))
-    return false;
+    goto fail;
   out->portal_count = n;
   ALLOC(out->portals, n);
   for (size_t i = 0; i < n; i++) {
@@ -263,7 +286,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 12, 4, &d, &n))
-    return false;
+    goto fail;
   out->portal_index_count = n;
   ALLOC(out->portal_indexes, n);
   for (size_t i = 0; i < n; i++)
@@ -271,7 +294,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (n)
     qa_binary_reader_destroy(&d);
   if (!lump_reader(&r, out, 13, 16, &d, &n))
-    return false;
+    goto fail;
   out->cluster_count = n;
   ALLOC(out->clusters, n);
   for (size_t i = 0; i < n; i++) {
@@ -285,6 +308,7 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
     qa_binary_reader_destroy(&d);
   qa_binary_reader_destroy(&h);
   free(decoded);
+  decoded = NULL;
   qa_binary_reader_destroy(&r);
   if (out->area_count != out->setting_count)
     qa_binary_error(src, 0, "AAS area/settings counts differ");
@@ -321,9 +345,9 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   if (out->node_count < 2)
     qa_binary_error(src, 0, "AAS has no BSP root node");
   /* A tree gives each node one parent and never re-enters the root; a DAG would make area queries exponential. */
-  uint8_t *marks = calloc(out->node_count > out->reachability_count ? out->node_count : out->reachability_count + 1, 1);
+  marks = calloc(out->node_count > out->reachability_count ? out->node_count : out->reachability_count + 1, 1);
   if (marks == NULL)
-    return false;
+    goto fail;
   for (size_t i = 1; i < out->node_count; i++) {
     idx(out->nodes[i].plane, (int64_t)out->plane_count, "node plane");
     for (int k = 0; k < 2; k++) {
@@ -333,7 +357,6 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
       if (c <= 0)
         continue;
       if (c == 1 || marks[c] == 1) {
-        free(marks);
         qa_binary_error(src, 0, "AAS BSP node has more than one parent");
       }
       marks[c] = 1;
@@ -344,12 +367,12 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
     for (int64_t reach = out->settings[i].first_reach;
          reach < out->settings[i].first_reach + out->settings[i].reach_count; reach++) {
       if (marks[reach] == 1) {
-        free(marks);
         qa_binary_error(src, 0, "AAS area reachability ranges overlap");
       }
       marks[reach] = 1;
     }
   free(marks);
+  marks = NULL;
   for (size_t i = 1; i < out->setting_count; i++) {
     const qa_aas_setting_rec *setting = &out->settings[i];
     if (setting->cluster > 0) {
@@ -371,7 +394,17 @@ bool qa_parse_aas(qa_aas_asset *out, uint8_t *bytes, size_t length, const char *
   for (size_t i = 0; i < out->cluster_count; i++)
     rng(out->clusters[i].first_portal, out->clusters[i].portal_count,
         (int64_t)out->portal_index_count, "cluster portals");
+  qa_cleanup_pop(&guard);
   return true;
+fail:
+  qa_cleanup_pop(&guard);
+  parse_release(&g);
+  return false;
+#undef r
+#undef h
+#undef d
+#undef decoded
+#undef marks
 }
 static double plane_dist(const qa_aas_plane_rec *p, qa_vec3 pt) {
   return fr(fr(fr(fr(pt.x * p->normal.x) + fr(pt.y * p->normal.y)) + fr(pt.z * p->normal.z)) -
@@ -403,7 +436,9 @@ qa_aas_area_crossing *qa_aas_trace_areas(const qa_aas_asset *a, qa_vec3 st, qa_v
   *out_count = 0;
   if (maximum == 0)
     return NULL;
-  qa_aas_area_crossing *outp = malloc((size_t)maximum * sizeof *outp);
+  /* The output grows as TS's array does; `maximum` only caps it. */
+  size_t out_cap = 16;
+  qa_aas_area_crossing *outp = malloc(out_cap * sizeof *outp);
   size_t cap = 64, sp = 0;
   Frame *stack = malloc(cap * sizeof *stack);
   if (!outp || !stack) {
@@ -415,8 +450,14 @@ qa_aas_area_crossing *qa_aas_trace_areas(const qa_aas_asset *a, qa_vec3 st, qa_v
   while (sp > 0 && *out_count < (size_t)maximum) {
     Frame f = stack[--sp];
     if (f.node <= 0) {
-      if (f.node < 0)
+      if (f.node < 0) {
+        if (*out_count == out_cap) {
+          qa_aas_area_crossing *grown = realloc(outp, out_cap * 2 * sizeof *outp);
+          if (!grown) { free(outp); free(stack); qa_range_error("Out of memory tracing AAS areas"); }
+          outp = grown; out_cap *= 2;
+        }
         outp[(*out_count)++] = (qa_aas_area_crossing){-f.node, f.start};
+      }
       continue;
     }
     if (f.depth >= (int64_t)a->node_count)

@@ -103,7 +103,7 @@ bool qa_qvm_read_item_records(const uint8_t *data, size_t length, qa_qvm_item_la
     double address = layout.address_global;
     if (!is_safe_integer(address) || address < 0 || (int64_t)address % 4 != 0 ||
         address + 4 > (double)length)
-      qa_range_error("QVM item table locator exceeds module data");
+      qa_raise("Error", 0, 0, "QVM item table locator exceeds module data");
     if (range != NULL) range->call(range->ctx, address, 4);
     table_value = data_i32(data, length, (int64_t)address);
   }
@@ -114,7 +114,7 @@ bool qa_qvm_read_item_records(const uint8_t *data, size_t length, qa_qvm_item_la
     double address = layout.count_global;
     if (!is_safe_integer(address) || address < 0 || (int64_t)address % 4 != 0 ||
         address + 4 > (double)length)
-      qa_range_error("QVM item table locator exceeds module data");
+      qa_raise("Error", 0, 0, "QVM item table locator exceeds module data");
     if (range != NULL) range->call(range->ctx, address, 4);
     count_value = data_i32(data, length, (int64_t)address);
   }
@@ -124,7 +124,7 @@ bool qa_qvm_read_item_records(const uint8_t *data, size_t length, qa_qvm_item_la
       (count_value > 0 && table_value == 0) ||
       !is_safe_integer(table_value + count_value * layout.stride) ||
       table_value + count_value * layout.stride > (double)length)
-    qa_range_error("QVM item table exceeds initialized or live module data");
+    qa_raise("Error", 0, 0, "QVM item table exceeds initialized or live module data");
   if (count_value > 0 && range != NULL) range->call(range->ctx, table_value, count_value * layout.stride);
   out->entries = NULL;
   out->count = 0;
@@ -147,14 +147,14 @@ bool qa_qvm_read_item_records(const uint8_t *data, size_t length, qa_qvm_item_la
       if (pointer <= 0 || pointer >= (int64_t)length) {
         free(strings[0]);
         qa_qvm_catalog_records_destroy(out);
-        qa_range_error("QVM item string is outside initialized module data");
+        qa_raise("Error", 0, 0, "QVM item string is outside initialized module data");
       }
       size_t end = (size_t)pointer;
       while (end < length && data[end] != 0) end++;
       if (end >= length) {
         free(strings[0]);
         qa_qvm_catalog_records_destroy(out);
-        qa_range_error("QVM item string is unterminated");
+        qa_raise("Error", 0, 0, "QVM item string is unterminated");
       }
       if (range != NULL) range->call(range->ctx, pointer, (double)(end - (size_t)pointer + 1));
       strings[s] = malloc(end - (size_t)pointer + 1);
@@ -170,7 +170,7 @@ bool qa_qvm_read_item_records(const uint8_t *data, size_t length, qa_qvm_item_la
       free(strings[0]);
       free(strings[1]);
       qa_qvm_catalog_records_destroy(out);
-      qa_range_error("QVM item has no source name");
+      qa_raise("Error", 0, 0, "QVM item has no source name");
     }
     if (out->count == capacity) {
       capacity = capacity == 0 ? 8 : capacity * 2;
@@ -213,7 +213,7 @@ bool qa_qvm_read_item_catalog(const uint8_t *data, size_t length, qa_qvm_item_la
     if (item->tag < 1 || (!private_inventory && item->tag > 15)) {
       qa_qvm_catalog_records_destroy(&records);
       qa_qvm_catalog_items_destroy(out);
-      qa_range_error("QVM item cannot be represented by its public weapon/ammo state");
+      qa_raise("Error", 0, 0, "QVM item cannot be represented by its public weapon/ammo state");
     }
     out->entries[i].class_name = item->class_name;
     out->entries[i].pickup_name = item->pickup_name;
@@ -349,7 +349,7 @@ bool qa_qvm_source_item_catalog_records(qa_qvm_source_item_catalog *catalog,
                                         const qa_qvm_catalog_records **out) {
   qa_qvm_memory_writes *writes = catalog_writes(catalog);
   if (writes != NULL) qa_qvm_memory_writes_assert_live(writes);
-  if (catalog->closed) qa_range_error("QVM item catalog owner is retired");
+  if (catalog->closed) qa_raise("Error", 0, 0, "QVM item catalog owner is retired");
   if (catalog->has_records) {
     *out = &catalog->records;
     return true;
@@ -359,10 +359,10 @@ bool qa_qvm_source_item_catalog_records(qa_qvm_source_item_catalog *catalog,
   bool live = catalog->layout.has_source && strcmp(catalog->layout.source, "live") == 0;
   catalog_ranges ranges = {NULL, 0, 0};
   catalog_read job = {catalog, live, &ranges, false};
-  char message[512];
-  bool ok = qa_range_error_catch(catalog_read_body, &job, message, sizeof message);
+  qa_caught_error caught;
+  bool ok = qa_try(catalog_read_body, &job, &caught);
   free(ranges.ranges);
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) qa_rethrow(&caught);
   if (!job.ok) return false;
   *out = &catalog->records;
   return true;

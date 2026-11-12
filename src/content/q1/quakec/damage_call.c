@@ -21,8 +21,61 @@ static void push_location(qa_q1qc_role_locations *locations, qa_q1qc_damage_role
   if (locations->items == NULL) qa_range_error("out of memory");
   locations->items[locations->count++] = location;
 }
+/* The layout owns its declaration: id1_program.c caches layouts for the life of
+ * the process (TS WeakMap keeps the declaration object alive), so it cannot
+ * borrow the caller's argument and global arrays or their strings. */
+static char *copy_text(const char *text) {
+  if (text == NULL) return NULL;
+  size_t length = strlen(text);
+  char *copy = xmalloc(length + 1);
+  memcpy(copy, text, length + 1);
+  return copy;
+}
+static void copy_value(qa_mod_callback_value *out, const qa_mod_callback_value *in) {
+  *out = *in;
+  out->kind = copy_text(in->kind);
+  out->name = copy_text(in->name);
+  out->string_value = copy_text(in->string_value);
+}
+static void free_value(const qa_mod_callback_value *value) {
+  free((char *)value->kind);
+  free((char *)value->name);
+  free((char *)value->string_value);
+}
+static void copy_declaration(qa_mod_source_call *out, const qa_mod_source_call *in) {
+  qa_mod_callback_value *arguments = xmalloc(in->argument_count * sizeof *arguments);
+  qa_mod_named_value *globals = xmalloc(in->global_count * sizeof *globals);
+  for (size_t i = 0; i < in->argument_count; i++) copy_value(&arguments[i], &in->arguments[i]);
+  for (size_t i = 0; i < in->global_count; i++) {
+    globals[i].name = copy_text(in->globals[i].name);
+    copy_value(&globals[i].value, &in->globals[i].value);
+  }
+  out->function = copy_text(in->function);
+  out->arguments = arguments;
+  out->argument_count = in->argument_count;
+  out->globals = globals;
+  out->global_count = in->global_count;
+}
+static void free_declaration(qa_mod_source_call *call) {
+  for (size_t i = 0; i < call->argument_count; i++) free_value(&call->arguments[i]);
+  for (size_t i = 0; i < call->global_count; i++) {
+    free((char *)call->globals[i].name);
+    free_value(&call->globals[i].value);
+  }
+  free((char *)call->function);
+  free((void *)call->arguments);
+  free((void *)call->globals);
+}
+/* A parameter type outlives the program mirror it was read from. */
+static const char *static_type(const char *type) {
+  static const char *const TYPES[] = {"entity", "float", "vector", "string", "function"};
+  for (size_t i = 0; i < sizeof TYPES / sizeof *TYPES; i++)
+    if (strcmp(type, TYPES[i]) == 0) return TYPES[i];
+  return NULL;
+}
 void qa_q1qc_damage_call_layout_destroy(qa_q1qc_damage_call_layout *layout) {
   if (layout == NULL) return;
+  if (layout->has_declaration) free_declaration(&layout->declaration_copy);
   free(layout->parameters);
   for (int i = 0; i < 4; i++) free(layout->roles[i].items);
   free(layout);
@@ -65,13 +118,11 @@ qa_q1qc_damage_call_layout *qa_q1qc_damage_call_layout_create(
     const char *type = NULL;
     for (size_t g = 0; g < program->global_count; g++) {
       if (program->globals[g].offset == word && strcmp(program->globals[g].type, "void") != 0) {
-        type = program->globals[g].type;
+        type = static_type(program->globals[g].type);
         break;
       }
     }
-    if (type == NULL || (strcmp(type, "entity") != 0 && strcmp(type, "float") != 0 &&
-                         strcmp(type, "vector") != 0 && strcmp(type, "string") != 0 &&
-                         strcmp(type, "function") != 0)) {
+    if (type == NULL) {
       qa_q1qc_damage_call_layout_destroy(layout);
       qa_q1qc_program_error(program, "Unsupported QC damage call: untyped original parameter");
     }
@@ -164,7 +215,7 @@ qa_q1qc_damage_call_layout *qa_q1qc_damage_call_layout_create(
   free(global_words);
   free(global_roles);
   if (declaration != NULL) {
-    layout->declaration_copy = *declaration;
+    copy_declaration(&layout->declaration_copy, declaration);
     layout->declaration = &layout->declaration_copy;
   }
   layout->has_declaration = declaration != NULL;

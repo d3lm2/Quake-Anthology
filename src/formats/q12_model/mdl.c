@@ -62,6 +62,9 @@ static void read_frame_set(qa_binary_reader *reader, double vertex_count, qa_vec
   out->compressed_bounds[1] = qa_q12_packed_vertex(reader);
   size_t endpoint_count = 0;
   double *endpoints = qa_q12_intervals(reader, frame_count, &endpoint_count);
+  /* The frame data check below raises too: release the endpoints then. */
+  qa_cleanup endpoints_node;
+  qa_cleanup_push(&endpoints_node, free, endpoints);
   qa_binary_reader_check_number(reader, (double)reader->cursor, frame_count * (24 + vertex_count * 4));
   qa_vec3 points[2] = {qa_q12_packed_position(out->compressed_bounds[0], scale, translate),
                        qa_q12_packed_position(out->compressed_bounds[1], scale, translate)};
@@ -70,8 +73,6 @@ static void read_frame_set(qa_binary_reader *reader, double vertex_count, qa_vec
   out->is_group = true;
   out->frames = entries;
   out->frame_count = endpoint_count;
-  qa_cleanup endpoints_node;
-  qa_cleanup_push(&endpoints_node, free, endpoints);
   for (size_t i = 0; i < endpoint_count; i++) {
     qa_q1_alias_frame *frame = xmalloc(sizeof *frame);
     entries[i].interval_seconds = endpoints[i];

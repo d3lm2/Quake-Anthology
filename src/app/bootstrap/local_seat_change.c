@@ -21,14 +21,32 @@ static int compare_identity(const void *a, const void *b) {
   int64_t right = qa_session_seat_id(((const qa_app_local_seat_identity *)b)->seat).index;
   return left < right ? -1 : left > right ? 1 : 0;
 }
+typedef struct prepare_seat_call {
+  qa_engine_session *session;
+  int64_t index;
+  qa_session_client *client;
+  qa_session_seat *seat;
+} prepare_seat_call;
+static void prepare_seat_run(void *ctx) {
+  prepare_seat_call *call = ctx;
+  call->seat = qa_engine_session_prepare_seat(call->session, call->index, call->client, NULL);
+}
+static void close_client_run(void *ctx) { qa_session_client_close(ctx); }
+static void free_change_node(void *arg) {
+  qa_app_prepared_local_seat_change *change = arg;
+  free(change->next);
+  free(change);
+}
 qa_app_prepared_local_seat_change *qa_app_prepare_local_seat_change(qa_engine_session *session,
     const qa_app_local_seat_identity *current, size_t current_count,
     qa_app_local_seat_request request, qa_app_local_seat_capacity capacity) {
   qa_world_lifetime *world = qa_engine_session_world(session);
   if (world == NULL || qa_world_lifetime_is_closed(world))
-    qa_range_error("Local player changes require an active world");
+    qa_raise("Error", 0, 0, "Local player changes require an active world");
   qa_app_prepared_local_seat_change *change = calloc(1, sizeof *change);
   if (change == NULL) qa_range_error("Out of memory");
+  qa_cleanup change_node;
+  qa_cleanup_push(&change_node, free_change_node, change);
   change->session = session; change->world = world; change->phase = "prepared";
   if (strcmp(request.kind, "join") == 0) {
     int64_t index = 0;
@@ -39,26 +57,32 @@ qa_app_prepared_local_seat_change *qa_app_prepare_local_seat_change(qa_engine_se
       if (!taken) break;
       index++;
     }
-    if ((double)index >= capacity.local_seats) { free(change); qa_range_error("All local player slots are occupied"); }
+    if ((double)index >= capacity.local_seats) qa_raise("Error", 0, 0, "All local player slots are occupied");
     int64_t slot = 0;
     while ((double)slot < capacity.clients && qa_engine_session_client_at(session, slot) != NULL) slot++;
-    if ((double)slot >= capacity.clients) { free(change); qa_range_error("The server has no free player slots"); }
+    if ((double)slot >= capacity.clients) qa_raise("Error", 0, 0, "The server has no free player slots");
     qa_session_client *client = qa_engine_session_prepare_client(session, slot, NULL);
-    /* TS: prepareSeat failure closes the client and rethrows. The
-     * landed prepare_seat aborts on misuse instead of throwing, so
-     * the AggregateError path cannot be reached here. */
-    qa_session_seat *seat = qa_engine_session_prepare_seat(session, index, client, NULL);
+    /* try { added = { client, seat: prepareSeat(index, client) } } catch (error) { close the client; rethrow, or
+     * AggregateError when the close throws too }. */
+    prepare_seat_call call = {session, index, client, NULL};
+    qa_caught_error error, cleanup;
+    if (!qa_try(prepare_seat_run, &call, &error)) {
+      if (!qa_try(close_client_run, client, &cleanup))
+        qa_raise("AggregateError", 0, 0, "Local player preparation and cleanup failed");
+      qa_rethrow(&error);
+    }
+    qa_session_seat *seat = call.seat;
     change->has_added = true;
     change->added.client = client; change->added.seat = seat;
     change->added_client = client; change->added_seat = seat;
   } else {
     bool found = false;
-    for (size_t i = 0; i < current_count; i++) {
+    for (size_t i = 0; i < current_count && !found; i++) {
       if (qa_same_seat(qa_session_seat_id(current[i].seat), request.seat)) {
-        change->removed = current[i]; found = true;
+        change->removed = current[i]; found = true; /* current.find: the first match */
       }
     }
-    if (!found) { free(change); qa_range_error("Local player is no longer active"); }
+    if (!found) qa_raise("Error", 0, 0, "Local player is no longer active");
     change->has_removed = true;
     change->removed_client = change->removed.client;
     change->removed_seat = change->removed.seat;
@@ -75,6 +99,7 @@ qa_app_prepared_local_seat_change *qa_app_prepare_local_seat_change(qa_engine_se
   if (change->has_added) change->next[at++] = change->added;
   change->next_count = at;
   qa_js_sort(change->next, change->next_count, sizeof *change->next, compare_identity);
+  qa_cleanup_pop(&change_node);
   return change;
 }
 void qa_app_prepared_local_seat_change_destroy(qa_app_prepared_local_seat_change *change) {
@@ -114,9 +139,9 @@ static qa_session_seat_change seats_of(qa_app_prepared_local_seat_change *change
 void qa_app_prepared_local_seat_change_validate(qa_app_prepared_local_seat_change *change,
     const qa_session_presentation_entry *presentations, size_t presentation_count) {
   if (strcmp(change->phase, "prepared") != 0)
-    qa_range_error("Local seat change is %s", change->phase);
+    qa_raise("Error", 0, 0, "Local seat change is %s", change->phase);
   if (qa_engine_session_world(change->session) != change->world || qa_world_lifetime_is_closed(change->world))
-    qa_range_error("Local player world changed during preparation");
+    qa_raise("Error", 0, 0, "Local player world changed during preparation");
   qa_engine_session_validate_local_seats(change->session, presentations, presentation_count,
       clients_of(change), seats_of(change));
 }

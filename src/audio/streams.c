@@ -50,8 +50,11 @@ void qa_pcm_stream_seek(qa_pcm_stream *stream, int64_t frame) {
 }
 void qa_pcm_stream_close(qa_pcm_stream *stream) {
   if (stream == NULL) return;
-  stream->ops->close(stream->state);
+  /* The wrapper goes first: a close that raises (VorbisError from ov_clear) leaves nothing. */
+  void *state = stream->state;
+  void (*close)(void *) = stream->ops->close;
   free(stream);
+  close(state);
 }
 
 /* ---- MemoryPcmStream ---- */
@@ -142,9 +145,12 @@ typedef struct vorbis_state {
   bool failed;
 } vorbis_state;
 
+/* A decoder failure is the TS VorbisError (a negative libvorbis code) or a
+   plain Error; it is file input, so it raises (MusicPlayer.mix catches it
+   and stops the damaged track) instead of aborting. */
 static noreturn void vorbis_fail(const qa_vorbis_error *error) {
-  fprintf(stderr, "VorbisError: %s\n", error->message);
-  abort();
+  qa_raise(error->code != 0 ? "VorbisError" : "Error", error->code, 0, "%s",
+           error->message);
 }
 
 static int64_t vorbis_sample_rate(void *opaque) {
@@ -204,7 +210,8 @@ static void vorbis_close(void *opaque) {
   }
   state->closed = true;
   qa_vorbis_error error;
-  qa_vorbis_decoder_close(&state->decoder, &error);
+  memset(&error, 0, sizeof error);
+  int result = qa_vorbis_decoder_close(&state->decoder, &error);
   if (state->temporary_directory != NULL) {
     char path[1024];
     snprintf(path, sizeof path, "%s/source.ogg", state->temporary_directory);
@@ -213,6 +220,9 @@ static void vorbis_close(void *opaque) {
     free(state->temporary_directory);
   }
   free(state);
+  /* TS: try { decoder.close() } finally { rmSync } — the VorbisError of a failed ov_clear
+     reaches the caller after the cleanup (libvorbisfile's ov_clear returns 0 today). */
+  if (result != 0) vorbis_fail(&error);
 }
 static const qa_pcm_stream_ops vorbis_ops = {
     vorbis_sample_rate, vorbis_channels, vorbis_frame_count,
@@ -690,6 +700,8 @@ qa_save_value *qa_raw_audio_stream_capture_checkpoint(
   return root;
 }
 
+static void stream_cleanup(void *arg) { qa_raw_audio_stream_destroy(arg); }
+
 static bool reader_field_number(const qa_save_reader *reader, const char *name,
                                 qa_save_reader *out) {
   return qa_save_reader_field(reader, name, out);
@@ -708,6 +720,9 @@ bool qa_raw_audio_stream_restore_checkpoint(qa_raw_audio_stream *out,
   rate = (int64_t)qa_save_reader_integer_min(&field, 1);
   qa_save_reader_destroy(&field);
   qa_raw_audio_stream_init(&stream, rate);
+  /* A SaveReader failure raises: release the segments read so far. */
+  qa_cleanup stream_guard;
+  qa_cleanup_push(&stream_guard, stream_cleanup, &stream);
   if (!qa_save_reader_field(&root, "inputRate", &field)) goto done;
   stream.input_rate = (int64_t)qa_save_reader_integer_min(&field, 0);
   qa_save_reader_destroy(&field);
@@ -768,9 +783,12 @@ bool qa_raw_audio_stream_restore_checkpoint(qa_raw_audio_stream *out,
           goto done;
         }
       }
+      qa_cleanup samples_guard;
+      qa_cleanup_push(&samples_guard, free, samples);
       for (size_t j = 0; j < sample_count; j++) {
         qa_save_reader sample_reader;
         if (!qa_save_reader_item(&sub, j, &sample_reader)) {
+          qa_cleanup_pop(&samples_guard);
           free(samples);
           qa_save_reader_destroy(&sub);
           qa_save_reader_destroy(&item);
@@ -785,10 +803,9 @@ bool qa_raw_audio_stream_restore_checkpoint(qa_raw_audio_stream *out,
       }
       qa_save_reader_destroy(&sub);
       if (sample_count != (size_t)((end - begin) * stream.channels) ||
-          begin == end) {
-        free(samples);
+          begin == end)
         qa_save_reader_fail(&item, "invalid PCM segment extent");
-      }
+      qa_cleanup_pop(&samples_guard);
       if (stream.segment_count == stream.segment_capacity) {
         size_t capacity = stream.segment_capacity == 0
                               ? 4
@@ -827,16 +844,21 @@ bool qa_raw_audio_stream_restore_checkpoint(qa_raw_audio_stream *out,
     if (invalid) qa_save_reader_fail(&root, "invalid PCM cursor");
   }
   if (output_rate < 1) qa_range_error("Invalid PCM output rate");
+  qa_cleanup_pop(&stream_guard);
   if (rate == output_rate) {
     *out = stream;
   } else if (!qa_raw_audio_stream_with_output_rate(&stream, output_rate, out)) {
-    goto done;
+    qa_raw_audio_stream_destroy(&stream);
+    goto done_root;
   } else {
     qa_raw_audio_stream_destroy(&stream);
   }
   ok = true;
 done:
-  if (!ok) qa_raw_audio_stream_destroy(&stream);
+  if (!ok) {
+    qa_cleanup_pop(&stream_guard);
+    qa_raw_audio_stream_destroy(&stream);
+  }
 done_root:
   qa_save_reader_destroy(&root);
   return ok;

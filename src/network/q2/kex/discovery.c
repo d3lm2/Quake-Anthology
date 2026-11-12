@@ -37,6 +37,14 @@ static char *dup_lower(const char *s) {
   return qa_js_to_lower_case(s);
 }
 
+/* TS string.length of decoded UTF-8 text: UTF-16 code units. */
+static size_t utf16_length(const char *text) {
+  size_t units = 0;
+  for (const uint8_t *p = (const uint8_t *)text; *p != 0; p++)
+    if ((*p & 0xc0) != 0x80) units += *p >= 0xf0 ? 2 : 1;
+  return units;
+}
+
 uint8_t *qa_kex_discovery_query(size_t *out_length) {
   qa_kex_packet_writer writer;
   qa_kex_packet_writer_init(&writer);
@@ -83,7 +91,7 @@ bool qa_kex_read_discovery(const uint8_t *bytes, size_t length,
   if (scope.name != NULL) {
     uint64_t players = qa_kex_packet_reader_integer(&reader);
     uint64_t maximum = qa_kex_packet_reader_integer(&reader);
-    if (players > 255 || maximum > 255 || players > maximum || strlen(scope.name) > 1024)
+    if (players > 255 || maximum > 255 || players > maximum || utf16_length(scope.name) > 1024)
       qa_q2_throw_error("Invalid KEX lobby status");
     bool oom = false;
     while (qa_kex_packet_reader_remaining(&reader) != 0) {
@@ -180,7 +188,7 @@ typedef struct dns_reader {
 
 static uint16_t dns_u16_at(const uint8_t *bytes, size_t length, size_t offset) {
   /* DataView defaults to big-endian; out-of-bounds throws in TS. */
-  if (offset + 2 > length) qa_q2_throw_error("Offset is outside the bounds of the DataView");
+  if (offset + 2 > length) qa_raise("RangeError", 0, 0, "Out of bounds access");
   return (uint16_t)(((uint32_t)bytes[offset] << 8) | bytes[offset + 1]);
 }
 static int64_t dns_word(dns_reader *reader) {
@@ -261,7 +269,10 @@ static char *dns_name(dns_reader *reader, bool use_position, size_t initial_offs
     }
     if (size > 63 || offset + size > reader->length) qa_q2_throw_error("Invalid mDNS label");
     if (!utf8_check(reader->bytes + offset, size)) qa_q2_throw_utf8_error();
-    if (!bytes_push(&joined, reader->bytes + offset, size) || !byte_push(&joined, '.')) break;
+    /* Each label goes through its own TextDecoder.decode, which drops one leading BOM. */
+    size_t bom = size >= 3 && reader->bytes[offset] == 0xef && reader->bytes[offset + 1] == 0xbb &&
+                         reader->bytes[offset + 2] == 0xbf ? 3 : 0;
+    if (!bytes_push(&joined, reader->bytes + offset + bom, size - bom) || !byte_push(&joined, '.')) break;
     offset += size;
   }
   qa_cleanup_pop(&node);
@@ -639,9 +650,11 @@ static void mdns_announce(qa_kex_mdns *mdns, double ttl) {
   typedef struct rec {
     byte_list bytes;
   } rec_t;
-  rec_t records[24];
+  /* TS adds one A record per external IPv4 address, without a limit. */
+  size_t record_capacity = 8;
+  rec_t *records = (rec_t *)calloc(record_capacity, sizeof *records);
   size_t record_count = 0;
-  memset(records, 0, sizeof records);
+  if (records == NULL) return;
   byte_list instance_domain = {NULL, 0, 0};
   (void)domain_push(&instance_domain, INSTANCE_NAME);
   byte_list first = {NULL, 0, 0};
@@ -665,13 +678,18 @@ static void mdns_announce(qa_kex_mdns *mdns, double ttl) {
   records[record_count++].bytes = third;
   struct ifaddrs *interfaces = NULL;
   if (getifaddrs(&interfaces) == 0) {
-    for (struct ifaddrs *entry = interfaces; entry != NULL && record_count < 24;
-         entry = entry->ifa_next) {
+    for (struct ifaddrs *entry = interfaces; entry != NULL; entry = entry->ifa_next) {
       if (entry->ifa_addr == NULL || entry->ifa_addr->sa_family != AF_INET) continue;
       if ((entry->ifa_flags & IFF_LOOPBACK) != 0) continue;
       struct sockaddr_in *sin = (struct sockaddr_in *)entry->ifa_addr;
       uint8_t octets[4];
       memcpy(octets, &sin->sin_addr.s_addr, sizeof octets);
+      if (record_count == record_capacity) {
+        rec_t *grown = (rec_t *)realloc(records, record_capacity * 2 * sizeof *records);
+        if (grown == NULL) break;
+        records = grown;
+        record_capacity *= 2;
+      }
       byte_list rec = {NULL, 0, 0};
       (void)record_push(&rec, target, 1, octets, sizeof octets, ttl);
       records[record_count++].bytes = rec;
@@ -694,6 +712,7 @@ static void mdns_announce(qa_kex_mdns *mdns, double ttl) {
     (void)bytes_push(&packet, records[i].bytes.data, records[i].bytes.length);
     free(records[i].bytes.data);
   }
+  free(records);
   (void)mdns_send(mdns, packet.data, packet.length);
   free(packet.data);
 }

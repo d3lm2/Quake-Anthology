@@ -7,6 +7,7 @@
 #include "qa/foundation/support.h"
 #include "qa/network/common/js_number.h"
 #include "qa/materials/sky.h"
+#include "qa/foundation/js.h"
 
 static float fr(double v) { return (float)v; }
 
@@ -19,6 +20,8 @@ qa_vec3 qa_sky_vector(double face, double s, double t, double size) {
   size = fr(size);
   double horizontal = fr(fr(s) * size), vertical = fr(fr(t) * size);
   qa_vec3 out;
+  /* The TS switch compares strictly: a fractional or NaN face is the default. */
+  if (!(face >= 0 && face <= 5 && face == floor(face))) qa_range_error("sky face must be 0..5");
   switch ((int)face) {
     case 0: out = (qa_vec3){size, -horizontal, vertical}; break;
     case 1: out = (qa_vec3){-size, horizontal, vertical}; break;
@@ -54,10 +57,11 @@ static void project_polygon(const qa_vec3 *points, size_t count,
     if (divisor < 0.001) continue;
     s = fr(s / divisor);
     t = fr(t / divisor);
-    if (s < range->min_s) range->min_s = s;
-    if (t < range->min_t) range->min_t = t;
-    if (s > range->max_s) range->max_s = s;
-    if (t > range->max_t) range->max_t = t;
+    /* Math.min/Math.max: a NaN point (NaN divisor passes the test) sticks. */
+    range->min_s = qa_js_min(range->min_s, s);
+    range->min_t = qa_js_min(range->min_t, t);
+    range->max_s = qa_js_max(range->max_s, s);
+    range->max_t = qa_js_max(range->max_t, t);
   }
 }
 
@@ -189,6 +193,19 @@ qa_sky_geometry qa_sky_builder_build(qa_sky_builder *builder, qa_vec3 origin,
     double raw_min_s = floor(b.min_s * 4), raw_min_t = floor(b.min_t * 4);
     double raw_max_s = ceil(b.max_s * 4), raw_max_t = ceil(b.max_t * 4);
     if (raw_min_s >= raw_max_s || raw_min_t >= raw_max_t) continue;
+    if (isnan(raw_min_s) || isnan(raw_min_t) || isnan(raw_max_s) || isnan(raw_max_t)) {
+      /* NaN bounds pass the test above; every TS loop then runs zero times
+         and the face is kept with empty geometry and no strips. */
+      if (result.face_count == face_capacity) {
+        face_capacity = face_capacity == 0 ? 4 : face_capacity * 2;
+        result.box = realloc(result.box, face_capacity * sizeof *result.box);
+        if (result.box == NULL) qa_range_error("sky allocation failed");
+      }
+      qa_sky_face *empty = &result.box[result.face_count++];
+      memset(empty, 0, sizeof *empty);
+      empty->face = face;
+      continue;
+    }
     int min_s = (int)clamp4(raw_min_s), min_t = (int)clamp4(raw_min_t);
     int max_s = (int)clamp4(raw_max_s), max_t = (int)clamp4(raw_max_t);
     int width = max_s - min_s + 1;

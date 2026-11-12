@@ -16,7 +16,7 @@ qa_image_picture qa_native_ui_art_picture(const qa_native_ui_art *art,
   if (!art->closed)
     for (size_t i = 0; i < 4; i++)
       if (art->resources[i] != NULL && strcmp(art->resources[i], resource) == 0) return art->pictures[i];
-  qa_range_error("Unregistered native UI image: %s", resource);
+  qa_raise("Error", 0, 0, "Unregistered native UI image: %s", resource);
 }
 
 void qa_native_ui_art_close(qa_native_ui_art *art) {
@@ -77,8 +77,8 @@ void qa_ui_load_native_art_selected(qa_native_ui_art *art, qa_resource_id font,
     if (decoded[i].width != assets[i].file->width
         || decoded[i].height != assets[i].file->height) {
       qa_native_ui_art_close(art);
-      qa_range_error("Menu image dimensions differ from the manifest: %s",
-                     assets[i].file->file);
+      qa_raise("Error", 0, 0, "Menu image dimensions differ from the manifest: %s",
+               assets[i].file->file);
     }
     qa_image_level storage;
     qa_texture_sampling sampling = { "clamp", "linear" };

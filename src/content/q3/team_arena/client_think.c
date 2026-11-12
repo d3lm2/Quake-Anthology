@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "qa/content/q3/base/shared/entity_shared.h"
@@ -16,11 +17,23 @@ enum { MASK_PLAYERSOLID = 1 | 0x10000 | 0x2000000, CONTENTS_BODY = 0x2000000,
   REWARD_FLAGS = 0x8 | 0x40 | 0x800 | 0x8000 | 0x10000 | 0x20000 };
 #define CONTENTS_TRIGGER_BITS 0x40000000
 static double s32(double v) { return qa_js_to_int32(v); }
-static double imul(double a, double b) { return (int32_t)(qa_js_to_int32(a) * qa_js_to_int32(b)); }
+/* Math.imul wraps; a signed C product (g_forcerespawn * 1000) is undefined past 2^31. */
+static double imul(double a, double b) {
+  return qa_js_to_int32((double)((uint32_t)qa_js_to_int32(a) * (uint32_t)qa_js_to_int32(b)));
+}
+/* TS areaActors and movement.contacts are arrays the caller owns. The C ones are borrowed
+ * from a host buffer that the next query or move refills, and the touch callbacks made while
+ * walking them query again (a teleporter's kill box) or move (ClientSpawn runs a think). */
+static qa_actor_id *own_actors(const qa_actor_id *borrowed, size_t count) {
+  qa_actor_id *owned = malloc((count ? count : 1) * sizeof *owned);
+  if (owned == NULL) qa_range_error("out of memory");
+  if (count) memcpy(owned, borrowed, count * sizeof *owned);
+  return owned;
+}
 static double slot_get(qa_q3_base_player_state_slots *s, double i) { return qa_q3_base_player_state_slots_get(s, (size_t)i); }
 
 static qa_q3_game_client *client_for(qa_q3_game_entity *entity) {
-  if (entity->client == NULL) qa_range_error("ClientThink requires a game client");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "ClientThink requires a game client");
   return entity->client;
 }
 static bool overlap(qa_bounds a, qa_bounds b) {
@@ -77,7 +90,11 @@ void qa_q3_ta_client_think_runtime_touch_triggers(qa_q3_ta_client_think_runtime 
   qa_vec3 max2 = qa_add3(qa_q3_base_player_state_record_origin(ps), range);
   qa_bounds area = {min2, max2};
   size_t count = 0;
-  const qa_actor_id *touches = r->host.spatial->area_actors(r->host.spatial->ctx, area, QA_Q3_MAX_GENTITIES, &count);
+  /* Two statements: the count is only known after the query returns (C argument order is unspecified). */
+  const qa_actor_id *borrowed = r->host.spatial->area_actors(r->host.spatial->ctx, area, QA_Q3_MAX_GENTITIES, &count);
+  qa_actor_id *touches = own_actors(borrowed, count);
+  qa_cleanup touches_node;
+  qa_cleanup_push(&touches_node, free, touches);
   qa_vec3 origin = qa_q3_base_player_state_record_origin(ps);
   qa_vec3 mins = qa_q3_base_entity_shared_mins(&entity->r);
   qa_vec3 maxs = qa_q3_base_entity_shared_maxs(&entity->r);
@@ -100,6 +117,8 @@ void qa_q3_ta_client_think_runtime_touch_triggers(qa_q3_ta_client_think_runtime 
     if ((qa_js_to_int32(entity->r.sv_flags) & QA_Q3_BASE_SVF_BOT) != 0 && entity->touch.fn != NULL)
       r->host.touches.touch(r->host.touches.ctx, self, actor);
   }
+  qa_cleanup_pop(&touches_node);
+  free(touches);
   if (ps->jumppad_frame != ps->pmove_framecount) { ps->jumppad_frame = 0; ps->jumppad_ent = 0; }
 }
 
@@ -182,6 +201,9 @@ void qa_q3_ta_client_think_runtime_client_think_real(qa_q3_ta_client_think_runti
       QA_Q3_TA_MOVEMENT_LITERAL_THINK};
   qa_q3_ta_client_movement_result movement =
       r->host.movement.move_client(r->host.movement.ctx, entity, movement_command, options);
+  qa_actor_id *contacts = own_actors(movement.contacts, movement.contact_count);
+  qa_cleanup contacts_node;
+  qa_cleanup_push(&contacts_node, free, contacts);
   if (ps->event_sequence != old_event_sequence) entity->event_time = frame.time;
   if (settings.smooth_clients) qa_q3_game_player_state_to_entity_state(ps, &entity->s, true, true, ps->command_time);
   else qa_q3_game_player_state_to_entity_state(ps, &entity->s, true, false, 0);
@@ -196,7 +218,9 @@ void qa_q3_ta_client_think_runtime_client_think_real(qa_q3_ta_client_think_runti
   qa_q3_base_entity_shared_with_current_origin(&entity->r, entity->s.pos.base, &linked, client_think_link);
   qa_q3_base_entity_shared_set_current_origin(&entity->r, qa_q3_base_player_state_record_origin(ps));
   r->host.bot_test_aas(r->host.ctx, qa_q3_base_entity_shared_current_origin(&entity->r));
-  qa_q3_ta_client_think_runtime_client_impacts(r, entity, movement.contacts, movement.contact_count);
+  qa_q3_ta_client_think_runtime_client_impacts(r, entity, contacts, movement.contact_count);
+  qa_cleanup_pop(&contacts_node);
+  free(contacts);
   if (ps->event_sequence != old_event_sequence) entity->event_time = frame.time;
   client->old_buttons = client->buttons;
   client->buttons = command->buttons;

@@ -107,6 +107,8 @@ typedef struct qa_current_original_pickup {
   qa_original_pickup_rule captured;
   qa_pickup_write write;
   bool (*current)(void *ctx);
+  /* Releases ctx when the holder drops the match (TS: the closure is collected); NULL when nothing to release. */
+  void (*release)(void *ctx);
 } qa_current_original_pickup;
 
 typedef struct qa_original_pickup_resolution {

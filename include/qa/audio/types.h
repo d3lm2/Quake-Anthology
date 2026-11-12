@@ -129,6 +129,10 @@ typedef struct qa_sound_channel_command {
 /* Aborts with the TS RangeError on an invalid channel. */
 qa_sound_channel_command qa_source_sound_channel(qa_sound_family family,
                                                  int64_t channel);
+/* TS sourceSoundChannel over a JS number: any value, Number.isInteger checked
+ * (a huge integral channel is an extension name, never an int64 cast). */
+qa_sound_channel_command qa_source_sound_channel_number(qa_sound_family family,
+                                                        double channel);
 
 typedef enum qa_audio_voice_event_kind {
   QA_AUDIO_VOICE_EVENT_START,

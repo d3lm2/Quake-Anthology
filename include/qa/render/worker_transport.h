@@ -21,8 +21,9 @@
  * transport then releases it after copying. size 0 with NULL bytes is undefined. */
 typedef struct qa_rwt_value { const void *bytes; size_t size; void *owned; } qa_rwt_value;
 void qa_rwt_value_release(qa_rwt_value *value);
-/* Error objects live until qa_rwt_destroy; pointer equality is TS identity. */
-typedef struct qa_rwt_error { char name[64]; char message[1024]; struct qa_rwt_error *next; } qa_rwt_error;
+/* Error objects live until qa_rwt_destroy; pointer equality is TS identity.
+ * message is the whole TS error.message (heap, owned by the error). */
+typedef struct qa_rwt_error { char name[64]; char *message; struct qa_rwt_error *next; } qa_rwt_error;
 typedef struct qa_rwt_transport qa_rwt_transport;
 typedef struct qa_rwt_host {
   void *ctx;
@@ -31,9 +32,18 @@ typedef struct qa_rwt_host {
   bool (*completed)(void *ctx, qa_rwt_value payload, qa_rwt_error **error);
   void (*failed)(void *ctx, qa_rwt_error *error); /* optional */
 } qa_rwt_host;
-/* Worker-side failure (TS Failure union), passed across threads by value. */
-typedef struct qa_rwt_failure { bool is_host; int64_t token; char name[64]; char message[1024]; } qa_rwt_failure;
+/* Worker-side failure (TS Failure union), passed across threads. message is the
+ * whole TS error.message: heap text owned by the failure (NULL for a host token or
+ * an unset failure). Start every failure zeroed; a by-value copy moves the text, so
+ * the source must forget it (qa_rwt_failure_move) or be duplicated (_copy). */
+typedef struct qa_rwt_failure { bool is_host; int64_t token; char name[64]; char *message; } qa_rwt_failure;
+/* Replaces the failure, releasing any text it held. */
 void qa_rwt_failure_set(qa_rwt_failure *failure, const char *name, const char *message);
+/* *to = *from, releasing what *to held; *from is left zeroed. */
+void qa_rwt_failure_move(qa_rwt_failure *to, qa_rwt_failure *from);
+/* *to = a copy of *from, releasing what *to held. */
+void qa_rwt_failure_copy(qa_rwt_failure *to, const qa_rwt_failure *from);
+void qa_rwt_failure_release(qa_rwt_failure *failure);
 typedef struct qa_rwt_worker qa_rwt_worker;
 /* TS RenderWorkerRuntime. Everything here runs on the worker thread. */
 typedef struct qa_rwt_runtime {
@@ -52,6 +62,9 @@ bool qa_rwt_worker_request(qa_rwt_worker *worker, qa_rwt_value payload, qa_rwt_v
  * qa_rwt_destroy. Invalid timeouts abort, as the TS RangeError precedes any worker. */
 bool qa_rwt_open(qa_rwt_transport **out, qa_rwt_initialize_fn initialize, void *initialize_ctx, qa_rwt_value initialization, qa_rwt_host host, double timeout_milliseconds, qa_rwt_error **error);
 qa_rwt_error *qa_rwt_error_new(qa_rwt_transport *transport, const char *name, const char *message);
+/* TS restoreFailure keeps error.name whatever it is. qa_raise wants static text, so this returns one
+ * process-lifetime copy per distinct name (thread safe). */
+const char *qa_rwt_error_class(const char *name);
 bool qa_rwt_active(const qa_rwt_transport *transport);
 bool qa_rwt_settled(const qa_rwt_transport *transport);
 bool qa_rwt_retired(const qa_rwt_transport *transport);

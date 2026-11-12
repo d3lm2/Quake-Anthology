@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 #include "qa/app/bootstrap/config_scripts.h"
+#include "qa/app/bootstrap/cvar_archives.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/input/device_settings.h"
 #include "qa/input/source_input.h"
@@ -252,31 +254,19 @@ void qa_app_input_devices_frame(qa_app_input_devices *devices, double now) {
 
 void qa_app_input_devices_info(qa_app_input_devices *devices) { qa_source_midi_input_info(devices->midi); }
 
-/* JSON.stringify string escaping over byte text. */
+/* JSON.stringify of a cvar name or value (qa_app_cvar_json_string: the UTF-8 TS's store.dump writes). */
 static void json_string(char **text, size_t *length, size_t *capacity, const char *value) {
-  size_t need = strlen(value) * 6 + 3;
+  char *quoted = qa_app_cvar_json_string(value);
+  size_t need = strlen(quoted);
   if (*length + need + 1 > *capacity) {
     size_t next = (*length + need + 1) * 2;
     char *grown = realloc(*text, next);
-    if (grown == NULL) qa_range_error("Out of memory");
+    if (grown == NULL) { free(quoted); qa_range_error("Out of memory"); }
     *text = grown; *capacity = next;
   }
-  char *out = *text + *length;
-  *out++ = '"';
-  for (const unsigned char *at = (const unsigned char *)value; *at != '\0'; at++) {
-    unsigned char c = *at;
-    if (c == '"' || c == '\\') { *out++ = '\\'; *out++ = (char)c; }
-    else if (c == '\b') { *out++ = '\\'; *out++ = 'b'; }
-    else if (c == '\f') { *out++ = '\\'; *out++ = 'f'; }
-    else if (c == '\n') { *out++ = '\\'; *out++ = 'n'; }
-    else if (c == '\r') { *out++ = '\\'; *out++ = 'r'; }
-    else if (c == '\t') { *out++ = '\\'; *out++ = 't'; }
-    else if (c < 0x20) out += sprintf(out, "\\u%04x", c);
-    else *out++ = (char)c;
-  }
-  *out++ = '"';
-  *out = '\0';
-  *length = (size_t)(out - *text);
+  memcpy(*text + *length, quoted, need + 1);
+  *length += need;
+  free(quoted);
 }
 
 static void append_raw(char **text, size_t *length, size_t *capacity, const char *value) {
@@ -316,7 +306,7 @@ void qa_app_input_devices_save(qa_app_input_devices *devices) {
   qa_app_cvar_archive_entries_free(entries, count);
   bool saved = qa_config_store_dump(devices->store, "cvars/input/devices.json", text);
   free(text);
-  if (!saved) qa_input_error("Could not write cvars/input/devices.json");
+  if (!saved) qa_settings_raise_write_failure();
 }
 
 /* --- bindings() --- */
@@ -404,10 +394,11 @@ static const qa_ui_choice *midi_choices(void *ctx, size_t *out_count) {
   qa_caught_error caught;
   if (!qa_try(list_devices, &list, &caught)) {
     /* TS `${String(error)}`: "<name>: <message>". */
-    size_t length = strlen(caught.name) + strlen(caught.message) + 40;
+    const char *message = qa_caught_message(&caught);
+    size_t length = strlen(caught.name) + strlen(message) + 40;
     char *line = malloc(length);
     if (line == NULL) qa_range_error("Out of memory");
-    snprintf(line, length, "MIDI devices unavailable: %s: %s\n", caught.name, caught.message);
+    snprintf(line, length, "MIDI devices unavailable: %s: %s\n", caught.name, message);
     row->devices->print(row->devices->print_ctx, line);
     free(line);
     *out_count = 0;

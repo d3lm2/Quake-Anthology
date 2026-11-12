@@ -10,6 +10,7 @@
 #include "qa/foundation/support.h"
 #include "qa/network/common/session.h"
 #include "qa/persistence/recipe.h"
+#include "qa/persistence/save_image.h"
 #include "qa/persistence/shared.h"
 #include "qa/foundation/js.h"
 static void *xmalloc(size_t size) {
@@ -143,17 +144,19 @@ static void json_escape(buffer *b, const char *text) {
   }
   buffer_add_char(b, '"');
 }
+/* network/common/session.ts canonical(): Object.is(value, -0) ? "-0" : String(value). */
 static void json_number(buffer *b, double value) {
   if (!isfinite(value)) qa_range_error("Composition identity contains a non-finite number");
   char text[40];
-  qa_net_json_number(value, text, sizeof text);
+  if (value == 0 && signbit(value)) snprintf(text, sizeof text, "-0");
+  else qa_net_js_number(value, text, sizeof text);
   buffer_add(b, text);
 }
 static int compare_entries(const void *a, const void *b) {
   return strcmp(((const qa_save_entry *)a)->key, ((const qa_save_entry *)b)->key);
 }
 static void canonical(buffer *b, const qa_save_value *value) {
-  if (!value) qa_range_error("Composition identity contains a non-serializable value");
+  if (!value) qa_raise("TypeError", 0, 0, "Composition identity contains a non-serializable value");
   switch (value->kind) {
     case QA_SAVE_NULL: buffer_add(b, "null"); return;
     case QA_SAVE_BOOLEAN: buffer_add(b, value->boolean ? "true" : "false"); return;
@@ -183,7 +186,7 @@ static void canonical(buffer *b, const qa_save_value *value) {
       return;
     }
     default:
-      qa_range_error("Composition identity contains a non-serializable value");
+      qa_raise("TypeError", 0, 0, "Composition identity contains a non-serializable value");
   }
 }
 static char *canonical_text(const qa_save_value *value) {
@@ -424,7 +427,7 @@ static const char *rebind_plan(rebind_state *state, const char *id) {
 static qa_save_value *rebind_mount_for(rebind_state *state, const char *id) {
   for (size_t i = 0; i < state->mount_count; i++)
     if (strcmp(state->mounts[i].old_id, id) == 0) return state->mounts[i].mount;
-  qa_range_error("Unified reference uses an undeclared mount");
+  qa_raise("Error", 0, 0, "Unified reference uses an undeclared mount");
 }
 static void validate_path(const char *value) {
   char *normalized = qa_normalize_resource_path(value);
@@ -444,8 +447,8 @@ static void rebind_order(rebind_state *state, qa_save_value *list) {
   for (size_t i = 0; i < list->item_count; i++)
     for (size_t j = i + 1; j < list->item_count; j++)
       if (strcmp(text_of(list->items[i]), text_of(list->items[j])) == 0)
-        qa_range_error("Unified mount order must include every mount once");
-  if (list->item_count != state->mount_count) qa_range_error("Unified mount order must include every mount once");
+        qa_raise("Error", 0, 0, "Unified mount order must include every mount once");
+  if (list->item_count != state->mount_count) qa_raise("Error", 0, 0, "Unified mount order must include every mount once");
   for (size_t i = 0; i < list->item_count; i++) {
     qa_save_value *mount = rebind_mount_for(state, text_of(list->items[i]));
     qa_save_value *id = qa_save_value_string(text_of(object_get(object_get(mount, "identity"), "id")));
@@ -467,7 +470,7 @@ static void rebind_resource(rebind_state *state, qa_save_value *resource) {
   const char *mount_kind = text_of(object_get(mount, "kind"));
   bool same = (strcmp(kind, "archive") == 0 && strcmp(mount_kind, "archive") == 0)
       || (strcmp(kind, "loose") == 0 && strcmp(mount_kind, "loose") == 0);
-  if (!same) qa_range_error("Unified resource mount kind differs");
+  if (!same) qa_raise("Error", 0, 0, "Unified resource mount kind differs");
   if (strcmp(text_of(object_get(resolution, "kind")), "link") == 0) {
     validate_prefix(text_of(object_get(resolution, "sourcePrefix")));
     validate_path(text_of(object_get(resolution, "targetPath")));
@@ -488,7 +491,7 @@ static void normalize_body(qa_save_value *recipe, rebind_state *state) {
     qa_save_value *identity = object_get(mount, "identity");
     const char *old_id = text_of(object_get(identity, "id"));
     for (size_t j = 0; j < state->mount_count; j++)
-      if (strcmp(state->mounts[j].old_id, old_id) == 0) qa_range_error("Repeated unified mount identity");
+      if (strcmp(state->mounts[j].old_id, old_id) == 0) qa_raise("Error", 0, 0, "Repeated unified mount identity");
     state->mounts[state->mount_count].old_id = copy_text(old_id);
     state->mounts[state->mount_count].mount = mount;
     state->mount_count++;
@@ -622,15 +625,41 @@ void qa_app_unified_composition_destroy(qa_app_unified_composition *composition)
   free(composition);
 }
 typedef struct read_scope {
+  qa_save_value *recipe;
   qa_app_unified_map_sidecar *sidecars;
   qa_app_unified_composition *identity;
   char *parsed;
 } read_scope;
 static void read_scope_free(void *arg) {
   read_scope *scope = arg;
+  qa_save_value_free(scope->recipe);
   free(scope->sidecars);
   qa_app_unified_composition_destroy(scope->identity);
   free(scope->parsed);
+}
+static void cleanup_recipe(void *arg) { qa_executable_recipe_free(arg); }
+/* TS readRecipe's value as a tree: only the fields the reader keeps (an offered recipe with
+ * extra fields digests as the parsed one). readRecipe keeps a present "mods" or
+ * "weaponBehaviors" list even when empty; the recipe writer omits empty ones. */
+static qa_save_value *parsed_recipe_tree(qa_save_reader *recipe_reader) {
+  qa_executable_recipe checked = qa_read_recipe(recipe_reader);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, cleanup_recipe, &checked);
+  qa_save_value *tree = qa_save_recipe_value(&checked);
+  qa_cleanup_pop(&guard);
+  qa_executable_recipe_free(&checked);
+  if (!tree) qa_range_error("out of memory");
+  static const char *const optional_lists[] = {"mods", "weaponBehaviors"};
+  for (size_t i = 0; i < 2; i++)
+    if (qa_save_value_get(recipe_reader->value, optional_lists[i]) && !qa_save_value_get(tree, optional_lists[i])) {
+      qa_save_value *empty = qa_save_value_array();
+      if (!empty || !qa_save_value_set(tree, optional_lists[i], empty)) {
+        qa_save_value_free(empty);
+        qa_save_value_free(tree);
+        qa_range_error("out of memory");
+      }
+    }
+  return tree;
 }
 qa_app_unified_composition *qa_app_unified_read_composition(const qa_save_value *value) {
   qa_save_reader reader;
@@ -644,25 +673,29 @@ qa_app_unified_composition *qa_app_unified_read_composition(const qa_save_value 
   if (qa_save_reader_list_count(&f) != 0)
     qa_save_reader_fail(&composition, "actor configurations are negotiated by frame");
   qa_save_reader recipe_reader = field_of(&composition, "recipe");
-  /* TS readRecipe: the checked recipe; only its validation is needed here, the tree carries on. */
-  qa_executable_recipe checked = qa_read_recipe(&recipe_reader);
-  qa_executable_recipe_free(&checked);
   read_scope scope;
   memset(&scope, 0, sizeof scope);
   qa_cleanup guard;
   qa_cleanup_push(&guard, read_scope_free, &scope);
+  /* TS readRecipe: the parsed recipe, not the offered tree, is composed and digested. */
+  scope.recipe = parsed_recipe_tree(&recipe_reader);
   f = field_of(&composition, "sidecars");
   size_t sidecar_count = read_sidecars(&f, &scope.sidecars);
-  scope.identity = qa_app_unified_create_composition(recipe_reader.value, scope.sidecars, sidecar_count);
-  /* compositionIdentity({...identity.composition, recipe}): the offered recipe must already be
+  scope.identity = qa_app_unified_create_composition(scope.recipe, scope.sidecars, sidecar_count);
+  /* compositionIdentity({...identity.composition, recipe}): the parsed recipe must already be
    * the normalized one. */
-  scope.parsed = composition_digest(recipe_reader.value, scope.identity->sidecar_tree);
-  f = field_of(&reader, "digest");
-  const char *digest = qa_read_digest(&f);
-  if (strcmp(scope.parsed, scope.identity->digest) != 0 || strcmp(digest, scope.identity->digest) != 0)
-    qa_save_reader_fail(&reader, "noncanonical or mismatched unified composition");
+  scope.parsed = composition_digest(scope.recipe, scope.identity->sidecar_tree);
+  /* TS `parsed.digest !== identity.digest || readDigest(...) !== identity.digest`: the
+   * offered digest is read only when the recomputed one matches. */
+  bool mismatched = strcmp(scope.parsed, scope.identity->digest) != 0;
+  if (!mismatched) {
+    f = field_of(&reader, "digest");
+    mismatched = strcmp(qa_read_digest(&f), scope.identity->digest) != 0;
+  }
+  if (mismatched) qa_save_reader_fail(&reader, "noncanonical or mismatched unified composition");
   qa_cleanup_pop(&guard);
   qa_app_unified_composition *identity = scope.identity;
+  qa_save_value_free(scope.recipe);
   free(scope.sidecars);
   free(scope.parsed);
   return identity;
@@ -839,20 +872,26 @@ qa_save_value *qa_app_unified_resolve_composition(
   const char *plan_id = text_of(object_get(plan, "id"));
   qa_save_value *references[1] = {object_get(map, "geometry")};
   size_t total = 1 + list->item_count + execution->item_count;
+#define REFERENCE_AT(k) ((k) == 0 ? references[0] \
+      : (k) <= list->item_count ? list->items[(k) - 1] \
+      : object_get(execution->items[(k) - 1 - list->item_count], "artifact"))
   for (size_t i = 0; i < total; i++) {
-    qa_save_value *resource = i == 0 ? references[0]
-        : i <= list->item_count ? list->items[i - 1]
-        : object_get(execution->items[i - 1 - list->item_count], "artifact");
+    qa_save_value *resource = REFERENCE_AT(i);
     if (!resource) continue;
     const char *id = text_of(object_get(resource, "id"));
     bool seen = false;
     for (size_t j = 0; j < i && !seen; j++) {
-      qa_save_value *earlier = j == 0 ? references[0]
-          : j <= list->item_count ? list->items[j - 1]
-          : object_get(execution->items[j - 1 - list->item_count], "artifact");
+      qa_save_value *earlier = REFERENCE_AT(j);
       if (earlier && strcmp(text_of(object_get(earlier, "id")), id) == 0) seen = true;
     }
     if (seen) continue;
+    /* new Map(references.map(r => [r.id, r])).values(): a repeated id keeps its first
+     * position but holds the last reference with that id. */
+    for (size_t j = i + 1; j < total; j++) {
+      qa_save_value *later = REFERENCE_AT(j);
+      if (later && strcmp(text_of(object_get(later, "id")), id) == 0) resource = later;
+    }
+#undef REFERENCE_AT
     host->plan_read(host->ctx, resource);
     qa_save_value *resolution = object_get(resource, "resolution");
     if (strcmp(text_of(object_get(resolution, "plan")), plan_id) == 0) {

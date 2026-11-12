@@ -46,7 +46,7 @@ void qa_q2rm_update_monster_beam(qa_q2_entity *beam, qa_q2_game_services *game, 
     } else if (damage && beam->damage < 0 && combat.has_value && entity && combat.value.health < entity->max_health) {
       double healed = combat.value.health - beam->damage;
       qa_gameplay_authority_set_health(game->host->combat, entity->actor,
-                                    healed < entity->max_health ? healed : entity->max_health);
+                                    qa_js_min(entity->max_health, healed));
     }
     if (!game->host->is_monster(game->host->ctx, target) && !game->host->is_player(game->host->ctx, target)) {
       if (damage) q2rm_emit_effect(game, "q2:laser-sparks", trace.end, normal, 10, beam->skin);

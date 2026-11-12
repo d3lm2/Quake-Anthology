@@ -84,6 +84,9 @@ typedef struct qa_script_completion {
   qa_command_context source; /* origin chain owned */
   qa_script_result_kind result;
   char *error_message; /* owned, failed only */
+  /* Failed only: the read error's class (TS rethrows event.result.error as it was thrown); static text, NULL is
+   * "Error". */
+  const char *error_name;
   qa_command_buffer *buffer; /* internal: frees the origin chain */
 } qa_script_completion;
 void qa_script_completion_free(qa_script_completion *event);
@@ -91,7 +94,9 @@ void qa_script_completion_free(qa_script_completion *event);
 /* Synchronous readScript result (see header note). For READY, text
  * is a malloc'd script body or NULL for TS undefined (missing file);
  * has_text distinguishes them. For PENDING, poll is re-called until
- * it reports a settled kind. For FAILED, error_message is set. */
+ * it reports a settled kind. For FAILED, error_message is set (the TS
+ * error.message) and error_name names its class (static text, NULL is
+ * "Error"), so a completion handler rethrows what the read threw. */
 typedef enum qa_script_read_kind {
   QA_SCRIPT_READ_READY, QA_SCRIPT_READ_PENDING, QA_SCRIPT_READ_FAILED
 } qa_script_read_kind;
@@ -100,6 +105,11 @@ typedef struct qa_script_read_result {
   bool has_text;
   char *text;
   char *error_message;
+  const char *error_name;
+  /* READY text is a TS string held as UTF-8 (a TextDecoder result, U+0000 as C0 80 or a raw 0) rather than console
+   * text: the insertion applies sourceCommandText (cut at U+0000; a character above U+00FF throws RangeError after
+   * the "execing" line). */
+  bool text_utf8;
   void *poll_ctx;
   struct qa_script_read_result (*poll)(void *poll_ctx);
   void (*cancel)(void *poll_ctx);
@@ -123,6 +133,20 @@ typedef void (*qa_script_complete_fn)(void *ctx, const qa_script_completion *eve
 typedef bool (*qa_allow_command_fn)(void *ctx, qa_command_invocation *command);
 /* TS (command, registered) => boolean | undefined; -1 = undefined. */
 typedef int (*qa_source_command_fn)(void *ctx, qa_command_invocation *command, bool registered);
+
+/* TS LocalForm: `bind -local`, `unbind -local` or `set -local` (also seta, setu,
+ * sets) after the flag is removed. args are the arguments after the command
+ * name, without `-local`; borrowed for the call. */
+typedef enum qa_local_form_command {
+  QA_LOCAL_FORM_BIND, QA_LOCAL_FORM_UNBIND, QA_LOCAL_FORM_SET
+} qa_local_form_command;
+typedef struct qa_local_form {
+  qa_local_form_command command;
+  const char *const *args;
+  size_t arg_count;
+  qa_command_context source;
+} qa_local_form;
+typedef void (*qa_local_form_fn)(void *ctx, const qa_local_form *form);
 
 typedef struct qa_command_buffer_options {
   qa_command_dialect dialect;
@@ -154,6 +178,10 @@ typedef struct qa_command_buffer_options {
   double max_command_length; /* <= 0 selects the TS default */
   bool builtins;             /* default true; set builtins_set false */
   bool builtins_set;
+  /* TS localForm: told of a local form after the flag is removed; the command
+   * then runs as the plain form. NULL when absent. */
+  qa_local_form_fn local_form;
+  void *local_form_ctx;
 } qa_command_buffer_options;
 
 /* NULL only on OOM; invalid profiles abort as the TS throws. */
@@ -275,6 +303,13 @@ void qa_command_buffer_append_preparation(qa_command_buffer *buffer, const char 
                                           const qa_command_context *source, int dialect);
 void qa_command_buffer_insert(qa_command_buffer *buffer, const char *text,
                               const qa_command_context *source, int dialect);
+/* append(text) / insert(text) of a TS string held as UTF-8 (a TextDecoder result, U+0000 as C0 80): cut at its first
+ * U+0000 and converted to console text; a character above U+00FF drops it with the print "Command text requires
+ * source bytes" (TS sourceText). */
+void qa_command_buffer_append_decoded(qa_command_buffer *buffer, const char *utf8,
+                                      const qa_command_context *source, int dialect);
+void qa_command_buffer_insert_decoded(qa_command_buffer *buffer, const char *utf8,
+                                      const qa_command_context *source, int dialect);
 void qa_command_buffer_copy_to_defer(qa_command_buffer *buffer);
 void qa_command_buffer_insert_from_defer(qa_command_buffer *buffer);
 double qa_command_buffer_execute(qa_command_buffer *buffer);

@@ -89,8 +89,9 @@ static void emit_message(qa_q1_services *game, qa_actor_id player, const char *t
 void qa_q1mp_runes_frame(qa_q1mp_rogue_runes *runes, qa_actor_id actor) {
   qa_q1_services *game = runes->game;
   qa_q1_actor *world = game->world;
-  const double gamecfg = runes->gamecfg != NULL ? runes->gamecfg(runes->gamecfg_ctx) : 0;
-  if (game->options.deathmatch != 0 && (bits(gamecfg) & 1) != 0 && world != NULL && qa_q1_actor_number(world, "rogue:runes_spawned") == 0) {
+  /* TS reads gamecfg only in deathmatch. */
+  if (game->options.deathmatch != 0 && (bits(runes->gamecfg != NULL ? runes->gamecfg(runes->gamecfg_ctx) : 0) & 1) != 0 && world != NULL &&
+      qa_q1_actor_number(world, "rogue:runes_spawned") == 0) {
     qa_q1mp_world_number(world, "rogue:runes_spawned", 1);
     qa_q1mp_world_later(game, qa_q1_create(game, "rogue_rune_spawner", NULL, NULL), 0.1, "rogue:rune_spawn");
   }

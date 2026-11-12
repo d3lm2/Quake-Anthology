@@ -1,6 +1,7 @@
 /* Port of src/persistence/execution.ts. GPL-2.0-or-later. */
 #include "qa/persistence/execution.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -76,6 +77,29 @@ static int64_t field_bigint(const qa_save_reader *reader, const char *name) {
   int64_t value = qa_save_reader_bigint(&f);
   qa_save_reader_destroy(&f);
   return value;
+}
+/* The checkpoint qa_read_guest is filling: a bigint read into one of its fields that lies
+ * outside int64 is listed with its saved text (TS keeps any bigint). */
+static _Thread_local qa_guest_checkpoint *wide_target;
+static void note_wide(const qa_save_reader *reader, const int64_t *dest) {
+  if (wide_target == NULL) return;
+  const char *text = qa_save_reader_bigint_text(reader);
+  errno = 0;
+  (void)strtoll(text, NULL, 10);
+  if (errno != ERANGE) return;
+  qa_guest_wide_bigint *grown = (qa_guest_wide_bigint *)realloc(
+      (void *)wide_target->wide_bigints, (wide_target->wide_bigint_count + 1) * sizeof *grown);
+  if (grown == NULL) qa_save_reader_fail(reader, "out of memory");
+  grown[wide_target->wide_bigint_count] = (qa_guest_wide_bigint){dest, text};
+  wide_target->wide_bigints = grown;
+  wide_target->wide_bigint_count++;
+}
+/* `*dest = reader.field(name).bigint()` into a checkpoint field. */
+static void field_bigint_into(const qa_save_reader *reader, const char *name, int64_t *dest) {
+  qa_save_reader f = field(reader, name);
+  *dest = qa_save_reader_bigint(&f);
+  note_wide(&f, dest);
+  qa_save_reader_destroy(&f);
 }
 static qa_byte_view field_bytes(const qa_save_reader *reader, const char *name) {
   qa_save_reader f = field(reader, name);
@@ -173,6 +197,28 @@ static qa_guest_storage read_storage(const qa_save_reader *reader) {
       "uint32", "int64", "uint64", "float32", "float64", "pointer"};
   return qa_save_reader_choice_string(reader, storages, 11);
 }
+/* Releases what qa_read_layout / read_value_layout / read_callback allocate (field and
+ * parameter arrays, nested aggregate layouts); zeroed values release nothing. */
+static void layout_release(qa_guest_layout *layout) {
+  free((void *)layout->fields);
+  layout->fields = NULL;
+  layout->field_count = 0;
+}
+static void value_layout_release(qa_guest_value_layout *layout) {
+  if (layout->is_aggregate) layout_release(&layout->layout);
+}
+static void binding_release(qa_saved_guest_callback_binding *binding) {
+  qa_guest_value_layout *parameters = (qa_guest_value_layout *)binding->parameters;
+  for (size_t i = 0; i < binding->parameter_count; i++) value_layout_release(&parameters[i]);
+  free(parameters);
+  binding->parameters = NULL;
+  binding->parameter_count = 0;
+  if (!binding->result_is_void) value_layout_release(&binding->result);
+}
+static void binding_unwind(void *arg) { binding_release((qa_saved_guest_callback_binding *)arg); }
+static void checkpoint_unwind(void *arg) { qa_guest_checkpoint_release((qa_guest_checkpoint *)arg); }
+static void restore_wide_target(void *arg) { wide_target = (qa_guest_checkpoint *)arg; }
+
 qa_guest_layout qa_read_layout(const qa_save_reader *reader) {
   static const double pointer_bytes[] = {4, 8};
   qa_guest_layout layout;
@@ -187,6 +233,9 @@ qa_guest_layout qa_read_layout(const qa_save_reader *reader) {
   qa_guest_field_layout *values =
       count > 0 ? (qa_guest_field_layout *)malloc(count * sizeof *values) : NULL;
   if (count > 0 && values == NULL) qa_save_reader_fail(&fields, "out of memory");
+  /* A malformed field raises with the array released. */
+  qa_cleanup values_node;
+  qa_cleanup_push(&values_node, free, values);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader entry = item(&fields, i);
     values[i].name = field_string(&entry, "name");
@@ -197,6 +246,7 @@ qa_guest_layout qa_read_layout(const qa_save_reader *reader) {
     values[i].count = field_integer_min(&entry, "count", 0);
     qa_save_reader_destroy(&entry);
   }
+  qa_cleanup_pop(&values_node);
   qa_save_reader_destroy(&fields);
   layout.fields = values;
   layout.field_count = count;
@@ -262,23 +312,27 @@ static qa_saved_guest_callback_binding read_callback(const qa_save_reader *reade
   qa_save_reader parameters = field(reader, "parameters");
   size_t count = qa_save_reader_list_count(&parameters);
   qa_guest_value_layout *values =
-      count > 0 ? (qa_guest_value_layout *)malloc(count * sizeof *values) : NULL;
+      count > 0 ? (qa_guest_value_layout *)calloc(count, sizeof *values) : NULL;
   if (count > 0 && values == NULL) qa_save_reader_fail(&parameters, "out of memory");
+  /* Attached before reading: a raise releases the parameters read so far. */
+  binding.parameters = values;
+  binding.parameter_count = count;
+  qa_cleanup binding_node;
+  qa_cleanup_push(&binding_node, binding_unwind, &binding);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader entry = item(&parameters, i);
     values[i] = read_value_layout(&entry);
     qa_save_reader_destroy(&entry);
   }
   qa_save_reader_destroy(&parameters);
-  binding.parameters = values;
-  binding.parameter_count = count;
   qa_save_reader result = field(reader, "result");
   const qa_save_value *raw = result.value;
-  if (raw != NULL && raw->kind == QA_SAVE_STRING && strcmp(raw->text, "void") == 0)
+  if (raw != NULL && raw->kind == QA_SAVE_STRING && strcmp(raw->text, "void") == 0 && raw->text_length == 0)
     binding.result_is_void = true;
   else
     binding.result = read_value_layout(&result);
   qa_save_reader_destroy(&result);
+  qa_cleanup_pop(&binding_node);
   return binding;
 }
 static qa_guest_private_state read_private(const qa_save_reader *reader) {
@@ -350,11 +404,11 @@ static void *heap_calloc(const qa_save_reader *reader, size_t count, size_t size
   if (memory == NULL) qa_save_reader_fail(reader, "out of memory");
   return memory;
 }
-static int64_t item_bigint(const qa_save_reader *reader, size_t index) {
+static void item_bigint_into(const qa_save_reader *reader, size_t index, int64_t *dest) {
   qa_save_reader entry = item(reader, index);
-  int64_t value = qa_save_reader_bigint(&entry);
+  *dest = qa_save_reader_bigint(&entry);
+  note_wide(&entry, dest);
   qa_save_reader_destroy(&entry);
-  return value;
 }
 static double item_integer_min(const qa_save_reader *reader, size_t index, double minimum) {
   qa_save_reader entry = item(reader, index);
@@ -367,6 +421,7 @@ static bool field_nullable_bigint(const qa_save_reader *reader, const char *name
   qa_save_reader f = field(reader, name);
   bool present = !qa_save_reader_is_null(&f);
   *out = present ? qa_save_reader_bigint(&f) : 0;
+  if (present) note_wide(&f, out);
   qa_save_reader_destroy(&f);
   return present;
 }
@@ -379,7 +434,7 @@ static void read_windows_tables(const qa_save_reader *windows, heap_build *build
     int64_t *values = heap_calloc(&list, count, sizeof *values);
     tables->heaps = values;
     tables->heap_count = count;
-    for (size_t i = 0; i < count; i++) values[i] = item_bigint(&list, i);
+    for (size_t i = 0; i < count; i++) item_bigint_into(&list, i, &values[i]);
     qa_save_reader_destroy(&list);
   }
   {
@@ -390,7 +445,7 @@ static void read_windows_tables(const qa_save_reader *windows, heap_build *build
     tables->reservation_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&list, i);
-      values[i].base = field_bigint(&entry, "base");
+      field_bigint_into(&entry, "base", &values[i].base);
       values[i].size = field_integer_min(&entry, "size", 1);
       qa_save_reader_destroy(&entry);
     }
@@ -448,7 +503,7 @@ static const qa_native_guest_heap_image *read_native_heap(const qa_save_reader *
     image->layout_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader mapping = item(&list, i);
-      values[i].base = field_bigint(&mapping, "base");
+      field_bigint_into(&mapping, "base", &values[i].base);
       values[i].byte_length = field_integer_min(&mapping, "byteLength", 1);
       values[i].permissions = field_region_permissions(&mapping, "permissions");
       values[i].label = field_string(&mapping, "label");
@@ -465,8 +520,8 @@ static const qa_native_guest_heap_image *read_native_heap(const qa_save_reader *
     image->allocator.hint_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader hint = item(&list, i);
-      values[i].alignment = field_bigint(&hint, "alignment");
-      values[i].base = field_bigint(&hint, "base");
+      field_bigint_into(&hint, "alignment", &values[i].alignment);
+      field_bigint_into(&hint, "base", &values[i].base);
       values[i].byte_length = field_integer_min(&hint, "byteLength", 1);
       qa_save_reader_destroy(&hint);
     }
@@ -482,7 +537,7 @@ static const qa_native_guest_heap_image *read_native_heap(const qa_save_reader *
     image->allocator.slab_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader slab = item(&list, i);
-      values[i].base = field_bigint(&slab, "base");
+      field_bigint_into(&slab, "base", &values[i].base);
       values[i].used = field_bytes(&slab, "used");
       values[i].next = field_integer_min(&slab, "next", 0);
       qa_save_reader_destroy(&slab);
@@ -509,9 +564,9 @@ static const qa_native_guest_heap_image *read_native_heap(const qa_save_reader *
     image->block_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader block = item(&list, i);
-      values[i].base = field_bigint(&block, "base");
+      field_bigint_into(&block, "base", &values[i].base);
       values[i].size = field_integer_min(&block, "size", 0);
-      values[i].heap = field_bigint(&block, "heap");
+      field_bigint_into(&block, "heap", &values[i].heap);
       qa_save_reader_destroy(&block);
     }
     qa_save_reader_destroy(&list);
@@ -534,11 +589,15 @@ void qa_guest_checkpoint_release(qa_guest_checkpoint *checkpoint) {
   for (size_t i = 0; i < checkpoint->random_count; i++)
     free((void *)checkpoint->random[i].words.values);
   free((void *)checkpoint->random);
+  qa_saved_guest_callback_binding *callbacks = (qa_saved_guest_callback_binding *)checkpoint->callbacks;
+  for (size_t i = 0; i < checkpoint->callback_count; i++) binding_release(&callbacks[i]);
   free((void *)checkpoint->callbacks);
+  layout_release(&checkpoint->processor_layout);
   free((void *)checkpoint->call_stack);
   free((void *)checkpoint->operand_stack.values);
   free((void *)checkpoint->regions);
   heap_image_free((qa_native_guest_heap_image *)checkpoint->heap);
+  free((void *)checkpoint->wide_bigints);
   memset(checkpoint, 0, sizeof *checkpoint);
 }
 
@@ -546,6 +605,14 @@ qa_guest_checkpoint qa_read_guest(const qa_save_reader *reader) {
   static const char *const kinds[] = {"typescript", "quakec", "qvm", "native-guest"};
   qa_guest_checkpoint checkpoint;
   memset(&checkpoint, 0, sizeof checkpoint);
+  /* A malformed checkpoint raises part way; every list below is attached (zeroed, counted)
+   * before it is filled, so this node releases exactly what was read. */
+  qa_cleanup checkpoint_node;
+  qa_cleanup_push(&checkpoint_node, checkpoint_unwind, &checkpoint);
+  qa_guest_checkpoint *outer_target = wide_target;
+  qa_cleanup target_node; /* a raise restores the enclosing read's target */
+  qa_cleanup_push(&target_node, restore_wide_target, outer_target);
+  wide_target = &checkpoint;
   qa_save_reader module = field(reader, "module");
   checkpoint.module = qa_read_module(&module);
   qa_save_reader_destroy(&module);
@@ -553,8 +620,10 @@ qa_guest_checkpoint qa_read_guest(const qa_save_reader *reader) {
     qa_save_reader random = field(reader, "random");
     size_t count = qa_save_reader_list_count(&random);
     qa_random_state *values =
-        count > 0 ? (qa_random_state *)malloc(count * sizeof *values) : NULL;
+        count > 0 ? (qa_random_state *)calloc(count, sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&random, "out of memory");
+    checkpoint.random = values;
+    checkpoint.random_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&random, i);
       values[i] = qa_read_random(&entry);
@@ -568,11 +637,20 @@ qa_guest_checkpoint qa_read_guest(const qa_save_reader *reader) {
     qa_save_reader callbacks = field(reader, "callbacks");
     size_t count = qa_save_reader_list_count(&callbacks);
     qa_saved_guest_callback_binding *values = count > 0
-        ? (qa_saved_guest_callback_binding *)malloc(count * sizeof *values) : NULL;
+        ? (qa_saved_guest_callback_binding *)calloc(count, sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&callbacks, "out of memory");
+    checkpoint.callbacks = values;
+    checkpoint.callback_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&callbacks, i);
       values[i] = read_callback(&entry);
+      if (values[i].reference.reference.kind == QA_GUEST_CALLBACK_NATIVE_GUEST) {
+        qa_save_reader reference = field(&entry, "reference");
+        qa_save_reader offset = field(&reference, "byteOffset");
+        note_wide(&offset, &values[i].reference.byte_offset);
+        qa_save_reader_destroy(&offset);
+        qa_save_reader_destroy(&reference);
+      }
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&callbacks);
@@ -603,6 +681,7 @@ qa_guest_checkpoint qa_read_guest(const qa_save_reader *reader) {
     qa_quakec_stack_frame *frames =
         count > 0 ? (qa_quakec_stack_frame *)malloc(count * sizeof *frames) : NULL;
     if (count > 0 && frames == NULL) qa_save_reader_fail(&stack, "out of memory");
+    checkpoint.call_stack = frames;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&stack, i);
       frames[i].statement = field_integer(&entry, "statement");
@@ -633,6 +712,7 @@ qa_guest_checkpoint qa_read_guest(const qa_save_reader *reader) {
     size_t count = qa_save_reader_list_count(&operands);
     double *values = count > 0 ? (double *)malloc(count * sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&operands, "out of memory");
+    checkpoint.operand_stack.values = values;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&operands, i);
       values[i] = qa_save_reader_integer(&entry);
@@ -653,9 +733,10 @@ qa_guest_checkpoint qa_read_guest(const qa_save_reader *reader) {
     qa_guest_memory_region *values =
         count > 0 ? (qa_guest_memory_region *)malloc(count * sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&regions, "out of memory");
+    checkpoint.regions = values;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&regions, i);
-      values[i].base = field_bigint(&entry, "base");
+      field_bigint_into(&entry, "base", &values[i].base);
       values[i].permissions = field_region_permissions(&entry, "permissions");
       values[i].bytes = field_bytes(&entry, "bytes");
       qa_save_reader_destroy(&entry);
@@ -670,5 +751,8 @@ qa_guest_checkpoint qa_read_guest(const qa_save_reader *reader) {
     checkpoint.processor_state = field_bytes(reader, "processorState");
     checkpoint.runtime_state = field_private(reader, "runtimeState");
   }
+  qa_cleanup_pop(&target_node);
+  wide_target = outer_target;
+  qa_cleanup_pop(&checkpoint_node);
   return checkpoint;
 }

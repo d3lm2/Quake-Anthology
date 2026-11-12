@@ -8,6 +8,12 @@
 #include <string.h>
 #include "qa/foundation/js.h"
 static uint32_t le32(const uint8_t b[4]) { return (uint32_t)b[0]|((uint32_t)b[1]<<8)|((uint32_t)b[2]<<16)|((uint32_t)b[3]<<24); }
+/* Bytes of one UTF-16 unit at p: a well-formed two- or three-byte sequence, else one byte. */
+static size_t separator_bytes(const unsigned char *p) {
+  size_t need = *p >= 0xc2 && *p < 0xe0 ? 2 : *p >= 0xe0 && *p < 0xf0 ? 3 : 1;
+  for (size_t i = 1; i < need; i++) if ((p[i] & 0xc0) != 0x80) return 1;
+  return need;
+}
 int qa_source_ipv4_filter(const char *text, qa_ipv4_filter *out) {
   uint8_t bytes[4] = {0,0,0,0}, mask[4] = {0,0,0,0};
   size_t cursor = 0, len = strlen(text);
@@ -19,7 +25,9 @@ int qa_source_ipv4_filter(const char *text, qa_ipv4_filter *out) {
     int32_t value = qa_js_to_int32(qa_js_parse_int(text + start, 10)) & 255;
     bytes[index] = (uint8_t)value; if (value != 0) mask[index] = 255;
     if (cursor >= len) break;
-    cursor++;
+    /* cursor++ steps one UTF-16 unit: a whole BMP character, or the high surrogate of an
+     * astral one (whose low half then fails the digit test, as a lone byte does here). */
+    cursor += separator_bytes((const unsigned char *)text + cursor);
   }
   out->mask = le32(mask); out->compare = le32(bytes);
   return 1;
@@ -63,8 +71,9 @@ qa_ipv4_filter *qa_ip_filter_list_snapshot(const qa_ip_filter_list *l, size_t *o
   return copy;
 }
 void qa_flood_limiter_init_max(qa_flood_limiter *l, double burst, double interval_ms, double max_entries) {
-  if (burst <= 0 || interval_ms <= 0 || max_entries < 1 || isnan(burst) || isnan(interval_ms) || isnan(max_entries))
-    qa_range_error("Invalid flood limit");
+  /* TS compares only: a NaN burst or interval passes, and a NaN or fractional maxEntries
+   * fails in the PeerTable constructor with its own message. */
+  if (burst <= 0 || interval_ms <= 0 || max_entries < 1) qa_range_error("Invalid flood limit");
   memset(l, 0, sizeof *l); l->burst = burst; l->interval_ms = interval_ms; l->max_entries = max_entries;
   if (!qa_peer_table_init(&l->peers, max_entries)) qa_range_error("Out of memory");
   l->tokens = calloc((size_t)max_entries, sizeof *l->tokens);

@@ -7,9 +7,7 @@
  * allocated by the local adapters (resolved QVM artifacts, bridges,
  * profiles, native declarations) are retained for the process
  * lifetime: this is a one-shot CLI tool and the catalog list
- * destructors do not free service payloads. Fatal-UTF-8 TextDecoder
- * checks before JSON.parse are the lenient qa_parse_json_value decode
- * (see persistence/value.h). */
+ * destructors do not free service payloads. */
 #include "qa/app/bootstrap/weapon_behavior_tool.h"
 #include "qa/network/common/js_number.h"
 
@@ -17,6 +15,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,20 +33,30 @@
 #include "qa/content/catalog/qvm_weapon_behaviors.h"
 #include "qa/content/catalog/weapon_behavior_document.h"
 #include "qa/content/catalog/weapon_behaviors.h"
+#include "qa/content/json_text.h"
 #include "qa/content/mounts.h"
 #include "qa/content/user_data.h"
 #include "qa/foundation/support.h"
+#include "qa/app/bootstrap/cvar_archives.h"
 #include "qa/guest/pe/format.h"
+#include "qa/llm/errors.h"
+#include "qa/platform/files/contained.h"
 #include "qa/input/support.h"
 #include "qa/persistence/value.h"
 
-/* TS `throw new Error(msg)`: prints the Error string form and aborts. */
+/* TS `throw new Error(msg)` with the whole message. */
 static noreturn void qa_error(const char *format, ...) {
-  char text[1536];
-  va_list args;
+  va_list args, copy;
   va_start(args, format);
-  vsnprintf(text, sizeof text, format, args);
+  va_copy(copy, args);
+  int length = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *text = length < 0 ? NULL : malloc((size_t)length + 1);
+  if (text == NULL) { va_end(args); qa_range_error("Out of memory"); }
+  vsnprintf(text, (size_t)length + 1, format, args);
   va_end(args);
+  qa_cleanup text_cleanup;
+  qa_cleanup_push(&text_cleanup, free, text);
   qa_raise("Error", 0, 0, "%s", text);
 }
 
@@ -100,10 +109,34 @@ static void text_add_cstr(text *out, const char *bytes) {
 static void text_add_indent(text *out, int depth) {
   for (int i = 0; i < depth * 2; i++) text_add(out, " ", 1);
 }
-static void json_write_string(text *out, const char *value) {
+/* A three-byte surrogate (ED A0..BF xx) at p: its UTF-16 unit, else 0. */
+static unsigned surrogate_at(const unsigned char *p, const unsigned char *end) {
+  if (end - p < 3 || p[0] != 0xed || p[1] < 0xa0 || p[1] > 0xbf || (p[2] & 0xc0) != 0x80) return 0;
+  return 0xd000u | ((unsigned)(p[1] & 0x3f) << 6) | (p[2] & 0x3f);
+}
+/* JSON.stringify of a string of `length` bytes (a parsed "\u0000" is a NUL inside it; a lone surrogate is written
+ * \udXXX, a pair as its four-byte UTF-8). */
+static void json_write_string_length(text *out, const char *value, size_t length) {
+  static const char hex[] = "0123456789abcdef";
   text_add(out, "\"", 1);
-  for (const unsigned char *p = (const unsigned char *)(value != NULL ? value : "");
-       *p != '\0'; p++) {
+  const unsigned char *end = (const unsigned char *)value + length;
+  for (const unsigned char *p = (const unsigned char *)value; p < end; p++) {
+    unsigned unit = surrogate_at(p, end);
+    if (unit != 0) {
+      unsigned low = unit <= 0xdbff ? surrogate_at(p + 3, end) : 0;
+      if (low >= 0xdc00) {
+        uint32_t cp = 0x10000u + ((unit - 0xd800u) << 10) + (low - 0xdc00u);
+        char pair[4] = {(char)(0xf0 | (cp >> 18)), (char)(0x80 | ((cp >> 12) & 0x3f)),
+                        (char)(0x80 | ((cp >> 6) & 0x3f)), (char)(0x80 | (cp & 0x3f))};
+        text_add(out, pair, 4);
+        p += 5;
+      } else {
+        char escape[7] = {'\\', 'u', hex[unit >> 12], hex[(unit >> 8) & 15], hex[(unit >> 4) & 15], hex[unit & 15], '\0'};
+        text_add_cstr(out, escape);
+        p += 2;
+      }
+      continue;
+    }
     switch (*p) {
       case '"': text_add_cstr(out, "\\\""); break;
       case '\\': text_add_cstr(out, "\\\\"); break;
@@ -114,8 +147,7 @@ static void json_write_string(text *out, const char *value) {
       case '\t': text_add_cstr(out, "\\t"); break;
       default:
         if (*p < 0x20) {
-          char escape[8];
-          snprintf(escape, sizeof escape, "\\u%04x", *p);
+          char escape[7] = {'\\', 'u', '0', '0', hex[*p >> 4], hex[*p & 15], '\0'};
           text_add_cstr(out, escape);
         } else {
           text_add(out, (const char *)p, 1);
@@ -123,6 +155,14 @@ static void json_write_string(text *out, const char *value) {
     }
   }
   text_add(out, "\"", 1);
+}
+static void json_write_string(text *out, const char *value) {
+  if (value == NULL) value = "";
+  json_write_string_length(out, value, strlen(value));
+}
+static size_t recorded_length(const char *text, size_t recorded) {
+  size_t length = strlen(text);
+  return recorded > length ? recorded : length;
 }
 static void json_write_number(text *out, double value) {
   char buffer[40];
@@ -146,7 +186,8 @@ static void json_write_value(text *out, const qa_save_value *value, int depth) {
       text_add_cstr(out, value->text != NULL ? value->text : "0");
       return;
     case QA_SAVE_STRING:
-      json_write_string(out, value->text);
+      if (value->text == NULL) json_write_string(out, "");
+      else json_write_string_length(out, value->text, recorded_length(value->text, value->text_length));
       return;
     case QA_SAVE_BYTES:
       text_add_cstr(out, "null");
@@ -176,7 +217,8 @@ static void json_write_value(text *out, const qa_save_value *value, int depth) {
         if (value->entries[i].value == NULL ||
             value->entries[i].value->kind == QA_SAVE_UNDEFINED) continue;
         text_add_indent(out, depth + 1);
-        json_write_string(out, value->entries[i].key);
+        json_write_string_length(out, value->entries[i].key,
+                                 recorded_length(value->entries[i].key, value->entries[i].key_length));
         text_add_cstr(out, ": ");
         json_write_value(out, value->entries[i].value, depth + 1);
         if (++written < visible) text_add(out, ",", 1);
@@ -248,6 +290,14 @@ static qa_save_value *value_copy(const qa_save_value *value) {
       break;
     case QA_SAVE_STRING:
       copy = qa_save_value_string(value->text != NULL ? value->text : "");
+      if (copy != NULL && value->text != NULL && value->text_length > strlen(value->text)) {
+        char *whole = malloc(value->text_length + 1);
+        if (whole == NULL) { qa_save_value_free(copy); qa_range_error("Out of memory"); }
+        memcpy(whole, value->text, value->text_length + 1);
+        free(copy->text);
+        copy->text = whole;
+        copy->text_length = value->text_length;
+      }
       break;
     case QA_SAVE_BYTES:
       copy = qa_save_value_bytes(value->bytes, value->byte_length);
@@ -259,9 +309,20 @@ static qa_save_value *value_copy(const qa_save_value *value) {
       return copy;
     case QA_SAVE_OBJECT:
       copy = value_object();
-      for (size_t i = 0; i < value->entry_count; i++)
-        value_set(copy, value->entries[i].key,
-                  value_copy(value->entries[i].value));
+      for (size_t i = 0; i < value->entry_count; i++) {
+        const qa_save_entry *entry = &value->entries[i];
+        value_set(copy, entry->key, value_copy(entry->value));
+        if (entry->key_length > strlen(entry->key)) {
+          /* a key holding a NUL: keep it whole (a parsed object's keys are distinct) */
+          qa_save_entry *last = &copy->entries[copy->entry_count - 1];
+          char *whole = malloc(entry->key_length + 1);
+          if (whole == NULL) qa_range_error("Out of memory");
+          memcpy(whole, entry->key, entry->key_length + 1);
+          free(last->key);
+          last->key = whole;
+          last->key_length = entry->key_length;
+        }
+      }
       return copy;
   }
   if (copy == NULL) qa_range_error("Out of memory");
@@ -358,10 +419,33 @@ static bool qvm_read_profile(void *ctx, const qa_save_value *declaration,
   out->service_value = profile;
   return true;
 }
+/* C ownership (TS GC): the service values qvm_resolve_artifact /
+ * qvm_read_profile allocated. */
+static void qvm_release(void *ctx, qa_catalog_qvm_artifact *artifact,
+                        qa_catalog_qvm_weapon_profile *profile) {
+  (void)ctx;
+  qa_qvm_weapon_profile *read = (qa_qvm_weapon_profile *)profile->service_value;
+  if (read != NULL) {
+    qa_qvm_weapon_profile_free(read);
+    free(read);
+  }
+  qa_resolved_qvm_artifact *resolved =
+      (qa_resolved_qvm_artifact *)artifact->service_value;
+  if (resolved != NULL) {
+    qa_resolved_qvm_artifact_destroy(resolved);
+    free(resolved);
+  }
+  profile->service_value = NULL;
+  artifact->service_value = NULL;
+}
+static void qvm_release_entry(qa_mounted_qvm_weapon_behavior *entry) {
+  qvm_release(NULL, &entry->artifact, &entry->profile);
+}
 static qa_qvm_weapon_behavior_services qvm_services(void) {
   qa_qvm_weapon_behavior_services services = {0};
   services.resolve_artifact = qvm_resolve_artifact;
   services.read_profile = qvm_read_profile;
+  services.release = qvm_release;
   return services;
 }
 
@@ -749,6 +833,8 @@ static void run_qvm_tool(const qa_app_weapon_behavior_tool_command *command,
     print(print_ctx, output);
     free(output);
     qa_save_value_free(report);
+    for (size_t i = 0; i < declarations.count; i++)
+      qvm_release_entry(&declarations.values[i]);
     qa_mounted_qvm_weapon_behavior_list_free(&declarations);
     qa_qvm_image_destroy(&image);
     free(provider);
@@ -761,8 +847,9 @@ static void run_qvm_tool(const qa_app_weapon_behavior_tool_command *command,
   opened_file profile_file = {0};
   if (!content_open(content, command->profile, &profile_file))
     qa_error("Mounted QVM author profile is missing: %s", command->profile);
-  qa_save_value *declaration = qa_parse_json_value(
-      profile_file.bytes, profile_file.byte_length, false);
+  /* JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) */
+  qa_save_value *declaration = qa_content_parse_json_fatal(
+      profile_file.bytes, profile_file.byte_length);
   if (declaration == NULL) qa_range_error("Out of memory");
   char *owned_path = NULL;
   qa_mounted_qvm_weapon_behavior entry = {0};
@@ -791,6 +878,7 @@ static void run_qvm_tool(const qa_app_weapon_behavior_tool_command *command,
       if (!qa_load_qvm_weapon_behavior(reader, services, provider, old,
                                        &old_path_owned, &retained_entry))
         qa_range_error("Out of memory");
+      qvm_release_entry(&retained_entry);
       free(old_path_owned);
       value_push(profiles, value_copy(old));
     }
@@ -806,6 +894,7 @@ static void run_qvm_tool(const qa_app_weapon_behavior_tool_command *command,
   print_saved(print, print_ctx, entry.profile.definition.id, destination,
               product->expectation_id);
   free(destination);
+  qvm_release_entry(&entry);
   free(owned_path);
   qa_save_value_free(declaration);
   free(provider);
@@ -883,8 +972,9 @@ static void run_native_tool(
   if (!content_open(content, command->profile, &profile_file))
     qa_error("Mounted native author profile is missing: %s",
              command->profile);
-  qa_save_value *value = qa_parse_json_value(
-      profile_file.bytes, profile_file.byte_length, false);
+  /* JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) */
+  qa_save_value *value = qa_content_parse_json_fatal(
+      profile_file.bytes, profile_file.byte_length);
   if (value == NULL) qa_range_error("Out of memory");
   qa_mounted_native_weapon_behavior entry = {0};
   if (!qa_load_native_weapon_behavior(reader, services, provider, value,
@@ -972,42 +1062,50 @@ void qa_app_run_weapon_behavior_tool(qa_app_weapon_behavior_tool_host host,
   host.close_product(host.ctx, opened);
 }
 
+/* TS writeBehaviorDocument: mkdir -p, then a temporary opened "wx" 0600, written, synced and closed, renamed over
+ * the destination; the temporary is removed in the finally. A failing step raises Node's fs Error. */
+typedef struct behavior_write { char *destination, *temporary; int fd; } behavior_write;
+static void behavior_write_finally(void *ctx) {
+  behavior_write *write_state = ctx;
+  if (write_state->fd >= 0) close(write_state->fd);
+  unlink(write_state->temporary);
+  free(write_state->temporary);
+  free(write_state->destination);
+}
 char *qa_app_write_behavior_document(const char *directory, const char *name,
                                      const char *bytes) {
-  /* mkdir -p (single level walk). */
-  char *walk = qa_input_dup(directory);
-  if (!walk) qa_range_error("Out of memory");
-  for (char *p = walk + 1; *p; p++) {
-    if (*p == '/') { *p = '\0'; mkdir(walk, 0777); *p = '/'; }
+  char *failed = NULL;
+  int code = qa_app_mkdir_recursive(directory, &failed);
+  if (code != 0) {
+    qa_cleanup failed_cleanup;
+    qa_cleanup_push(&failed_cleanup, free, failed);
+    qa_node_fs_error(code, "mkdir", failed);
   }
-  mkdir(walk, 0777);
-  free(walk);
-  size_t dir_len = strlen(directory), name_len = strlen(name);
-  char *destination = malloc(dir_len + 1 + name_len + 1);
-  char *temporary = malloc(dir_len + 64);
-  if (!destination || !temporary) qa_range_error("Out of memory");
-  snprintf(destination, dir_len + 1 + name_len + 1, "%s/%s", directory, name);
-  snprintf(temporary, dir_len + 64, "%s/.weapon-behaviors-%ld.tmp", directory,
-           (long)getpid());
-  int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0600);
-  if (fd < 0) qa_range_error("Cannot write behavior document: %s", strerror(errno));
+  char uuid[37];
+  qa_llm_random_uuid(uuid);
+  behavior_write state = {xformat("%s/%s", directory, name),
+                          xformat("%s/.weapon-behaviors-%s.tmp", directory, uuid), -1};
+  qa_cleanup state_cleanup;
+  qa_cleanup_push(&state_cleanup, behavior_write_finally, &state);
+  state.fd = open(state.temporary, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (state.fd < 0) qa_node_fs_error(errno, "open", state.temporary);
   size_t len = strlen(bytes), written = 0;
   while (written < len) {
-    ssize_t n = write(fd, bytes + written, len - written);
+    ssize_t n = write(state.fd, bytes + written, len - written);
     if (n < 0) {
-      close(fd);
-      unlink(temporary);
-      qa_range_error("Cannot write behavior document: %s", strerror(errno));
+      if (errno == EINTR) continue;
+      qa_node_fs_error_paths(errno, "write", NULL, NULL);
     }
     written += (size_t)n;
   }
-  fsync(fd);
-  close(fd);
-  if (rename(temporary, destination) != 0) {
-    unlink(temporary);
-    qa_range_error("Cannot write behavior document: %s", strerror(errno));
-  }
-  unlink(temporary);
-  free(temporary);
-  return destination;
+  if (fsync(state.fd) != 0) qa_node_fs_error_paths(errno, "fsync", NULL, NULL);
+  int fd = state.fd;
+  state.fd = -1;
+  if (close(fd) != 0) qa_node_fs_error_paths(errno, "close", NULL, NULL);
+  if (rename(state.temporary, state.destination) != 0)
+    qa_node_fs_error_paths(errno, "rename", state.temporary, state.destination);
+  qa_cleanup_pop(&state_cleanup);
+  unlink(state.temporary);
+  free(state.temporary);
+  return state.destination;
 }

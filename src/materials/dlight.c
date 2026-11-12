@@ -106,10 +106,34 @@ bool qa_receives_projected_dlights(const qa_mat_compiled_material *material) {
   return true;
 }
 
+/* What a projection holds while the project callback or an index check can
+ * raise: released then (TS: the GC), otherwise handed to the caller. */
+typedef struct dlight_scratch {
+  int *clip_bits;
+  qa_render_vertex *vertices;
+  double *indices;
+  qa_draw_batch *batches;
+  size_t count;
+} dlight_scratch;
+static void dlight_scratch_free(void *arg) {
+  dlight_scratch *scratch = arg;
+  free(scratch->clip_bits);
+  free(scratch->vertices);
+  free(scratch->indices);
+  for (size_t i = 0; i < scratch->count; i++) {
+    free((void *)scratch->batches[i].vertices);
+    free((void *)scratch->batches[i].indices.values);
+  }
+  free(scratch->batches);
+}
+
 qa_draw_batch *qa_project_dlight_texture(qa_deform_geometry geometry,
     int32_t mask, const qa_q3_dynamic_light *lights, size_t light_count,
     qa_renderer_image image, qa_mat_project_fn project, const char *cull,
     size_t *out_count) {
+  dlight_scratch scratch = {NULL, NULL, NULL, NULL, 0};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, dlight_scratch_free, &scratch);
   qa_draw_batch *batches = NULL;
   size_t count = 0, capacity = 0;
   for (size_t li = 0; li < light_count; li++) {
@@ -123,6 +147,8 @@ qa_draw_batch *qa_project_dlight_texture(qa_deform_geometry geometry,
     int *clip_bits = malloc((vcount > 0 ? vcount : 1) * sizeof *clip_bits);
     qa_render_vertex *vertices = malloc(
         (vcount > 0 ? vcount : 1) * sizeof *vertices);
+    scratch.clip_bits = clip_bits;
+    scratch.vertices = vertices;
     if (clip_bits == NULL || vertices == NULL)
       qa_range_error("dlight allocation failed");
     for (size_t vi = 0; vi < vcount; vi++) {
@@ -154,17 +180,18 @@ qa_draw_batch *qa_project_dlight_texture(qa_deform_geometry geometry,
     double *indices = malloc(
         (geometry.index_count > 0 ? geometry.index_count : 1) *
         sizeof *indices);
+    scratch.indices = indices;
     if (indices == NULL) qa_range_error("dlight allocation failed");
     size_t index_count = 0;
     for (size_t offset = 0; offset < geometry.index_count; offset += 3) {
       if (offset + 2 >= geometry.index_count)
-        qa_range_error("dlight triangle indices are incomplete");
+        qa_raise("Error", 0, 0, "dlight triangle indices are incomplete");
       double a = geometry.indices[offset], b = geometry.indices[offset + 1],
              c = geometry.indices[offset + 2];
       int64_t ai = (int64_t)a, bi = (int64_t)b, ci = (int64_t)c;
       if (ai < 0 || (size_t)ai >= vcount || bi < 0 || (size_t)bi >= vcount ||
           ci < 0 || (size_t)ci >= vcount)
-        qa_range_error("ProjectDlightTexture: triangle has no active clipBits entry; inactive source scratch is indeterminate");
+        qa_raise("Error", 0, 0, "ProjectDlightTexture: triangle has no active clipBits entry; inactive source scratch is indeterminate");
       if ((clip_bits[ai] & clip_bits[bi] & clip_bits[ci]) == 0) {
         indices[index_count++] = a;
         indices[index_count++] = b;
@@ -172,18 +199,26 @@ qa_draw_batch *qa_project_dlight_texture(qa_deform_geometry geometry,
       }
     }
     free(clip_bits);
+    scratch.clip_bits = NULL;
     if (index_count == 0) {
       free(vertices);
       free(indices);
+      scratch.vertices = NULL;
+      scratch.indices = NULL;
       continue;
     }
     if (count == capacity) {
       capacity = capacity == 0 ? 4 : capacity * 2;
-      batches = realloc(batches, capacity * sizeof *batches);
-      if (batches == NULL) qa_range_error("dlight allocation failed");
+      qa_draw_batch *grown = realloc(batches, capacity * sizeof *batches);
+      if (grown == NULL) qa_range_error("dlight allocation failed");
+      batches = grown;
+      scratch.batches = batches;
     }
     qa_draw_batch *batch = &batches[count++];
     memset(batch, 0, sizeof *batch);
+    scratch.count = count;
+    scratch.vertices = NULL;
+    scratch.indices = NULL;
     batch->indices.values = indices;
     batch->indices.count = index_count;
     batch->texture.kind = QA_TEXTURE_BINDING_BIND_IMAGE;
@@ -201,6 +236,7 @@ qa_draw_batch *qa_project_dlight_texture(qa_deform_geometry geometry,
     batch->vertices = vertices;
     batch->vertex_count = vcount;
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return batches;
 }

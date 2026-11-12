@@ -46,7 +46,7 @@ static bool read_masked(qa_app_cgame_status_cvars *c, bool found, qa_cvar_snapsh
     || c->previous_source.numeric_value != value->numeric_value
     || c->previous_source.integer_value != value->integer_value;
   if (changed) {
-    if (c->revision == 0x7fffffff) qa_range_error("Cgame status cvar version exhausted");
+    if (c->revision == 0x7fffffff) qa_raise("Error", 0, 0, "Cgame status cvar version exhausted");
     c->revision++;
     if (c->has_previous) qa_cvar_read_free(&c->previous_source);
     copy_snapshot(value, &c->previous_source);

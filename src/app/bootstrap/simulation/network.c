@@ -25,6 +25,7 @@
 #include "qa/network/q2/handshake.h"
 #include "qa/network/q2/server_write.h"
 #include "qa/network/q2/solid.h"
+#include "qa/core/math.h"
 
 static void *xcalloc(size_t count, size_t size) {
   void *p = calloc(count ? count : 1, size ? size : 1);
@@ -234,8 +235,8 @@ typedef struct q2_host {
   qa_q2_mvd_capture_config *capture_configs; qa_q2_mvd_capture_player *capture_players;
   qa_q2_wire_entity *capture_entities; qa_q2_mvd_emission *capture_messages; size_t capture_message_count;
   uint8_t *portal_bits; char *capture_gamedir;
-  /* input storage, released at observe */
-  qa_actor_command **commands; size_t command_count;
+  qa_actor_command input; /* host input() scratch: the network copies each command */
+  char *admit_reason; /* the last refusal text, kept whole (TS strings have no length limit) */
 } q2_host;
 
 static void print_to(q2_host *h, const char *text) { h->options.print(h->options.print_ctx, text); }
@@ -269,6 +270,7 @@ static qa_q2_server_event *push_event(owned_events *events, bool has_reliable, b
   return event;
 }
 static void clear_state(per_player *entry) {
+  qa_q2_server_data_result_clear(&entry->data); /* NULL until a game state sets them */
   if (!entry->has_state) return;
   for (size_t i = 0; i < entry->configs.count; i++) free(entry->configs.entries[i].value);
   free(entry->configs.entries);
@@ -551,13 +553,12 @@ static void player_state(q2_host *h, qa_actor_id actor, qa_q2_wire_player *state
     state->pmove.gravity = q2->gravity;
     state->pmove.viewheight = q2->view_height;
   } else qa_raise("Error", 0, 0, "Native Q2 playerstate requires a Q2 movement provider");
-  qa_vec3 zero = {0, 0, 0};
   qa_vec3 offset = {0, 0, movement->view_height};
   vector(state->viewangles, has_view ? view.angles : movement->view_angles);
   vector(state->viewoffset, has_view ? view.offset : offset);
-  vector(state->kick_angles, has_view ? view.kick_angles : zero);
-  vector(state->gunangles, has_view ? view.gun_angles : zero);
-  vector(state->gunoffset, has_view ? view.gun_offset : zero);
+  vector(state->kick_angles, has_view ? view.kick_angles : qa_zero_vec3);
+  vector(state->gunangles, has_view ? view.gun_angles : qa_zero_vec3);
+  vector(state->gunoffset, has_view ? view.gun_offset : qa_zero_vec3);
   if (has_view) {
     state->blend[0] = (float)view.blend.x; state->blend[1] = (float)view.blend.y;
     state->blend[2] = (float)view.blend.z; state->blend[3] = (float)view.blend.w;
@@ -788,8 +789,7 @@ static bool host_mvd_settings(void *ctx, bool *enabled, double *max_viewers, con
 static bool host_rejects(void *ctx, const void *address) { q2_host *h = ctx; return h->options.rejects(h->options.rejects_ctx, address); }
 static const void *const *host_masters(void *ctx, size_t *out_count) {
   q2_host *h = ctx;
-  *out_count = h->options.master_count;
-  return h->options.masters;
+  return h->options.masters(h->options.masters_ctx, out_count);
 }
 static qa_q2_status discovery_status(void *ctx) {
   q2_host *h = ctx;
@@ -824,8 +824,6 @@ static void host_observe(void *ctx, const void *output_value, const void *const 
   q2_host *h = ctx;
   const qa_simulation_output *output = output_value;
   const qa_app_sim_presentation_event *const *events = (const qa_app_sim_presentation_event *const *)events_value;
-  for (size_t i = 0; i < h->command_count; i++) free(h->commands[i]);
-  h->command_count = 0;
   if (h->event_frame != output->snapshot.frame.frame) {
     h->entity_event_count = 0;
     h->event_frame = output->snapshot.frame.frame;
@@ -918,7 +916,6 @@ static qa_app_q2_admission host_admit(void *ctx, const void *from_value, const v
   char *userinfo = qa_app_sim_info_text(&pairs);
   qa_app_sim_info_clear(&pairs);
   const char *social_id = request->has_social_ids && request->social_id_count > 0 ? request->social_ids[0] : "";
-  static _Thread_local char reason[300];
   if (social_id[0] != '\0' && h->options.player_identity == NULL) {
     free(userinfo);
     result.reason = "Server has no rerelease social identity owner";
@@ -926,10 +923,21 @@ static qa_app_q2_admission host_admit(void *ctx, const void *from_value, const v
   }
   qa_q2_connection_result allowed = qa_q2_players_connect(h->source->players, h->game, userinfo);
   free(userinfo);
-  if (!allowed.allowed) { snprintf(reason, sizeof reason, "%s", allowed.reason); result.reason = reason; return result; }
+  if (!allowed.allowed) {
+    char *reason = xstrdup(allowed.reason);
+    free(h->admit_reason);
+    h->admit_reason = reason;
+    result.reason = reason;
+    return result;
+  }
   double slot = 0;
   for (; slot < h->game->options.max_clients; slot++) if (!slot_taken(h, slot)) break;
   if (slot == h->game->options.max_clients) { result.reason = "Server is full"; return result; }
+  /* allowed.userinfo lives in the players object until its next connect; session and
+   * identity callbacks and the admission run before it is used, so keep a copy. */
+  char *admitted_userinfo = xstrdup(allowed.userinfo);
+  qa_cleanup userinfo_guard;
+  qa_cleanup_push(&userinfo_guard, free, admitted_userinfo);
   qa_session_client *client = qa_engine_session_create_client(h->options.session, slot);
   qa_session_client_connect(client, from->kind == QA_NET_LOOPBACK ? "loopback" : "remote");
   qa_client_id id = qa_session_client_id(client);
@@ -937,9 +945,12 @@ static qa_app_q2_admission host_admit(void *ctx, const void *from_value, const v
     h->options.player_identity(h->options.player_identity_ctx, id, true, request->has_split_seat ? request->split_seat : 0, social_id);
   admit_scope scope;
   memset(&scope, 0, sizeof scope);
-  scope.h = h; scope.client = id; scope.userinfo = allowed.userinfo; scope.slot = slot;
+  scope.h = h; scope.client = id; scope.userinfo = admitted_userinfo; scope.slot = slot;
   qa_caught_error error;
-  if (qa_try(admit_body, &scope, &error)) { result.accepted = true; result.player = scope.player; return result; }
+  bool admitted = qa_try(admit_body, &scope, &error);
+  qa_cleanup_pop(&userinfo_guard);
+  free(admitted_userinfo);
+  if (admitted) { result.accepted = true; result.player = scope.player; return result; }
   if (scope.has_actor) s->disconnect_player(s->ctx, scope.actor);
   if (h->options.player_identity) h->options.player_identity(h->options.player_identity_ctx, id, false, 0, NULL);
   qa_engine_session_close_client(h->options.session, id);
@@ -986,9 +997,17 @@ static qa_app_q2_game_state host_game_state(void *ctx, qa_app_q2_player player, 
   for (size_t i = 0; i < state_count; i++) {
     qa_actor_id actor; qa_q2_base_player_state *state;
     if (!qa_q2_players_state_at(h->source->players, i, &actor, &state)) continue;
-    char skin[4200];
-    snprintf(skin, sizeof skin, "%s\\%s", state->name, state->skin);
+    /* `${state.name}\\${state.skin}`: no length limit. */
+    size_t name = strlen(state->name), skin_length = strlen(state->skin);
+    char *skin = xrealloc(NULL, name + skin_length + 2);
+    memcpy(skin, state->name, name);
+    skin[name] = '\\';
+    memcpy(skin + name + 1, state->skin, skin_length + 1);
+    qa_cleanup skin_guard;
+    qa_cleanup_push(&skin_guard, free, skin);
     config_set(&h->configs, h->layout.player_skins + state->slot, skin);
+    qa_cleanup_pop(&skin_guard);
+    free(skin);
   }
   per_player *entry = player_slot(h, (double)player.client.slot);
   if (entry->has_known) config_clear(&entry->known);
@@ -998,10 +1017,12 @@ static qa_app_q2_game_state host_game_state(void *ctx, qa_app_q2_player player, 
   memset(&entry->data, 0, sizeof entry->data);
   entry->data.servercount = 1;
   entry->data.attractloop = false;
-  snprintf(entry->data.gamedir, sizeof entry->data.gamedir, "%s", qa_app_sim_network_gamedir(
-      h->options.content->content_directory(h->options.content->ctx, s->recipe->map.entities.content)));
   entry->data.clientnum = player.source_entity - 1;
-  snprintf(entry->data.levelname, sizeof entry->data.levelname, "%s", text_or_empty(config_get(&h->configs, 0)));
+  /* gamedir and levelname are owned copies of any length (a guest CS_NAME is not cut). */
+  const char *gamedir = qa_app_sim_network_gamedir(
+      h->options.content->content_directory(h->options.content->ctx, s->recipe->map.entities.content));
+  qa_q2_server_data_result_set_strings(&entry->data, gamedir,
+      text_or_empty(config_get(&h->configs, 0)));
   entry->data.server_state = 2;
   if (is(protocol.kind, "q2-r1q2")) {
     entry->data.has_r1q2_version = true; entry->data.r1q2_version = (double)protocol.revision;
@@ -1165,7 +1186,8 @@ static const qa_app_q2_server_event *host_events(void *ctx, qa_app_q2_player pla
 static const void *host_input(void *ctx, qa_app_q2_player player, const void *command_value, double sequence) {
   q2_host *h = ctx;
   const qa_q2_wire_usercmd *command = command_value;
-  qa_actor_command *out = xcalloc(1, sizeof *out);
+  qa_actor_command *out = &h->input;
+  memset(out, 0, sizeof *out);
   out->actor = player.actor;
   out->source.kind = QA_COMMAND_SOURCE_REMOTE_CLIENT; out->source.client = player.client;
   out->sequence = sequence;
@@ -1177,8 +1199,6 @@ static const void *host_input(void *ctx, qa_app_q2_player player, const void *co
     qa_q2_to_rerelease_command(command, is(h->options.protocol.kind, "q2-kex") ? command->server_frame : sequence,
         &out->command.as.q2_rerelease);
   }
-  h->commands = xrealloc(h->commands, (h->command_count + 1) * sizeof *h->commands);
-  h->commands[h->command_count++] = out;
   return out;
 }
 static const char *variable(void *ctx, const char *name) {
@@ -1210,6 +1230,13 @@ static void host_userinfo(void *ctx, qa_app_q2_player player, const char *value)
 }
 static void host_print(void *ctx, const char *text) { print_to(ctx, text); }
 
+/* A raise while the host is built releases what was built so far. */
+static void release_partial_host(void *arg) {
+  qa_app_q2_server_host host;
+  memset(&host, 0, sizeof host);
+  host.ctx = arg;
+  qa_app_sim_q2_application_server_host_destroy(host);
+}
 qa_app_q2_server_host qa_app_sim_create_q2_application_server_host(qa_app_sim_q2_server_binding_options options) {
   const qa_app_sim_network_simulation *s = options.simulation;
   qa_q2_product_runtime *source = s->q2_source(s->ctx);
@@ -1234,7 +1261,7 @@ qa_app_q2_server_host qa_app_sim_create_q2_application_server_host(qa_app_sim_q2
   }
   q2_host *h = xcalloc(1, sizeof *h);
   qa_cleanup guard;
-  qa_cleanup_push(&guard, free, h);
+  qa_cleanup_push(&guard, release_partial_host, h);
   h->options = options; h->simulation = s; h->source = source; h->game = game; h->cvars = cvars;
   h->event_frame = -1;
   const qa_executable_recipe *recipe = options.content->recipe;
@@ -1309,13 +1336,12 @@ qa_app_q2_server_host qa_app_sim_create_q2_application_server_host(qa_app_sim_q2
 void qa_app_sim_q2_application_server_host_destroy(qa_app_q2_server_host host) {
   q2_host *h = host.ctx;
   if (h == NULL) return;
+  free(h->admit_reason);
   for (size_t i = 0; i < h->player_count; i++) {
     clear_player(&h->players[i]);
     if (h->players[i].has_known) config_clear(&h->players[i].known);
   }
   free(h->players);
-  for (size_t i = 0; i < h->command_count; i++) free(h->commands[i]);
-  free(h->commands);
   clear_capture(h);
   free(h->cached_states);
   free(h->entity_events);

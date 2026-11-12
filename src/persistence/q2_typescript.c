@@ -7,7 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "qa/persistence/value.h"
+
+static void free_json(void *arg) { qa_save_json_free(arg); }
 
 /* Shallow object copy (entries point at the same child nodes); the
  * TS spread {...root, key: value}. Frees shallowly. */
@@ -64,6 +67,8 @@ static qa_save_json *array_of(qa_save_json **nodes, size_t count) {
 bool qa_decode_q2_typescript_game(const char *text, qa_q2_typescript_game_save *out) {
   qa_save_json *root = qa_parse_source_json(text);
   if (root == NULL) return false;
+  qa_cleanup root_guard; /* a malformed save raises with its tree released */
+  qa_cleanup_push(&root_guard, free_json, root);
   (void)qa_source_object(root, "q2-typescript");
   const qa_save_json *stamp = qa_save_json_get_const(root, "stamp");
   if (stamp == NULL || stamp->kind != QA_SAVE_JSON_STRING ||
@@ -74,12 +79,20 @@ bool qa_decode_q2_typescript_game(const char *text, qa_q2_typescript_game_save *
     qa_save_format_error("clients", "expected source client array");
   qa_save_json **values = clients->item_count > 0
       ? (qa_save_json **)malloc(clients->item_count * sizeof *values) : NULL;
-  if (clients->item_count > 0 && values == NULL) { qa_save_json_free(root); return false; }
+  if (clients->item_count > 0 && values == NULL) {
+    qa_cleanup_pop(&root_guard);
+    qa_save_json_free(root);
+    return false;
+  }
+  qa_cleanup values_guard;
+  qa_cleanup_push(&values_guard, free, values);
   for (size_t i = 0; i < clients->item_count; i++) {
     char path[64];
     (void)snprintf(path, sizeof path, "clients[%zu]", i);
     values[i] = qa_source_object(clients->items[i], path);
   }
+  qa_cleanup_pop(&values_guard);
+  qa_cleanup_pop(&root_guard);
   out->root = root;
   out->clients = values;
   out->client_count = clients->item_count;
@@ -102,6 +115,8 @@ char *qa_encode_q2_typescript_game(const qa_q2_typescript_game_save *save) {
 bool qa_decode_q2_typescript_level(const char *text, qa_q2_typescript_level_save *out) {
   qa_save_json *root = qa_parse_source_json(text);
   if (root == NULL) return false;
+  qa_cleanup root_guard;
+  qa_cleanup_push(&root_guard, free_json, root);
   (void)qa_source_object(root, "q2-typescript");
   qa_save_json *level = qa_source_object(qa_save_json_get(root, "level"), "level");
   qa_save_json *edicts = qa_save_json_get(root, "edicts");
@@ -109,7 +124,13 @@ bool qa_decode_q2_typescript_level(const char *text, qa_q2_typescript_level_save
     qa_save_format_error("edicts", "expected source entity array");
   qa_q2_typescript_level_edict *values = edicts->item_count > 0
       ? (qa_q2_typescript_level_edict *)malloc(edicts->item_count * sizeof *values) : NULL;
-  if (edicts->item_count > 0 && values == NULL) { qa_save_json_free(root); return false; }
+  if (edicts->item_count > 0 && values == NULL) {
+    qa_cleanup_pop(&root_guard);
+    qa_save_json_free(root);
+    return false;
+  }
+  qa_cleanup values_guard;
+  qa_cleanup_push(&values_guard, free, values);
   for (size_t i = 0; i < edicts->item_count; i++) {
     char path[64];
     (void)snprintf(path, sizeof path, "edicts[%zu]", i);
@@ -127,6 +148,8 @@ bool qa_decode_q2_typescript_level(const char *text, qa_q2_typescript_level_save
     values[i].index = index;
     values[i].data = qa_source_object(qa_save_json_get(record, "data"), data_path);
   }
+  qa_cleanup_pop(&values_guard);
+  qa_cleanup_pop(&root_guard);
   out->root = root;
   out->level = level;
   out->edicts = values;

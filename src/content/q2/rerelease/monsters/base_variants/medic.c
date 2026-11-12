@@ -2,7 +2,6 @@
  * Rerelease m_medic.cpp. ZeniMax Media, GPL-2.0. */
 #include "qa/content/q2/rerelease/monsters/base_variants/medic.h"
 
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -21,6 +20,7 @@
 #include "qa/content/q2/rerelease/monsters/tables/medic.h"
 #include "../rrm_internal.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
 
 static const qa_vec3 cable_offsets[10] = {
   {45, -9.2, 15.5}, {48.4, -9.7, 15.2}, {47.8, -9.8, 15.8},
@@ -66,20 +66,20 @@ size_t qa_q2rm_rerelease_medic_reinforcements(const qa_q2_spawn_fields *fields,
   for (;;) {
     const char *end = strchr(entry, ';');
     size_t length = end ? (size_t)(end - entry) : strlen(entry);
-    /* trim, then split on whitespace runs (TS split(/\s+/)). */
+    /* TS entry.trim().split(/\s+/): the first two runs of non-white-space, by JS white space
+     * (js.h), so a trailing run of white space leaves no empty second part. */
     const char *s = entry, *e = entry + length;
-    while (s < e && isspace((unsigned char)*s)) s++;
-    while (e > s && isspace((unsigned char)e[-1])) e--;
+    size_t space;
+    while (s < e && (space = qa_js_white_space_length(s)) != 0) s += space;
     const char *word_end = s;
-    while (word_end < e && !isspace((unsigned char)*word_end)) word_end++;
+    while (word_end < e && qa_js_white_space_length(word_end) == 0) word_end++;
     entries[index].classname = dup_range(s, (size_t)(word_end - s));
     const char *num = word_end;
-    while (num < e && isspace((unsigned char)*num)) num++;
-    const char *num_end = num;
-    while (num_end < e && !isspace((unsigned char)*num_end)) num_end++;
-    /* JS Number.parseInt(parts[1]): missing or non-numeric is NaN. */
-    /* strtod read "12e3" as 12000 and "0x10" as 16; parseInt stops at the first non-digit. */
-    entries[index].strength = num < num_end ? qa_js_parse_int(num, 10) : NAN;
+    while (num < e && (space = qa_js_white_space_length(num)) != 0) num += space;
+    /* TS `[classname = "", strength = "0"]`: a missing strength is "0", so 0; a non-numeric one is NaN.
+     * strtod read "12e3" as 12000 and "0x10" as 16; parseInt stops at the first non-digit (the next
+     * white space or ';' at the latest). */
+    entries[index].strength = num < e ? qa_js_parse_int(num, 10) : 0;
     index++;
     if (!end) break;
     entry = end + 1;
@@ -95,7 +95,7 @@ void qa_q2rm_medic_reinforcements_free(qa_q2rm_medic_reinforcement_choice *entri
 static void emit_beam_event(qa_q2_entity *beam, qa_q2_game_services *game, bool visible) {
   qa_q2_presentation_event event;
   memset(&event, 0, sizeof event);
-  event.has_actor = true; event.kind = "beam"; event.has_actor = true; event.actor = beam->actor.id;
+  event.kind = "beam"; event.has_actor = true; event.actor = beam->actor.id;
   event.start = q2rm_body(game, beam).origin;
   event.end = beam->pos2;
   event.width = 1;
@@ -418,12 +418,8 @@ static void cable(medic_ctx *box, qa_q2m_context *c) {
       armor.regular.kind = QA_REGULAR_ARMOR_NONE;
       armor.powered.kind = "none";
       qa_gameplay_authority_set_armor(game->host->combat, target->actor, armor);
-      size_t inventory_count = 0;
-      (void)qa_shared_inventory_table_entries(game->host->inventory, target->actor.id, &inventory_count);
-      bool has_inventory = false;
-      /* TS inventory.has: the qa_q2f mirror entries() count stands in. */
-      has_inventory = inventory_count > 0 || qa_shared_inventory_table_count(game->host->inventory, target->actor.id, "q2:monster-power") != 0;
-      if (has_inventory) {
+      /* TS inventory.has(actor): an inventory with no entries still takes the configure. */
+      if (qa_shared_inventory_table_has(game->host->inventory, target->actor.id)) {
         qa_inventory_entry entry;
         memset(&entry, 0, sizeof entry);
         entry.item = "q2:monster-power";
@@ -486,10 +482,18 @@ static void cable(medic_ctx *box, qa_q2m_context *c) {
   memset(&beam, 0, sizeof beam);
   beam.kind = "monster-beam";
   beam.effect = "medic";
-  beam.has_actor = true; beam.kind = "beam"; beam.has_actor = true; beam.actor = entity->actor.id;
+  beam.has_actor = true; beam.actor = entity->actor.id;
   beam.start = beam_start;
   beam.end = beam_end;
   game->host->emit(game->host->ctx, beam);
+}
+/* Owned lists held across calls that can raise (an unknown classname, a record index, a callback): a caught
+ * raise frees them, as the collector does in TS. */
+typedef struct choice_scope { qa_q2rm_medic_reinforcement_choice *choices; size_t count; reinforcement *list; } choice_scope;
+static void choice_scope_free(void *arg) {
+  choice_scope *scope = arg;
+  qa_q2rm_medic_reinforcements_free(scope->choices, scope->count);
+  free(scope->list);
 }
 static size_t reinforcement_list(medic_ctx *box, qa_q2m_context *c, reinforcement **out) {
   qa_q2rm_medic_reinforcement_choice *choices = NULL;
@@ -497,8 +501,11 @@ static size_t reinforcement_list(medic_ctx *box, qa_q2m_context *c, reinforcemen
   reinforcement *list = NULL;
   if (count) {
     list = malloc(count * sizeof *list);
-    if (!list) qa_raise("Error", 0, 0, "Out of memory building medic reinforcement list");
+    if (!list) { qa_q2rm_medic_reinforcements_free(choices, count); qa_raise("Error", 0, 0, "Out of memory building medic reinforcement list"); }
   }
+  choice_scope scope = {choices, count, list};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, choice_scope_free, &scope);
   for (size_t i = 0; i < count; i++) {
     const qa_q2m_definition *definition = qa_q2m_monsters_definition(box->monsters, choices[i].classname, c->game);
     if (!definition) qa_raise("Error", 0, 0, "Unknown medic reinforcement %s", choices[i].classname);
@@ -506,7 +513,8 @@ static size_t reinforcement_list(medic_ctx *box, qa_q2m_context *c, reinforcemen
     list[i].strength = choices[i].strength;
     list[i].bounds = definition->bounds;
   }
-  free(choices);
+  qa_cleanup_pop(&cleanup);
+  free(choices); /* the names moved to the list */
   *out = list;
   return count;
 }
@@ -514,10 +522,20 @@ static void free_reinforcement_list(reinforcement *list, size_t count) {
   for (size_t i = 0; i < count; i++) free(list[i].classname);
   free(list);
 }
+typedef struct list_scope { reinforcement *list; size_t count; double *chosen; size_t *available; } list_scope;
+static void list_scope_free(void *arg) {
+  list_scope *scope = arg;
+  free_reinforcement_list(scope->list, scope->count);
+  free(scope->chosen);
+  free(scope->available);
+}
 typedef bool (*spawn_visitor)(void *ctx, qa_vec3 point, const reinforcement *entry);
 static void each_spawn(medic_ctx *box, qa_q2m_context *c, bool behind, void *visit_ctx, spawn_visitor visit, bool determine) {
   reinforcement *list = NULL;
   size_t list_count = reinforcement_list(box, c, &list);
+  list_scope scope = {list, list_count, NULL, NULL};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, list_scope_free, &scope);
   qa_q2mpm_rogue_state *private_state = qa_q2mpm_state_get(box->source, c->entity);
   for (size_t i = 0; i < private_state->reinforcement_count; i++) {
     const reinforcement *entry = &list[qa_q2m_record_at(list_count,
@@ -532,6 +550,7 @@ static void each_spawn(medic_ctx *box, qa_q2m_context *c, bool behind, void *vis
     if (qa_q2rm_find_rerelease_spawn_point_default(c->game, raised, entry->bounds, 32, &spawn)
         && visit(visit_ctx, spawn, entry)) break;
   }
+  qa_cleanup_pop(&cleanup);
   free_reinforcement_list(list, list_count);
 }
 /* pickRogueCoopTarget (TS owner: src/content/q2/missionpacks/
@@ -677,22 +696,31 @@ static void determine_spawn_fn(void *ctx, qa_q2m_context *c) {
   double *chosen = NULL;
   size_t chosen_count = 0, chosen_cap = 0;
   double remaining = c->state->monster_slots - c->state->monster_used;
+  /* TS list.flatMap(...): every reinforcement that fits, however long the authored list is. */
+  size_t *available = list_count ? malloc(list_count * sizeof *available) : NULL;
+  if (list_count && !available) { free_reinforcement_list(list, list_count); qa_raise("Error", 0, 0, "Out of memory choosing medic reinforcements"); }
+  list_scope scope = {list, list_count, NULL, available};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, list_scope_free, &scope);
   for (double i = 0; i < count && remaining != 0; i++) {
-    size_t available[64];
     size_t available_count = 0;
     for (size_t j = 0; j < list_count; j++)
-      if (list[j].strength <= remaining && available_count < 64) available[available_count++] = j;
+      if (list[j].strength <= remaining) available[available_count++] = j;
     if (available_count == 0) break;
     int32_t picked = qa_q2_rerelease_random_integer_max(qa_q2rm_rerelease_random(c), (int64_t)available_count);
     size_t index = available[qa_q2m_record_at(available_count, (double)picked)];
     if (chosen_count == chosen_cap) {
       chosen_cap = chosen_cap ? chosen_cap * 2 : 4;
-      chosen = realloc(chosen, chosen_cap * sizeof *chosen);
-      if (!chosen) qa_raise("Error", 0, 0, "Out of memory choosing medic reinforcements");
+      double *grown = realloc(chosen, chosen_cap * sizeof *chosen);
+      if (!grown) qa_raise("Error", 0, 0, "Out of memory choosing medic reinforcements");
+      chosen = grown;
+      scope.chosen = chosen;
     }
     chosen[chosen_count++] = (double)index;
     remaining -= list[index].strength;
   }
+  qa_cleanup_pop(&cleanup);
+  free(available);
   qa_q2mpm_rogue_state *private_state = qa_q2mpm_state_get(box->source, c->entity);
   free(private_state->chosen_reinforcements);
   private_state->chosen_reinforcements = chosen;
@@ -745,11 +773,14 @@ static void init_fn(void *ctx, qa_q2m_context *c) {
     c->entity->skin = 2;
     double slots = qa_q2_number_field(&c->entity->spawn, "monster_slots", 3);
     c->state->monster_slots = slots;
-    reinforcement *list = NULL;
-    size_t list_count = reinforcement_list(box, c, &list);
-    if (slots != 0 && list_count != 0)
-      c->state->monster_slots += floor(slots * c->game->options.skill / 2);
-    free_reinforcement_list(list, list_count);
+    /* TS `slots !== 0 && reinforcementList(context).length !== 0`: the list (which raises on an
+     * unknown classname) is only built when there are slots. */
+    if (slots != 0) {
+      reinforcement *list = NULL;
+      size_t list_count = reinforcement_list(box, c, &list);
+      free_reinforcement_list(list, list_count);
+      if (list_count != 0) c->state->monster_slots += floor(slots * c->game->options.skill / 2);
+    }
   }
 }
 static void pain_fn(void *ctx, qa_q2m_context *c, qa_pain_reaction reaction) {

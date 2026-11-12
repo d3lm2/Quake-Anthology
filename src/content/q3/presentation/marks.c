@@ -28,6 +28,10 @@ static double unit_color(double v) {
   if (r < 0 || r > 1) qa_range_error("mark colors must be in [0, 1]");
   return r;
 }
+static bool unit_color_ok(double v) {
+  float r = (float)v;
+  return isfinite(r) && r >= 0 && r <= 1;
+}
 /* TS Math.trunc(Math.fround(value)) & 255: ToInt32, defined for NaN and any magnitude. */
 static double byte_of(double v) { return (double)(qa_js_to_int32(trunc((float)v)) & 255); }
 static double now_of(qa_q3_pres_impact_mark_system *s) {
@@ -93,15 +97,20 @@ bool qa_q3_pres_impact_mark_system_impact_mark(qa_q3_pres_impact_mark_system *s,
   const double signs[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
   for (int i = 0; i < 4; i++) {
     double a = signs[i][0], b = signs[i][1];
+    /* TS adds the two binary32 terms as doubles and vec3() rounds the sum once. */
     corners[i] = (qa_vec3){
-        (float)(origin.x + (float)(a * (float)(radius * axis1.x))) + (float)(b * (float)(radius * axis2.x)),
-        (float)(origin.y + (float)(a * (float)(radius * axis1.y))) + (float)(b * (float)(radius * axis2.y)),
-        (float)(origin.z + (float)(a * (float)(radius * axis1.z))) + (float)(b * (float)(radius * axis2.z))};
+        (float)((double)(float)(origin.x + (float)(a * (float)(radius * axis1.x))) + (double)(float)(b * (float)(radius * axis2.x))),
+        (float)((double)(float)(origin.y + (float)(a * (float)(radius * axis1.y))) + (double)(float)(b * (float)(radius * axis2.y))),
+        (float)((double)(float)(origin.z + (float)(a * (float)(radius * axis1.z))) + (double)(float)(b * (float)(radius * axis2.z)))};
   }
   qa_q3_pres_mark_fragments fragments;
   qa_q3_pres_mark_projection query = {corners, 4, qa_scale3(direction, -20),
                                       QA_Q3_PRES_MAX_MARK_POINTS, QA_Q3_PRES_MAX_MARK_FRAGMENTS};
   if (!qa_q3_pres_bsp_mark_projector_mark_fragments(s->projector, query, &fragments)) return false;
+  /* TS validates the colour after the projection; release the fragments before that raise. */
+  if (!unit_color_ok(request.color.x) || !unit_color_ok(request.color.y) || !unit_color_ok(request.color.z) ||
+      !unit_color_ok(request.color.w))
+    qa_q3_pres_mark_fragments_destroy(&fragments);
   qa_vec4 color = {unit_color(request.color.x), unit_color(request.color.y), unit_color(request.color.z),
                    unit_color(request.color.w)};
   qa_vec4 modulate = {byte_of(color.x * 255), byte_of(color.y * 255), byte_of(color.z * 255), byte_of(color.w * 255)};
@@ -115,8 +124,9 @@ bool qa_q3_pres_impact_mark_system_impact_mark(qa_q3_pres_impact_mark_system *s,
       qa_vec3 point = fragments.points[(size_t)frag.first_point + k];
       qa_vec3 delta = qa_sub3(point, origin);
       verts[k].position = point;
-      verts[k].tex_coord = (qa_vec2){0.5 + (float)(qa_dot3(delta, axis1) * scale),
-                                     0.5 + (float)(qa_dot3(delta, axis2) * scale)};
+      /* TS vec2() rounds each sum to binary32. */
+      verts[k].tex_coord = (qa_vec2){(float)(0.5 + (float)(qa_dot3(delta, axis1) * scale)),
+                                     (float)(0.5 + (float)(qa_dot3(delta, axis2) * scale))};
       verts[k].color = modulate;
     }
     if (request.temporary) {
@@ -139,9 +149,11 @@ bool qa_q3_pres_impact_mark_system_impact_mark(qa_q3_pres_impact_mark_system *s,
       s->active = np;
       s->capacity = nc;
     }
+    /* TS evaluates this.now() (which can throw) before unshift touches the list. */
+    double stored_time = now_of(s);
     memmove(s->active + 1, s->active, s->count * sizeof *s->active);
     stored *entry = &s->active[0];
-    entry->time = now_of(s);
+    entry->time = stored_time;
     entry->shader = request.shader;
     entry->alpha_fade = request.alpha_fade;
     entry->color = color;

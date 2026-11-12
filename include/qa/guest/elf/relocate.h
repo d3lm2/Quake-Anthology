@@ -4,7 +4,7 @@
  * GNU-unique Map and the mutable imports array become small owned lists.
  * TS bigint addresses are uint64_t with wrap arithmetic. The TS address-
  * space identity check has no C counterpart (qa_guest_core_address carries no
- * space token). ElfError aborts via qa_range_error. GPL-2.0-or-later.
+ * space token). ElfError is a qa_raise under that name. GPL-2.0-or-later.
  */
 #ifndef QA_GUEST_ELF_RELOCATE_H
 #define QA_GUEST_ELF_RELOCATE_H

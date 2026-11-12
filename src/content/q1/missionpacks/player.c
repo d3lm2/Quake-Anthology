@@ -281,6 +281,8 @@ static void deny_vengeance(qa_q1mp_mission_pack_players *players, qa_actor_id ow
   const char *name = owner_entity != NULL ? qa_q1_actor_text(owner_entity, "netname") : "";
   size_t count = 0;
   qa_q1_actor **spheres = qa_q1mp_entities(game, &count);
+  qa_cleanup spheres_node; /* removing a sphere runs release callbacks, which can raise */
+  qa_cleanup_push(&spheres_node, free, spheres);
   for (size_t i = 0; i < count; i++) {
     qa_q1_actor *sphere = spheres[i];
     if (!qa_q1mp_streq(sphere->classname, "Vengeance") || !sphere->has_owner || !qa_same_actor(sphere->owner, owner) ||
@@ -292,6 +294,7 @@ static void deny_vengeance(qa_q1mp_mission_pack_players *players, qa_actor_id ow
       if (!qa_same_actor(recipients[r], owner)) qa_q1_message(game, &recipients[r], "$qc_death_denied_vengance", false, args, 1);
     qa_q1_remove(game, sphere);
   }
+  qa_cleanup_pop(&spheres_node);
   free(spheres);
 }
 static void on_release(void *ctx, qa_owned_actor actor) {

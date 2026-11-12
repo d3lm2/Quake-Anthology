@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
@@ -70,7 +71,8 @@ static void coop_fix_fn(void *c, qa_q2_entity *self, qa_q2_game_services *active
     qa_q2_entity *start = starts[i];
     if (start->targetname[0] != '\0' &&
         qa_q2_length((a = qa_q2_game_body(active, start).origin, b = qa_q2_game_body(active, self).origin, qa_q2_subtract(a, b))) < 384) {
-      if (!equals_lower(self->targetname, start->targetname)) self->targetname = start->targetname;
+      /* The spot keeps its own (interned) copy: the start's text belongs to the start. */
+      if (!equals_lower(self->targetname, start->targetname)) self->targetname = qa_q2_intern(start->targetname);
       break;
     }
   }
@@ -191,7 +193,7 @@ qa_q2_entity *qa_q2_select_spawn(qa_q2_game_services *game, qa_q2_base_player_st
     if (!spot && spawn_point[0] == '\0' && count > 0) spot = starts[0];
     free(starts);
   }
-  if (!spot) qa_range_error("No Q2 player spawn for '%s' on %s", spawn_point, game->options.map_name);
+  if (!spot) qa_raise("Error", 0, 0, "No Q2 player spawn for '%s' on %s", spawn_point, game->options.map_name);
   return spot;
 }
 

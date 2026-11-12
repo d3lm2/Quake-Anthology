@@ -1,5 +1,6 @@
 /* Port of src/app/bootstrap/capture.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/capture.h"
+#include "qa/foundation/caught_message.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,8 @@ static char *dup_text(const char *text) {
   memcpy(copy, text, length + 1);
   return copy;
 }
+
+const qa_screenshot_naming qa_app_capture_default_naming = {"screenshots", "shot", 4};
 
 /* ---- inputCaptureServices ---- */
 typedef struct input_capture_ctx {
@@ -53,7 +56,18 @@ static bool ic_can_chat(void *ctx) {
   input_capture_ctx *c = ctx;
   return qa_app_application_input_binding_capabilities(c->input).chat;
 }
-static const char *ic_root(void *ctx) { return ((input_capture_ctx *)ctx)->root; }
+static const char *ic_root(void *ctx) {
+  /* input.scripts.native?.layout.directory ?? root */
+  input_capture_ctx *c = ctx;
+  qa_native_config *native = qa_app_console_script_files_native(qa_app_application_input_scripts(c->input));
+  return native != NULL ? native->layout->directory : c->root;
+}
+static const qa_screenshot_naming *ic_naming(void *ctx) {
+  /* input.scripts.native?.layout.screenshots ?? defaultNaming */
+  input_capture_ctx *c = ctx;
+  qa_native_config *native = qa_app_console_script_files_native(qa_app_application_input_scripts(c->input));
+  return native != NULL ? &native->layout->screenshots : &qa_app_capture_default_naming;
+}
 static const char *ic_map_name(void *ctx) {
   input_capture_ctx *c = ctx;
   return c->map_name(c->map_ctx);
@@ -90,6 +104,7 @@ qa_app_application_capture_services qa_app_input_capture_services(qa_app_applica
     .input = ic_input,
     .can_chat = ic_can_chat,
     .root = ic_root,
+    .naming = ic_naming,
     .map_name = ic_map_name,
     .write = ic_write,
     .print = ic_print,
@@ -113,6 +128,7 @@ struct qa_app_capture {
   bool closed;
   bool has_frame_capture;
   qa_frame_capture frame_capture;
+  const qa_screenshot_naming *naming; /* the naming object the frame capture was made with */
   capture_read *reads; /* TS reads: armed renderer captures */
   size_t read_count;
   /* The frame a resolved read hands FrameCapture.readRgba, or the rejection the
@@ -133,12 +149,20 @@ static qa_image_level read_frame(void *ctx) {
 
 static qa_frame_capture *current_frame_capture(qa_app_capture *capture) {
   const char *root = capture->services.root(capture->services.ctx);
-  if (!capture->has_frame_capture || strcmp(capture->frame_capture.root, root) != 0) {
+  const qa_screenshot_naming *naming =
+      capture->services.naming != NULL ? capture->services.naming(capture->services.ctx) : NULL;
+  if (naming == NULL) naming = &qa_app_capture_default_naming;
+  if (!capture->has_frame_capture || strcmp(capture->frame_capture.root, root) != 0 || capture->naming != naming ||
+      strcmp(capture->frame_capture.naming.directory, naming->directory) != 0 ||
+      strcmp(capture->frame_capture.naming.prefix, naming->prefix) != 0 ||
+      capture->frame_capture.naming.digits != naming->digits) {
     qa_frame_capture next;
-    if (!qa_frame_capture_init(&next, root, (qa_frame_readback){capture, read_frame})) qa_range_error("Out of memory");
+    if (!qa_frame_capture_init_naming(&next, root, (qa_frame_readback){capture, read_frame}, *naming))
+      qa_range_error("Out of memory");
     if (capture->has_frame_capture) qa_frame_capture_destroy(&capture->frame_capture);
     capture->frame_capture = next;
     capture->has_frame_capture = true;
+    capture->naming = naming;
   }
   return &capture->frame_capture;
 }
@@ -174,7 +198,7 @@ static void settle_read(capture_read *read) {
   free(read);
   qa_caught_error caught;
   if (!qa_try(run_operation_fn, &run, &caught))
-    print_failure(capture, capture->read_failure != NULL ? capture->read_failure : caught.message);
+    print_failure(capture, capture->read_failure != NULL ? capture->read_failure : qa_caught_message(&caught));
   capture->has_frame = false;
   free(capture->read_failure);
   capture->read_failure = NULL;
@@ -229,7 +253,7 @@ static void capture_queue(void *ctx, qa_console_queued_operation_fn operation, v
   }
   write_call call = {capture, {operation, op_ctx}, NULL};
   qa_caught_error caught;
-  if (!qa_try(write_call_fn, &call, &caught)) print_failure(capture, caught.message);
+  if (!qa_try(write_call_fn, &call, &caught)) print_failure(capture, qa_caught_message(&caught));
   else if (call.error != NULL) print_failure(capture, call.error);
 }
 

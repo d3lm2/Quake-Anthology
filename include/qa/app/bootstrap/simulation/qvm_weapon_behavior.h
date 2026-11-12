@@ -16,6 +16,7 @@
 #define QA_APP_BOOTSTRAP_SIMULATION_QVM_WEAPON_BEHAVIOR_H
 #include <stdbool.h>
 #include <stddef.h>
+#include "qa/app/bootstrap/simulation/qvm_component_state.h"
 #include "qa/compat/qvm/artifacts.h"
 #include "qa/compat/qvm/common_syscalls.h"
 #include "qa/compat/qvm/weapon_behavior_profile.h"
@@ -97,6 +98,5 @@ void qa_app_sim_qvm_weapon_behavior_source_close(qa_app_sim_qvm_weapon_behavior_
 /* TS readQvmWeaponBehaviorCheckpoint. */
 qa_app_sim_qvm_weapon_behavior_checkpoint qa_app_sim_read_qvm_weapon_behavior_checkpoint(
     const qa_save_reader *reader, qa_weapon_behavior_definition expected);
-/* TS qvmWeaponInitializationEntities. Malloc'd entity text; caller frees. */
-char *qa_app_sim_qvm_weapon_initialization_entities(const char *text);
+/* TS qvmWeaponInitializationEntities lives in qvm_component_state.h (TS moved it to qvm-component-state.ts). */
 #endif

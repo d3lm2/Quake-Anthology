@@ -23,7 +23,8 @@ extern const qa_guest_layout qa_compat_q2_native_rerelease_mod_layout;
 const qa_compat_q2_native_combat_field *qa_compat_q2_native_combat_fields(qa_compat_q2_native_combat_operation op, int64_t pointer_bytes, size_t *count);
 /* TS stockNativeCombatCall into caller storage (max 10 args). */
 qa_compat_q2_native_combat_call qa_compat_q2_stock_native_combat_call(qa_compat_q2_native_combat_operation op, bool has_abi, qa_native_call_abi abi, qa_compat_q2_native_combat_argument *storage);
-/* TS nativeCombatSignature into caller parameter storage. */
+/* TS nativeCombatSignature into caller parameter storage: call->argument_count entries (a declared call has no
+ * argument limit). */
 qa_compat_q2_guest_call_signature qa_compat_q2_native_combat_signature(const qa_compat_q2_native_combat_call *call, qa_compat_q2_native_combat_operation op, qa_native_call_abi abi, qa_guest_value_layout *storage);
 void qa_compat_q2_validate_native_combat_call(const qa_compat_q2_native_combat_call *call, qa_compat_q2_native_combat_operation op, qa_native_call_abi abi);
 /* TS readNativeCombatCall: arguments/bytes/address arrays malloc'd

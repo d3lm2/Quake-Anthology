@@ -233,9 +233,7 @@ void qa_validate_equipment(qa_equipment_selection equipment,
           strcmp(grapple.source.provider, grapple.profile->module.id) != 0)
         qa_range_error("QVM hook source differs from its declared executable");
     } else {
-      qa_range_error("Equipment source %s/%s does not supply %s %s",
-                     grapple.source.provider, grapple.source.content,
-                     grapple.source.provider, grapple.edition);
+      return; /* TS `default: return exhaustive`: an unknown mechanic ends the check */
     }
   }
   qa_hand_grenade_selection grenades = equipment.hand_grenades;
@@ -243,12 +241,13 @@ void qa_validate_equipment(qa_equipment_selection equipment,
     check_equipment_source(grenades.source,
                            qa_equipment_provider_ids.hand_grenades,
                            QA_GAME_FAMILY_Q2, "baseq2", grenades.edition, catalog);
+    /* Number.isSafeInteger of both, range first: the casts are then defined. */
     bool valid = grenades.initial_ammo >= 0 && grenades.capacity >= 0 &&
+                 grenades.initial_ammo <= 9007199254740991.0 &&
+                 grenades.capacity <= 9007199254740991.0 &&
                  grenades.capacity >= grenades.initial_ammo &&
                  grenades.initial_ammo == (double)(int64_t)grenades.initial_ammo &&
-                 grenades.capacity == (double)(int64_t)grenades.capacity &&
-                 grenades.initial_ammo <= 9007199254740991.0 &&
-                 grenades.capacity <= 9007199254740991.0;
+                 grenades.capacity == (double)(int64_t)grenades.capacity;
     if (!valid)
       qa_range_error(
           "Equipment hand grenade allowance must be whole ammunition within capacity");

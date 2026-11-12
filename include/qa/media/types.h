@@ -69,6 +69,15 @@ typedef struct qa_cinematic_audio {
   double time;
   int64_t loop;
   bool reset_stream;
+  /* The TS object's own key order, which a checkpoint that spreads the block
+   * ({ ...block, signed, samples }) writes: the producer decides it. */
+  enum {
+    QA_CINEMATIC_AUDIO_KEYS_RESTORED, /* campaign readAudio: samples channels sampleRate sourceSample sourceTime time loop resetStream */
+    QA_CINEMATIC_AUDIO_KEYS_CIN,      /* CinDecoder + run(): samples sampleRate channels sourceSample sourceTime time loop resetStream */
+    QA_CINEMATIC_AUDIO_KEYS_ROQ,      /* RoqPlayback: samples channels sampleRate loop sourceSample sourceTime time resetStream */
+    QA_CINEMATIC_AUDIO_KEYS_OGV       /* Vorbis chunk + OgvPlayback: samples frames channels sampleRate frameCount loopStart
+                                         sourceSample sourceTime time loop resetStream */
+  } key_order;
 } qa_cinematic_audio;
 
 /* TS focus literals shared by the playback runners. */

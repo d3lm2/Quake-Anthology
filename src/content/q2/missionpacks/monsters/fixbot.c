@@ -15,10 +15,40 @@ typedef struct before_entry {
   qa_owned_actor actor;
   qa_vec3 origin;
 } before_entry;
+/* TS beforeMove: WeakMap<OwnedActor, Vec3>. An entry ends with its actor, so released actors are dropped
+ * before the list grows, and the storage is the module arena's (freed with the module). */
 typedef struct fixbot_bundle {
   qa_q2m_monsters *monsters;
+  qa_q2mpm_arena *arena;
   before_entry *before; size_t before_count, before_cap;
 } fixbot_bundle;
+static before_entry *before_find(fixbot_bundle *bundle, qa_owned_actor actor) {
+  for (size_t i = 0; i < bundle->before_count; i++)
+    if (bundle->before[i].actor.token == actor.token && qa_same_actor(bundle->before[i].actor.id, actor.id))
+      return &bundle->before[i];
+  return NULL;
+}
+static before_entry *before_slot(fixbot_bundle *bundle, qa_q2m_context *c) {
+  before_entry *entry = before_find(bundle, c->entity->actor);
+  if (entry) return entry;
+  if (bundle->before_count == bundle->before_cap) {
+    size_t kept = 0;
+    for (size_t i = 0; i < bundle->before_count; i++)
+      if (q2mpm_live(c->game, bundle->before[i].actor.id)) bundle->before[kept++] = bundle->before[i];
+    bundle->before_count = kept;
+  }
+  if (bundle->before_count == bundle->before_cap) {
+    size_t cap = bundle->before_cap ? bundle->before_cap * 2 : 8;
+    before_entry *grown = qa_q2mpm_arena_alloc(bundle->arena, cap * sizeof *grown);
+    if (!grown) qa_raise("Error", 0, 0, "Out of memory in fixbot movement");
+    if (bundle->before_count) memcpy(grown, bundle->before, bundle->before_count * sizeof *grown);
+    bundle->before = grown;
+    bundle->before_cap = cap;
+  }
+  entry = &bundle->before[bundle->before_count++];
+  entry->actor = c->entity->actor;
+  return entry;
+}
 static void run_move(qa_q2m_context *c) {
   q2mpm_set_move(c, c->state->stand_ground ? "fixbot_move_stand" : "fixbot_move_run");
 }
@@ -140,26 +170,8 @@ static void ai_move2_fn(void *ctx, qa_q2m_context *c, double distance) {
 }
 static void ai_movetogoal_fn(void *ctx, qa_q2m_context *c, double distance) {
   fixbot_bundle *bundle = ctx;
-  bool found = false;
-  for (size_t i = 0; i < bundle->before_count; i++) {
-    if (bundle->before[i].actor.token == c->entity->actor.token
-        && qa_same_actor(bundle->before[i].actor.id, c->entity->actor.id)) {
-      bundle->before[i].origin = q2mpm_body(c->game, c->entity).origin;
-      found = true;
-    }
-  }
-  if (!found) {
-    if (bundle->before_count == bundle->before_cap) {
-      size_t cap = bundle->before_cap ? bundle->before_cap * 2 : 8;
-      before_entry *grown = realloc(bundle->before, cap * sizeof *grown);
-      if (!grown) qa_raise("Error", 0, 0, "Out of memory in fixbot movement");
-      bundle->before = grown;
-      bundle->before_cap = cap;
-    }
-    bundle->before[bundle->before_count].actor = c->entity->actor;
-    bundle->before[bundle->before_count].origin = q2mpm_body(c->game, c->entity).origin;
-    bundle->before_count++;
-  }
+  qa_vec3 origin = q2mpm_body(c->game, c->entity).origin;
+  before_slot(bundle, c)->origin = origin;
   (void)c->move_to_goal(c->impl_ctx, c, distance);
 }
 static void ai_facing_fn(void *ctx, qa_q2m_context *c, double distance) {
@@ -252,15 +264,9 @@ static void use_scanner_fn(void *ctx, qa_q2m_context *c) {
     else leave_goal(c);
     return;
   }
-  qa_vec3 previous;
-  bool found = false;
-  for (size_t i = 0; i < bundle->before_count; i++) {
-    if (bundle->before[i].actor.token == entity->actor.token && qa_same_actor(bundle->before[i].actor.id, entity->actor.id)) {
-      previous = bundle->before[i].origin;
-      found = true;
-    }
-  }
-  if (!found) qa_raise("Error", 0, 0, "Fixbot scanner must follow source movement in the same frame");
+  const before_entry *before = before_find(bundle, entity->actor);
+  if (!before) qa_raise("Error", 0, 0, "Fixbot scanner must follow source movement in the same frame");
+  qa_vec3 previous = before->origin;
   if (trunc(qa_hypot3(qa_sub3_double(q2mpm_body(game, entity).origin, previous))) == 0) {
     if (strcmp(target->classname, "object_repair") == 0) q2mpm_set_move(c, "fixbot_move_stand");
     else leave_goal(c);
@@ -366,6 +372,7 @@ qa_q2m_definition qa_q2mpm_create_fixbot_definition(qa_q2mpm_arena *arena, qa_q2
   if (!bundle) qa_raise("Error", 0, 0, "Out of memory creating fixbot definition");
   memset(bundle, 0, sizeof *bundle);
   bundle->monsters = monsters;
+  bundle->arena = arena;
   qa_q2m_named_handler *callbacks = qa_q2mpm_arena_alloc(arena, 12 * sizeof *callbacks);
   qa_q2m_named_ai *ai = qa_q2mpm_arena_alloc(arena, 3 * sizeof *ai);
   qa_q2_named_think *thinks = qa_q2mpm_arena_alloc(arena, sizeof *thinks);

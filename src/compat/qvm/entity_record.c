@@ -21,30 +21,36 @@ int32_t qa_qvmx_event_ex(double value, qa_qvm_abi_profile profile, bool reverse,
   else if (event >= 0 && event < (int32_t)(sizeof qvmx_events / sizeof qvmx_events[0])) mapped = qvmx_events[event];
   if (mapped < 0) {
     if (lenient) return 0;
-    qa_range_error("QVM event %d is not represented by the selected legacy ABI", (int)event);
+    qa_raise("Error", 0, 0, "QVM event %d is not represented by the selected legacy ABI", (int)event);
   }
   return mapped | flags;
 }
 int32_t qa_qvmx_event(double value, qa_qvm_abi_profile profile, bool reverse) { return qa_qvmx_event_ex(value, profile, reverse, false); }
-int32_t qa_qvmx_entity_type_ex(double value, qa_qvm_abi_profile profile, bool reverse, bool lenient) {
-  if (modern(profile)) return qa_int32(value);
-  int32_t source_events = reverse ? 13 : 12, target_events = reverse ? 12 : 13;
-  int32_t word = qa_int32(value);
-  if (word >= source_events) {
-    const int32_t event = qa_qvmx_event_ex(word - source_events, profile, reverse, lenient);
-    return event == 0 && lenient ? 0 : target_events + event;
+/* TS qvmEntityType works on the JS number: the comparison and the subtraction
+ * happen before any int32 conversion and the sum after it, so a value outside
+ * int32 (or Infinity) maps as TS maps it, and the result is a number a reader
+ * sees unwrapped. A store converts it with ToInt32, as DataView.setInt32 does. */
+static double entity_type_number(double value, qa_qvm_abi_profile profile, bool reverse, bool lenient) {
+  if (modern(profile)) return value;
+  const double source_events = reverse ? 13 : 12, target_events = reverse ? 12 : 13;
+  if (value >= source_events) {
+    const int32_t event = qa_qvmx_event_ex(value - source_events, profile, reverse, lenient);
+    return event == 0 && lenient ? 0 : target_events + (double)event;
   }
-  if (reverse && word == 12) {
+  if (reverse && value == 12) {
     if (lenient) return 0;
-    qa_range_error("Legacy QVM has no team entity type");
+    qa_raise("Error", 0, 0, "Legacy QVM has no team entity type");
   }
-  return word;
+  return value;
+}
+int32_t qa_qvmx_entity_type_ex(double value, qa_qvm_abi_profile profile, bool reverse, bool lenient) {
+  return qa_int32(entity_type_number(value, profile, reverse, lenient));
 }
 int32_t qa_qvmx_entity_type(double value, qa_qvm_abi_profile profile, bool reverse) { return qa_qvmx_entity_type_ex(value, profile, reverse, false); }
 int32_t qa_qvmx_powerup_bits_ex(double bits, qa_qvm_abi_profile profile, bool lenient) {
   int32_t word = qa_int32(bits);
   if (!modern(profile) && lenient) return word & 0x1ff;
-  if (!modern(profile) && (word & ~0x1ff) != 0) qa_range_error("Legacy ball or private powerup has no modern presentation mapping");
+  if (!modern(profile) && (word & ~0x1ff) != 0) qa_raise("Error", 0, 0, "Legacy ball or private powerup has no modern presentation mapping");
   return word;
 }
 int32_t qa_qvmx_powerup_bits(double bits, qa_qvm_abi_profile profile) { return qa_qvmx_powerup_bits_ex(bits, profile, false); }
@@ -54,7 +60,7 @@ int32_t qa_qvmx_configstring(double index, qa_qvm_abi_profile profile) {
   int32_t word = qa_int32(index);
   if (word >= 12 && word <= 15) return word + 8;
   if (word >= 16 && word <= 26)
-    qa_range_error("Legacy private configstring %d has no declared modern presentation mapping", (int)word);
+    qa_raise("Error", 0, 0, "Legacy private configstring %d has no declared modern presentation mapping", (int)word);
   return word;
 }
 
@@ -91,7 +97,7 @@ static void write_trajectory(qa_qvmx_view *view, int64_t offset, qa_qvm_trajecto
 
 double qa_qvm_entity_state_get_number(const qa_qvm_entity_state *s) { return qa_qvmx_view_i32(&s->view, 0); }
 void qa_qvm_entity_state_set_number(qa_qvm_entity_state *s, double v) { qa_qvmx_view_set_i32((qa_qvmx_view *)&s->view, 0, qa_int32(v)); }
-double qa_qvm_entity_state_get_e_type(const qa_qvm_entity_state *s) { int32_t v = qa_qvmx_view_i32(&s->view, 4); return s->source ? v : qa_qvmx_entity_type(v, s->profile, false); }
+double qa_qvm_entity_state_get_e_type(const qa_qvm_entity_state *s) { int32_t v = qa_qvmx_view_i32(&s->view, 4); return s->source ? v : entity_type_number(v, s->profile, false, false); }
 void qa_qvm_entity_state_set_e_type(qa_qvm_entity_state *s, double v) { qa_qvmx_view_set_i32((qa_qvmx_view *)&s->view, 4, s->source ? qa_int32(v) : qa_qvmx_entity_type_ex(v, s->profile, true, s->lenient)); }
 double qa_qvm_entity_state_get_e_flags(const qa_qvm_entity_state *s) { return qa_qvmx_view_i32(&s->view, 8); }
 void qa_qvm_entity_state_set_e_flags(qa_qvm_entity_state *s, double v) { qa_qvmx_view_set_i32((qa_qvmx_view *)&s->view, 8, qa_int32(v)); }
@@ -144,7 +150,7 @@ void qa_qvm_entity_state_set_legs_anim(qa_qvm_entity_state *s, double v) { qa_qv
 double qa_qvm_entity_state_get_torso_anim(const qa_qvm_entity_state *s) { return qa_qvmx_view_i32(&s->view, 200); }
 void qa_qvm_entity_state_set_torso_anim(qa_qvm_entity_state *s, double v) { qa_qvmx_view_set_i32((qa_qvmx_view *)&s->view, 200, qa_int32(v)); }
 double qa_qvm_entity_state_get_generic1(const qa_qvm_entity_state *s) { return modern(s->profile) ? qa_qvmx_view_i32(&s->view, 204) : 0; }
-void qa_qvm_entity_state_set_generic1(qa_qvm_entity_state *s, double v) { if (modern(s->profile)) qa_qvmx_view_set_i32((qa_qvmx_view *)&s->view, 204, qa_int32(v)); else if (v != 0 && !s->lenient) qa_range_error("Legacy QVM entity has no generic1 field"); }
+void qa_qvm_entity_state_set_generic1(qa_qvm_entity_state *s, double v) { if (modern(s->profile)) qa_qvmx_view_set_i32((qa_qvmx_view *)&s->view, 204, qa_int32(v)); else if (v != 0 && !s->lenient) qa_raise("Error", 0, 0, "Legacy QVM entity has no generic1 field"); }
 
 qa_qvm_entity_state qa_qvm_borrow_entity_state(qa_qvmx_view view, qa_qvm_abi_profile profile) {
   require_record(&view, profile);
@@ -156,7 +162,8 @@ qa_qvm_entity_state qa_qvm_entity_state_copy(const qa_qvm_entity_state *state) {
   uint8_t *copy = malloc(bytes);
   if (copy == NULL) qa_range_error("out of memory");
   memcpy(copy, state->view.bytes, bytes);
-  qa_qvm_entity_state s = {{copy, bytes}, state->profile, state->source, copy, state->lenient};
+  /* TS copy(): new BorrowedEntityState(view, profile, source), so the copy is never lenient. */
+  qa_qvm_entity_state s = {{copy, bytes}, state->profile, state->source, copy, false};
   return s;
 }
 qa_qvm_entity_state qa_qvm_read_entity_state(qa_qvmx_view view) {
@@ -207,7 +214,8 @@ void qa_qvm_write_entity_state_unmapped(qa_qvmx_view view, const qa_qvm_entity_s
                                         bool ignore_unmapped) {
   write_entity_state(view, state, profile, false, ignore_unmapped);
 }
-void qa_qvm_entity_state_copy_from(qa_qvm_entity_state *state, const qa_qvm_entity_state_fields *source) { write_entity_state(state->view, source, state->profile, state->source, state->lenient); }
+/* TS copyFrom(): writeEntityState(view, source, profile, this.source), lenient left at its default. */
+void qa_qvm_entity_state_copy_from(qa_qvm_entity_state *state, const qa_qvm_entity_state_fields *source) { write_entity_state(state->view, source, state->profile, state->source, false); }
 void qa_qvm_entity_state_destroy(qa_qvm_entity_state *state) { if (state == NULL) return; free(state->owned_bytes); state->owned_bytes = NULL; }
 void qa_qvm_get_entity_state_fields(const qa_qvm_entity_state *state, qa_qvm_entity_state_fields *out) {
   out->number = qa_qvm_entity_state_get_number(state);

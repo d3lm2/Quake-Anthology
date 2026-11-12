@@ -41,22 +41,48 @@ void qa_ui_script_fail_env_destroy(qa_ui_script_fail_env *env) {
   env->pending_identity = NULL;
 }
 
+static void catch_restore(void *raw) {
+  qa_ui_script_catch *frame = raw;
+  frame->env->top = frame->prev;
+  frame->entered = false;
+}
+void qa_ui_script_catch_enter(qa_ui_script_fail_env *env,
+                              qa_ui_script_catch *frame) {
+  frame->env = env;
+  frame->prev = env->top;
+  frame->mark = qa_unwind_mark_take();
+  frame->entered = true;
+  env->top = frame;
+  qa_cleanup_push(&frame->restore, catch_restore, frame);
+}
+void qa_ui_script_catch_leave(qa_ui_script_catch *frame) {
+  if (!frame->entered) return; /* a throw landed here: already unwound */
+  qa_cleanup_pop(&frame->restore);
+  catch_restore(frame);
+}
+
 _Noreturn void qa_ui_script_fail_throw(
     qa_ui_script_fail_env *env, qa_ui_script_diagnostic *diagnostic,
     const qa_ui_script_diagnostic *identity) {
   if (env->top == NULL) {
-    /* Uncaught ScriptLanguageError: TS message form, then abort. */
-    fprintf(stderr, "ScriptLanguageError: %s:%lld:%lld: %s\n",
-            diagnostic->location.path,
-            (long long)diagnostic->location.line,
-            (long long)diagnostic->location.column, diagnostic->message);
-    abort();
+    /* No script catch frame: the ScriptLanguageError leaves through the
+     * general raise, so a caller's qa_try sees it as a TS try/catch does (and
+     * only a raise nobody catches ends the process). */
+    char text[QA_CAUGHT_MESSAGE_CAPACITY];
+    snprintf(text, sizeof text, "%s:%lld:%lld: %s", diagnostic->location.path,
+             (long long)diagnostic->location.line,
+             (long long)diagnostic->location.column, diagnostic->message);
+    qa_ui_script_diagnostic_destroy(diagnostic);
+    qa_raise("ScriptLanguageError", 0, 0, "%s", text);
   }
   if (env->has_pending) qa_ui_script_diagnostic_destroy(&env->pending);
   env->pending = *diagnostic;
   env->has_pending = true;
   env->pending_identity = identity;
-  longjmp(env->top->buf, 1);
+  /* Leave everything entered since the catching frame, the frame included. */
+  qa_ui_script_catch *target = env->top;
+  qa_unwind_to(target->mark);
+  longjmp(target->buf, 1);
 }
 
 const char *qa_ui_script_token_type_name(int64_t type) {
@@ -155,47 +181,42 @@ oom:
 
 bool qa_ui_script_read_diagnostic(const qa_save_reader *reader,
                                   qa_ui_script_diagnostic *out) {
+  /* TS readScriptDiagnostic: severity, message, location path, line and
+     column. Texts are borrowed until every field is read, so a malformed
+     field raises owning nothing. */
   memset(out, 0, sizeof *out);
   qa_save_reader field, location;
   const char *choices[2] = {"warning", "error"};
   if (!qa_save_reader_field(reader, "severity", &field)) return false;
   const char *severity = qa_save_reader_choice_string(&field, choices, 2);
-  out->severity = strcmp(severity, "error") == 0
-                      ? QA_UI_SCRIPT_SEVERITY_ERROR
-                      : QA_UI_SCRIPT_SEVERITY_WARNING;
+  qa_ui_script_severity parsed = strcmp(severity, "error") == 0
+                                     ? QA_UI_SCRIPT_SEVERITY_ERROR
+                                     : QA_UI_SCRIPT_SEVERITY_WARNING;
   qa_save_reader_destroy(&field);
   if (!qa_save_reader_field(reader, "message", &field)) return false;
-  out->message = copy_cstring(qa_save_reader_string(&field));
+  const char *message = qa_save_reader_string(&field);
   qa_save_reader_destroy(&field);
-  if (out->message == NULL) return false;
-  if (!qa_save_reader_field(reader, "location", &location)) goto oom;
-  if (!qa_save_reader_field(&location, "path", &field)) {
-    qa_save_reader_destroy(&location);
-    goto oom;
-  }
-  out->location.path = copy_cstring(qa_save_reader_string(&field));
+  if (!qa_save_reader_field(reader, "location", &location)) return false;
+  if (!qa_save_reader_field(&location, "path", &field)) return false;
+  const char *path = qa_save_reader_string(&field);
   qa_save_reader_destroy(&field);
-  if (out->location.path == NULL) {
-    qa_save_reader_destroy(&location);
-    goto oom;
-  }
-  if (!qa_save_reader_field(&location, "line", &field)) {
-    qa_save_reader_destroy(&location);
-    goto oom;
-  }
-  out->location.line = (int64_t)qa_save_reader_integer(&field);
+  if (!qa_save_reader_field(&location, "line", &field)) return false;
+  int64_t line = (int64_t)qa_save_reader_integer(&field);
   qa_save_reader_destroy(&field);
-  if (!qa_save_reader_field(&location, "column", &field)) {
-    qa_save_reader_destroy(&location);
-    goto oom;
-  }
-  out->location.column = (int64_t)qa_save_reader_integer(&field);
+  if (!qa_save_reader_field(&location, "column", &field)) return false;
+  int64_t column = (int64_t)qa_save_reader_integer(&field);
   qa_save_reader_destroy(&field);
   qa_save_reader_destroy(&location);
+  out->severity = parsed;
+  out->message = copy_cstring(message);
+  out->location.path = copy_cstring(path);
+  out->location.line = line;
+  out->location.column = column;
+  if (out->message == NULL || out->location.path == NULL) {
+    qa_ui_script_diagnostic_destroy(out);
+    return false;
+  }
   return true;
-oom:
-  qa_ui_script_diagnostic_destroy(out);
-  return false;
 }
 
 const char *qa_ui_script_token_kind_name(qa_ui_script_token_kind kind) {
@@ -303,7 +324,8 @@ static void build_table(owned_spec *specs, size_t count,
   for (size_t index = 0; index < count; index++) {
     owned_spec *added = &specs[index];
     unsigned int character = (uint8_t)added->text[0];
-    if (character > 127)
+    /* TS charCodeAt(0) of "" is NaN: heads[NaN] is undefined. */
+    if (added->text[0] == '\0' || character > 127)
       qa_range_error("punctuation table index exceeds its source signed-char allocation");
     int64_t pointer = heads[character];
     owned_spec *previous = NULL;
@@ -340,6 +362,14 @@ static void free_specs(owned_spec *specs, size_t count) {
   if (specs == NULL) return;
   for (size_t index = 0; index < count; index++) free(specs[index].text);
   free(specs);
+}
+typedef struct copied_specs {
+  owned_spec *specs;
+  size_t count;
+} copied_specs;
+static void free_copied_specs(void *raw) {
+  copied_specs *copied = raw;
+  free_specs(copied->specs, copied->count);
 }
 
 qa_ui_source_script_storage *qa_ui_script_allocate_source(
@@ -689,7 +719,10 @@ static int read_escape(qa_ui_script_lexer *lexer) {
     size_t length = 0;
     char *text = source_slice(lexer, start, get_offset(lexer), &length);
     if (text == NULL) qa_range_error("script token allocation failed");
+    qa_cleanup text_node; /* an escape that overflows fails the source */
+    qa_cleanup_push(&text_node, free, text);
     int64_t value = source_escape_hex_value(lexer, text, length);
+    qa_cleanup_pop(&text_node);
     free(text);
     return (int)value;
   }
@@ -699,7 +732,10 @@ static int read_escape(qa_ui_script_lexer *lexer) {
     size_t length = 0;
     char *text = source_slice(lexer, start, get_offset(lexer), &length);
     if (text == NULL) qa_range_error("script token allocation failed");
+    qa_cleanup text_node; /* an escape that overflows fails the source */
+    qa_cleanup_push(&text_node, free, text);
     int64_t value = decimal_escape_value(lexer, text, length);
+    qa_cleanup_pop(&text_node);
     free(text);
     return (int)value;
   }
@@ -749,6 +785,8 @@ static size_t read_quoted(qa_ui_script_lexer *lexer, int quote,
       message[22] = (char)quote;
       memcpy(message + 23, bytes + 1, shown);
       message[23 + shown] = '\0';
+      qa_cleanup message_node; /* the failure keeps its own copy */
+      qa_cleanup_push(&message_node, free, message);
       lexer_fail(lexer, message);
     }
     if (character == '\\'
@@ -1007,6 +1045,9 @@ bool qa_ui_script_lexer_next_into(qa_ui_script_lexer *lexer,
   char *leading =
       source_slice(lexer, whitespace_start, get_offset(lexer), &leading_length);
   if (leading == NULL) qa_range_error("script token allocation failed");
+  /* Reading the token can fail the source; the copy goes with the failure. */
+  qa_cleanup leading_node;
+  qa_cleanup_push(&leading_node, free, leading);
   int64_t token_column = lexer->column;
   int character = peek_at(lexer, 0);
   size_t text_extent = 0;
@@ -1034,10 +1075,7 @@ bool qa_ui_script_lexer_next_into(qa_ui_script_lexer *lexer,
     text_extent = read_name(lexer, output);
   } else {
     const owned_spec *spec = read_punctuation(lexer);
-    if (spec == NULL) {
-      free(leading);
-      lexer_fail(lexer, "can't read token");
-    }
+    if (spec == NULL) lexer_fail(lexer, "can't read token");
     size_t spec_length = strlen(spec->text);
     qa_ui_source_token_write_string(output, spec->text, spec_length);
     advance(lexer, (int64_t)spec_length);
@@ -1046,14 +1084,12 @@ bool qa_ui_script_lexer_next_into(qa_ui_script_lexer *lexer,
     text_extent = spec_length;
   }
   char *path = current_path_copy(lexer);
-  if (path == NULL) {
-    free(leading);
-    qa_range_error("script token allocation failed");
-  }
+  if (path == NULL) qa_range_error("script token allocation failed");
   qa_ui_source_token_context context;
   memset(&context, 0, sizeof context);
   bool context_ok = qa_ui_source_token_context_set(
       &context, path, token_column, leading, leading_length);
+  qa_cleanup_pop(&leading_node);
   free(path);
   free(leading);
   if (!context_ok) qa_range_error("script token allocation failed");
@@ -1086,16 +1122,14 @@ bool qa_ui_script_lexer_next(qa_ui_script_lexer *lexer,
 static bool read_expected_into(qa_ui_script_lexer *lexer,
                                qa_ui_source_token_memory *output) {
   qa_ui_script_catch catch_block;
-  catch_block.prev = lexer->env->top;
-  lexer->env->top = &catch_block;
-  bool result;
+  qa_ui_script_catch_enter(lexer->env, &catch_block);
+  volatile bool result;
   if (setjmp(catch_block.buf) == 0) {
     qa_ui_script_token_record record;
     result = qa_ui_script_lexer_next_into(lexer, output, &record);
     if (result) qa_ui_script_token_record_release(&record);
-    lexer->env->top = catch_block.prev;
+    qa_ui_script_catch_leave(&catch_block);
   } else {
-    lexer->env->top = catch_block.prev;
     qa_ui_script_fail_env_clear_pending(lexer->env);
     result = false;
   }
@@ -1138,8 +1172,10 @@ static qa_ui_script_lexer *lexer_alloc(const char *path,
   lexer->specs = specs;
   lexer->spec_count = DEFAULT_SPEC_COUNT;
   build_table(lexer->specs, lexer->spec_count, lexer->heads);
-  if (lexer->max_token_length < 4)
+  if (lexer->max_token_length < 4) {
+    qa_ui_script_lexer_destroy(lexer);
     qa_range_error("maxTokenLength must be an integer of at least 4");
+  }
   return lexer;
 }
 
@@ -1296,10 +1332,14 @@ void qa_ui_script_lexer_set_punctuations(
   owned_spec *copied = NULL;
   if (!copy_specs(values, value_count, &copied))
     qa_range_error("script punctuation allocation failed");
+  copied_specs guard_specs = {copied, value_count};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_copied_specs, &guard_specs);
   uint32_t heads[256];
   build_table(copied, value_count, heads);
   if (lexer->storage != NULL)
     qa_ui_source_script_set_default_punctuations(lexer->storage, heads, 256);
+  qa_cleanup_pop(&guard);
   free_specs(lexer->specs, lexer->spec_count);
   lexer->specs = copied;
   lexer->spec_count = value_count;
@@ -1352,19 +1392,25 @@ static void output_string(qa_ui_script_lexer *lexer,
 
 bool qa_ui_script_lexer_expect_token_string(qa_ui_script_lexer *lexer,
                                             const char *text) {
-  char message[1200];
+  /* The expected text is the caller's and has no length limit. */
+  size_t capacity = strlen(text) + QA_UI_SOURCE_TOKEN_STRING_BYTES + 64;
+  char *message = malloc(capacity);
+  if (message == NULL) qa_range_error("script token allocation failed");
   if (!read_expected_into(lexer, lexer->output)) {
-    snprintf(message, sizeof message, "couldn't find expected %s", text);
+    snprintf(message, capacity, "couldn't find expected %s", text);
     lexer_error(lexer, message);
+    free(message);
     return false;
   }
   char found[QA_UI_SOURCE_TOKEN_STRING_BYTES];
   output_string(lexer, found);
   if (strcmp(found, text) != 0) {
-    snprintf(message, sizeof message, "expected %s, found %s", text, found);
+    snprintf(message, capacity, "expected %s, found %s", text, found);
     lexer_error(lexer, message);
+    free(message);
     return false;
   }
+  free(message);
   return true;
 }
 
@@ -1504,60 +1550,48 @@ int64_t qa_ui_script_lexer_read_signed_int(qa_ui_script_lexer *lexer) {
   return (int32_t)product;
 }
 
+/* TS byte(): 0 at the end of the source; a read past it is the RangeError. */
+static int literal_byte(qa_ui_script_lexer *lexer) {
+  if (get_offset(lexer) == (int64_t)source_length(lexer)) return 0;
+  int character = peek_at(lexer, 0);
+  if (character < 0)
+    qa_range_error("PS_ReadLiteral reads outside its source allocation");
+  return character;
+}
+static int literal_take(qa_ui_script_lexer *lexer) {
+  int value = literal_byte(lexer);
+  set_offset(lexer, get_offset(lexer) + 1);
+  lexer->column++;
+  return value;
+}
+
 bool qa_ui_script_lexer_read_literal_into(
     qa_ui_script_lexer *lexer, qa_ui_source_token_memory *output) {
   qa_ui_script_catch catch_block;
-  catch_block.prev = lexer->env->top;
-  lexer->env->top = &catch_block;
+  qa_ui_script_catch_enter(lexer->env, &catch_block);
   if (setjmp(catch_block.buf) != 0) {
-    lexer->env->top = catch_block.prev;
     qa_ui_script_fail_env_clear_pending(lexer->env);
     return false;
   }
-  /* byte()/take() work on offset/column directly. */
   qa_ui_source_token_set_type(output, QA_UI_SCRIPT_TOKEN_LITERAL);
-  int64_t length = (int64_t)source_length(lexer);
-  int first = get_offset(lexer) == length ? 0 : peek_at(lexer, 0);
-  if (first < 0 && get_offset(lexer) != length)
-    qa_range_error("PS_ReadLiteral reads outside its source allocation");
-  set_offset(lexer, get_offset(lexer) + 1);
-  lexer->column++;
-  qa_ui_source_token_set_string_byte(output, 0, first);
-  int next = get_offset(lexer) == length ? 0 : peek_at(lexer, 0);
-  if (next == 0) {
+  qa_ui_source_token_set_string_byte(output, 0, literal_take(lexer));
+  if (literal_byte(lexer) == 0) {
     lexer_error(lexer, "end of file before trailing '");
-    lexer->env->top = catch_block.prev;
+    qa_ui_script_catch_leave(&catch_block);
     return false;
   }
-  int value;
-  if (next == 92) {
-    value = read_escape(lexer);
-  } else {
-    value = next;
-    set_offset(lexer, get_offset(lexer) + 1);
-    lexer->column++;
-  }
+  int value = literal_byte(lexer) == 92 ? read_escape(lexer) : literal_take(lexer);
   qa_ui_source_token_set_string_byte(output, 1, value);
-  int current = get_offset(lexer) == length ? 0 : peek_at(lexer, 0);
-  if (current != 39) {
+  if (literal_byte(lexer) != 39) {
     lexer_warn(lexer, "too many characters in literal, ignored");
-    while (current != 0 && current != 39 && current != 10) {
-      set_offset(lexer, get_offset(lexer) + 1);
-      lexer->column++;
-      current = get_offset(lexer) == length ? 0 : peek_at(lexer, 0);
-    }
-    if (current == 39) {
-      set_offset(lexer, get_offset(lexer) + 1);
-      lexer->column++;
-    }
+    while (literal_byte(lexer) != 0 && literal_byte(lexer) != 39 && literal_byte(lexer) != 10)
+      (void)literal_take(lexer);
+    if (literal_byte(lexer) == 39) (void)literal_take(lexer);
   }
-  int trailing = get_offset(lexer) == length ? 0 : peek_at(lexer, 0);
-  set_offset(lexer, get_offset(lexer) + 1);
-  lexer->column++;
-  qa_ui_source_token_set_string_byte(output, 2, trailing);
+  qa_ui_source_token_set_string_byte(output, 2, literal_take(lexer));
   qa_ui_source_token_set_string_byte(output, 3, 0);
   qa_ui_source_token_set_subtype(output, value < 128 ? value : value - 256);
-  lexer->env->top = catch_block.prev;
+  qa_ui_script_catch_leave(&catch_block);
   return true;
 }
 
@@ -1728,13 +1762,18 @@ static int64_t read_int_field_min(const qa_save_reader *reader,
   qa_save_reader_destroy(&field);
   return value;
 }
-static char *read_string_field(const qa_save_reader *reader,
-                               const char *name) {
-  qa_save_reader field;
-  if (!field_reader(reader, name, &field)) return NULL;
-  char *value = copy_cstring(qa_save_reader_string(&field));
-  qa_save_reader_destroy(&field);
-  return value;
+
+/* A lexer dropped by a failed restore: its restored storage keeps its
+   allocations (they belong to the restore owner, as in TS). */
+void qa_ui_script_lexer_discard(qa_ui_script_lexer *lexer) {
+  if (lexer == NULL) return;
+  qa_ui_source_script_discard(lexer->storage);
+  lexer->storage = NULL;
+  qa_ui_script_lexer_destroy(lexer);
+}
+static void lexer_discard(void *raw) { qa_ui_script_lexer_discard(raw); }
+static void storage_discard_cleanup(void *storage) {
+  qa_ui_source_script_discard(storage);
 }
 
 qa_ui_script_lexer *qa_ui_script_lexer_restore_save_state_env(
@@ -1747,58 +1786,54 @@ qa_ui_script_lexer *qa_ui_script_lexer_restore_save_state_env(
   qa_ui_script_lexer *lexer = NULL;
   qa_save_reader saved_source, field;
   if (!field_reader(&reader, "source", &saved_source)) goto oom;
-  if (!field_reader(&saved_source, "kind", &field)) {
-    qa_save_reader_destroy(&saved_source);
-    goto oom;
-  }
+  if (!field_reader(&saved_source, "kind", &field)) goto oom;
   const char *kinds[2] = {"text", "storage"};
   const char *kind = qa_save_reader_choice_string(&field, kinds, 2);
   bool is_text = strcmp(kind, "text") == 0;
   qa_save_reader_destroy(&field);
-  char *path = read_string_field(&reader, "diagnosticPath");
+  /* TS reads the source, then diagnosticPath and maxTokenLength. Texts are
+     borrowed from the save value, so a raise owns only the guarded storage. */
+  const char *text = NULL;
+  size_t text_length = 0;
+  qa_ui_source_script_storage *storage = NULL;
+  qa_cleanup storage_guard;
+  if (is_text) {
+    if (!field_reader(&saved_source, "text", &field)) goto oom;
+    text = qa_save_reader_string_length(&field, &text_length);
+    qa_save_reader_destroy(&field);
+  } else {
+    if (!has_memory)
+      qa_save_reader_fail(&reader, "stored lexer requires memory owner");
+    if (!field_reader(&saved_source, "state", &field)) goto oom;
+    storage = qa_ui_source_script_restore_save_state(field.value, memory,
+                                                     restore);
+    qa_save_reader_destroy(&field);
+    if (storage == NULL) goto oom;
+    qa_cleanup_push(&storage_guard, storage_discard_cleanup, storage);
+  }
+  qa_save_reader_destroy(&saved_source);
+  if (!field_reader(&reader, "diagnosticPath", &field)) goto oom_storage;
+  const char *path = qa_save_reader_string(&field);
+  qa_save_reader_destroy(&field);
   qa_ui_script_lexer_options options;
   memset(&options, 0, sizeof options);
   options.has_max_token_length = true;
   options.max_token_length = read_int_field_min(&reader, "maxTokenLength", 4);
   options.report = report;
   options.report_ctx = report_ctx;
-  if (path == NULL) {
-    qa_save_reader_destroy(&saved_source);
-    goto oom;
-  }
   if (is_text) {
-    char *text = read_string_field(&saved_source, "text");
-    if (text == NULL) {
-      free(path);
-      qa_save_reader_destroy(&saved_source);
-      goto oom;
-    }
-    lexer = qa_ui_script_lexer_create_text_env(
-        (const uint8_t *)text, strlen(text), path, &options, env);
-    free(text);
+    lexer = qa_ui_script_lexer_create_text_env((const uint8_t *)text,
+                                               text_length, path, &options,
+                                               env);
   } else {
-    if (!has_memory)
-      qa_save_reader_fail(&reader, "stored lexer requires memory owner");
-    if (!field_reader(&saved_source, "state", &field)) {
-      free(path);
-      qa_save_reader_destroy(&saved_source);
-      goto oom;
-    }
-    qa_ui_source_script_storage *storage =
-        qa_ui_source_script_restore_save_state(field.value, memory, restore);
-    qa_save_reader_destroy(&field);
-    if (storage == NULL) {
-      free(path);
-      qa_save_reader_destroy(&saved_source);
-      goto oom;
-    }
     lexer = qa_ui_script_lexer_create_storage_env(storage, path, &options,
                                                   env);
-    if (lexer == NULL) qa_ui_source_script_destroy(storage);
+    qa_cleanup_pop(&storage_guard);
+    if (lexer == NULL) qa_ui_source_script_discard(storage);
   }
-  free(path);
-  qa_save_reader_destroy(&saved_source);
   if (lexer == NULL) goto oom;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, lexer_discard, lexer);
   lexer->diagnostic_flags = read_int_field(&reader, "diagnosticFlags");
   lexer->diagnostic_offset = read_int_field(&reader, "diagnosticOffset");
   lexer->diagnostic_line = read_int_field(&reader, "diagnosticLine");
@@ -1810,85 +1845,87 @@ qa_ui_script_lexer *qa_ui_script_lexer_restore_save_state_env(
   lexer->diagnostic_whitespace_end =
       read_int_field(&reader, "diagnosticWhitespaceEnd");
   lexer->column = read_int_field(&reader, "column");
-  if (!field_reader(&reader, "diagnosticTokenAvailable", &field)) goto oom;
+  if (!field_reader(&reader, "diagnosticTokenAvailable", &field))
+    goto oom_lexer;
   lexer->diagnostic_token_available = qa_save_reader_boolean(&field);
   qa_save_reader_destroy(&field);
-  if (!field_reader(&reader, "diagnosticToken", &field)) goto oom;
+  if (!field_reader(&reader, "diagnosticToken", &field)) goto oom_lexer;
   qa_ui_source_token_restore_save_state(lexer->diagnostic_token, field.value,
                                         false);
   qa_save_reader_destroy(&field);
-  if (!field_reader(&reader, "output", &field)) goto oom;
+  if (!field_reader(&reader, "output", &field)) goto oom_lexer;
   qa_ui_source_token_restore_save_state(lexer->output, field.value, false);
   qa_save_reader_destroy(&field);
-  if (!field_reader(&reader, "tokenContext", &saved_source)) goto oom;
+  if (!field_reader(&reader, "tokenContext", &saved_source)) goto oom_lexer;
   {
-    char *context_path = read_string_field(&saved_source, "path");
+    if (!field_reader(&saved_source, "path", &field)) goto oom_lexer;
+    const char *context_path = qa_save_reader_string(&field);
+    qa_save_reader_destroy(&field);
     int64_t column = read_int_field(&saved_source, "column");
-    char *ws = read_string_field(&saved_source, "leadingWhitespace");
+    if (!field_reader(&saved_source, "leadingWhitespace", &field))
+      goto oom_lexer;
+    size_t ws_length = 0;
+    const char *ws = qa_save_reader_string_length(&field, &ws_length);
+    qa_save_reader_destroy(&field);
     qa_save_reader_destroy(&saved_source);
-    if (context_path == NULL || ws == NULL
-        || !qa_ui_source_token_context_set(&lexer->token_context,
-                                           context_path, column, ws,
-                                           strlen(ws))) {
-      free(context_path);
-      free(ws);
-      goto oom;
-    }
-    free(context_path);
-    free(ws);
+    if (!qa_ui_source_token_context_set(&lexer->token_context, context_path,
+                                        column, ws, ws_length))
+      goto oom_lexer;
   }
-  if (!field_reader(&reader, "punctuations", &saved_source)) goto oom;
+  if (!field_reader(&reader, "punctuations", &saved_source)) goto oom_lexer;
   {
     size_t count = qa_save_reader_list_count(&saved_source);
     owned_spec *specs = calloc(count == 0 ? 1 : count, sizeof *specs);
-    if (specs == NULL) {
-      qa_save_reader_destroy(&saved_source);
-      goto oom;
-    }
-    bool ok = true;
-    for (size_t index = 0; index < count && ok; index++) {
-      qa_save_reader entry;
-      ok = qa_save_reader_item(&saved_source, index, &entry);
-      if (ok) {
-        specs[index].text = read_string_field(&entry, "text");
-        specs[index].punctuation = read_int_field(&entry, "punctuation");
-        ok = specs[index].text != NULL;
-        qa_save_reader_destroy(&entry);
-      }
-    }
-    qa_save_reader_destroy(&saved_source);
-    if (!ok) {
-      free_specs(specs, count);
-      goto oom;
-    }
+    if (specs == NULL) goto oom_lexer;
+    /* Owned by the lexer from here, so a malformed entry frees them. */
     free_specs(lexer->specs, lexer->spec_count);
     lexer->specs = specs;
     lexer->spec_count = count;
-    build_table(lexer->specs, count, lexer->heads);
-  }
-  if (!field_reader(&reader, "reported", &saved_source)) goto oom;
-  {
-    size_t count = qa_save_reader_list_count(&saved_source);
-    bool ok = true;
-    for (size_t index = 0; index < count && ok; index++) {
+    for (size_t index = 0; index < count; index++) {
       qa_save_reader entry;
-      ok = qa_save_reader_item(&saved_source, index, &entry);
-      if (ok) {
-        qa_ui_script_diagnostic diagnostic;
-        ok = qa_ui_script_read_diagnostic(&entry, &diagnostic)
-             && push_diagnostic(lexer, &diagnostic);
-        if (!ok) qa_ui_script_diagnostic_destroy(&diagnostic);
-        qa_save_reader_destroy(&entry);
-      }
+      if (!qa_save_reader_item(&saved_source, index, &entry)) goto oom_lexer;
+      if (!field_reader(&entry, "text", &field)) goto oom_lexer;
+      const char *spec_text = qa_save_reader_string(&field);
+      qa_save_reader_destroy(&field);
+      int64_t punctuation = read_int_field(&entry, "punctuation");
+      qa_save_reader_destroy(&entry);
+      specs[index].text = copy_cstring(spec_text);
+      if (specs[index].text == NULL) goto oom_lexer;
+      specs[index].punctuation = punctuation;
     }
     qa_save_reader_destroy(&saved_source);
-    if (!ok) goto oom;
+    build_table(lexer->specs, count, lexer->heads);
   }
+  if (!field_reader(&reader, "reported", &saved_source)) goto oom_lexer;
+  {
+    size_t count = qa_save_reader_list_count(&saved_source);
+    for (size_t index = 0; index < count; index++) {
+      qa_save_reader entry;
+      if (!qa_save_reader_item(&saved_source, index, &entry)) goto oom_lexer;
+      qa_ui_script_diagnostic diagnostic;
+      bool ok = qa_ui_script_read_diagnostic(&entry, &diagnostic)
+                && push_diagnostic(lexer, &diagnostic);
+      if (!ok) qa_ui_script_diagnostic_destroy(&diagnostic);
+      qa_save_reader_destroy(&entry);
+      if (!ok) goto oom_lexer;
+    }
+    qa_save_reader_destroy(&saved_source);
+  }
+  qa_cleanup_pop(&guard);
   qa_save_reader_destroy(&reader);
   return lexer;
+oom_storage:
+  if (storage != NULL) {
+    qa_cleanup_pop(&storage_guard);
+    qa_ui_source_script_discard(storage);
+  }
+  goto oom;
+oom_lexer:
+  qa_cleanup_pop(&guard);
+  lexer_discard(lexer);
+  lexer = NULL;
 oom:
   qa_save_reader_destroy(&reader);
-  qa_ui_script_lexer_destroy(lexer);
   return NULL;
 }
 

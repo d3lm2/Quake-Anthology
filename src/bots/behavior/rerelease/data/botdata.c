@@ -7,8 +7,14 @@
 #include <string.h>
 #include "qa/foundation/js.h"
 typedef struct { char **v; size_t n, cap; } Errs;
-static void errf(Errs *e, const char *fmt, const char *a, int64_t line) { char buf[1024]; if (a) snprintf(buf, sizeof buf, fmt, (long long)line, a); else snprintf(buf, sizeof buf, fmt, (long long)line);
-  if (e->n == e->cap) { e->cap = e->cap ? e->cap * 2 : 8; e->v = realloc(e->v, e->cap * sizeof *e->v); } size_t l = strlen(buf); e->v[e->n] = malloc(l + 1); memcpy(e->v[e->n], buf, l + 1); e->n++; }
+/* A TS template literal has no length limit: the message is sized before it is formatted. */
+static void errf(Errs *e, const char *fmt, const char *a, int64_t line) {
+  int l = a ? snprintf(NULL, 0, fmt, (long long)line, a) : snprintf(NULL, 0, fmt, (long long)line);
+  char *buf = malloc(l < 0 ? 1 : (size_t)l + 1);
+  if (!buf) return;
+  if (a) snprintf(buf, (size_t)l + 1, fmt, (long long)line, a); else snprintf(buf, (size_t)l + 1, fmt, (long long)line);
+  if (e->n == e->cap) { e->cap = e->cap ? e->cap * 2 : 8; e->v = realloc(e->v, e->cap * sizeof *e->v); }
+  e->v[e->n++] = buf; }
 static void errs_from_blocks(Errs *e, qa_block_parse_result *p) { for (size_t i = 0; i < p->error_count; i++) errf(e, "line %lld: %s", p->errors[i].message, p->errors[i].line); }
 static void errs_free(char **v, size_t n) { for (size_t i = 0; i < n; i++) free(v[i]); free(v); }
 static bool exp_str(Errs *e, const qa_block_field *f, const char **o) { if (qa_field_string((const char *const *)f->values, f->value_count, o)) return true; errf(e, "line %lld: \"%s\" expects a single string", f->key, f->line); return false; }
@@ -81,10 +87,11 @@ bool qa_parse_interactables(qa_interactables_result *out, const char *text) { BE
 void qa_interactables_result_destroy(qa_interactables_result *r) { for (size_t i = 0; i < r->entry_count; i++) base_free(&r->entries[i].base); free(r->entries); errs_free(r->errors, r->error_count); qa_block_parse_result_destroy(&r->parsed); memset(r, 0, sizeof *r); }
 bool qa_parse_game_rules(qa_game_rules_result *out, const char *text) { BEGIN(qa_game_rules_result, qa_game_rule_entry);
   for (size_t i = 0; i < out->entry_count; i++) { qa_game_rule_entry *en = &out->entries[i]; const qa_block *bl = &out->parsed.blocks[i]; en->base.source = bl; en->cvar = en->game_type = ""; en->only_game_type = en->not_game_type = NULL;
-    const char *cvars[64]; double vals[64]; size_t nc = 0, nv = 0;
+    /* TS arrays have no cap: a block with more than 64 cvar or value fields keeps them all. */
+    const char **cvars = malloc((bl->field_count ? bl->field_count : 1) * sizeof *cvars); double *vals = malloc((bl->field_count ? bl->field_count : 1) * sizeof *vals); size_t nc = 0, nv = 0;
     for (size_t j = 0; j < bl->field_count; j++) { const qa_block_field *f = &bl->fields[j]; const char *s; double n; bool b;
-      if (!strcmp(f->key, "cvar")) { if (exp_str(&errs, f, &s)) { en->cvar = s; if (nc < 64) cvars[nc++] = s; } }
-      else if (!strcmp(f->key, "value")) { if (exp_num(&errs, f, &n)) { en->value = n; if (nv < 64) vals[nv++] = n; } }
+      if (!strcmp(f->key, "cvar")) { if (exp_str(&errs, f, &s)) { en->cvar = s; cvars[nc++] = s; } }
+      else if (!strcmp(f->key, "value")) { if (exp_num(&errs, f, &n)) { en->value = n; vals[nv++] = n; } }
       else if (!strcmp(f->key, "weapon_stay")) { if (exp_bool(&errs, f, &b)) { en->weapon_stay = b; en->weapon_stay_specified = true; } }
       else if (!strcmp(f->key, "has_teams")) { if (exp_bool(&errs, f, &b)) { en->has_teams = b; en->has_teams_present = true; } }
       else if (!strcmp(f->key, "team_damage")) { if (exp_bool(&errs, f, &b)) { en->team_damage = b; en->team_damage_present = true; } }
@@ -93,7 +100,7 @@ bool qa_parse_game_rules(qa_game_rules_result *out, const char *text) { BEGIN(qa
       else if (!strcmp(f->key, "logic_op")) { if (exp_str(&errs, f, &s)) { if (!strcmp(s, "and")) en->logic_is_and = true; else if (!strcmp(s, "or")) en->logic_is_and = false; else errf(&errs, "line %lld: unsupported logic_op \"%s\"", s, f->line); } }
       else if (!strcmp(f->key, "game_type")) { if (exp_str(&errs, f, &s)) en->game_type = s; } else unknown(&errs, &en->base, f); }
     if (nc != nv || nc > 2) errf(&errs, "line %lld: game rule expects one or two paired cvar/value entries", NULL, bl->line);
-    en->conditions = malloc((nc ? nc : 1) * sizeof *en->conditions); size_t cc = 0; for (size_t k = 0; k < nc && k < nv; k++) en->conditions[cc++] = (qa_bot_rule_condition){cvars[k], vals[k]}; en->condition_count = cc; } END(); }
+    en->conditions = malloc((nc ? nc : 1) * sizeof *en->conditions); size_t cc = 0; for (size_t k = 0; k < nc && k < nv; k++) en->conditions[cc++] = (qa_bot_rule_condition){cvars[k], vals[k]}; en->condition_count = cc; free(cvars); free(vals); } END(); }
 void qa_game_rules_result_destroy(qa_game_rules_result *r) { for (size_t i = 0; i < r->entry_count; i++) { base_free(&r->entries[i].base); free(r->entries[i].conditions); } free(r->entries); errs_free(r->errors, r->error_count); qa_block_parse_result_destroy(&r->parsed); memset(r, 0, sizeof *r); }
 bool qa_parse_teams(qa_teams_result *out, const char *text) { BEGIN(qa_teams_result, qa_team_entry);
   for (size_t i = 0; i < out->entry_count; i++) { qa_team_entry *en = &out->entries[i]; const qa_block *bl = &out->parsed.blocks[i]; en->base.source = bl; en->name = "";
@@ -160,12 +167,28 @@ static void apply_skill(qa_bot_skill_settings *st, const qa_block_field *f, Errs
   else if (!strcmp(k, "weapons.decay_time")) skill_num(e, f, &st->weapons.decay_time);
   else if (!strcmp(k, "weapons.fov_angle")) skill_num(e, f, &st->weapons.fov_angle);
   else if (!strcmp(k, "weapons.sight_time")) skill_num(e, f, &st->weapons.sight_time);
-  else { st->unknown = realloc((void *)st->unknown, (st->unknown_count + 1) * sizeof *st->unknown); st->unknown[st->unknown_count++] = f; errf(e, "line %lld: unknown key \"%s\"", k, f->line); } }
+  else { /* settings.unknown[key] = values: a repeated key replaces its values in place */
+    size_t slot = 0; while (slot < st->unknown_count && strcmp(st->unknown[slot]->key, k)) slot++;
+    if (slot == st->unknown_count) { st->unknown = realloc((void *)st->unknown, (st->unknown_count + 1) * sizeof *st->unknown); st->unknown_count++; }
+    st->unknown[slot] = f; errf(e, "line %lld: unknown key \"%s\"", k, f->line); } }
+/* JSON.stringify(string[]): quotes, backslashes and controls below 0x20 escaped, no length cap. */
+static char *header_json(const qa_block *bl) {
+  size_t cap = 3; for (size_t h = 0; h < bl->header_count; h++) cap += 3 + 6 * strlen(bl->header[h]);
+  char *out = malloc(cap); if (!out) return NULL; size_t n = 0; out[n++] = '[';
+  for (size_t h = 0; h < bl->header_count; h++) { if (h) out[n++] = ','; out[n++] = '"';
+    for (const unsigned char *c = (const unsigned char *)bl->header[h]; *c; c++) {
+      switch (*c) { case '"': out[n++] = '\\'; out[n++] = '"'; break; case '\\': out[n++] = '\\'; out[n++] = '\\'; break;
+        case '\b': out[n++] = '\\'; out[n++] = 'b'; break; case '\f': out[n++] = '\\'; out[n++] = 'f'; break;
+        case '\n': out[n++] = '\\'; out[n++] = 'n'; break; case '\r': out[n++] = '\\'; out[n++] = 'r'; break;
+        case '\t': out[n++] = '\\'; out[n++] = 't'; break;
+        default: if (*c < 0x20) { n += (size_t)snprintf(out + n, cap - n, "\\u%04x", *c); } else out[n++] = (char)*c; } }
+    out[n++] = '"'; }
+  out[n++] = ']'; out[n] = 0; return out; }
 bool qa_parse_bot_settings(qa_bot_settings_result *out, const char *text) { memset(out, 0, sizeof *out); if (!qa_parse_blocks(&out->parsed, text)) return false; Errs errs = {0}; errs_from_blocks(&errs, &out->parsed);
   out->skills = calloc(out->parsed.block_count ? out->parsed.block_count : 1, sizeof *out->skills); size_t n = 0;
   for (size_t i = 0; i < out->parsed.block_count; i++) { const qa_block *bl = &out->parsed.blocks[i];
-    if (bl->header_count != 2 || strcmp(bl->header[0], "skill")) { char hdr[512] = ""; for (size_t h = 0; h < bl->header_count; h++) { if (h) strncat(hdr, ",", sizeof hdr - strlen(hdr) - 1); strncat(hdr, "\"", sizeof hdr - strlen(hdr) - 1); strncat(hdr, bl->header[h], sizeof hdr - strlen(hdr) - 1); strncat(hdr, "\"", sizeof hdr - strlen(hdr) - 1); }
-      char buf[640]; snprintf(buf, sizeof buf, "[%s]", hdr); /* TS JSON.stringify(header) */ errf(&errs, "line %lld: block header is not \"skill <name>\" (got %s)", buf, bl->line); continue; }
+    if (bl->header_count < 1 || strcmp(bl->header[0], "skill") || bl->header_count != 2) { char *json = header_json(bl); /* TS JSON.stringify(header), whole */
+      errf(&errs, "line %lld: block header is not \"skill <name>\" (got %s)", json ? json : "[]", bl->line); free(json); continue; }
     qa_bot_skill_settings *st = &out->skills[n++]; qa_bot_skill_settings_init(st); st->source = bl; st->skill = bl->header[1];
     for (size_t j = 0; j < bl->field_count; j++) apply_skill(st, &bl->fields[j], &errs); }
   out->skill_count = n; out->errors = errs.v; out->error_count = errs.n; return true; }

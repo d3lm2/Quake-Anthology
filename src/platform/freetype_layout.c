@@ -27,9 +27,10 @@ bool qa_freetype_layout_for(const char *platform, const char *arch,
 int32_t qa_freetype_metric(const uint8_t *bytes, size_t length, int64_t offset,
                            const qa_freetype_layout *layout) {
   size_t size = layout->long_bytes == 4 ? 4u : 8u;
-  if (offset < 0 || (uint64_t)offset > (uint64_t)length ||
-      (uint64_t)size > (uint64_t)length - (uint64_t)offset)
-    qa_range_error("Offset is outside the bounds of the DataView");
+  /* TS view.getInt32 / view.getBigInt64: the native DataView refusals. */
+  if (offset < 0) qa_range_error("byteOffset cannot be negative");
+  if ((uint64_t)offset > (uint64_t)length || (uint64_t)size > (uint64_t)length - (uint64_t)offset)
+    qa_range_error("Out of bounds access");
   const uint8_t *p = bytes + (size_t)offset;
   uint64_t raw = 0;
   for (size_t i = 0; i < size; i++) raw |= (uint64_t)p[i] << (8u * i);

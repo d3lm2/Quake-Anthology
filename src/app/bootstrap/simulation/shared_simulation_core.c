@@ -28,6 +28,7 @@
 #include "qa/world/actors/body.h"
 #include "qa/formats/q2_map.h"
 #include "qa/network/common/js_number.h"
+#include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/content/q2/foundation/runtime.h"
 #include "qa/formats/q1_map/entities.h"
@@ -45,12 +46,8 @@ static void ss_release_q3_bridge_policy(void *ctx) {
   qa_q3_base_combat_bridge_policy_destroy(policy);
 }
 
-const qa_vec3 qa_ss_zero = {0, 0, 0};
-
 static noreturn void ss_fail(const char *format, ...) {
-  char message[1024];
-  va_list args; va_start(args, format); vsnprintf(message, sizeof message, format, args); va_end(args);
-  qa_raise("Error", 0, 0, "%s", message);
+  va_list args; va_start(args, format); qa_ss_raise_error(format, args);
 }
 static void *ss_grow(void *ptr, size_t *capacity, size_t need, size_t size) {
   if (need <= *capacity) return ptr;
@@ -68,6 +65,27 @@ void *qa_app_shared_sim_keep(qa_app_shared_simulation *sim, size_t size) {
   sim->allocations = ss_grow(sim->allocations, &sim->allocation_capacity, sim->allocation_count + 1, sizeof *sim->allocations);
   sim->allocations[sim->allocation_count++] = allocation;
   return allocation;
+}
+void *qa_app_shared_sim_scratch(qa_app_shared_simulation *sim, size_t size) {
+  sim->scratch = ss_grow(sim->scratch, &sim->scratch_capacity, sim->scratch_count + 1, sizeof *sim->scratch);
+  void *allocation = calloc(1, size ? size : 1);
+  if (!allocation) qa_range_error("Out of memory");
+  sim->scratch[sim->scratch_count++] = allocation;
+  return allocation;
+}
+bool qa_app_shared_sim_scratch_claim(qa_app_shared_simulation *sim, void *value) {
+  for (size_t i = sim->scratch_count; i-- > 0;)
+    if (sim->scratch[i] == value) {
+      memmove(&sim->scratch[i], &sim->scratch[i + 1], (sim->scratch_count - i - 1) * sizeof *sim->scratch);
+      sim->scratch_count--;
+      return true;
+    }
+  return false;
+}
+void qa_app_shared_sim_release_call_storage(qa_app_shared_simulation *sim) {
+  for (size_t i = 0; i < sim->scratch_count; i++) free(sim->scratch[i]);
+  sim->scratch_count = 0;
+  qa_app_shared_sim_collect_player_arsenals(sim);
 }
 void qa_app_shared_sim_keep_owned(qa_app_shared_simulation *sim, void *value, void (*release)(void *value)) {
   sim->owned = ss_grow(sim->owned, &sim->owned_capacity, sim->owned_count + 1, sizeof *sim->owned);
@@ -132,6 +150,10 @@ static bool ss_recipe_equal(const qa_executable_recipe *a, const qa_executable_r
   left.recipe = *a; right.recipe = *b;
   /* isDeepStrictEqual ignores key insertion order. */
   left.recipe.launch_key_order = false; right.recipe.launch_key_order = false;
+  if (left.recipe.mods_key == QA_RECIPE_KEY_LAST) left.recipe.mods_key = QA_RECIPE_KEY_FIRST;
+  if (right.recipe.mods_key == QA_RECIPE_KEY_LAST) right.recipe.mods_key = QA_RECIPE_KEY_FIRST;
+  if (left.recipe.weapon_behaviors_key == QA_RECIPE_KEY_LAST) left.recipe.weapon_behaviors_key = QA_RECIPE_KEY_FIRST;
+  if (right.recipe.weapon_behaviors_key == QA_RECIPE_KEY_LAST) right.recipe.weapon_behaviors_key = QA_RECIPE_KEY_FIRST;
   uint8_t *left_bytes = NULL, *right_bytes = NULL; size_t left_length = 0, right_length = 0;
   if (!qa_encode_save_image(&left, &left_bytes, &left_length) || !qa_encode_save_image(&right, &right_bytes, &right_length))
     qa_range_error("Out of memory");
@@ -280,11 +302,44 @@ void qa_app_shared_sim_emit(qa_app_shared_simulation *sim, qa_content_id content
   qa_app_sim_simulation_events_emit(sim->events, content, source, time != NULL, time ? *time : sim->source_frame.time,
                                     recipient != NULL, recipient ? *recipient : none);
 }
+/* Interned strings are immutable, so one copy per distinct text serves every caller (a per-call copy grew the
+ * keep arena on every QVM pickup, restore and item fallback until the simulation ended). */
 const char *qa_app_shared_sim_intern(qa_app_shared_simulation *sim, const char *text) {
+  if (sim->interned.value_size == 0) qa_ss_map_init(&sim->interned, QA_SS_KEY_STRING, sizeof(const char *));
+  const char **found = qa_ss_map_get(&sim->interned, &text); /* string keys are passed by their pointer's address */
+  if (found != NULL) return *found;
   size_t length = strlen(text) + 1;
   char *copy = qa_app_shared_sim_keep(sim, length);
   memcpy(copy, text, length);
+  const char *kept = copy;
+  qa_ss_map_set(&sim->interned, &kept, &kept);
   return copy;
+}
+
+static void ss_release_source_actors(void *value) {
+  qa_source_actors_result_free(value);
+  free(value);
+}
+
+/* ---- sourceModels: entries own their strings ---- */
+static void ss_source_model_release(qa_q2_presentation_event *model) {
+  free((char *)model->path);
+  for (int i = 0; i < 3; i++) free((char *)model->attached_models[i]);
+}
+void qa_app_shared_sim_set_source_model(qa_app_shared_simulation *sim, const qa_q2_presentation_event *model) {
+  qa_q2_presentation_event kept = *model;
+  /* Copies first: the incoming strings may be the stored entry's own. */
+  kept.path = model->path != NULL ? qa_ss_strdup(model->path) : NULL;
+  for (int i = 0; i < 3; i++) kept.attached_models[i] = model->attached_models[i] != NULL ? qa_ss_strdup(model->attached_models[i]) : NULL;
+  qa_q2_presentation_event *existing = qa_ss_map_get(&sim->source_models, &model->actor);
+  if (existing != NULL) ss_source_model_release(existing);
+  qa_ss_map_set(&sim->source_models, &model->actor, &kept);
+}
+void qa_app_shared_sim_delete_source_model(qa_app_shared_simulation *sim, qa_actor_id actor) {
+  qa_q2_presentation_event *existing = qa_ss_map_get(&sim->source_models, &actor);
+  if (existing == NULL) return;
+  ss_source_model_release(existing);
+  qa_ss_map_delete(&sim->source_models, &actor);
 }
 
 /* ---- createModClients (495-537) ---- */
@@ -417,10 +472,12 @@ static qa_mod_client_output_lease ss_claim_outputs(void *ctx, qa_provider_id own
       movement = sim->options.recipe.timing[i].clock.kind; has_movement = true; break;
     }
   sim->strategy->check_output_claim(sim, channels, channel_count, has_movement, movement);
+  /* The lease first: a refused claim raises before anything is held. */
+  qa_mod_client_output_lease lease = qa_mod_client_outputs_claim(sim->mod_client_outputs, owner, channels, channel_count);
   ss_output_claim *claim = malloc(sizeof *claim);
-  if (!claim) qa_range_error("Out of memory");
+  if (!claim) { lease.close(lease.ctx); qa_range_error("Out of memory"); }
   claim->sim = sim;
-  claim->lease = qa_mod_client_outputs_claim(sim->mod_client_outputs, owner, channels, channel_count);
+  claim->lease = lease;
   claim->stop = qa_mod_client_applications_subscribe(sim->mod_client_applications, ss_claim_noop_listener, NULL);
   return (qa_mod_client_output_lease){claim, ss_claim_publish, ss_claim_release, ss_claim_close};
 }
@@ -855,7 +912,7 @@ static bool ss_physics_motion(void *ctx, qa_owned_actor actor, qa_q2_motion *out
   qa_app_sim_movement_player *player = qa_app_shared_sim_player_state(sim, actor);
   if (player) {
     memset(out, 0, sizeof *out);
-    out->actor = actor; out->velocity = body.velocity; out->angular_velocity = qa_ss_zero;
+    out->actor = actor; out->velocity = body.velocity; out->angular_velocity = qa_zero_vec3;
     qa_q1_character_actor **q1 = qa_ss_map_get(&sim->q1_characters, &actor);
     qa_q2_character_actor **q2 = qa_ss_map_get(&sim->q2_characters, &actor);
     const char *q1_movement = q1 ? qa_q1_character_actor_presentation(*q1).movement : NULL;
@@ -869,7 +926,7 @@ static bool ss_physics_motion(void *ctx, qa_owned_actor actor, qa_q2_motion *out
   qa_q2_motion motion = qa_app_sim_actor_motion(entry, body);
   if (!motion.kind) return false;
   if (sim->selected_monsters == NULL || qa_app_sim_selected_monsters_active(sim->selected_monsters, actor.id)) { *out = motion; return true; }
-  motion.kind = "stationary"; motion.velocity = qa_ss_zero; motion.angular_velocity = qa_ss_zero;
+  motion.kind = "stationary"; motion.velocity = qa_zero_vec3; motion.angular_velocity = qa_zero_vec3;
   *out = motion;
   return true;
 }
@@ -988,9 +1045,52 @@ static void ss_combat_impulse(void *ctx, qa_owned_actor actor, qa_vec3 impulse, 
   body.velocity = velocity;
   qa_shared_body_table_write(qa_app_sim_shared_physics_bodies(sim->physics), actor, body);
 }
+qa_attack_provenance *qa_ss_attack_box_store(qa_ss_attack_box **slot, const qa_attack_provenance *attack) {
+  qa_ss_attack_box *box = *slot;
+  if (box == NULL) {
+    box = malloc(sizeof *box);
+    if (box == NULL) qa_range_error("Out of memory");
+    *slot = box;
+  }
+  box->attack = *attack;
+  if (attack->attacker != NULL) { box->attacker = *attack->attacker; box->attack.attacker = &box->attacker; }
+  if (attack->inflictor != NULL) { box->inflictor = *attack->inflictor; box->attack.inflictor = &box->inflictor; }
+  /* TS keeps the attack object, whose strings are values. Producers may pass text that lives only for the damage
+   * call (id1 environment death types are read into the call's own buffer), so the kept copy holds interned text. */
+  qa_attack_provenance *kept = &box->attack;
+  kept->weapon = qa_q2_intern(kept->weapon);
+  kept->weapon_provider = qa_q2_intern(kept->weapon_provider);
+  kept->damage_powerup_owner = qa_q2_intern(kept->damage_powerup_owner);
+  kept->combat_provider = qa_q2_intern(kept->combat_provider);
+  kept->inventory_provider = qa_q2_intern(kept->inventory_provider);
+  kept->movement_provider = qa_q2_intern(kept->movement_provider);
+  kept->cause.death_type = qa_q2_intern(kept->cause.death_type);
+  kept->cause.armor_effect = qa_q2_intern(kept->cause.armor_effect);
+  kept->cause.hazard = qa_q2_intern(kept->cause.hazard);
+  kept->cause.native.edition = qa_q2_intern(kept->cause.native.edition);
+  kept->cause.native.game = qa_q2_intern(kept->cause.native.game);
+  return &box->attack;
+}
+void qa_app_shared_sim_record_attack(qa_app_shared_simulation *sim, qa_owned_actor actor, const qa_attack_provenance *attack) {
+  qa_ss_attack_box **stored = qa_ss_map_get(&sim->last_attack, &actor);
+  if (stored != NULL) { (void)qa_ss_attack_box_store(stored, attack); return; }
+  qa_ss_attack_box *box = NULL;
+  (void)qa_ss_attack_box_store(&box, attack);
+  qa_ss_map_set(&sim->last_attack, &actor, &box);
+}
+const qa_attack_provenance *qa_app_shared_sim_last_attack(qa_app_shared_simulation *sim, qa_owned_actor actor) {
+  qa_ss_attack_box **stored = qa_ss_map_get(&sim->last_attack, &actor);
+  return stored != NULL ? &(*stored)->attack : NULL;
+}
+void qa_app_shared_sim_forget_attack(qa_app_shared_simulation *sim, qa_owned_actor actor) {
+  qa_ss_attack_box **stored = qa_ss_map_get(&sim->last_attack, &actor);
+  if (stored == NULL) return;
+  free(*stored);
+  qa_ss_map_delete(&sim->last_attack, &actor);
+}
 static void ss_combat_before_reaction(void *ctx, qa_owned_actor actor, qa_damage_decision decision) {
   qa_app_shared_simulation *sim = ctx;
-  qa_ss_map_set(&sim->last_attack, &actor, &decision.request.attack);
+  qa_app_shared_sim_record_attack(sim, actor, &decision.request.attack);
   sim->strategy->reaction_start(sim, actor, &decision);
   if (sim->selected_q3_source) {
     qa_q3_base_combat_bridge *bridge = qa_app_q3_selected_source_bridge(sim->selected_q3_source);
@@ -1012,24 +1112,22 @@ static void ss_combat_before_reaction(void *ctx, qa_owned_actor actor, qa_damage
 void qa_ss_q2_reaction_end(qa_app_shared_simulation *sim, qa_owned_actor actor, const qa_damage_decision *in) {
   qa_damage_decision decision = *in;
   qa_app_sim_movement_player *player = qa_app_shared_sim_player_state(sim, actor);
+  /* TS reads the entity once, before beforeReaction, and records the death against that entity. */
+  qa_q2_game_services *game = sim->source.product->services;
+  qa_q2_entity *entity = game->entity(game->ctx, &actor.id);
   {
-    qa_q2_game_services *game = sim->source.product->services;
-    qa_q2_entity *entity = game->entity(game->ctx, &actor.id);
     if (entity) {
       /* entity.lastAttack = decision.request.attack: the entity borrows a
        * per-actor copy the simulation keeps until the actor is released. */
-      qa_attack_provenance **stored = qa_ss_map_get(&sim->q2_entity_attacks, &actor.id);
-      qa_attack_provenance *copy = stored ? *stored : malloc(sizeof *copy);
-      if (!copy) qa_range_error("Out of memory");
-      *copy = decision.request.attack;
-      if (!stored) qa_ss_map_set(&sim->q2_entity_attacks, &actor.id, &copy);
+      qa_ss_attack_box **stored = qa_ss_map_get(&sim->q2_entity_attacks, &actor.id);
+      qa_ss_attack_box *box = stored ? *stored : NULL;
+      qa_attack_provenance *copy = qa_ss_attack_box_store(&box, &decision.request.attack);
+      if (!stored) qa_ss_map_set(&sim->q2_entity_attacks, &actor.id, &box);
       entity->last_attack = copy;
       if (player) qa_q2_product_runtime_before_reaction(sim->source.product, actor.id, copy);
     }
   }
   if (qa_ss_is(decision.reaction, "death") && player && player->character != QA_GAME_FAMILY_Q2) {
-    qa_q2_game_services *game = sim->source.product->services;
-    qa_q2_entity *entity = game->entity(game->ctx, &actor.id);
     if (entity) {
       qa_death_reaction death; memset(&death, 0, sizeof death);
       death.pain.attack = &decision.request.attack; death.pain.self = actor;
@@ -1111,9 +1209,9 @@ static void ss_on_release(void *ctx, qa_owned_actor actor) {
   qa_ss_map_delete(&sim->mod_client_commands, &id); qa_ss_map_delete(&sim->mod_client_admissions, &id);
   qa_app_shared_sim_events_retire(sim, id);
   qa_ss_map_delete(&sim->actor_executions, &id);
+  qa_app_shared_sim_retire_q3_execution(sim, id);
   qa_ss_map_delete(&sim->monster_missions, &id);
-  qa_ss_map_delete(&sim->lmctf_teams, &id); qa_ss_map_delete(&sim->lmctf_health, &id); qa_ss_map_delete(&sim->lmctf_regen_at, &id);
-  qa_ss_map_delete(&sim->deathball_teams, &id); qa_ss_map_delete(&sim->tag_health, &id);
+  qa_app_foreign_match_rules_release(sim, id);
   qa_ss_map_delete(&sim->native_equipment_players, &id); qa_ss_map_delete(&sim->native_equipment_alive, &id);
   qa_ss_map_delete(&sim->native_equipment_velocity, &id); qa_ss_map_delete(&sim->native_weapon_requests, &id);
   qa_ss_dispose *binding = qa_ss_map_get(&sim->selected_pickup_bindings, &id);
@@ -1131,6 +1229,7 @@ static void ss_on_release(void *ctx, qa_owned_actor actor) {
   qa_app_sim_weapon_slot **slot = qa_ss_map_get(&sim->weapon_slots, &id);
   if (slot) qa_app_sim_weapon_slot_destroy(*slot);
   qa_ss_map_delete(&sim->weapon_slots, &id);
+  qa_app_shared_sim_release_slot_bindings(sim, &id);
   qa_app_sim_movement_player **player = qa_ss_map_get(&sim->player_states, &actor);
   if (player) qa_app_sim_movement_player_destroy(*player);
   qa_ss_map_delete(&sim->player_states, &actor);
@@ -1147,10 +1246,10 @@ static void ss_on_release(void *ctx, qa_owned_actor actor) {
   qa_ss_map_delete(&sim->q1_characters, &actor); qa_ss_map_delete(&sim->q2_views, &id);
   qa_ss_map_delete(&sim->q2_characters, &actor); qa_ss_map_delete(&sim->character_ticks, &actor);
   qa_ss_map_delete(&sim->entry_carry, &actor); qa_ss_map_delete(&sim->detached_models, &actor);
-  qa_ss_map_delete(&sim->source_models, &id); qa_ss_map_delete(&sim->source_model_read_order, &id);
+  qa_app_shared_sim_delete_source_model(sim, id); qa_ss_map_delete(&sim->source_model_read_order, &id);
   qa_ss_map_delete(&sim->view_models, &id);
-  qa_ss_map_delete(&sim->last_attack, &actor);
-  qa_attack_provenance **attack = qa_ss_map_get(&sim->q2_entity_attacks, &id);
+  qa_app_shared_sim_forget_attack(sim, actor);
+  qa_ss_attack_box **attack = qa_ss_map_get(&sim->q2_entity_attacks, &id);
   if (attack) free(*attack);
   qa_ss_map_delete(&sim->q2_entity_attacks, &id);
   qa_app_sim_q1_player_punch_release(sim->q1_punch, actor);
@@ -1176,8 +1275,8 @@ static qa_q1_visibility_client ss_q1_visibility_client(void *ctx, int64_t slot) 
   qa_combat_state_result combat = has_actor ? qa_gameplay_authority_read(sim->combat, actor) : (qa_combat_state_result){0};
   client.health = !has_actor ? 0 : combat.has_value ? combat.value.health : 0;
   client.notarget = has_actor && qa_app_shared_sim_monster_target_notarget(sim, actor);
-  client.origin = has_eye ? eye.origin : qa_ss_zero;
-  client.view_offset = has_eye ? eye.view_offset : qa_ss_zero;
+  client.origin = has_eye ? eye.origin : qa_zero_vec3;
+  client.view_offset = has_eye ? eye.view_offset : qa_zero_vec3;
   return client;
 }
 static double ss_scene_point_leaf(void *ctx, qa_vec3 point) { return qa_shared_point_leaf(ctx, point); }
@@ -1389,8 +1488,9 @@ static void ss_init_containers(qa_app_shared_simulation *sim) {
   qa_ss_map_init(&sim->native_travel_consumed, QA_SS_KEY_CLIENT, 0);
   qa_ss_map_init(&sim->native_weapon_times, QA_SS_KEY_ACTOR, sizeof(double));
   qa_ss_map_init(&sim->selected_pickup_bindings, QA_SS_KEY_ACTOR, sizeof(qa_ss_dispose));
-  qa_ss_map_init(&sim->last_attack, QA_SS_KEY_OWNED, sizeof(qa_attack_provenance));
-  qa_ss_map_init(&sim->q2_entity_attacks, QA_SS_KEY_ACTOR, sizeof(qa_attack_provenance *));
+  qa_ss_map_init(&sim->last_attack, QA_SS_KEY_OWNED, sizeof(qa_ss_attack_box *));
+  qa_ss_map_init(&sim->q2_entity_attacks, QA_SS_KEY_ACTOR, sizeof(qa_ss_attack_box *));
+  qa_ss_map_init(&sim->q3_source_executions, QA_SS_KEY_ACTOR, sizeof(void *));
   qa_ss_map_init(&sim->area_portals, QA_SS_KEY_NUMBER, sizeof(bool));
   qa_ss_map_init(&sim->quake_world_touched, QA_SS_KEY_NUMBER, 0);
   qa_ss_map_init(&sim->source.visited, QA_SS_KEY_STRING, sizeof(void *));
@@ -1561,9 +1661,14 @@ static qa_app_shared_simulation *ss_create(qa_app_simulation_options options, bo
     qa_provider_checkpoint slots = qa_app_sim_simulation_provider_checkpoint(*saved, "world:source-slots");
     qa_source_actors_result sources;
     if (!qa_read_source_actors_checkpoint(&slots, &sources)) qa_range_error("Out of memory");
+    /* The registry keeps each restored binding's provider string (TS holds the decoded strings), so the decoded
+     * checkpoint lives as long as the simulation. */
+    qa_source_actors_result *kept = calloc(1, sizeof *kept);
+    if (kept == NULL) { qa_source_actors_result_free(&sources); qa_range_error("Out of memory"); }
+    *kept = sources;
+    qa_app_shared_sim_keep_owned(sim, kept, ss_release_source_actors);
     sim->actors = qa_session_actor_registry_restore(&sim->options.identity, saved->actors, saved->actor_count,
-        sources.entries, sources.count, 65536);
-    qa_source_actors_result_free(&sources);
+        kept->entries, kept->count, 65536);
   }
   if (!sim->actors) qa_range_error("Out of memory");
   sim->source_match = qa_mod_match_state_create(sim->actors, ss_match_primary, sim);
@@ -1795,16 +1900,19 @@ static void ss_construct_source(void *ctx) {
     qa_cvar_registry_clear_modified(host->cvars, "g_gametype");
   } else if ((sim->strategy->as_q2_native(sim) != NULL)) {
     if (!options.native_q2_travel && !loading) {
-      char *map_name = qa_ss_map_name(sim->recipe.map.geometry.requested_path);
-      const char *entities = qa_app_shared_sim_guest_monster_entities(sim, sim->world_entities, sim->source.edition);
-      if (qa_ss_is(sim->source.edition, "classic")) {
-        qa_app_sim_classic_guest_world_init(sim->source.classic_world);
-        qa_app_sim_classic_guest_world_spawn(sim->source.classic_world, map_name, entities, "");
-      } else {
-        qa_app_sim_rerelease_guest_world_init(sim->source.rerelease_world);
-        qa_app_sim_rerelease_guest_world_spawn(sim->source.rerelease_world, map_name, entities, "");
+      if (options.native_import) sim->strategy->import_original(sim, options.native_import);
+      else {
+        char *map_name = qa_ss_map_name(sim->recipe.map.geometry.requested_path);
+        const char *entities = qa_app_shared_sim_guest_monster_entities(sim, sim->world_entities, sim->source.edition);
+        if (qa_ss_is(sim->source.edition, "classic")) {
+          qa_app_sim_classic_guest_world_init(sim->source.classic_world);
+          qa_app_sim_classic_guest_world_spawn(sim->source.classic_world, map_name, entities, "");
+        } else {
+          qa_app_sim_rerelease_guest_world_init(sim->source.rerelease_world);
+          qa_app_sim_rerelease_guest_world_spawn(sim->source.rerelease_world, map_name, entities, "");
+        }
+        free(map_name);
       }
-      free(map_name);
     }
     /* Retained travel already spawned the new map during source creation;
      * either way the guest world exists now and replacements can join it. */
@@ -1834,10 +1942,11 @@ static void ss_construct_source(void *ctx) {
           if (names[0]) strcat(names, ", ");
           strcat(names, name);
         }
-        char message[2048];
-        snprintf(message, sizeof message, "Unimplemented authored Q2 spawns: %s", names);
-        free(names);
-        ss_fail("%s", message);
+        /* The message is whole (TS template string); the list lives until the next report on this thread. */
+        static __thread char *last_names;
+        free(last_names);
+        last_names = names;
+        ss_fail("Unimplemented authored Q2 spawns: %s", last_names);
       }
       /* Hand the primary's unclaimed authored entities to the Q1 adjunct;
        * retire its inert placeholders first so each authored entity has
@@ -1886,7 +1995,7 @@ static void ss_load_body(void *ctx) {
   if (options->prepare_rerelease_navigation && ((q2 && q2->services->options.edition == QA_Q2_EDITION_RERELEASE)
       || (options->has_q2_guest && qa_ss_is(options->q2_guest.edition, "rerelease")) || ss_any_rerelease_behavior(options)))
     qa_app_shared_sim_install_rerelease_navigation(sim,
-        (qa_app_sim_application_bot_navigation *)options->prepare_rerelease_navigation(options->nav_ctx, (void *)sim));
+        (qa_app_sim_application_bot_navigation *)options->prepare_rerelease_navigation(options->nav_ctx, sim));
   if ((sim->strategy->as_q2_native(sim) != NULL)) {
     bool travel = sim->has_pending_native_travel;
     sim->has_pending_native_travel = false;
@@ -1898,6 +2007,9 @@ static void ss_load_body(void *ctx) {
       qa_app_shared_sim_restore(sim, options->restore, true);
       if (options->has_travel) qa_app_shared_sim_restore_campaign_travel(sim, &options->travel);
       if (sim->source_collision_settings) qa_shared_bind_collision_settings(sim->scene, sim->source_collision_settings);
+    } else if (options->native_import) {
+      sim->strategy->import_loading(sim, options->native_import, load->next_frame, load->frame_ctx);
+      qa_app_shared_sim_admit_guest_monsters(sim);
     } else {
       char *map_name = qa_ss_map_name(options->recipe.map.geometry.requested_path);
       const char *entities = qa_app_shared_sim_guest_monster_entities(sim, sim->world_entities, sim->source.edition);
@@ -1920,8 +2032,7 @@ static void ss_load_body(void *ctx) {
   if (options->prepared_mods != NULL || qa_app_sim_enabled_mod_count(options->enabled_mods) != 0
       || mod_state || options->mod_travel)
     qa_app_shared_sim_open_mods(sim, mod_state, load->next_frame, load->frame_ctx);
-  if (sim->source_items_restore)
-    qa_source_item_restore_finish(sim->source_items_restore, sim->actors, sim->inventory);
+  qa_app_shared_sim_finish_source_item_restore(sim);
   qa_app_shared_sim_restore_native_inventory_cursors(sim, NULL);
   for (size_t i = 0; i < sim->weapon_slots.count; i++)
     qa_app_sim_weapon_slot_validate_restore(*(qa_app_sim_weapon_slot **)qa_ss_map_value_at(&sim->weapon_slots, i));
@@ -1941,7 +2052,11 @@ qa_app_shared_simulation *qa_app_shared_simulation_load(qa_app_simulation_option
   if (!qa_try(ss_load_body, &load, &caught)) {
     size_t failures = 1;
     if (!qa_try(ss_shutdown_q3_guest, sim, &cleanup)) failures++;
-    if (!qa_try(ss_close, sim, &cleanup)) failures++;
+    bool closed = qa_try(ss_close, sim, &cleanup);
+    if (!closed) failures++;
+    /* TS drops the unreachable simulation to the GC; C frees it once close() has run (a failed close leaves its
+     * owners in an unknown state, so they are not freed). */
+    if (closed) qa_app_shared_simulation_destroy(sim);
     if (failures > 1) qa_raise("AggregateError", 0, 0, "Simulation loading and cleanup failed");
     qa_rethrow(&caught);
   }
@@ -1979,7 +2094,7 @@ static void ss_close_one(void *ctx) {
       else qa_app_sim_rerelease_guest_world_close(sim->source.rerelease_world);
     }
     break;
-  case 9: if (sim->selected_ammo_timers) qa_app_q3_mapped_ammo_regeneration_close(sim->selected_ammo_timers); break;
+  case 9: qa_app_shared_sim_close_selected_ammo(sim); break;
   case 10: if (sim->selected_q3_source) qa_app_q3_selected_source_close(sim->selected_q3_source); break;
   case 11: qa_session_actor_registry_close(sim->actors); break;
   case 12: if ((sim->strategy->as_q3(sim) != NULL)) qa_app_q3_source_runtime_close(sim->source.q3); break;
@@ -2031,7 +2146,13 @@ void qa_app_shared_simulation_destroy(qa_app_shared_simulation *sim) {
     qa_app_sim_movement_player_destroy(*(qa_app_sim_movement_player **)qa_ss_map_value_at(&sim->native_movement_players, i));
   for (size_t i = 0; i < sim->weapon_slots.count; i++)
     qa_app_sim_weapon_slot_destroy(*(qa_app_sim_weapon_slot **)qa_ss_map_value_at(&sim->weapon_slots, i));
-  for (size_t i = 0; i < sim->q2_entity_attacks.count; i++) free(*(qa_attack_provenance **)qa_ss_map_value_at(&sim->q2_entity_attacks, i));
+  for (size_t i = 0; i < sim->q2_entity_attacks.count; i++) free(*(qa_ss_attack_box **)qa_ss_map_value_at(&sim->q2_entity_attacks, i));
+  for (size_t i = 0; i < sim->q3_source_executions.count; i++) free(*(void **)qa_ss_map_value_at(&sim->q3_source_executions, i));
+  qa_app_shared_sim_free_retired_q3_executions(sim); free(sim->retired_q3_executions); sim->retired_q3_executions = NULL;
+  for (size_t i = 0; i < sim->last_attack.count; i++) free(*(qa_ss_attack_box **)qa_ss_map_value_at(&sim->last_attack, i));
+  for (size_t i = 0; i < sim->source_models.count; i++) ss_source_model_release(qa_ss_map_value_at(&sim->source_models, i));
+  /* bindSelectedOriginalPickups' records (malloc'd; their dispose unbinds and frees, the inventory is gone here). */
+  for (size_t i = 0; i < sim->selected_pickup_bindings.count; i++) free(((qa_ss_dispose *)qa_ss_map_value_at(&sim->selected_pickup_bindings, i))->ctx);
   qa_ss_map *maps[] = {&sim->horde_fragged, &sim->tag_health, &sim->lmctf_teams, &sim->lmctf_flags, &sim->lmctf_runes,
     &sim->lmctf_health, &sim->lmctf_regen_at, &sim->lmctf_spot_flags, &sim->deathball_teams, &sim->deathball_goals,
     &sim->actor_executions, &sim->player_states, &sim->native_movement_players, &sim->native_character_commands,
@@ -2044,7 +2165,7 @@ void qa_app_shared_simulation_destroy(qa_app_shared_simulation *sim) {
     &sim->selected_original_weapons, &sim->q3_arsenals, &sim->q3_commands, &sim->source_models, &sim->source_model_read_order, &sim->presentation_snapshot,
     &sim->view_models, &sim->monster_sources, &sim->monster_missions, &sim->settled_q3_sources, &sim->mod_client_admissions,
     &sim->mod_client_commands, &sim->restored_native_inventory_selections, &sim->native_travel_consumed,
-    &sim->native_weapon_times, &sim->selected_pickup_bindings, &sim->last_attack, &sim->q2_entity_attacks, &sim->area_portals,
+    &sim->native_weapon_times, &sim->selected_pickup_bindings, &sim->last_attack, &sim->q2_entity_attacks, &sim->q3_source_executions, &sim->area_portals,
     &sim->quake_world_touched, &sim->source.visited, &sim->source.clients};
   for (size_t i = 0; i < sizeof maps / sizeof *maps; i++) qa_ss_map_free(maps[i]);
   if (sim->weapon_behavior) qa_app_sim_simulation_weapon_behaviors_destroy(sim->weapon_behavior);
@@ -2076,6 +2197,9 @@ void qa_app_shared_simulation_destroy(qa_app_shared_simulation *sim) {
   free(sim->mod_client_subscriptions); free(sim->tag_spawns); free(sim->lmctf_spot_health);
   for (size_t i = sim->owned_count; i-- > 0;) sim->owned[i].release(sim->owned[i].value);
   free(sim->owned);
+  for (size_t i = 0; i < sim->scratch_count; i++) free(sim->scratch[i]);
+  free(sim->scratch); sim->scratch = NULL; sim->scratch_count = sim->scratch_capacity = 0;
+  if (sim->interned.value_size != 0) qa_ss_map_free(&sim->interned);
   for (size_t i = 0; i < sim->allocation_count; i++) free(sim->allocations[i]);
   free(sim->allocations);
   free(sim);

@@ -139,6 +139,8 @@ void qa_q3_pres_client_info_store_destroy(qa_q3_pres_client_info_store *store);
 /* TS entityReset field (null by default): CG_LoadClientInfo ends by resetting every player entity of that client. */
 void qa_q3_pres_client_info_store_set_entity_reset(qa_q3_pres_client_info_store *store,
     void (*reset)(void *ctx, qa_q3_pres_client_entity *entity), void *ctx);
+/* TS store.host.state, for the identity checks of the services built over one cgame state. */
+qa_q3_pres_client_game_state *qa_q3_pres_client_info_store_state(const qa_q3_pres_client_info_store *store);
 qa_q3_pres_client_info *qa_q3_pres_client_info_store_client_info(qa_q3_pres_client_info_store *store,
     double index);
 /* Pick<view> adapter for PlayerPresentationHost clients / config. */

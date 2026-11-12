@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "qa/compat/q2/rerelease/native_weapon_declaration.h"
+#include "qa/compat/qvm/grapple_profile.h"
 #include "qa/content/mods/declaration_writer.h"
 #include "qa/persistence/execution.h"
 #include "qa/persistence/mods.h"
@@ -87,9 +88,11 @@ qa_saved_body_state qa_read_saved_body(const qa_save_reader *reader) {
   qa_save_reader_destroy(&bounds);
   qa_save_reader ground = field(reader, "ground");
   if (!qa_save_reader_is_null(&ground)) {
+    /* Read before allocating: a malformed actor raises with nothing to release. */
+    qa_saved_actor_id actor = qa_read_saved_actor(&ground);
     qa_saved_actor_id *saved = malloc(sizeof *saved);
     if (saved == NULL) qa_save_reader_fail(reader, "out of memory");
-    *saved = qa_read_saved_actor(&ground);
+    *saved = actor;
     body.ground = saved;
   }
   qa_save_reader_destroy(&ground);
@@ -359,8 +362,9 @@ static qa_actor_slot_checkpoint read_actor_slot(const qa_save_reader *reader) {
   if (strcmp(kind, "free") == 0) {
     qa_save_reader freed = field(&lifetime, "freedAt");
     if (!qa_save_reader_is_null(&freed)) {
+      qa_source_time read = qa_read_time(&freed);
       qa_source_time *time = xalloc(reader, 1, sizeof *time);
-      *time = qa_read_time(&freed);
+      *time = read;
       slot.freed_at = time;
     }
     qa_save_reader_destroy(&freed);
@@ -393,34 +397,34 @@ static qa_combat_state read_combat(const qa_save_reader *reader) {
   qa_save_reader_destroy(&knockback);
   return state;
 }
-static qa_body_checkpoint read_body_checkpoint(const qa_save_reader *reader) {
-  qa_body_checkpoint body;
-  memset(&body, 0, sizeof body);
-  body.actor = field_saved_actor(reader, "actor");
+/* Fills `body`, which is already attached to the partial image (zeroed): every allocation is
+ * reachable from it the moment it is made, so a raise part way leaks nothing. */
+static void read_body_checkpoint(const qa_save_reader *reader, qa_body_checkpoint *body) {
+  body->actor = field_saved_actor(reader, "actor");
   qa_save_reader state = field(reader, "body");
-  body.body = qa_read_saved_body(&state);
+  body->body = qa_read_saved_body(&state);
   qa_save_reader_destroy(&state);
   qa_save_reader attachment = field(reader, "attachment");
   if (!qa_save_reader_is_null(&attachment)) {
+    qa_saved_body_attachment read = qa_read_saved_body_attachment(&attachment);
     qa_saved_body_attachment *saved = xalloc(reader, 1, sizeof *saved);
-    *saved = qa_read_saved_body_attachment(&attachment);
-    body.attachment = saved;
+    *saved = read;
+    body->attachment = saved;
   }
   qa_save_reader_destroy(&attachment);
-  body.link_count = field_integer_min(reader, "linkCount", 0);
+  body->link_count = field_integer_min(reader, "linkCount", 0);
   qa_save_reader linked = field(reader, "linked");
   if (!qa_save_reader_is_null(&linked)) {
     qa_body_checkpoint_linked *link = xalloc(reader, 1, sizeof *link);
+    body->linked = link;
     qa_save_reader inner = field(&linked, "state");
     link->state = qa_read_saved_body(&inner);
     qa_save_reader_destroy(&inner);
     inner = field(&linked, "absoluteBounds");
     link->absolute_bounds = qa_read_bounds(&inner);
     qa_save_reader_destroy(&inner);
-    body.linked = link;
   }
   qa_save_reader_destroy(&linked);
-  return body;
 }
 static void release_partial_image(void *arg) {
   qa_save_image_result_free((qa_save_image_result *)arg);
@@ -516,7 +520,7 @@ bool qa_parse_save_image(const qa_save_value *value, qa_save_image_result *out) 
     for (size_t i = 0; i < count; i++) {
       image->body_count = i + 1;
       qa_save_reader entry = item_at(&bodies, i);
-      values[i] = read_body_checkpoint(&entry);
+      read_body_checkpoint(&entry, &values[i]);
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&bodies);
@@ -750,7 +754,7 @@ void qa_save_image_result_free(qa_save_image_result *result) {
     qa_guest_checkpoint_release((qa_guest_checkpoint *)&image->guests[i]);
   free((void *)image->guests);
   free((void *)image->consumption);
-  if (image->mods != NULL) free((void *)image->mods->mods);
+  if (image->mods != NULL) qa_mod_session_checkpoint_release((struct qa_mod_session_checkpoint *)image->mods);
   free((void *)image->mods);
   qa_executable_recipe_free(&image->recipe);
   qa_save_value_free(result->root);
@@ -1291,10 +1295,13 @@ static qa_save_value *resource_value(qa_resolved_resource_reference r) {
                set_num(resolution, "rank", (double)r.resolution.rank);
           break;
         case QA_RESOURCE_RESOLUTION_PREFIX_ORDER:
+          /* mounts/index.ts #open builds { kind, plan, prefix, rank }; readResolution
+           * reads { kind, plan, rank, prefix }. */
           ok = set_str(resolution, "kind", "prefix-order") &&
                set_str(resolution, "plan", r.resolution.plan) &&
+               (r.parsed_order || set_str(resolution, "prefix", r.resolution.prefix)) &&
                set_num(resolution, "rank", (double)r.resolution.rank) &&
-               set_str(resolution, "prefix", r.resolution.prefix);
+               (!r.parsed_order || set_str(resolution, "prefix", r.resolution.prefix));
           break;
         case QA_RESOURCE_RESOLUTION_LINK:
           ok = set_str(resolution, "kind", "link") &&
@@ -1428,9 +1435,10 @@ static qa_save_value *value_layout_value(qa_guest_value_layout layout) {
   TRY(set_str(o, "kind", "scalar") && set_str(o, "storage", layout.storage));
   return o;
 }
-static qa_save_value *callback_reference_value(
-    qa_saved_guest_callback_reference saved) {
-  qa_guest_callback_reference ref = saved.reference;
+static qa_save_value *guest_bigint(const qa_guest_checkpoint *guest, const int64_t *field);
+static qa_save_value *callback_reference_value(const qa_guest_checkpoint *guest,
+                                               const qa_saved_guest_callback_reference *saved) {
+  qa_guest_callback_reference ref = saved->reference;
   qa_save_value *o = obj();
   if (o == NULL) return NULL;
   switch (ref.kind) {
@@ -1452,13 +1460,14 @@ static qa_save_value *callback_reference_value(
     case QA_GUEST_CALLBACK_NATIVE_GUEST:
       TRY(set_str(o, "kind", "native-guest") &&
           set_own(o, "module", module_value(ref.module)) &&
-          set_own(o, "byteOffset", qa_save_value_bigint_i64(saved.byte_offset)) &&
+          set_own(o, "byteOffset", guest_bigint(guest, &saved->byte_offset)) &&
           set_own(o, "abi", abi_value(ref.abi)));
       break;
   }
   return o;
 }
-static qa_save_value *callback_value(qa_saved_guest_callback_binding binding) {
+static qa_save_value *callback_value(const qa_guest_checkpoint *guest, const qa_saved_guest_callback_binding *callback) {
+  qa_saved_guest_callback_binding binding = *callback;
   qa_save_value *o = obj();
   if (o == NULL) return NULL;
   qa_save_value *parameters = arr();
@@ -1473,7 +1482,7 @@ static qa_save_value *callback_value(qa_saved_guest_callback_binding binding) {
       return NULL;
     }
   TRY(set_str(o, "id", binding.id) &&
-      set_own(o, "reference", callback_reference_value(binding.reference)) &&
+      set_own(o, "reference", callback_reference_value(guest, &callback->reference)) &&
       set_own(o, "parameters", parameters) &&
       (binding.result_is_void
            ? set_str(o, "result", "void")
@@ -1510,19 +1519,27 @@ static void order_guest_checkpoint(qa_save_value *o, qa_guest_checkpoint_kind ki
   if (kind == QA_GUEST_CHECKPOINT_QVM) order_keys(o, qvm, sizeof qvm / sizeof qvm[0]);
   else if (kind == QA_GUEST_CHECKPOINT_QUAKEC) order_keys(o, quakec, sizeof quakec / sizeof quakec[0]);
 }
-/* TS NativeGuestHeapImage, keys in the producer's order. */
-static qa_save_value *bigint_or_null(bool present, int64_t value) {
-  return present ? qa_save_value_bigint_i64(value) : qa_save_value_null();
+/* A guest checkpoint's bigint field: the saved decimal when the read value lay outside
+ * int64 (TS keeps any bigint), else the int64. `guest` is NULL for a fresh checkpoint. */
+static qa_save_value *guest_bigint(const qa_guest_checkpoint *guest, const int64_t *field) {
+  if (guest != NULL)
+    for (size_t i = 0; i < guest->wide_bigint_count; i++)
+      if (guest->wide_bigints[i].field == field) return qa_save_value_bigint_text(guest->wide_bigints[i].text);
+  return qa_save_value_bigint_i64(*field);
 }
-static qa_save_value *windows_tables_value(const qa_windows_heap_tables *w) {
+/* TS NativeGuestHeapImage, keys in the producer's order. */
+static qa_save_value *bigint_or_null(const qa_guest_checkpoint *guest, bool present, const int64_t *value) {
+  return present ? guest_bigint(guest, value) : qa_save_value_null();
+}
+static qa_save_value *windows_tables_value(const qa_guest_checkpoint *guest, const qa_windows_heap_tables *w) {
   qa_save_value *o = obj();
   if (o == NULL) return NULL;
   qa_save_value *heaps = arr(), *reservations = arr(), *tls = arr(), *fls = arr();
   bool ok = heaps != NULL && reservations != NULL && tls != NULL && fls != NULL;
-  for (size_t i = 0; ok && i < w->heap_count; i++) ok = push_own(heaps, qa_save_value_bigint_i64(w->heaps[i]));
+  for (size_t i = 0; ok && i < w->heap_count; i++) ok = push_own(heaps, guest_bigint(guest, &w->heaps[i]));
   for (size_t i = 0; ok && i < w->reservation_count; i++) {
     qa_save_value *entry = obj();
-    ok = entry != NULL && set_own(entry, "base", qa_save_value_bigint_i64(w->reservations[i].base)) &&
+    ok = entry != NULL && set_own(entry, "base", guest_bigint(guest, &w->reservations[i].base)) &&
          set_num(entry, "size", w->reservations[i].size);
     if (ok) ok = push_own(reservations, entry);
     else qa_save_value_free(entry);
@@ -1531,8 +1548,8 @@ static qa_save_value *windows_tables_value(const qa_windows_heap_tables *w) {
   for (size_t i = 0; ok && i < w->fls_count; i++) {
     qa_save_value *slot = obj();
     ok = slot != NULL && set_num(slot, "index", w->fls[i].index) &&
-         set_own(slot, "callback", bigint_or_null(w->fls[i].has_callback, w->fls[i].callback)) &&
-         set_own(slot, "value", bigint_or_null(w->fls[i].has_value, w->fls[i].value));
+         set_own(slot, "callback", bigint_or_null(guest, w->fls[i].has_callback, &w->fls[i].callback)) &&
+         set_own(slot, "value", bigint_or_null(guest, w->fls[i].has_value, &w->fls[i].value));
     if (ok) ok = push_own(fls, slot);
     else qa_save_value_free(slot);
   }
@@ -1548,7 +1565,7 @@ static qa_save_value *windows_tables_value(const qa_windows_heap_tables *w) {
       set_own(o, "fls", fls) && set_num(o, "lastError", w->last_error));
   return o;
 }
-static qa_save_value *native_heap_value(const qa_native_guest_heap_image *heap) {
+static qa_save_value *native_heap_value(const qa_guest_checkpoint *guest, const qa_native_guest_heap_image *heap) {
   if (heap == NULL) return qa_save_value_null();
   qa_save_value *o = obj();
   if (o == NULL) return NULL;
@@ -1559,7 +1576,7 @@ static qa_save_value *native_heap_value(const qa_native_guest_heap_image *heap) 
   for (size_t i = 0; ok && i < heap->layout_count; i++) {
     const qa_guest_mapping_record *m = &heap->layout[i];
     qa_save_value *entry = obj();
-    ok = entry != NULL && set_own(entry, "base", qa_save_value_bigint_i64(m->base)) &&
+    ok = entry != NULL && set_own(entry, "base", guest_bigint(guest, &m->base)) &&
          set_num(entry, "byteLength", m->byte_length) && set_str(entry, "permissions", m->permissions) &&
          set_str(entry, "label", m->label);
     if (ok) ok = push_own(layout, entry);
@@ -1568,15 +1585,15 @@ static qa_save_value *native_heap_value(const qa_native_guest_heap_image *heap) 
   for (size_t i = 0; ok && i < heap->allocator.hint_count; i++) {
     const qa_guest_allocator_hint *h = &heap->allocator.hints[i];
     qa_save_value *entry = obj();
-    ok = entry != NULL && set_own(entry, "alignment", qa_save_value_bigint_i64(h->alignment)) &&
-         set_own(entry, "base", qa_save_value_bigint_i64(h->base)) && set_num(entry, "byteLength", h->byte_length);
+    ok = entry != NULL && set_own(entry, "alignment", guest_bigint(guest, &h->alignment)) &&
+         set_own(entry, "base", guest_bigint(guest, &h->base)) && set_num(entry, "byteLength", h->byte_length);
     if (ok) ok = push_own(hints, entry);
     else qa_save_value_free(entry);
   }
   for (size_t i = 0; ok && i < heap->allocator.slab_count; i++) {
     const qa_guest_allocator_slab *sl = &heap->allocator.slabs[i];
     qa_save_value *entry = obj();
-    ok = entry != NULL && set_own(entry, "base", qa_save_value_bigint_i64(sl->base)) &&
+    ok = entry != NULL && set_own(entry, "base", guest_bigint(guest, &sl->base)) &&
          set_bytes(entry, "used", sl->used) && set_num(entry, "next", sl->next);
     if (ok) ok = push_own(slabs, entry);
     else qa_save_value_free(entry);
@@ -1586,8 +1603,8 @@ static qa_save_value *native_heap_value(const qa_native_guest_heap_image *heap) 
   for (size_t i = 0; ok && i < heap->block_count; i++) {
     const qa_native_heap_block *b = &heap->blocks[i];
     qa_save_value *entry = obj();
-    ok = entry != NULL && set_own(entry, "base", qa_save_value_bigint_i64(b->base)) && set_num(entry, "size", b->size) &&
-         set_own(entry, "heap", qa_save_value_bigint_i64(b->heap));
+    ok = entry != NULL && set_own(entry, "base", guest_bigint(guest, &b->base)) && set_num(entry, "size", b->size) &&
+         set_own(entry, "heap", guest_bigint(guest, &b->heap));
     if (ok) ok = push_own(blocks, entry);
     else qa_save_value_free(entry);
   }
@@ -1610,10 +1627,12 @@ static qa_save_value *native_heap_value(const qa_native_guest_heap_image *heap) 
     return NULL;
   }
   TRY(set_own(o, "layout", layout) && set_own(o, "allocator", allocator) && set_own(o, "blocks", blocks) &&
-      set_own(o, "windows", heap->windows == NULL ? qa_save_value_null() : windows_tables_value(heap->windows)));
+      set_own(o, "windows", heap->windows == NULL ? qa_save_value_null() : windows_tables_value(guest, heap->windows)));
   return o;
 }
-static qa_save_value *guest_value(const qa_guest_checkpoint *guest) {
+/* `parsed`: execution.ts readGuest's order ({ ...common, kind, ... }, a native image's
+ * version after kind and its processor layout in readLayout's order). */
+static qa_save_value *guest_value_ordered(const qa_guest_checkpoint *guest, bool parsed) {
   qa_save_value *o = obj();
   if (o == NULL) return NULL;
   qa_save_value *random = arr();
@@ -1627,9 +1646,10 @@ static qa_save_value *guest_value(const qa_guest_checkpoint *guest) {
   for (size_t i = 0; i < guest->random_count; i++)
     if (!push_own(random, random_value(guest->random[i]))) goto oom;
   for (size_t i = 0; i < guest->callback_count; i++)
-    if (!push_own(callbacks, callback_value(guest->callbacks[i]))) goto oom;
+    if (!push_own(callbacks, callback_value(guest, &guest->callbacks[i]))) goto oom;
   /* A native Q3 process image is written in Q3NativeGuestSource.checkpoint()'s key order: kind and version first. */
-  if (guest->kind == QA_GUEST_CHECKPOINT_NATIVE_GUEST && !(set_str(o, "kind", "native-guest") && set_num(o, "version", 2))) goto oom;
+  if (!parsed && guest->kind == QA_GUEST_CHECKPOINT_NATIVE_GUEST && !(set_str(o, "kind", "native-guest") && set_num(o, "version", 2)))
+    goto oom;
   TRY(set_own(o, "module", module_value(guest->module)) &&
       set_own(o, "random", random) && set_own(o, "callbacks", callbacks));
   random = NULL;
@@ -1705,8 +1725,7 @@ static qa_save_value *guest_value(const qa_guest_checkpoint *guest) {
       for (size_t i = 0; i < guest->region_count; i++) {
         qa_save_value *entry = obj();
         bool ok = entry != NULL &&
-                  set_own(entry, "base",
-                          qa_save_value_bigint_i64(guest->regions[i].base)) &&
+                  set_own(entry, "base", guest_bigint(guest, &guest->regions[i].base)) &&
                   set_str(entry, "permissions", guest->regions[i].permissions) &&
                   set_bytes(entry, "bytes", guest->regions[i].bytes) &&
                   push_own(regions, entry);
@@ -1715,11 +1734,17 @@ static qa_save_value *guest_value(const qa_guest_checkpoint *guest) {
           goto oom;
         }
       }
+      if (parsed && !(set_str(o, "kind", "native-guest") && set_num(o, "version", 2))) {
+        qa_save_value_free(regions);
+        qa_save_value_free(o);
+        return NULL;
+      }
       TRY(set_own(o, "abi", abi_value(guest->abi)) &&
           set_own(o, "regions", regions) &&
-          set_own(o, "heap", native_heap_value(guest->heap)) &&
+          set_own(o, "heap", native_heap_value(guest, guest->heap)) &&
           set_own(o, "processorLayout",
-                  native_processor_layout_value(guest->processor_layout)) &&
+                  parsed ? layout_value(guest->processor_layout)
+                         : native_processor_layout_value(guest->processor_layout)) &&
           set_bytes(o, "processorState", guest->processor_state) &&
           set_own(o, "runtimeState", private_value(guest->runtime_state)));
       break;
@@ -1732,6 +1757,7 @@ oom:
   qa_save_value_free(o);
   return NULL;
 }
+static qa_save_value *guest_value(const qa_guest_checkpoint *guest) { return guest_value_ordered(guest, false); }
 /* TS readExecution: { kind, owner, implementation | artifact, profile?, role, api }. */
 static qa_save_value *execution_value(qa_resolved_execution_module module) {
   qa_save_value *o = obj();
@@ -1746,7 +1772,13 @@ static qa_save_value *execution_value(qa_resolved_execution_module module) {
   TRY(set_str(o, "kind", kind) && set_own(o, "owner", provider_value(module.owner)));
   if (module.kind == QA_EXECUTION_MODULE_TYPESCRIPT)
     TRY(set_str(o, "implementation", module.implementation) && set_str(o, "role", module.role));
-  else
+  else if (((const qa_resolved_resource_reference *)module.artifact)->parsed_order) {
+    /* recipe.ts readExecution: { kind, owner, artifact, profile?, role, api }. */
+    TRY(set_own(o, "artifact", resource_value(*(const qa_resolved_resource_reference *)module.artifact)));
+    if (module.kind == QA_EXECUTION_MODULE_NATIVE) TRY(set_own(o, "profile", abi_value(module.profile)));
+    TRY(set_str(o, "role", module.role) && set_own(o, "api", api_value(module.api)));
+    return o;
+  } else
     TRY(set_str(o, "role", module.role) &&
         set_own(o, "artifact",
                 resource_value(*(const qa_resolved_resource_reference *)module.artifact)));
@@ -1805,7 +1837,37 @@ static qa_save_value *enemies_value(qa_enemy_selection e) {
   }
   return o;
 }
-static qa_save_value *equipment_value(qa_equipment_selection equipment) {
+/* QvmGrappleDefinition: qa_qvm_grapple_profile_declaration less its {version,
+ * artifactDigest, artifactPath} tail is grapple-profile.ts readQvmGrappleProfile's
+ * order (a selected profile); persistence/qvm-grapple.ts readQvmGrappleDefinition
+ * reads pullingFlag after clientStride and fields.hook after mover. */
+static qa_save_value *qvm_grapple_definition_value(const qa_qvm_grapple_definition *profile, bool parsed) {
+  static const char *const tail[] = {"version", "artifactDigest", "artifactPath"};
+  static const char *const top[] = {"id", "title", "module", "abiProfile", "entityStride", "clientStride", "pullingFlag"};
+  static const char *const fields[] = {"inuse", "client", "parent", "target", "mover", "hook"};
+  qa_save_value *o = qa_qvm_grapple_profile_declaration(profile);
+  if (o == NULL) return NULL;
+  for (size_t k = 0; k < sizeof tail / sizeof tail[0]; k++)
+    for (size_t i = 0; i < o->entry_count; i++)
+      if (strcmp(o->entries[i].key, tail[k]) == 0) {
+        free(o->entries[i].key);
+        qa_save_value_free(o->entries[i].value);
+        memmove(&o->entries[i], &o->entries[i + 1], (o->entry_count - i - 1) * sizeof *o->entries);
+        o->entry_count--;
+        break;
+      }
+  if (parsed) {
+    order_keys(o, top, sizeof top / sizeof top[0]);
+    for (size_t i = 0; i < o->entry_count; i++)
+      if (strcmp(o->entries[i].key, "fields") == 0) order_keys(o->entries[i].value, fields, sizeof fields / sizeof fields[0]);
+  }
+  return o;
+}
+/* `fresh`: the catalog / startup-selection literals a launched recipe holds
+ * (grapple { kind, mechanic, edition, binding, source, profile? }, hand grenades
+ * { kind, source, edition, binding, initialAmmo, capacity }); otherwise
+ * recipe.ts readGrapple / readHandGrenades order. */
+static qa_save_value *equipment_value(qa_equipment_selection equipment, bool fresh) {
   qa_save_value *o = obj();
   if (o == NULL) return NULL;
   qa_save_value *grapple = obj();
@@ -1815,17 +1877,20 @@ static qa_save_value *equipment_value(qa_equipment_selection equipment) {
   }
   if (!equipment.grapple.is_enabled) {
     if (!set_str(grapple, "kind", "disabled")) goto grapple_oom;
-  } else if (strcmp(equipment.grapple.mechanic, "q3-qvm") == 0) {
-    /* No checkpoint-value writer for qa_qvm_grapple_definition yet. */
-    qa_save_format_error("save",
-                         "q3-qvm grapple profile writer is not yet ported");
   } else {
-    bool ok = set_str(grapple, "kind", "enabled") &&
-              set_own(grapple, "source",
-                      provider_value(equipment.grapple.source)) &&
-              set_str(grapple, "binding", equipment.grapple.binding) &&
-              set_str(grapple, "mechanic", equipment.grapple.mechanic) &&
-              set_str(grapple, "edition", equipment.grapple.edition);
+    bool qvm = strcmp(equipment.grapple.mechanic, "q3-qvm") == 0;
+    bool ok = set_str(grapple, "kind", "enabled");
+    if (fresh)
+      ok = ok && set_str(grapple, "mechanic", equipment.grapple.mechanic) &&
+           set_str(grapple, "edition", equipment.grapple.edition) &&
+           set_str(grapple, "binding", equipment.grapple.binding) &&
+           set_own(grapple, "source", provider_value(equipment.grapple.source));
+    else
+      ok = ok && set_own(grapple, "source", provider_value(equipment.grapple.source)) &&
+           set_str(grapple, "binding", equipment.grapple.binding) &&
+           set_str(grapple, "mechanic", equipment.grapple.mechanic) &&
+           set_str(grapple, "edition", equipment.grapple.edition);
+    if (ok && qvm) ok = set_own(grapple, "profile", qvm_grapple_definition_value(equipment.grapple.profile, !fresh));
     if (!ok) goto grapple_oom;
   }
   {
@@ -1838,8 +1903,10 @@ static qa_save_value *equipment_value(qa_equipment_selection equipment) {
       ok = set_str(grenades, "kind", "enabled") &&
            set_own(grenades, "source",
                    provider_value(equipment.hand_grenades.source)) &&
-           set_str(grenades, "binding", "offhand") &&
-           set_str(grenades, "edition", equipment.hand_grenades.edition) &&
+           (fresh ? set_str(grenades, "edition", equipment.hand_grenades.edition) &&
+                        set_str(grenades, "binding", "offhand")
+                  : set_str(grenades, "binding", "offhand") &&
+                        set_str(grenades, "edition", equipment.hand_grenades.edition)) &&
            set_num(grenades, "initialAmmo",
                    equipment.hand_grenades.initial_ammo) &&
            set_num(grenades, "capacity", equipment.hand_grenades.capacity);
@@ -1947,7 +2014,7 @@ static qa_save_value *behavior_callback_value(qa_weapon_behavior_callback cb) {
     case QA_WEAPON_CALLBACK_NATIVE_ARTIFACT:
       TRY(set_str(o, "kind", "native-artifact") &&
           set_own(o, "module", module_value(cb.module)) &&
-          set_own(o, "imageOffset", qa_save_value_bigint_i64(cb.image_offset)) &&
+          set_own(o, "imageOffset", qa_save_value_bigint_u64(cb.image_offset)) &&
           set_own(o, "abi", abi_value(cb.abi)));
       break;
   }
@@ -1984,6 +2051,14 @@ static qa_save_value *weapon_behavior_value(
   }
   TRY(set_own(o, "source", provider_value(behavior.source)) &&
       set_own(o, "artifact", resource_value(behavior.artifact)));
+  /* weapon-behavior-selection.ts builds { source, artifact, definition, component? };
+   * recipe.ts readWeaponBehavior returns { source, artifact, component?, definition }. */
+  bool parsed = behavior.artifact.parsed_order;
+  if (!parsed) {
+    bool set = set_own(o, "definition", value);
+    value = NULL;
+    TRY(set);
+  }
   if (behavior.has_component) {
     qa_save_value *component = obj();
     if (component == NULL) {
@@ -2032,7 +2107,7 @@ static qa_save_value *weapon_behavior_value(
       return NULL;
     }
   }
-  TRY(set_own(o, "definition", value));
+  if (parsed) TRY(set_own(o, "definition", value));
   return o;
 }
 static qa_save_value *selection_value(qa_mod_selection selection) {
@@ -2070,30 +2145,37 @@ static qa_save_value *gameplay_mod_value(const qa_resolved_gameplay_mod *mod) {
       set_str(o, "declarationDigest", mod->declaration_digest));
   return o;
 }
-static qa_save_value *recipe_value(const qa_executable_recipe *recipe) {
-  qa_save_value *o = obj();
-  if (o == NULL) return NULL;
-  if (recipe->mod_count > 0) {
+/* The optional mods / weaponBehaviors keys placed at `last` (false: the front, as
+ * readRecipe; true: appended, as applyApplicationMods' { ...recipe, mods, weaponBehaviors }). */
+static bool recipe_optional_keys(qa_save_value *o, const qa_executable_recipe *recipe, bool last) {
+  if ((recipe->mods_key == QA_RECIPE_KEY_LAST) == last &&
+      (recipe->mod_count > 0 || recipe->mods_key != QA_RECIPE_KEY_IF_ANY)) {
     qa_save_value *mods = arr();
-    if (mods == NULL) goto oom;
+    if (mods == NULL) return false;
     for (size_t i = 0; i < recipe->mod_count; i++)
       if (!push_own(mods, gameplay_mod_value(recipe->mods[i]))) {
         qa_save_value_free(mods);
-        goto oom;
+        return false;
       }
-    TRY(set_own(o, "mods", mods));
+    if (!set_own(o, "mods", mods)) return false;
   }
-  if (recipe->weapon_behavior_count > 0) {
+  if ((recipe->weapon_behaviors_key == QA_RECIPE_KEY_LAST) == last &&
+      (recipe->weapon_behavior_count > 0 || recipe->weapon_behaviors_key != QA_RECIPE_KEY_IF_ANY)) {
     qa_save_value *behaviors = arr();
-    if (behaviors == NULL) goto oom;
+    if (behaviors == NULL) return false;
     for (size_t i = 0; i < recipe->weapon_behavior_count; i++)
-      if (!push_own(behaviors,
-                    weapon_behavior_value(recipe->weapon_behaviors[i]))) {
+      if (!push_own(behaviors, weapon_behavior_value(recipe->weapon_behaviors[i]))) {
         qa_save_value_free(behaviors);
-        goto oom;
+        return false;
       }
-    TRY(set_own(o, "weaponBehaviors", behaviors));
+    if (!set_own(o, "weaponBehaviors", behaviors)) return false;
   }
+  return true;
+}
+static qa_save_value *recipe_value(const qa_executable_recipe *recipe) {
+  qa_save_value *o = obj();
+  if (o == NULL) return NULL;
+  TRY(recipe_optional_keys(o, recipe, false));
   {
     qa_save_value *map = obj();
     bool ok = map != NULL &&
@@ -2182,7 +2264,7 @@ static qa_save_value *recipe_value(const qa_executable_recipe *recipe) {
           set_own(o, "movement", provider_value(recipe->movement)) &&
           set_own(o, "character", character_value(recipe->character)) &&
           set_own(o, "weapons", weapons) &&
-          set_own(o, "equipment", equipment_value(recipe->equipment)) &&
+          set_own(o, "equipment", equipment_value(recipe->equipment, recipe->launch_key_order)) &&
           set_own(o, "enemies", enemies_value(recipe->enemies)) &&
           set_own(o, "presentation", presentation_value(recipe->presentation)) &&
           set_own(o, "engineBehavior", provider_value(recipe->engine_behavior)) &&
@@ -2196,6 +2278,7 @@ static qa_save_value *recipe_value(const qa_executable_recipe *recipe) {
           set_num(o, "schemaVersion", (double)recipe->schema_version) &&
           set_own(o, "mounts", mount_plan_value(recipe->mounts, !recipe->launch_key_order)) &&
           set_own(o, "resources", resources));
+      TRY(recipe_optional_keys(o, recipe, true));
       return o;
     }
     TRY(set_num(o, "schemaVersion", (double)recipe->schema_version) &&
@@ -2204,7 +2287,7 @@ static qa_save_value *recipe_value(const qa_executable_recipe *recipe) {
         set_own(o, "movement", provider_value(recipe->movement)) &&
         set_own(o, "character", character_value(recipe->character)) &&
         set_own(o, "weapons", weapons) &&
-        set_own(o, "equipment", equipment_value(recipe->equipment)) &&
+        set_own(o, "equipment", equipment_value(recipe->equipment, recipe->launch_key_order)) &&
         set_own(o, "enemies", enemies_value(recipe->enemies)) &&
         set_own(o, "presentation", presentation_value(recipe->presentation)) &&
         set_own(o, "engineBehavior",
@@ -2217,6 +2300,7 @@ static qa_save_value *recipe_value(const qa_executable_recipe *recipe) {
         set_own(o, "mounts", mount_plan_value(recipe->mounts, !recipe->launch_key_order)) &&
         set_own(o, "resources", resources) && set_own(o, "timing", timing) &&
         set_own(o, "ordering", ordering_value(recipe->ordering)));
+    TRY(recipe_optional_keys(o, recipe, true));
   }
   return o;
 oom:
@@ -2353,8 +2437,10 @@ oom:
   qa_save_value_free(o);
   return NULL;
 }
+/* `parsed`: mods.ts readModSession's guests (readGuest order); otherwise each mod's
+ * source.checkpoint() (QvmModule / QuakeC executor order). */
 static qa_save_value *mod_session_value(
-    const qa_mod_session_checkpoint *session) {
+    const qa_mod_session_checkpoint *session, bool parsed) {
   qa_save_value *o = obj();
   if (o == NULL) return NULL;
   qa_save_value *mods = arr();
@@ -2369,7 +2455,11 @@ static qa_save_value *mod_session_value(
     qa_save_value *providers = arr();
     bool ok = state != NULL && guests != NULL && providers != NULL;
     for (size_t k = 0; ok && k < checkpoint->state.guest_count; k++)
-      ok = push_own(guests, guest_value(&checkpoint->state.guests[k]));
+    {
+      qa_save_value *guest = guest_value_ordered(&checkpoint->state.guests[k], parsed);
+      if (!parsed) order_guest_checkpoint(guest, checkpoint->state.guests[k].kind);
+      ok = push_own(guests, guest);
+    }
     for (size_t k = 0; ok && k < checkpoint->state.provider_count; k++)
       ok = push_own(providers, provider_checkpoint_value(
                                    checkpoint->state.providers[k]));
@@ -2426,7 +2516,7 @@ static qa_save_value *image_value(const qa_save_image *image) {
       set_own(o, "frame", frame_value(image->frame)) &&
       set_num(o, "nextEventSequence", image->next_event_sequence));
   if (!parsed) {
-    if (image->mods != NULL) TRY(set_own(o, "mods", mod_session_value(image->mods)));
+    if (image->mods != NULL) TRY(set_own(o, "mods", mod_session_value(image->mods, parsed)));
     TRY(set_own(o, "consumption", consumption_value(image)));
   }
   {
@@ -2650,7 +2740,7 @@ static qa_save_value *image_value(const qa_save_image *image) {
     qa_save_value *guests = arr();
     if (guests == NULL) goto oom;
     for (size_t i = 0; i < image->guest_count; i++) {
-      qa_save_value *guest = guest_value(&image->guests[i]);
+      qa_save_value *guest = guest_value_ordered(&image->guests[i], parsed);
       if (!parsed) order_guest_checkpoint(guest, image->guests[i].kind);
       if (!push_own(guests, guest)) {
         qa_save_value_free(guests);
@@ -2660,7 +2750,7 @@ static qa_save_value *image_value(const qa_save_image *image) {
     TRY(set_own(o, "guests", guests));
   }
   if (parsed) {
-    if (image->mods != NULL) TRY(set_own(o, "mods", mod_session_value(image->mods)));
+    if (image->mods != NULL) TRY(set_own(o, "mods", mod_session_value(image->mods, parsed)));
     TRY(set_own(o, "consumption", consumption_value(image)));
   }
   return o;

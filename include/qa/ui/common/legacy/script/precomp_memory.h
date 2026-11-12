@@ -95,6 +95,10 @@ int64_t qa_ui_precomp_define_parameter_index(qa_ui_precomp_define *define,
 qa_ui_precomp_memory *qa_ui_precomp_memory_create(
     const qa_ui_script_memory *memory);
 void qa_ui_precomp_memory_destroy(qa_ui_precomp_memory *memory);
+/* Frees the C handles of a heap dropped by a failed restore. Allocations of
+   a memory owner stay with it (TS drops the objects); without an owner the
+   bytes are freed (the collector's part). */
+void qa_ui_precomp_memory_discard(qa_ui_precomp_memory *memory);
 size_t qa_ui_precomp_memory_token_count(const qa_ui_precomp_memory *memory);
 qa_save_value *qa_ui_precomp_memory_capture_save_state(
     qa_ui_precomp_memory *memory,

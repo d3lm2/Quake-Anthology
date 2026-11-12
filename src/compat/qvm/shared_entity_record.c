@@ -70,7 +70,7 @@ int32_t qa_qvm_shared_entity_get_single_client(qa_qvm_shared_entity *e) {
 
 void qa_qvm_shared_entity_set_single_client(qa_qvm_shared_entity *e, int32_t v) {
   if (is_modern(e->profile)) qa_qvm_writable_view_set_int32(&e->view, 428, v, true);
-  else if (v != 0) qa_range_error("Legacy QVM entity has no singleClient field");
+  else if (v != 0) qa_raise("Error", 0, 0, "Legacy QVM entity has no singleClient field");
 }
 
 qa_vec3 qa_qvm_shared_entity_get_mins(qa_qvm_shared_entity *e) { return get_vector(e, 436); }

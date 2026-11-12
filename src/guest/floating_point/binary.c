@@ -150,6 +150,16 @@ void qa_bigint_neg(qa_bigint *out, const qa_bigint *a) {
   qa_bigint_clone(out, a);
   out->sign = -out->sign;
 }
+/* JavaScriptCore (bun) refuses a BigInt result longer than 2^20 bits with this RangeError; the x87 series in
+ * x87-extended.ts reach it for out-of-domain operands (F2XM1 of 2^31), and the CPU rethrows it. */
+#define BIGINT_MAX_BITS 1048576u
+static void bi_too_big(qa_bigint *partial) {
+  qa_bigint_free(partial);
+  qa_raise("RangeError", 0, 0, "Out of memory: BigInt generated from this operation is too big");
+}
+static void bi_limit(qa_bigint *result) {
+  if (qa_bigint_bit_length(result) > BIGINT_MAX_BITS) bi_too_big(result);
+}
 void qa_bigint_add(qa_bigint *out, const qa_bigint *a, const qa_bigint *b) {
   qa_bigint r; qa_bigint_init(&r);
   if (a->sign == 0) qa_bigint_clone(&r, b);
@@ -161,6 +171,7 @@ void qa_bigint_add(qa_bigint *out, const qa_bigint *a, const qa_bigint *b) {
     else if (c > 0) { bi_sub_abs(&r, a, b); r.sign = r.len ? a->sign : 0; }
     else { bi_sub_abs(&r, b, a); r.sign = r.len ? b->sign : 0; }
   }
+  bi_limit(&r);
   qa_bigint_free(out);
   *out = r;
 }
@@ -171,6 +182,7 @@ void qa_bigint_sub(qa_bigint *out, const qa_bigint *a, const qa_bigint *b) {
 }
 void qa_bigint_mul(qa_bigint *out, const qa_bigint *a, const qa_bigint *b) {
   qa_bigint r; qa_bigint_init(&r);
+  if (a->len != 0 && b->len != 0 && qa_bigint_bit_length(a) + qa_bigint_bit_length(b) - 1 > BIGINT_MAX_BITS) bi_too_big(&r);
   if (a->len != 0 && b->len != 0) {
     bi_reserve(&r, a->len + b->len);
     for (size_t i = 0; i < a->len + b->len; i++) r.limbs[i] = 0;
@@ -187,19 +199,76 @@ void qa_bigint_mul(qa_bigint *out, const qa_bigint *a, const qa_bigint *b) {
     r.sign = a->sign * b->sign;
     bi_normalize(&r);
   }
+  bi_limit(&r);
   qa_bigint_free(out);
   *out = r;
-}
-/* Magnitude long division over bits (sizes here are modest). */
-static bool bi_get_bit(const qa_bigint *v, size_t bit) {
-  size_t limb = bit / 32u;
-  return limb < v->len && ((v->limbs[limb] >> (bit % 32u)) & 1u) != 0;
 }
 static void bi_set_bit(qa_bigint *v, size_t bit) {
   size_t limb = bit / 32u;
   bi_reserve(v, limb + 1);
   if (v->len < limb + 1) { for (size_t i = v->len; i <= limb; i++) v->limbs[i] = 0; v->len = limb + 1; }
   v->limbs[limb] |= 1u << (bit % 32u);
+}
+/* Magnitude long division (Knuth vol. 2, 4.3.1, algorithm D) in base 2^32: quotient and remainder of |a| / |b|
+ * for |a| >= |b| and b->len >= 2. A bit-serial division made the x87 series in x87-extended.c (F2XM1 of a large
+ * operand) run for hours where the TS BigInt takes a second. */
+static void bi_divmod_long(qa_bigint *quot, qa_bigint *rem, const qa_bigint *a, const qa_bigint *b) {
+  const size_t m = a->len, n = b->len;
+  unsigned shift = 0;
+  for (uint32_t top = b->limbs[n - 1]; (top & 0x80000000u) == 0; top <<= 1) shift++;
+  uint32_t *vn = (uint32_t *)malloc(n * sizeof(uint32_t));
+  uint32_t *un = (uint32_t *)malloc((m + 1) * sizeof(uint32_t));
+  if (vn == NULL || un == NULL) { free(vn); free(un); qa_range_error("bigint allocation failed"); }
+  for (size_t i = n - 1; i > 0; i--)
+    vn[i] = (b->limbs[i] << shift) | (shift != 0 ? b->limbs[i - 1] >> (32u - shift) : 0u);
+  vn[0] = b->limbs[0] << shift;
+  un[m] = shift != 0 ? a->limbs[m - 1] >> (32u - shift) : 0u;
+  for (size_t i = m - 1; i > 0; i--)
+    un[i] = (a->limbs[i] << shift) | (shift != 0 ? a->limbs[i - 1] >> (32u - shift) : 0u);
+  un[0] = a->limbs[0] << shift;
+  bi_reserve(quot, m - n + 1);
+  quot->len = m - n + 1;
+  for (size_t j = m - n + 1; j-- > 0;) {
+    const uint64_t top = ((uint64_t)un[j + n] << 32) | un[j + n - 1];
+    uint64_t qhat = top / vn[n - 1], rhat = top % vn[n - 1];
+    while (qhat > 0xffffffffull || qhat * vn[n - 2] > ((rhat << 32) | un[j + n - 2])) {
+      qhat--;
+      rhat += vn[n - 1];
+      if (rhat > 0xffffffffull) break;
+    }
+    uint64_t carry = 0, borrow = 0;
+    for (size_t i = 0; i < n; i++) {
+      const uint64_t product = qhat * vn[i] + carry;
+      carry = product >> 32;
+      const uint64_t difference = (uint64_t)un[i + j] - (product & 0xffffffffull) - borrow;
+      un[i + j] = (uint32_t)difference;
+      borrow = difference >> 63;
+    }
+    const uint64_t difference = (uint64_t)un[j + n] - carry - borrow;
+    un[j + n] = (uint32_t)difference;
+    if ((difference >> 63) != 0) {
+      qhat--;
+      uint64_t sum_carry = 0;
+      for (size_t i = 0; i < n; i++) {
+        const uint64_t sum = (uint64_t)un[i + j] + vn[i] + sum_carry;
+        un[i + j] = (uint32_t)sum;
+        sum_carry = sum >> 32;
+      }
+      un[j + n] += (uint32_t)sum_carry;
+    }
+    quot->limbs[j] = (uint32_t)qhat;
+  }
+  bi_reserve(rem, n);
+  rem->len = n;
+  for (size_t i = 0; i + 1 < n; i++)
+    rem->limbs[i] = (un[i] >> shift) | (shift != 0 ? un[i + 1] << (32u - shift) : 0u);
+  rem->limbs[n - 1] = un[n - 1] >> shift;
+  free(vn);
+  free(un);
+  quot->sign = 1;
+  rem->sign = 1;
+  bi_normalize(quot);
+  bi_normalize(rem);
 }
 void qa_bigint_divmod(qa_bigint *q, qa_bigint *r, const qa_bigint *a, const qa_bigint *b) {
   if (b->len == 0) qa_range_error("Division by zero");
@@ -208,23 +277,22 @@ void qa_bigint_divmod(qa_bigint *q, qa_bigint *r, const qa_bigint *a, const qa_b
   if (qa_bigint_cmp_abs(a, b) < 0) {
     qa_bigint_clone(&rem, a);
   } else {
-    size_t nbits = qa_bigint_bit_length(a);
-    qa_bigint divisor; qa_bigint_init(&divisor); qa_bigint_clone(&divisor, b); divisor.sign = 1;
-    for (size_t i = nbits; i-- > 0;) {
-      /* rem = (rem << 1) | bit_i(a) */
-      qa_bigint shifted; qa_bigint_init(&shifted);
-      qa_bigint_shl(&shifted, &rem, 1);
-      qa_bigint_free(&rem); rem = shifted;
-      if (bi_get_bit(a, i)) bi_set_bit(&rem, 0);
-      if (rem.len > 0) rem.sign = 1;
-      if (qa_bigint_cmp_abs(&rem, &divisor) >= 0) {
-        qa_bigint next; qa_bigint_init(&next); bi_sub_abs(&next, &rem, &divisor);
-        next.sign = next.len ? 1 : 0;
-        qa_bigint_free(&rem); rem = next;
-        bi_set_bit(&quot, i);
+    if (b->len == 1) {
+      const uint64_t divisor = b->limbs[0];
+      uint64_t carry = 0;
+      bi_reserve(&quot, a->len);
+      quot.len = a->len;
+      for (size_t i = a->len; i-- > 0;) {
+        const uint64_t current = (carry << 32) | a->limbs[i];
+        quot.limbs[i] = (uint32_t)(current / divisor);
+        carry = current % divisor;
       }
+      quot.sign = 1;
+      bi_normalize(&quot);
+      qa_bigint_set_u64(&rem, carry);
+    } else {
+      bi_divmod_long(&quot, &rem, a, b);
     }
-    qa_bigint_free(&divisor);
     if (quot.len > 0) quot.sign = a->sign * b->sign;
     if (rem.len > 0) rem.sign = a->sign;
   }
@@ -234,6 +302,8 @@ void qa_bigint_divmod(qa_bigint *q, qa_bigint *r, const qa_bigint *a, const qa_b
 void qa_bigint_shl(qa_bigint *out, const qa_bigint *a, int64_t shift) {
   if (shift < 0) { qa_bigint_shr(out, a, -shift); return; }
   qa_bigint r; qa_bigint_init(&r);
+  if (a->len != 0 && (uint64_t)shift > BIGINT_MAX_BITS - (qa_bigint_bit_length(a) < BIGINT_MAX_BITS ? qa_bigint_bit_length(a) : BIGINT_MAX_BITS))
+    bi_too_big(&r);
   if (a->len != 0) {
     size_t limb_shift = (size_t)shift / 32u;
     unsigned bit_shift = (unsigned)shift % 32u;

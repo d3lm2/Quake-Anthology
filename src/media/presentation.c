@@ -23,21 +23,43 @@ static qa_media_input *dimension_open(void *ctx) {
   return qa_cinematic_source_open((const qa_cinematic_source *)ctx);
 }
 
+static void input_release(void *raw) { qa_media_input_close((qa_media_input *)raw); }
+
+typedef struct roq_dimension_scope {
+  qa_roq_decoder *decoder;
+  qa_roq_stream *stream;
+  qa_roq_scratch *scratch;
+  qa_roq_event event;
+} roq_dimension_scope;
+
+static void roq_dimension_release(void *raw) {
+  roq_dimension_scope *scope = (roq_dimension_scope *)raw;
+  qa_roq_event_dispose(&scope->event);
+  qa_roq_decoder_destroy(scope->decoder);
+  qa_roq_stream_destroy(scope->stream);
+  qa_roq_scratch_destroy(scope->scratch);
+}
+
 bool qa_cinematic_dimensions(const qa_cinematic_source *source,
                              int64_t *width, int64_t *height) {
   if (source->format == QA_CINEMATIC_FORMAT_OGV) {
     qa_media_input *input = qa_cinematic_source_open(source);
     if (input == NULL) return false;
+    /* TS try/finally: input.close() also when the read throws. */
+    qa_cleanup input_guard;
+    qa_cleanup_push(&input_guard, input_release, input);
     uint8_t *bytes = qa_read_media(input, 0, input->byte_length);
+    qa_cleanup_pop(&input_guard);
     size_t length = (size_t)input->byte_length;
     qa_media_input_close(input);
     if (bytes == NULL && length != 0) return false;
     qa_ogg_movie movie;
-    if (!qa_decode_ogg_movie(bytes, length, &movie)) {
-      free(bytes);
-      return false;
-    }
+    qa_cleanup bytes_guard;
+    qa_cleanup_push(&bytes_guard, free, bytes);
+    bool decoded = qa_decode_ogg_movie(bytes, length, &movie);
+    qa_cleanup_pop(&bytes_guard);
     free(bytes);
+    if (!decoded) return false;
     qa_platform_ogg_packet headers[3];
     for (int i = 0; i < 3; i++) {
       headers[i].data = movie.video[i].data;
@@ -70,7 +92,10 @@ bool qa_cinematic_dimensions(const qa_cinematic_source *source,
   if (source->format == QA_CINEMATIC_FORMAT_CIN) {
     qa_media_input *input = qa_cinematic_source_open(source);
     if (input == NULL) return false;
+    qa_cleanup input_guard;
+    qa_cleanup_push(&input_guard, input_release, input);
     uint8_t *bytes = qa_read_media(input, 0, 8);
+    qa_cleanup_pop(&input_guard);
     qa_media_input_close(input);
     if (bytes == NULL) return false;
     qa_binary_reader reader;
@@ -99,41 +124,36 @@ bool qa_cinematic_dimensions(const qa_cinematic_source *source,
     media_error("Empty cinematic: %s", source->source);
   }
   qa_roq_decoder decoder;
+  memset(&decoder, 0, sizeof decoder);
   qa_roq_decoder_options options;
   memset(&options, 0, sizeof options);
   options.silent = true;
   options.scratch = &scratch;
-  if (!qa_roq_decoder_init_stream(&decoder, stream, source->source,
-                                  &options)) {
-    qa_roq_stream_destroy(stream);
-    qa_roq_scratch_destroy(&scratch);
-    return false;
-  }
+  /* TS try/finally: stream.close() on every exit, the malformed-file throws
+   * included; the decoder and scratch go with it. */
+  roq_dimension_scope scope = {&decoder, stream, &scratch, {0}};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, roq_dimension_release, &scope);
+  bool ok = qa_roq_decoder_init_stream(&decoder, stream, source->source,
+                                       &options);
   bool found = false;
-  bool ok = true;
-  while (!found) {
-    qa_roq_event event;
+  while (ok && !found) {
     if (!qa_roq_decoder_next_chunk(&decoder, NULL, NULL, NULL, NULL, NULL,
-                                   NULL, &event)) {
+                                   NULL, &scope.event)) {
       ok = false;
       break;
     }
-    if (event.kind == QA_ROQ_EVENT_INFO) {
-      *width = event.width;
-      *height = event.height;
+    if (scope.event.kind == QA_ROQ_EVENT_INFO) {
+      *width = scope.event.width;
+      *height = scope.event.height;
       found = true;
-    } else if (event.kind == QA_ROQ_EVENT_END) {
-      qa_roq_event_dispose(&event);
-      qa_roq_decoder_destroy(&decoder);
-      qa_roq_stream_destroy(stream);
-      qa_roq_scratch_destroy(&scratch);
+    } else if (scope.event.kind == QA_ROQ_EVENT_END) {
       media_error("Cinematic contains no video info: %s", source->source);
     }
-    qa_roq_event_dispose(&event);
+    qa_roq_event_dispose(&scope.event);
   }
-  qa_roq_decoder_destroy(&decoder);
-  qa_roq_stream_destroy(stream);
-  qa_roq_scratch_destroy(&scratch);
+  qa_cleanup_pop(&guard);
+  roq_dimension_release(&scope);
   return ok;
 }
 
@@ -242,6 +262,10 @@ qa_cinematic_image_upload *qa_cinematic_image_prepare(
   return upload;
 }
 
+static void executing_clear(void *raw) {
+  ((qa_cinematic_image *)raw)->executing = false;
+}
+
 qa_renderer_image qa_cinematic_image_resolve(
     qa_cinematic_image *image, const qa_cinematic_frame *frame,
     int64_t revision,
@@ -249,6 +273,10 @@ qa_renderer_image qa_cinematic_image_resolve(
     void *apply_ctx) {
   if (image->executing) media_error("Cinematic upload cannot reenter");
   image->executing = true;
+  /* TS try/finally: a throwing prepare, apply or completion still clears
+   * the reentry flag. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, executing_clear, image);
   qa_cinematic_image_prepare(image, frame, revision);
   if (image->has_pending) {
     qa_cinematic_image_upload *pending = &image->pending;
@@ -260,6 +288,7 @@ qa_renderer_image qa_cinematic_image_resolve(
     }
     qa_cinematic_image_upload_complete(pending);
   }
+  qa_cleanup_pop(&guard);
   image->executing = false;
   return image->current;
 }

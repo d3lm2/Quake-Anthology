@@ -6,9 +6,13 @@
  * numeric leaves consume &mem->base). TS closures become small structs
  * (fetch sequence, executable guards, write-observer handles). GuestAddress has no
  * addressSpace token in C, so foreign-address-space faults cannot be
- * detected (registers.h precedent). Observer callbacks cannot throw:
- * the TS AggregateError aggregation has no counterpart; a callback
- * that longjmps through the throw channel skips later observers.
+ * detected (registers.h precedent). An observer callback that raises
+ * is collected as TS does: the other observers still run, one error is
+ * rethrown as it was and several become an AggregateError.
+ * Ownership: TS frees a backing buffer when its last mapping and
+ * observer are gone; here backings are reference counted and retired
+ * mappings are freed at once (guards and fetch sequences revalidate by
+ * generation and mapping serial instead of holding the mapping).
  * GPL-2.0-or-later.
  */
 #ifndef QA_GUEST_CORE_MEMORY_H
@@ -27,18 +31,22 @@ typedef struct qa_sparse_backing {
   bool exposed; /* a borrow() view of this buffer exists */
   uint64_t *page_revisions; /* lazily allocated, one per 4096 bytes */
   size_t page_count;
+  size_t refs;           /* mappings and observer chunks that hold this buffer */
+  size_t slot;           /* index in the owner's backing list */
+  size_t snapshot_index; /* scratch for checkpoint */
 } qa_sparse_backing;
 
 typedef struct qa_sparse_mapping {
   uint64_t base;
   size_t byte_length;
   qa_guest_permissions permissions;
-  char *label; /* owned */
+  const char *label; /* interned in the memory: stays valid until the memory is destroyed */
   qa_sparse_backing *backing;
   size_t backing_offset; /* TS bytes.byteOffset */
   uint64_t end;          /* base + byte_length (<= 2^64, may wrap to 0 only at exactly 2^64) */
   bool end_wraps;        /* end == 2^64 */
   bool active;
+  uint64_t serial;       /* unique per memory: identity of the TS mapping object */
 } qa_sparse_mapping;
 
 typedef struct qa_sparse_write_observer qa_sparse_write_observer;
@@ -57,8 +65,13 @@ typedef struct qa_sparse_guest_memory {
   uint64_t allocation_base;
   qa_sparse_mapping **mappings; /* sorted, disjoint */
   size_t mapping_count, mapping_cap;
-  qa_sparse_mapping **retired; /* kept alive for guards/sequences */
-  size_t retired_count, retired_cap;
+  uint64_t next_mapping_serial;
+  /* Mapping labels, one copy per distinct text (open-addressing set). qa_sparse_mappings hands these pointers
+   * out, and its callers keep them past the mapping's own life as TS keeps the label strings. */
+  char **label_slots;
+  size_t label_capacity, label_count;
+  size_t notify_depth;      /* observer deliveries in progress */
+  bool observers_unlinked;  /* a removal was deferred until deliveries finish */
   qa_sparse_backing **backings;
   size_t backing_count, backing_cap;
   qa_sparse_write_observer *observers; /* list head via impl in .c (opaque node) */
@@ -75,9 +88,6 @@ typedef struct qa_sparse_guest_memory {
   qa_sparse_mapping *recent_mappings[4];
   qa_sparse_mapping *working_set[QA_SPARSE_WORKING_SET];
   size_t next_working_mapping;
-  /* TS #maximumMappedBytes / #mappedTotal: bytes mapped at once (aliases included). */
-  uint64_t maximum_mapped_bytes;
-  uint64_t mapped_total;
   /* TS #writeDeliveries: stores that reached at least one observer. */
   uint64_t write_deliveries;
   uint8_t dummy;
@@ -88,8 +98,6 @@ typedef struct qa_sparse_guest_memory_options {
   int pointer_bytes; /* 4 | 8 */
   uint64_t allocation_base;
   bool has_allocation_base; /* false = TS undefined (0x10000) */
-  /* TS maximumMappedBytes; 0 = TS undefined (0x40000000). */
-  uint64_t maximum_mapped_bytes;
 } qa_sparse_guest_memory_options;
 
 void qa_sparse_guest_memory_init(qa_sparse_guest_memory *mem, const qa_sparse_guest_memory_options *options);
@@ -184,7 +192,10 @@ uint8_t qa_guest_fetch_sequence_next(qa_guest_fetch_sequence *seq);
 typedef struct qa_guest_executable_guard {
   bool valid; /* false = TS null */
   qa_sparse_guest_memory *mem;
-  qa_sparse_mapping *mapping;
+  qa_sparse_mapping *mapping; /* valid only while mapping_serial is still mapped */
+  uint64_t address;           /* first guarded guest byte */
+  uint64_t mapping_serial;
+  uint64_t generation;        /* memory generation at the last liveness check */
   size_t mapping_offset;
   uint8_t *expected; /* owned */
   size_t byte_length;

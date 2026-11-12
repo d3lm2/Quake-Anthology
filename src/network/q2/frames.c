@@ -385,7 +385,9 @@ qa_q2_wire_frame *qa_q2_frame_history_read(qa_q2_frame_history *history,
     }
     for (double index = 1; index < total && !oom; index++) {
       int32_t length = qa_q2_msg_read_byte(&wire->message);
-      size_t len = length > 0 ? (size_t)length : 0;
+      /* TS new Uint8Array(length): a truncated length byte reads -1. */
+      if (length < 0) qa_range_error("length cannot be negative");
+      size_t len = (size_t)length;
       uint8_t *area = (uint8_t *)calloc(len > 0 ? len : 1, 1);
       if (area == NULL) { oom = true; break; }
       splits[split_count].area_bits = area; /* owned by the split list from here */

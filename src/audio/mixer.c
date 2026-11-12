@@ -48,6 +48,20 @@ static void *xrealloc(void *ptr, size_t size) {
   return value;
 }
 
+static char *xformat(const char *format, ...) __attribute__((format(printf, 1, 2)));
+static char *xformat(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  va_list sizing;
+  va_copy(sizing, args);
+  int needed = vsnprintf(NULL, 0, format, sizing);
+  va_end(sizing);
+  char *text = xmalloc((size_t)(needed < 0 ? 0 : needed) + 1);
+  vsnprintf(text, (size_t)(needed < 0 ? 0 : needed) + 1, format, args);
+  va_end(args);
+  return text;
+}
+
 /* JS String(number) for the values these messages interpolate:
  * integral values print as plain integers, others shortest-roundtrip. */
 static void fmt_num(char *out, size_t size, double value) {
@@ -120,6 +134,8 @@ static void prepared_release(prepared_sound *prepared) {
     free(prepared);
   }
 }
+/* Throw-time release of a prepared sound not yet stored in a voice or loop. */
+static void prepared_release_cleanup(void *arg) { prepared_release(arg); }
 static double prepared_frames(const prepared_sound *prepared) {
   return prepared->output_frames;
 }
@@ -239,6 +255,11 @@ struct qa_audio_mixer {
   size_t loop_channel_count;
   size_t loop_channel_capacity;
   int32_t raw_samples[RAW_CAPACITY * 2];
+  /* TS paintScratch, and the mix pass's merged-voice marks: owned by the
+     mixer so a raise inside a paint pass leaks nothing. */
+  double paint_scratch[PAINTBUFFER_SIZE * 2];
+  bool *merged_scratch;
+  size_t merged_capacity;
   int64_t painted_time;
   int64_t sound_time;
   int64_t raw_end_time;
@@ -340,41 +361,11 @@ static size_t take_channel(qa_audio_mixer *mixer, bool *had_free) {
   return index;
 }
 
-/* Source MAX_CHANNELS (TS MAXIMUM_VOICES). */
-#define MAXIMUM_VOICES 128
-
-/* TS acquireChannel: a free slot, a new slot below the voice limit, or the
- * oldest ordinary effect (the listener's own sounds only for the listener),
- * stopped as "replaced". False refuses the new sound. */
-static bool acquire_channel(qa_audio_mixer *mixer, double entity,
-                            size_t *out_index, bool *out_reused) {
+/* TS acquireChannel: a free slot when one exists, otherwise a new slot. */
+static void acquire_channel(qa_audio_mixer *mixer, size_t *out_index, bool *out_reused) {
   bool had_free = false;
-  if (mixer->free_count > 0 ||
-      (double)mixer->voice_count <
-          (mixer->capacity > MAXIMUM_VOICES ? (double)mixer->capacity : MAXIMUM_VOICES)) {
-    *out_index = take_channel(mixer, &had_free);
-    *out_reused = had_free;
-    return true;
-  }
-  int64_t victim = -1;
-  double oldest = INFINITY;
-  for (size_t i = 0; i < mixer->voice_count; i++) {
-    const one_shot_voice *voice = &mixer->voices[i];
-    if (!voice->occupied ||
-        (voice->entity == mixer->listener_entity && entity != mixer->listener_entity))
-      continue;
-    if (voice->has_policy && voice->policy.role != ROLE_EFFECT) continue;
-    if ((double)voice->allocated_at < oldest) {
-      oldest = (double)voice->allocated_at;
-      victim = (int64_t)i;
-    }
-  }
-  if (victim < 0) return false;
-  free_channel_reason(mixer, (size_t)victim, QA_AUDIO_VOICE_STOP_REPLACED);
-  mixer->free_count--; /* TS freeChannels.pop() of the slot just freed */
-  *out_index = (size_t)victim;
-  *out_reused = true;
-  return true;
+  *out_index = take_channel(mixer, &had_free);
+  *out_reused = had_free;
 }
 
 static void raw_debug_print(qa_audio_mixer *mixer, const char *text) {
@@ -440,11 +431,11 @@ static void validate_sound(const qa_pcm_sound *sound, bool allow_stereo) {
 
 static prepared_sound *prepare_sound(qa_audio_mixer *mixer,
                                      const qa_pcm_sound *sound) {
-  prepared_sound *prepared = prepared_new(sound);
   double scale = fround_((double)sound->sample_rate / (double)mixer->output_rate);
   double frames = trunc(fround_(fround_((double)sound->frame_count) / scale));
   if (!is_safe_integer(frames) || frames < 0)
     qa_range_error("resampled PCM frame count is outside the supported range");
+  prepared_sound *prepared = prepared_new(sound);
   prepared->step256 = trunc(scale * 256);
   prepared->output_frames = frames;
   return prepared;
@@ -458,9 +449,8 @@ qa_mixer_stereo_volume qa_spatialize_sound_origin(qa_vec3 position,
   double distance = qa_length3(source);
   qa_vec3 direction = qa_normalize3(source);
   double pan = -qa_dot3(direction, listener_axis.vectors[1]);
-  double beyond = distance - SOUND_FULLVOLUME;
-  double distance_beyond = beyond > 0 ? fround_(beyond) : 0;
-  if (distance_beyond < 0) distance_beyond = 0;
+  /* Math.max(0, Math.fround(...)): a NaN distance stays NaN. */
+  double distance_beyond = qa_js_max(0, fround_(distance - SOUND_FULLVOLUME));
   double distance_loss = fround_(distance_beyond * fround_(sound_attenuate));
   double right_scale =
       channels == 1 ? 1 : qa_js_max(0, fround_(0.5 * (1 + pan)));
@@ -472,10 +462,6 @@ qa_mixer_stereo_volume qa_spatialize_sound_origin(qa_vec3 position,
   qa_mixer_stereo_volume result = {left, right};
   return result;
 }
-
-/* Math.max(0, Math.fround(distance - SOUND_FULLVOLUME)) above: the
- * fround runs before the max in TS; folding it into the branch is
- * identical for every double (fround of a negative stays <= 0). */
 
 static bool vec_key_equal(qa_vec3 a, qa_vec3 b) {
   return (a.x == b.x || (isnan(a.x) && isnan(b.x))) &&
@@ -574,8 +560,8 @@ static qa_mixer_stereo_volume policy_spatialize(qa_audio_mixer *mixer,
   if (!voice->has_policy)
     plain_error("Source spatialization requires a voice policy");
   const voice_policy *policy = &voice->policy;
-  double beyond = distance - policy->distance_offset;
-  double gain = voice->volume * (1 - (beyond > 0 ? beyond : 0) * policy->attenuation);
+  double gain = voice->volume *
+                (1 - qa_js_max(0, distance - policy->distance_offset) * policy->attenuation);
   bool mono = mixer->output_channels == 1 ||
               (policy->unattenuated_mono && policy->attenuation == 0);
   qa_mixer_stereo_volume volume;
@@ -672,6 +658,7 @@ void qa_audio_mixer_destroy(qa_audio_mixer *mixer) {
   free(mixer->loop_channels);
   free(mixer->entity_positions);
   free(mixer->transmission_cache);
+  free(mixer->merged_scratch);
   free(mixer);
 }
 
@@ -932,15 +919,22 @@ bool qa_audio_mixer_start_shared_sound(qa_audio_mixer *mixer,
   }
   require_channel_volume(options.volume);
   prepared_sound *prepared = prepare_sound(mixer, sound);
+  /* The diagnostic print, the observers replace_channel notifies and the
+     allocation clock can raise before the voice owns the prepared sound. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, prepared_release_cleanup, prepared);
   if (diagnostic_setting(mixer, "s_show") == 1) {
     if (source_name == NULL || mixer->console_print == NULL)
       plain_error(
           "Sound start diagnostics require a registered name and console "
           "output");
-    char text[1024];
-    snprintf(text, sizeof text, "%lld : %s\n",
-             (long long)mixer->painted_time, source_name);
+    char *text = xformat("%lld : %s\n",
+                                  (long long)mixer->painted_time, source_name);
+    qa_cleanup text_guard;
+    qa_cleanup_push(&text_guard, free, text);
     mixer->console_print(text, mixer->console_ctx);
+    qa_cleanup_pop(&text_guard);
+    free(text);
     if (!mixer->enabled)
       plain_error("Sound playback ended during start diagnostics");
   }
@@ -952,6 +946,7 @@ bool qa_audio_mixer_start_shared_sound(qa_audio_mixer *mixer,
         voice->entity != options.entity || voice->prepared->sound != sound)
       continue;
     if (qa_int32((double)(time - voice->allocated_at)) < 50) {
+      qa_cleanup_pop(&guard);
       prepared_release(prepared);
       return false;
     }
@@ -959,6 +954,7 @@ bool qa_audio_mixer_start_shared_sound(qa_audio_mixer *mixer,
   }
   int64_t allowed = options.entity == mixer->listener_entity ? 8 : 4;
   if (same_count > allowed) {
+    qa_cleanup_pop(&guard);
     prepared_release(prepared);
     return false;
   }
@@ -966,15 +962,15 @@ bool qa_audio_mixer_start_shared_sound(qa_audio_mixer *mixer,
                   QA_AUDIO_VOICE_STOP_REPLACED);
   size_t index = 0;
   bool reused = false;
-  if (!acquire_channel(mixer, options.entity, &index, &reused)) {
-    prepared_release(prepared);
-    return false;
-  }
+  acquire_channel(mixer, &index, &reused);
   int64_t allocated_at = reused ? allocation_time(mixer) : time;
+  /* TS evaluates the id inside the voice literal: a raise stores nothing. */
+  double voice_id = allocate_voice_id(mixer);
+  qa_cleanup_pop(&guard);
   one_shot_voice *voice = &mixer->voices[index];
   memset(voice, 0, sizeof *voice);
   voice->occupied = true;
-  voice->voice_id = allocate_voice_id(mixer);
+  voice->voice_id = voice_id;
   voice->asset = asset;
   voice->notification = NOTIFY_PENDING;
   voice->prepared = prepared;
@@ -1041,17 +1037,21 @@ static bool admit_source_sound(qa_audio_mixer *mixer, const qa_pcm_sound *sound,
       attenuation < 0)
     qa_range_error("Invalid source sound gain or attenuation");
   double ratio = (double)sound->sample_rate / (double)mixer->output_rate;
-  prepared_sound *prepared = prepared_new(sound);
-  prepared->step256 = ratio * 256;
-  prepared->output_frames = trunc((double)sound->frame_count / ratio);
-  if (prepared->output_frames < 1)
-    plain_error("Sound resamples to zero frames");
+  double output_frames = trunc((double)sound->frame_count / ratio);
+  if (output_frames < 1) plain_error("Sound resamples to zero frames");
   bool has_marker = policy.has_loop_start || sound->loop_start != -1;
   double marker = policy.has_loop_start
                       ? policy.loop_start
                       : trunc((double)sound->loop_start / ratio);
-  if (has_marker && (marker < 0 || marker >= prepared->output_frames))
+  if (has_marker && (marker < 0 || marker >= output_frames))
     qa_range_error("Sound loop outside PCM");
+  prepared_sound *prepared = prepared_new(sound);
+  prepared->step256 = ratio * 256;
+  prepared->output_frames = output_frames;
+  /* The random source, the id and clock callbacks, spatialization and the
+     observers replace_channel notifies can raise before a voice owns it. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, prepared_release_cleanup, prepared);
   double offset = 0;
   if (random != NULL) {
     bool same_frame = false;
@@ -1105,6 +1105,7 @@ static bool admit_source_sound(qa_audio_mixer *mixer, const qa_pcm_sound *sound,
   if (scheduled == NULL) voice.stereo = policy_spatialize(mixer, &voice);
   if (scheduled == NULL && policy.role == ROLE_EFFECT &&
       voice.stereo.left == 0 && voice.stereo.right == 0) {
+    qa_cleanup_pop(&guard);
     prepared_release(prepared);
     return false;
   }
@@ -1112,10 +1113,8 @@ static bool admit_source_sound(qa_audio_mixer *mixer, const qa_pcm_sound *sound,
     replace_channel(mixer, entity, command, false, QA_AUDIO_VOICE_STOP_REPLACED);
   size_t index = 0;
   bool reused = false;
-  if (!acquire_channel(mixer, voice.entity, &index, &reused)) {
-    prepared_release(prepared);
-    return false;
-  }
+  acquire_channel(mixer, &index, &reused);
+  qa_cleanup_pop(&guard);
   mixer->voices[index] = voice;
   voice_started(mixer, &mixer->voices[index]);
   return true;
@@ -1346,6 +1345,10 @@ void qa_audio_mixer_update_looping_sound(
   double volume = options.has_volume ? options.volume : 127;
   require_channel_volume(volume);
   prepared_sound *prepared = prepare_sound(mixer, sound);
+  /* The listener position, the s_doppler read and the length check can
+     raise before the loop owns the prepared sound. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, prepared_release_cleanup, prepared);
   if (prepared_frames(prepared) == 0)
     qa_range_error("loop sound has length 0");
   loop_voice *previous = find_loop(mixer, options.entity);
@@ -1387,6 +1390,7 @@ void qa_audio_mixer_update_looping_sound(
   loop.doppler_scale = doppler_scale;
   loop.old_doppler_scale = old_doppler_scale;
   loop.frame_number = options.frame_number;
+  qa_cleanup_pop(&guard);
   set_loop(mixer, loop);
 }
 
@@ -1399,8 +1403,10 @@ void qa_audio_mixer_update_real_looping_sound(
   double volume = options.has_volume ? options.volume : 90;
   require_channel_volume(volume);
   prepared_sound *prepared = prepare_sound(mixer, sound);
-  if (prepared_frames(prepared) == 0)
+  if (prepared_frames(prepared) == 0) {
+    prepared_release(prepared);
     qa_range_error("loop sound has length 0");
+  }
   loop_voice *previous = find_loop(mixer, options.entity);
   loop_voice loop = {0};
   loop.prepared = prepared;
@@ -1435,11 +1441,10 @@ void qa_audio_mixer_stop_looping_sound(qa_audio_mixer *mixer, double entity) {
 
 void qa_audio_mixer_stop_channel(qa_audio_mixer *mixer, double entity,
                                  double channel) {
-  if (!is_integer(channel)) qa_range_error("Invalid source sound channel");
-  replace_channel(
-      mixer, entity,
-      qa_source_sound_channel(QA_SOUND_FAMILY_Q3, (int64_t)channel), false,
-      QA_AUDIO_VOICE_STOP_STOPPED);
+  /* sourceSoundChannel("q3", channel) over the number itself: an integral channel past
+     int64 is an extension name in TS (a C cast of it would be undefined). */
+  replace_channel(mixer, entity, qa_source_sound_channel_number(QA_SOUND_FAMILY_Q3, channel),
+                  false, QA_AUDIO_VOICE_STOP_STOPPED);
 }
 
 void qa_audio_mixer_stop_shared_channel(qa_audio_mixer *mixer, double entity,
@@ -1812,6 +1817,8 @@ static void issue_scheduled_sounds(qa_audio_mixer *mixer) {
   }
   if (due_count == 0) return;
   size_t *due = xmalloc(due_count * sizeof *due);
+  qa_cleanup due_guard;
+  qa_cleanup_push(&due_guard, free, due);
   size_t at = 0;
   for (size_t i = 0; i < mixer->voice_count; i++) {
     const one_shot_voice *voice = &mixer->voices[i];
@@ -1849,11 +1856,15 @@ static void issue_scheduled_sounds(qa_audio_mixer *mixer) {
       voice = &mixer->voices[index];
       if (!voice->occupied || voice->start_kind != START_SCHEDULED) continue;
     }
+    /* TS spatializes a started copy and stores it only afterwards: a raise
+       leaves the voice scheduled. Spatialization never reads the start. */
+    qa_mixer_stereo_volume stereo = policy_spatialize(mixer, voice);
     voice->start_kind = START_STARTED;
     voice->start_sample = mixer->painted_time;
-    voice->stereo = policy_spatialize(mixer, voice);
+    voice->stereo = stereo;
     voice_started(mixer, voice);
   }
+  qa_cleanup_pop(&due_guard);
   free(due);
 }
 
@@ -1895,9 +1906,17 @@ static void mix_internal(qa_audio_mixer *mixer, bool direct,
       }
     }
     size_t paint_length = (size_t)count * 2;
-    double *paint = xcalloc(paint_length, sizeof *paint);
+    double *paint = mixer->paint_scratch;
+    memset(paint, 0, paint_length * sizeof *paint);
     paint_raw(mixer, paint, count);
-    bool *merged = xcalloc(mixer->voice_count, sizeof *merged);
+    if (mixer->merged_capacity < mixer->voice_count) {
+      mixer->merged_capacity = mixer->voice_count;
+      mixer->merged_scratch =
+          xrealloc(mixer->merged_scratch,
+                   mixer->merged_capacity * sizeof *mixer->merged_scratch);
+    }
+    bool *merged = mixer->merged_scratch;
+    memset(merged, 0, mixer->voice_count * sizeof *merged);
     for (size_t i = 0; i < mixer->voice_count; i++) {
       one_shot_voice *voice = &mixer->voices[i];
       if (!voice->occupied || voice->start_kind == START_SCHEDULED ||
@@ -1941,7 +1960,6 @@ static void mix_internal(qa_audio_mixer *mixer, bool direct,
         paint_effect(paint, paint_length, frame, sample, stereo, effects_gain);
       }
     }
-    free(merged);
     for (size_t i = 0; i < mixer->loop_channel_count; i++) {
       const loop_mix *loop = &mixer->loop_channels[i];
       paint_loop(mixer, paint, paint_length, count, loop, effects_gain);
@@ -1959,7 +1977,6 @@ static void mix_internal(qa_audio_mixer *mixer, bool direct,
     qa_write_linear_blast_stereo16_f64(
         paint, paint_length, out + output_offset,
         (size_t)((frames * 2) - output_offset), (int64_t)paint_length);
-    free(paint);
     mixer->painted_time += count;
     for (size_t i = 0; i < mixer->voice_count; i++) {
       one_shot_voice *voice = &mixer->voices[i];

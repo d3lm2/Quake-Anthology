@@ -21,7 +21,7 @@ static qa_bot_move_variable var_of(qa_bot_travel_context *c, qa_bot_movement_var
 static qa_vec3 mover_bottom_center(qa_bot_travel_context *c, qa_travel_reachability reach) {
   qa_bot_travel_model model;
   if (!c->model_info(c->ctx, RFACE(reach) & 0xffff, &model))
-    qa_range_error("Source mover has no shared entity/model binding");
+    qa_raise("Error", 0, 0, "Source mover has no shared entity/model binding");
   qa_vec3 middle = qa_add3(model.bounds.min, model.bounds.max);
   return qa_math_vec3(model.origin.x + 0.5 * middle.x, model.origin.y + 0.5 * middle.y, RSTART(reach).z);
 }
@@ -128,7 +128,7 @@ qa_bot_move_result qa_travel_func_bobbing(qa_bot_travel_context *c, qa_bot_move_
   qa_bot_move_result result; qa_bot_move_result_init(&result);
   BobRange bob = func_bob_start_end(c, reach);
   if (c->on_mover(c->ctx, s, reach)) {
-    if (!bob.has_origin) qa_range_error("BotTravel_FuncBobbing consumes an undefined mover origin");
+    if (!bob.has_origin) qa_raise("Error", 0, 0, "BotTravel_FuncBobbing consumes an undefined mover origin");
     if (qa_length3(qa_sub3(bob.origin, bob.end)) < 24) {
       qa_vec3 direction = qa_normalize3(qa_math_vec3(REND(reach).x - s->src->origin.x, REND(reach).y - s->src->origin.y, 0));
       if (!c->check_barrier_jump(c->ctx, s, direction, 100)) qa_bot_action_move(c->actions, s->src->client, direction, 400);
@@ -163,7 +163,7 @@ qa_bot_move_result qa_travel_func_bobbing(qa_bot_travel_context *c, qa_bot_move_
   qa_vec3 start_direction = (s->src->move_flags & QA_BOT_MF_SWIMMING) ? start_offset : qa_math_vec3(start_offset.x, start_offset.y, 0);
   double start_distance = qa_length3(start_direction);
   qa_vec3 first = qa_normalize3(start_direction);
-  if (!bob.has_origin) qa_range_error("BotTravel_FuncBobbing consumes an undefined mover origin");
+  if (!bob.has_origin) qa_raise("Error", 0, 0, "BotTravel_FuncBobbing consumes an undefined mover origin");
   if (qa_length3(qa_sub3(bob.origin, bob.start)) > 16) {
     distance = start_distance; direction = first;
     c->check_blocked(c->ctx, s, direction, false, &result);
@@ -197,7 +197,7 @@ qa_bot_move_result qa_travel_func_bobbing(qa_bot_travel_context *c, qa_bot_move_
 qa_bot_move_result qa_finish_travel_func_bobbing(qa_bot_travel_context *c, qa_bot_move_state *s, qa_travel_reachability reach) {
   qa_bot_move_result result; qa_bot_move_result_init(&result);
   BobRange bob = func_bob_start_end(c, reach);
-  if (!bob.has_origin) qa_range_error("BotFinishTravel_FuncBobbing consumes an undefined mover origin");
+  if (!bob.has_origin) qa_raise("Error", 0, 0, "BotFinishTravel_FuncBobbing consumes an undefined mover origin");
   qa_vec3 direction = qa_sub3(bob.origin, bob.end);
   if (qa_length3(direction) < 16) {
     qa_vec3 offset = qa_sub3(REND(reach), qa_bot_v3(s->src->origin));
@@ -272,7 +272,8 @@ qa_bot_move_result qa_travel_grapple(qa_bot_travel_context *c, qa_bot_move_state
         return result;
       }
     } else if (hook_state == 0 || (hook_state == 2 && distance > fr((double)s->src->last_grapple_distance - 2))) {
-      if (s->src->grapple_visible_time < fr(c->time(c->ctx)) - 0.4f) {
+      /* TS f(time()) - 0.4: a double subtraction of the double literal. */
+      if (s->src->grapple_visible_time < (double)fr(c->time(c->ctx)) - 0.4) {
         grapple_off(c, s);
         s->src->move_flags &= ~QA_BOT_MF_ACTIVEGRAPPLE;
         s->src->move_flags |= QA_BOT_MF_GRAPPLERESET;

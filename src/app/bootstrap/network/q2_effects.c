@@ -42,7 +42,7 @@ bool qa_app_q2_beam_from_wire(const qa_q2_temp_entity *value, qa_q2w_event *out)
   if (!effect) return false;
   const qa_q2_temp_field *start = find_field(value, QA_Q2_TEMP_FIELD_VECTOR, QA_Q2_TEMP_NAME_POSITION1);
   const qa_q2_temp_field *end = find_field(value, QA_Q2_TEMP_FIELD_VECTOR, QA_Q2_TEMP_NAME_POSITION2);
-  if (!start || !end) qa_range_error("Q2 trail requires both source endpoints");
+  if (!start || !end) qa_raise("Error", 0, 0, "Q2 trail requires both source endpoints");
   memset(out, 0, sizeof *out);
   out->kind = QA_Q2W_EVENT_BEAM;
   out->effect = effect; out->actor = NULL;

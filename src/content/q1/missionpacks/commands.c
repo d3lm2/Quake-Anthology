@@ -27,8 +27,9 @@ bool qa_q1mp_mission_pack_command(qa_q1_services *game, qa_q1_base *base, qa_q1m
   const bool hipnotic = qa_q1mp_streq(pack, "hipnotic"), rogue = qa_q1mp_streq(pack, "rogue");
   const bool classic = qa_q1mp_streq(game->options.edition, "classic");
   if (impulse == 9) {
-    const bool cheats_allowed = options != NULL && options->cheats_allowed != NULL ? options->cheats_allowed(options->ctx) : false;
-    if (multiplayer && (classic || !cheats_allowed)) return true;
+    /* TS asks cheatsAllowed only in a non-classic multiplayer game. */
+    if (multiplayer && (classic || !(options != NULL && options->cheats_allowed != NULL ? options->cheats_allowed(options->ctx) : false)))
+      return true;
     const bool selected_weapons = cheat_arsenal(options, player->actor.id, "weapons");
     if (!selected_weapons) {
       for (size_t i = 0; i < 8; i++) set_count(game, player, qa_q1_weapon_item(QA_Q1_WEAPONS[i]), 1, 1);
@@ -69,12 +70,15 @@ bool qa_q1mp_mission_pack_command(qa_q1_services *game, qa_q1_base *base, qa_q1m
     qa_q1_actor *world = game->world;
     if (world != NULL) {
       qa_q1mp_entity_walk walk = {0};
+      qa_cleanup walk_node; /* a damage callback can raise */
+      qa_cleanup_push(&walk_node, qa_q1mp_entity_walk_cleanup, &walk);
       for (qa_q1_actor *entity; (entity = qa_q1mp_entity_walk_next(game, &walk)) != NULL;) {
         if (entity->monster != NULL && qa_q1_health(game, entity->actor.id) > 0) {
           const qa_actor_id self = world->actor.id;
           (void)qa_q1_damage(game, entity->actor.id, self, &self, qa_q1_health(game, entity->actor.id) + 10, NULL, NULL, NULL, NULL);
         }
       }
+      qa_cleanup_pop(&walk_node);
       qa_q1mp_entity_walk_free(&walk);
     }
     return true;
@@ -87,11 +91,15 @@ bool qa_q1mp_mission_pack_command(qa_q1_services *game, qa_q1_base *base, qa_q1m
       ordinal++;
       if (impulse == 203 && qa_q1_health(game, entity->actor.id) <= 0) continue;
       const qa_vec3 origin = qa_q1_get_body(game, entity).origin;
-      char text[512];
-      if (impulse == 202) (void)snprintf(text, sizeof text, "%d %s\n", ordinal, entity->classname);
-      else (void)snprintf(text, sizeof text, "%d %s '%s %s %s'\n--------------------\n", ordinal, entity->classname,
-                          QA_JS_NUMBER(origin.x), QA_JS_NUMBER(origin.y), QA_JS_NUMBER(origin.z));
+      /* The classname comes from the map: no fixed buffer (TS template literal). */
+      char *text = impulse == 202 ? qa_q1mp_format("%d %s\n", ordinal, entity->classname)
+                                  : qa_q1mp_format("%d %s '%s %s %s'\n--------------------\n", ordinal, entity->classname,
+                                                   QA_JS_NUMBER(origin.x), QA_JS_NUMBER(origin.y), QA_JS_NUMBER(origin.z));
+      qa_cleanup text_node; /* the host callback can raise */
+      qa_cleanup_push(&text_node, free, text);
       developer_message(options, text);
+      qa_cleanup_pop(&text_node);
+      free(text);
     }
     return true;
   }

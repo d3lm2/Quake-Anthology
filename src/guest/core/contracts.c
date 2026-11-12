@@ -39,7 +39,6 @@ const char *qa_guest_memory_fault_reason_name(qa_guest_memory_fault_reason reaso
     case QA_FAULT_UNMAPPED: return "unmapped";
     case QA_FAULT_PERMISSION: return "permission";
     case QA_FAULT_OVERLAP: return "overlap";
-    case QA_FAULT_QUOTA: return "quota";
     default: return "noncontiguous-borrow";
   }
 }
@@ -69,6 +68,16 @@ void qa_guest_throw_init(qa_guest_throw *throw_ctx, jmp_buf *buf) {
   throw_ctx->kind = QA_GUEST_THROW_NONE;
 }
 
+static _Thread_local qa_guest_memory_fault last_raised;
+static _Thread_local bool has_last_raised;
+
+void qa_guest_rethrow_memory(qa_guest_throw *throw_ctx, const char *message) {
+  if (throw_ctx == NULL || throw_ctx->buf == NULL || !has_last_raised || strcmp(last_raised.message, message) != 0) return;
+  throw_ctx->kind = QA_GUEST_THROW_MEMORY;
+  throw_ctx->memory = last_raised;
+  longjmp(*throw_ctx->buf, 1);
+}
+
 _Noreturn void qa_guest_throw_memory(qa_guest_throw *throw_ctx, qa_guest_memory_fault_reason reason,
                                      const qa_guest_module_ref *module, uint64_t address,
                                      size_t byte_length, qa_guest_fault_access access, const char *detail) {
@@ -77,7 +86,18 @@ _Noreturn void qa_guest_throw_memory(qa_guest_throw *throw_ctx, qa_guest_memory_
   (void)snprintf(message, sizeof message, "%s: %s at 0x%llx (%zu bytes): %s",
                  module != NULL && module->id != NULL ? module->id : "",
                  qa_guest_fault_access_name(access), (unsigned long long)address, byte_length, detail);
-  if (throw_ctx == NULL || throw_ctx->buf == NULL) qa_range_error("%s", message);
+  if (throw_ctx == NULL || throw_ctx->buf == NULL) {
+    /* No processor fault target: an ordinary TS throw of the GuestMemoryFault class (error.name), kept in full so
+     * qa_guest_rethrow_memory can hand it back to a processor. */
+    last_raised.reason = reason;
+    last_raised.module = module != NULL ? *module : (qa_guest_module_ref){0};
+    last_raised.address = address;
+    last_raised.byte_length = byte_length;
+    last_raised.access = access;
+    (void)snprintf(last_raised.message, sizeof last_raised.message, "%s", message);
+    has_last_raised = true;
+    qa_raise("GuestMemoryFault", (int)reason, (long long)address, "%s", message);
+  }
   throw_ctx->kind = QA_GUEST_THROW_MEMORY;
   throw_ctx->memory.reason = reason;
   throw_ctx->memory.module = module != NULL ? *module : (qa_guest_module_ref){0};

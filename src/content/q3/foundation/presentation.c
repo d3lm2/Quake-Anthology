@@ -12,7 +12,7 @@
 #include "qa/render/scene/models/transform.h"
 #include "qa/foundation/js.h"
 
-static const qa_vec3 ZERO={0,0,0}, UNIT={1,1,1};
+static const qa_vec3 UNIT={1,1,1};
 static void *xrealloc(void*p,size_t n){ void*q=realloc(p,n?n:1); if(!q) qa_range_error("out of memory"); return q; }
 void qa_q3_character_presenter_init(qa_q3_character_presenter *p, const qa_q3_character_assets *assets){
   *p=(qa_q3_character_presenter){0}; p->pose=qa_q3_create_player_pose_state(); p->assets=assets;
@@ -84,7 +84,7 @@ const qa_q3_character_pass *qa_q3_character_presenter_frame(qa_q3_character_pres
     e.has_opacity=true; e.opacity=view.has_opacity?view.opacity:1;
     e.actor=&p->actor_storage; e.resource=asset->resource;
     e.model.kind=QA_DECODED_MODEL_Q3_MESH; e.model.as.q3_mesh=&asset->scene.model;
-    qa_vec3 origin=idx==0?view.origin:ZERO;
+    qa_vec3 origin=idx==0?view.origin:qa_zero_vec3;
     double sc=view.has_scale?view.scale:1;
     e.transform.origin=origin; e.transform.axis=axes3[idx];
     e.transform.scale=idx==0?(qa_vec3){sc,sc,sc}:UNIT;
@@ -110,7 +110,7 @@ const qa_q3_character_pass *qa_q3_character_presenter_frame(qa_q3_character_pres
   else {
     wanted[wanted_count++]=NULL;
     if(pw&(1<<QA_Q3_PW_QUAD)) wanted[wanted_count++]=view.team&&strcmp(view.team,"red")==0?"powerups/blueflag":"powerups/quad";
-    if((pw&(1<<QA_Q3_PW_REGEN))&&qa_js_to_int32(trunc(options.time_milliseconds/100))%10==1) wanted[wanted_count++]="powerups/regen";
+    if((pw&(1<<QA_Q3_PW_REGEN))&&fmod(trunc(options.time_milliseconds/100),10)==1) wanted[wanted_count++]="powerups/regen";
     if(pw&(1<<QA_Q3_PW_BATTLESUIT)) wanted[wanted_count++]="powerups/battleSuit";
   }
   for(size_t i=0;i<wanted_count;i++){

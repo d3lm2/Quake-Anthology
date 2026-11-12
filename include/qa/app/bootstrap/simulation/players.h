@@ -56,10 +56,11 @@ typedef struct qa_app_sim_player_movement_host {
   void *ctx;
   /* Optional (NULL = TS undefined). */
   qa_mod_client_movement_outputs (*client_outputs)(void *ctx);
-  bool input_applications_active;
+  /* TS `host.inputApplications?.active === true`, read on each use (NULL = no owner). */
+  bool (*input_applications_active)(void *ctx);
   bool (*input_begin)(void *ctx, qa_app_sim_movement_player *player, const char *scope, qa_user_command command,
       qa_frame_context frame, qa_movement_state state, const qa_arsenal_intent *arsenal,
-      qa_user_command *out_command, const qa_arsenal_intent **out_arsenal);
+      qa_user_command *out_command, const qa_arsenal_intent **out_arsenal, bool *out_has_application);
   void (*input_finish)(void *ctx, bool failed);
   bool has_source_client;
   qa_movement_state (*project_state)(void *ctx, qa_movement_state state);
@@ -137,7 +138,15 @@ struct qa_app_sim_movement_player {
   /* private (C-visible) */
   qa_app_sim_player_movement_host host;
   bool netquake_application_open, netquake_slice_open;
+  /* TS sliceApplications: one entry per open movement slice, true when its begin pushed an application on the host
+   * (an inactive owner pushes none; TS pushes null and finish(null) does nothing). */
+  bool *slice_pushed; size_t slice_depth, slice_capacity;
+  qa_actor_id restored_jump_pad; /* storage behind a restored Q3 state's jumpPad */
+  /* Storage behind the client movement outputs fixedEnvironment hands the movement code (TS builds a new object). */
+  qa_bounds client_body_bounds; qa_mod_client_movement_outputs client_outputs_storage;
   bool has_netquake_slice_command; qa_q1_user_command netquake_slice_command;
+  /* TS netQuakeApplication?.command: the open client-command application's command (begin returned one). */
+  bool has_netquake_application_command; qa_user_command netquake_application_command;
   qa_q3_movement_provider_options q3_provider_options;
   qa_app_sim_q3_weapon_wrap q3_weapon_wrap;
   /* The contact and effect arrays of the last movement result this player

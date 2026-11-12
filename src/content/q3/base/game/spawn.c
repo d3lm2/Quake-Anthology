@@ -57,7 +57,7 @@ void qa_q3_spawn_parser_init(qa_q3_spawn_parser *p, const char *text, const char
 }
 static int token_ws(int code) { return code <= 32 || code >= 128; }
 static void advance(qa_q3_spawn_parser *p) { if (p->text[p->offset] == '\n') { p->line++; p->column = 1; } else p->column++; p->offset++; }
-typedef struct { char value[QA_TOKEN_MAX]; int present; } token_t;
+typedef struct { char value[QA_TOKEN_MAX]; int present; size_t line, column; } token_t;
 static token_t next_token(qa_q3_spawn_parser *p) {
   size_t len = strlen(p->text);
   while (1) {
@@ -69,29 +69,41 @@ static token_t next_token(qa_q3_spawn_parser *p) {
       if (p->offset < len) { advance(p); if (p->offset < len) advance(p); }
     } else break;
   }
-  token_t t; t.present = 0; t.value[0] = 0; if (p->offset == len) return t;
+  token_t t; t.present = 0; t.value[0] = 0; t.line = p->line; t.column = p->column; if (p->offset == len) return t;
   int quoted = p->text[p->offset] == '"'; size_t n = 0; if (quoted) advance(p);
   while (p->offset < len) {
     char ch = p->text[p->offset];
     if (quoted ? ch == '"' : token_ws((unsigned char)ch)) break;
-    t.value[n++] = ch; advance(p); if (n >= QA_TOKEN_MAX) qa_range_error("Spawn token exceeds MAX_TOKEN_CHARS");
+    t.value[n++] = ch; advance(p);
+    /* TS #error(message, token): a TextParseError at the token's own position. */
+    if (n >= QA_TOKEN_MAX) qa_text_parse_error(p->name, (int64_t)t.line, (int64_t)t.column, "Spawn token exceeds MAX_TOKEN_CHARS");
   }
   if (quoted && p->offset < len) advance(p);
   t.value[n] = 0; t.present = 1; return t;
 }
+/* Pairs collected so far, released when a parse error unwinds (TS: garbage collected). */
+typedef struct pending_pairs { qa_q3_spawn_pair entries[QA_Q3_MAX_SPAWN_VARS]; size_t count; } pending_pairs;
+static void free_pending_pairs(void *arg) {
+  pending_pairs *pending = arg;
+  for (size_t i = 0; i < pending->count; i++) { free(pending->entries[i].key); free(pending->entries[i].value); }
+  pending->count = 0;
+}
 bool qa_q3_spawn_parser_next(qa_q3_spawn_parser *p, qa_q3_spawn_variables *out) {
   token_t opening = next_token(p); if (!opening.present) return false;
-  if (opening.value[0] != '{') qa_range_error("G_ParseSpawnVars: found %s when expecting {", opening.value);
-  qa_q3_spawn_pair entries[QA_Q3_MAX_SPAWN_VARS]; size_t count = 0, chars = 0;
+  if (opening.value[0] != '{') qa_text_parse_error(p->name, (int64_t)opening.line, (int64_t)opening.column, "G_ParseSpawnVars: found %s when expecting {", opening.value);
+  pending_pairs pending; pending.count = 0; size_t chars = 0;
+  qa_cleanup node; qa_cleanup_push(&node, free_pending_pairs, &pending);
   while (1) {
-    token_t key = next_token(p); if (!key.present) qa_range_error("G_ParseSpawnVars: EOF without closing brace");
-    if (key.value[0] == '}') { qa_q3_spawn_variables_init(out, entries, count); for (size_t i = 0; i < count; i++) { free(entries[i].key); free(entries[i].value); } return true; }
-    token_t value = next_token(p); if (!value.present) qa_range_error("G_ParseSpawnVars: EOF without closing brace");
-    if (value.value[0] == '}') qa_range_error("G_ParseSpawnVars: closing brace without data");
-    if (count == QA_Q3_MAX_SPAWN_VARS) qa_range_error("G_ParseSpawnVars: MAX_SPAWN_VARS");
+    token_t key = next_token(p); if (!key.present) qa_text_parse_error(p->name, (int64_t)p->line, (int64_t)p->column, "G_ParseSpawnVars: EOF without closing brace");
+    if (key.value[0] == '}') { qa_q3_spawn_variables_init(out, pending.entries, pending.count); qa_cleanup_pop(&node); free_pending_pairs(&pending); return true; }
+    token_t value = next_token(p); if (!value.present) qa_text_parse_error(p->name, (int64_t)p->line, (int64_t)p->column, "G_ParseSpawnVars: EOF without closing brace");
+    if (value.value[0] == '}') qa_text_parse_error(p->name, (int64_t)value.line, (int64_t)value.column, "G_ParseSpawnVars: closing brace without data");
+    if (pending.count == QA_Q3_MAX_SPAWN_VARS) qa_text_parse_error(p->name, (int64_t)key.line, (int64_t)key.column, "G_ParseSpawnVars: MAX_SPAWN_VARS");
     chars += strlen(key.value) + strlen(value.value) + 2;
-    if (chars > QA_Q3_MAX_SPAWN_VARS_CHARS) qa_range_error("G_AddSpawnVarToken: MAX_SPAWN_CHARS");
-    entries[count].key = dupstr(key.value); entries[count].value = dupstr(value.value); count++;
+    if (chars > QA_Q3_MAX_SPAWN_VARS_CHARS) qa_text_parse_error(p->name, (int64_t)value.line, (int64_t)value.column, "G_AddSpawnVarToken: MAX_SPAWN_CHARS");
+    char *owned_key = dupstr(key.value), *owned_value = dupstr(value.value);
+    if (!owned_key || !owned_value) { free(owned_key); free(owned_value); qa_range_error("out of memory"); }
+    pending.entries[pending.count].key = owned_key; pending.entries[pending.count].value = owned_value; pending.count++;
   }
 }
 bool qa_q3_parse_spawn_field(const char *key, const char *value, qa_q3_game_entity *e, qa_q3_game_memory *memory) {
@@ -137,9 +149,19 @@ static int excluded(const qa_q3_spawn_variables *vars, qa_q3_spawn_context *ctx,
   }
   return 0;
 }
+typedef struct spawn_fields { const qa_q3_spawn_variables *vars; qa_q3_game_entity *entity; qa_q3_game_memory *memory; } spawn_fields;
+static void parse_spawn_fields(void *arg) {
+  spawn_fields *f = arg;
+  for (size_t i = 0; i < f->vars->count; i++) qa_q3_parse_spawn_field(f->vars->entries[i].key, f->vars->entries[i].value, f->entity, f->memory);
+}
 qa_q3_spawn_outcome qa_q3_spawn_entity(const qa_q3_spawn_variables *vars, qa_q3_spawn_context *ctx) {
   qa_q3_game_entity *e = qa_q3_entity_pool_spawn(ctx->pool); double slot = e->slot; qa_q3_spawn_outcome o; memset(&o, 0, sizeof o); o.slot = slot;
-  for (size_t i = 0; i < vars->count; i++) qa_q3_parse_spawn_field(vars->entries[i].key, vars->entries[i].value, e, ctx->memory);
+  /* TS try/catch: a field error other than CommonError frees the new entity before it propagates. */
+  spawn_fields fields = {vars, e, ctx->memory}; qa_caught_error caught;
+  if (!qa_try(parse_spawn_fields, &fields, &caught)) {
+    if (strcmp(caught.name, "CommonError") != 0) qa_q3_entity_pool_free(ctx->pool, e);
+    qa_rethrow(&caught);
+  }
   qa_q3_spawn_filter reason;
   if (excluded(vars, ctx, &reason)) { qa_q3_entity_pool_free(ctx->pool, e); o.kind = QA_Q3_SPAWN_FILTERED; o.reason = reason; return o; }
   e->s.pos.base = e->s.origin; qa_q3_base_entity_shared_set_current_origin(&e->r, e->s.origin);
@@ -154,13 +176,14 @@ qa_q3_spawn_outcome qa_q3_spawn_entity(const qa_q3_spawn_variables *vars, qa_q3_
     for (size_t i = 0; i < ctx->handler_count; i++) if (strcmp(ctx->handlers[i].classname, classname) == 0) {
       ctx->handlers[i].fn(ctx->handlers[i].ctx, e, vars); o.kind = QA_Q3_SPAWN_DISPATCHED; o.route = QA_Q3_ROUTE_HANDLER; o.entity = e; return o;
     }
-    char buf[1024]; snprintf(buf, sizeof buf, "%s doesn't have a spawn function\n", classname); ctx->warn(ctx->ctx, buf);
+    size_t need = strlen(classname) + sizeof " doesn't have a spawn function\n"; char *text = malloc(need); if (!text) qa_range_error("out of memory");
+    snprintf(text, need, "%s doesn't have a spawn function\n", classname); ctx->warn(ctx->ctx, text); free(text);
   }
   qa_q3_entity_pool_free(ctx->pool, e); o.kind = QA_Q3_SPAWN_UNKNOWN; return o;
 }
 void qa_q3_spawn_world(const qa_q3_spawn_variables *vars, qa_q3_worldspawn_context *ctx) {
   if (!lower_equal(qa_q3_spawn_variables_string(vars, "classname", "").value, "worldspawn"))
-    qa_range_error("SP_worldspawn: The first entity isn't 'worldspawn'");
+    qa_raise("Error", 0, 0, "SP_worldspawn: The first entity isn't 'worldspawn'");
   ctx->set_configstring(ctx->ctx, 20, "baseq3-1");
   char buf[64]; snprintf(buf, sizeof buf, "%lld", (long long)qa_js_to_int32(ctx->start_time)); ctx->set_configstring(ctx->ctx, 21, buf);
   ctx->set_configstring(ctx->ctx, 2, qa_q3_spawn_variables_string(vars, "music", "").value);
@@ -178,10 +201,10 @@ void qa_q3_spawn_world(const qa_q3_spawn_variables *vars, qa_q3_worldspawn_conte
 void qa_q3_spawn_outcome_destroy(qa_q3_spawn_outcome *outcome) { free(outcome->classname); outcome->classname = NULL; }
 void qa_q3_spawn_report_destroy(qa_q3_spawn_report *r) { qa_q3_spawn_variables_destroy(&r->world_variables); for (size_t i = 0; i < r->outcome_count; i++) qa_q3_spawn_outcome_destroy(&r->outcomes[i]); free(r->outcomes); r->outcomes = NULL; r->outcome_count = 0; }
 qa_q3_spawn_report qa_q3_spawn_entities(const char *text, qa_q3_spawn_map_context *ctx, const char *source) {
-  if (ctx->spawn.pool != ctx->world.pool) qa_range_error("Worldspawn and entity dispatch must share an entity pool");
+  if (ctx->spawn.pool != ctx->world.pool) qa_raise("Error", 0, 0, "Worldspawn and entity dispatch must share an entity pool");
   qa_q3_spawn_parser parser; qa_q3_spawn_parser_init(&parser, text, source ? source : "<spawn entities>");
   qa_q3_spawn_report report; memset(&report, 0, sizeof report);
-  if (!qa_q3_spawn_parser_next(&parser, &report.world_variables)) qa_range_error("SpawnEntities: no entities");
+  if (!qa_q3_spawn_parser_next(&parser, &report.world_variables)) qa_raise("Error", 0, 0, "SpawnEntities: no entities");
   qa_q3_spawn_world(&report.world_variables, &ctx->world);
   size_t cap = 0;
   while (1) {

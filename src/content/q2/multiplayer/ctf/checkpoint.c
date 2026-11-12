@@ -90,8 +90,7 @@ void qa_restore_q2_ctf(qa_q2_ctf_context *context, qa_q2_game_services *g, const
     players[i].hook = qa_restore_ctf_grapple(entry->state.grapple, g);
   }
   qa_q2_ctf_context_clear(context);
-  /* TS also clears equipment.states; the landed equipment has no map
-   * clear, so restored hooks below overwrite per-player state. */
+  if (equipment != NULL) qa_q2_ctf_grapple_clear_states(equipment); /* TS equipment?.states.clear() */
   for (size_t i = 0; i < checkpoint->player_count; i++) {
     qa_q2_ctf_context_set(context, players[i].actor, players[i].state);
     if (equipment != NULL) *qa_q2_ctf_grapple_state(equipment, players[i].actor) = players[i].hook;
@@ -199,19 +198,8 @@ uint8_t *qa_encode_q2_ctf_checkpoint(const qa_q2_ctf_checkpoint *checkpoint, siz
   set_str(match, "phase", mc->phase);
   set_num(match, "matchTime", mc->match_time);
   set_num(match, "lastTime", mc->last_time);
-  if (mc->has_election) {
-    qa_save_value *election = qa_q2mp_xalloc(qa_save_value_object());
-    set_str(election, "kind", mc->election.kind);
-    set_field(election, "target", saved_actor_value(mc->election.target));
-    set_str(election, "map", mc->election.map);
-    set_str(election, "message", mc->election.message);
-    set_num(election, "votes", mc->election.votes);
-    set_num(election, "needed", mc->election.needed);
-    set_num(election, "expires", mc->election.expires);
-    set_field(match, "election", election);
-  } else {
-    set_null(match, "election");
-  }
+  /* Keys in the order captureQ2Ctf builds them (`{ ...match, ghosts, election }`, and for a player
+   * `{ ...state, ...captureCtfGrapple() }`): the encoding is JSON text and keeps key order. */
   qa_save_value *ghosts = qa_q2mp_xalloc(qa_save_value_array());
   for (size_t i = 0; i < mc->ghost_count; i++) {
     const qa_q2_ctf_ghost_checkpoint *gc = &mc->ghosts[i];
@@ -230,6 +218,19 @@ uint8_t *qa_encode_q2_ctf_checkpoint(const qa_q2_ctf_checkpoint *checkpoint, siz
     if (!qa_save_value_push(ghosts, ghost)) qa_raise("Error", 0, 0, "Out of memory");
   }
   set_field(match, "ghosts", ghosts);
+  if (mc->has_election) {
+    qa_save_value *election = qa_q2mp_xalloc(qa_save_value_object());
+    set_str(election, "kind", mc->election.kind);
+    set_field(election, "target", saved_actor_value(mc->election.target));
+    set_str(election, "map", mc->election.map);
+    set_str(election, "message", mc->election.message);
+    set_num(election, "votes", mc->election.votes);
+    set_num(election, "needed", mc->election.needed);
+    set_num(election, "expires", mc->election.expires);
+    set_field(match, "election", election);
+  } else {
+    set_null(match, "election");
+  }
   set_field(root, "match", match);
   qa_save_value *players = qa_q2mp_xalloc(qa_save_value_array());
   for (size_t i = 0; i < checkpoint->player_count; i++) {
@@ -248,16 +249,16 @@ uint8_t *qa_encode_q2_ctf_checkpoint(const qa_q2_ctf_checkpoint *checkpoint, siz
     set_bool(state, "admin", s->admin);
     set_bool(state, "idView", s->id_view);
     set_nullable_num(state, "ghostCode", s->has_ghost_code, s->ghost_code);
+    set_num(state, "regenTime", s->regen_time);
+    set_num(state, "techSoundTime", s->tech_sound_time);
+    set_num(state, "lastTechMessage", s->last_tech_message);
+    set_nullable_num(state, "matchRespawnAt", s->has_match_respawn_at, s->match_respawn_at);
     if (gr->has_grapple) set_field(state, "grapple", saved_actor_value(gr->grapple));
     else set_null(state, "grapple");
     set_str(state, "grappleState", gr->grapple_state);
     set_num(state, "grappleReleaseTime", gr->grapple_release_time);
     if (gr->has_no_knockback) set_bool(state, "grappleNoKnockback", gr->grapple_no_knockback);
     else set_null(state, "grappleNoKnockback");
-    set_num(state, "regenTime", s->regen_time);
-    set_num(state, "techSoundTime", s->tech_sound_time);
-    set_num(state, "lastTechMessage", s->last_tech_message);
-    set_nullable_num(state, "matchRespawnAt", s->has_match_respawn_at, s->match_respawn_at);
     qa_save_value *player = qa_q2mp_xalloc(qa_save_value_object());
     set_field(player, "actor", saved_actor_value(entry->actor));
     set_field(player, "state", state);
@@ -383,10 +384,16 @@ static void read_player(const qa_save_reader *reader, qa_q2_ctf_player_checkpoin
   out->state.has_match_respawn_at = read_nullable_finite(reader, "matchRespawnAt", &out->state.match_respawn_at);
 }
 
+static void free_decoded(void *arg) { qa_save_value_free(arg); }
+static void destroy_checkpoint(void *arg) { qa_q2_ctf_checkpoint_destroy(arg); }
 void qa_decode_q2_ctf_checkpoint(const uint8_t *bytes, size_t length, qa_q2_ctf_checkpoint *out) {
   memset(out, 0, sizeof *out);
   qa_save_value *decoded = qa_decode_checkpoint_value(bytes, length);
   qa_q2mp_xalloc(decoded);
+  /* A malformed checkpoint raises from a reader below: the decoded tree and what was copied out so far go with it. */
+  qa_cleanup decoded_cleanup, out_cleanup;
+  qa_cleanup_push(&decoded_cleanup, free_decoded, decoded);
+  qa_cleanup_push(&out_cleanup, destroy_checkpoint, out);
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, decoded, "q2-ctf")) qa_raise("Error", 0, 0, "Out of memory");
   qa_save_reader field;
@@ -439,7 +446,7 @@ void qa_decode_q2_ctf_checkpoint(const uint8_t *bytes, size_t length, qa_q2_ctf_
   qa_save_reader_destroy(&field);
   if (!qa_save_reader_field(&match, "ghosts", &field)) qa_raise("Error", 0, 0, "Out of memory");
   mc->ghost_count = qa_save_reader_list_count(&field);
-  mc->ghosts = qa_q2mp_xalloc(malloc((mc->ghost_count == 0 ? 1 : mc->ghost_count) * sizeof *mc->ghosts));
+  mc->ghosts = qa_q2mp_xalloc(calloc(mc->ghost_count == 0 ? 1 : mc->ghost_count, sizeof *mc->ghosts));
   for (size_t i = 0; i < mc->ghost_count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(&field, i, &item)) qa_raise("Error", 0, 0, "Out of memory");
@@ -477,6 +484,8 @@ void qa_decode_q2_ctf_checkpoint(const uint8_t *bytes, size_t length, qa_q2_ctf_
   }
   qa_save_reader_destroy(&field);
   qa_save_reader_destroy(&reader);
+  qa_cleanup_pop(&out_cleanup);
+  qa_cleanup_pop(&decoded_cleanup);
   /* Reader results point at static choice strings; names were copied. */
   qa_save_value_free(decoded);
 }

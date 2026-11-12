@@ -148,14 +148,25 @@ void qa_app_sim_bot_arsenal_restore_checkpoint(qa_app_sim_bot_arsenal *a, const 
 }
 
 /* ---- transport checkpoint codec ---- */
+/* UTF-16 units of UTF-8 text (a four-byte sequence is two). */
+static size_t utf16_units(const char *text, size_t length) {
+  size_t units = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char byte = (unsigned char)text[i];
+    if ((byte & 0xC0) == 0x80) continue;
+    units += byte >= 0xF0 ? 2 : 1;
+  }
+  return units;
+}
 static void decode_transport_reader(const qa_save_reader *reader, qa_app_sim_bot_transport_checkpoint *out) {
   memset(out, 0, sizeof *out);
   qa_save_reader f, list, entry, client, actor, reliable, slots, item;
   rfield(reader, "version", &f); qa_save_reader_literal_number(&f, 1); qa_save_reader_destroy(&f);
   rfield(reader, "elapsedMilliseconds", &f); out->elapsed_milliseconds = qa_save_reader_finite(&f); qa_save_reader_destroy(&f);
   rfield(reader, "connections", &list);
-  out->connection_count = qa_save_reader_list_count(&list);
-  out->connections = xcalloc(out->connection_count, sizeof *out->connections);
+  size_t connection_count = qa_save_reader_list_count(&list);
+  out->connections = xcalloc(connection_count, sizeof *out->connections);
+  out->connection_count = connection_count; /* counted once the list exists, so a partial image frees cleanly */
   for (size_t i = 0; i < out->connection_count; i++) {
     qa_app_sim_bot_transport_connection *c = &out->connections[i];
     ritem(&list, i, &entry);
@@ -175,22 +186,28 @@ static void decode_transport_reader(const qa_save_reader *reader, qa_app_sim_bot
     c->slot_count = slot_count;
     for (size_t s = 0; s < slot_count; s++) {
       ritem(&slots, s, &item);
-      const char *text = qa_save_reader_string(&item);
-      if (s < QA_Q3_MAX_RELIABLE_COMMANDS) c->slots[s] = xstrdup(text);
+      size_t length = 0;
+      const char *text = qa_save_reader_string_length(&item, &length);
+      if (s < QA_Q3_MAX_RELIABLE_COMMANDS) {
+        c->slots[s] = xstrdup(text);
+        c->slot_invalid[s] = length != strlen(text) || utf16_units(text, length) > 1023;
+      }
       qa_save_reader_destroy(&item);
     }
     qa_save_reader_destroy(&slots); qa_save_reader_destroy(&reliable); qa_save_reader_destroy(&entry);
   }
   qa_save_reader_destroy(&list);
   rfield(reader, "snapshots", &list);
-  out->snapshot_count = qa_save_reader_list_count(&list);
-  out->snapshots = xcalloc(out->snapshot_count, sizeof *out->snapshots);
+  size_t snapshot_count = qa_save_reader_list_count(&list);
+  out->snapshots = xcalloc(snapshot_count, sizeof *out->snapshots);
+  out->snapshot_count = snapshot_count;
   for (size_t i = 0; i < out->snapshot_count; i++) {
     ritem(&list, i, &entry);
     rfield(&entry, "client", &f); out->snapshots[i].client = qa_save_reader_integer_min(&f, 0); qa_save_reader_destroy(&f);
     rfield(&entry, "entities", &slots);
-    out->snapshots[i].entity_count = qa_save_reader_list_count(&slots);
-    out->snapshots[i].entities = xcalloc(out->snapshots[i].entity_count, sizeof *out->snapshots[i].entities);
+    size_t entity_count = qa_save_reader_list_count(&slots);
+    out->snapshots[i].entities = xcalloc(entity_count, sizeof *out->snapshots[i].entities);
+    out->snapshots[i].entity_count = entity_count;
     for (size_t e = 0; e < out->snapshots[i].entity_count; e++) {
       ritem(&slots, e, &item); out->snapshots[i].entities[e] = qa_save_reader_integer_min(&item, 0); qa_save_reader_destroy(&item);
     }
@@ -198,10 +215,15 @@ static void decode_transport_reader(const qa_save_reader *reader, qa_app_sim_bot
   }
   qa_save_reader_destroy(&list);
 }
+static void transport_partial_free(void *arg) { qa_app_sim_bot_transport_checkpoint_free(arg); }
 void qa_app_sim_decode_bot_transport(const qa_save_value *value, qa_app_sim_bot_transport_checkpoint *out) {
+  memset(out, 0, sizeof *out);
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, "application.bots.transport")) qa_range_error("Out of memory");
+  qa_cleanup cleanup; /* a failed read releases what it decoded */
+  qa_cleanup_push(&cleanup, transport_partial_free, out);
   decode_transport_reader(&reader, out);
+  qa_cleanup_pop(&cleanup);
   qa_save_reader_destroy(&reader);
 }
 void qa_app_sim_bot_transport_checkpoint_free(qa_app_sim_bot_transport_checkpoint *image) {
@@ -211,17 +233,21 @@ void qa_app_sim_bot_transport_checkpoint_free(qa_app_sim_bot_transport_checkpoin
   free(image->connections); free(image->snapshots);
   memset(image, 0, sizeof *image);
 }
+static void decoded_partial_free(void *arg) { qa_app_sim_decoded_bots_checkpoint_free(arg); }
 void qa_app_sim_decode_application_bots_checkpoint(const qa_save_value *value, qa_app_sim_decoded_bots_checkpoint *out) {
   memset(out, 0, sizeof *out);
   qa_save_reader reader, f, list, entry, actor;
   if (!qa_save_reader_init(&reader, value, "application.bots")) qa_range_error("Out of memory");
+  qa_cleanup cleanup; /* a failed read releases what it decoded */
+  qa_cleanup_push(&cleanup, decoded_partial_free, out);
   rfield(&reader, "version", &f); qa_save_reader_literal_number(&f, 1); qa_save_reader_destroy(&f);
   rfield(&reader, "transport", &f); qa_app_sim_decode_bot_transport(f.value, &out->transport); qa_save_reader_destroy(&f);
   out->director = qa_save_value_get(value, "director"); out->navigation = qa_save_value_get(value, "navigation");
   out->knowledge = qa_save_value_get(value, "knowledge"); out->shared_world = qa_save_value_get(value, "sharedWorld");
   rfield(&reader, "observations", &list);
-  out->observation_count = qa_save_reader_list_count(&list);
-  out->observations = xcalloc(out->observation_count, sizeof *out->observations);
+  size_t observation_count = qa_save_reader_list_count(&list);
+  out->observations = xcalloc(observation_count, sizeof *out->observations);
+  out->observation_count = observation_count;
   for (size_t i = 0; i < out->observation_count; i++) {
     ritem(&list, i, &entry);
     rfield(&entry, "number", &f); out->observations[i].number = qa_save_reader_integer_min(&f, 0); qa_save_reader_destroy(&f);
@@ -230,6 +256,7 @@ void qa_app_sim_decode_application_bots_checkpoint(const qa_save_value *value, q
     rfield(&actor, "generation", &f); out->observations[i].actor.generation = qa_save_reader_integer_min(&f, 0); qa_save_reader_destroy(&f);
     qa_save_reader_destroy(&actor); qa_save_reader_destroy(&entry);
   }
+  qa_cleanup_pop(&cleanup);
   qa_save_reader_destroy(&list); qa_save_reader_destroy(&reader);
 }
 void qa_app_sim_decoded_bots_checkpoint_free(qa_app_sim_decoded_bots_checkpoint *image) {
@@ -257,7 +284,7 @@ qa_q3_server_reliable_commands *qa_app_sim_restored_bot_reliable_commands(const 
   if (!qa_q3_server_reliable_commands_init(&ring)) return NULL;
   for (size_t index = 0; index < QA_Q3_MAX_RELIABLE_COMMANDS; index++) {
     const char *text = image->slots[index];
-    if (strlen(text) > 1023) { qa_q3_reliable_ring_destroy(ring); fail("Invalid saved bot reliable command text"); }
+    if (image->slot_invalid[index]) { qa_q3_reliable_ring_destroy(ring); fail("Invalid saved bot reliable command text"); }
     qa_q3_reliable_ring_replace(ring, (int64_t)index, text);
   }
   qa_q3_reliable_ring_set_sequences(ring, (int64_t)image->sequence, (int64_t)image->acknowledge);
@@ -505,7 +532,12 @@ typedef struct bot_connection {
 } bot_connection;
 typedef struct bot_snapshot { int64_t client; int64_t *entities; size_t count; } bot_snapshot;
 typedef enum restart_kind { RESTART_ACTIVE, RESTART_DETACHED, RESTART_BOUND } restart_kind;
-typedef struct phase_client { qa_session_client *client; qa_q3_server_reliable_commands *reliable; char *userinfo; } phase_client;
+/* TS keeps a phase client's SessionClient object and asks it isClosed() after
+ * app_disconnect closes it; qa_engine_session_close_client frees the object.
+ * A phase client keeps the client's identity and resolves the live object
+ * through the session (phase_client_live): one the session no longer holds is
+ * closed. */
+typedef struct phase_client { qa_client_id id; qa_q3_server_reliable_commands *reliable; char *userinfo; } phase_client;
 struct qa_app_sim_application_bots {
   qa_app_sim_bots_options options;
   qa_source_bot_director *director;
@@ -872,6 +904,13 @@ static const qa_actor_command *app_frame(void *ctx, double time_milliseconds, do
   qa_bot_frame frame = {source_time, elapsed_milliseconds};
   return qa_shared_bot_population_frame(&b->population, frame, out_count);
 }
+/* The live, open session client of a phase client, or NULL once it is closed. */
+static qa_session_client *phase_client_live(app_bots *b, const phase_client *phase) {
+  qa_session_client *client = qa_engine_session_client_at(b->options.session, phase->id.slot);
+  if (client == NULL || !qa_same_client(qa_session_client_id(client), phase->id) || qa_session_client_is_closed(client))
+    return NULL;
+  return client;
+}
 static const qa_app_sim_bot_client *app_clients(void *ctx, size_t *out_count) {
   app_bots *b = ctx;
   size_t n = 0;
@@ -879,8 +918,9 @@ static const qa_app_sim_bot_client *app_clients(void *ctx, size_t *out_count) {
     b->client_views = xrealloc(b->client_views, b->phase_client_count, sizeof *b->client_views);
     b->client_view_capacity = b->phase_client_count;
     for (size_t i = 0; i < b->phase_client_count; i++) {
-      if (qa_session_client_is_closed(b->phase_clients[i].client)) continue;
-      b->client_views[n].client = b->phase_clients[i].client; b->client_views[n].reliable = b->phase_clients[i].reliable;
+      qa_session_client *live = phase_client_live(b, &b->phase_clients[i]);
+      if (live == NULL) continue;
+      b->client_views[n].client = live; b->client_views[n].reliable = b->phase_clients[i].reliable;
       b->client_views[n].userinfo = b->phase_clients[i].userinfo; n++;
     }
     *out_count = n;
@@ -912,11 +952,27 @@ qa_save_value *qa_app_sim_application_bots_checkpoint_orchestration(app_bots *b)
   put(o, "snapshots", snapshots);
   return o;
 }
+/* The connections and snapshots a transport restore builds before it applies them; a refused entry releases them. */
+typedef struct orchestration_parts {
+  bot_connection *connections; size_t connection_count;
+  bot_snapshot *snapshots; size_t snapshot_count;
+} orchestration_parts;
+static void orchestration_parts_free(void *arg) {
+  orchestration_parts *parts = arg;
+  for (size_t i = 0; i < parts->connection_count; i++) qa_q3_reliable_ring_destroy(parts->connections[i].reliable);
+  for (size_t i = 0; i < parts->snapshot_count; i++) free(parts->snapshots[i].entities);
+  free(parts->connections); free(parts->snapshots);
+  memset(parts, 0, sizeof *parts);
+}
 /* Bind existing restored players without allocating clients, spawning actors or invoking admission. */
 static void restore_orchestration_image(app_bots *b, const qa_app_sim_bot_transport_checkpoint *image) {
   const qa_app_sim_bot_simulation *s = sim(b);
   if (b->closed || !isfinite(image->elapsed_milliseconds) || image->elapsed_milliseconds < 0) fail("Invalid bot transport restoration");
-  bot_connection *connections = xcalloc(image->connection_count, sizeof *connections);
+  orchestration_parts parts;
+  memset(&parts, 0, sizeof parts);
+  qa_cleanup parts_cleanup;
+  qa_cleanup_push(&parts_cleanup, orchestration_parts_free, &parts);
+  bot_connection *connections = parts.connections = xcalloc(image->connection_count, sizeof *connections);
   size_t connection_count = 0;
   for (size_t i = 0; i < image->connection_count; i++) {
     const qa_app_sim_bot_transport_connection *entry = &image->connections[i];
@@ -937,10 +993,11 @@ static void restore_orchestration_image(app_bots *b, const qa_app_sim_bot_transp
     qa_q3_server_reliable_commands *reliable = qa_app_sim_restored_bot_reliable_commands(entry);
     if (reliable == NULL) qa_range_error("Out of memory");
     connections[connection_count].slot = id.slot; connections[connection_count].client = client;
-    connections[connection_count].reliable = reliable; connections[connection_count].actor = actor; connection_count++;
+    connections[connection_count].reliable = reliable; connections[connection_count].actor = actor;
+    parts.connection_count = ++connection_count;
   }
   int64_t entity_count = b->game->entity_count(b->game->ctx);
-  bot_snapshot *snapshots = xcalloc(image->snapshot_count, sizeof *snapshots);
+  bot_snapshot *snapshots = parts.snapshots = xcalloc(image->snapshot_count, sizeof *snapshots);
   size_t snapshot_count = 0;
   for (size_t i = 0; i < image->snapshot_count; i++) {
     const qa_app_sim_bot_transport_snapshot *snapshot = &image->snapshots[i];
@@ -956,8 +1013,9 @@ static void restore_orchestration_image(app_bots *b, const qa_app_sim_bot_transp
     snapshots[snapshot_count].count = snapshot->entity_count;
     snapshots[snapshot_count].entities = xcalloc(snapshot->entity_count, sizeof *snapshots[snapshot_count].entities);
     for (size_t e = 0; e < snapshot->entity_count; e++) snapshots[snapshot_count].entities[e] = (int64_t)snapshot->entities[e];
-    snapshot_count++;
+    parts.snapshot_count = ++snapshot_count;
   }
+  qa_cleanup_pop(&parts_cleanup); /* nothing below raises but allocation failure: the parts move into the transport */
   for (size_t i = 0; i < b->connection_count; i++) qa_q3_reliable_ring_destroy(b->connections[i].reliable);
   b->connection_count = 0; snapshots_clear(b);
   for (size_t i = 0; i < connection_count; i++) set_connection(b, connections[i]);
@@ -1058,10 +1116,14 @@ static void restore_checkpoint(app_bots *b, const qa_app_sim_decoded_bots_checkp
   if (b->shared != NULL) qa_app_sim_shared_bot_world_restore_checkpoint(b->shared, image->shared_world, restore_reference, &r);
   restore_orchestration_image(b, &image->transport);
   qa_app_sim_bot_observation *observations = xcalloc(image->observation_count, sizeof *observations);
+  qa_cleanup observations_cleanup;
+  qa_cleanup_push(&observations_cleanup, free, observations);
   size_t observation_count = 0;
   qa_q3_base_ownership_state *native = b->source != NULL
       ? qa_q3_base_entity_records_capture_ownership(qa_app_q3_source_subsystems_owner_records(b->source->owner)) : NULL;
   if (b->source != NULL && native == NULL) qa_range_error("Out of memory");
+  qa_cleanup native_cleanup;
+  qa_cleanup_push(&native_cleanup, free, native);
   for (size_t i = 0; i < image->observation_count; i++) {
     const qa_app_sim_bot_observation *entry = &image->observations[i];
     bool duplicate = false;
@@ -1078,6 +1140,7 @@ static void restore_checkpoint(app_bots *b, const qa_app_sim_decoded_bots_checkp
   size_t expected = 0;
   if (native != NULL) { for (size_t n = 0; n < QA_Q3_MAX_GENTITIES; n++) if (native[n].has_actor) expected++; }
   else s->players(s->ctx, &expected);
+  qa_cleanup_pop(&native_cleanup);
   free(native);
   if (observation_count != expected) fail("Saved bot observation authority is incomplete");
   r.observations = observations; r.observation_count = observation_count;
@@ -1086,6 +1149,7 @@ static void restore_checkpoint(app_bots *b, const qa_app_sim_decoded_bots_checkp
   qa_app_sim_bot_arsenal *knowledge = knowledge_of(b);
   if (is_null_value(image->knowledge) != (knowledge == NULL)) fail("Saved bot arsenal knowledge differs from selected source");
   if (knowledge != NULL) qa_app_sim_bot_arsenal_restore_checkpoint(knowledge, image->knowledge, restore_reference, &r, restore_weapon_handle, &r);
+  qa_cleanup_pop(&observations_cleanup);
   free(observations);
 }
 static void restore_client(app_bots *b, qa_session_client *client, qa_q3_server_reliable_commands *reliable, const char *userinfo) {
@@ -1121,7 +1185,7 @@ static bool app_disconnect(void *ctx, int64_t client) {
   qa_session_client *session_client = connection != NULL ? connection->client : NULL;
   if (session_client == NULL && b->restart != RESTART_ACTIVE)
     for (size_t i = 0; i < b->phase_client_count && session_client == NULL; i++)
-      if (qa_session_client_id(b->phase_clients[i].client).slot == client) session_client = b->phase_clients[i].client;
+      if (b->phase_clients[i].id.slot == client) session_client = phase_client_live(b, &b->phase_clients[i]);
   if (session_client == NULL || qa_session_client_is_closed(session_client)) return false;
   qa_client_id id = qa_session_client_id(session_client);
   if (connection != NULL) {
@@ -1151,7 +1215,7 @@ static const qa_app_sim_bot_client *app_begin_round_restart(void *ctx, size_t *o
   const qa_app_sim_bot_client *clients = app_clients(b, &count);
   b->phase_clients = xcalloc(count, sizeof *b->phase_clients);
   for (size_t i = 0; i < count; i++) {
-    b->phase_clients[i].client = clients[i].client; b->phase_clients[i].reliable = clients[i].reliable;
+    b->phase_clients[i].id = qa_session_client_id(clients[i].client); b->phase_clients[i].reliable = clients[i].reliable;
     b->phase_clients[i].userinfo = xstrdup(clients[i].userinfo);
   }
   b->phase_client_count = count;
@@ -1190,7 +1254,7 @@ static void app_bind_restarted_round(void *ctx) {
   b->pending = xcalloc(b->phase_client_count, sizeof *b->pending);
   b->pending_count = 0;
   for (size_t i = 0; i < b->phase_client_count; i++)
-    if (!qa_session_client_is_closed(b->phase_clients[i].client)) b->pending[b->pending_count++] = qa_session_client_id(b->phase_clients[i].client).slot;
+    if (phase_client_live(b, &b->phase_clients[i]) != NULL) b->pending[b->pending_count++] = b->phase_clients[i].id.slot;
   b->restart = RESTART_BOUND;
 }
 /* Call once for each preserved slot after the three source settle frames; humans return false. */
@@ -1199,19 +1263,20 @@ static bool app_reconnect_restarted_client(void *ctx, qa_client_id client) {
   if (b->closed || b->restart != RESTART_BOUND) fail("Bind the new bot round before reconnecting clients");
   phase_client *saved = NULL;
   for (size_t i = 0; i < b->phase_client_count && saved == NULL; i++)
-    if (qa_same_client(qa_session_client_id(b->phase_clients[i].client), client)) saved = &b->phase_clients[i];
+    if (qa_same_client(b->phase_clients[i].id, client)) saved = &b->phase_clients[i];
   if (saved == NULL) return false;
   size_t pending_index = b->pending_count;
   for (size_t i = 0; i < b->pending_count; i++) if (b->pending[i] == client.slot) pending_index = i;
-  if (qa_session_client_is_closed(saved->client)) {
+  qa_session_client *saved_client = phase_client_live(b, saved);
+  if (saved_client == NULL) {
     if (pending_index < b->pending_count) { memmove(&b->pending[pending_index], &b->pending[pending_index + 1], (b->pending_count - pending_index - 1) * sizeof *b->pending); b->pending_count--; }
     return true;
   }
   if (pending_index == b->pending_count) fail("Bot restart client was already reconnected");
-  if (!append_reliable(b, saved->client, saved->reliable, "map_restart\n")) return true;
+  if (!append_reliable(b, saved_client, saved->reliable, "map_restart\n")) return true;
   qa_q3_server_reliable_commands *reliable = saved->reliable;
   saved->reliable = NULL; /* owned by the connection */
-  restore_client(b, saved->client, reliable, saved->userinfo);
+  restore_client(b, saved_client, reliable, saved->userinfo);
   for (size_t i = 0; i < b->pending_count; i++)
     if (b->pending[i] == client.slot) { memmove(&b->pending[i], &b->pending[i + 1], (b->pending_count - i - 1) * sizeof *b->pending); b->pending_count--; break; }
   return true;
@@ -1366,6 +1431,7 @@ qa_app_sim_application_bots *qa_app_sim_application_bots_create(const qa_app_sim
     if (options->restore == NULL) qa_source_bot_director_close(b->director, false);
     else qa_bot_log_shutdown(&b->director->library.log);
     qa_bot_memory_dispose(&b->director->library.memory);
+    qa_app_sim_application_bots_destroy(b); /* TS drops the half-built transport to the collector */
     qa_rethrow(&caught);
   }
   return b;

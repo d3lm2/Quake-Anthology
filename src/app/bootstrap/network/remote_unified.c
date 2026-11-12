@@ -66,6 +66,9 @@ struct qa_app_unified_remote {
   qa_app_selected_movement_prediction *predictor;
   bool has_predicted; qa_app_movement_prediction_result predicted;
   qa_actor_id *linked; size_t linked_count, linked_cap;
+  /* TS this.projection: the last projection correctPrediction accepted (its frame may since have
+   * been replaced or freed, so the fields read later are kept). */
+  bool has_projection; qa_actor_id projection_actor; double projection_command_time;
   double generation;
   bool closed;
   double world_epoch, content_epoch;
@@ -78,18 +81,7 @@ struct qa_app_unified_remote {
   qa_app_simulation_presentation *shifted_models;
   qa_q3_character_view *shifted_characters;
   qa_active_mod_client_presentation *client_sources; size_t client_source_cap;
-  /* Component updates the consumers retain pointers into: an owned re-read of each control's
-   * update (its tree and arrays), released when the epoch's consumers are. */
-  struct retained_update { qa_save_value *tree; qa_app_unified_component_update update; } *retained;
-  size_t retained_count, retained_cap;
 };
-static void retained_release(qa_app_unified_remote *remote) {
-  for (size_t i = 0; i < remote->retained_count; i++) {
-    qa_app_unified_component_update_free(&remote->retained[i].update);
-    qa_save_value_free(remote->retained[i].tree);
-  }
-  remote->retained_count = 0;
-}
 static void assert_current(qa_app_unified_remote *remote, double generation) {
   if (remote->closed || generation != remote->generation)
     qa_raise("Error", 0, 0, "Unified replica load was retired");
@@ -225,12 +217,13 @@ static void predicted_clear_result(qa_app_unified_remote *remote) {
   remote->has_predicted = false;
 }
 static void clear_prediction(qa_app_unified_remote *remote) {
-  if (remote->has_current && remote->options.scene_unlink) {
+  if (remote->has_projection && remote->options.scene_unlink) {
     void *scene = qa_app_remote_world_scene(remote->world);
     for (size_t i = 0; i < remote->linked_count; i++)
       remote->options.scene_unlink(remote->options.ctx, scene, remote->linked[i]);
   }
   remote->linked_count = 0;
+  remote->has_projection = false;
   if (remote->predictor) {
     qa_app_selected_movement_prediction_destroy(remote->predictor);
     remote->predictor = NULL;
@@ -350,12 +343,10 @@ void qa_app_unified_remote_destroy(qa_app_unified_remote *remote) {
   if (remote->components) qa_app_unified_component_consumers_destroy(remote->components);
   if (remote->native) qa_app_unified_native_consumers_destroy(remote->native);
   if (remote->has_current) qa_app_unified_presentation_frame_free(&remote->current);
-  retained_release(remote);
   qa_app_presentation_state_destroy(remote->media);
   remote->media = NULL;
   simulation_records_free(remote->drained, remote->drained_count);
   free(remote->drained_events);
-  free(remote->retained);
   qa_app_remote_world_content_destroy(remote->world);
   free(remote->actors);
   free(remote->clients);
@@ -421,7 +412,6 @@ void qa_app_unified_remote_offer(qa_app_unified_remote *remote,
   for (size_t i = 0; i < remote->resource_count; i++) free(remote->resources[i].id);
   remote->resource_count = 0;
   remote->sequence_count = 0;
-  retained_release(remote);
   media_replace(remote);
   simulation_records_free(remote->simulation_events, remote->simulation_count);
   remote->simulation_events = NULL;
@@ -499,30 +489,11 @@ static void components_publish(void *ctx) {
     qa_app_unified_native_commit_free(commit);
   }
 }
-static void cleanup_value(void *arg) { qa_save_value_free(arg); }
 void qa_app_unified_remote_receive_components(qa_app_unified_remote *remote,
     double epoch, const qa_app_unified_component_update *update) {
-  /* The decoded control (and the strings its update borrows) is freed after this call, while the
-   * consumers keep identities and configstrings: they get an owned copy. */
-  if (remote->retained_count == remote->retained_cap) {
-    size_t cap = remote->retained_cap ? remote->retained_cap * 2 : 4;
-    struct retained_update *grown = realloc(remote->retained, cap * sizeof *grown);
-    if (!grown) qa_range_error("out of memory");
-    remote->retained = grown;
-    remote->retained_cap = cap;
-  }
-  qa_save_value *tree = qa_app_unified_write_component_update(update);
-  if (!tree) qa_range_error("out of memory");
-  qa_cleanup tree_guard;
-  qa_cleanup_push(&tree_guard, cleanup_value, tree);
-  qa_save_reader reader;
-  if (!qa_save_reader_init(&reader, tree, "unified-components")) qa_range_error("out of memory");
-  qa_app_unified_component_update owned = qa_app_unified_read_component_update(&reader);
-  qa_cleanup_pop(&tree_guard);
-  struct retained_update *slot = &remote->retained[remote->retained_count++];
-  slot->tree = tree;
-  slot->update = owned;
-  components_op op = {remote, epoch, &slot->update};
+  /* The decoded control is freed after this call: the consumers copy what they keep (TS keeps
+   * the objects only while an entry refers to them). */
+  components_op op = {remote, epoch, update};
   if (!remote->options.publish_components) components_publish(&op);
   else remote->options.publish_components(remote->options.ctx, components_publish, &op);
 }
@@ -788,8 +759,8 @@ static void correct_prediction(qa_app_unified_remote *remote,
   if (!qa_same_actor(projection->actor, frame->player_actor)
       || projection->snapshot.sequence != frame->acknowledged_input)
     qa_raise("Error", 0, 0, "Unified prediction does not match admitted snapshot");
-  if (remote->has_current && remote->predictor
-      && !qa_same_actor(remote->current.prediction.actor, projection->actor))
+  /* TS compares this.projection (the previous frame's); remote->current is already this frame. */
+  if (remote->has_projection && !qa_same_actor(remote->projection_actor, projection->actor))
     clear_prediction(remote);
   void *scene = remote->options.scene_link ? qa_app_remote_world_scene(remote->world) : NULL;
   size_t kept = 0;
@@ -818,6 +789,9 @@ static void correct_prediction(qa_app_unified_remote *remote,
       remote->linked[remote->linked_count++] = projection->collisions[i].body.actor;
     }
   }
+  remote->has_projection = true;
+  remote->projection_actor = projection->actor;
+  remote->projection_command_time = projection->snapshot.command_time_milliseconds;
   qa_app_movement_prediction_snapshot initial = projection->snapshot;
   initial.has_q3_arsenal = false;
   memset(&initial.q3_arsenal, 0, sizeof initial.q3_arsenal);
@@ -936,8 +910,8 @@ bool qa_app_unified_remote_receive_frame(qa_app_unified_remote *remote,
   return true;
 }
 bool qa_app_unified_remote_command_time(const qa_app_unified_remote *remote, double *out) {
-  if (!remote->has_current) return false;
-  *out = remote->current.prediction.snapshot.command_time_milliseconds;
+  if (!remote->has_projection) return false;
+  *out = remote->projection_command_time;
   return true;
 }
 void qa_app_unified_remote_predict(qa_app_unified_remote *remote,

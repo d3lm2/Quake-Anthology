@@ -132,8 +132,6 @@ typedef struct qa_windows_service_host {
   void (*own)(void *ctx, void *resource, void (*release)(void *resource));
   /* TS heaps/reservations/tlsIndices/fiberSlots; NULL: the kernel keeps private tables. */
   qa_windows_kernel_tables *tables;
-  /* TS chargeBytes; NULL charges nothing (a host with no attached runner). */
-  void (*charge_bytes)(void *ctx, size_t byte_length);
 } qa_windows_service_host;
 
 /* Convenience wrappers mirroring host.method(...) call sites. */
@@ -159,7 +157,6 @@ bool qa_windows_free_library(qa_windows_service_host *host, qa_guest_core_addres
 const char *qa_windows_library_name(qa_windows_service_host *host, qa_guest_core_address handle);
 const qa_pe_image *const *qa_windows_images(qa_windows_service_host *host, size_t *count);
 void qa_windows_own(qa_windows_service_host *host, void *resource, void (*release)(void *resource));
-void qa_windows_charge_bytes(qa_windows_service_host *host, size_t byte_length);
 
 /* TS throw new UnsupportedWindowsImport(library, symbol, context, detail?). */
 void qa_unsupported_windows_import(const char *library, const char *symbol, const char *detail);

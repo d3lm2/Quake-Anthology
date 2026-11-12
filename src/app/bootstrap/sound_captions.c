@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/content/mounts.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/text/media_captions.h"
 /* A catalog is heap-allocated: voices keep pointers to it while the map grows. */
@@ -127,7 +128,10 @@ void qa_app_seat_sound_captions_prepare(qa_app_seat_sound_captions *c, qa_app_lo
     catalog *found = NULL;
     for (size_t j = 0; j < c->catalog_count && found == NULL; j++) if (strcmp(c->catalogs[j]->key, key) == 0) found = c->catalogs[j];
     if (found == NULL) {
+      qa_cleanup key_guard;
+      qa_cleanup_push(&key_guard, free, key);
       qa_content_mounted *mounts = (qa_content_mounted *)qa_app_loaded_content_for_content(content, content_id);
+      qa_cleanup_pop(&key_guard);
       if (c->closed) { free(key); continue; }
       if (c->catalog_count == c->catalog_cap) {
         c->catalog_cap = c->catalog_cap ? c->catalog_cap * 2 : 8;
@@ -147,10 +151,11 @@ void qa_app_seat_sound_captions_prepare(qa_app_seat_sound_captions *c, qa_app_lo
       prepare_job job = {found, reference->requested_path, language};
       qa_caught_error caught;
       if (!qa_try(prepare_run, &job, &caught)) {
-        size_t length = strlen(reference->requested_path) + strlen(caught.message) + 64;
+        const char *message = qa_caught_message(&caught);
+        size_t length = strlen(reference->requested_path) + strlen(message) + 64;
         char *text = malloc(length);
         if (text == NULL) qa_range_error("Out of memory");
-        snprintf(text, length, "Sound captions for %s unavailable: %s\n", reference->requested_path, caught.message);
+        snprintf(text, length, "Sound captions for %s unavailable: %s\n", reference->requested_path, message);
         warn(c, text);
         free(text);
       }

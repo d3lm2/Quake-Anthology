@@ -20,8 +20,12 @@ static size_t woff(const qa_compat_qc_words *w, int64_t word) {
 int32_t qa_compat_qc_words_int(const qa_compat_qc_words *w, int64_t word) { int32_t v; memcpy(&v, w->bytes + woff(w, word), 4); return v; }
 double qa_compat_qc_words_float(const qa_compat_qc_words *w, int64_t word) { float v; memcpy(&v, w->bytes + woff(w, word), 4); return v; }
 void qa_compat_qc_words_set_int(qa_compat_qc_words *w, int64_t word, double value) { int32_t v = qa_int32(value); memcpy(w->bytes + woff(w, word), &v, 4); }
-/* DataView.setFloat32 stores every NaN as the canonical 0x7fc00000 (the oracle engine purifies
- * NaN); x86 arithmetic would otherwise leave the sign-set default NaN in the word. */
+/* Every NaN is stored as the canonical 0x7fc00000. The sign TypeScript stores is not defined by the
+ * source: JavaScriptCore purifies a NaN it reads from a DataView, keeps the hardware NaN an
+ * operation makes (the x86 default NaN is negative), and which of the two a store sees depends
+ * on the JIT tier the statement loop is running in (measured for the gate read: the same
+ * program run six times in one process stored 0x7fc00000 or 0xffc00000 for 0 / 0 depending on
+ * the run). The review test compares NaN words by class for the same reason. */
 void qa_compat_qc_words_set_float(qa_compat_qc_words *w, int64_t word, double value) {
   size_t at = woff(w, word);
   if (isnan(value)) { static const uint32_t canonical = 0x7fc00000u; memcpy(w->bytes + at, &canonical, 4); return; }
@@ -158,7 +162,9 @@ int64_t qa_compat_qc_strings_intern(qa_compat_qc_strings *s, const char *text) {
 int64_t qa_compat_qc_strings_set_engine(qa_compat_qc_strings *s, const char *name, const char *text, int64_t capacity) {
   if (capacity < 0) capacity = 128;
   size_t idx = s->engine_count; bool found = false;
-  for (size_t i = 0; i < s->engine_count; i++) if (strcmp(s->engines[i].name, name) == 0) { idx = i; found = true; break; }
+  /* TS engineIndex is a Map from name to index: a restored checkpoint that repeats a name maps
+   * it to its last entry (new Map(entries) keeps the last), and names added later are new. */
+  for (size_t i = s->engine_count; i-- > 0;) if (strcmp(s->engines[i].name, name) == 0) { idx = i; found = true; break; }
   if (found && strlen(text) >= (size_t)s->engines[idx].capacity) {
     /* A longer value moves to a larger buffer; the old bytes stay valid for aliases taken earlier. */
     int64_t grown = (int64_t)strlen(text) + 1, doubled = s->engines[idx].capacity * 2;

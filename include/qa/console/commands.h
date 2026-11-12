@@ -5,10 +5,9 @@
  * C accommodations:
  *  - SeatConsole/ConfigStore are the ported qa_seat_console /
  *    qa_config_store, reached through the TS console(seat) /
- *    config(seat) lookups as function pointer + ctx. FrameCapture's
- *    file writing is not ported yet (see include/qa/capture/index.h),
- *    so capture stays decomposed into the operations this file
- *    calls; has_capture is the TS `capture(seat) === null` check,
+ *    config(seat) lookups as function pointer + ctx. FrameCapture
+ *    (include/qa/capture/index.h) is reached as the operations this
+ *    file calls; has_capture is the TS `capture(seat) === null` check,
  *    taken at the same instant. A failed qa_config_store_dump (the
  *    TS rejected dump) reports the fixed message named in commands.c
  *    to the writeconfig failure notification.

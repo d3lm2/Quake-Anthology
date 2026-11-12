@@ -12,23 +12,33 @@ struct qa_app_remote_seat_identities {
   phase state;
 };
 static const char *phase_name(phase p) { return p == PUBLISHED ? "published" : p == DISCARDED ? "discarded" : "prepared"; }
+static void close_client(void *client) { qa_session_client_close(client); }
+/* TS discardAdded: close every added client newest first; any failure makes an AggregateError. */
 static void discard_added(qa_app_remote_seat_identity *added, size_t count) {
-  for (size_t i = count; i-- > 0;) qa_session_client_close(added[i].client);
+  bool failed = false;
+  for (size_t i = count; i-- > 0;) {
+    qa_caught_error caught;
+    if (!qa_try(close_client, added[i].client, &caught)) failed = true;
+  }
+  if (failed) qa_raise("AggregateError", 0, 0, "Remote seat identity cleanup failed");
 }
-qa_app_remote_seat_identities *qa_app_prepare_remote_seat_identities(qa_engine_session *session,
-    const qa_app_remote_seat_identity *retained, size_t retained_count, double count_d) {
-  if (count_d != trunc(count_d) || count_d < 1 || count_d > 4)
-    qa_range_error("Remote play requires one to four local players");
-  size_t count = (size_t)count_d;
-  qa_app_remote_seat_identities *p = calloc(1, sizeof *p);
-  if (!p) return NULL;
-  p->session = session;
-  p->selected = calloc(count, sizeof *p->selected);
-  p->added = calloc(count, sizeof *p->added);
-  if (!p->selected || !p->added) { free(p->selected); free(p->added); free(p); return NULL; }
-  size_t keep = retained_count < count ? retained_count : count;
-  memcpy(p->selected, retained, keep * sizeof *p->selected);
-  p->selected_count = keep;
+typedef struct discard_scope { qa_app_remote_seat_identity *added; size_t count; } discard_scope;
+static void discard_body(void *ctx) {
+  discard_scope *scope = ctx;
+  discard_added(scope->added, scope->count);
+}
+typedef struct reserve_scope { qa_engine_session *session; int64_t index; qa_session_client *client; qa_session_seat *seat; } reserve_scope;
+static void reserve_seat(void *ctx) {
+  reserve_scope *scope = ctx;
+  scope->seat = qa_engine_session_prepare_seat(scope->session, scope->index, scope->client, NULL);
+}
+typedef struct prepare_scope { qa_app_remote_seat_identities *p; const qa_app_remote_seat_identity *retained; size_t retained_count, count; } prepare_scope;
+static void prepare_body(void *ctx) {
+  prepare_scope *scope = ctx;
+  qa_app_remote_seat_identities *p = scope->p;
+  qa_engine_session *session = p->session;
+  const qa_app_remote_seat_identity *retained = scope->retained;
+  size_t retained_count = scope->retained_count, count = scope->count;
   while (p->selected_count < count) {
     int64_t slot = 0;
     for (;;) {
@@ -49,10 +59,46 @@ qa_app_remote_seat_identities *qa_app_prepare_remote_seat_identities(qa_engine_s
       index++;
     }
     qa_session_client *client = qa_engine_session_prepare_client(session, slot, NULL);
-    qa_session_seat *seat = qa_engine_session_prepare_seat(session, index, client, NULL);
-    qa_app_remote_seat_identity entry = {client, seat};
+    reserve_scope reserve = {session, index, client, NULL};
+    qa_caught_error caught;
+    if (!qa_try(reserve_seat, &reserve, &caught)) {
+      qa_caught_error cleanup;
+      if (!qa_try(close_client, client, &cleanup)) qa_raise("AggregateError", 0, 0, "Remote seat reservation failed");
+      qa_rethrow(&caught);
+    }
+    qa_app_remote_seat_identity entry = {client, reserve.seat};
     p->added[p->added_count++] = entry;
     p->selected[p->selected_count++] = entry;
+  }
+}
+qa_app_remote_seat_identities *qa_app_prepare_remote_seat_identities(qa_engine_session *session,
+    const qa_app_remote_seat_identity *retained, size_t retained_count, double count_d) {
+  if (count_d != trunc(count_d) || count_d < 1 || count_d > 4)
+    qa_raise("Error", 0, 0, "Remote play requires one to four local players");
+  size_t count = (size_t)count_d;
+  qa_app_remote_seat_identities *p = calloc(1, sizeof *p);
+  if (!p) return NULL;
+  p->session = session;
+  p->selected = calloc(count, sizeof *p->selected);
+  p->added = calloc(count, sizeof *p->added);
+  if (!p->selected || !p->added) { free(p->selected); free(p->added); free(p); return NULL; }
+  size_t keep = retained_count < count ? retained_count : count;
+  memcpy(p->selected, retained, keep * sizeof *p->selected);
+  p->selected_count = keep;
+  prepare_scope scope = {p, retained, retained_count, count};
+  qa_caught_error caught;
+  if (!qa_try(prepare_body, &scope, &caught)) {
+    /* TS: discardAdded(); a failed cleanup makes an AggregateError */
+    qa_caught_error cleanup;
+    bool failed = false;
+    qa_app_remote_seat_identity *added = p->added;
+    size_t added_count = p->added_count;
+    free(p->selected); free(p);
+    discard_scope discard = {added, added_count};
+    if (!qa_try(discard_body, &discard, &cleanup)) failed = true;
+    free(added);
+    if (failed) qa_raise("AggregateError", 0, 0, "Remote seat preparation failed");
+    qa_rethrow(&caught);
   }
   p->state = PREPARED;
   return p;
@@ -72,25 +118,35 @@ static void changes(qa_app_remote_seat_identities *p, qa_session_client_change *
                     qa_session_client ***cbuf, qa_session_seat ***sbuf) {
   *cbuf = calloc(p->added_count ? p->added_count : 1, sizeof **cbuf);
   *sbuf = calloc(p->added_count ? p->added_count : 1, sizeof **sbuf);
-  if (!*cbuf || !*sbuf) qa_range_error("Out of memory");
+  if (!*cbuf || !*sbuf) { free(*cbuf); free(*sbuf); qa_range_error("Out of memory"); }
   for (size_t i = 0; i < p->added_count; i++) { (*cbuf)[i] = p->added[i].client; (*sbuf)[i] = p->added[i].seat; }
   clients->added = *cbuf; clients->added_count = p->added_count; clients->removed = NULL; clients->removed_count = 0;
   seats->added = *sbuf; seats->added_count = p->added_count; seats->removed = NULL; seats->removed_count = 0;
 }
 void qa_app_remote_seat_identities_validate(qa_app_remote_seat_identities *p) {
-  if (p->state != PREPARED) qa_range_error("Remote seat identities are %s", phase_name(p->state));
+  if (p->state != PREPARED) qa_raise("Error", 0, 0, "Remote seat identities are %s", phase_name(p->state));
   qa_session_client_change clients; qa_session_seat_change seats;
-  qa_session_client **cbuf; qa_session_seat **sbuf;
+  qa_session_client **cbuf = NULL; qa_session_seat **sbuf = NULL;
   changes(p, &clients, &seats, &cbuf, &sbuf);
+  qa_cleanup cguard, sguard;
+  qa_cleanup_push(&cguard, free, cbuf);
+  qa_cleanup_push(&sguard, free, sbuf);
   qa_engine_session_validate_local_seats(p->session, NULL, 0, clients, seats);
+  qa_cleanup_pop(&sguard);
+  qa_cleanup_pop(&cguard);
   free(cbuf); free(sbuf);
 }
 void qa_app_remote_seat_identities_publish(qa_app_remote_seat_identities *p) {
   qa_app_remote_seat_identities_validate(p);
   qa_session_client_change clients; qa_session_seat_change seats;
-  qa_session_client **cbuf; qa_session_seat **sbuf;
+  qa_session_client **cbuf = NULL; qa_session_seat **sbuf = NULL;
   changes(p, &clients, &seats, &cbuf, &sbuf);
+  qa_cleanup cguard, sguard;
+  qa_cleanup_push(&cguard, free, cbuf);
+  qa_cleanup_push(&sguard, free, sbuf);
   qa_session_resource retired = qa_engine_session_publish_local_seats(p->session, NULL, 0, clients, seats);
+  qa_cleanup_pop(&sguard);
+  qa_cleanup_pop(&cguard);
   free(cbuf); free(sbuf);
   if (retired.close) retired.close(retired.ctx);
   p->state = PUBLISHED;

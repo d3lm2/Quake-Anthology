@@ -2,7 +2,7 @@
  * Port of src/settings/server/types.ts (types only): server setting
  * definitions, collections, owners, and profiles. C accommodations:
  *  - The TS Control<Kind> helper extracts CvarSettingSpec variants
- *    from src/ui/settings/index.ts (ui module not yet ported); the
+ *    from src/ui/settings/index.ts; the
  *    resulting fields are spelled out here directly: toggle carries
  *    no extra fields, slider carries minimum/maximum/step plus the
  *    TS integer flag, choice carries qa_ui_choice rows, text-entry

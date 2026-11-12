@@ -54,10 +54,12 @@ static void slots_set(actor_slot_map *m, qa_actor_id actor, int64_t slot) { acto
 static void actors_set(actor_slot_map *m, int64_t slot, qa_actor_id actor) { actor_slot *e = by_slot(m, slot); if (e) e->actor = actor; else map_append(m, actor, slot); }
 static void actors_delete(actor_slot_map *m, int64_t slot) { actor_slot *e = by_slot(m, slot); if (e) map_remove_at(m, e); }
 
+/* An attached projectile's instance: owned by the source until its holder closes it (the
+ * attachments close each instance once and then drop it), so close frees it. */
 typedef struct qc_instance {
   qa_app_sim_quakec_weapon_behavior_source *source;
   int64_t slot; bool closed;
-  struct qc_instance *next;
+  struct qc_instance *next, *previous;
 } qc_instance;
 
 #define HOST_BUILTIN_COUNT 13
@@ -129,10 +131,13 @@ static void refresh_targets(qa_app_sim_quakec_weapon_behavior_source *s, const q
     project_body(s, slot, target->body);
     qa_compat_qc_words_set_float(fields, field(s, "health"), target->health);
     qa_compat_qc_words_set_float(fields, field(s, "solid"), target->solid ? 2 : 0);
+    /* setInt(field(name), intern(text)): the field lookup (which can raise) precedes the intern. */
+    int64_t classname_field = field(s, "classname");
     int64_t classname = qa_compat_qc_strings_intern(&s->machine.strings, target->classname);
-    qa_compat_qc_words_set_int(fields, field(s, "classname"), (double)classname);
+    qa_compat_qc_words_set_int(fields, classname_field, (double)classname);
+    int64_t netname_field = field(s, "netname");
     int64_t netname = qa_compat_qc_strings_intern(&s->machine.strings, target->name);
-    qa_compat_qc_words_set_int(fields, field(s, "netname"), (double)netname);
+    qa_compat_qc_words_set_int(fields, netname_field, (double)netname);
   }
   for (size_t i = 0; i < s->slots.count;) {
     qa_actor_id actor = s->slots.entries[i].actor; int64_t slot = s->slots.entries[i].slot;
@@ -191,12 +196,18 @@ static void instance_close(void *ctx) {
   if (instance->closed) return;
   instance->closed = true; set_delete(&s->bound, slot); set_delete(&s->retired, slot); set_add(&s->free, slot);
   actors_delete(&s->actors, slot); set_delete(&s->projectiles, slot);
+  /* A step that released the projectile reads only the source and slot after this. */
+  if (instance->previous) instance->previous->next = instance->next; else s->instances = instance->next;
+  if (instance->next) instance->next->previous = instance->previous;
+  free(instance);
 }
 static qa_weapon_behavior_instance make_instance(qa_app_sim_quakec_weapon_behavior_source *s, int64_t slot) {
   if (set_has(&s->bound, slot)) fail_error("QuakeC projectile behavior already has an attachment");
   set_add(&s->bound, slot);
   qc_instance *instance = checked(calloc(1, sizeof *instance));
-  instance->source = s; instance->slot = slot; instance->next = s->instances; s->instances = instance;
+  instance->source = s; instance->slot = slot; instance->next = s->instances;
+  if (s->instances) s->instances->previous = instance;
+  s->instances = instance;
   qa_weapon_behavior_instance out; memset(&out, 0, sizeof out);
   out.ctx = instance; out.definition = s->definition;
   out.initial = fields_trajectory(s, qa_compat_qc_entity_memory_at(&s->entities, slot));

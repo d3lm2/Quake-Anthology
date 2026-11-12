@@ -13,18 +13,30 @@
 #include "qa/guest/runtime/common/memory.h"
 #include "qa/foundation/js.h"
 
-static qa_guest_scan_catch *g_catch;
+/* What one scan owns; released however it ends (TS leaves it to the collector). */
+typedef struct scan_scope { char *format; void *directives; char *token; struct qa_guest_scan_catch *previous; } scan_scope;
+static struct qa_guest_scan_catch *g_catch;
+static void scan_scope_release(void *arg) {
+  scan_scope *scope = arg;
+  g_catch = scope->previous;
+  free(scope->format);
+  free(scope->directives);
+  free(scope->token);
+  memset(scope, 0, sizeof *scope);
+}
+
+/* TS `throw new UnsupportedGuestScan(...)`. Its class sets no name, so uncaught it reads as an Error. */
 static void unsupported(const char *format, ...) {
-  char buffer[512];
+  char buffer[QA_CAUGHT_MESSAGE_CAPACITY];
   va_list args;
   va_start(args, format);
   (void)vsnprintf(buffer, sizeof buffer, format, args);
   va_end(args);
-  if (g_catch == NULL) qa_range_error("%s", buffer);
+  if (g_catch == NULL) qa_raise("Error", 0, 0, "%s", buffer);
   (void)snprintf(g_catch->message, sizeof g_catch->message, "%s", buffer);
   longjmp(g_catch->buf, 1);
 }
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
 static void *xmalloc(size_t size) {
   void *p = malloc(size == 0 ? 1 : size);
   if (p == NULL) qa_range_error("Guest runtime out of memory");
@@ -50,11 +62,11 @@ static bool is_space_char(char c) {
   return c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r' || c == ' ';
 }
 
-static directive *parse_directives(const char *format, size_t *out_count) {
+static directive *parse_directives(const char *format, size_t *out_count, scan_scope *scope) {
   directive *result = NULL; size_t count = 0, cap = 0;
   size_t length = strlen(format);
 #define PUSH(d) do { \
-    if (count == cap) { cap = cap == 0 ? 8 : cap * 2; result = xrealloc(result, cap * sizeof *result); } \
+    if (count == cap) { cap = cap == 0 ? 8 : cap * 2; result = xrealloc(result, cap * sizeof *result); scope->directives = result; } \
     result[count++] = (d); \
   } while (0)
   for (size_t index = 0; index < length;) {
@@ -250,11 +262,11 @@ static uint64_t digits_mod_2_64(const char *digits, unsigned base) {
   }
   return value;
 }
-static int scan_run(const qa_scan_windows_buffer_options *options) {
+static int scan_run(const qa_scan_windows_buffer_options *options, scan_scope *scope) {
   qa_mapped_guest_memory *memory = options->memory;
-  char *format = qa_read_string(memory, options->memory_ext, options->format, 1048576);
+  char *format = scope->format = qa_read_string(memory, options->memory_ext, options->format, 1048576);
   size_t directive_count = 0;
-  directive *directives = parse_directives(format, &directive_count);
+  directive *directives = parse_directives(format, &directive_count, scope);
   qa_format_arguments args;
   qa_format_arguments_init(&args, memory, QA_FORMAT_WINDOWS, options->has_arguments, options->arguments);
   scan_state state; memset(&state, 0, sizeof state);
@@ -276,11 +288,11 @@ static int scan_run(const qa_scan_windows_buffer_options *options) {
     if (peek_byte(&state) < 0) { result = failure(&state); done = true; break; }
     size_t start = state.cursor;
     size_t token_cap = 64, token_len = 0;
-    char *token = xmalloc(token_cap);
+    char *token = scope->token = xmalloc(token_cap);
 #define CURRENT() (((int64_t)(state.cursor - start) < dir->width) ? peek_byte(&state) : -1)
 #define TAKE() do { \
       int b_ = peek_byte(&state); \
-      if (token_len + 2 > token_cap) { token_cap *= 2; token = xrealloc(token, token_cap); } \
+      if (token_len + 2 > token_cap) { token_cap *= 2; token = scope->token = xrealloc(token, token_cap); } \
       token[token_len++] = (char)(b_ < 0 ? 0 : b_); token[token_len] = '\0'; \
       state.cursor++; \
     } while (0)
@@ -300,7 +312,6 @@ static int scan_run(const qa_scan_windows_buffer_options *options) {
         }
         if (nonfinite) unsupported("scanf nonfinite text is not implemented");
         result = state.assigned; done = true;
-        free(token);
         break;
       }
       while (isdigit(CURRENT())) TAKE();
@@ -329,7 +340,7 @@ static int scan_run(const qa_scan_windows_buffer_options *options) {
       }
       valid = valid_int_token(token);
     }
-    if (!valid) { result = state.assigned; done = true; free(token); break; }
+    if (!valid) { result = state.assigned; done = true; break; }
     state.converted = true;
     if (!dir->suppressed) {
       qa_format_argument argument = qa_format_arguments_next(&args, QA_FORMAT_ARG_POINTER);
@@ -358,24 +369,29 @@ static int scan_run(const qa_scan_windows_buffer_options *options) {
       }
       state.assigned++;
     }
+    scope->token = NULL;
     free(token);
 #undef CURRENT
 #undef TAKE
   }
   if (!done) result = state.assigned;
-  free(directives);
-  free(format);
   return result;
 }
 
 int qa_scan_windows_buffer(const qa_scan_windows_buffer_options *options, qa_guest_scan_catch *catch_) {
-  qa_guest_scan_catch *previous = g_catch;
+  scan_scope scope;
+  memset(&scope, 0, sizeof scope);
+  scope.previous = g_catch;
+  qa_cleanup scope_node;
+  qa_cleanup_push(&scope_node, scan_scope_release, &scope); /* a raise (guest fault, TypeError) */
   g_catch = catch_;
   if (catch_ != NULL && setjmp(catch_->buf) != 0) {
-    g_catch = previous;
+    qa_cleanup_pop(&scope_node);
+    scan_scope_release(&scope);
     return -2; /* unsupported: message in catch_->message; caller rethrows */
   }
-  int result = scan_run(options);
-  g_catch = previous;
+  int result = scan_run(options, &scope);
+  qa_cleanup_pop(&scope_node);
+  scan_scope_release(&scope);
   return result;
 }

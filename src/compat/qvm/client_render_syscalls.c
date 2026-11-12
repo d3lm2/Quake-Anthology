@@ -32,6 +32,11 @@ static void out_of_memory(bool ok) {
   if (!ok) qa_range_error("out of memory");
 }
 
+/* A string read for a service is released when the service, or the read of a
+ * later argument, raises (TS leaves it to the collector). free(NULL) is fine. */
+#define HOLD(node, pointer) qa_cleanup node; qa_cleanup_push(&node, free, pointer)
+#define RELEASE(node, pointer) qa_cleanup_pop(&node); free(pointer)
+
 typedef struct picture_ctx {
   qa_q3_pres_q3_renderer_resources *resources;
   int32_t shader_word;
@@ -65,8 +70,9 @@ static bool resource_syscall(const qa_qvm_host_call *call, qa_q3_pres_q3_rendere
     int32_t name_word = word_at(call, 1);
     char *name = name_word == 0 ? NULL : read_string(memory, name_word);
     qa_q3_pres_scene_model model;
+    HOLD(held, name);
     out_of_memory(qa_q3_pres_q3_renderer_resources_register_model(resources, name == NULL ? "" : name, &model));
-    free(name);
+    RELEASE(held, name);
     *out = qa_int32(qa_q3_pres_q3_renderer_resources_model_handle(resources, &model));
     return true;
   }
@@ -74,18 +80,20 @@ static bool resource_syscall(const qa_qvm_host_call *call, qa_q3_pres_q3_rendere
     int32_t name_word = word_at(call, 1);
     char *name = name_word == 0 ? NULL : read_string(memory, name_word);
     const qa_q3_pres_scene_skin *skin = NULL;
+    HOLD(held, name);
     out_of_memory(qa_q3_pres_q3_renderer_resources_register_skin(resources, name == NULL ? "" : name, &skin));
-    free(name);
+    RELEASE(held, name);
     *out = qa_int32(qa_q3_pres_q3_renderer_resources_skin_handle(resources, skin));
     return true;
   }
   if ((ids->shader >= 0 && trap == ids->shader) || trap == ids->shader_no_mip) {
     char *name = read_string(memory, word_at(call, 1));
     const qa_q3_pres_scene_shader *shader = NULL;
+    HOLD(held, name);
     out_of_memory(trap == ids->shader
                       ? qa_q3_pres_q3_renderer_resources_register_shader(resources, name, &shader)
                       : qa_q3_pres_q3_renderer_resources_register_shader_no_mip(resources, name, &shader));
-    free(name);
+    RELEASE(held, name);
     *out = qa_int32(qa_q3_pres_q3_renderer_resources_shader_handle(resources, shader));
     return true;
   }
@@ -140,8 +148,9 @@ static bool resource_syscall(const qa_qvm_host_call *call, qa_q3_pres_q3_rendere
     qa_q3_pres_model_tag tag;
     if (base != NULL && base->kind == QA_DECODED_MODEL_Q3_MESH && base->as.q3_mesh->tag_row_count != 0) {
       char *name = read_string(memory, name_word);
+      HOLD(held, name);
       has_tag = qa_q3_pres_lerp_model_tag(&model, name, start, end, fraction, &tag);
-      free(name);
+      RELEASE(held, name);
     }
     if (!has_tag) {
       qa_vec3 zero = {0, 0, 0};
@@ -156,13 +165,16 @@ static bool resource_syscall(const qa_qvm_host_call *call, qa_q3_pres_q3_rendere
   }
   if (trap == ids->remap) {
     char *original = read_string(memory, word_at(call, 1));
+    HOLD(held_original, original);
     char *replacement = read_string(memory, word_at(call, 2));
+    HOLD(held_replacement, replacement);
     int32_t offset_word = word_at(call, 3);
     char *offset = offset_word == 0 ? NULL : read_string(memory, offset_word);
+    HOLD(held_offset, offset);
     qa_q3_pres_q3_renderer_resources_remap_shader(resources, original, replacement, offset == NULL ? "" : offset);
-    free(original);
-    free(replacement);
-    free(offset);
+    RELEASE(held_offset, offset);
+    RELEASE(held_replacement, replacement);
+    RELEASE(held_original, original);
     *out = 0;
     return true;
   }
@@ -295,8 +307,9 @@ bool qa_qvm_client_render_syscall(const qa_qvm_host_call *call,
   if (!ui && trap == 36) {
     char *name = read_string(guest, word_at(call, 1));
     qa_q3_pres_world_scene world;
+    HOLD(held, name);
     out_of_memory(qa_q3_pres_q3_renderer_resources_load_world(resources, name, &world));
-    free(name);
+    RELEASE(held, name);
     *out = 0;
     return true;
   }
@@ -336,9 +349,13 @@ bool qa_qvm_client_render_syscall(const qa_qvm_host_call *call,
     const qa_q3_pres_scene_shader *shader =
         qa_q3_pres_q3_renderer_resources_shader_for_handle(resources, shader_handle);
     int64_t stride = (int64_t)count * QA_QVM_POLY_VERTEX_BYTES;
-    (void)qa_qvm_memory_get_span(guest, pointer, stride * polys, 0); /* TS guest.span extent check */
+    /* TS guest.span extent check. count and polys are guest words: their product
+     * reaches 2^66, past int64, where TS has a number no allocation holds. */
+    const double extent = (double)stride * (double)polys;
+    (void)qa_qvm_memory_get_span(guest, pointer, extent > 9007199254740991.0 ? INT64_MAX : stride * polys, 0);
     qa_q3_pres_ref_poly_vertex *vertices = malloc(sizeof *vertices * (size_t)count);
     if (vertices == NULL) qa_range_error("out of memory");
+    HOLD(held, vertices);
     for (int32_t index = 0; index < polys; index++) {
       qa_qvm_writable_view view;
       qa_qvm_memory_view(guest, pointer, stride, index * stride, &view);
@@ -346,7 +363,7 @@ bool qa_qvm_client_render_syscall(const qa_qvm_host_call *call,
       qa_q3_pres_ref_poly poly = {shader, vertices, (size_t)count};
       qa_q3_pres_q3_renderer_resources_add_poly(resources, &poly);
     }
-    free(vertices);
+    RELEASE(held, vertices);
     *out = 0;
     return true;
   }

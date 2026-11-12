@@ -68,14 +68,14 @@ qa_compat_qc_mod_input_cleanup qa_compat_qc_mod_input_open(I *in, qa_mod_client_
         if (!isfinite((double)qa_float32(scalar))) { for(size_t k=0;k<in->field_count;k++) memcpy(words->bytes+c->offsets[k], c->saved+k*12, (size_t)in->fields[k].words*4); retire_cell(in, c); qa_range_error("Source input exceeds the QC scalar ABI"); }
         qa_compat_qc_words_set_float(words, field->offset, scalar);
       }
-    } else { for(size_t k=0;k<in->field_count;k++) memcpy(words->bytes+c->offsets[k], c->saved+k*12, (size_t)in->fields[k].words*4); retire_cell(in, c); qa_range_error("Missing validated QuakeC client input"); }
+    } else { for(size_t k=0;k<in->field_count;k++) memcpy(words->bytes+c->offsets[k], c->saved+k*12, (size_t)in->fields[k].words*4); retire_cell(in, c); qa_raise("Error", 0, 0, "Missing validated QuakeC client input"); }
   }
   if (in->frame_count==in->frame_capacity){ size_t cap=in->frame_capacity?in->frame_capacity*2:4; in->frames=realloc(in->frames,cap*sizeof *in->frames); in->frame_cells=realloc(in->frame_cells,cap*sizeof *in->frame_cells); if(!in->frames||!in->frame_cells) qa_range_error("mod input allocation failed"); in->frame_capacity=cap; }
   in->frame_cells[in->frame_count]=c; in->frames[in->frame_count++]=app;
   return (qa_compat_qc_mod_input_cleanup){c, cleanup_fn};
 }
 qa_mod_client_input_values qa_compat_qc_mod_input_values(I *in, qa_mod_client_application *app) {
-  if (in->frame_count==0 || in->frames[in->frame_count-1]!=app) qa_range_error("QuakeC client input scope is not active");
+  if (in->frame_count==0 || in->frames[in->frame_count-1]!=app) qa_raise("Error", 0, 0, "QuakeC client input scope is not active");
   return qa_mod_client_input_values_of(app);
 }
 void qa_compat_qc_mod_input_observe_call(I *in, qa_compat_qc_call_site call) {
@@ -95,6 +95,8 @@ static void pop_capture(void *arg) {
   free(cap->entered); free(cap->handler_indices); free(cap->handlers); free(s->befores);
   s->in->capture_count = s->index;
 }
+typedef struct { void *handler_indices; void *handlers; void *befores; } OutputScratch;
+static void output_scratch_free(void *arg) { OutputScratch *s = arg; free(s->handler_indices); free(s->handlers); free(s->befores); }
 qa_mod_client_input_output *qa_compat_qc_mod_input_output(I *in, const qa_mod_qc_input_output *outputs, size_t output_count, qa_mod_client_application *app, void *run_ctx, void (*run)(void *), size_t *out_count) {
   int64_t reference = in->reference(in->ctx, app->identity.actor);
   qa_compat_qc_words *words = qa_compat_qc_entity_memory_from_reference(in->machine->entities, reference);
@@ -105,17 +107,20 @@ qa_mod_client_input_output *qa_compat_qc_mod_input_output(I *in, const qa_mod_qc
   typedef struct { const qa_compat_qc_mod_input_field *field; bool is_vector; qa_vec3 vec; double num; } Before;
   Before *befores = malloc((output_count?output_count:1)*sizeof *befores); size_t bn=0;
   if(!befores) qa_range_error("mod input allocation failed");
+  OutputScratch scratch = {hidx, handlers, befores}; /* released when an output declaration is refused */
+  qa_cleanup scratch_scope; qa_cleanup_push(&scratch_scope, output_scratch_free, &scratch);
   for (size_t i=0;i<output_count;i++) {
     if (outputs[i].is_handler) { hidx[hn]=qa_compat_qc_program_function_named(in->machine->program, outputs[i].function)->index; handlers[hn]=&outputs[i]; hn++; continue; }
-    const qa_compat_qc_mod_input_field *field=NULL;
-    for(size_t j=0;j<in->field_count;j++) if(strcmp(in->fields[j].declaration.field, outputs[i].field)==0) field=&in->fields[j];
-    if(!field) qa_range_error("QC output lacks its declared input field");
+    const qa_compat_qc_mod_input_field *field=NULL; /* TS find: the first field */
+    for(size_t j=0;j<in->field_count && !field;j++) if(strcmp(in->fields[j].declaration.field, outputs[i].field)==0) field=&in->fields[j];
+    if(!field) qa_raise("Error", 0, 0, "QC output lacks its declared input field");
     befores[bn].field=field;
     befores[bn].is_vector=field->words==3; befores[bn].num=NAN; /* TS before!==after holds for a vector before */
     if(field->words==3) befores[bn].vec=qa_compat_qc_words_vector(words,field->offset); else befores[bn].num=qa_compat_qc_words_float(words,field->offset);
     bn++;
   }
   if (in->capture_count==in->capture_capacity){ size_t c=in->capture_capacity?in->capture_capacity*2:4; in->captures=realloc(in->captures,c*sizeof *in->captures); if(!in->captures) qa_range_error("mod input allocation failed"); in->capture_capacity=c; }
+  qa_cleanup_pop(&scratch_scope); /* the capture owns them from here (pop_capture) */
   size_t capture_index=in->capture_count++;
   struct qa_compat_qc_mod_input_capture *cap=&in->captures[capture_index];
   cap->application=app; cap->reference=reference; cap->handler_indices=hidx; cap->handlers=handlers; cap->handler_count=hn; cap->entered=NULL; cap->entered_count=0; cap->entered_capacity=0;

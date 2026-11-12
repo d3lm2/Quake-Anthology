@@ -3,7 +3,10 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/compat/q2/rerelease/deferred_damage.h"
+#include "qa/compat/q2/rerelease/module.h"
 #include "qa/compat/q2/rerelease/public_state.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/support.h"
 #include "qa/network/common/js_number.h"
 
@@ -24,6 +27,8 @@ struct qa_app_sim_rerelease_guest_world {
   qa_app_sim_classic_guest_client *clients; size_t client_count, client_capacity;
   qa_q2_rerelease_entity_state *states; size_t state_capacity;
   char *connect_userinfo;
+  /* writeSave's game projections: the host returns its foreign-actor scratch, which the level write reuses. */
+  qa_compat_q2_rerelease_projection_save *game_projections;
 };
 typedef qa_app_sim_rerelease_guest_world world_t;
 
@@ -35,14 +40,9 @@ static const qa_app_sim_rerelease_guest_services_options *service_options(world_
 static void require_ownership(const world_t *w) { if (w->phase == TRANSFERRED || w->phase == CLOSED) fail("Native rerelease world is retired"); }
 static void require_running(world_t *w) { require_ownership(w); if (w->phase != RUNNING) fail("Native world has not spawned"); }
 
-char *qa_app_sim_fit_rerelease_text(const char *text, size_t capacity) {
-  /* UTF-16 slicing in TS can split a surrogate pair; the C bytes are cut at code point boundaries. */
-  size_t n = strlen(text);
-  if (n < capacity) return dup_text(text);
-  size_t end = capacity == 0 ? 0 : capacity - 1;
-  while (end > 0 && ((unsigned char)text[end] & 0xc0) == 0x80) end--;
-  char *out = malloc(end + 1); if (out == NULL) qa_range_error("Out of memory"); memcpy(out, text, end); out[end] = '\0'; return out;
-}
+/* TS fitRereleaseText (compat/q2/rerelease/module.ts): the longest UTF-16 prefix whose UTF-8 is shorter than capacity,
+ * which can end in the high half of a surrogate pair (U+FFFD in UTF-8). */
+char *qa_app_sim_fit_rerelease_text(const char *text, size_t capacity) { return qa_compat_q2_fit_rerelease_text(text, capacity); }
 
 /* --- clients --- */
 static qa_app_sim_classic_guest_client *find_client(world_t *w, double slot) { for (size_t i = 0; i < w->client_count; i++) if (w->clients[i].slot == slot) return &w->clients[i]; return NULL; }
@@ -115,8 +115,20 @@ static world_t *new_world(retained *shared) { world_t *w = calloc(1, sizeof *w);
 static qa_compat_q2_rerelease_core_services bind_memory(void *ctx, qa_compat_q2_memory *memory) { return qa_app_sim_rerelease_guest_services_bind_memory(((retained *)ctx)->services, memory); }
 static bool clock_now(void *ctx, double *out) { retained *r = ctx; return r->now(r->clock_ctx, out); }
 static bool clock_counter(void *ctx, int64_t *out) { retained *r = ctx; return r->counter(r->clock_ctx, out); }
+/* A refused create releases the services and the source it built (TS drops them). */
+static void create_release(void *arg) {
+  retained *shared = arg;
+  if (shared->source != NULL) qa_app_sim_rerelease_guest_source_destroy(shared->source);
+  if (shared->services != NULL) qa_app_sim_rerelease_guest_services_destroy(shared->services);
+  free(shared);
+}
+static void bind_created(void *arg) {
+  retained *shared = arg;
+  qa_app_sim_rerelease_guest_services_bind_host(shared->services, qa_app_sim_rerelease_guest_source_host(shared->source));
+}
 world_t *qa_app_sim_rerelease_guest_world_create(const qa_app_sim_rerelease_guest_world_options *options) {
   retained *shared = calloc(1, sizeof *shared); if (shared == NULL) qa_range_error("Out of memory");
+  qa_cleanup release_node; qa_cleanup_push(&release_node, create_release, shared);
   qa_app_sim_rerelease_guest_services_options services = options->services;
   shared->fallback = services.base.command; services.base.command.ctx = shared; services.base.command.command = context_command;
   shared->services = qa_app_sim_rerelease_guest_services_create(&services); if (shared->services == NULL) qa_range_error("Out of memory");
@@ -130,7 +142,15 @@ world_t *qa_app_sim_rerelease_guest_world_create(const qa_app_sim_rerelease_gues
   if (options->has_instruction_budget) { source.host.module_options.has_instruction_budget = true; source.host.module_options.instruction_budget = options->instruction_budget; }
   source.services_ctx = shared; source.services = bind_memory;
   shared->source = qa_app_sim_rerelease_guest_source_create(options->prepared, &source);
-  qa_app_sim_rerelease_guest_services_bind_host(shared->services, qa_app_sim_rerelease_guest_source_host(shared->source));
+  /* try { services.bindHost(source.host) } catch (error) { try { source.close() } catch (cleanup) { AggregateError } throw error } */
+  qa_caught_error caught;
+  if (!qa_try(bind_created, shared, &caught)) {
+    qa_caught_error cleanup;
+    if (!qa_try((void (*)(void *))qa_app_sim_rerelease_guest_source_close, shared->source, &cleanup))
+      qa_raise("AggregateError", 0, 0, "Native services binding and cleanup failed");
+    qa_rethrow(&caught);
+  }
+  qa_cleanup_pop(&release_node);
   return new_world(shared);
 }
 static void release_shared(retained *r) {
@@ -140,6 +160,7 @@ static void release_shared(retained *r) {
 void qa_app_sim_rerelease_guest_world_destroy(world_t *w) {
   if (w == NULL) return;
   close_input(w); clear_clients(w); free(w->clients); free(w->retirements); free(w->states); free(w->connect_userinfo);
+  free(w->game_projections);
   release_shared(w->shared); free(w);
 }
 bool qa_app_sim_rerelease_guest_world_is_retired(const world_t *w) { return w->phase == TRANSFERRED || w->phase == CLOSED; }
@@ -229,7 +250,16 @@ static world_t *transfer(world_t *w, qa_app_sim_classic_guest_map map, const qa_
   for (size_t i = 0; i < t.client_count; i++) free(t.clients[i].userinfo);
   free(t.clients);
   qa_cleanup_pop(&s.node); w->busy = false;
-  if (!completed) { qa_app_sim_rerelease_guest_world_close(next); qa_rethrow(&caught); }
+  if (!completed) {
+    /* catch (error) { try { next.close() } catch (cleanup) { throw AggregateError([error, cleanup], ...) } throw error }.
+     * Nothing holds the candidate afterwards, so it is released (and with it its share of the source). */
+    qa_caught_error cleanup;
+    bool closed = qa_try((void (*)(void *))qa_app_sim_rerelease_guest_world_close, next, &cleanup);
+    next->phase = CLOSED;
+    qa_app_sim_rerelease_guest_world_destroy(next);
+    if (!closed) qa_raise("AggregateError", 0, 0, "Native map travel and cleanup failed");
+    qa_rethrow(&caught);
+  }
   return next;
 }
 world_t *qa_app_sim_rerelease_guest_world_travel(world_t *w, qa_app_sim_classic_guest_map map, const qa_app_sim_rerelease_guest_map_services *binding, const qa_app_sim_rerelease_guest_revisit *revisit) {
@@ -286,7 +316,11 @@ void qa_app_sim_rerelease_guest_world_userinfo(world_t *w, double slot, const ch
   uint8_t output[2048]; memory->copy(memory->ctx, info.info, output, 2048);
   void *end_byte = memchr(output, 0, 2048);
   if (end_byte == NULL) fail("ClientUserinfoChanged returned unterminated userinfo");
-  set_client(w, slot, phase, (const char *)output);
+  /* new TextDecoder().decode(output.subarray(0, end)) */
+  char *decoded = qa_text_decoder_decode(output, (size_t)((uint8_t *)end_byte - output), NULL); if (decoded == NULL) qa_range_error("Out of memory");
+  qa_cleanup decoded_node; qa_cleanup_push(&decoded_node, free, decoded);
+  set_client(w, slot, phase, decoded);
+  qa_cleanup_pop(&decoded_node); free(decoded);
   qa_cleanup_pop(&node); unmap_info(&info);
   end(&s);
 }
@@ -343,6 +377,7 @@ const qa_q2_rerelease_entity_state *qa_app_sim_rerelease_guest_world_entity_stat
 }
 qa_q2_rerelease_entity_state qa_app_sim_rerelease_guest_world_entity_state(world_t *w, double slot) { require_running(w); return qa_app_sim_rerelease_guest_services_entity_state(w->shared->services, slot); }
 qa_q2_rerelease_player_state qa_app_sim_rerelease_guest_world_player_state(world_t *w, double slot) { require_running(w); return qa_app_sim_rerelease_guest_services_player_state(w->shared->services, slot); }
+qa_q2_rerelease_player_state qa_app_sim_rerelease_guest_world_player_state_into(world_t *w, double slot, double *stats) { require_running(w); return qa_app_sim_rerelease_guest_services_player_state_into(w->shared->services, slot, stats); }
 double qa_app_sim_rerelease_guest_world_player_ping(world_t *w, double slot) { require_running(w); return qa_app_sim_rerelease_guest_services_player_ping(w->shared->services, slot); }
 void qa_app_sim_rerelease_guest_world_set_player_ping(world_t *w, double slot, double ping) {
   scope_t s; begin(w, &s); require_running(w); (void)require_client(w, slot, NULL); qa_app_sim_rerelease_guest_services_set_player_ping(w->shared->services, slot, ping); end(&s);
@@ -354,15 +389,37 @@ void qa_app_sim_rerelease_guest_world_restore_configstrings(world_t *w, const qa
   if (w->phase != INITIALIZED) fail("Native configstrings require the initialized candidate");
   qa_app_sim_rerelease_guest_services_restore_configstrings(qa_app_sim_rerelease_guest_world_services(w), values, count);
 }
+/* The game save's projections borrow the host's scratch, which the level write refills (and may move): keep a copy
+ * the world owns until the next save. A refused level write releases the game save it already wrote. */
+static void keep_game_projections(world_t *w, qa_compat_q2_rerelease_source_save *game) {
+  free(w->game_projections); w->game_projections = NULL;
+  if (game->projection_count == 0) return;
+  w->game_projections = malloc(game->projection_count * sizeof *w->game_projections);
+  if (w->game_projections == NULL) qa_range_error("Out of memory");
+  memcpy(w->game_projections, game->projections, game->projection_count * sizeof *w->game_projections);
+  game->projections = w->game_projections;
+}
+static void release_written_game(void *arg) {
+  qa_compat_q2_rerelease_source_save *game = arg;
+  free(game->native);
+  qa_compat_q2_rerelease_deferred_damage_free_saves((qa_compat_q2_rerelease_deferred_damage_save *)game->deferred_damage, game->deferred_damage_count);
+}
 qa_app_sim_rerelease_guest_save qa_app_sim_rerelease_guest_world_write_save(world_t *w, bool autosave) {
-  scope_t s; begin(w, &s); require_running(w); qa_app_sim_rerelease_guest_save out;
-  out.game = qa_compat_q2_rerelease_q2_guest_host_write_save(host_of(w), "game", autosave); out.level = qa_compat_q2_rerelease_q2_guest_host_write_save(host_of(w), "level", false);
+  scope_t s; begin(w, &s); require_running(w); qa_app_sim_rerelease_guest_save out; out.level_absent = false;
+  out.game = qa_compat_q2_rerelease_q2_guest_host_write_save(host_of(w), "game", autosave);
+  qa_cleanup game_node; qa_cleanup_push(&game_node, release_written_game, &out.game);
+  keep_game_projections(w, &out.game);
+  out.level = qa_compat_q2_rerelease_q2_guest_host_write_save(host_of(w), "level", false);
+  qa_cleanup_pop(&game_node);
   end(&s); return out;
 }
 qa_app_sim_rerelease_guest_save qa_app_sim_rerelease_guest_world_write_save_loading(world_t *w, bool autosave, void (*next_frame)(void *), void *next_ctx) {
-  scope_t s; begin(w, &s); require_running(w); qa_app_sim_rerelease_guest_save out;
+  scope_t s; begin(w, &s); require_running(w); qa_app_sim_rerelease_guest_save out; out.level_absent = false;
   out.game = qa_compat_q2_rerelease_q2_guest_host_write_save_loading(host_of(w), "game", autosave, next_frame, next_ctx);
+  qa_cleanup game_node; qa_cleanup_push(&game_node, release_written_game, &out.game);
+  keep_game_projections(w, &out.game);
   out.level = qa_compat_q2_rerelease_q2_guest_host_write_save_loading(host_of(w), "level", false, next_frame, next_ctx);
+  qa_cleanup_pop(&game_node);
   end(&s); return out;
 }
 qa_compat_q2_rerelease_source_save qa_app_sim_rerelease_guest_world_write_travel_level(world_t *w) {
@@ -378,7 +435,8 @@ static void restore(world_t *w, qa_app_sim_rerelease_guest_save saved, qa_app_si
   else { qa_compat_q2_rerelease_q2_guest_host_read_save_loading(host_of(w), "game", saved.game, next_frame, next_ctx, "checkpoint"); spawn_map_loading(w, map, next_frame, next_ctx); }
   w->phase = INITIALIZED; size_t drained; (void)qa_app_sim_rerelease_guest_services_drain_messages(w->shared->services, &drained);
   restore_server_state(restore_ctx);
-  if (next_frame == NULL) qa_compat_q2_rerelease_q2_guest_host_read_save(host_of(w), "level", saved.level, "checkpoint");
+  if (saved.level_absent) { /* TS saved.level === null: the freshly spawned level stays */ }
+  else if (next_frame == NULL) qa_compat_q2_rerelease_q2_guest_host_read_save(host_of(w), "level", saved.level, "checkpoint");
   else qa_compat_q2_rerelease_q2_guest_host_read_save_loading(host_of(w), "level", saved.level, next_frame, next_ctx, "checkpoint");
   qa_app_sim_rerelease_guest_services_complete_spawn(w->shared->services); w->phase = RUNNING;
 }

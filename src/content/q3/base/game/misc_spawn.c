@@ -13,7 +13,7 @@ static qa_q3_entity_callback cb_use(qa_q3_entity_use_fn fn, void *ctx) { qa_q3_e
 static qa_q3_entity_callback cb_think(qa_q3_entity_think_fn fn, void *ctx) { qa_q3_entity_callback cb; memcpy(&cb.fn, &fn, sizeof fn); cb.ctx = ctx; return cb; }
 static void owned(qa_q3_misc_spawn_runtime *r, qa_q3_game_entity *e) {
   if (qa_q3_entity_pool_get(r->host.pool, e->slot) != e)
-    qa_range_error("Misc spawn entity does not belong to its entity pool or was replaced");
+    qa_raise("Error", 0, 0, "Misc spawn entity does not belong to its entity pool or was replaced");
 }
 static qa_q3_portal_context portal_ctx(qa_q3_misc_spawn_runtime *r) {
   qa_q3_portal_context c; memset(&c, 0, sizeof c);
@@ -52,7 +52,7 @@ void qa_q3_misc_spawn_bind_save_callbacks(qa_q3_misc_spawn_runtime *r) {
   qa_q3_callback_family_intern(&r->host.pool->callbacks.think, "q3.base.game.misc-spawn.shooter.think", cb_think(finish_shooter, r));
 }
 void qa_q3_misc_spawn_runtime_init(qa_q3_misc_spawn_runtime *r, qa_q3_misc_spawn_host host) {
-  if (host.item_product != host.missile_product) qa_range_error("Misc spawn item registry does not match its missile product");
+  if (host.item_product != host.missile_product) qa_raise("Error", 0, 0, "Misc spawn item registry does not match its missile product");
   r->host = host; qa_q3_misc_spawn_bind_save_callbacks(r); qa_q3_bind_portal_save_callbacks(portal_ctx(r));
 }
 static void shooter(qa_q3_misc_spawn_runtime *r, qa_q3_game_entity *e, double weapon) {

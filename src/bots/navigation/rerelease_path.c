@@ -161,9 +161,16 @@ qa_rerelease_path_info qa_rerelease_path_to_goal(qa_navigation_runtime *runtime,
     Cost *entry = NULL;
     for (size_t i = 0; i < cn; i++) if (costs[i].node == cursor) entry = &costs[i];
     const qa_navigation_edge *edge = entry ? entry->previous : NULL;
-    if (!edge || en >= runtime->graph->node_count) qa_range_error("Invalid shared navigation predecessor chain");
+    /* TS throws plain Errors here. */
+    if (!edge || en >= runtime->graph->node_count) {
+      free(costs); free(edges); free(nodes);
+      qa_raise("Error", 0, 0, "Invalid shared navigation predecessor chain");
+    }
     const qa_navigation_node *node = qa_navigation_runtime_node(runtime, edge->from);
-    if (!node) qa_range_error("Missing shared navigation predecessor");
+    if (!node) {
+      free(costs); free(edges); free(nodes);
+      qa_raise("Error", 0, 0, "Missing shared navigation predecessor");
+    }
     PUSH_PTR(edges, en, ecap, edge);
     PUSH_PTR(nodes, nn, ncap, node);
     cursor = edge->from;
@@ -175,13 +182,13 @@ qa_rerelease_path_info qa_rerelease_path_to_goal(qa_navigation_runtime *runtime,
   size_t first_index = 0;
   if (!request.ignore_node_flags && edge && (edge->mode == QA_TM_WALK || edge->mode == QA_TM_CROUCH)) {
     double dx = request.start.x - start->origin.x, dy = request.start.y - start->origin.y;
-    double length = hypot(dx, dy);
+    double length = qa_js_hypot2(dx, dy);
     const qa_navigation_node *next = nn > 1 ? nodes[1] : NULL;
     if ((length <= start->radius && fabs(request.start.z - start->origin.z) <= 64) ||
         (length > 0 && next && dx * (next->origin.x - start->origin.x) + dy * (next->origin.y - start->origin.y) > start->radius * length))
       first_index = 1;
   }
-  if (first_index >= nn) qa_range_error("Empty shared navigation result");
+  if (first_index >= nn) { free(edges); free(nodes); qa_raise("Error", 0, 0, "Empty shared navigation result"); }
   const qa_navigation_node *first_node = nodes[first_index];
   double walked = 0;
   qa_vec3 at = request.start;

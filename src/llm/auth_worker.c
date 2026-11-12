@@ -42,29 +42,33 @@ static void post_message(qa_llm_auth_worker *worker, qa_llm_auth_worker_message_
   if (worker->post != NULL) worker->post(worker->post_ctx, &message);
 }
 
-void qa_llm_auth_worker_validate(int requested_port, const char *expected_state) {
-  if (requested_port < 0 || requested_port > 65535 || expected_state == NULL || expected_state[0] == '\0') {
-    qa_llm_plain_error("Invalid subscription callback worker data.");
-  }
+/* The worker's startup checks throw an Error in the worker thread; the parent
+ * sees its "error"/"exit" events (Sign-in failed.), never a process abort. */
+bool qa_llm_auth_worker_validate(int requested_port, const char *expected_state) {
+  return !(requested_port < 0 || requested_port > 65535 || expected_state == NULL || expected_state[0] == '\0');
 }
 
-void qa_llm_auth_worker_parse_data(const qa_llm_json *worker_data, int *out_port, char **out_state) {
+bool qa_llm_auth_worker_parse_data(const qa_llm_json *worker_data, int *out_port, char **out_state) {
+  *out_port = 0;
+  *out_state = NULL;
   /* fields(): only a plain object is admitted. */
-  if (!qa_llm_json_is_object(worker_data)) qa_llm_plain_error("Invalid subscription callback worker data.");
+  if (!qa_llm_json_is_object(worker_data)) return false;
   const qa_llm_json *port = qa_llm_json_get(worker_data, "port");
   const qa_llm_json *state = qa_llm_json_get(worker_data, "state");
   if (port == NULL || port->kind != QA_LLM_JSON_NUMBER || port->number != floor(port->number) ||
       !(port->number >= 0 && port->number <= 65535) ||
       state == NULL || state->kind != QA_LLM_JSON_STRING || state->string[0] == '\0') {
-    qa_llm_plain_error("Invalid subscription callback worker data.");
+    return false;
   }
   *out_port = (int)port->number;
   *out_state = qa_llm_strdup(state->string);
+  return true;
 }
 
 qa_llm_auth_worker *qa_llm_auth_worker_start(int requested_port, const char *expected_state,
                                              qa_llm_auth_worker_post_fn post, void *post_ctx) {
-  qa_llm_auth_worker_validate(requested_port, expected_state);
+  /* Invalid workerData: the worker throws before posting anything. */
+  if (!qa_llm_auth_worker_validate(requested_port, expected_state)) return NULL;
   qa_llm_auth_worker *worker = calloc(1, sizeof *worker);
   if (worker == NULL) qa_llm_oom();
   worker->listen_fd = -1;
@@ -123,7 +127,15 @@ static char *query_decode(const char *text, size_t length) {
     }
     qa_llm_strbuf_append_char(&out, c);
   }
-  return qa_llm_strbuf_steal(&out);
+  /* The percent-decoded bytes are then UTF-8 decoded without BOM, each invalid
+   * sequence becoming U+FFFD (the code is forwarded to the token request). */
+  qa_llm_bytes utf8;
+  qa_llm_bytes_init(&utf8);
+  qa_llm_utf8_decode_lossy((const uint8_t *)qa_llm_strbuf_text(&out), out.length, &utf8);
+  qa_llm_strbuf_free(&out);
+  char *decoded = qa_llm_strndup(utf8.length > 0 ? (const char *)utf8.data : "", utf8.length);
+  qa_llm_bytes_free(&utf8);
+  return decoded;
 }
 
 static char *query_get(const char *query, const char *name, bool *present) {
@@ -198,22 +210,30 @@ bool qa_llm_auth_worker_serve_once(qa_llm_auth_worker *worker, int timeout_ms) {
   if (ready <= 0 || (poller.revents & POLLIN) == 0) return true;
   int connection = accept(worker->listen_fd, NULL, NULL);
   if (connection < 0) return true;
-  /* One request line is all the handler needs; read until its end. */
-  char buffer[8192];
-  size_t length = 0;
+  /* One request line is all the handler needs; read until its end. The line
+   * may be as long as Bun.serve's request head (16 KiB by default). */
+  enum { REQUEST_HEAD_LIMIT = 16384 };
+  qa_llm_strbuf buffer;
+  qa_llm_strbuf_init(&buffer);
   struct pollfd reader = { connection, POLLIN, 0 };
-  while (length + 1 < sizeof buffer) {
+  char chunk[4096];
+  while (buffer.length < REQUEST_HEAD_LIMIT) {
     if (poll(&reader, 1, 1000) <= 0) break;
-    ssize_t got = read(connection, buffer + length, sizeof buffer - 1 - length);
+    ssize_t got = read(connection, chunk, sizeof chunk);
     if (got <= 0) break;
-    length += (size_t)got;
-    buffer[length] = '\0';
-    if (strstr(buffer, "\r\n") != NULL) break;
+    qa_llm_strbuf_append_n(&buffer, chunk, (size_t)got);
+    if (strstr(qa_llm_strbuf_text(&buffer), "\r\n") != NULL) break;
   }
-  buffer[length] = '\0';
-  char method[16] = "";
-  char target[4096] = "";
-  if (sscanf(buffer, "%15s %4095s", method, target) == 2) {
+  const char *line = qa_llm_strbuf_text(&buffer);
+  size_t line_length = strcspn(line, "\r\n");
+  const char *method_end = memchr(line, ' ', line_length);
+  const char *target_begin = method_end != NULL ? method_end + 1 : NULL;
+  const char *target_end = target_begin != NULL ? memchr(target_begin, ' ', line_length - (size_t)(target_begin - line)) : NULL;
+  if (target_end == NULL && target_begin != NULL) target_end = line + line_length;
+  char *method = method_end != NULL && method_end > line ? qa_llm_strndup(line, (size_t)(method_end - line)) : NULL;
+  char *target = target_end != NULL && target_end > target_begin ? qa_llm_strndup(target_begin, (size_t)(target_end - target_begin)) : NULL;
+  qa_llm_strbuf_free(&buffer);
+  if (method != NULL && target != NULL) {
     int status = 400;
     char *body = NULL;
     qa_llm_auth_worker_handle_request(worker, method, target, &status, &body);
@@ -233,6 +253,8 @@ bool qa_llm_auth_worker_serve_once(qa_llm_auth_worker *worker, int timeout_ms) {
     qa_llm_strbuf_free(&response);
     free(body);
   }
+  free(method);
+  free(target);
   close(connection);
   return true;
 }

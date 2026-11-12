@@ -79,9 +79,7 @@ static void missile_use_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services 
   qa_q2_entity *const *found = game->targets(game->ctx, entity->target, &n);
   qa_q2_entity *target = n > 0 ? found[0] : NULL;
   if (target == NULL) {
-    char message[256];
-    (void)snprintf(message, sizeof message, "misc_viper_missile missing target %s", entity->target);
-    game->host->diagnostic(game->host->ctx, message);
+    q2mp_diagnosticf(game, "misc_viper_missile missing target %s", entity->target);
     return;
   }
   entity->enemy = target->actor.id; entity->has_enemy = true;

@@ -80,6 +80,8 @@ void qa_q1mpm_eel_zap(qa_q1mpm_mission_monster *monster) {
   qa_q1_actor *entity = monster->base.entity;
   size_t count = 0;
   qa_actor_id *targets = qa_q1mpm_radius_actors(game, qa_q1_base_monster_origin(&monster->base), 85, &count);
+  qa_cleanup targets_node; /* a damage callback can raise */
+  qa_cleanup_push(&targets_node, free, targets);
   for (size_t i = 0; i < count; i++) {
     const qa_actor_id target = targets[i];
     const char *classname = game->host.classname(game->host.ctx, target);
@@ -95,6 +97,7 @@ void qa_q1mpm_eel_zap(qa_q1mpm_mission_monster *monster) {
     if (points > 0 && qa_q1_can_damage(game, target, entity->actor.id))
       (void)qa_q1_damage(game, target, entity->actor.id, &entity->actor.id, points, NULL, NULL, NULL, NULL);
   }
+  qa_cleanup_pop(&targets_node);
   free(targets);
 }
 qa_q1_actor *qa_q1mpm_missile(qa_q1_services *game, qa_actor_id owner, const char *classname,

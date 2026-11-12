@@ -8,83 +8,140 @@ enum { ST_SERVER_VARS, ST_SET_VIEWS, ST_SEQUENCE, ST_LEVEL_COMPLETED, ST_BACK_TO
   ST_PROMPT_BEGIN, ST_PROMPT_CHOICE, ST_STAT, ST_LIGHT_STYLE, ST_NAME, ST_COLORS, ST_FRAGS,
   ST_PING, ST_SOCIAL, ST_PLAYER_INFO, ST_SET_VIEW, ST_SET_ANGLE, ST_PAUSE, ST_CD_TRACK,
   ST_FOG, ST_SKYBOX, ST_INTERMISSION };
-static int state_key(int category, int discriminator) { return discriminator * 32 + category; }
-#define MAX_ENTRIES 512
-#define MAX_CLIENTS 64
-typedef struct local_state { int keys[MAX_ENTRIES]; qa_netquake_message values[MAX_ENTRIES]; size_t count; } local_state;
+/* TS Maps: every table grows without a fixed cap. */
+typedef struct local_state { double *keys; qa_netquake_message *values; size_t count, capacity; } local_state;
 struct qa_app_sim_quakec_local_messages {
   local_state baseline;
-  qa_actor_id client_actors[MAX_CLIENTS]; local_state clients[MAX_CLIENTS]; size_t client_count;
+  qa_actor_id *client_actors; local_state *clients; size_t client_count, client_capacity;
   bool has_baseline_view; qa_actor_id baseline_view;
-  qa_actor_id view_actors[MAX_CLIENTS], view_targets[MAX_CLIENTS]; size_t view_count;
-  qa_netquake_message scratch[MAX_ENTRIES]; size_t scratch_count;
+  qa_actor_id *view_actors, *view_targets; size_t view_count, view_capacity;
+  qa_netquake_message *scratch; size_t scratch_count, scratch_capacity;
 };
+static void *grow(void *items, size_t *capacity, size_t needed, size_t size) {
+  if (needed <= *capacity) return items;
+  size_t next = *capacity ? *capacity * 2 : 8;
+  while (next < needed) next *= 2;
+  void *grown = realloc(items, next * size);
+  if (grown == NULL) qa_range_error("Out of memory");
+  *capacity = next;
+  return grown;
+}
+/* TS strings are values that live while a Map holds them: every table owns deep copies of its
+ * messages' text, released when the entry is replaced, deleted or the table is freed. */
+static char *text_copy(const char *text) {
+  if (text == NULL) return NULL;
+  size_t n = strlen(text) + 1;
+  char *out = malloc(n);
+  if (out == NULL) qa_range_error("Out of memory");
+  memcpy(out, text, n);
+  return out;
+}
+static char **texts_copy(char *const *texts, size_t count) {
+  if (count == 0) return NULL;
+  char **out = calloc(count, sizeof *out);
+  if (out == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < count; i++) out[i] = text_copy(texts[i]);
+  return out;
+}
+static qa_netquake_message message_copy(const qa_netquake_message *m) {
+  qa_netquake_message c = *m;
+  c.text = NULL; c.level = NULL; c.str_value = NULL; c.models = NULL; c.sounds = NULL;
+  c.text = text_copy(m->text); c.level = text_copy(m->level); c.str_value = text_copy(m->str_value);
+  c.models = texts_copy(m->models, m->model_count); c.sounds = texts_copy(m->sounds, m->sound_count);
+  return c;
+}
+static void state_free(local_state *s) {
+  for (size_t i = 0; i < s->count; i++) qa_netquake_message_destroy(&s->values[i]);
+  free(s->keys); free(s->values); memset(s, 0, sizeof *s);
+}
+static local_state state_copy(const local_state *from) {
+  local_state out; memset(&out, 0, sizeof out);
+  if (from->count == 0) return out;
+  out.keys = malloc(from->count * sizeof *out.keys);
+  out.values = calloc(from->count, sizeof *out.values);
+  if (out.keys == NULL || out.values == NULL) { free(out.keys); free(out.values); qa_range_error("Out of memory"); }
+  memcpy(out.keys, from->keys, from->count * sizeof *out.keys);
+  for (size_t i = 0; i < from->count; i++) out.values[i] = message_copy(&from->values[i]);
+  out.count = out.capacity = from->count;
+  return out;
+}
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
-static int find_key(local_state *s, int key) {
-  for (size_t i = 0; i < s->count; i++) if (s->keys[i] == key) return (int)i;
+/* TS stateKey(category, discriminator) = discriminator * 32 + category, a number key. */
+static double state_key(int category, double discriminator) { return discriminator * 32 + category; }
+/* Map keys compare by SameValueZero: a NaN key finds a NaN key. */
+static int find_key(local_state *s, double key) {
+  for (size_t i = 0; i < s->count; i++) if (s->keys[i] == key || (s->keys[i] != s->keys[i] && key != key)) return (int)i;
   return -1;
 }
-static void set_key(local_state *s, int key, qa_netquake_message m) {
+/* Takes ownership of m (an owned copy): Map.set replaces the value in place. */
+static void set_owned(local_state *s, double key, qa_netquake_message m) {
   int at = find_key(s, key);
-  if (at >= 0) { s->values[at] = m; return; }
-  if (s->count >= MAX_ENTRIES) qa_range_error("Out of memory");
+  if (at >= 0) { qa_netquake_message old = s->values[at]; s->values[at] = m; qa_netquake_message_destroy(&old); return; }
+  size_t keys_capacity = s->capacity;
+  s->keys = grow(s->keys, &keys_capacity, s->count + 1, sizeof *s->keys);
+  s->values = grow(s->values, &s->capacity, s->count + 1, sizeof *s->values);
   s->keys[s->count] = key; s->values[s->count++] = m;
 }
-static qa_netquake_message *get_key(local_state *s, int key) {
+/* Copies m first, so m may alias the entry it replaces. */
+static void set_key(local_state *s, double key, const qa_netquake_message *m) { set_owned(s, key, message_copy(m)); }
+static qa_netquake_message *get_key(local_state *s, double key) {
   int at = find_key(s, key); return at >= 0 ? &s->values[at] : NULL;
 }
-static void delete_key(local_state *s, int key) {
+static void delete_key(local_state *s, double key) {
   int at = find_key(s, key); if (at < 0) return;
+  qa_netquake_message_destroy(&s->values[at]);
   memmove(&s->keys[at], &s->keys[at + 1], (s->count - (size_t)at - 1) * sizeof s->keys[0]);
   memmove(&s->values[at], &s->values[at + 1], (s->count - (size_t)at - 1) * sizeof s->values[0]);
   s->count--;
 }
-static void retained(local_state *state, qa_netquake_message m) {
+static void retained(local_state *state, const qa_netquake_message *message) {
+  qa_netquake_message m = *message;
   const char *k = m.kind;
-  if (is(k, "server-vars")) set_key(state, state_key(ST_SERVER_VARS, 0), m);
-  else if (is(k, "set-views")) set_key(state, state_key(ST_SET_VIEWS, 0), m);
-  else if (is(k, "sequence")) set_key(state, state_key(ST_SEQUENCE, 0), m);
-  else if (is(k, "level-completed")) set_key(state, state_key(ST_LEVEL_COMPLETED, 0), m);
-  else if (is(k, "back-to-lobby")) set_key(state, state_key(ST_BACK_TO_LOBBY, 0), m);
+  if (is(k, "server-vars")) set_key(state, state_key(ST_SERVER_VARS, 0), message);
+  else if (is(k, "set-views")) set_key(state, state_key(ST_SET_VIEWS, 0), message);
+  else if (is(k, "sequence")) set_key(state, state_key(ST_SEQUENCE, 0), message);
+  else if (is(k, "level-completed")) set_key(state, state_key(ST_LEVEL_COMPLETED, 0), message);
+  else if (is(k, "back-to-lobby")) set_key(state, state_key(ST_BACK_TO_LOBBY, 0), message);
   else if (is(k, "prompt-begin") || is(k, "prompt-clear")) {
+    qa_netquake_message owned = message_copy(message); /* message may alias an entry deleted below */
     for (size_t i = state->count; i-- > 0;)
-      if (state->keys[i] % 32 == ST_PROMPT_BEGIN || state->keys[i] % 32 == ST_PROMPT_CHOICE) delete_key(state, state->keys[i]);
-    set_key(state, state_key(ST_PROMPT_BEGIN, 0), m);
+      if (fmod(state->keys[i], 32) == ST_PROMPT_BEGIN || fmod(state->keys[i], 32) == ST_PROMPT_CHOICE) delete_key(state, state->keys[i]);
+    set_owned(state, state_key(ST_PROMPT_BEGIN, 0), owned);
   } else if (is(k, "prompt-choice")) {
     qa_netquake_message *begin = get_key(state, state_key(ST_PROMPT_BEGIN, 0));
     if (begin && is(begin->kind, "prompt-begin") && begin->text && begin->text[0] != '\0') {
       int count = 0;
       for (size_t i = 0; i < state->count; i++) if (is(state->values[i].kind, "prompt-choice")) count++;
-      set_key(state, state_key(ST_PROMPT_CHOICE, count), m);
+      set_key(state, state_key(ST_PROMPT_CHOICE, count), message);
     }
   } else if (is(k, "stat")) {
-    if (m.index != trunc(m.index) || m.index < 0 || m.index >= 32) qa_range_error("Invalid NetQuake client stat");
-    set_key(state, state_key(ST_STAT, (int)m.index), m);
+    if (m.index != trunc(m.index) || m.index < 0 || m.index >= 32) qa_raise("Error", 0, 0, "Invalid NetQuake client stat");
+    set_key(state, state_key(ST_STAT, m.index), message);
   } else if (is(k, "killed-monster") || is(k, "found-secret")) {
     int index = is(k, "killed-monster") ? 14 : 13;
     qa_netquake_message *old = get_key(state, state_key(ST_STAT, index));
     qa_netquake_message stat; memset(&stat, 0, sizeof stat);
     stat.kind = "stat"; stat.index = index; stat.value = (old && is(old->kind, "stat") ? old->value : 0) + 1;
-    set_key(state, state_key(ST_STAT, index), stat);
+    set_owned(state, state_key(ST_STAT, index), stat);
   } else if (is(k, "spawned-monster")) {
     qa_netquake_message *old = get_key(state, state_key(ST_STAT, 12));
     qa_netquake_message stat; memset(&stat, 0, sizeof stat);
     stat.kind = "stat"; stat.index = 12; stat.value = (old && is(old->kind, "stat") ? old->value : 0) + m.value;
-    set_key(state, state_key(ST_STAT, 12), stat);
-  } else if (is(k, "light-style")) set_key(state, state_key(ST_LIGHT_STYLE, (int)m.index), m);
-  else if (is(k, "name")) set_key(state, state_key(ST_NAME, (int)m.slot), m);
-  else if (is(k, "colors")) set_key(state, state_key(ST_COLORS, (int)m.slot), m);
-  else if (is(k, "frags")) set_key(state, state_key(ST_FRAGS, (int)m.slot), m);
-  else if (is(k, "ping")) set_key(state, state_key(ST_PING, (int)m.slot), m);
-  else if (is(k, "social")) set_key(state, state_key(ST_SOCIAL, (int)m.slot), m);
-  else if (is(k, "player-info")) set_key(state, state_key(ST_PLAYER_INFO, (int)m.slot), m);
-  else if (is(k, "set-view")) set_key(state, state_key(ST_SET_VIEW, 0), m);
-  else if (is(k, "set-angle")) set_key(state, state_key(ST_SET_ANGLE, 0), m);
-  else if (is(k, "pause")) set_key(state, state_key(ST_PAUSE, 0), m);
-  else if (is(k, "cd-track")) set_key(state, state_key(ST_CD_TRACK, 0), m);
-  else if (is(k, "fog")) set_key(state, state_key(ST_FOG, 0), m);
-  else if (is(k, "skybox")) set_key(state, state_key(ST_SKYBOX, 0), m);
-  else if (is(k, "intermission") || is(k, "finale") || is(k, "cutscene")) set_key(state, state_key(ST_INTERMISSION, 0), m);
+    set_owned(state, state_key(ST_STAT, 12), stat);
+  } else if (is(k, "light-style")) set_key(state, state_key(ST_LIGHT_STYLE, m.index), message);
+  else if (is(k, "name")) set_key(state, state_key(ST_NAME, m.slot), message);
+  else if (is(k, "colors")) set_key(state, state_key(ST_COLORS, m.slot), message);
+  else if (is(k, "frags")) set_key(state, state_key(ST_FRAGS, m.slot), message);
+  else if (is(k, "ping")) set_key(state, state_key(ST_PING, m.slot), message);
+  else if (is(k, "social")) set_key(state, state_key(ST_SOCIAL, m.slot), message);
+  else if (is(k, "player-info")) set_key(state, state_key(ST_PLAYER_INFO, m.slot), message);
+  else if (is(k, "set-view")) set_key(state, state_key(ST_SET_VIEW, 0), message);
+  else if (is(k, "set-angle")) set_key(state, state_key(ST_SET_ANGLE, 0), message);
+  else if (is(k, "pause")) set_key(state, state_key(ST_PAUSE, 0), message);
+  else if (is(k, "cd-track")) set_key(state, state_key(ST_CD_TRACK, 0), message);
+  else if (is(k, "fog")) set_key(state, state_key(ST_FOG, 0), message);
+  else if (is(k, "skybox")) set_key(state, state_key(ST_SKYBOX, 0), message);
+  else if (is(k, "intermission") || is(k, "finale") || is(k, "cutscene")) set_key(state, state_key(ST_INTERMISSION, 0), message);
 }
 static local_state *client_of(qa_app_sim_quakec_local_messages *s, qa_actor_id actor) {
   for (size_t i = 0; i < s->client_count; i++) if (qa_same_actor(s->client_actors[i], actor)) return &s->clients[i];
@@ -92,7 +149,9 @@ static local_state *client_of(qa_app_sim_quakec_local_messages *s, qa_actor_id a
 }
 static void view_set(qa_app_sim_quakec_local_messages *s, qa_actor_id actor, qa_actor_id target) {
   for (size_t i = 0; i < s->view_count; i++) if (qa_same_actor(s->view_actors[i], actor)) { s->view_targets[i] = target; return; }
-  if (s->view_count >= MAX_CLIENTS) qa_range_error("Out of memory");
+  size_t actors_capacity = s->view_capacity;
+  s->view_actors = grow(s->view_actors, &actors_capacity, s->view_count + 1, sizeof *s->view_actors);
+  s->view_targets = grow(s->view_targets, &s->view_capacity, s->view_count + 1, sizeof *s->view_targets);
   s->view_actors[s->view_count] = actor; s->view_targets[s->view_count++] = target;
 }
 static void view_delete(qa_app_sim_quakec_local_messages *s, qa_actor_id actor) {
@@ -107,13 +166,30 @@ qa_app_sim_quakec_local_messages *qa_app_sim_quakec_local_messages_create(void) 
   if (!s) qa_range_error("Out of memory");
   return s;
 }
-void qa_app_sim_quakec_local_messages_destroy(qa_app_sim_quakec_local_messages *state) { free(state); }
+static void clients_clear(qa_app_sim_quakec_local_messages *s) {
+  for (size_t i = 0; i < s->client_count; i++) state_free(&s->clients[i]);
+  s->client_count = 0;
+}
+void qa_app_sim_quakec_local_messages_destroy(qa_app_sim_quakec_local_messages *state) {
+  if (state == NULL) return;
+  clients_clear(state); state_free(&state->baseline);
+  free(state->client_actors); free(state->clients); free(state->view_actors); free(state->view_targets); free(state->scratch);
+  free(state);
+}
+static void clients_reserve(qa_app_sim_quakec_local_messages *s) {
+  size_t actors_capacity = s->client_capacity;
+  s->client_actors = grow(s->client_actors, &actors_capacity, s->client_count + 1, sizeof *s->client_actors);
+  s->clients = grow(s->clients, &s->client_capacity, s->client_count + 1, sizeof *s->clients);
+}
+/* The caller reserved a slot first, so pushing cannot raise and orphan an owned copy. */
+static void clients_push(qa_app_sim_quakec_local_messages *s, qa_actor_id actor, local_state value) {
+  s->client_actors[s->client_count] = actor;
+  s->clients[s->client_count++] = value;
+}
 void qa_app_sim_quakec_local_messages_admit(qa_app_sim_quakec_local_messages *state, qa_actor_id actor) {
   if (client_of(state, actor)) return;
-  if (state->client_count >= MAX_CLIENTS) qa_range_error("Out of memory");
-  state->client_actors[state->client_count] = actor;
-  state->clients[state->client_count] = state->baseline;
-  state->client_count++;
+  clients_reserve(state);
+  clients_push(state, actor, state_copy(&state->baseline));
   if (state->has_baseline_view) view_set(state, actor, state->baseline_view);
 }
 bool qa_app_sim_quakec_local_messages_has_client(qa_app_sim_quakec_local_messages *state, qa_actor_id actor) {
@@ -121,6 +197,7 @@ bool qa_app_sim_quakec_local_messages_has_client(qa_app_sim_quakec_local_message
 }
 void qa_app_sim_quakec_local_messages_retire(qa_app_sim_quakec_local_messages *state, qa_actor_id actor) {
   for (size_t i = 0; i < state->client_count; i++) if (qa_same_actor(state->client_actors[i], actor)) {
+    state_free(&state->clients[i]);
     memmove(&state->client_actors[i], &state->client_actors[i + 1], (state->client_count - i - 1) * sizeof state->client_actors[0]);
     memmove(&state->clients[i], &state->clients[i + 1], (state->client_count - i - 1) * sizeof state->clients[0]);
     state->client_count--; break;
@@ -147,19 +224,19 @@ void qa_app_sim_quakec_local_messages_receive(qa_app_sim_quakec_local_messages *
   }
   if (actor == NULL) {
     for (size_t i = 0; i < message_count; i++) {
-      retained(&state->baseline, messages[i]);
-      for (size_t c = 0; c < state->client_count; c++) retained(&state->clients[c], messages[i]);
+      retained(&state->baseline, &messages[i]);
+      for (size_t c = 0; c < state->client_count; c++) retained(&state->clients[c], &messages[i]);
     }
   } else {
     qa_app_sim_quakec_local_messages_admit(state, *actor);
     local_state *client = client_of(state, *actor);
-    if (client == NULL) qa_range_error("Missing local QC client state");
-    for (size_t i = 0; i < message_count; i++) retained(client, messages[i]);
+    if (client == NULL) qa_raise("Error", 0, 0, "Missing local QC client state");
+    for (size_t i = 0; i < message_count; i++) retained(client, &messages[i]);
   }
 }
 bool qa_app_sim_quakec_local_messages_stat(qa_app_sim_quakec_local_messages *state, qa_actor_id actor, double index, double *out) {
   local_state *c = client_of(state, actor);
-  qa_netquake_message *m = c ? get_key(c, state_key(ST_STAT, (int)index)) : NULL;
+  qa_netquake_message *m = c ? get_key(c, state_key(ST_STAT, index)) : NULL;
   if (m && is(m->kind, "stat")) { *out = m->value; return true; }
   return false;
 }
@@ -195,7 +272,7 @@ void qa_app_sim_quakec_local_messages_restore_views(qa_app_sim_quakec_local_mess
   for (size_t i = 0; i < client_count; i++) {
     qa_actor_id ignored;
     if (!client_of(state, clients[i].actor) || qa_app_sim_quakec_local_messages_view_target(state, clients[i].actor, &ignored))
-      qa_range_error("Invalid retained QC view recipient");
+      qa_raise("Error", 0, 0, "Invalid retained QC view recipient");
     view_set(state, clients[i].actor, clients[i].target);
   }
 }
@@ -249,6 +326,7 @@ bool qa_app_sim_quakec_local_messages_intermission(qa_app_sim_quakec_local_messa
 const qa_netquake_message *qa_app_sim_quakec_local_messages_presentation(qa_app_sim_quakec_local_messages *state, qa_actor_id actor, size_t *out_count) {
   state->scratch_count = 0;
   local_state *c = client_of(state, actor);
+  if (c) state->scratch = grow(state->scratch, &state->scratch_capacity, c->count, sizeof *state->scratch);
   if (c) for (size_t i = 0; i < c->count; i++) {
     const char *k = c->values[i].kind;
     if (is(k, "skybox") || is(k, "name") || is(k, "colors") || is(k, "frags") || is(k, "ping") || is(k, "social")
@@ -283,18 +361,55 @@ qa_app_sim_quakec_capture qa_app_sim_quakec_local_messages_capture(qa_app_sim_qu
 void qa_app_sim_quakec_capture_free(qa_app_sim_quakec_capture *capture) {
   free(capture->baseline); free(capture->clients); free(capture->storage); memset(capture, 0, sizeof *capture);
 }
+typedef struct restore_input {
+  qa_netquake_message *baseline; size_t baseline_count;
+  qa_netquake_message **clients; size_t client_counts_done;
+  const qa_app_sim_quakec_captured_client *sizes;
+} restore_input;
+static qa_netquake_message *messages_copy(const qa_netquake_message *messages, size_t count) {
+  if (count == 0) return NULL;
+  qa_netquake_message *out = calloc(count, sizeof *out);
+  if (out == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < count; i++) out[i] = message_copy(&messages[i]);
+  return out;
+}
+static void messages_free(qa_netquake_message *messages, size_t count) {
+  if (messages == NULL) return;
+  for (size_t i = 0; i < count; i++) qa_netquake_message_destroy(&messages[i]);
+  free(messages);
+}
+static void restore_input_free(void *arg) {
+  restore_input *input = arg;
+  messages_free(input->baseline, input->baseline_count);
+  for (size_t i = 0; i < input->client_counts_done; i++) messages_free(input->clients[i], input->sizes[i].message_count);
+  free(input->clients);
+  memset(input, 0, sizeof *input);
+}
 void qa_app_sim_quakec_local_messages_restore(qa_app_sim_quakec_local_messages *state,
     const qa_netquake_message *baseline, size_t baseline_count,
     const qa_app_sim_quakec_captured_client *clients, size_t client_count) {
-  state->baseline.count = 0; state->client_count = 0; state->has_baseline_view = false; state->view_count = 0;
-  for (size_t i = 0; i < baseline_count; i++) retained(&state->baseline, baseline[i]);
+  /* The input may be this state's own capture: copy it before the tables it borrows are freed. */
+  restore_input input; memset(&input, 0, sizeof input);
+  input.sizes = clients;
+  qa_cleanup scope; qa_cleanup_push(&scope, restore_input_free, &input);
+  input.baseline = messages_copy(baseline, baseline_count); input.baseline_count = baseline_count;
+  input.clients = client_count ? calloc(client_count, sizeof *input.clients) : NULL;
+  if (client_count && input.clients == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < client_count; i++) {
-    if (client_of(state, clients[i].actor)) qa_range_error("Duplicate restored local QC client");
-    if (state->client_count >= MAX_CLIENTS) qa_range_error("Out of memory");
-    state->client_actors[state->client_count] = clients[i].actor;
-    local_state *c = &state->clients[state->client_count++]; c->count = 0;
-    for (size_t j = 0; j < clients[i].message_count; j++) retained(c, clients[i].messages[j]);
+    input.clients[i] = messages_copy(clients[i].messages, clients[i].message_count);
+    input.client_counts_done = i + 1;
   }
+  state_free(&state->baseline); clients_clear(state); state->has_baseline_view = false; state->view_count = 0;
+  for (size_t i = 0; i < baseline_count; i++) retained(&state->baseline, &input.baseline[i]);
+  for (size_t i = 0; i < client_count; i++) {
+    if (client_of(state, clients[i].actor)) qa_raise("Error", 0, 0, "Duplicate restored local QC client");
+    clients_reserve(state);
+    clients_push(state, clients[i].actor, (local_state){0});
+    local_state *c = &state->clients[state->client_count - 1];
+    for (size_t j = 0; j < clients[i].message_count; j++) retained(c, &input.clients[i][j]);
+  }
+  qa_cleanup_pop(&scope);
+  restore_input_free(&input);
 }
 bool qa_app_sim_quakec_local_view(qa_actor_id actor, qa_app_sim_quakec_local_messages *state,
     qa_app_sim_quakec_local_view_source source, qa_app_sim_player_view *out) {
@@ -460,7 +575,7 @@ void qa_app_sim_present_quakec_local_message(qa_netquake_message message, const 
       static const char *const channels[] = {"auto", "weapon", "voice", "item", "body", "5", "6", "7"};
       double channel = message.channel;
       if (!(channel >= 0 && channel <= 7) || channel != (double)(int)channel)
-        qa_range_error("Invalid local QC sound channel");
+        qa_raise("Error", 0, 0, "Invalid local QC sound channel");
       qa_q1_event e = q1_of("sound");
       e.has_actor = true; e.actor = host.actor(host.ctx, message.entity);
       e.path = path; e.sound_channel = channels[(int)channel];
@@ -482,5 +597,5 @@ void qa_app_sim_present_quakec_local_message(qa_netquake_message message, const 
     e.skin = message.state.base.skin; e.origin = message.state.base.origin; e.angles = message.state.base.angles;
     host.emit(host.ctx, &e, NULL); return;
   }
-  qa_range_error("Unsupported local QuakeC service %s", k ? k : "(null)");
+  qa_raise("Error", 0, 0, "Unsupported local QuakeC service %s", k ? k : "(null)");
 }

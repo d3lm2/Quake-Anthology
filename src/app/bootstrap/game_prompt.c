@@ -14,7 +14,14 @@ const char qa_app_game_prompt_menu[] = "menu:application:prompt";
 /* TS PendingPrompt: { content, value: Prompt }, owned copy. */
 typedef struct pending_t { char *content, *title; qa_actor_id actor; qa_app_prompt_choice *choices; size_t choice_count; } pending_t;
 /* TS catalogs: Map<string, Promise<LocalizationCatalog>>; the reader keeps the provider's mounts. */
-typedef struct catalog_entry { char *key; qa_content_mounted *mounts; qa_localization_catalog catalog; } catalog_entry;
+/* A failed load stays cached with its error (TS keeps the rejected promise: every later await rethrows). */
+typedef struct catalog_entry {
+  char *key;
+  qa_content_mounted *mounts;
+  qa_localization_catalog catalog;
+  bool failed;
+  qa_caught_error error;
+} catalog_entry;
 typedef struct choice_ctx { struct qa_app_seat_game_prompt *prompt; size_t index; } choice_ctx;
 struct qa_app_seat_game_prompt {
   qa_seat_id seat;
@@ -205,12 +212,28 @@ static uint8_t *catalog_read(void *ctx, const char *path, size_t *out_length) {
   }
   return opened.bytes;
 }
+typedef struct catalog_job {
+  qa_app_seat_game_prompt *prompt;
+  catalog_entry *entry;
+  const char *content, *language;
+  qa_app_application_assets *assets;
+} catalog_job;
+static void catalog_run(void *ctx) {
+  catalog_job *job = ctx;
+  job->entry->mounts = qa_app_application_assets_provider(job->assets, job->content).mounts;
+  qa_load_localization_resources(job->prompt->seat, job->language, catalog_read, job->entry, QA_LOC_Q1_RERELEASE,
+                                 &job->entry->catalog);
+}
 /* TS catalog(content, language, assets). */
 static qa_localization_catalog *catalog_for(qa_app_seat_game_prompt *prompt, const char *content, const char *language,
                                             qa_app_application_assets *assets) {
   char *key = format("%s:%s", content, language);
   for (size_t i = 0; i < prompt->catalog_count; i++)
-    if (strcmp(prompt->catalogs[i]->key, key) == 0) { free(key); return &prompt->catalogs[i]->catalog; }
+    if (strcmp(prompt->catalogs[i]->key, key) == 0) {
+      free(key);
+      if (prompt->catalogs[i]->failed) qa_rethrow(&prompt->catalogs[i]->error);
+      return &prompt->catalogs[i]->catalog;
+    }
   catalog_entry *entry = calloc(1, sizeof *entry);
   if (entry == NULL) qa_range_error("Out of memory");
   entry->key = key;
@@ -221,8 +244,11 @@ static qa_localization_catalog *catalog_for(qa_app_seat_game_prompt *prompt, con
     prompt->catalogs = grown;
   }
   prompt->catalogs[prompt->catalog_count++] = entry;
-  entry->mounts = qa_app_application_assets_provider(assets, content).mounts;
-  qa_load_localization_resources(prompt->seat, language, catalog_read, entry, QA_LOC_Q1_RERELEASE, &entry->catalog);
+  catalog_job job = {prompt, entry, content, language, assets};
+  if (!qa_try(catalog_run, &job, &entry->error)) {
+    entry->failed = true;
+    qa_rethrow(&entry->error);
+  }
   return &entry->catalog;
 }
 static char *localize(qa_localization_catalog *catalog, const char *text) {
@@ -310,7 +336,7 @@ void qa_app_seat_game_prompt_close(qa_app_seat_game_prompt *prompt) {
   qa_app_seat_game_prompt_clear(prompt);
   qa_native_ui_controller_unregister(prompt->controller, prompt->registration);
   for (size_t i = 0; i < prompt->catalog_count; i++) {
-    qa_localization_catalog_destroy(&prompt->catalogs[i]->catalog);
+    if (!prompt->catalogs[i]->failed) qa_localization_catalog_destroy(&prompt->catalogs[i]->catalog);
     free(prompt->catalogs[i]->key);
     free(prompt->catalogs[i]);
   }

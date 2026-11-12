@@ -99,11 +99,55 @@ char *qa_normalize_shader_name(const char *name) {
   ascii_lower(copy);
   return copy;
 }
+/* One UTF-16 code unit of UTF-8 text at *at (docs/PORTING.md, Strings): a
+ * supplementary code point yields its high then low surrogate, C0 80 is a
+ * decoded U+0000, and a byte that does not start valid UTF-8 is one unit of
+ * its own value (a byte string). */
+static int32_t next_utf16_unit(const char *text, size_t *at, int32_t *pending_low) {
+  if (*pending_low != 0) {
+    int32_t low = *pending_low;
+    *pending_low = 0;
+    return low;
+  }
+  const unsigned char *b = (const unsigned char *)text + *at;
+  unsigned char c = b[0];
+  if (c == 0xc0 && b[1] == 0x80) { /* a decoded U+0000 (qa_text_decoder_decode) */
+    *at += 2;
+    return 0;
+  }
+  size_t need = 0;
+  uint32_t cp = c;
+  unsigned char low = 0x80, high = 0xbf;
+  if (c >= 0xc2 && c <= 0xdf) { need = 1; cp = c & 0x1f; }
+  else if (c >= 0xe0 && c <= 0xef) {
+    need = 2; cp = c & 0x0f;
+    if (c == 0xe0) low = 0xa0;
+    if (c == 0xed) high = 0x9f;
+  } else if (c >= 0xf0 && c <= 0xf4) {
+    need = 3; cp = c & 0x07;
+    if (c == 0xf0) low = 0x90;
+    if (c == 0xf4) high = 0x8f;
+  }
+  for (size_t k = 1; k <= need; k++) {
+    unsigned char lower = k == 1 ? low : 0x80, upper = k == 1 ? high : 0xbf;
+    if (b[k] < lower || b[k] > upper) { need = 0; cp = c; break; }
+    cp = (cp << 6) | (b[k] & 0x3f);
+  }
+  *at += need + 1;
+  if (cp >= 0x10000) {
+    *pending_low = (int32_t)(0xdc00 + ((cp - 0x10000) & 0x3ff));
+    return (int32_t)(0xd800 + ((cp - 0x10000) >> 10));
+  }
+  return (int32_t)cp;
+}
+
+/* tr_shader.c generateHashValue over the name's UTF-16 code units. */
 int64_t qa_shader_name_hash(const char *name, int64_t size) {
   int32_t hash = 0;
-  size_t length = strlen(name);
-  for (size_t index = 0; index < length; index++) {
-    int32_t letter = (unsigned char)name[index];
+  size_t at = 0;
+  int32_t pending_low = 0;
+  for (size_t index = 0; name[at] != '\0' || pending_low != 0; index++) {
+    int32_t letter = next_utf16_unit(name, &at, &pending_low);
     if (letter == 0 || letter == 46) break;
     if (letter >= 65 && letter <= 90) letter += 32;
     if (letter == 92) letter = 47;
@@ -126,14 +170,35 @@ bool qa_same_shader_name(const char *first, const char *second) {
   return true;
 }
 
-/* TS normalizeImageName (JS toLowerCase; ASCII folding here). */
-static char *normalize_image_name(storage *st, const char *name) {
-  if (name[0] == '*') return s_strdup(st, name);
-  char *copy = s_strdup(st, name);
-  for (char *p = copy; *p != '\0'; p++) {
-    if (*p == '\\') *p = '/';
-    if (*p >= 'A' && *p <= 'Z') *p = (char)(*p + 32);
+char *qa_shader_text_name_code_units(const char *text) {
+  size_t length = strlen(text), at = 0, count = 0;
+  char *out = (char *)malloc(length + 1);
+  if (out == NULL) qa_range_error("shader parser allocation failed");
+  int32_t pending_low = 0;
+  while (text[at] != '\0' || pending_low != 0) {
+    int32_t unit = next_utf16_unit(text, &at, &pending_low);
+    if (unit > 0xff) {
+      memcpy(out, text, length + 1);
+      return out;
+    }
+    out[count++] = (char)unit;
   }
+  out[count] = '\0';
+  return out;
+}
+
+/* TS normalizeImageName (JS toLowerCase; ASCII folding here). */
+/* name.replaceAll("\\", "/").toLowerCase(): Unicode lowering of decoded text,
+ * Latin-1 lowering of a byte string (TS byteText). */
+static char *normalize_image_name(storage *st, const char *name, bool byte_text) {
+  if (name[0] == '*') return s_strdup(st, name);
+  char *slashed = s_strdup(st, name);
+  for (char *p = slashed; *p != '\0'; p++)
+    if (*p == '\\') *p = '/';
+  char *lowered = byte_text ? qa_js_latin1_to_lower_case(slashed) : qa_js_to_lower_case(slashed);
+  if (lowered == NULL) qa_range_error("Out of memory");
+  char *copy = s_strdup(st, lowered);
+  free(lowered);
   return copy;
 }
 
@@ -192,7 +257,7 @@ double qa_evaluate_waveform(qa_waveform wave, double time) {
   int32_t index = shader_table_index(
       (double)f32((double)f32(wave.phase + (double)f32(time * wave.frequency)) * 1024.0));
   double value;
-  if (kind_is(wave.kind, "none")) qa_range_error("EvalWaveForm does not support GF_NONE");
+  if (kind_is(wave.kind, "none")) qa_raise("Error", 0, 0, "EvalWaveForm does not support GF_NONE");
   else if (kind_is(wave.kind, "sin")) value = qa_renderer_sine(index);
   else if (kind_is(wave.kind, "square")) value = index < 512 ? 1 : -1;
   else if (kind_is(wave.kind, "sawtooth")) value = index / 1024.0;
@@ -200,7 +265,7 @@ double qa_evaluate_waveform(qa_waveform wave, double time) {
   else if (kind_is(wave.kind, "triangle"))
     value = index < 256 ? index / 256.0 : index < 768 ? 2 - index / 256.0 : index / 256.0 - 4;
   else
-    qa_range_error("Noise waveforms require the renderer's seeded R_NoiseGet4f context; EvalWaveForm does not support GF_NOISE");
+    qa_raise("Error", 0, 0, "Noise waveforms require the renderer's seeded R_NoiseGet4f context; EvalWaveForm does not support GF_NOISE");
   return f32(wave.base + (double)f32(value * wave.amplitude));
 }
 
@@ -213,14 +278,14 @@ qa_vec2 qa_evaluate_tex_coords(const qa_shader_stage_def *stage, qa_vec2 uv,
   if (kind_is(stage->tc_gen.kind, "texture")) result = uv;
   else if (kind_is(stage->tc_gen.kind, "lightmap")) {
     if (!context->has_lightmap)
-      qa_range_error("Lightmap tcGen requires lightmap coordinates");
+      qa_raise("Error", 0, 0, "Lightmap tcGen requires lightmap coordinates");
     result = context->lightmap;
   } else if (kind_is(stage->tc_gen.kind, "vector")) {
     result.x = qa_dot3(position, stage->tc_gen.s);
     result.y = qa_dot3(position, stage->tc_gen.t);
   } else {
     if (!context->has_view_origin)
-      qa_range_error("Environment tcGen requires the view origin in model coordinates");
+      qa_raise("Error", 0, 0, "Environment tcGen requires the view origin in model coordinates");
     qa_vec3 delta = qa_sub3(context->view_origin, position);
     qa_vec3 viewer = qa_normalize_fast3(delta);
     double d = qa_dot3(normal, viewer);
@@ -246,7 +311,7 @@ qa_vec2 qa_evaluate_tex_coords(const qa_shader_stage_def *stage, qa_vec2 uv,
       result.y = t + f32(y - floor(y));
     } else if (kind_is(mod->kind, "entitytranslate")) {
       if (!context->has_shader_tex_coord)
-        qa_range_error("entityTranslate requires entity shaderTexCoord");
+        qa_raise("Error", 0, 0, "entityTranslate requires entity shaderTexCoord");
       double x = f32(context->shader_tex_coord.x * time);
       double y = f32(context->shader_tex_coord.y * time);
       result.x = s + f32(x - floor(x));
@@ -357,13 +422,13 @@ typedef struct def_build {
 
 struct parser {
   bool common_mode;
+  bool byte_text;
   qa_tokenizer tokenizer;
   bool tokenizer_owned;
   qa_common_parse_state common;
   qa_common_parse_cursor *cursor;
   bool has_offset;
   size_t offset;
-  bool owns_cursor;
   qa_common_parse_cursor owned_cursor;
   token pending;
   bool has_pending;
@@ -411,7 +476,8 @@ static void set_error(parser *p, const char *message, const char *reason) {
 static _Noreturn void fail_with(parser *p, const char *message, const char *reason) {
   set_error(p, message, reason);
   if (p->catch_buf != NULL) longjmp(*p->catch_buf, 1);
-  qa_range_error("%s", p->error.formatted);
+  /* TS throws the ShaderParseError itself (class name "ShaderParseError"). */
+  qa_raise("ShaderParseError", 0, 0, "%s", p->error.formatted);
 }
 static _Noreturn void p_fail(parser *p, const char *message) {
   fail_with(p, message, "source-rejection");
@@ -492,8 +558,27 @@ static const char *required_token(parser *p, bool allow_line_breaks) {
   if (!p_next(p, allow_line_breaks, &value)) p_fail(p, "Missing shader parameter");
   return value.value;
 }
-static double source_atof(const char *value) { return f32(qa_native_atof(value)); }
-static double p_number(parser *p) { return source_atof(required_token(p, false)); }
+/* TS nativeAtof(token): the token's code units are bytes; a unit above 255
+ * throws. Decoded text is UTF-8, so its U+0080..U+00FF units are handed to
+ * the byte parser as the single bytes they are in TS. */
+static double native_atof(parser *p, const char *value) {
+  if (p->byte_text) return qa_native_atof(value);
+  bool ascii = true;
+  for (const char *c = value; *c != '\0' && ascii; c++) ascii = (unsigned char)*c < 0x80;
+  if (ascii) return qa_native_atof(value);
+  char *bytes = (char *)s_alloc(p->scratch, strlen(value) + 1);
+  size_t at = 0, count = 0;
+  int32_t pending_low = 0;
+  while (value[at] != '\0' || pending_low != 0) {
+    int32_t unit = next_utf16_unit(value, &at, &pending_low);
+    if (unit > 255) qa_range_error("Native numbers require byte characters");
+    bytes[count++] = (char)unit;
+  }
+  bytes[count] = '\0';
+  return qa_native_atof(bytes);
+}
+static double source_atof(parser *p, const char *value) { return f32(native_atof(p, value)); }
+static double p_number(parser *p) { return source_atof(p, required_token(p, false)); }
 typedef struct vector_result { qa_vec3 value; bool complete; } vector_result;
 static vector_result source_vector(parser *p, qa_vec3 previous) {
   token value;
@@ -516,7 +601,7 @@ static vector_result source_vector(parser *p, qa_vec3 previous) {
       out.complete = false;
       return out;
     }
-    *fields[i] = source_atof(value.value);
+    *fields[i] = source_atof(p, value.value);
   }
   if (!p_next(p, false, &value) || strcmp(value.value, ")") != 0) {
     p_warn(p, s_format(p->scratch, "WARNING: missing parenthesis in shader '%s'\n",
@@ -570,9 +655,10 @@ static qa_string_view_list line_arguments(parser *p) {
   out.count = count;
   return out;
 }
-/* TS token.toLowerCase(): Unicode lowering of shader text. */
+/* TS token.toLowerCase(): Unicode lowering of decoded shader text, Latin-1
+ * lowering of a byte string (TS byteText). */
 static char *lower_copy(parser *p, const char *text) {
-  char *lowered = qa_js_to_lower_case(text);
+  char *lowered = p->byte_text ? qa_js_latin1_to_lower_case(text) : qa_js_to_lower_case(text);
   if (lowered == NULL) qa_range_error("Out of memory");
   char *copy = s_strdup(p->scratch, lowered);
   free(lowered);
@@ -667,17 +753,17 @@ static sun_directive p_sun_directive(parser *p) {
   bool has;
   const char *v;
   v = source_line_value(p, &has);
-  double red = source_atof(has ? v : "");
+  double red = source_atof(p, has ? v : "");
   v = source_line_value(p, &has);
-  double green = source_atof(has ? v : "");
+  double green = source_atof(p, has ? v : "");
   v = source_line_value(p, &has);
-  double blue = source_atof(has ? v : "");
+  double blue = source_atof(p, has ? v : "");
   v = source_line_value(p, &has);
-  double intensity = source_atof(has ? v : "");
+  double intensity = source_atof(p, has ? v : "");
   v = source_line_value(p, &has);
-  double azimuth = source_atof(has ? v : "");
+  double azimuth = source_atof(p, has ? v : "");
   v = source_line_value(p, &has);
-  double elevation = source_atof(has ? v : "");
+  double elevation = source_atof(p, has ? v : "");
   qa_vec3 color = {red, green, blue};
   qa_vec3 light = qa_scale3(qa_normalize3(color), intensity);
   double azimuth_rad = f32((double)f32(azimuth / 180.0) * QA_PI);
@@ -718,7 +804,7 @@ static void sky_directive(parser *p, bool has_previous, qa_mat_shader_sky_params
   }
   bool outer_dash = strcmp(outer_token.value, "-") == 0;
   const char *outer_name = outer_dash ? (has_previous ? previous.outer_box : NULL)
-                                      : normalize_image_name(p->result, outer_token.value);
+                                      : normalize_image_name(p->result, outer_token.value, p->byte_text);
   if (!outer_dash) sky_images(p, true, outer_token.value, "clamp");
   token height_token;
   if (!p_next(p, false, &height_token)) {
@@ -735,7 +821,7 @@ static void sky_directive(parser *p, bool has_previous, qa_mat_shader_sky_params
     out->outer_box = outer_name;
     return;
   }
-  double parsed_height = source_atof(height_token.value);
+  double parsed_height = source_atof(p, height_token.value);
   double cloud_height = parsed_height == 0 ? 512 : parsed_height;
   exec_initialize_sky(p, cloud_height);
   token inner_token;
@@ -756,7 +842,7 @@ static void sky_directive(parser *p, bool has_previous, qa_mat_shader_sky_params
   }
   bool inner_dash = strcmp(inner_token.value, "-") == 0;
   const char *inner_name = inner_dash ? (has_previous ? previous.inner_box : NULL)
-                                      : normalize_image_name(p->result, inner_token.value);
+                                      : normalize_image_name(p->result, inner_token.value, p->byte_text);
   if (!inner_dash) sky_images(p, false, inner_token.value, "repeat");
   *has_out = true;
   out->outer_box = outer_name;
@@ -858,7 +944,7 @@ static bool p_alpha(parser *p, qa_waveform previous_wave, qa_alpha_generator *ou
   if (strcmp(kind, "const") == 0) {
     bool has;
     const char *raw = source_line_value(p, &has);
-    double alpha = qa_native_atof(has ? raw : "");
+    double alpha = native_atof(p, has ? raw : "");
     double integer = trunc(255.0 * alpha);
     if (!isfinite(integer) || integer < -2147483648.0 || integer > 2147483647.0)
       fail_with(p, "alphaGen const reaches undefined source byte conversion",
@@ -927,7 +1013,7 @@ static double tcmod_number(parser *p, const char *kind, int *count) {
   token value;
   if (p_next(p, false, &value)) {
     (*count)++;
-    return source_atof(value.value);
+    return source_atof(p, value.value);
   }
   const char *label = strcmp(kind, "scale") == 0    ? "scale parms"
                       : strcmp(kind, "scroll") == 0 ? "scale scroll parms"
@@ -1118,6 +1204,14 @@ static blend_result p_blend(parser *p, qa_blend_state previous, uint32_t previou
   out.destination_bits = destination.bits;
   out.complete = true;
   return out;
+}
+
+/* The tokenizer over the retained text: decoded text counts its columns and
+ * token limit in UTF-16 units (TS Tokenizer over the decoded string); a byte
+ * string (TS byteText) is one unit per byte. */
+static bool init_tokenizer(qa_tokenizer *tokenizer, const char *text, bool byte_text, const char *source) {
+  return byte_text ? qa_tokenizer_init(tokenizer, text, strlen(text), source)
+                   : qa_tokenizer_init_text(tokenizer, text, strlen(text), source);
 }
 
 static void init_parser_fields(parser *p, storage *result, storage *scratch,
@@ -1361,7 +1455,7 @@ static qa_mat_parsed_stage parse_stage(parser *p, int slot) {
     }
     if (strcmp(keyword, "map") == 0 || strcmp(keyword, "clampmap") == 0) {
       const char *source_name = stage_parameter(p, keyword);
-      char *name = normalize_image_name(p->result, source_name);
+      char *name = normalize_image_name(p->result, source_name, p->byte_text);
       if (strcmp(keyword, "map") == 0 && strcmp(name, "$lightmap") == 0) {
         memset(&b.map, 0, sizeof b.map);
         b.map.kind = "lightmap";
@@ -1384,7 +1478,7 @@ static qa_mat_parsed_stage parse_stage(parser *p, int slot) {
                               false, slot, 0, 0, snapshot);
       }
     } else if (strcmp(keyword, "animmap") == 0) {
-      double frequency = source_atof(stage_parameter(p, "animMmap"));
+      double frequency = source_atof(p, stage_parameter(p, "animMmap"));
       exec_set_animation_frequency(p, slot, frequency);
       const char *frames[8];
       size_t frame_count = 0;
@@ -1400,7 +1494,7 @@ static qa_mat_parsed_stage parse_stage(parser *p, int slot) {
           break;
         }
         if (frame_count < 8)
-          frames[frame_count++] = normalize_image_name(p->result, frame_token.value);
+          frames[frame_count++] = normalize_image_name(p->result, frame_token.value, p->byte_text);
         const char **list = (const char **)s_alloc(p->result, frame_count * sizeof *list);
         for (size_t i = 0; i < frame_count; i++) list[i] = frames[i];
         b.map.frames.values = list;
@@ -1418,7 +1512,7 @@ static qa_mat_parsed_stage parse_stage(parser *p, int slot) {
       const char *source_name = stage_parameter(p, "videoMmap");
       memset(&b.map, 0, sizeof b.map);
       b.map.kind = "video";
-      b.map.name = normalize_image_name(p->result, source_name);
+      b.map.name = normalize_image_name(p->result, source_name, p->byte_text);
       (void)update_partial(p, stage_value(p, &b, false));
       exec_play_video(p, slot, source_name);
     } else if (strcmp(keyword, "blendfunc") == 0) {
@@ -1496,6 +1590,7 @@ static qa_mat_parsed_stage parse_stage(parser *p, int slot) {
         for (;;) {
           token arg;
           if (!p_next(p, false, &arg)) break;
+          /* token.value.length: COM_Parse tokens are code-unit bytes (one byte per unit). */
           length += strlen(arg.value) + 1;
           if (length >= 1024)
             qa_range_error("tcMod arguments exceed the source 1024-byte buffer");
@@ -1520,9 +1615,11 @@ static qa_mat_parsed_stage parse_stage(parser *p, int slot) {
         sub = (parser *)s_alloc(p->scratch, sizeof *sub);
         init_parser_fields(sub, p->result, p->scratch, p->source_name, p->shader_name);
         sub->common_mode = true;
-        sub->owns_cursor = true;
+        sub->byte_text = p->byte_text;
         if (!qa_common_parse_cursor_init(&sub->owned_cursor, text, strlen(text), false))
           qa_range_error("shader parser allocation failed");
+        /* The cursor copy goes with the scratch storage, also when the sub-parser raises. */
+        storage_track(p->scratch, sub->owned_cursor.source);
         sub->cursor = &sub->owned_cursor;
         sub->has_offset = true;
         sub->offset = 0;
@@ -1555,13 +1652,11 @@ static qa_mat_parsed_stage parse_stage(parser *p, int slot) {
         which->catch_buf = saved_catch;
         if (strcmp(which->error.reason, "source-rejection") != 0) {
           qa_shader_parse_error error = which->error;
-          if (sub != NULL && sub->owns_cursor) qa_common_parse_cursor_destroy(&sub->owned_cursor);
           p->error = error;
           if (p->catch_buf != NULL) longjmp(*p->catch_buf, 1);
-          qa_range_error("%s", error.formatted);
+          qa_raise("ShaderParseError", 0, 0, "%s", error.formatted);
         }
       }
-      if (sub != NULL && sub->owns_cursor) qa_common_parse_cursor_destroy(&sub->owned_cursor);
     } else {
       p_reject(p, s_format(p->scratch,
                            "WARNING: unknown parameter '%s' in shader '%s'\n",
@@ -1578,7 +1673,7 @@ static bool deform_number(parser *p, bool bulge, double *out) {
                        bulge ? "bulge " : "", p->shader_name));
     return false;
   }
-  *out = source_atof(value.value);
+  *out = source_atof(p, value.value);
   return true;
 }
 static qa_vertex_deformation p_deform(parser *p) {
@@ -1666,7 +1761,7 @@ static bool p_sort(parser *p, double *out) {
   else if (strcmp(lower, "underwater") == 0) *out = 8;
   else if (strcmp(lower, "additive") == 0) *out = 10;
   else if (strcmp(lower, "nearest") == 0) *out = 16;
-  else *out = source_atof(lower);
+  else *out = source_atof(p, lower);
   return true;
 }
 
@@ -1759,7 +1854,7 @@ static definition_result run_definition(parser *p, const char *name) {
       p->def.entity_mergable = true;
     } else if (strcmp(keyword, "clamptime") == 0) {
       token value;
-      if (p_next(p, false, &value)) p->def.clamp_time = source_atof(value.value);
+      if (p_next(p, false, &value)) p->def.clamp_time = source_atof(p, value.value);
     } else if (strcmp(keyword, "portal") == 0) {
       p->def.has_sort = true;
       p->def.sort = 1;
@@ -1820,7 +1915,7 @@ static definition_result run_definition(parser *p, const char *name) {
                            "WARNING: missing parm for 'fogParms' keyword in shader '%s'\n",
                            p->shader_name));
       } else {
-        p->def.fog.depth_for_opaque = source_atof(value.value);
+        p->def.fog.depth_for_opaque = source_atof(p, value.value);
         (void)line_arguments(p);
       }
     } else if (strcmp(keyword, "q3map_sun") == 0) {
@@ -1870,7 +1965,7 @@ static const qa_mat_registered_sky_box *registered_sky_box(storage *st, working_
     all = all && box->has[i];
   }
   if (!any) return NULL;
-  if (!all) qa_range_error("source sky box registration became incomplete");
+  if (!all) qa_raise("Error", 0, 0, "source sky box registration became incomplete");
   sky_box_ctx *ctx = (sky_box_ctx *)s_alloc(st, sizeof *ctx);
   for (int i = 0; i < 6; i++) ctx->image[i] = box->image[i];
   qa_mat_registered_sky_box *out =
@@ -1917,7 +2012,7 @@ static qa_mat_registered_stage registered_stage(storage *st, working_bundle *bun
     frames[0] = primary.frame;
     for (int i = 1; i < bundle->animation_count; i++) {
       if (!bundle->has_image[i])
-        qa_range_error("source animation count includes an unregistered frame");
+        qa_raise("Error", 0, 0, "source animation count includes an unregistered frame");
       frames[i] = bundle->images[i].frame;
     }
     out.binding.playback.kind = "animation";
@@ -1936,7 +2031,7 @@ static const qa_mat_registered_stage *registered_stages(storage *st,
   *count = def.stage_count;
   if (def.stage_count == 0) return NULL;
   if (def.stage_count > 8)
-    qa_range_error("shader definition exceeds the registered stage store");
+    qa_raise("Error", 0, 0, "shader definition exceeds the registered stage store");
   qa_mat_registered_stage *out =
       (qa_mat_registered_stage *)s_alloc(st, def.stage_count * sizeof *out);
   for (size_t i = 0; i < def.stage_count; i++) out[i] = registered_stage(st, &drv->bundles[i]);
@@ -2012,6 +2107,7 @@ void qa_shader_program_destroy(qa_shader_registration_program *program) {
 /* Compiled program: re-parses retained text from the recorded resume
  * point (see header note). ctx lives in the inspection storage. */
 typedef struct compiled_ctx {
+  bool byte_text;
   char *text;
   char *source;
   char *name;
@@ -2022,14 +2118,33 @@ typedef struct compiled_ctx {
   char *location_value;
   int64_t location_line, location_column;
 } compiled_ctx;
+/* What a registration owns while it runs: a host callback, a drop (CommonError) or a RangeError
+ * that raises releases it (TS: the GC takes the abandoned registration). */
+typedef struct register_guard {
+  storage *result, *scratch;
+  parser *p;
+  qa_shader_registration_result *out;
+} register_guard;
+static void register_abandon(void *raw) {
+  register_guard *g = (register_guard *)raw;
+  if (g->p != NULL && g->p->tokenizer_owned) qa_tokenizer_destroy(&g->p->tokenizer);
+  storage_free(g->scratch);
+  storage_free(g->result);
+  memset(g->out, 0, sizeof *g->out);
+}
 static void compiled_register(void *raw, qa_shader_registration_host *host,
                               qa_shader_registration_result *out) {
   compiled_ctx *ctx = (compiled_ctx *)raw;
   storage *result = storage_new();
   storage *scratch = storage_new();
+  register_guard guard = {result, scratch, NULL, out};
+  qa_cleanup abandon;
+  qa_cleanup_push(&abandon, register_abandon, &guard);
   parser *p = (parser *)s_alloc(scratch, sizeof *p);
+  guard.p = p;
   init_parser_fields(p, result, scratch, ctx->source, ctx->registration_name);
-  if (!qa_tokenizer_init(&p->tokenizer, ctx->text, strlen(ctx->text), ctx->source))
+  p->byte_text = ctx->byte_text;
+  if (!init_tokenizer(&p->tokenizer, ctx->text, ctx->byte_text, ctx->source))
     qa_range_error("shader parser allocation failed");
   p->tokenizer_owned = true;
   p->tokenizer.offset = ctx->offset;
@@ -2040,6 +2155,7 @@ static void compiled_register(void *raw, qa_shader_registration_host *host,
   p->location.line = ctx->location_line;
   p->location.column = ctx->location_column;
   run_register(p, ctx->name, host, out);
+  qa_cleanup_pop(&abandon);
   qa_tokenizer_destroy(&p->tokenizer);
   storage_free(scratch);
 }
@@ -2057,13 +2173,21 @@ static void source_register(void *raw, qa_shader_registration_host *host,
   source_ctx *ctx = (source_ctx *)raw;
   storage *result = storage_new();
   storage *scratch = storage_new();
+  register_guard guard = {result, scratch, NULL, out};
+  qa_cleanup abandon;
+  qa_cleanup_push(&abandon, register_abandon, &guard);
   parser *p = (parser *)s_alloc(scratch, sizeof *p);
   init_parser_fields(p, result, scratch, ctx->source, ctx->name);
+  guard.p = p;
   p->common_mode = true;
+  /* A CommonParseCursor holds a Latin-1 byte string: one code unit per byte (Latin-1 lowering,
+     byte numbers, tcMod argument lengths in bytes). */
+  p->byte_text = true;
   p->cursor = ctx->cursor;
   p->has_offset = ctx->has_offset;
   p->offset = ctx->offset;
   run_register(p, ctx->name, host, out);
+  qa_cleanup_pop(&abandon);
   storage_free(scratch);
 }
 static void source_destroy(void *raw) {
@@ -2087,20 +2211,35 @@ void qa_source_shader_program_init(qa_shader_registration_program *program,
   program->destroy = source_destroy;
 }
 
+/* What an inspection owns while it runs: released when it raises (TS: the GC takes a parse that threw). */
+typedef struct inspect_guard { storage *result, *scratch; parser *p; qa_shader_script_inspection *out; } inspect_guard;
+static void inspect_abandon(void *arg) {
+  inspect_guard *g = (inspect_guard *)arg;
+  if (g->p != NULL && g->p->tokenizer_owned) qa_tokenizer_destroy(&g->p->tokenizer);
+  storage_free(g->scratch);
+  storage_free(g->result);
+  memset(g->out, 0, sizeof *g->out);
+}
 /* TS ShaderParser.parse / parseShaderScript / inspectShaderScript. */
 static void inspect_impl(const char *text, const char *source,
                          const char *registration_name, bool recover,
-                         qa_shader_script_inspection *out) {
+                         bool byte_text, qa_shader_script_inspection *out) {
   const char *source_name = source == NULL ? "<shader>" : source;
   storage *result = storage_new();
   storage *scratch = storage_new();
+  /* A caller that catches the raise (a scene registry skips a script it cannot inspect) gets nothing back. */
+  inspect_guard guard = {result, scratch, NULL, out};
+  qa_cleanup abandon;
+  qa_cleanup_push(&abandon, inspect_abandon, &guard);
   parser *p = (parser *)s_alloc(scratch, sizeof *p);
+  guard.p = p;
   char *retained_source = s_strdup(result, source_name);
   char *retained_text = s_strdup(result, text);
   char *retained_registration =
       registration_name == NULL ? NULL : s_strdup(result, registration_name);
   init_parser_fields(p, result, scratch, retained_source, retained_registration);
-  if (!qa_tokenizer_init(&p->tokenizer, text, strlen(text), retained_source))
+  p->byte_text = byte_text;
+  if (!init_tokenizer(&p->tokenizer, retained_text, byte_text, retained_source))
     qa_range_error("shader parser allocation failed");
   p->tokenizer_owned = true;
   memset(out, 0, sizeof *out);
@@ -2127,6 +2266,7 @@ static void inspect_impl(const char *text, const char *source,
       continue;
     }
     compiled_ctx *ctx = (compiled_ctx *)s_alloc(result, sizeof *ctx);
+    ctx->byte_text = byte_text;
     ctx->text = retained_text;
     ctx->source = retained_source;
     ctx->name = s_strdup(result, name_token.value);
@@ -2139,7 +2279,7 @@ static void inspect_impl(const char *text, const char *source,
     ctx->location_line = p->location.line;
     ctx->location_column = p->location.column;
     definition_result terminal = run_definition(p, name_token.value);
-    if (!terminal.accepted && !recover) qa_range_error("%s", p->error.formatted);
+    if (!terminal.accepted && !recover) qa_raise("ShaderParseError", 0, 0, "%s", p->error.formatted);
     if (count == cap) {
       size_t grown = cap == 0 ? 4 : cap * 2;
       entries = (qa_shader_catalog_entry *)s_grow(result, entries,
@@ -2170,13 +2310,19 @@ static void inspect_impl(const char *text, const char *source,
   }
   out->entries = entries;
   out->count = count;
+  qa_cleanup_pop(&abandon);
   qa_tokenizer_destroy(&p->tokenizer);
   storage_free(scratch);
 }
 void qa_inspect_shader_script(const char *text, const char *source,
                               const char *registration_name,
                               qa_shader_script_inspection *out) {
-  inspect_impl(text, source, registration_name, true, out);
+  inspect_impl(text, source, registration_name, true, false, out);
+}
+void qa_inspect_shader_byte_script(const char *text, const char *source,
+                                   const char *registration_name,
+                                   qa_shader_script_inspection *out) {
+  inspect_impl(text, source, registration_name, true, true, out);
 }
 void qa_shader_script_inspection_free(qa_shader_script_inspection *inspection) {
   if (inspection == NULL) return;
@@ -2186,7 +2332,7 @@ void qa_shader_script_inspection_free(qa_shader_script_inspection *inspection) {
 void qa_parse_shader_script(const char *text, const char *source,
                             qa_shader_definitions *out) {
   qa_shader_script_inspection inspection;
-  inspect_impl(text, source, NULL, false, &inspection);
+  inspect_impl(text, source, NULL, false, false, &inspection);
   memset(out, 0, sizeof *out);
   out->_storage = inspection._storage;
   out->count = inspection.count;
@@ -2194,8 +2340,14 @@ void qa_parse_shader_script(const char *text, const char *source,
     qa_shader_definition *items = (qa_shader_definition *)s_alloc(
         (storage *)inspection._storage, inspection.count * sizeof *items);
     for (size_t i = 0; i < inspection.count; i++) {
-      if (!inspection.entries[i].accepted)
-        qa_range_error("%s", inspection.entries[i].error.formatted);
+      if (!inspection.entries[i].accepted) {
+        /* TS rethrows the entry's ShaderParseError; release the inspection first. */
+        char message[QA_CAUGHT_MESSAGE_CAPACITY];
+        snprintf(message, sizeof message, "%s", inspection.entries[i].error.formatted);
+        storage_free((storage *)inspection._storage);
+        memset(out, 0, sizeof *out);
+        qa_raise("ShaderParseError", 0, 0, "%s", message);
+      }
       items[i] = inspection.entries[i].definition;
     }
     out->items = items;
@@ -2239,7 +2391,7 @@ double qa_mat_evaluate_waveform(qa_waveform wave, double time) {
       (double)qa_mat_f((double)qa_mat_f(wave.phase + (double)qa_mat_f(time * wave.frequency)) * 1024.0));
   double value;
   if (qa_mat_kind_is(wave.kind, "none"))
-    qa_range_error("EvalWaveForm does not support GF_NONE");
+    qa_raise("Error", 0, 0, "EvalWaveForm does not support GF_NONE");
   else if (qa_mat_kind_is(wave.kind, "sin")) value = qa_renderer_sine(index);
   else if (qa_mat_kind_is(wave.kind, "square")) value = index < 512 ? 1 : -1;
   else if (qa_mat_kind_is(wave.kind, "sawtooth")) value = index / 1024.0;
@@ -2247,6 +2399,6 @@ double qa_mat_evaluate_waveform(qa_waveform wave, double time) {
   else if (qa_mat_kind_is(wave.kind, "triangle"))
     value = index < 256 ? index / 256.0 : index < 768 ? 2 - index / 256.0 : index / 256.0 - 4;
   else /* "noise" */
-    qa_range_error("Noise waveforms require the renderer's seeded R_NoiseGet4f context; EvalWaveForm does not support GF_NOISE");
+    qa_raise("Error", 0, 0, "Noise waveforms require the renderer's seeded R_NoiseGet4f context; EvalWaveForm does not support GF_NOISE");
   return qa_mat_f(wave.base + (double)qa_mat_f(value * wave.amplitude));
 }

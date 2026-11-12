@@ -5,16 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void *xmalloc(size_t size) {
-  void *p = malloc(size == 0 ? 1 : size);
-  if (p == NULL) qa_pe_error(QA_PE_STAGE_HEADERS, "out of memory");
-  return p;
-}
-static void *xrealloc(void *p, size_t size) {
-  void *next = realloc(p, size == 0 ? 1 : size);
-  if (next == NULL) qa_pe_error(QA_PE_STAGE_HEADERS, "out of memory");
-  return next;
-}
+/* Through the PE allocation scope: a directory that raises part way leaves nothing behind. */
+static void *xmalloc(size_t size) { return qa_pe_xmalloc(size); }
+static void *xrealloc(void *p, size_t size) { return qa_pe_xrealloc(p, size); }
 static char *xstrndup(const char *text, size_t len) {
   char *copy = xmalloc(len + 1);
   memcpy(copy, text, len);
@@ -41,6 +34,8 @@ static void export_push(export_list *list, qa_guest_export entry) {
 
 void qa_pe_read_imports(const qa_pe_image_reader *image, qa_pe_owned_strings *pool,
                         qa_guest_import **out, size_t *out_count) {
+  qa_pe_scope scope;
+  qa_pe_scope_begin(&scope, NULL, NULL);
   qa_pe_image_reader reader = qa_pe_image_reader_for_stage(image, QA_PE_STAGE_IMPORTS);
   import_list imports; memset(&imports, 0, sizeof imports);
   uint32_t *slots = NULL; size_t slot_count = 0, slot_cap = 0;
@@ -48,7 +43,7 @@ void qa_pe_read_imports(const qa_pe_image_reader *image, qa_pe_owned_strings *po
   if (qa_pe_directory(reader.pe, 13).rva != 0)
     qa_pe_error(QA_PE_STAGE_IMPORTS, "delay-load imports require a guest delay-loader; unsupported");
   *out = NULL; *out_count = 0;
-  if (table.rva == 0) return;
+  if (table.rva == 0) { qa_pe_scope_commit(&scope); return; }
   qa_pe_image_reader_range(&reader, table.rva, table.byte_length);
   int width = reader.pe->abi.pointer_bytes;
   uint64_t ordinal_bit = 1ULL << (width * 8 - 1);
@@ -59,8 +54,9 @@ void qa_pe_read_imports(const qa_pe_image_reader *image, qa_pe_owned_strings *po
     uint32_t name_rva = qa_pe_image_reader_u32(&reader, at + 12);
     uint32_t iat = qa_pe_image_reader_u32(&reader, at + 16);
     if (lookup == 0 && timestamp == 0 && forward == 0 && name_rva == 0 && iat == 0) {
-      free(slots);
+      qa_pe_xfree(slots);
       *out = imports.items; *out_count = imports.count;
+      qa_pe_scope_commit(&scope);
       return;
     }
     if (name_rva == 0 || iat == 0 || iat % (uint32_t)width != 0 || lookup % (uint32_t)width != 0
@@ -100,7 +96,6 @@ void qa_pe_read_imports(const qa_pe_image_reader *image, qa_pe_owned_strings *po
       import_push(&imports, entry);
     }
   }
-  free(slots);
   qa_pe_error(QA_PE_STAGE_IMPORTS, "unterminated import descriptor table");
 }
 
@@ -135,6 +130,8 @@ void qa_pe_read_exports(const qa_pe_image_reader *image, qa_pe_owned_strings *po
   *out = NULL; *out_count = 0;
   qa_pe_directory_entry table = qa_pe_directory(reader.pe, 0);
   if (table.rva == 0) return;
+  qa_pe_scope scope;
+  qa_pe_scope_begin(&scope, NULL, NULL);
   if (table.byte_length < 40) qa_pe_error(QA_PE_STAGE_EXPORTS, "truncated export directory");
   qa_pe_image_reader_range(&reader, table.rva, table.byte_length);
   uint32_t ordinal_base = qa_pe_image_reader_u32(&reader, table.rva + 16);
@@ -158,7 +155,7 @@ void qa_pe_read_exports(const qa_pe_image_reader *image, qa_pe_owned_strings *po
     if (rva >= table.rva && rva < table.rva + table.byte_length) {
       char *text = qa_pe_image_reader_text(&reader, rva, table.rva + table.byte_length);
       forwarded_target(pool, text, &target);
-      free(text);
+      qa_pe_xfree(text);
     } else {
       target.address = qa_pe_image_reader_address(&reader, rva, 1);
     }
@@ -196,8 +193,9 @@ void qa_pe_read_exports(const qa_pe_image_reader *image, qa_pe_owned_strings *po
     entry.symbol.ordinal = 0;
     export_push(&exports, entry);
   }
-  free(targets);
+  qa_pe_xfree(targets);
   *out = exports.items; *out_count = exports.count;
+  qa_pe_scope_commit(&scope);
 }
 
 void qa_pe_read_tls(const qa_pe_image_reader *image, bool *has_tls, qa_guest_tls_template *tls,
@@ -207,6 +205,8 @@ void qa_pe_read_tls(const qa_pe_image_reader *image, bool *has_tls, qa_guest_tls
   memset(tls, 0, sizeof *tls);
   qa_pe_directory_entry table = qa_pe_directory(reader.pe, 9);
   if (table.rva == 0) return;
+  qa_pe_scope scope;
+  qa_pe_scope_begin(&scope, NULL, NULL);
   int width = reader.pe->abi.pointer_bytes;
   if (table.byte_length < (uint32_t)(width * 4 + 8)) qa_pe_error(QA_PE_STAGE_TLS, "truncated TLS directory");
   uint64_t start = qa_pe_image_reader_pointer(&reader, table.rva);
@@ -244,6 +244,7 @@ void qa_pe_read_tls(const qa_pe_image_reader *image, bool *has_tls, qa_guest_tls
   *has_tls = true;
   *index_out = qa_pe_image_reader_address(&reader, qa_pe_image_reader_rva(&reader, index, 4), 4);
   *has_index = true;
+  qa_pe_scope_commit(&scope);
 }
 
 static qa_pe_unwind_record read_unwind_entry(const qa_pe_image_reader *reader, uint32_t begin_rva,
@@ -272,10 +273,11 @@ static qa_pe_unwind_record read_unwind_entry(const qa_pe_image_reader *reader, u
     if (ancestor_count > 0) memcpy(next_ancestors, ancestors, ancestor_count * sizeof(uint32_t));
     next_ancestors[ancestor_count] = info_rva;
     qa_pe_unwind_record *chained = xmalloc(sizeof(qa_pe_unwind_record));
-    *chained = read_unwind_entry(reader, qa_pe_image_reader_u32(reader, tail),
-                                  qa_pe_image_reader_u32(reader, tail + 4),
-                                  qa_pe_image_reader_u32(reader, tail + 8),
-                                  next_ancestors, ancestor_count + 1);
+    /* Read in TS argument order: the first field out of range is the one reported. */
+    const uint32_t chained_begin = qa_pe_image_reader_u32(reader, tail);
+    const uint32_t chained_end = qa_pe_image_reader_u32(reader, tail + 4);
+    const uint32_t chained_info = qa_pe_image_reader_u32(reader, tail + 8);
+    *chained = read_unwind_entry(reader, chained_begin, chained_end, chained_info, next_ancestors, ancestor_count + 1);
     record.chained = chained;
     size += 12;
   } else if ((flags & 3) != 0) {
@@ -299,6 +301,8 @@ void qa_pe_read_unwind(const qa_pe_image_reader *image, qa_pe_unwind_record **ou
   if (reader.pe->abi.pointer_bytes != 8 || table.byte_length % 12 != 0)
     qa_pe_error(QA_PE_STAGE_UNWIND, "unsupported exception directory layout");
   qa_pe_image_reader_range(&reader, table.rva, table.byte_length);
+  qa_pe_scope scope;
+  qa_pe_scope_begin(&scope, NULL, NULL);
   size_t count = table.byte_length / 12;
   qa_pe_unwind_record *records = xmalloc(count * sizeof(qa_pe_unwind_record));
   int64_t previous = -1;
@@ -307,10 +311,12 @@ void qa_pe_read_unwind(const qa_pe_image_reader *image, qa_pe_unwind_record **ou
     uint32_t begin = qa_pe_image_reader_u32(&reader, at);
     if ((int64_t)begin <= previous) qa_pe_error(QA_PE_STAGE_UNWIND, "unsorted runtime function table");
     previous = begin;
-    records[n++] = read_unwind_entry(&reader, begin, qa_pe_image_reader_u32(&reader, at + 4),
-                                      qa_pe_image_reader_u32(&reader, at + 8), NULL, 0);
+    const uint32_t function_end = qa_pe_image_reader_u32(&reader, at + 4);
+    const uint32_t unwind_info = qa_pe_image_reader_u32(&reader, at + 8);
+    records[n++] = read_unwind_entry(&reader, begin, function_end, unwind_info, NULL, 0);
   }
   *out = records; *out_count = n;
+  qa_pe_scope_commit(&scope);
 }
 
 bool qa_pe_read_load_configuration(const qa_pe_image_reader *image, qa_pe_load_configuration *out) {
@@ -322,6 +328,8 @@ bool qa_pe_read_load_configuration(const qa_pe_image_reader *image, qa_pe_load_c
   /* Linkers targeting old Windows record a directory size of 64 while the structure's own Size is larger; the structure only has to fit the image. */
   if (size < 4) qa_pe_error(QA_PE_STAGE_LOAD_CONFIG, "invalid load configuration size");
   qa_pe_image_reader_range(&reader, table.rva, size);
+  qa_pe_scope scope;
+  qa_pe_scope_begin(&scope, NULL, NULL);
   int width = reader.pe->abi.pointer_bytes;
   out->address = qa_pe_image_reader_address(&reader, table.rva, size);
   out->bytes = qa_pe_image_reader_copy(&reader, table.rva, size);
@@ -341,5 +349,6 @@ bool qa_pe_read_load_configuration(const qa_pe_image_reader *image, qa_pe_load_c
   }
   uint32_t guard_offset = width == 4 ? 88 : 144;
   out->guard_flags = guard_offset + 4 <= size ? qa_pe_image_reader_u32(&reader, table.rva + guard_offset) : 0;
+  qa_pe_scope_commit(&scope);
   return true;
 }

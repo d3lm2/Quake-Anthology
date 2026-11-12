@@ -16,63 +16,73 @@ static int64_t check_field(qa_compat_qc_program *p, qa_mod_callback_declaration 
   bool declared = false;
   for (size_t i = 0; i < decl.actor_field_count; i++) if (strcmp(decl.actor_fields[i].field, name) == 0
       && (strcmp(decl.actor_fields[i].binding, "private") == 0 || (input && strcmp(decl.actor_fields[i].binding, "client-input") == 0))) declared = true;
-  if (!d || strcmp(d->type, type) != 0 || !declared) qa_range_error("QC item storage %s requires declared original %s storage", name, type);
+  if (!d || strcmp(d->type, type) != 0 || !declared) qa_raise("Error", 0, 0, "QC item storage %s requires declared original %s storage", name, type);
   return d->offset;
 }
 static bool build_instance_qview(qa_compat_qc_mod_items *items, qa_compat_qc_program *p);
 /* TS ToInt32, for bit operators over float words. */
 static int32_t to_int32(double v) { if (!isfinite(v)) return 0; double m = fmod(trunc(v), 4294967296.0); if (m < 0) m += 4294967296.0; return (int32_t)(uint32_t)m; }
+typedef struct { bool *bound; void *seen; } ValidationScratch;
+static void validation_scratch_free(void *arg) { ValidationScratch *s = arg; free(s->bound); free(s->seen); s->bound = NULL; s->seen = NULL; }
+static void qview_free(void *arg) {
+  qa_compat_qc_mod_items *view = arg;
+  free(view->qglobals); free(view->qfields); free(view->qfunctions); free(view->qstatements);
+  view->qglobals = NULL; view->qfields = NULL; view->qfunctions = NULL; view->qstatements = NULL;
+}
 void qa_compat_qc_validate_items(qa_compat_qc_program *p, qa_mod_callback_declaration decl) {
   const qa_mod_qc_items *items = decl.items; if (!items) return;
-  if (!decl.clients || items->definition_count == 0) qa_range_error("QC source items require canonical clients and definitions");
+  if (!decl.clients || items->definition_count == 0) qa_raise("Error", 0, 0, "QC source items require canonical clients and definitions");
   for (size_t i = 0; i < items->definition_count; i++) {
-    if (strlen(items->definitions[i].label ? items->definitions[i].label : "") == 0) qa_range_error("QC item definitions are empty or duplicated");
-    for (size_t j = i + 1; j < items->definition_count; j++) if (strcmp(items->definitions[i].item, items->definitions[j].item) == 0) qa_range_error("QC item definitions are empty or duplicated");
+    if (strlen(items->definitions[i].label ? items->definitions[i].label : "") == 0) qa_raise("Error", 0, 0, "QC item definitions are empty or duplicated");
+    for (size_t j = i + 1; j < items->definition_count; j++) if (strcmp(items->definitions[i].item, items->definitions[j].item) == 0) qa_raise("Error", 0, 0, "QC item definitions are empty or duplicated");
   }
-  bool *bound = calloc(items->definition_count, sizeof(bool)); size_t bound_n = 0;
+  ValidationScratch scratch = {NULL, NULL}; /* released when a declaration is refused */
+  qa_cleanup scratch_scope; qa_cleanup_push(&scratch_scope, validation_scratch_free, &scratch);
+  bool *bound = scratch.bound = calloc(items->definition_count, sizeof(bool)); size_t bound_n = 0;
   if (!bound) qa_range_error("item validation allocation failed");
   typedef struct { int64_t field; const char *kind; } Seen; size_t seen_n = 0;
-  Seen *seen = calloc(items->storage_count * 2 + 1, sizeof *seen);
+  Seen *seen = scratch.seen = calloc(items->storage_count * 2 + 1, sizeof *seen);
   if (!seen) qa_range_error("item validation allocation failed");
   for (size_t si = 0; si < items->storage_count; si++) {
     const qa_mod_qc_item_storage *storage = &items->storage[si];
     int64_t count_field = check_field(p, decl, storage->field, "float", false);
-    for (size_t k = 0; k < seen_n; k++) if (seen[k].field == count_field) qa_range_error("QC item storage fields overlap");
+    for (size_t k = 0; k < seen_n; k++) if (seen[k].field == count_field) qa_raise("Error", 0, 0, "QC item storage fields overlap");
     seen[seen_n++] = (Seen){count_field, "count"};
     if (strcmp(storage->kind, "counter") == 0) {
       bool found = false; for (size_t d = 0; d < items->definition_count; d++) if (strcmp(items->definitions[d].item, storage->item) == 0 && !bound[d]) { bound[d] = true; bound_n++; found = true; }
-      if (!found) qa_range_error("QC item %s lacks distinct declared storage", storage->item);
+      if (!found) qa_raise("Error", 0, 0, "QC item %s lacks distinct declared storage", storage->item);
       if (!storage->capacity.is_constant) {
         int64_t cap_field = check_field(p, decl, storage->capacity.field, "float", false);
-        for (size_t k = 0; k < seen_n; k++) if (seen[k].field == cap_field && strcmp(seen[k].kind, "count") == 0) qa_range_error("QC item capacity overlaps source storage");
+        for (size_t k = 0; k < seen_n; k++) if (seen[k].field == cap_field && strcmp(seen[k].kind, "count") == 0) qa_raise("Error", 0, 0, "QC item capacity overlaps source storage");
         bool dup=false; for(size_t k=0;k<seen_n;k++) if(seen[k].field==cap_field) dup=true; if(!dup) seen[seen_n++]=(Seen){cap_field,"capacity"};
-      } else if (!isfinite(storage->capacity.value) || storage->capacity.value < 0 || qa_float32(storage->capacity.value) != storage->capacity.value) qa_range_error("QC item capacity exceeds its source ABI");
+      } else if (!isfinite(storage->capacity.value) || storage->capacity.value < 0 || qa_float32(storage->capacity.value) != storage->capacity.value) qa_raise("Error", 0, 0, "QC item capacity exceeds its source ABI");
     } else {
       double mask = storage->private_mask;
-      if (mask != trunc(mask) || mask < 0 || mask > 0xffffff || storage->item_count == 0) qa_range_error("QC packed inventory requires an exact binary32 mask");
+      if (mask != trunc(mask) || mask < 0 || mask > 0xffffff || storage->item_count == 0) qa_raise("Error", 0, 0, "QC packed inventory requires an exact binary32 mask");
       int64_t imask = (int64_t)mask;
       for (size_t ei = 0; ei < storage->item_count; ei++) {
         bool found = false; for (size_t d = 0; d < items->definition_count; d++) if (strcmp(items->definitions[d].item, storage->items[ei].item) == 0 && !bound[d]) { bound[d] = true; bound_n++; found = true; }
-        if (!found) qa_range_error("QC item %s lacks distinct declared storage", storage->items[ei].item);
+        if (!found) qa_raise("Error", 0, 0, "QC item %s lacks distinct declared storage", storage->items[ei].item);
         double em = storage->items[ei].mask;
-        if (em != trunc(em) || em < 1 || em > 0x800000) qa_range_error("QC packed inventory masks overlap or exceed source precision");
+        if (em != trunc(em) || em < 1 || em > 0x800000) qa_raise("Error", 0, 0, "QC packed inventory masks overlap or exceed source precision");
         int64_t emi = (int64_t)em;
-        if ((emi & (emi - 1)) != 0 || (imask & emi) != 0) qa_range_error("QC packed inventory masks overlap or exceed source precision");
+        if ((emi & (emi - 1)) != 0 || (imask & emi) != 0) qa_raise("Error", 0, 0, "QC packed inventory masks overlap or exceed source precision");
         imask |= emi;
       }
     }
   }
-  if (bound_n != items->definition_count) qa_range_error("QC item definition has no source storage");
-  free(bound); free(seen);
+  if (bound_n != items->definition_count) qa_raise("Error", 0, 0, "QC item definition has no source storage");
+  qa_cleanup_pop(&scratch_scope); validation_scratch_free(&scratch);
   size_t weapon_n = 0; for (size_t i = 0; i < items->definition_count; i++) if (items->definitions[i].is_weapon) weapon_n++;
-  if ((weapon_n == 0) == (items->weapons != NULL)) qa_range_error("QC weapon definitions require their original source consumer");
+  if ((weapon_n == 0) == (items->weapons != NULL)) qa_raise("Error", 0, 0, "QC weapon definitions require their original source consumer");
   if (items->weapons) {
     qa_compat_qc_mod_items view; memset(&view, 0, sizeof view);
+    qa_cleanup view_scope; qa_cleanup_push(&view_scope, qview_free, &view); /* a refused stage releases the view */
     if (!build_instance_qview(&view, p)) qa_range_error("item validation allocation failed");
     qa_q1qc_weapon_stage *stage = qa_q1qc_declared_weapon_stage(&view.qprogram, items->weapons->stage); qa_q1qc_weapon_stage_destroy(stage);
-    free(view.qglobals); free(view.qfields); free(view.qfunctions); free(view.qstatements);
+    qa_cleanup_pop(&view_scope); qview_free(&view);
     static const char *const think_names[2] = {"think","nextthink"};
-    for (int i = 0; i < 2; i++) { bool has=false; for(size_t j=0;j<decl.actor_field_count;j++) if(strcmp(decl.actor_fields[j].field,think_names[i])==0&&strcmp(decl.actor_fields[j].binding,think_names[i])==0) has=true; if(!has) qa_range_error("QC weapons require continuing source think ownership"); }
+    for (int i = 0; i < 2; i++) { bool has=false; for(size_t j=0;j<decl.actor_field_count;j++) if(strcmp(decl.actor_fields[j].field,think_names[i])==0&&strcmp(decl.actor_fields[j].binding,think_names[i])==0) has=true; if(!has) qa_raise("Error", 0, 0, "QC weapons require continuing source think ownership"); }
     const struct { const char *field; const qa_mod_qc_weapon_value *values; size_t count; bool input; } maps[2] = {
       {items->weapons->selected_field, items->weapons->selected_values, items->weapons->selected_value_count, false},
       {items->weapons->select_field, items->weapons->select_values, items->weapons->select_value_count, true}};
@@ -85,14 +95,14 @@ void qa_compat_qc_validate_items(qa_compat_qc_program *p, qa_mod_callback_declar
         bool has=false; for(size_t j=0;j<maps[mi].count;j++) if(strcmp(maps[mi].values[j].item, items->definitions[i].item)==0) has=true; if(!has) bad=true;
       }
       for (size_t i = 0; i < maps[mi].count; i++) if (!isfinite(maps[mi].values[i].value) || qa_float32(maps[mi].values[i].value) != maps[mi].values[i].value || maps[mi].values[i].value == 0) bad = true;
-      if (bad) qa_range_error("QC weapon selectors differ from their definitions");
+      if (bad) qa_raise("Error", 0, 0, "QC weapon selectors differ from their definitions");
     }
     check_field(p, decl, items->weapons->model_field, "string", false);
     check_field(p, decl, items->weapons->model_frame, "float", false);
     for (size_t i = 0; i < items->definition_count; i++) if (items->definitions[i].is_weapon && items->definitions[i].weapon.ammo) {
       bool has=false; for(size_t j=0;j<items->definition_count;j++) if(strcmp(items->definitions[j].item, items->definitions[i].weapon.ammo)==0) has=true;
       for(size_t j=0;j<decl.actor_field_count;j++) if(strcmp(decl.actor_fields[j].binding,"inventory")==0 && decl.actor_fields[j].item && strcmp(decl.actor_fields[j].item, items->definitions[i].weapon.ammo)==0) has=true;
-      if(!has) qa_range_error("QC weapon has no declared ammo source");
+      if(!has) qa_raise("Error", 0, 0, "QC weapon has no declared ammo source");
     }
   }
 }
@@ -100,7 +110,7 @@ static int64_t off_of(I *items, const char *name) {
   qa_compat_qc_program *p = items->operations.machine(items->operations.ctx)->program;
   /* TS new Map(program.fields...): the last definition of a name wins. */
   for (size_t i = p->field_count; i-- > 0;) if (strcmp(p->fields[i].name, name) == 0) return p->fields[i].offset;
-  qa_range_error("Missing admitted source field %s", name);
+  qa_raise("Error", 0, 0, "Missing admitted source field %s", name);
 }
 static qa_compat_qc_words *words_of(I *items, qa_actor_id actor) {
   qa_compat_qc_machine *m = items->operations.machine(items->operations.ctx);
@@ -129,7 +139,7 @@ static size_t read_entries(I *items, qa_actor_id actor, const qa_compat_qc_entit
       else value = qa_compat_qc_words_float(words, foff);
       int64_t mask = (int64_t)storage->private_mask;
       for (size_t ei = 0; ei < storage->item_count; ei++) mask |= (int64_t)storage->items[ei].mask;
-      if (value != trunc(value) || value < 0 || value > 0xffffff || (((int64_t)value) & ~mask) != 0) qa_range_error("Original QC inventory contains undeclared bits");
+      if (value != trunc(value) || value < 0 || value > 0xffffff || (((int64_t)value) & ~mask) != 0) qa_raise("Error", 0, 0, "Original QC inventory contains undeclared bits");
       for (size_t ei = 0; ei < storage->item_count; ei++) {
         if (n < cap) out[n] = (qa_inventory_entry){storage->items[ei].item, (((int64_t)value) & (int64_t)storage->items[ei].mask) == 0 ? 0 : 1, 1, false, {NULL,NULL}};
         n++;
@@ -166,19 +176,19 @@ static bool st_entry(void *ctx, qa_item_id item, qa_inventory_entry *out) {
   double count = qa_compat_qc_words_float(words, off_of(items, storage->field));
   if (strcmp(storage->kind,"counter")==0) { *out=(qa_inventory_entry){item,count,storage->capacity.is_constant?storage->capacity.value:qa_compat_qc_words_float(words,off_of(items,storage->capacity.field)),true,{"source-counter","binary32"}}; return true; }
   const qa_mod_qc_item_mask *bit=NULL; for(size_t j=0;j<storage->item_count;j++) if(strcmp(storage->items[j].item,item)==0) bit=&storage->items[j];
-  if(!bit) qa_range_error("Admitted packed item is missing");
+  if(!bit) qa_raise("Error", 0, 0, "Admitted packed item is missing");
   *out=(qa_inventory_entry){item,(to_int32(count)&(int32_t)bit->mask)==0?0:1,1,false,{NULL,NULL}}; return true;
 }
 static void st_write(void *ctx, qa_inventory_entry entry) {
   StateCtx *s = ctx; I *items = s->items;
   qa_compat_qc_mod_items_entry *current = find_entry(items, s->actor);
-  if (!current || !current->lease.current(current->lease.ctx)) qa_range_error("QC source items are no longer current");
+  if (!current || !current->lease.current(current->lease.ctx)) qa_raise("Error", 0, 0, "QC source items are no longer current");
   qa_compat_qc_words *words = words_of(items, s->actor);
   for (size_t i=0;i<items->definition->storage_count;i++) {
     const qa_mod_qc_item_storage *storage=&items->definition->storage[i];
     if (strcmp(storage->kind,"counter")==0 && strcmp(storage->item,entry.item)==0) {
-      if (!isfinite((double)qa_float32(entry.count)) || !isfinite((double)qa_float32(entry.capacity))) qa_range_error("QC inventory exceeds source scalar precision");
-      if (storage->capacity.is_constant && entry.capacity != storage->capacity.value) qa_range_error("QC source capacity is immutable");
+      if (!isfinite((double)qa_float32(entry.count)) || !isfinite((double)qa_float32(entry.capacity))) qa_raise("Error", 0, 0, "QC inventory exceeds source scalar precision");
+      if (storage->capacity.is_constant && entry.capacity != storage->capacity.value) qa_raise("Error", 0, 0, "QC source capacity is immutable");
       qa_compat_qc_words_set_float(words, off_of(items, storage->field), entry.count);
       if (!storage->capacity.is_constant) qa_compat_qc_words_set_float(words, off_of(items, storage->capacity.field), entry.capacity);
       return;
@@ -186,12 +196,12 @@ static void st_write(void *ctx, qa_inventory_entry entry) {
     if (strcmp(storage->kind,"bits")==0) {
       const qa_mod_qc_item_mask *bit=NULL; for(size_t j=0;j<storage->item_count;j++) if(strcmp(storage->items[j].item,entry.item)==0) bit=&storage->items[j];
       if(!bit) continue;
-      if (entry.capacity!=1 || (entry.count!=0 && entry.count!=1)) qa_range_error("QC weapon ownership must be one source bit");
+      if (entry.capacity!=1 || (entry.count!=0 && entry.count!=1)) qa_raise("Error", 0, 0, "QC weapon ownership must be one source bit");
       int64_t off=off_of(items,storage->field); int32_t bits=to_int32(qa_compat_qc_words_float(words,off));
       qa_compat_qc_words_set_float(words,off,(double)(entry.count==0?bits&~(int32_t)bit->mask:bits|(int32_t)bit->mask)); return;
     }
   }
-  qa_range_error("QC item write has no source field");
+  qa_raise("Error", 0, 0, "QC item write has no source field");
 }
 static bool st_mutable(void *ctx, qa_item_id item) {
   StateCtx *s=ctx; for(size_t i=0;i<s->items->definition->storage_count;i++){ const qa_mod_qc_item_storage *st=&s->items->definition->storage[i]; if(strcmp(st->kind,"counter")==0&&strcmp(st->item,item)==0&&!st->capacity.is_constant) return true; } return false;
@@ -214,7 +224,7 @@ static void st_action(void *ctx, qa_item_id item, const char *action) {
   qa_owned_actor resolved_o; bool resolved_ok = current && items->operations.resolve_owned && items->operations.resolve_owned(items->operations.ctx, s->actor, &resolved_o) && qa_same_owned_actor(resolved_o, current->actor);
   bool cur = current && current->lease.current(current->lease.ctx) && resolved_ok
     && items->operations.reference(items->operations.ctx, s->actor)==current->reference;
-  if (!current || !cur || !call) qa_range_error("Source item action is no longer admitted");
+  if (!current || !cur || !call) qa_raise("Error", 0, 0, "Source item action is no longer admitted");
   invoke_item(items, s->actor, *call);
 }
 static bool current_of(I *items, qa_compat_qc_mod_items_entry *entry) {
@@ -229,7 +239,7 @@ static qa_item_id active_item(I *items, qa_actor_id actor) {
   int64_t word = off_of(items, w->selected_field);
   double value = qa_compat_qc_words_float(w2, word);
   for (size_t i=0;i<w->selected_value_count;i++) if (w->selected_values[i].value==value) return w->selected_values[i].item;
-  if (value != 0) qa_range_error("Original QC selected an undeclared source weapon");
+  if (value != 0) qa_raise("Error", 0, 0, "Original QC selected an undeclared source weapon");
   return NULL;
 }
 struct qa_compat_qc_mod_items_weapon { I *items; qa_compat_qc_mod_items_entry entry; qa_source_weapon_presentation_model model; };
@@ -248,15 +258,15 @@ static WeaponCtx *weapon_for(I *items, qa_compat_qc_mod_items_entry *entry) {
 static bool wpn_current(void *ctx) { WeaponCtx *w=ctx; return current_snapshot(w->items, w); }
 static qa_source_weapon_presentation wpn_read(void *ctx) {
   WeaponCtx *w=ctx; I *items=w->items;
-  if (!current_snapshot(items, w)) qa_range_error("QC source weapon presentation has expired");
+  if (!current_snapshot(items, w)) qa_raise("Error", 0, 0, "QC source weapon presentation has expired");
   const qa_mod_qc_weapons *def = items->definition->weapons;
-  if (!def) qa_range_error("QC source has no weapon presentation");
+  if (!def) qa_raise("Error", 0, 0, "QC source has no weapon presentation");
   qa_compat_qc_words *words = words_of(items, w->entry.actor.id);
   qa_compat_qc_machine *m = items->operations.machine(items->operations.ctx);
-  const char *path0 = qa_compat_qc_strings_get(&m->strings, qa_compat_qc_words_int(words, off_of(items, def->model_field)));
-  char path[512]; snprintf(path,sizeof path,"%s",path0);
+  /* The whole model path (no copy is kept: the lookup and the refusal text read it directly). */
+  const char *path = qa_compat_qc_strings_get(&m->strings, qa_compat_qc_words_int(words, off_of(items, def->model_field)));
   qa_resolved_resource_reference asset; bool has = path[0] && items->operations.media_resource(items->operations.ctx, path, &asset);
-  if (path[0] && !has) qa_range_error("Original QC weapon model was not prepared: %s", path);
+  if (path[0] && !has) qa_raise("Error", 0, 0, "Original QC weapon model was not prepared: %s", path);
   qa_source_weapon_presentation r; memset(&r,0,sizeof r);
   r.source.provider = items->provider; r.source.content = items->operations.media_content;
   r.active = active_item(items, w->entry.actor.id);
@@ -282,13 +292,13 @@ static bool wpn_select(void *ctx, qa_item_id item) {
   qa_item_id active = active_item(w->items, w->entry.actor.id);
   return active && strcmp(active,item)==0;
 }
-static void wpn_holster(void *ctx) { WeaponCtx *w=ctx; if(!current_snapshot(w->items, w)) qa_range_error("QC source weapon retired while holstering"); }
+static void wpn_holster(void *ctx) { WeaponCtx *w=ctx; if(!current_snapshot(w->items, w)) qa_raise("Error", 0, 0, "QC source weapon retired while holstering"); }
 static bool wpn_holstered(void *ctx) { WeaponCtx *w=ctx; return current_snapshot(w->items, w) && qa_q1qc_weapon_stage_settled(&w->items->stage_binding, w->entry.reference); }
 static bool wpn_resume(void *ctx, qa_item_id item) {
   WeaponCtx *w=ctx; const qa_mod_qc_weapons *def=w->items->definition->weapons;
-  if(!current_snapshot(w->items, w)) qa_range_error("QC source weapon retired while resuming");
+  if(!current_snapshot(w->items, w)) qa_raise("Error", 0, 0, "QC source weapon retired while resuming");
   if (item) return wpn_select(ctx,item);
-  for(size_t i=0;i<def->resume_count;i++){ if(!current_snapshot(w->items, w)) qa_range_error("QC source weapon retired while resuming"); invoke_item(w->items,w->entry.actor.id,def->resume[i]); }
+  for(size_t i=0;i<def->resume_count;i++){ if(!current_snapshot(w->items, w)) qa_raise("Error", 0, 0, "QC source weapon retired while resuming"); invoke_item(w->items,w->entry.actor.id,def->resume[i]); }
   return current_snapshot(w->items, w);
 }
 static bool build_instance_qview(I *items, qa_compat_qc_program *p) {
@@ -359,11 +369,11 @@ bool qa_compat_qc_mod_items_init(I *items, const qa_mod_qc_items *definition, qa
   for(size_t i=0;i<definition->storage_count;i++){
     int64_t words_list[2]; size_t wn=0;
     const qa_compat_qc_definition *f=last_field(program, definition->storage[i].field);
-    if(!f) qa_range_error("Missing admitted source field %s", definition->storage[i].field);
+    if(!f) qa_raise("Error", 0, 0, "Missing admitted source field %s", definition->storage[i].field);
     words_list[wn++]=f->offset;
     if(strcmp(definition->storage[i].kind,"counter")==0 && !definition->storage[i].capacity.is_constant){
       const qa_compat_qc_definition *cf=last_field(program, definition->storage[i].capacity.field);
-      if(!cf) qa_range_error("Missing admitted source field %s", definition->storage[i].capacity.field);
+      if(!cf) qa_raise("Error", 0, 0, "Missing admitted source field %s", definition->storage[i].capacity.field);
       words_list[wn++]=cf->offset;
     }
     for(size_t j=0;j<wn;j++){ bool dup=false; for(size_t k=0;k<items->watched_word_count;k++) if(items->watched_words[k]==words_list[j]) dup=true;
@@ -371,7 +381,7 @@ bool qa_compat_qc_mod_items_init(I *items, const qa_mod_qc_items *definition, qa
   }
   items->has_weapons = definition->weapons != NULL;
   if (items->has_weapons) {
-    if (!operations.weapon_bind) qa_range_error("QC weapons require the destination weapon slot service");
+    if (!operations.weapon_bind) qa_raise("Error", 0, 0, "QC weapons require the destination weapon slot service");
     if (!build_instance_qview(items, program)) return false;
     items->qmachine.fail = items_qm_fail; items->qmachine.execute = items_qm_execute; items->qmachine.execute_region = items_qm_execute_region;
     items->qmachine.strings_get = items_qm_strings_get; items->qmachine.strings_set_engine = items_qm_strings_set_engine;
@@ -391,18 +401,22 @@ void qa_compat_qc_mod_items_destroy(I *items) {
   free(items->weapon_storage);
   memset(items,0,sizeof *items);
 }
-typedef struct { I *items; qa_actor_id actor; qa_source_item_lease lease; } AdmitUnwind;
 static void remove_entry(I *items, qa_actor_id actor) {
   qa_compat_qc_mod_items_entry *e = find_entry(items, actor); if (!e) return;
   size_t idx = (size_t)(e - items->entries);
   memmove(&items->entries[idx], &items->entries[idx+1], (items->entry_count-idx-1)*sizeof *items->entries); items->entry_count--;
 }
-static void unwind_admit(void *arg) { AdmitUnwind *u = arg; u->lease.close(u->lease.ctx); remove_entry(u->items, u->actor); }
+typedef struct { I *items; qa_owned_actor owner; qa_source_weapon_binding binding; void (*remove_weapon)(void *); void *remove_weapon_ctx; bool bound; } WeaponBindJob;
+static void weapon_bind_job(void *ctx) {
+  WeaponBindJob *job = ctx;
+  job->bound = job->items->operations.weapon_bind(job->items->operations.ctx, job->owner, job->binding, &job->remove_weapon, &job->remove_weapon_ctx);
+  if (!job->bound) qa_raise("Error", 0, 0, "QC source weapon service is absent");
+}
 void qa_compat_qc_mod_items_admit(I *items, qa_actor_id actor) {
   if (find_entry(items, actor)) return;
   qa_owned_actor owner;
   if (!items->operations.resolve_owned(items->operations.ctx, actor, &owner) || !items->operations.client_is_current(items->operations.ctx, actor))
-    qa_range_error("QC items require a live canonical client");
+    qa_raise("Error", 0, 0, "QC items require a live canonical client");
   int64_t reference = items->operations.reference(items->operations.ctx, actor);
   StateCtx *state = state_for(items, actor);
   qa_source_item_lease lease = items->operations.bind_items(items->operations.ctx, owner, items->admissions, items->admission_count, state, st_read, st_entry, st_write, st_mutable, st_action);
@@ -418,21 +432,33 @@ void qa_compat_qc_mod_items_admit(I *items, qa_actor_id actor) {
     binding.handoff.ctx=w; binding.handoff.accepts=wpn_accepts; binding.handoff.select=wpn_select;
     binding.handoff.holster=wpn_holster; binding.handoff.is_holstered=wpn_holstered; binding.handoff.is_source_input=false; binding.handoff.resume_immediate=wpn_resume;
     binding.current=wpn_current;
-    AdmitUnwind unwind = {items, actor, lease}; qa_cleanup scope; qa_cleanup_push(&scope, unwind_admit, &unwind); /* TS catch */
-    bool bound = items->operations.weapon_bind(items->operations.ctx, owner, binding, &remove_weapon, &remove_weapon_ctx);
-    qa_cleanup_pop(&scope);
-    if (!bound) {
-      lease.close(lease.ctx); items->entry_count--; qa_range_error("QC source weapon service is absent");
+    /* TS catch (error) { lease.close(); entries.delete(actor); throw error }: a raising close propagates
+     * its own error and leaves the entry. */
+    WeaponBindJob job = {items, owner, binding, NULL, NULL, false};
+    qa_caught_error caught;
+    if (!qa_try(weapon_bind_job, &job, &caught)) {
+      lease.close(lease.ctx);
+      remove_entry(items, actor);
+      qa_rethrow(&caught);
     }
+    remove_weapon = job.remove_weapon; remove_weapon_ctx = job.remove_weapon_ctx;
     entry = find_entry(items, actor); /* the service may have admitted others and moved the table */
     if (entry) { entry->remove_weapon = remove_weapon; entry->remove_weapon_ctx = remove_weapon_ctx; }
   }
+}
+typedef struct { qa_mod_qc_item_storage *affected; qa_inventory_entry *before, *after; qa_source_item_store *changes; } ObserveScratch;
+static void observe_scratch_free(void *arg) {
+  ObserveScratch *s = arg;
+  free(s->affected); free(s->before); free(s->after); free(s->changes);
+  memset(s, 0, sizeof *s);
 }
 void qa_compat_qc_mod_items_observe(I *items, qa_compat_qc_entity_store_observation store, const qa_original_pickup_execution *pickup) {
   int64_t end = store.word + (int64_t)(store.after_length / 4);
   bool touched=false; for(size_t i=0;i<items->watched_word_count;i++) if(items->watched_words[i]>=store.word && items->watched_words[i]<end) touched=true;
   if(!touched) return;
-  qa_mod_qc_item_storage *affected_storage = malloc((items->definition->storage_count ? items->definition->storage_count : 1) * sizeof *affected_storage); size_t an=0;
+  ObserveScratch scratch; memset(&scratch, 0, sizeof scratch); /* released when a read, check or store raises */
+  qa_cleanup scratch_scope; qa_cleanup_push(&scratch_scope, observe_scratch_free, &scratch);
+  qa_mod_qc_item_storage *affected_storage = scratch.affected = malloc((items->definition->storage_count ? items->definition->storage_count : 1) * sizeof *affected_storage); size_t an=0;
   if (!affected_storage) qa_range_error("item allocation failed");
   size_t entry_capacity = 0;
   for(size_t i=0;i<items->definition->storage_count;i++){
@@ -443,10 +469,10 @@ void qa_compat_qc_mod_items_observe(I *items, qa_compat_qc_entity_store_observat
   }
   qa_actor_id actor = items->operations.actor(items->operations.ctx, store.reference);
   qa_compat_qc_mod_items_entry *entry = find_entry(items, actor);
-  if (!entry) { free(affected_storage); return; }
-  if (!current_of(items, entry)) qa_range_error("QC source item store belongs to a retired actor");
-  qa_inventory_entry *before = calloc(entry_capacity + 1, sizeof *before), *after = calloc(entry_capacity + 1, sizeof *after);
-  qa_source_item_store *changes = calloc(entry_capacity + 1, sizeof *changes); size_t cn=0;
+  if (!entry) { qa_cleanup_pop(&scratch_scope); observe_scratch_free(&scratch); return; }
+  if (!current_of(items, entry)) qa_raise("Error", 0, 0, "QC source item store belongs to a retired actor");
+  qa_inventory_entry *before = scratch.before = calloc(entry_capacity + 1, sizeof *before), *after = scratch.after = calloc(entry_capacity + 1, sizeof *after);
+  qa_source_item_store *changes = scratch.changes = calloc(entry_capacity + 1, sizeof *changes); size_t cn=0;
   if (!before || !after || !changes) qa_range_error("item allocation failed");
   size_t bn = read_entries(items, actor, &store, affected_storage, an, before, entry_capacity);
   size_t fn = read_entries(items, actor, NULL, affected_storage, an, after, entry_capacity);
@@ -461,28 +487,33 @@ void qa_compat_qc_mod_items_observe(I *items, qa_compat_qc_entity_store_observat
           && (prev->count==after[i].count || strcmp(wr->fields,"capacity")!=0)
           && (prev->capacity==after[i].capacity || strcmp(wr->fields,"count")!=0)) ok=true;
       }
-      if(!ok) qa_range_error("Original pickup changed an undeclared source item");
+      if(!ok) qa_raise("Error", 0, 0, "Original pickup changed an undeclared source item");
     }
     changes[cn++]=(qa_source_item_store){*prev, after[i]};
   }
   if (cn) entry->lease.stored(entry->lease.ctx, changes, cn);
-  free(changes); free(after); free(before); free(affected_storage);
+  qa_cleanup_pop(&scratch_scope); observe_scratch_free(&scratch);
 }
 static void close_lease(void *arg) { qa_source_item_lease *lease = arg; lease->close(lease->ctx); }
+typedef struct { void (*remove)(void *); void *ctx; } RemoveWeapon;
+static void remove_weapon_job(void *arg) { RemoveWeapon *job = arg; if (job->remove) job->remove(job->ctx); }
 void qa_compat_qc_mod_items_release(I *items, qa_actor_id actor) {
   qa_compat_qc_mod_items_entry *entry=find_entry(items,actor); if(!entry) return;
   qa_source_item_lease lease=entry->lease; void (*remove)(void *)=entry->remove_weapon; void *rctx=entry->remove_weapon_ctx;
   remove_entry(items, actor); /* selection capability ends before the inventory is exposed */
-  qa_cleanup scope; qa_cleanup_push(&scope, close_lease, &lease); /* TS finally */
-  if (remove) remove(rctx);
-  qa_cleanup_pop(&scope); close_lease(&lease);
+  /* TS try { removeWeapon() } finally { lease.close() }: the close runs either way, and its error wins. */
+  RemoveWeapon job = {remove, rctx};
+  qa_caught_error caught;
+  bool removed = qa_try(remove_weapon_job, &job, &caught);
+  close_lease(&lease);
+  if (!removed) qa_rethrow(&caught);
 }
 typedef struct { I *items; qa_actor_id actor; } CloseTry;
 static void close_release(void *ctx) { CloseTry *t = ctx; qa_compat_qc_mod_items_release(t->items, t->actor); }
 void qa_compat_qc_mod_items_close(I *items) {
   size_t errors = 0;
   while (items->entry_count) { CloseTry attempt = {items, items->entries[0].actor.id}; qa_caught_error caught; if (!qa_try(close_release, &attempt, &caught)) errors++; }
-  if (errors) qa_range_error("QC source item release failed");
+  if (errors) qa_raise("AggregateError", 0, 0, "QC source item release failed");
 }
 const qa_q1qc_weapon_stage_binding *qa_compat_qc_mod_items_weapons(const I *items) { return items->has_weapons ? &items->stage_binding : NULL; }
 void qa_compat_qc_mod_items_compose_functions(I *items, qa_q1qc_weapon_function_composed *composed, qa_q1qc_function_boundary inner) { qa_q1qc_weapon_compose_functions(composed, &items->stage_binding, inner); }

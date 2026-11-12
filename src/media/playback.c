@@ -198,6 +198,7 @@ static void adapt_roq_audio(void *ctx, const qa_roq_playback_audio *audio) {
   out.time = audio->time;
   out.loop = audio->loop;
   out.reset_stream = audio->reset_stream;
+  out.key_order = QA_CINEMATIC_AUDIO_KEYS_ROQ;
   playback->options.on_audio(playback->options.on_audio_ctx, &out,
                              playback->target);
 }
@@ -237,6 +238,15 @@ static qa_cinematic_status status_of(const char *name) {
   return QA_CINEMATIC_PLAYING;
 }
 
+static void input_release(void *raw) { qa_media_input_close((qa_media_input *)raw); }
+static void init_unwind(void *raw) {
+  qa_cinematic_playback_destroy((qa_cinematic_playback *)raw);
+}
+static bool init_body(qa_cinematic_playback *playback,
+                      const qa_cinematic_source *source,
+                      const qa_cinematic_options *options,
+                      const qa_save_value *checkpoint);
+
 bool qa_cinematic_playback_init(qa_cinematic_playback *playback,
                                 const qa_cinematic_source *source,
                                 const qa_cinematic_options *options,
@@ -249,6 +259,20 @@ bool qa_cinematic_playback_init(qa_cinematic_playback *playback,
   playback->decoder_status = QA_CINEMATIC_DECODER_PLAYING;
   playback->source = dup_text(source->source);
   if (playback->source == NULL) return false;
+  /* A refused checkpoint or a malformed movie raises out of the constructor;
+   * everything built so far is released (TS: garbage, after closing the input
+   * or stream as below). */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, init_unwind, playback);
+  bool ok = init_body(playback, source, options, checkpoint);
+  qa_cleanup_pop(&guard);
+  return ok;
+}
+
+static bool init_body(qa_cinematic_playback *playback,
+                      const qa_cinematic_source *source,
+                      const qa_cinematic_options *options,
+                      const qa_save_value *checkpoint) {
   const qa_save_value *saved_clock = NULL;
   const qa_save_value *saved_decoder = NULL;
   bool has_saved = checkpoint != NULL;
@@ -325,7 +349,11 @@ bool qa_cinematic_playback_init(qa_cinematic_playback *playback,
         qa_media_input_close(input);
         qa_range_error("Ogg movie exceeds 512 MiB");
       }
+      /* TS try/finally: the input closes when the read throws too. */
+      qa_cleanup input_guard;
+      qa_cleanup_push(&input_guard, input_release, input);
       uint8_t *bytes = qa_read_media(input, 0, input->byte_length);
+      qa_cleanup_pop(&input_guard);
       size_t length = (size_t)input->byte_length;
       qa_media_input_close(input);
       if (bytes == NULL && length != 0) {
@@ -340,8 +368,11 @@ bool qa_cinematic_playback_init(qa_cinematic_playback *playback,
       ogv_options.silent = options->silent;
       ogv_options.on_audio_ctx = playback;
       ogv_options.on_audio = adapt_cin_audio;
+      qa_cleanup bytes_guard;
+      qa_cleanup_push(&bytes_guard, free, bytes);
       ok = qa_ogv_playback_init(&playback->movie.ogv, bytes, length,
                                 &ogv_options, saved_decoder);
+      qa_cleanup_pop(&bytes_guard);
       free(bytes);
       if (ok && !has_saved) {
         const qa_cinematic_frame *frame =

@@ -120,7 +120,8 @@ bool qa_q1ad_handle_mg3_item_impulse(qa_q1ad_context *context, qa_actor_id actor
   }
   if (impulse >= 111 && impulse <= 115) {
     static const char *const TYPES[] = {"health", "shells", "nails", "rockets", "cells"};
-    (void)qa_q1ad_give_next_mg3_upgrade(context, TYPES[(int)impulse - 111], player);
+    /* types[impulse - 111]: a fractional impulse indexes nothing and grants nothing. */
+    if (impulse == (double)(int)impulse) (void)qa_q1ad_give_next_mg3_upgrade(context, TYPES[(int)impulse - 111], player);
     return true;
   }
   if (impulse == 118) {

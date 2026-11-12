@@ -1,6 +1,7 @@
 /* Port of src/app/bootstrap/q3-client.ts. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "qa/app/bootstrap/q3_client.h"
+#include "qa/foundation/caught_message.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -603,6 +604,7 @@ static bool submit_body(qa_app_application_q3_client *client, double number, qa_
   body->base = base;
   body->options.custom_shader = prepared.custom_shader;
   body->options.custom_skin = skin;
+  body->options.has_custom_skin = prepared.custom_skin != NULL; /* an empty skin is still a skin (calloc(0) may be NULL) */
   body->options.custom_skin_count = skin != NULL ? prepared.custom_skin_count : 0;
   body->options.has_non_normalized_axes = true;
   body->options.non_normalized_axes = prepared.non_normalized_axes;
@@ -1204,6 +1206,14 @@ static bool no_font_data(void *ctx) {
 }
 static void destroy_storage(qa_app_application_q3_client *client);
 static void close_ctx(void *ctx) { qa_app_application_q3_client_close(ctx); }
+/* The TS try block of create(): initialize, assertCurrent, initializing = false, bindFrameTime. */
+static void finish_create(void *ctx) {
+  qa_app_application_q3_client *client = ctx;
+  initialize(client);
+  assert_current_option(client);
+  client->initializing = false;
+  bind_frame_time(client);
+}
 qa_app_application_q3_client *qa_app_application_q3_client_create(const qa_app_application_q3_client_options *options,
                                                                   qa_app_qvm_presentation_artifacts *artifacts) {
   if (options->assert_current != NULL) options->assert_current(options->ctx);
@@ -1322,14 +1332,11 @@ qa_app_application_q3_client *qa_app_application_q3_client_create(const qa_app_a
     qa_range_error("Out of memory");
   client->has_light_sampler = true;
   qa_caught_error error;
-  if (qa_try(initialize, client, &error)) {
-    assert_current_option(client);
-    client->initializing = false;
-    bind_frame_time(client);
-    return client;
-  }
+  if (qa_try(finish_create, client, &error)) return client;
+  /* catch (error) { client.close(); throw error; }: an error out of close() replaces it (the owner is left as close
+   * left it, as the TS leaves it to the collector). */
   qa_caught_error cleanup;
-  if (!qa_try(close_ctx, client, &cleanup)) qa_raise("AggregateError", 0, 2, "%s", error.message);
+  if (!qa_try(close_ctx, client, &cleanup)) qa_rethrow(&cleanup);
   destroy_storage(client);
   qa_rethrow(&error);
 }

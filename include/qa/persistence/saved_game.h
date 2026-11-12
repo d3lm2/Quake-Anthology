@@ -21,6 +21,7 @@
 
 #include "qa/contracts/session.h"
 #include "qa/persistence/q1.h"
+#include "qa/persistence/save_image.h"
 #include "qa/persistence/value.h"
 
 /* TS SavedGame union on kind: "shared" | "q1-source". */
@@ -36,12 +37,35 @@ typedef struct qa_saved_game {
 
 /* False only on OOM; malformed saves abort as the TS throws. */
 bool qa_decode_saved_game(const uint8_t *bytes, size_t length, qa_saved_game *out);
-/* TS readSavedGame (synchronous). False on I/O failure or OOM. */
+
+/* A save in the original format cannot hold everything this engine keeps, so the engine writes that state
+ * beside it: a sidecar holding the shared container behind a signature and the SHA-256 of the original-format
+ * file or files it belongs to. */
+#define QA_SIDECAR_EXTENSION ".qtsave"
+#define QA_SAVE_DIGEST_BYTES 32
+/* TS sidecarPath: malloc'd; `.sav` or `.pak.gz` (any case) becomes `.qtsave`. NULL only on OOM. */
+char *qa_sidecar_path(const char *path);
+/* TS digestBytes of saved-game.ts: SHA-256 (qa_digest_bytes is content/mounts' digestBytes). */
+void qa_save_digest_bytes(const uint8_t *bytes, size_t length, uint8_t out[QA_SAVE_DIGEST_BYTES]);
+/* TS encodeSaveSidecar: malloc'd; NULL only on OOM. */
+uint8_t *qa_encode_save_sidecar(const uint8_t digest[QA_SAVE_DIGEST_BYTES], const qa_save_image *image,
+                                size_t *out_length);
+/* TS decodeSaveSidecar: false is the TS null (not a sidecar, or written beside other content). On true `out`
+ * is released with qa_save_image_result_free. */
+bool qa_decode_save_sidecar(const uint8_t *bytes, size_t length, const uint8_t digest[QA_SAVE_DIGEST_BYTES],
+                            qa_save_image_result *out);
+
+/* TS readSavedGame (synchronous). False on I/O failure or OOM. An original-format save whose sidecar still
+ * matches it reads as the shared image the sidecar holds. */
 bool qa_read_saved_game(const char *path, qa_saved_game *out);
 /* TS writeSavedGame (synchronous). False only on I/O failure or OOM;
  * contained-path RangeErrors abort via qa_write_contained_save. */
 bool qa_write_saved_game(const char *directory, const char *path,
                          const qa_saved_game *save);
+/* writeSavedGame(directory, path, save, sidecar): `sidecar` (NULL for undefined) is written beside a q1-source
+ * save as `<name>.qtsave`. */
+bool qa_write_saved_game_sidecar(const char *directory, const char *path, const qa_saved_game *save,
+                                 const qa_save_image *sidecar);
 void qa_saved_game_free(qa_saved_game *save);
 
 #endif

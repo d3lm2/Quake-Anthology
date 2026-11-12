@@ -34,11 +34,14 @@ struct qa_app_q1_server_network {
   qa_app_q1_server_host host;
   qa_protocol_codec codec; bool codec_live;
   peer **peers; size_t peer_count, peer_cap;
-  const void **pending; size_t pending_count, pending_cap, pending_head;
+  /* TS pending: EventRing<ActorCommand>. Each admitted command is copied in, so the host's
+   * input() result is borrowed only for the call. */
+  qa_actor_command *pending; size_t pending_count, pending_cap, pending_head;
   double source_seconds;
   struct { double slot; char *name; } *names; size_t name_count, name_cap;
   bool ended;
-  const void **poll_result; size_t poll_result_cap;
+  /* poll()'s result: copies of the drained queue, valid until the next poll. */
+  const void **poll_result; qa_actor_command *poll_values; size_t poll_result_cap;
   qa_connectionless_gate gate;
   /* Removed peers stay allocated until no frame still holds them (TS objects outlive removal). */
   struct peer **retired; size_t retired_count, retired_cap;
@@ -194,11 +197,12 @@ static void pending_admit(qa_app_q1_server_network *n, const void *command) {
   if (n->pending_count - n->pending_head >= 8192)
     qa_range_error("Event ring capacity exhausted (8192 undrained records); drain before admitting more");
   if (n->pending_count == n->pending_cap) {
-    n->pending_cap = n->pending_cap ? n->pending_cap * 2 : 32;
-    n->pending = realloc(n->pending, n->pending_cap * sizeof *n->pending);
-    if (!n->pending) qa_range_error("out of memory");
+    size_t cap = n->pending_cap ? n->pending_cap * 2 : 32;
+    qa_actor_command *grown = realloc(n->pending, cap * sizeof *n->pending);
+    if (!grown) qa_range_error("out of memory");
+    n->pending = grown; n->pending_cap = cap;
   }
-  n->pending[n->pending_count++] = command;
+  n->pending[n->pending_count++] = *(const qa_actor_command *)command; /* host input never returns NULL */
 }
 static void send_bytes(qa_app_q1_server_network *n, const qa_net_address *to,
     const uint8_t *bytes, size_t length) {
@@ -220,6 +224,7 @@ void qa_app_q1_server_network_destroy(qa_app_q1_server_network *network) {
   free(network->peers);
   free(network->pending);
   free(network->poll_result);
+  free(network->poll_values);
   for (size_t i = 0; i < network->name_count; i++) free(network->names[i].name);
   free(network->names);
   for (size_t i = 0; i < network->retired_count; i++) peer_destroy(network->retired[i]);
@@ -291,7 +296,8 @@ void qa_app_q1_server_network_change_world(qa_app_q1_server_network *network,
 bool qa_app_q1_server_network_disconnect_client(qa_app_q1_server_network *network,
     qa_client_id client, const char *reason) {
   peer *p = NULL;
-  for (size_t i = 0; i < network->peer_count; i++)
+  /* TS find: the first peer of that client. */
+  for (size_t i = 0; i < network->peer_count && !p; i++)
     if (network->peers[i]->player.client.slot == client.slot
         && network->peers[i]->player.client.generation == client.generation
         && network->peers[i]->player.client.token == client.token) p = network->peers[i];
@@ -309,11 +315,10 @@ bool qa_app_q1_server_network_disconnect_client(qa_app_q1_server_network *networ
   }
   qa_app_q1_player player = p->player;
   peer_remove(network, p);
-  /* pending live-filter by actor: commands are opaque; filter via
-   * the qa_actor_command layout (actor is the first field). */
+  /* pending.filterLive(command => !command.actor.equals(peer.player.actor)) */
   size_t kept = network->pending_head;
   for (size_t i = network->pending_head; i < network->pending_count; i++) {
-    const qa_actor_command *command = network->pending[i];
+    const qa_actor_command *command = &network->pending[i];
     bool drop = command->actor.slot == player.actor.slot
         && command->actor.generation == player.actor.generation
         && command->actor.token == player.actor.token;
@@ -683,11 +688,18 @@ const void *const *qa_app_q1_server_network_poll(qa_app_q1_server_network *n,
   }
   size_t count = n->pending_count - n->pending_head;
   if (n->poll_result_cap < count) {
-    n->poll_result = realloc(n->poll_result, count * sizeof *n->poll_result);
-    if (!n->poll_result) qa_range_error("out of memory");
+    const void **result = realloc(n->poll_result, count * sizeof *n->poll_result);
+    if (!result) qa_range_error("out of memory");
+    n->poll_result = result;
+    qa_actor_command *values = realloc(n->poll_values, count * sizeof *n->poll_values);
+    if (!values) qa_range_error("out of memory");
+    n->poll_values = values;
     n->poll_result_cap = count;
   }
-  for (size_t i = 0; i < count; i++) n->poll_result[i] = n->pending[n->pending_head + i];
+  for (size_t i = 0; i < count; i++) {
+    n->poll_values[i] = n->pending[n->pending_head + i];
+    n->poll_result[i] = &n->poll_values[i];
+  }
   n->pending_head = n->pending_count = 0;
   reap_retired(n);
   *out_count = count;

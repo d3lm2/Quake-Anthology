@@ -64,6 +64,9 @@ static void sb_addf(struct sb *b, const char *format, ...) {
   va_end(args);
   sb_add(b, tmp);
 }
+#define utf16_units_of_lead qa_q2mp_utf16_units_of_lead
+#define utf16_units qa_q2mp_utf16_units
+#define slice_utf16 qa_q2mp_slice_utf16
 static void pad_start(char *out, size_t size, const char *text, size_t width) {
   size_t len = strlen(text);
   size_t pad = len < width ? width - len : 0;
@@ -296,22 +299,19 @@ char *qa_q2_ctf_presentation_location(qa_q2_ctf_presentation *p, qa_q2_entity *e
   qa_vec3 point = qa_q2_add(origin, (qa_vec3){0, 0, qa_q2_game_body(g, entity).bounds.min.z + 1});
   const char *water = (qa_js_to_int32(g->host->point_contents(g->host->ctx, point)) & 56) != 0 ? "in the water " : "";
   const char *name = qa_q2_item_module_item_name(p->context->hooks.items, hot->classname);
-  char buffer[512];
-  snprintf(buffer, sizeof buffer, "%s%s the %s%s", water, where, team, name == NULL ? hot->classname : name);
-  return qa_q2mp_dup(buffer);
+  return qa_q2mp_format("%s%s the %s%s", water, where, team, name == NULL ? hot->classname : name);
 }
 
 static char *armor_text(qa_q2_ctf_presentation *p, qa_q2_entity *entity, qa_q2_game_services *g, const qa_combat_state_result *combat) {
   if (!combat->has_value) return qa_q2mp_dup("no armor");
   qa_armor_state value = combat->value.armor;
   double cells = qa_q2mp_inv_count(g, entity->actor.id, "q2:ammo_cells");
-  char power[128] = "";
+  char *power = NULL, *conventional = NULL;
   if (value.powered.kind != NULL && strcmp(value.powered.kind, "none") != 0 && cells > 0) {
     char cells_text[32];
     qa_q2mp_format_number(cells_text, sizeof cells_text, cells);
-    snprintf(power, sizeof power, "Power %s with %s cells", strcmp(value.powered.kind, "screen") == 0 ? "Screen" : "Shield", cells_text);
+    power = qa_q2mp_format("Power %s with %s cells", strcmp(value.powered.kind, "screen") == 0 ? "Screen" : "Shield", cells_text);
   }
-  char conventional[256] = "";
   qa_regular_armor_state regular = value.regular;
   if (regular.kind != QA_REGULAR_ARMOR_NONE && regular.points > 0) {
     char points[32];
@@ -319,17 +319,19 @@ static char *armor_text(qa_q2_ctf_presentation *p, qa_q2_entity *entity, qa_q2_g
     if (regular.kind == QA_REGULAR_ARMOR_Q2) {
       qa_q2_inventory_item found;
       const char *name = regular.item != NULL && qa_q2_item_module_lookup(p->context->hooks.items, regular.item, &found) ? found.name : "armor";
-      snprintf(conventional, sizeof conventional, "%s units of %s", points, name);
+      conventional = qa_q2mp_format("%s units of %s", points, name); /* the item name has no length limit */
     } else {
-      snprintf(conventional, sizeof conventional, "%s armor", points);
+      conventional = qa_q2mp_format("%s armor", points);
     }
   }
-  char buffer[512];
-  if (power[0] && conventional[0]) snprintf(buffer, sizeof buffer, "%s and %s", power, conventional);
-  else if (power[0]) snprintf(buffer, sizeof buffer, "%s", power);
-  else if (conventional[0]) snprintf(buffer, sizeof buffer, "%s", conventional);
-  else snprintf(buffer, sizeof buffer, "no armor");
-  return qa_q2mp_dup(buffer);
+  char *out;
+  if (power != NULL && conventional != NULL) out = qa_q2mp_format("%s and %s", power, conventional);
+  else if (power != NULL) out = qa_q2mp_dup(power);
+  else if (conventional != NULL) out = qa_q2mp_dup(conventional);
+  else out = qa_q2mp_dup("no armor");
+  free(power);
+  free(conventional);
+  return out;
 }
 
 static char *sight_text(qa_q2_ctf_presentation *p, qa_q2_entity *entity, qa_q2_game_services *g) {
@@ -376,16 +378,20 @@ void qa_q2_ctf_presentation_say_team(qa_q2_ctf_presentation *p, qa_q2_entity *en
   struct sb text = {0};
   /* TS expansions: each %-key (lowercased) is expanded once per message and reused. */
   char *expansions[256] = {0};
-  for (size_t i = 0; text_source[i] && text.len < 1023; i++) {
+  /* TS stops once text.length reaches 1023 UTF-16 units; the bytes of one character are never separated. */
+  size_t units = 0;
+  for (size_t i = 0; text_source[i] && (units < 1023 || utf16_units_of_lead((unsigned char)text_source[i]) == 0); i++) {
     if (text_source[i] != '%' || text_source[i + 1] == '\0' || text_source[i + 1] == '\n') {
       char ch[2] = {text_source[i], '\0'};
       sb_add(&text, ch);
+      units += utf16_units_of_lead((unsigned char)text_source[i]);
       continue;
     }
     char character = text_source[++i];
     unsigned char key = (unsigned char)tolower((unsigned char)character);
     if (expansions[key] != NULL) {
       sb_add(&text, expansions[key]);
+      units += utf16_units(expansions[key]);
       continue;
     }
     char *replacement = NULL;
@@ -436,14 +442,12 @@ void qa_q2_ctf_presentation_say_team(qa_q2_ctf_presentation *p, qa_q2_entity *en
       }
     }
     sb_add(&text, replacement);
+    units += utf16_units(replacement);
     expansions[key] = replacement;
   }
   for (size_t k = 0; k < 256; k++) free(expansions[k]);
   free(text_source);
-  if (text.len > 1023) {
-    text.data[1023] = '\0';
-    text.len = 1023;
-  }
+  if (text.data != NULL) slice_utf16(text.data, 1023); /* text.slice(0, 1023) */
   size_t pn = 0;
   const qa_actor_id *players = g->host->players(g->host->ctx, &pn);
   for (size_t i = 0; i < pn; i++) {
@@ -498,10 +502,11 @@ void qa_q2_ctf_presentation_stats(qa_q2_ctf_presentation *p, qa_q2_entity *entit
   sb_add(&text, "Name             Frags Deaths Caps Base Carrier\n");
   for (size_t i = 0; i < p->context->match.ghost_count; i++) {
     qa_q2_ctf_ghost *ghost = &p->context->match.ghosts[i];
-    char name[17];
-    snprintf(name, sizeof name, "%s", ghost->name);
-    char padded[24];
-    pad_end(padded, sizeof padded, name, 16);
+    /* ghost.name.slice(0, 16).padEnd(16), in UTF-16 units (at most 48 bytes of name). */
+    char padded[80];
+    snprintf(padded, 49, "%s", ghost->name);
+    slice_utf16(padded, 16);
+    for (size_t have = utf16_units(padded), end = strlen(padded); have < 16; have++) { padded[end++] = ' '; padded[end] = '\0'; }
     char kills[32], deaths[32], captures[32], base[32], carrier[32];
     qa_q2mp_format_number(kills, sizeof kills, ghost->kills);
     qa_q2mp_format_number(deaths, sizeof deaths, ghost->deaths);
@@ -510,10 +515,7 @@ void qa_q2_ctf_presentation_stats(qa_q2_ctf_presentation *p, qa_q2_entity *entit
     qa_q2mp_format_number(carrier, sizeof carrier, ghost->carrier_defense);
     sb_addf(&text, "%s %s %s %s %s %s\n", padded, kills, deaths, captures, base, carrier);
   }
-  if (text.len > 1399) {
-    text.data[1399] = '\0';
-    text.len = 1399;
-  }
+  slice_utf16(text.data, 1399); /* text.slice(0, 1399) */
   qa_ctf_print(g, &entity->actor.id, NULL, "%s", text.data == NULL ? "" : text.data);
   free(text.data);
 }

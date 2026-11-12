@@ -45,11 +45,13 @@ static bool is_safe_integer(double v) {
   return is_integer(v) && v >= -9007199254740991.0 && v <= 9007199254740991.0;
 }
 
+static void destroy_on_raise(void *arg) { qa_qvm_body_submissions_destroy(arg); }
+
 qa_qvm_body_submissions *qa_qvm_body_submissions_create(
     qa_qvm_module *module, const qa_qvm_image *image, bool artifact_is_bytecode_cgame,
     const qa_qvm_body_submission *declarations, size_t declaration_count,
     qa_qvm_body_hidden_fn hidden, const qa_qvm_body_capture *capture) {
-  if (!artifact_is_bytecode_cgame) qa_range_error("Body submissions require authored cgame bytecode");
+  if (!artifact_is_bytecode_cgame) qa_raise("Error", 0, 0, "Body submissions require authored cgame bytecode");
   qa_qvm_body_submissions *submissions = calloc(1, sizeof *submissions);
   if (submissions == NULL) return NULL;
   submissions->module = module;
@@ -66,6 +68,9 @@ qa_qvm_body_submissions *qa_qvm_body_submissions_create(
     free(submissions);
     return NULL;
   }
+  /* TS throws out of the constructor and the half-built object goes to the GC. */
+  qa_cleanup construction;
+  qa_cleanup_push(&construction, destroy_on_raise, submissions);
   for (size_t i = 0; i < declaration_count; i++) {
     const qa_qvm_body_submission *declaration = &declarations[i];
     bool seen = false;
@@ -77,7 +82,7 @@ qa_qvm_body_submissions *qa_qvm_body_submissions_create(
             : NULL;
     if (instruction == NULL || instruction->opcode != QA_QVM_OP_ENTER || instruction->operand < 8 ||
         seen)
-      qa_range_error("Cgame body declaration requires a unique source function entry");
+      qa_raise("Error", 0, 0, "Cgame body declaration requires a unique source function entry");
     double arguments[3];
     size_t argument_count = 0;
     arguments[argument_count++] = declaration->actor_argument;
@@ -86,19 +91,21 @@ qa_qvm_body_submissions *qa_qvm_body_submissions_create(
     for (size_t a = 0; a < argument_count; a++)
       if (!is_integer(arguments[a]) || arguments[a] < 0 ||
           arguments[a] >= QA_QVM_MAX_PRIVATE_ARGUMENT_WORDS)
-        qa_range_error("Cgame body argument is outside the source ABI");
+        qa_raise("Error", 0, 0, "Cgame body argument is outside the source ABI");
     if (!is_safe_integer(declaration->entity_number_offset) || declaration->entity_number_offset < 0 ||
         (int64_t)declaration->entity_number_offset % 4 != 0)
-      qa_range_error("Cgame body entity number requires an aligned field offset");
+      qa_raise("Error", 0, 0, "Cgame body entity number requires an aligned field offset");
     if (declaration->has_mesh) {
       qa_qvm_scene_body body = {{declaration->entry, declaration->actor_argument},
                                 declaration->mesh};
       if (!qa_qvm_qualify_body_calls(image, body, &submissions->calls[i])) {
+        qa_cleanup_pop(&construction);
         qa_qvm_body_submissions_destroy(submissions);
         return NULL;
       }
     }
   }
+  qa_cleanup_pop(&construction);
   return submissions;
 }
 
@@ -157,7 +164,7 @@ static void *grow_stack(void *array, size_t *capacity, size_t count, size_t size
 
 static int32_t call_word(const qa_qvm_module_function_call *call, int64_t byte_offset) {
   if (byte_offset < 0 || byte_offset > (int64_t)call->words_length - 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   const uint8_t *p = call->words + byte_offset;
   uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
                   ((uint32_t)p[3] << 24);
@@ -168,6 +175,16 @@ typedef struct hook_ctx {
   qa_qvm_body_submissions *submissions;
   size_t declaration_index;
 } hook_ctx;
+
+static void pop_range_on_raise(void *arg) {
+  qa_qvm_body_submissions *submissions = arg;
+  if (submissions->range_count != 0) submissions->range_count--;
+}
+
+static void pop_mesh_on_raise(void *arg) {
+  qa_qvm_body_submissions *submissions = arg;
+  if (submissions->mesh_count != 0) submissions->mesh_count--;
+}
 
 static int32_t body_hook(void *ctx, qa_qvm_module_function_call *call) {
   hook_ctx *hook = ctx;
@@ -210,10 +227,14 @@ static int32_t body_hook(void *ctx, qa_qvm_module_function_call *call) {
   range->declaration = declaration;
   range->calls = submissions->calls[hook->declaration_index];
   submissions->range_count++;
+  /* TS try/finally: the scope is popped when the original raises too. */
+  qa_cleanup scope;
+  qa_cleanup_push(&scope, pop_range_on_raise, submissions);
   int32_t result = call->proceed_async(call->call_ctx);
-  if (submissions->range_count == 0 || submissions->range_count - 1 != range_index)
-    qa_range_error("Cgame body submission scopes unwound out of order");
-  submissions->range_count--;
+  qa_cleanup_pop(&scope);
+  bool same = submissions->range_count != 0 && submissions->range_count - 1 == range_index;
+  if (submissions->range_count != 0) submissions->range_count--;
+  if (!same) qa_raise("Error", 0, 0, "Cgame body submission scopes unwound out of order");
   return result;
 }
 
@@ -251,21 +272,29 @@ static int32_t mesh_hook(void *ctx, qa_qvm_module_function_call *call) {
   active->part = part;
   active->shader = qa_qvm_writable_view_get_int32(&shader_view, 0, true);
   submissions->mesh_count++;
+  qa_cleanup scope;
+  qa_cleanup_push(&scope, pop_mesh_on_raise, submissions);
   int32_t result = call->proceed_async(call->call_ctx);
-  if (submissions->mesh_count == 0 || submissions->mesh_count - 1 != active_index)
-    qa_range_error("Cgame body mesh scopes unwound out of order");
-  submissions->mesh_count--;
+  qa_cleanup_pop(&scope);
+  bool same = submissions->mesh_count != 0 && submissions->mesh_count - 1 == active_index;
+  if (submissions->mesh_count != 0) submissions->mesh_count--;
+  if (!same) qa_raise("Error", 0, 0, "Cgame body mesh scopes unwound out of order");
   return result;
 }
 
+static void run_removals_on_raise(void *arg) { run_removals(arg); }
+
 void qa_qvm_body_submissions_enable(qa_qvm_body_submissions *submissions, bool active) {
   if (submissions->range_count != 0)
-    qa_range_error("Cannot change body submissions during source rendering");
+    qa_raise("Error", 0, 0, "Cannot change body submissions during source rendering");
   if (!active) {
     run_removals(submissions);
     return;
   }
   if (submissions->removal_count != 0) return;
+  /* TS catch: any failure while binding removes what was bound. */
+  qa_cleanup bound;
+  qa_cleanup_push(&bound, run_removals_on_raise, submissions);
   for (size_t i = 0; i < submissions->declaration_count; i++) {
     const qa_qvm_body_submission *declaration = &submissions->declarations[i];
     const qa_qvm_instruction *instruction =
@@ -273,10 +302,8 @@ void qa_qvm_body_submissions_enable(qa_qvm_body_submissions *submissions, bool a
                 declaration->entry < (double)submissions->image->instruction_count
             ? &submissions->image->instructions[(size_t)declaration->entry]
             : NULL;
-    if (instruction == NULL || instruction->opcode != QA_QVM_OP_ENTER) {
-      run_removals(submissions);
-      qa_range_error("Cgame body entry changed");
-    }
+    if (instruction == NULL || instruction->opcode != QA_QVM_OP_ENTER)
+      qa_raise("Error", 0, 0, "Cgame body entry changed");
     hook_ctx *hook = malloc(sizeof *hook);
     if (hook == NULL) qa_range_error("out of memory");
     hook->submissions = submissions;
@@ -286,9 +313,11 @@ void qa_qvm_body_submissions_enable(qa_qvm_body_submissions *submissions, bool a
     reference.kind = QA_GUEST_CALLBACK_QVM;
     reference.module = qa_qvm_module_get_profile(submissions->module)->module;
     reference.instruction_index = declaration->entry;
-    push_removal(submissions,
-                 qa_qvm_module_bind_function(submissions->module, &reference, body_hook, hook),
-                 hook);
+    qa_cleanup pending;
+    qa_cleanup_push(&pending, free, hook);
+    size_t hook_id = qa_qvm_module_bind_function(submissions->module, &reference, body_hook, hook);
+    qa_cleanup_pop(&pending);
+    push_removal(submissions, hook_id, hook);
     if (declaration->has_mesh) {
       bool seen = false;
       for (size_t j = 0; j < i; j++)
@@ -304,12 +333,15 @@ void qa_qvm_body_submissions_enable(qa_qvm_body_submissions *submissions, bool a
         mesh_reference.kind = QA_GUEST_CALLBACK_QVM;
         mesh_reference.module = qa_qvm_module_get_profile(submissions->module)->module;
         mesh_reference.instruction_index = declaration->mesh.entry;
-        push_removal(submissions, qa_qvm_module_bind_function(submissions->module, &mesh_reference,
-                                                              mesh_hook, mesh),
-                     mesh);
+        qa_cleanup_push(&pending, free, mesh);
+        size_t mesh_id =
+            qa_qvm_module_bind_function(submissions->module, &mesh_reference, mesh_hook, mesh);
+        qa_cleanup_pop(&pending);
+        push_removal(submissions, mesh_id, mesh);
       }
     }
   }
+  qa_cleanup_pop(&bound);
 }
 
 bool qa_qvm_body_submissions_suppress(qa_qvm_body_submissions *submissions,

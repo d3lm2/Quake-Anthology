@@ -105,6 +105,20 @@ void qa_cin_huffman_destroy(qa_cin_huffman *huffman) {
   memset(huffman, 0, sizeof *huffman);
 }
 
+typedef struct decode_scratch {
+  uint8_t *stored;
+  uint8_t *output;
+  qa_binary_reader *reader;
+} decode_scratch;
+
+/* Releases the decode scratch when a refusal raises (TS: garbage). */
+static void decode_scratch_release(void *raw) {
+  decode_scratch *scratch = (decode_scratch *)raw;
+  if (scratch->reader != NULL) qa_binary_reader_destroy(scratch->reader);
+  free(scratch->output);
+  free(scratch->stored);
+}
+
 uint8_t *qa_cin_huffman_decode(qa_cin_huffman *huffman,
                                const uint8_t *compressed, size_t length,
                                int64_t expected_pixels) {
@@ -116,6 +130,9 @@ uint8_t *qa_cin_huffman_decode(qa_cin_huffman *huffman,
     free(stored);
     return NULL;
   }
+  decode_scratch scratch = {stored, NULL, &reader};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decode_scratch_release, &scratch);
   int32_t count = qa_binary_reader_i32(&reader);
   if (count != expected_pixels) {
     qa_binary_error(huffman->source, 0,
@@ -124,10 +141,11 @@ uint8_t *qa_cin_huffman_decode(qa_cin_huffman *huffman,
   }
   uint8_t *output = (uint8_t *)malloc(count == 0 ? 1 : (size_t)count);
   if (output == NULL) {
-    qa_binary_reader_destroy(&reader);
-    free(stored);
+    qa_cleanup_pop(&guard);
+    decode_scratch_release(&scratch);
     return NULL;
   }
+  scratch.output = output;
   int context = 0;
   int value = 0;
   int bits = 0;
@@ -151,6 +169,7 @@ uint8_t *qa_cin_huffman_decode(qa_cin_huffman *huffman,
     output[index] = (uint8_t)node;
     context = node;
   }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   free(stored);
   return output;
@@ -179,6 +198,13 @@ static void reader_init(qa_save_reader *reader, const qa_save_value *value,
   }
 }
 
+static bool decoder_init_body(qa_cin_decoder *decoder, qa_media_input *input);
+static void decoder_init_unwind(void *raw) {
+  qa_cin_decoder *decoder = (qa_cin_decoder *)raw;
+  qa_cin_decoder_close(decoder);
+  qa_cin_huffman_destroy(&decoder->huffman);
+}
+
 bool qa_cin_decoder_init(qa_cin_decoder *decoder, qa_media_input *input,
                          const char *source) {
   (void)source; /* TS passes it to mediaBytes only for byte inputs. */
@@ -187,6 +213,15 @@ bool qa_cin_decoder_init(qa_cin_decoder *decoder, qa_media_input *input,
   decoder->input_length = input->byte_length;
   decoder->frame_rate = 14;
   decoder->offset = 20 + 65536;
+  /* TS: catch (error) { this.input.close(); throw error; } */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decoder_init_unwind, decoder);
+  bool ok = decoder_init_body(decoder, input);
+  qa_cleanup_pop(&guard);
+  return ok;
+}
+
+static bool decoder_init_body(qa_cin_decoder *decoder, qa_media_input *input) {
   uint8_t *header_bytes = qa_read_media(input, 0, 20);
   if (header_bytes == NULL) {
     qa_cin_decoder_close(decoder);
@@ -337,6 +372,21 @@ static int32_t read_i32(qa_cin_decoder *decoder, uint8_t *bytes) {
   return value;
 }
 
+typedef struct next_scratch {
+  uint8_t **compressed;
+  qa_cin_frame *frame;
+} next_scratch;
+
+static void next_scratch_release(void *raw) {
+  next_scratch *scratch = (next_scratch *)raw;
+  free(*scratch->compressed);
+  *scratch->compressed = NULL;
+  qa_cin_frame_dispose(scratch->frame);
+}
+
+static bool decoder_next_body(qa_cin_decoder *decoder, uint8_t **compressed_slot,
+                              int32_t size, qa_cin_frame *out);
+
 bool qa_cin_decoder_next(qa_cin_decoder *decoder, qa_cin_frame *out) {
   memset(out, 0, sizeof *out);
   if (decoder->closed) media_error("CIN decoder is closed");
@@ -371,6 +421,22 @@ bool qa_cin_decoder_next(qa_cin_decoder *decoder, qa_cin_frame *out) {
   if (compressed == NULL) return false;
   qa_cin_frame frame;
   memset(&frame, 0, sizeof frame);
+  /* The audio read and the Huffman decode raise for a malformed stream. */
+  next_scratch scratch = {&compressed, &frame};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, next_scratch_release, &scratch);
+  bool ok = decoder_next_body(decoder, &compressed, size, &frame);
+  qa_cleanup_pop(&guard);
+  if (!ok) return false;
+  *out = frame;
+  return true;
+}
+
+static bool decoder_next_body(qa_cin_decoder *decoder, uint8_t **compressed_slot,
+                              int32_t size, qa_cin_frame *out) {
+  uint8_t *compressed = *compressed_slot;
+  qa_cin_frame frame;
+  memset(&frame, 0, sizeof frame);
   if (decoder->has_audio_format) {
     int64_t sample_rate = decoder->audio_format.sample_rate;
     int sample_bytes = decoder->audio_format.sample_bytes;
@@ -381,6 +447,7 @@ bool qa_cin_decoder_next(qa_cin_decoder *decoder, qa_cin_frame *out) {
     uint8_t *bytes = decoder_read(decoder, byte_count);
     if (bytes == NULL && byte_count != 0) {
       free(compressed);
+      *compressed_slot = NULL;
       return false;
     }
     frame.has_audio = true;
@@ -394,6 +461,7 @@ bool qa_cin_decoder_next(qa_cin_decoder *decoder, qa_cin_frame *out) {
       if (signed_samples == NULL) {
         free(bytes);
         free(compressed);
+        *compressed_slot = NULL;
         return false;
       }
       qa_binary_reader reader;
@@ -402,6 +470,7 @@ bool qa_cin_decoder_next(qa_cin_decoder *decoder, qa_cin_frame *out) {
         free(signed_samples);
         free(bytes);
         free(compressed);
+        *compressed_slot = NULL;
         return false;
       }
       for (size_t i = 0; i < count; i++) {
@@ -418,19 +487,20 @@ bool qa_cin_decoder_next(qa_cin_decoder *decoder, qa_cin_frame *out) {
       frame.audio.sample_count = (size_t)byte_count;
     }
   }
+  *out = frame; /* the audio is visible to the unwind from here */
   int64_t pixel_count = decoder->width * decoder->height;
-  frame.pixels = qa_cin_huffman_decode(&decoder->huffman, compressed,
-                                       (size_t)size, pixel_count);
+  out->pixels = qa_cin_huffman_decode(&decoder->huffman, compressed,
+                                      (size_t)size, pixel_count);
   free(compressed);
-  if (frame.pixels == NULL) {
-    qa_cin_frame_dispose(&frame);
+  *compressed_slot = NULL;
+  if (out->pixels == NULL) {
+    qa_cin_frame_dispose(out);
     return false;
   }
-  frame.pixels_length = (size_t)pixel_count;
-  frame.index = decoder->frame_index++;
-  frame.time = (double)frame.index * 1000.0 / 14.0;
-  memcpy(frame.palette, decoder->colors, 768);
-  *out = frame;
+  out->pixels_length = (size_t)pixel_count;
+  out->index = decoder->frame_index++;
+  out->time = (double)out->index * 1000.0 / 14.0;
+  memcpy(out->palette, decoder->colors, 768);
   return true;
 }
 

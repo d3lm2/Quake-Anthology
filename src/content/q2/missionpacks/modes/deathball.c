@@ -104,7 +104,8 @@ void qa_q2mp_deathball_post_spawn(qa_q2mp_deathball *ball, qa_q2_game_services *
 double qa_q2mp_deathball_change_damage(qa_q2mp_deathball *ball, qa_actor_id target, bool has_attacker,
                                        qa_actor_id attacker, double damage) {
   bool target_is_ball = ball->has_ball && qa_same_actor(target, ball->ball);
-  bool attacker_is_ball = has_attacker && ball->has_ball && qa_same_actor(attacker, ball->ball);
+  /* TS `attacker !== this.ball`: null equals null, so a world hit before any ball exists is not halved. */
+  bool attacker_is_ball = has_attacker ? ball->has_ball && qa_same_actor(attacker, ball->ball) : !ball->has_ball;
   return target_is_ball ? 1 : !attacker_is_ball ? trunc(damage / 2) : damage;
 }
 double qa_q2mp_deathball_change_knockback(qa_q2mp_deathball *ball, qa_actor_id target, double knockback,
@@ -274,9 +275,9 @@ bool qa_q2mp_deathball_spawn(qa_q2mp_deathball *ball, qa_q2_entity *entity, qa_q
     entity->touch = speed ? ball->speed_touch : ball->goal_touch;
     entity->visible = false;
     if (speed) {
-      if (entity->speed == 0) entity->speed = 2;
-      if (entity->delay == 0) entity->delay = 0.2;
-    } else if (entity->wait == 0) entity->wait = 10;
+      if (!q2mp_truthy(entity->speed)) entity->speed = 2;
+      if (!q2mp_truthy(entity->delay)) entity->delay = 0.2;
+    } else if (!q2mp_truthy(entity->wait)) entity->wait = 10;
     entity->movedir = qa_q2_movedir(q2mp_body(game, entity).angles);
     qa_q2_body_changes c = q2mp_changes();
     c.has_angles = true; c.angles = q2mp_zero();

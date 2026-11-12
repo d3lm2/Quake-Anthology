@@ -5,9 +5,9 @@
 qa_bot_aim_state qa_new_aim_state(double p, double y) { return (qa_bot_aim_state){p, y, 0, 0, 0}; }
 qa_bot_vec3 qa_aim_lead_point(qa_bot_vec3 t, qa_bot_vec3 v, qa_bot_aiming_settings s) { if (s.velocity_offset == 0) return t; return qa_bvec_ma(t, s.velocity_offset, v); }
 typedef struct { double angle, velocity; } Adv;
-static Adv advance_axis(double angle, double velocity, double error_to, double stiffness, double damping, double max_speed, int substeps, double h) {
+static Adv advance_axis(double angle, double velocity, double error_to, double stiffness, double damping, double max_speed, double substeps, double h) {
   double a = angle, v = velocity;
-  for (int i = 0; i < substeps; i++) { double error = error_to - (a - angle); double accel = stiffness * error - damping * v; v += accel * h; if (max_speed > 0) v = qa_bot_clamp(v, -max_speed, max_speed); a += v * h; }
+  for (double i = 0; i < substeps; i++) { double error = error_to - (a - angle); double accel = stiffness * error - damping * v; v += accel * h; if (max_speed > 0) v = qa_bot_clamp(v, -max_speed, max_speed); a += v * h; }
   return (Adv){a, v};
 }
 qa_bot_pitch_yaw qa_aim_step(qa_bot_aim_state *st, qa_bot_vec3 ideal_dir, qa_bot_aiming_settings s, double dt, double now) {
@@ -20,7 +20,9 @@ qa_bot_pitch_yaw qa_aim_step(qa_bot_aim_state *st, qa_bot_vec3 ideal_dir, qa_bot
   double max_speed = s.max_acceleration * (modified ? s.modifier_accel_scalar : 1);
   double stiffness = s.spring_stiffness * (modified ? s.modifier_spring_scalar : 1);
   double damping = s.damping * (modified ? s.modifier_damping_scalar : 1);
-  double omega = sqrt(qa_js_max(stiffness, 1)); int sub = (int)ceil((dt * omega) / 0.25); if (sub < 1) sub = 1; if (sub > 64) sub = 64; double h = dt / sub;
+  double omega = sqrt(qa_js_max(stiffness, 1));
+  /* Math.max(1, Math.min(64, Math.ceil(...))): a NaN count runs no substep (a C int cast of NaN is undefined). */
+  double sub = qa_js_max(1, qa_js_min(64, ceil((dt * omega) / 0.25))); double h = dt / sub;
   Adv p = advance_axis(st->pitch, st->pitch_velocity, pe, stiffness, damping, max_speed, sub, h);
   Adv y = advance_axis(st->yaw, st->yaw_velocity, ye, stiffness, damping, max_speed, sub, h);
   st->pitch = qa_bot_clamp(p.angle, -80, 80); st->pitch_velocity = st->pitch == p.angle ? p.velocity : 0;

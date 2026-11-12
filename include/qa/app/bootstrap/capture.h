@@ -11,15 +11,18 @@
  *    runs the operation against the rejection. Other operations run inside
  *    services.write as they are queued, so drain() has nothing to wait for.
  *  - Operation failures are raises (qa_raise) caught here and printed as
- *    "Console output failed: <message>". console/commands.c reports a failed
- *    capture as "Screenshot capture failed"; when the frame read itself was
- *    rejected, the rejection's message is printed, as TS sees it.
+ *    "Console output failed: <message>". A file-system failure of the capture
+ *    raises the error TS rejects with (capture/index.c), so its message is
+ *    printed; when the frame read itself was rejected, the rejection's message
+ *    is printed, as TS sees it. console/commands.c's "Screenshot capture
+ *    failed" is left for allocation failure.
  *  - An operation that never runs (a closed owner, a retired script writer)
  *    keeps its operation context: console/commands.c frees it only when run.
  *  - The TS unregister closure is the console command registration. */
 #ifndef QA_APP_BOOTSTRAP_CAPTURE_H
 #define QA_APP_BOOTSTRAP_CAPTURE_H
 #include <stdbool.h>
+#include "qa/capture/index.h"
 #include "qa/console/commands.h"
 #include "qa/console/session.h"
 #include "qa/contracts/identity.h"
@@ -27,6 +30,8 @@
 #include "qa/input/seat.h"
 /* TS applicationCaptureRoot. Malloc'd; user_content_root NULL = TS undefined. */
 char *qa_app_application_capture_root(const char *user_content_root);
+/* TS defaultNaming: screenshots/shotNNNN. */
+extern const qa_screenshot_naming qa_app_capture_default_naming;
 /* TS ApplicationCaptureServices. One ctx serves every callback. console and
  * input return borrowed objects or NULL (TS null); root and map_name are
  * borrowed for the call. write runs operation (TS write(operation)) and returns
@@ -40,6 +45,9 @@ typedef struct qa_app_application_capture_services {
   qa_seat_input *(*input)(void *ctx, qa_seat_id seat);
   bool (*can_chat)(void *ctx);
   const char *(*root)(void *ctx);
+  /* TS naming?(): borrowed for the call; a NULL function is the TS undefined (defaultNaming). The object's
+   * identity matters as in TS: a different pointer or different contents starts a new FrameCapture. */
+  const qa_screenshot_naming *(*naming)(void *ctx);
   const char *(*map_name)(void *ctx);
   const char *(*write)(void *ctx, const char *(*operation)(void *op_ctx), void *op_ctx);
   void (*print)(void *ctx, const char *text);
@@ -47,7 +55,8 @@ typedef struct qa_app_application_capture_services {
 } qa_app_application_capture_services;
 struct qa_app_application_input;
 /* TS inputCaptureServices(input, root, mapName, print). Copies root; the input
- * is borrowed. map_name and print are called with their own contexts. The
+ * is borrowed. root and naming answer with the stock game's own folder and
+ * screenshot naming when the input's scripts have a native config. map_name and print are called with their own contexts. The
  * returned services own their ctx (release). */
 qa_app_application_capture_services qa_app_input_capture_services(struct qa_app_application_input *input, const char *root,
     const char *(*map_name)(void *ctx), void *map_ctx, void (*print)(void *ctx, const char *text), void *print_ctx);

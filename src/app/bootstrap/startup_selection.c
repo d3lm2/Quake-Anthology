@@ -35,6 +35,7 @@
 #include "qa/content/q3/equipment/grapple_profiles.h"
 #include "qa/content/user_data.h"
 #include "qa/contracts/mods.h"
+#include "qa/core/commands/text.h"
 #include "qa/core/common_parse.h"
 #include "qa/core/cvars/index.h"
 #include "qa/core/q3_product_policy.h"
@@ -42,6 +43,8 @@
 #include "qa/formats/q1_map/entities.h"
 #include "qa/formats/q3_map/entities.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/caught_message.h"
+#include "qa/app/bootstrap/startup_entity_text.h"
 #include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include "qa/network/common/js_number.h"
@@ -96,10 +99,10 @@ static _Noreturn void fail(const char *format, ...) {
   va_start(args, format);
   char *message = xvprintf(format, args);
   va_end(args);
-  char copy[QA_CAUGHT_MESSAGE_CAPACITY];
-  snprintf(copy, sizeof copy, "%s", message);
-  free(message);
-  qa_raise("Error", 0, 0, "%s", copy);
+  /* The raise formats the whole message before it runs the cleanups. */
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, message);
+  qa_raise("Error", 0, 0, "%s", message);
 }
 static bool eq(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 static char *lower_dup(const char *text) {
@@ -132,6 +135,33 @@ static char *arena_printf(arena *a, const char *format, ...) {
   char *out = xvprintf(format, args);
   va_end(args);
   return arena_keep(a, out);
+}
+/* word.charAt(0).toUpperCase() + word.slice(1) over UTF-8 text, into `a`: the first UTF-16 unit is upper-cased as JS
+ * does (it may become several characters: U+00DF is "SS"); a first character above U+FFFF is a lone high surrogate
+ * to charAt and stays as it is, as do U+0000 (C0 80) and a lone surrogate's three-byte form. */
+static char *arena_capitalize(arena *a, const char *word, size_t length) {
+  const unsigned char *w = (const unsigned char *)word;
+  size_t first = 0;
+  if (length > 0) {
+    if (w[0] < 0x80) first = 1;
+    else if (w[0] >= 0xc2 && w[0] <= 0xdf && length >= 2) first = 2;
+    else if (w[0] >= 0xe0 && w[0] <= 0xef && length >= 3 && !(w[0] == 0xed && w[1] >= 0xa0)) first = 3;
+  }
+  char *upper = NULL;
+  if (first > 0) {
+    char head[4];
+    memcpy(head, word, first);
+    head[first] = '\0';
+    upper = qa_js_to_upper_case(head);
+    if (upper == NULL) qa_range_error("Out of memory");
+  }
+  size_t upper_length = upper != NULL ? strlen(upper) : 0;
+  char *out = arena_alloc(a, upper_length + (length - first) + 1);
+  if (upper != NULL) memcpy(out, upper, upper_length);
+  memcpy(out + upper_length, word + first, length - first);
+  out[upper_length + length - first] = '\0';
+  free(upper);
+  return out;
 }
 static void arena_reset(arena *a) {
   for (size_t i = 0; i < a->count; i++) free(a->items[i]);
@@ -332,6 +362,7 @@ void qa_app_startup_options_copy(qa_app_options *out, const qa_app_options *o) {
   out->server_profile_path = xdup(o->server_profile_path);
   out->corpus_root = xdup(o->corpus_root);
   out->user_content_root = xdup(o->user_content_root);
+  out->native_config_root = xdup(o->native_config_root);
   out->addon_content_roots = NULL;
   if (o->addon_content_roots != NULL) {
     out->addon_content_roots = xcalloc(o->addon_content_root_count, sizeof *out->addon_content_roots);
@@ -616,10 +647,20 @@ static qa_app_startup_selection_model *model_alloc(qa_content_catalog *catalog, 
 }
 static char *number_text(double number) { return xdup(QA_JS_NUMBER(number)); }
 
-/* TS constructor(currentCatalog, initial). */
+static void model_create_cleanup(void *arg) { qa_app_startup_selection_model_destroy(arg); }
+/* TS constructor(currentCatalog, initial). The model owns `catalog`; a constructor that raises
+ * releases both (TS leaves them to the collector). */
 static qa_app_startup_selection_model *model_create(qa_content_catalog *catalog, const qa_app_options *initial) {
-  qa_app_startup_selection_model *m = model_alloc(catalog, initial);
+  qa_app_startup_selection_model *m;
+  {
+    qa_cleanup catalog_node;
+    qa_cleanup_push(&catalog_node, catalog_release, catalog);
+    m = model_alloc(catalog, initial);
+    qa_cleanup_pop(&catalog_node);
+  }
   retain(&m->owned, catalog, catalog_release);
+  qa_cleanup model_node;
+  qa_cleanup_push(&model_node, model_create_cleanup, m);
   m->display_width = initial->width;
   m->display_height = initial->height;
   m->display_gamma = initial->gamma;
@@ -652,6 +693,7 @@ static qa_app_startup_selection_model *model_create(qa_content_catalog *catalog,
   m->values[F_SEATS] = number_text(initial->seats);
   m->values[F_RENDERER] = xdup(initial->renderer != NULL ? initial->renderer : "");
   smap_set(m->selected_models, m->values[F_CHARACTER], xdup(m->values[F_MODEL]));
+  qa_cleanup_pop(&model_node);
   return m;
 }
 qa_app_startup_selection_model *qa_app_startup_selection_model_new(qa_content_catalog *catalog, const qa_app_options *initial) {
@@ -843,7 +885,7 @@ static void set_enabled_body(void *ctx) {
 static void mod_set_enabled(void *ctx, const char *id, bool enabled) {
   set_enabled_call call = {ctx, id, enabled};
   qa_caught_error caught;
-  if (!qa_try(set_enabled_body, &call, &caught)) set_text(&call.m->mod_status, caught.message);
+  if (!qa_try(set_enabled_body, &call, &caught)) set_text(&call.m->mod_status, qa_caught_message(&caught));
 }
 static void prepare_hook_styles(qa_app_startup_selection_model *m, qa_content_catalog *catalog);
 static qa_content_catalog *discover_catalog(qa_content_catalog *from, bool generation_next);
@@ -866,7 +908,7 @@ static void mod_refresh(void *ctx) {
   set_text(&m->mod_status, "Reading installed mods...");
   refresh_call call = {m};
   qa_caught_error caught;
-  if (!qa_try(refresh_body, &call, &caught)) set_text(&m->mod_status, caught.message);
+  if (!qa_try(refresh_body, &call, &caught)) set_text(&m->mod_status, qa_caught_message(&caught));
   m->refreshing_mods = false;
 }
 static const char *mod_status(void *ctx) { return ((qa_app_startup_selection_model *)ctx)->mod_status; }
@@ -1112,10 +1154,12 @@ const qa_ui_choice *qa_app_startup_selection_team_choices(qa_app_startup_selecti
   char **keys = m->team_campaign != NULL ? qa_app_team_arena_team_choices(m->team_campaign, &count) : NULL;
   qa_ui_choice *out = arena_alloc(&m->team_arena, (count ? count : 1) * sizeof *out);
   for (size_t i = 0; i < count; i++) {
-    out[i].id = arena_dup(&m->team_arena, keys[i]);
-    char *label = arena_dup(&m->team_arena, keys[i]);
-    if (label[0] >= 'a' && label[0] <= 'z') label[0] = (char)(label[0] - 'a' + 'A');
-    out[i].label = label;
+    /* The campaign keys are its Latin-1 text (one byte per unit); UI text is UTF-8. */
+    char *key = qa_command_text_to_utf8(keys[i]);
+    out[i].id = arena_dup(&m->team_arena, key);
+    /* id.charAt(0).toUpperCase() + id.slice(1) */
+    out[i].label = arena_capitalize(&m->team_arena, key, strlen(key));
+    free(key);
   }
   free(keys);
   *out_count = count;
@@ -1130,7 +1174,11 @@ void qa_app_startup_selection_team_write(qa_app_startup_selection_model *m, cons
   bool known = false;
   size_t count = 0;
   char **keys = m->team_campaign != NULL ? qa_app_team_arena_team_choices(m->team_campaign, &count) : NULL;
-  for (size_t i = 0; i < count; i++) if (eq(keys[i], name)) known = true;
+  for (size_t i = 0; i < count && !known; i++) {
+    char *key = qa_command_text_to_utf8(keys[i]); /* the campaign's Latin-1 key as UTF-8 text */
+    known = eq(key, name);
+    free(key);
+  }
   free(keys);
   if (!known) { free(name); fail("Unknown authored Team Arena team"); }
   if (eq(side, "player")) { free(m->team_player); m->team_player = name; }
@@ -1183,10 +1231,27 @@ static const smap *files_of(qa_app_startup_selection_model *m, const qa_catalog_
   m->file_set_count++;
   return paths;
 }
-/* Path segments split on '/'. Fills up to `capacity`; returns the count. */
-static size_t split_path(const char *path, char *buffer, size_t buffer_size, const char **segments, size_t capacity) {
+/* Scratch text for the path tests below, each buffer as long as the longest path (TS has no length limit). */
+typedef struct path_scratch { char *split, *name, *skin; } path_scratch;
+static void path_scratch_free(void *arg) {
+  path_scratch *scratch = arg;
+  free(scratch->split); free(scratch->name); free(scratch->skin);
+  memset(scratch, 0, sizeof *scratch);
+}
+/* Fills a zeroed `scratch` whose path_scratch_free cleanup the caller has pushed. */
+static void path_scratch_init(path_scratch *scratch, const smap *paths) {
+  size_t longest = 0;
+  for (size_t i = 0; i < paths->count; i++) {
+    size_t length = strlen(paths->keys[i]);
+    if (length > longest) longest = length;
+  }
+  scratch->split = xmalloc(longest + 1);
+  scratch->name = xmalloc(longest + 1);
+  scratch->skin = xmalloc(longest + 1);
+}
+/* Path segments split on '/' in `buffer` (at least strlen(path) + 1 bytes). Fills up to `capacity`; returns the count. */
+static size_t split_path(const char *path, char *buffer, const char **segments, size_t capacity) {
   size_t length = strlen(path);
-  if (length + 1 > buffer_size) return 0;
   memcpy(buffer, path, length + 1);
   size_t count = 0;
   char *start = buffer;
@@ -1203,17 +1268,16 @@ static size_t split_path(const char *path, char *buffer, size_t buffer_size, con
   return count;
 }
 /* /^models\/players\/(?:characters\/)?([^/]+)\/<leaf>$/ with leaf test. Returns
- * the captured name in `name` (buffer) or false. */
+ * the captured name in `name` or false; `split` and `name` hold strlen(path) + 1 bytes. */
 static bool q3_player_path(const char *path, bool (*leaf)(const char *segment, void *ctx), void *ctx,
-                           char *name, size_t name_size) {
-  char buffer[1024];
+                           char *split, char *name) {
   const char *s[6];
-  size_t count = split_path(path, buffer, sizeof buffer, s, 6);
+  size_t count = split_path(path, split, s, 6);
   if (count < 4 || count > 5 || strcmp(s[0], "models") != 0 || strcmp(s[1], "players") != 0) return false;
   if (count == 5 && strcmp(s[2], "characters") != 0) return false;
   const char *captured = s[count - 2];
   if (captured[0] == '\0' || !leaf(s[count - 1], ctx)) return false;
-  snprintf(name, name_size, "%s", captured);
+  strcpy(name, captured);
   return true;
 }
 static bool leaf_lower_md3(const char *segment, void *ctx) { (void)ctx; return strcmp(segment, "lower.md3") == 0; }
@@ -1227,7 +1291,8 @@ static bool leaf_lower_skin(const char *segment, void *ctx) {
   skin[size] = '\0';
   return true;
 }
-static int compare_text(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
+/* [...names].sort(): UTF-16 code-unit order. */
+static int compare_text(const void *a, const void *b) { return qa_js_compare_code_units(*(const char *const *)a, *(const char *const *)b); }
 /* TS modelsFor(product). */
 static void models_for(qa_app_startup_selection_model *m, const qa_catalog_discovered_product *product, cvec *out) {
   const smap *paths = files_of(m, product);
@@ -1236,18 +1301,21 @@ static void models_for(qa_app_startup_selection_model *m, const qa_catalog_disco
     return;
   }
   smap *models = smap_new(NULL);
+  path_scratch scratch = {0};
+  qa_cleanup scratch_node;
+  qa_cleanup_push(&scratch_node, path_scratch_free, &scratch);
+  path_scratch_init(&scratch, paths);
+  char *name = scratch.name;
   bool q3 = product->expectation.family == QA_GAME_FAMILY_Q3;
   for (size_t i = 0; i < paths->count; i++) {
     const char *path = paths->keys[i];
-    char name[1024];
     bool found = false;
-    if (q3) found = q3_player_path(path, leaf_lower_md3, NULL, name, sizeof name);
+    if (q3) found = q3_player_path(path, leaf_lower_md3, NULL, scratch.split, name);
     else {
-      char buffer[1024];
       const char *s[4];
-      size_t count = split_path(path, buffer, sizeof buffer, s, 4);
+      size_t count = split_path(path, scratch.split, s, 4);
       if (count == 3 && strcmp(s[0], "players") == 0 && s[1][0] != '\0' && strcmp(s[2], "tris.md2") == 0) {
-        snprintf(name, sizeof name, "%s", s[1]);
+        strcpy(name, s[1]);
         found = true;
       }
     }
@@ -1261,6 +1329,8 @@ static void models_for(qa_app_startup_selection_model *m, const qa_catalog_disco
     }
     if (!smap_has(models, name)) smap_set(models, name, NULL);
   }
+  qa_cleanup_pop(&scratch_node);
+  path_scratch_free(&scratch);
   char **names = xcalloc(models->count, sizeof *names);
   for (size_t i = 0; i < models->count; i++) names[i] = models->keys[i];
   qa_js_sort(names, models->count, sizeof *names, compare_text);
@@ -1316,25 +1386,30 @@ static void skins_for(qa_app_startup_selection_model *m, const qa_catalog_discov
   if (family == QA_GAME_FAMILY_Q1 || model[0] == '\0') { free(model); return; }
   smap *skins = smap_new(NULL);
   const smap *paths = files_of(m, product);
+  path_scratch scratch = {0};
+  qa_cleanup scratch_node;
+  qa_cleanup_push(&scratch_node, path_scratch_free, &scratch);
+  path_scratch_init(&scratch, paths);
+  char *skin = scratch.skin;
   for (size_t i = 0; i < paths->count; i++) {
     const char *path = paths->keys[i];
     if (family == QA_GAME_FAMILY_Q2) {
-      char buffer[1024];
       const char *s[4];
-      size_t count = split_path(path, buffer, sizeof buffer, s, 4);
+      size_t count = split_path(path, scratch.split, s, 4);
       if (count != 3 || strcmp(s[0], "players") != 0 || s[1][0] == '\0') continue;
       size_t length = strlen(s[2]);
       if (length <= 4 || !ends_with(s[2], ".pcx")) continue;
-      char skin[1024];
-      snprintf(skin, sizeof skin, "%.*s", (int)(length - 4), s[2]);
+      memcpy(skin, s[2], length - 4);
+      skin[length - 4] = '\0';
       if (strcmp(s[1], model) == 0 && !ends_with(skin, "_i") && strcmp(skin, "weapon") != 0 && !smap_has(skins, skin))
         smap_set(skins, skin, NULL);
     } else {
-      char name[1024], skin[1024];
-      if (!q3_player_path(path, leaf_lower_skin, skin, name, sizeof name)) continue;
-      if (strcmp(name, model) == 0 && !smap_has(skins, skin)) smap_set(skins, skin, NULL);
+      if (!q3_player_path(path, leaf_lower_skin, skin, scratch.split, scratch.name)) continue;
+      if (strcmp(scratch.name, model) == 0 && !smap_has(skins, skin)) smap_set(skins, skin, NULL);
     }
   }
+  qa_cleanup_pop(&scratch_node);
+  path_scratch_free(&scratch);
   smap_delete(skins, "default");
   char **names = xcalloc(skins->count, sizeof *names);
   for (size_t i = 0; i < skins->count; i++) names[i] = skins->keys[i];
@@ -1438,14 +1513,46 @@ static const char *monster_label(const char *classname, arena *a) {
     memcpy(text, classname, before);
     strcpy(text + before, found + strlen("monster_"));
   } else strcpy(text, classname);
-  /* split("_").map(capitalize).join(" ") */
-  bool word_start = true;
-  for (char *p = text; *p; p++) {
-    if (*p == '_') { *p = ' '; word_start = true; continue; }
-    if (word_start && *p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
-    word_start = false;
+  /* split("_").map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(" ") */
+  size_t total = 0, capacity = strlen(text) * 3 + 1;
+  char *label = arena_alloc(a, capacity);
+  for (const char *word = text;;) {
+    const char *end = strchr(word, '_');
+    size_t word_length = end != NULL ? (size_t)(end - word) : strlen(word);
+    const char *part = arena_capitalize(a, word, word_length);
+    size_t part_length = strlen(part);
+    if (total + part_length + 2 > capacity) {
+      capacity = (total + part_length + 2) * 2;
+      char *grown = arena_alloc(a, capacity);
+      memcpy(grown, label, total);
+      label = grown;
+    }
+    memcpy(label + total, part, part_length);
+    total += part_length;
+    if (end == NULL) break;
+    label[total++] = ' ';
+    word = end + 1;
   }
-  return text;
+  label[total] = '\0';
+  return label;
+}
+char *qa_app_startup_monster_label(const char *classname) {
+  arena a = {0};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, arena_cleanup, &a);
+  char *label = xdup(monster_label(classname, &a));
+  qa_cleanup_pop(&guard);
+  arena_free(&a);
+  return label;
+}
+char *qa_app_startup_team_label(const char *id) {
+  arena a = {0};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, arena_cleanup, &a);
+  char *label = xdup(arena_capitalize(&a, id, strlen(id)));
+  qa_cleanup_pop(&guard);
+  arena_free(&a);
+  return label;
 }
 static const char *monster_program_suffix(const char *program, arena *a) {
   return eq(program, "id1") || eq(program, "baseq2") ? "" : arena_printf(a, " %s", program);
@@ -1815,20 +1922,15 @@ typedef struct map_read {
   qa_archive_source file; bool file_open;
   qa_archive_handle *archive; bool archive_owned;
   uint8_t *decoded; size_t decoded_length; bool has_decoded;
-  char *key; uint8_t *header; uint8_t *bytes; char *text;
-  qa_q1_entity *q1; size_t q1_count;
-  qa_q2_spawn_fields *q2; size_t q2_count;
-  qa_q3_entity *q3; size_t q3_count;
-  const char **classnames;
+  char *key; uint8_t *header; uint8_t *bytes;
+  char **names; size_t name_count; /* qa_app_entity_classnames */
   const qa_catalog_content_map **maps;
 } map_read;
 static void map_read_release(void *arg) {
   map_read *read = arg;
-  free(read->key); free(read->decoded); free(read->header); free(read->bytes); free(read->text); free(read->classnames);
+  free(read->key); free(read->decoded); free(read->header); free(read->bytes);
   free((void *)read->maps);
-  if (read->q1) qa_q1_entities_destroy(read->q1, read->q1_count);
-  if (read->q2) qa_q2_entities_free(read->q2, read->q2_count);
-  if (read->q3) qa_q3_entities_destroy(read->q3, read->q3_count);
+  qa_app_entity_classnames_free(read->names, read->name_count);
   if (read->archive_owned && read->archive) qa_archive_destroy(read->archive);
   if (read->file_open) qa_archive_source_destroy(&read->file);
   memset(read, 0, sizeof *read);
@@ -1910,17 +2012,15 @@ static void prepare_map_body(void *ctx) {
         read->bytes = qa_archive_source_read(file, offset + start, size, &byte_length);
         bytes = read->bytes;
       }
-      read->text = bytes_text(bytes, byte_length);
-      read->q1 = qa_q1_parse_entities(read->text, &read->q1_count);
-      read->classnames = xcalloc(read->q1_count, sizeof *read->classnames);
+      /* parseQ1Entities(new TextDecoder().decode(bytes)) */
+      read->names = qa_app_entity_classnames(bytes, byte_length, QA_APP_ENTITY_GRAMMAR_Q1, false, NULL, false, &read->name_count);
       bool accepted = false;
-      for (size_t i = 0; i < read->q1_count; i++) {
-        const char *classname = qa_q1_entity_value(&read->q1[i], "classname");
-        read->classnames[i] = classname != NULL ? classname : "";
+      for (size_t i = 0; i < read->name_count; i++) {
+        const char *classname = read->names[i];
         if (eq(classname, "info_player_start") || eq(classname, "info_player_deathmatch") || eq(classname, "info_player_coop")
             || eq(classname, "info_player_start2")) accepted = true;
       }
-      cache_monster_classes(call->m, read->key, read->classnames, read->q1_count);
+      cache_monster_classes(call->m, read->key, (const char **)read->names, read->name_count);
       call->accepted = accepted;
     } else call->accepted = true;
     call->has_accepted = true;
@@ -2007,7 +2107,7 @@ static void prepare_maps(qa_app_startup_selection_model *m) {
       qa_caught_error caught;
       if (qa_try(prepare_map_body, &call, &caught)) {
         if (!call.has_accepted || call.accepted) cvec_push(&choices, choice1(maps[i]->path));
-      } else cvec_push(&choices, choice3(maps[i]->path, maps[i]->path, arena_dup(&a, caught.message)));
+      } else cvec_push(&choices, choice3(maps[i]->path, maps[i]->path, arena_dup(&a, qa_caught_message(&caught))));
     }
     arena_keep(&a, choices.items);
     qa_authored_start_catalog authored;
@@ -2114,39 +2214,12 @@ static void prepare_map_classnames_body(void *ctx) {
     read->bytes = qa_archive_source_read(&read->file, offset + start, size, &byte_length);
     bytes = read->bytes;
   }
-  /* .replace(/\0+$/, ""): the C text already ends at the first NUL. */
-  read->text = bytes_text(bytes, byte_length);
-  const char **classnames = NULL;
-  size_t count = 0;
-  if (eq(codec, "q2")) {
-    char message[1024];
-    qa_q2_parse_status status = qa_q2_parse_entities_checked(read->text,
-        eq(edition_of(product), "rerelease") ? QA_Q2_EDITION_RERELEASE : QA_Q2_EDITION_CLASSIC,
-        &read->q2, &read->q2_count, message, sizeof message);
-    if (status == QA_Q2_PARSE_OOM) qa_range_error("Out of memory");
-    if (status == QA_Q2_PARSE_MALFORMED) fail("%s", message);
-    count = read->q2_count;
-    classnames = xcalloc(count, sizeof *classnames);
-    for (size_t i = 0; i < count; i++) classnames[i] = read->q2[i].classname != NULL ? read->q2[i].classname : "";
-  } else if (eq(codec, "q3")) {
-    read->q3 = qa_q3_parse_entities(read->text, map->path, &read->q3_count);
-    count = read->q3_count;
-    classnames = xcalloc(count, sizeof *classnames);
-    for (size_t i = 0; i < count; i++) {
-      const char *classname = qa_q3_entity_get(&read->q3[i], "classname");
-      classnames[i] = classname != NULL ? classname : "";
-    }
-  } else {
-    read->q1 = qa_q1_parse_entities(read->text, &read->q1_count);
-    count = read->q1_count;
-    classnames = xcalloc(count, sizeof *classnames);
-    for (size_t i = 0; i < count; i++) {
-      const char *classname = qa_q1_entity_value(&read->q1[i], "classname");
-      classnames[i] = classname != NULL ? classname : "";
-    }
-  }
-  read->classnames = classnames;
-  cache_monster_classes(m, read->key, classnames, count);
+  /* new TextDecoder().decode(bytes).replace(/\0+$/, ""), parsed by the codec's entity grammar. */
+  qa_app_entity_grammar grammar = eq(codec, "q2") ? QA_APP_ENTITY_GRAMMAR_Q2 : eq(codec, "q3") ? QA_APP_ENTITY_GRAMMAR_Q3
+                                                                                              : QA_APP_ENTITY_GRAMMAR_Q1;
+  read->names = qa_app_entity_classnames(bytes, byte_length, grammar, eq(edition_of(product), "rerelease"), map->path, true,
+                                         &read->name_count);
+  cache_monster_classes(m, read->key, (const char **)read->names, read->name_count);
   qa_cleanup_pop(&cleanup);
   map_read_release(read);
 }
@@ -2209,7 +2282,7 @@ bool qa_app_startup_selection_prepare_map_choices(qa_app_startup_selection_model
     const pchoices *current = smap_get(m->playable_maps, product_id);
     pchoices *next = pchoices_from(current != NULL ? current->items : NULL, current != NULL ? current->count : 0);
     for (size_t j = 0; j < next->count; j++)
-      if (eq(next->items[j].id, page.items[i])) { free((char *)next->items[j].unavailable); next->items[j].unavailable = xdup(caught.message); }
+      if (eq(next->items[j].id, page.items[i])) { free((char *)next->items[j].unavailable); next->items[j].unavailable = xdup(qa_caught_message(&caught)); }
     smap_set(m->playable_maps, product_id, next);
     smap_clear(m->eligible_maps);
   }
@@ -2462,8 +2535,20 @@ static void resolve_preset(qa_app_startup_selection_model *m, const char *id, bo
   if (eq(campaign_of(product), "missionpack") && level_is(level, 1, 5)) {
     if (m->team_campaign == NULL) fail("Team Arena metadata is not prepared");
     qa_app_team_arena_cursor cursor = {3, 0};
-    qa_app_team_arena_teams teams = {m->team_player, m->team_opponent};
+    /* The selected names are UTF-8 UI text; the campaign and the cvars and bot commands it writes hold Latin-1
+     * text (TS decodes the campaign files as latin1), so a name the campaign authored converts back. */
+    char *player = NULL, *opponent = NULL;
+    if (!qa_command_text_from_utf8(m->team_player, &player)) player = xdup(m->team_player);
+    if (!qa_command_text_from_utf8(m->team_opponent, &opponent)) opponent = xdup(m->team_opponent);
+    qa_app_team_arena_teams teams = {player, opponent};
+    qa_cleanup player_node, opponent_node;
+    qa_cleanup_push(&player_node, free, player);
+    qa_cleanup_push(&opponent_node, free, opponent);
     qa_app_team_arena_skirmish_init_default(&backing->skirmish, m->team_campaign, level, cursor, teams);
+    qa_cleanup_pop(&opponent_node);
+    qa_cleanup_pop(&player_node);
+    free(player);
+    free(opponent);
     backing->has_skirmish = true;
   }
   const qa_app_arena_selection_row *selected_arena = NULL;
@@ -2947,11 +3032,7 @@ static qa_equipment_selection selected_equipment(qa_app_startup_selection_model 
       else for (size_t i = 0; i < styles.count && id == NULL; i++) if (styles.all[i].unavailable == NULL) id = styles.all[i].id;
       const qa_grapple_style *style = NULL;
       for (size_t i = 0; id != NULL && i < styles.count && style == NULL; i++) if (eq(styles.all[i].id, id)) style = &styles.all[i];
-      if (style == NULL || style->unavailable != NULL) {
-        char message[1024];
-        snprintf(message, sizeof message, "%s", style != NULL ? style->unavailable : "Select an installed hook style");
-        fail("%s", message);
-      }
+      if (style == NULL || style->unavailable != NULL) fail("%s", style != NULL ? style->unavailable : "Select an installed hook style");
       equipment.grapple = style->selection;
       equipment.grapple.binding = eq(binding, "slot") ? "slot" : "offhand";
       qa_cleanup_pop(&cleanup);
@@ -3146,9 +3227,15 @@ void qa_app_startup_selection_refresh_catalog(qa_app_startup_selection_model *m)
   if (initial_product == NULL) fail("No installed game content remains");
   qa_app_options candidate_options;
   qa_app_startup_options_copy(&candidate_options, &m->initial);
+  qa_cleanup options_node;
+  qa_cleanup_push(&options_node, (void (*)(void *))qa_app_options_destroy, &candidate_options);
   set_text(&candidate_options.product, initial_product->expectation.id);
+  /* model_create owns the catalog from here, raise or not. */
+  qa_cleanup_pop(&options_node);
   qa_cleanup_pop(&catalog_node);
+  qa_cleanup_push(&options_node, (void (*)(void *))qa_app_options_destroy, &candidate_options);
   qa_app_startup_selection_model *candidate = model_create(catalog, &candidate_options);
+  qa_cleanup_pop(&options_node);
   qa_app_options_destroy(&candidate_options);
   qa_cleanup candidate_node;
   qa_cleanup_push(&candidate_node, candidate_cleanup, candidate);
@@ -3259,9 +3346,19 @@ typedef struct arena_read {
   qa_config_store store; bool has_store;
   qa_cvar_archive_entry *entries; size_t entry_count;
   qa_cvar_archive_entry *kept;
+  /* The new selection state, moved into the model only once it is complete (TS assigns
+   * arenaSelection after readArenaSelection returns, so a failed refresh keeps the old one). */
+  qa_app_base_arena_catalog catalog;
+  qa_app_base_arena_progression *progression;
+  qa_cvar_registry *cvars;
+  qa_identity_owner identity; bool has_identity;
 } arena_read;
 static void arena_read_release(void *arg) {
   arena_read *read = arg;
+  if (read->progression) qa_app_base_arena_progression_destroy(read->progression);
+  if (read->cvars) qa_cvar_registry_destroy(read->cvars);
+  if (read->has_identity) qa_identity_owner_destroy(&read->identity);
+  qa_app_base_arena_catalog_destroy(&read->catalog);
   free(read->kept);
   qa_app_cvar_archive_entries_free(read->entries, read->entry_count);
   if (read->has_store) qa_config_store_destroy(&read->store);
@@ -3296,29 +3393,28 @@ static void read_arena_selection(qa_app_startup_selection_model *m, const qa_app
   if (read.content == NULL) qa_range_error("Out of memory");
   qa_content_mounted *mounts = (qa_content_mounted *)qa_app_configuration_content_mounts(read.content);
   qa_app_arena_mounts arena_mounts = {mounts, arena_list_files, arena_open_text};
-  qa_app_base_arena_catalog arenas = qa_app_read_base_arena_catalog(arena_mounts);
-  arena_state_free(m);
-  m->arena_catalog = arenas;
-  if (!qa_identity_owner_create(&m->arena_identity, "arena-selection")) qa_range_error("Out of memory");
-  m->has_arena_identity = true;
+  read.catalog = qa_app_read_base_arena_catalog(arena_mounts);
+  const qa_app_base_arena_catalog *arenas = &read.catalog;
+  if (!qa_identity_owner_create(&read.identity, "arena-selection")) qa_range_error("Out of memory");
+  read.has_identity = true;
   qa_cvar_registry_options cvar_options;
   memset(&cvar_options, 0, sizeof cvar_options);
   cvar_options.dialect = QA_COMMAND_DIALECT_Q3;
-  cvar_options.context.session = m->arena_identity.session;
+  cvar_options.context.session = read.identity.session;
   cvar_options.context.origin.kind = QA_COMMAND_ORIGIN_SERVER_CONSOLE;
-  m->arena_cvars = qa_cvar_registry_create(&cvar_options);
-  if (m->arena_cvars == NULL) qa_range_error("Out of memory");
-  qa_app_arena_progression_catalog progression = {arenas.regular_count, arenas.regular_count, -1, -1};
-  for (size_t i = 0; i < arenas.arena_count; i++) if (arenas.arenas[i].special[0] != '\0') progression.total_levels++;
-  for (size_t i = 0; i < arenas.arena_count; i++) {
-    char *special = lower_dup(arenas.arenas[i].special);
-    if (progression.training < 0 && strcmp(special, "training") == 0) progression.training = arenas.arenas[i].number;
-    if (progression.final < 0 && strcmp(special, "final") == 0) progression.final = arenas.arenas[i].number;
+  read.cvars = qa_cvar_registry_create(&cvar_options);
+  if (read.cvars == NULL) qa_range_error("Out of memory");
+  qa_app_arena_progression_catalog progression = {arenas->regular_count, arenas->regular_count, -1, -1};
+  for (size_t i = 0; i < arenas->arena_count; i++) if (arenas->arenas[i].special[0] != '\0') progression.total_levels++;
+  for (size_t i = 0; i < arenas->arena_count; i++) {
+    char *special = lower_dup(arenas->arenas[i].special);
+    if (progression.training < 0 && strcmp(special, "training") == 0) progression.training = arenas->arenas[i].number;
+    if (progression.final < 0 && strcmp(special, "final") == 0) progression.final = arenas->arenas[i].number;
     free(special);
   }
-  m->arena_progression = qa_app_base_arena_progression_create(m->arena_cvars, progression);
-  if (m->arena_progression == NULL) qa_range_error("Out of memory");
-  if (!qa_cvar_registry_register(m->arena_cvars, "ui_spSelection", "", QA_CVAR_FLAG_ARCHIVE, NULL)) qa_range_error("Out of memory");
+  read.progression = qa_app_base_arena_progression_create(read.cvars, progression);
+  if (read.progression == NULL) qa_range_error("Out of memory");
+  if (!qa_cvar_registry_register(read.cvars, "ui_spSelection", "", QA_CVAR_FLAG_ARCHIVE, NULL)) qa_range_error("Out of memory");
   qa_app_application_configuration_selection selection = qa_app_configuration_content_selection(read.content);
   if (!qa_app_configuration_store_for_catalog(catalog, &read.options, selection.source.content, &read.store)) qa_range_error("Out of memory");
   read.has_store = true;
@@ -3328,16 +3424,32 @@ static void read_arena_selection(qa_app_startup_selection_model *m, const qa_app
   size_t kept = 0;
   for (size_t i = 0; i < read.entry_count; i++) {
     qa_cvar_read found;
-    if (qa_cvar_registry_find(m->arena_cvars, read.entries[i].name, &found)) {
+    if (qa_cvar_registry_find(read.cvars, read.entries[i].name, &found)) {
       qa_cvar_read_free(&found);
       read.kept[kept++] = read.entries[i];
     }
   }
-  qa_cvar_registry_apply_archive(m->arena_cvars, read.kept, kept);
-  char *saved = qa_cvar_registry_variable_string(m->arena_cvars, "ui_spSelection");
-  m->arenas = qa_app_arena_selection_make(&m->arena_catalog, m->arena_progression, saved);
-  m->has_arenas = true;
+  qa_cvar_registry_apply_archive(read.cvars, read.kept, kept);
+  char *saved = qa_cvar_registry_variable_string(read.cvars, "ui_spSelection");
+  qa_cleanup saved_node;
+  qa_cleanup_push(&saved_node, free, saved);
+  qa_app_arena_selection made = qa_app_arena_selection_make(&read.catalog, read.progression, saved);
+  qa_cleanup_pop(&saved_node);
   free(saved);
+  /* Complete: the old selection goes, the new state moves into the model (the rows point into the
+   * catalog's heap arrays, which the move keeps). */
+  arena_state_free(m);
+  m->arena_catalog = read.catalog;
+  memset(&read.catalog, 0, sizeof read.catalog);
+  m->arena_progression = read.progression;
+  read.progression = NULL;
+  m->arena_cvars = read.cvars;
+  read.cvars = NULL;
+  m->arena_identity = read.identity;
+  m->has_arena_identity = true;
+  read.has_identity = false;
+  m->arenas = made;
+  m->has_arenas = true;
   qa_cleanup_pop(&cleanup);
   arena_read_release(&read);
 }

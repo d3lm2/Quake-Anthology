@@ -47,14 +47,15 @@ char *qa_app_q2_localized_text(qa_localization_table *catalog, const char *text,
       if (localized != NULL) value = localized;
     }
     size_t slice = slot->start - start;
-    memcpy(result + at, entry->format + start, slice); at += slice;
     size_t vlen = strlen(value);
-    if (at + vlen + 1 > capacity) {
-      capacity = (at + vlen + 1) * 2;
+    /* A localized argument can outgrow its estimate: grow for the slice and the value together. */
+    if (at + slice + vlen + 1 > capacity) {
+      capacity = (at + slice + vlen + 1) * 2;
       char *next = realloc(result, capacity);
       if (next == NULL) { free(localized); free(result); return NULL; }
       result = next;
     }
+    memcpy(result + at, entry->format + start, slice); at += slice;
     memcpy(result + at, value, vlen); at += vlen;
     free(localized);
     start = slot->end;

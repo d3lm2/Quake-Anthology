@@ -7,14 +7,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/foundation/js_case.h"
+#include "qa/foundation/support.h"
 
+/* TS `throw new Error(message)`: raised through qa_raise so a TS catch is a qa_try;
+ * with no catch active it prints "Error: <message>" and aborts. */
 noreturn void qa_q2rr_error(const char *format, ...) {
+  char message[QA_CAUGHT_MESSAGE_CAPACITY];
   va_list args; va_start(args, format);
-  fprintf(stderr, "Error: ");
-  vfprintf(stderr, format, args);
-  fprintf(stderr, "\n");
+  (void)vsnprintf(message, sizeof message, format, args);
   va_end(args);
-  abort();
+  qa_raise("Error", 0, 0, "%s", message);
 }
 
 char *qa_q2rr_dup(const char *s) {
@@ -48,24 +50,31 @@ const char *qa_q2_coop_respawn_state_name(qa_q2_coop_respawn_state s) {
   }
 }
 
-static void copy_str(char *dst, size_t cap, const char *src) {
-  if (!src) src = "";
-  size_t n = strlen(src);
-  if (n >= cap) n = cap - 1;
-  memcpy(dst, src, n); dst[n] = '\0';
+static char *dup_or_abort(const char *src) {
+  char *out = qa_q2rr_dup(src ? src : "");
+  if (!out) qa_range_error("Out of memory");
+  return out;
+}
+void qa_q2rr_set_text(char **field, const char *value) {
+  char *next = dup_or_abort(value); /* value may alias *field */
+  free(*field);
+  *field = next;
 }
 
 void qa_q2rr_player_extra_state_init(qa_q2rr_player_extra_state *s, double seat, const char *social_id) {
   memset(s, 0, sizeof *s);
   s->seat = seat;
-  copy_str(s->social_id, sizeof s->social_id, social_id);
+  s->social_id = dup_or_abort(social_id);
   s->auto_shield = -1;
-  copy_str(s->help_image, sizeof s->help_image, "friend");
+  s->dogtag = dup_or_abort("");
+  s->help_image = dup_or_abort("friend");
   s->fog = qa_q2_create_fog();
   s->wanted_fog = qa_q2_create_fog();
 }
 void qa_q2rr_player_extra_state_destroy(qa_q2rr_player_extra_state *s) {
   free(s->help_points); s->help_points = NULL; s->help_point_count = s->help_point_cap = 0;
+  free(s->social_id); free(s->dogtag); free(s->help_image);
+  s->social_id = s->dogtag = s->help_image = NULL;
 }
 bool qa_q2rr_player_extra_state_clone(qa_q2rr_player_extra_state *dst, const qa_q2rr_player_extra_state *src) {
   qa_vec3 *pts = NULL;
@@ -74,9 +83,14 @@ bool qa_q2rr_player_extra_state_clone(qa_q2rr_player_extra_state *dst, const qa_
     if (!pts) return false;
     memcpy(pts, src->help_points, src->help_point_count * sizeof *pts);
   }
+  char *social_id = qa_q2rr_dup(src->social_id ? src->social_id : "");
+  char *dogtag = qa_q2rr_dup(src->dogtag ? src->dogtag : "");
+  char *help_image = qa_q2rr_dup(src->help_image ? src->help_image : "");
+  if (!social_id || !dogtag || !help_image) { free(pts); free(social_id); free(dogtag); free(help_image); return false; }
   *dst = *src;
   dst->help_points = pts;
   dst->help_point_cap = src->help_point_count;
+  dst->social_id = social_id; dst->dogtag = dogtag; dst->help_image = help_image;
   return true;
 }
 

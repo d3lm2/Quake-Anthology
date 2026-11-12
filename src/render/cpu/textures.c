@@ -7,7 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/foundation/js.h"
-typedef struct tex_obj { double ordinal; qa_render_image content; qa_texture_storage *levels; size_t level_count; bool mipmap; qa_texture_sampling sampling; qa_vec4 border_color; } tex_obj;
+/* content keeps no pointer into the operation: no levels, and for indexed8 its own copy of the palette colours and
+ * translation (TS colors.slice(), translation?.slice()) and of the fullbright range, attached again where it is used
+ * (texture records move when the table grows). The operation's content lives only as long as the drained array. */
+typedef struct tex_obj { double ordinal; qa_render_image content; qa_texture_storage *levels; size_t level_count; bool mipmap; qa_texture_sampling sampling; qa_vec4 border_color;
+  uint8_t *palette_colors; uint8_t *translation_bytes; qa_byte_view translation; bool has_translation; qa_fullbright_range fullbright; bool has_fullbright; } tex_obj;
 typedef struct depth_obj { double ordinal; qa_depth_image_level *levels; size_t level_count; float **owned; } depth_obj;
 typedef struct impl { tex_obj *tex; size_t tex_count, tex_cap; depth_obj *dep; size_t dep_count, dep_cap; bool has_unit[2]; double units[2]; } impl;
 static impl *I(qa_cpu_images *im){ return (impl*)im->impl; }
@@ -15,12 +19,12 @@ static bool same_session(qa_session_id a,qa_session_id b){ return a.token==b.tok
 /* Number.isSafeInteger, without a C cast of NaN or a huge double. */
 static bool safe_integer(double v){ return isfinite(v)&&v==floor(v)&&fabs(v)<=9007199254740991.0; }
 static void require_owner(qa_cpu_images *im,qa_renderer_image image){
-  if(image.owner.identity!=im->owner.identity||!same_session(image.owner.session,im->owner.session)||image.owner.generation!=im->owner.generation) qa_range_error("CPU image belongs to another renderer owner");
+  if(image.owner.identity!=im->owner.identity||!same_session(image.owner.session,im->owner.session)||image.owner.generation!=im->owner.generation) qa_raise("Error", 0, 0, "CPU image belongs to another renderer owner");
   if(!safe_integer(image.ordinal)||image.ordinal<0) qa_range_error("Invalid CPU image ordinal");
 }
 static tex_obj *find_tex(qa_cpu_images *im,double ord){ impl *p=I(im); for(size_t i=0;i<p->tex_count;i++)if(p->tex[i].ordinal==ord)return &p->tex[i]; return NULL; }
 static depth_obj *find_dep(qa_cpu_images *im,double ord){ impl *p=I(im); for(size_t i=0;i<p->dep_count;i++)if(p->dep[i].ordinal==ord)return &p->dep[i]; return NULL; }
-static tex_obj *require_tex(qa_cpu_images *im,qa_renderer_image image){ require_owner(im,image); tex_obj *o=find_tex(im,image.ordinal); if(!o)qa_range_error("CPU image has not been uploaded"); return o; }
+static tex_obj *require_tex(qa_cpu_images *im,qa_renderer_image image){ require_owner(im,image); tex_obj *o=find_tex(im,image.ordinal); if(!o)qa_raise("Error", 0, 0, "CPU image has not been uploaded"); return o; }
 static qa_texture_storage make_storage(const qa_image_level *level, bool *oom){
   qa_texture_storage s; memset(&s,0,sizeof s); *oom=false;
   if(!safe_integer(level->width)||!safe_integer(level->height)||level->width<=0||level->height<=0||(double)level->pixels.length!=level->width*level->height*4) qa_range_error("Invalid CPU RGBA image level");
@@ -36,19 +40,20 @@ static qa_texture_storage make_storage(const qa_image_level *level, bool *oom){
 static bool mip_filter(const char *f){ return strcmp(f,"nearest")&&strcmp(f,"linear"); }
 static bool linear_filter(const char *f){ return !strcmp(f,"linear")||!strcmp(f,"linear-mipmap-nearest")||!strcmp(f,"linear-mipmap-linear"); }
 bool qa_cpu_images_init(qa_cpu_images *im,qa_renderer_resource_owner owner){ im->owner=owner; im->impl=calloc(1,sizeof(impl)); return im->impl!=NULL; }
-static void free_tex(tex_obj *o){ for(size_t i=0;i<o->level_count;i++)free(o->levels[i].pixels); free(o->levels); }
+static void free_tex(tex_obj *o){ for(size_t i=0;i<o->level_count;i++)free(o->levels[i].pixels); free(o->levels); free(o->palette_colors); free(o->translation_bytes); }
+static uint8_t *copy_bytes(const uint8_t *bytes,size_t length){ uint8_t *out=(uint8_t*)malloc(length?length:1); if(!out)qa_range_error("CPU image allocation failed"); if(length)memcpy(out,bytes,length); return out; }
 void qa_cpu_images_destroy(qa_cpu_images *im){ if(!im->impl)return; impl *p=I(im);
   for (size_t i = 0; i < p->tex_count; i++) free_tex(&p->tex[i]);
   free(p->tex);
   for(size_t i=0;i<p->dep_count;i++){ for(size_t j=0;j<p->dep[i].level_count;j++)free(p->dep[i].owned[j]); free(p->dep[i].owned); free(p->dep[i].levels);} free(p->dep); free(p); im->impl=NULL; }
 void qa_cpu_images_validate(qa_cpu_images *im,qa_renderer_image image){ (void)require_tex(im,image); }
-qa_depth_image_level qa_cpu_images_depth_image(qa_cpu_images *im,qa_renderer_image image){ require_owner(im,image); depth_obj *o=find_dep(im,image.ordinal); if(!o||o->level_count==0)qa_range_error("CPU image is not a registered depth atlas"); return o->levels[0]; }
+qa_depth_image_level qa_cpu_images_depth_image(qa_cpu_images *im,qa_renderer_image image){ require_owner(im,image); depth_obj *o=find_dep(im,image.ordinal); if(!o||o->level_count==0)qa_raise("Error", 0, 0, "CPU image is not a registered depth atlas"); return o->levels[0]; }
 void qa_cpu_images_apply(qa_cpu_images *im,qa_image_resource_operation op){
   impl *p=I(im);
   switch(op.kind){
   case QA_IMAGE_OP_CREATE: {
     require_owner(im,op.image);
-    if(find_tex(im,op.image.ordinal)||find_dep(im,op.image.ordinal)) qa_range_error("CPU image is already uploaded");
+    if(find_tex(im,op.image.ordinal)||find_dep(im,op.image.ordinal)) qa_raise("Error", 0, 0, "CPU image is already uploaded");
     if(op.content.kind==QA_RENDER_IMAGE_DEPTH32F){
       if(p->dep_count==p->dep_cap){ size_t nc=p->dep_cap?p->dep_cap*2:8; depth_obj *nd=(depth_obj*)realloc(p->dep,nc*sizeof *nd); if(!nd)qa_range_error("CPU image allocation failed"); p->dep=nd;p->dep_cap=nc; }
       depth_obj *o=&p->dep[p->dep_count]; memset(o,0,sizeof *o); o->ordinal=op.image.ordinal; o->level_count=op.content.depth_level_count;
@@ -75,6 +80,13 @@ void qa_cpu_images_apply(qa_cpu_images *im,qa_image_resource_operation op){
         o->levels[i]=make_storage(&ex,&oom); qa_image_level_destroy(&ex); }
       if(oom)qa_range_error("CPU image allocation failed");
     }
+    o->content.levels=NULL; o->content.level_count=0; o->content.fullbright=NULL; o->content.translation=NULL;
+    if(op.content.kind==QA_RENDER_IMAGE_INDEXED8){
+      o->palette_colors=copy_bytes(op.content.palette.colors.bytes,op.content.palette.colors.length); o->content.palette.colors.bytes=o->palette_colors;
+      if(op.content.fullbright){ o->has_fullbright=true; o->fullbright=*op.content.fullbright; }
+      if(op.content.translation){ o->has_translation=true; o->translation_bytes=copy_bytes(op.content.translation->bytes,op.content.translation->length);
+        o->translation.bytes=o->translation_bytes; o->translation.length=op.content.translation->length; }
+    }
     p->tex_count++; return; }
   case QA_IMAGE_OP_UPDATE: {
     if(op.update_depth_level!=NULL){
@@ -89,6 +101,7 @@ void qa_cpu_images_apply(qa_cpu_images *im,qa_image_resource_operation op){
     if(op.update_level==NULL) qa_range_error("CPU update dimensions must match the existing image level");
     qa_image_level incoming=*op.update_level; qa_image_level ex; bool expanded=false;
     if(o->content.kind!=QA_RENDER_IMAGE_RGBA8){ qa_render_image tmp=o->content; tmp.levels=&incoming; tmp.level_count=1;
+      tmp.fullbright=o->has_fullbright?&o->fullbright:NULL; tmp.translation=o->has_translation?&o->translation:NULL;
       if(!qa_expand_indexed_image(&tmp,0,QA_PALETTE_LAYER_COMBINED,&ex))qa_range_error("CPU image allocation failed");
         expanded = true; }
     const qa_image_level *upd=expanded?&ex:&incoming;
@@ -107,10 +120,10 @@ void qa_cpu_images_apply(qa_cpu_images *im,qa_image_resource_operation op){
     for(size_t i=0;i<p->tex_count;i++)if(p->tex[i].mipmap)p->tex[i].sampling.filter=op.filter;
     return;
   }
-  qa_range_error("Invalid CPU image operation");
+  qa_raise("Error", 0, 0, "Invalid CPU image operation");
 }
 void qa_cpu_images_bind(qa_cpu_images *im,double unit,qa_texture_binding op){
-  if(op.kind==QA_TEXTURE_BINDING_DYNAMIC_IMAGE) qa_range_error("Dynamic texture must resolve before binding");
+  if(op.kind==QA_TEXTURE_BINDING_DYNAMIC_IMAGE) qa_raise("Error", 0, 0, "Dynamic texture must resolve before binding");
   if(op.kind==QA_TEXTURE_BINDING_RETAIN_CURRENT) return;
   (void)require_tex(im,op.image); impl *p=I(im); int u=unit==1?1:0; p->units[u]=op.image.ordinal; p->has_unit[u]=true;
 }

@@ -1,6 +1,6 @@
-/* Port of src/render/gl/buffers.ts. The TS WeakMap packed cache becomes
- * a small identity list owned by the process (entries die only with
- * qa_gl_packed_cache_clear, unlike GC). GPL-2.0-or-later. */
+/* Port of src/render/gl/buffers.ts. The TS WeakMap packed cache (identity of
+ * batch.vertices, entries collected with their arrays) is not mirrored: see
+ * qa_gl_packed_cache_clear in buffers.c. GPL-2.0-or-later. */
 #ifndef QA_RENDER_GL_BUFFERS_H
 #define QA_RENDER_GL_BUFFERS_H
 #include <stdbool.h>
@@ -25,5 +25,6 @@ void qa_gl_geometry_buffer_destroy(qa_gl_geometry_buffer *buffer);
 qa_gl_geometry_arrays qa_gl_geometry_buffer_pack(qa_gl_geometry_buffer *buffer, qa_draw_batch batch);
 /* Fresh allocation; free with qa_gl_geometry_arrays_destroy. */
 qa_gl_geometry_arrays qa_pack_gl_geometry(qa_draw_batch batch);
+/* No effect: there is no process-wide packed cache. Kept for callers. */
 void qa_gl_packed_cache_clear(void);
 #endif

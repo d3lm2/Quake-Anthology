@@ -27,22 +27,25 @@ typedef struct {
   qa_navigation_edge *edges; size_t edge_count, edge_cap;
   qa_navigation_rejected *rejected; size_t rejected_count, rejected_cap;
   /* seen keys */
-  int64_t *seen; size_t seen_count, seen_cap; /* triples */
+  double *seen; size_t seen_count, seen_cap; /* triples of Math.round results */
   /* grounded cache */
   struct GEntry { bool crouched; double x, y, z; bool has; qa_vec3 result; } *gcache;
   size_t g_count, g_cap;
   bool oom;
 } Build;
 
-static bool seen_has(Build *b, int64_t kx, int64_t ky, int64_t kz) {
+/* TS keys `${Math.round(x / 8)}:...` as text: equal numbers (0 and -0 alike, as String(-0) is "0") and
+   NaN with NaN match. Kept as doubles, since a C cast of NaN or a value past int64 is undefined. */
+static bool seen_same(double a, double b) { return a == b || (isnan(a) && isnan(b)); }
+static bool seen_has(Build *b, double kx, double ky, double kz) {
   for (size_t i = 0; i < b->seen_count; i += 3)
-    if (b->seen[i] == kx && b->seen[i + 1] == ky && b->seen[i + 2] == kz) return true;
+    if (seen_same(b->seen[i], kx) && seen_same(b->seen[i + 1], ky) && seen_same(b->seen[i + 2], kz)) return true;
   return false;
 }
-static void seen_add(Build *b, int64_t kx, int64_t ky, int64_t kz) {
+static void seen_add(Build *b, double kx, double ky, double kz) {
   if (b->seen_count + 3 > b->seen_cap) {
     size_t c = b->seen_cap ? b->seen_cap * 2 : 192;
-    int64_t *p = realloc(b->seen, c * sizeof *p);
+    double *p = realloc(b->seen, c * sizeof *p);
     if (!p) { b->oom = true; return; }
     b->seen = p; b->seen_cap = c;
   }
@@ -87,7 +90,7 @@ static bool grounded_once(Build *b, const qa_navigation_profile *posture, bool c
   return has;
 }
 static void insert_node(Build *b, qa_vec3 origin, qa_navigation_source source, const qa_navigation_profile *posture, bool crouched) {
-  int64_t kx = (int64_t)qa_js_round(origin.x / 8), ky = (int64_t)qa_js_round(origin.y / 8), kz = (int64_t)qa_js_round(origin.z / 4);
+  double kx = qa_js_round(origin.x / 8), ky = qa_js_round(origin.y / 8), kz = qa_js_round(origin.z / 4);
   if (seen_has(b, kx, ky, kz) || !qa_nav_clear(b->world, posture, origin, origin, map_target())) return;
   int64_t medium = qa_nav_contents(b->world, &b->profile, origin, map_target());
   if ((medium & 6) != 0) return;
@@ -146,11 +149,12 @@ static void polygon_candidates(Build *b, const qa_vec3 *polygon, size_t count, q
   qa_vec3 first = polygon[0];
   double plane = first.x * normal.x + first.y * normal.y + first.z * normal.z;
   double min_x = polygon[0].x, max_x = polygon[0].x, min_y = polygon[0].y, max_y = polygon[0].y;
+  /* Math.min(...xs) / Math.max(...xs): NaN propagates. */
   for (size_t i = 1; i < count; i++) {
-    if (polygon[i].x < min_x) min_x = polygon[i].x;
-    if (polygon[i].x > max_x) max_x = polygon[i].x;
-    if (polygon[i].y < min_y) min_y = polygon[i].y;
-    if (polygon[i].y > max_y) max_y = polygon[i].y;
+    min_x = qa_js_min(min_x, polygon[i].x);
+    max_x = qa_js_max(max_x, polygon[i].x);
+    min_y = qa_js_min(min_y, polygon[i].y);
+    max_y = qa_js_max(max_y, polygon[i].y);
   }
   for (double x = ceil(min_x / b->spacing) * b->spacing; x <= max_x; x += b->spacing)
     for (double y = ceil(min_y / b->spacing) * b->spacing; y <= max_y; y += b->spacing) {
@@ -281,7 +285,7 @@ bool qa_construct_navigation(qa_navigation_graph *out, qa_navigation_constructio
   memset(out, 0, sizeof *out);
   qa_nav_validate_profile(&options.profile);
   if (options.map.format != options.geometry.kind)
-    qa_range_error("Navigation map identity and decoded geometry disagree");
+    qa_raise("TypeError", 0, 0, "Navigation map identity and decoded geometry disagree");
   double spacing = options.has_spacing ? options.spacing : 48;
   double link_distance = options.has_link_distance ? options.link_distance : spacing * 2.1;
   int64_t maximum_nodes = options.has_maximum_nodes ? options.maximum_nodes : 100000;
@@ -326,13 +330,15 @@ bool qa_construct_navigation(qa_navigation_graph *out, qa_navigation_constructio
     }
   }
   /* bins keyed by cell */
-  typedef struct { int64_t cx, cy; int64_t *ids; size_t n, cap; } Bin;
+  /* TS keys `${Math.floor(x / linkDistance) + dx}:...` as text: equal numbers (0 and -0 alike) and NaN
+     with NaN match. Kept as doubles, since a C cast of NaN or a value past int64 is undefined. */
+  typedef struct { double cx, cy; int64_t *ids; size_t n, cap; } Bin;
   Bin *bins = NULL; size_t bin_count = 0, bin_cap = 0;
   for (size_t i = 0; i < b.node_count && !b.oom; i++) {
     qa_vec3 o = b.nodes[i].origin;
-    int64_t cx = (int64_t)floor(o.x / link_distance), cy = (int64_t)floor(o.y / link_distance);
+    double cx = floor(o.x / link_distance), cy = floor(o.y / link_distance);
     Bin *bin = NULL;
-    for (size_t k = 0; k < bin_count; k++) if (bins[k].cx == cx && bins[k].cy == cy) bin = &bins[k];
+    for (size_t k = 0; k < bin_count; k++) if (seen_same(bins[k].cx, cx) && seen_same(bins[k].cy, cy)) bin = &bins[k];
     if (!bin) {
       if (bin_count == bin_cap) { bin_cap = bin_cap ? bin_cap * 2 : 32; bins = realloc(bins, bin_cap * sizeof *bins); if (!bins) { b.oom = true; break; } }
       bins[bin_count] = (Bin){cx, cy, NULL, 0, 0}; bin = &bins[bin_count++];
@@ -344,10 +350,10 @@ bool qa_construct_navigation(qa_navigation_graph *out, qa_navigation_constructio
   for (size_t ni = 0; ni < b.node_count && !b.oom; ni++) {
     qa_navigation_node node = b.nodes[ni];
     for (int dx = -1; dx <= 1 && !b.oom; dx++) for (int dy = -1; dy <= 1 && !b.oom; dy++) {
-      int64_t cx = (int64_t)floor(node.origin.x / link_distance) + dx;
-      int64_t cy = (int64_t)floor(node.origin.y / link_distance) + dy;
+      double cx = floor(node.origin.x / link_distance) + dx;
+      double cy = floor(node.origin.y / link_distance) + dy;
       Bin *bin = NULL;
-      for (size_t k = 0; k < bin_count; k++) if (bins[k].cx == cx && bins[k].cy == cy) bin = &bins[k];
+      for (size_t k = 0; k < bin_count; k++) if (seen_same(bins[k].cx, cx) && seen_same(bins[k].cy, cy)) bin = &bins[k];
       if (!bin) continue;
       for (size_t k = 0; k < bin->n && !b.oom; k++) {
         int64_t other_id = bin->ids[k];
@@ -355,7 +361,7 @@ bool qa_construct_navigation(qa_navigation_graph *out, qa_navigation_constructio
         const qa_navigation_node *other = b.nodes ? &b.nodes[other_id] : NULL;
         /* node ids are insertion indexes in constructed graphs */
         double rise = other->origin.z - node.origin.z;
-        if (hypot(node.origin.x - other->origin.x, node.origin.y - other->origin.y) > link_distance ||
+        if (qa_js_hypot2(node.origin.x - other->origin.x, node.origin.y - other->origin.y) > link_distance ||
             fabs(rise) > qa_js_max(b.profile.maximum_drop, link_distance)) continue;
         qa_travel_mode mode = ((node.contents & 1) != 0 && (other->contents & 1) != 0) ? QA_TM_SWIM
                             : ((node.contents & 8) != 0 && (other->contents & 8) != 0) ? QA_TM_LADDER
@@ -401,8 +407,7 @@ bool qa_construct_navigation(qa_navigation_graph *out, qa_navigation_constructio
         edge.id = (int64_t)b.edge_count;
         edge.from = node.id; edge.to = other->id; edge.mode = mode;
         edge.start = node.origin; edge.end = other->origin;
-        double ts = qa_nav_distance(node.origin, other->origin) / 320;
-        edge.travel_seconds = ts > 0.01 ? ts : 0.01;
+        edge.travel_seconds = qa_js_max(0.01, qa_nav_distance(node.origin, other->origin) / 320);
         edge.source = node.source;
         push_edge(&b, edge);
       }

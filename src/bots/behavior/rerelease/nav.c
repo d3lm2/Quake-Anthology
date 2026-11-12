@@ -60,7 +60,9 @@ static qa_nav_graph_link link_view(const qa_navigation_edge *edge, qa_nav_link_t
 }
 void qa_source_rerelease_navigation_init(qa_source_rerelease_navigation *nav, qa_navigation_runtime *runtime,
                                          void *ground_ctx, qa_nav_ground_fn ground) {
+  static uint64_t identities = 0;
   nav->runtime = runtime; nav->ground_ctx = ground_ctx; nav->ground = ground;
+  nav->identity = ++identities;
 }
 qa_bot_transport_step qa_source_rerelease_navigation_transport(qa_source_rerelease_navigation *nav,
                                                                qa_nav_graph_link link, qa_bot_vec3 origin) {
@@ -186,7 +188,7 @@ bool qa_source_rerelease_navigation_plan_path(qa_source_rerelease_navigation *na
   for (size_t e = 0; e < route->edge_count; e++) {
     const qa_navigation_edge *edge = &route->edges[e];
     qa_nav_link_type type;
-    if (!link_type_of(edge, &type)) qa_range_error("Navigation admitted an unsupported rerelease command traversal");
+    if (!link_type_of(edge, &type)) qa_raise("Error", 0, 0, "Navigation admitted an unsupported rerelease command traversal");
     qa_nav_graph_link link = link_view(edge, type);
     /* nearestTrajectoryIndex(edge.start) */
     size_t begin = cursor; double begin_distance = INFINITY;
@@ -194,7 +196,6 @@ bool qa_source_rerelease_navigation_plan_path(qa_source_rerelease_navigation *na
       double d = qa_bvec_distance(route->points[i], edge->start);
       if (d < begin_distance) { begin = i; begin_distance = d; }
     }
-    if (route->point_count == 0 && cursor == 0) { /* TS would throw on absent point below when edges exist */ }
     for (; cursor < begin; cursor++) append_point(&st, route->points[cursor], false, link);
     size_t end = cursor; double end_distance = INFINITY;
     for (size_t i = cursor; i < route->point_count; i++) {
@@ -206,7 +207,15 @@ bool qa_source_rerelease_navigation_plan_path(qa_source_rerelease_navigation *na
       else append_point(&st, edge->end, true, link);
       cursor = end + 1;
     } else {
-      for (; cursor <= end && cursor < route->point_count; cursor++) append_point(&st, route->points[cursor], false, link);
+      for (; cursor <= end; cursor++) {
+        if (cursor >= route->point_count) {
+          /* TS throws a plain Error on the absent trajectory point. */
+          free(st.points); free(st.links); free(st.has_link);
+          qa_navigation_route_destroy(route);
+          qa_raise("Error", 0, 0, "Navigation movement point is absent");
+        }
+        append_point(&st, route->points[cursor], false, link);
+      }
     }
   }
   for (; cursor < route->point_count; cursor++) append_point(&st, route->points[cursor], false, (qa_nav_graph_link){0});
@@ -232,6 +241,7 @@ static qa_bot_transport_step iface_transport(void *ctx, qa_nav_graph_link link, 
 qa_bot_navigation_iface qa_source_rerelease_navigation_as_iface(qa_source_rerelease_navigation *nav) {
   qa_bot_navigation_iface iface; memset(&iface, 0, sizeof iface);
   iface.ctx = nav;
+  iface.identity = nav->identity;
   iface.node_count = iface_node_count;
   iface.nodes = iface_nodes;
   iface.plan_path = iface_plan;

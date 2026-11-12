@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "qa/content/archive/types.h"
+#include "qa/foundation/support.h"
 #include "qa/input/device_settings.h"
 #include "qa/input/source_midi.h"
 #include "qa/foundation/js.h"
@@ -42,11 +44,38 @@ static const char *errno_code(int value) {
     case EAGAIN: return "EAGAIN";
     case EINTR: return "EINTR";
     case EACCES: return "EACCES";
+    case EPERM: return "EPERM";
     case ENOTDIR: return "ENOTDIR";
     case EINVAL: return "EINVAL";
     case EIO: return "EIO";
-    default: return "EIO";
+    case ENODEV: return "ENODEV";
+    case ENXIO: return "ENXIO";
+    case EBUSY: return "EBUSY";
+    case ELOOP: return "ELOOP";
+    case EBADF: return "EBADF";
+    case EMFILE: return "EMFILE";
+    case ENFILE: return "ENFILE";
+    default: return "UNKNOWN";
   }
+}
+
+/* The Node/Bun fs error a TS caller prints as error.message:
+   "<CODE>: <description>, <syscall> '<path>'" (no path for descriptor calls). */
+typedef struct fs_error_call {
+  int number;
+  const char *syscall;
+  const char *path;
+} fs_error_call;
+static void raise_fs_error(void *ctx) {
+  fs_error_call *call = (fs_error_call *)ctx;
+  qa_content_fs_error(call->number, call->syscall, call->path);
+}
+static void set_fs_error(qa_midi_error *error, int number, const char *syscall,
+                         const char *path) {
+  fs_error_call call = {number, syscall, path};
+  qa_caught_error caught;
+  (void)qa_try(raise_fs_error, &call, &caught);
+  set_error(error, errno_code(number), caught.message);
 }
 
 static bool system_read_directory(void *ctx, char ***out_names, size_t *out_count,
@@ -54,7 +83,7 @@ static bool system_read_directory(void *ctx, char ***out_names, size_t *out_coun
   (void)ctx;
   DIR *directory = opendir("/dev/snd");
   if (directory == NULL) {
-    set_error(error, errno_code(errno), strerror(errno));
+    set_fs_error(error, errno, "scandir", "/dev/snd");
     return false;
   }
   char **names = NULL;
@@ -83,7 +112,7 @@ static bool system_open(void *ctx, const char *path, int flags, int *out_fd,
   (void)ctx;
   int fd = open(path, flags);
   if (fd < 0) {
-    set_error(error, errno_code(errno), strerror(errno));
+    set_fs_error(error, errno, "open", path);
     return false;
   }
   *out_fd = fd;
@@ -95,7 +124,7 @@ static bool system_is_character_device(void *ctx, int fd, bool *out,
   (void)ctx;
   struct stat info;
   if (fstat(fd, &info) != 0) {
-    set_error(error, errno_code(errno), strerror(errno));
+    set_fs_error(error, errno, "fstat", NULL);
     return false;
   }
   *out = S_ISCHR(info.st_mode);
@@ -107,7 +136,7 @@ static bool system_read(void *ctx, int fd, uint8_t *bytes, size_t length,
   (void)ctx;
   ssize_t count = read(fd, bytes, length);
   if (count < 0) {
-    set_error(error, errno_code(errno), strerror(errno));
+    set_fs_error(error, errno, "read", NULL);
     return false;
   }
   *out_count = count;

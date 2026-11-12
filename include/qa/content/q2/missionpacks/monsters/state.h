@@ -62,9 +62,11 @@ typedef struct qa_q2mpm_actor_state {
   qa_q2mpm_rogue_state state;
 } qa_q2mpm_actor_state;
 
-/* TS Q2MissionPackMonsterState. */
+/* TS Q2MissionPackMonsterState. Each entry is its own allocation, in Map
+ * insertion order: TS callers keep the state object across calls that add
+ * other actors' states, so an entry must not move when the list grows. */
 typedef struct qa_q2mpm_monster_state {
-  qa_q2mpm_actor_state *actors; size_t actor_count, actor_cap;
+  qa_q2mpm_actor_state **actors; size_t actor_count, actor_cap;
   qa_q2mpm_flyer_next_move flyer_next_move;
   double widow_shots_fired;
   double widow_damage_multiplier; /* 1 | 2 | 4 */
@@ -74,8 +76,9 @@ typedef struct qa_q2mpm_monster_state {
 
 void qa_q2mpm_state_init(qa_q2mpm_monster_state *state);
 void qa_q2mpm_state_destroy(qa_q2mpm_monster_state *state);
-/* TS get(entity): creates the default entry on first use. The
- * returned pointer is invalidated by the next get for a new actor. */
+/* TS get(entity): creates the default entry on first use. The returned
+ * pointer stays valid until the actor is released or the state is restored
+ * or destroyed (TS drops the object from its Map at the same points). */
 qa_q2mpm_rogue_state *qa_q2mpm_state_get(qa_q2mpm_monster_state *state, qa_q2_entity *entity);
 /* capture fills a malloc-backed checkpoint; false only on OOM. */
 /* TS bind(game): drop an actor's rogue state when the actor registry releases

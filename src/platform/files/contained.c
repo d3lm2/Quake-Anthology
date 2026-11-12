@@ -16,15 +16,6 @@
 
 #include "qa/foundation/support.h"
 
-/* TS `throw new Error(msg)`, as in src/text/atlas.c. */
-static noreturn void qa_error(const char *format, ...) {
-  char text[1536];
-  va_list args;
-  va_start(args, format);
-  vsnprintf(text, sizeof text, format, args);
-  va_end(args);
-  qa_raise("Error", 0, 0, "%s", text);
-}
 
 char **qa_contained_file_parts(const char *name, size_t *out_count) {
   size_t count = 1;
@@ -66,7 +57,11 @@ void qa_contained_file_parts_free(char **parts, size_t count) {
 
 /* Node/Bun fs error text: "<CODE>: <libuv description>, <syscall> '<path>'".
    Unlisted errno values fall back to strerror. */
-static noreturn void fs_error(int code, const char *syscall, const char *path) {
+noreturn void qa_node_fs_error(int code, const char *syscall, const char *path) {
+  qa_node_fs_error_paths(code, syscall, path, NULL);
+}
+/* The same with an optional path and destination: "<CODE>: <description>, <syscall>[ '<path>'][ -> '<dest>']". */
+noreturn void qa_node_fs_error_paths(int code, const char *syscall, const char *path, const char *dest) {
   static const struct { int code; const char *name, *text; } known[] = {
       {ENOENT, "ENOENT", "no such file or directory"},
       {ENOTDIR, "ENOTDIR", "not a directory"},
@@ -79,12 +74,20 @@ static noreturn void fs_error(int code, const char *syscall, const char *path) {
       {EROFS, "EROFS", "read-only file system"},
       {ENOSPC, "ENOSPC", "no space left on device"},
       {EISDIR, "EISDIR", "illegal operation on a directory"},
+      {ENOTEMPTY, "ENOTEMPTY", "directory not empty"},
+      {EXDEV, "EXDEV", "cross-device link not permitted"},
+      {EIO, "EIO", "i/o error"},
+      {EBUSY, "EBUSY", "resource busy or locked"},
   };
   for (size_t i = 0; i < sizeof known / sizeof known[0]; i++)
-    if (known[i].code == code)
-      qa_error("%s: %s, %s '%s'", known[i].name, known[i].text, syscall, path);
-  qa_error("%s", strerror(code));
+    if (known[i].code == code) {
+      if (path == NULL) qa_raise("Error", 0, 0, "%s: %s, %s", known[i].name, known[i].text, syscall);
+      if (dest == NULL) qa_raise("Error", 0, 0, "%s: %s, %s '%s'", known[i].name, known[i].text, syscall, path);
+      qa_raise("Error", 0, 0, "%s: %s, %s '%s' -> '%s'", known[i].name, known[i].text, syscall, path, dest);
+    }
+  qa_raise("Error", 0, 0, "%s", strerror(code));
 }
+#define fs_error qa_node_fs_error
 
 int qa_open_contained_parent(const char *root, const char *name, bool create,
                              char **out_leaf) {
@@ -93,7 +96,7 @@ int qa_open_contained_parent(const char *root, const char *name, bool create,
   (void)name;
   (void)create;
   (void)out_leaf;
-  qa_error("Contained file storage currently requires Linux directory descriptors");
+  qa_raise("Error", 0, 0, "Contained file storage currently requires Linux directory descriptors");
 #else
   size_t count = 0;
   char **parts = qa_contained_file_parts(name, &count);

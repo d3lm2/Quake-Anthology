@@ -9,17 +9,29 @@
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 #include "qa/content/q1/foundation/pickups.h"
 #include "qa/network/common/js_number.h"
 
-/* ASCII toLowerCase; TS lowercases UTF-16 (non-ASCII give args differ). */
-static char *lower_dup(const char *text) {
-  size_t length = strlen(text);
-  char *out = (char *)malloc(length + 1);
-  if (out == NULL) return NULL;
-  for (size_t i = 0; i < length; i++) out[i] = text[i] >= 'A' && text[i] <= 'Z' ? (char)(text[i] + 32) : text[i];
-  out[length] = '\0';
+/* TS text.toLowerCase(). */
+static char *lower_dup(const char *text) { return qa_js_to_lower_case(text); }
+/* Malloc'd printf text of any length (the TS messages have no limit). */
+static char *format_text(const char *format, const char *argument) {
+  size_t length = strlen(format) + strlen(argument) + 1;
+  char *out = (char *)malloc(length);
+  if (out == NULL) qa_range_error("Out of memory");
+  (void)snprintf(out, length, format, argument);
   return out;
+}
+/* TS try/finally around the created item: it is removed when the pickup or
+ * its touch throws. */
+typedef struct give_item {
+  qa_q1_services *game;
+  qa_q1_actor *item;
+} give_item;
+static void give_item_remove(void *arg) {
+  give_item *created = (give_item *)arg;
+  if (qa_q1_live(created->game, created->item)) qa_q1_remove(created->game, created->item);
 }
 
 static char *join_args(const char *const *args, size_t count) {
@@ -188,9 +200,9 @@ void qa_comp_give_q1(const qa_comp_q1_give_source *source, qa_actor_id actor,
         if (ammo != NULL && strcmp(ammo, shorthand) == 0) { available = true; break; }
       }
       if (!available) {
-        char text[96];
-        (void)snprintf(text, sizeof text, "Ammo %s is unavailable in this arsenal\n", input);
+        char *text = format_text("Ammo %s is unavailable in this arsenal\n", input);
         message(&state, text);
+        free(text);
       } else {
         ammo_count(&state, shorthand, has_amount ? amount : 0);
       }
@@ -258,19 +270,23 @@ void qa_comp_give_q1(const qa_comp_q1_give_source *source, qa_actor_id actor,
       goto done;
     if (strncmp(classname, "item_", 5) != 0 && strncmp(classname, "weapon_", 7) != 0) {
       char *joined_args = join_args(args, arg_count);
-      char text[600];
-      (void)snprintf(text, sizeof text, "Unknown Q1 item: %s\n", joined_args != NULL ? joined_args : "");
+      if (joined_args == NULL) qa_range_error("Out of memory");
+      char *text = format_text("Unknown Q1 item: %s\n", joined_args);
       free(joined_args);
       message(&state, text);
+      free(text);
       goto done;
     }
     qa_q1_actor *item = qa_q1_create(game, classname, NULL, NULL);
+    give_item created = {game, item};
+    qa_cleanup created_node;
+    qa_cleanup_push(&created_node, give_item_remove, &created);
     if (!qa_q1_give_pickup(game, item, actor)) {
       qa_q1_spawn_entity(game, item);
       if (!qa_q1_live(game, item) || item->touch.fn == NULL) {
-        char text[300];
-        (void)snprintf(text, sizeof text, "Item is not giveable: %s\n", classname);
+        char *text = format_text("Item is not giveable: %s\n", classname);
         message(&state, text);
+        free(text);
       } else {
         qa_q1_cancel(game, item);
         item->solid = "trigger";
@@ -281,6 +297,7 @@ void qa_comp_give_q1(const qa_comp_q1_give_source *source, qa_actor_id actor,
         (void)qa_actor_callback_table_touch(game->host.callbacks, contact);
       }
     }
+    qa_cleanup_pop(&created_node);
     if (qa_q1_live(game, item)) qa_q1_remove(game, item); /* TS finally */
   }
 done:

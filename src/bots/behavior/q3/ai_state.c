@@ -129,6 +129,16 @@ void qa_bot_goal_state_copy_from(qa_bot_goal_state_bots_a *d, qa_bot_goal s) {
   d->item_info = to_int32((double)s.item_info);
 }
 void qa_bot_goal_state_clear(qa_bot_goal_state_bots_a *g) { memset(g, 0, sizeof *g); }
+void qa_bot_waypoint_set_name_bots_a(qa_bot_waypoint_bots_a *waypoint, const char *text,
+                                     size_t length) {
+  char *copy = malloc(length + 1);
+  if (copy == NULL)
+    qa_range_error("Out of memory storing bot waypoint name");
+  memcpy(copy, text, length);
+  copy[length] = '\0';
+  free(waypoint->name);
+  waypoint->name = copy;
+}
 qa_bot_goal qa_bot_goal_state_get(const qa_bot_goal_state_bots_a *g) {
   qa_bot_goal out;
   memset(&out, 0, sizeof out);
@@ -320,7 +330,7 @@ static int64_t activation_id(const qa_bot_state_bots_a *s, const qa_bot_activate
   for (int i = 0; i < QA_MAX_ACTIVATESTACK; i++)
     if (&s->activate_goal_heap[i] == g)
       return i;
-  qa_range_error("Bot activation pointer escapes its heap");
+  qa_raise("Error", 0, 0, "Bot activation pointer escapes its heap");
 }
 qa_save_value *qa_bot_state_capture_save_state(const qa_bot_state_bots_a *s,
                                                qa_bot_waypoint_id_fn waypoint_id, void *ctx) {
@@ -649,7 +659,7 @@ static void copy_slots(int32_t *target, size_t count, const qa_q3_base_player_st
 void qa_copy_bot_player_state_bots_a(qa_bot_state_bots_a *destination,
                                      const qa_q3_base_player_state *p) {
   if (destination->product != qa_q3_base_player_state_record_product(p))
-    qa_range_error("Bot player-state product differs from its client state");
+    qa_raise("Error", 0, 0, "Bot player-state product differs from its client state");
   qa_bot_player_state_source *d = &destination->src->cur_ps;
   d->command_time = to_int32(p->command_time);
   d->pm_type = to_int32(p->pm_type);

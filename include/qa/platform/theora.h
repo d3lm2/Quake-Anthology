@@ -14,9 +14,8 @@
 #include <stdint.h>
 
 /*
- * Mirror of OggPacket from src/media/ogg.ts (TS owner; no C home
- * yet). Named with the platform prefix to stay collision-proof
- * until the media port lands.
+ * Mirror of OggPacket from src/media/ogg.ts, named with the platform
+ * prefix so it cannot collide with the media module's own type.
  */
 typedef struct qa_platform_ogg_packet {
   const uint8_t *data;

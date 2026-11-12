@@ -40,7 +40,8 @@ static void classify(const char *command, size_t length, buffer *kept, qa_compat
   if (name == NULL) qa_range_error("guest console allocation failed");
   for (size_t i = start; i < name_end; i++) {
     unsigned char c = (unsigned char)command[i];
-    name[i - start] = (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+    /* toLowerCase over a latin1 string: A-Z and the accented capitals U+00C0..U+00DE except the multiplication sign. */
+    name[i - start] = (char)((c >= 'A' && c <= 'Z') || (c >= 0xc0 && c <= 0xde && c != 0xd7) ? c + 32 : c);
   }
   name[name_end - start] = '\0';
   bool permitted = false;

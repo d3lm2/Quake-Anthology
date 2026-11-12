@@ -181,11 +181,22 @@ qa_q3_module_cvar_capture *qa_q3_base_game_settings_capture_save_state(qa_q3_bas
   *out_count = s->snapshot_count;
   return out;
 }
+typedef struct restore_scratch { qa_cvar_snapshot *snapshots; size_t count; void *restored; } restore_scratch;
+static void free_restore_scratch(void *arg) {
+  restore_scratch *scratch = arg;
+  for (size_t i = 0; i < scratch->count; i++) qa_cvar_read_free(&scratch->snapshots[i]);
+  free(scratch->snapshots); free(scratch->restored);
+  scratch->snapshots = NULL; scratch->restored = NULL; scratch->count = 0;
+}
 void qa_q3_base_game_settings_restore_save_state(qa_q3_base_game_settings *s, const qa_save_value *value) {
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, "q3.settings")) qa_range_error("out of memory");
   size_t count = qa_save_reader_list_count(&reader);
-  qa_cvar_snapshot *snapshots = xmalloc((count ? count : 1) * sizeof *snapshots);
+  qa_cvar_snapshot *snapshots = calloc(count ? count : 1, sizeof *snapshots);
+  if (!snapshots) qa_range_error("out of memory");
+  /* A rejected snapshot list raises; what was read so far is released then. */
+  restore_scratch scratch = {snapshots, count, NULL};
+  qa_cleanup guard; qa_cleanup_push(&guard, free_restore_scratch, &scratch);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(&reader, i, &item)) qa_range_error("out of memory");
@@ -195,6 +206,7 @@ void qa_q3_base_game_settings_restore_save_state(qa_q3_base_game_settings *s, co
   /* definitions map asciiFold(name) -> canonical name (last wins, JS Map). */
   typedef struct restored_entry { const char *name; qa_cvar_snapshot *snapshot; } restored_entry;
   restored_entry *restored = xmalloc((count ? count : 1) * sizeof *restored);
+  scratch.restored = restored;
   size_t restored_count = 0;
   for (size_t i = 0; i < count; i++) {
     char *folded = qa_ascii_fold(snapshots[i].name);
@@ -222,8 +234,8 @@ void qa_q3_base_game_settings_restore_save_state(qa_q3_base_game_settings *s, co
     m->name = NULL; m->value = NULL; m->reset_value = NULL; m->latched_value = NULL; /* ownership moves */
     set_snapshot(s, restored[i].name, snap);
   }
-  for (size_t i = 0; i < count; i++) qa_cvar_read_free(&snapshots[i]);
-  free(snapshots); free(restored);
+  qa_cleanup_pop(&guard);
+  free_restore_scratch(&scratch);
   qa_save_reader_destroy(&reader);
 }
 void qa_q3_base_game_settings_register(qa_q3_base_game_settings *s, const char *build_date) {
@@ -238,13 +250,13 @@ void qa_q3_base_game_settings_register(qa_q3_base_game_settings *s, const char *
     }
     qa_cvar_snapshot current;
     if (!qa_cvar_registry_register(s->host.cvars, def->name, def->value, def->flags, &current))
-      qa_range_error("Could not register Q3 game cvar %s", def->name);
+      qa_raise("Error", 0, 0, "Could not register Q3 game cvar %s", def->name);
     set_snapshot(s, def->name, current);
   }
 }
 const qa_cvar_snapshot *qa_q3_base_game_settings_snapshot(qa_q3_base_game_settings *s, const char *name) {
   snapshot_entry *e = find_entry(s, name);
-  if (!e) qa_range_error("Unregistered Q3 game cvar %s", name);
+  if (!e) qa_raise("Error", 0, 0, "Unregistered Q3 game cvar %s", name);
   return &e->snapshot;
 }
 double qa_q3_base_game_settings_integer(qa_q3_base_game_settings *s, const char *name) {
@@ -263,14 +275,14 @@ void qa_q3_base_game_settings_update(qa_q3_base_game_settings *s) {
     double previous_count = qa_q3_base_game_settings_snapshot(s, def->name)->modification_count;
     qa_cvar_snapshot current;
     if (!qa_cvar_registry_get(s->host.cvars, def->name, &current))
-      qa_range_error("Game cvar disappeared: %s", def->name);
+      qa_raise("Error", 0, 0, "Game cvar disappeared: %s", def->name);
     double current_count = current.modification_count;
     char *current_value = xstrdup(current.value);
     set_snapshot(s, def->name, current);
     if (previous_count == current_count) { free(current_value); continue; }
     if (def->track) {
       qa_q3_game_format_arg args[2] = {qa_q3_game_format_string(def->name), qa_q3_game_format_string(current_value)};
-      char *command = qa_q3_game_format("print \"Server: %s changed to %s\\n\"", args, 2, 32000);
+      char *command = qa_q3_game_format("print \"Server: %s changed to %s\n\"", args, 2, 32000);
       if (!command) qa_range_error("out of memory");
       s->host.send_server_command(s->host.ctx, -1, command);
       free(command);

@@ -162,6 +162,9 @@ struct qa_unified_audio {
   bool detached_playing;
   int64_t detached_buffer_frames;
   char *detached_device_name; /* owned or NULL */
+  /* The SdlAudioUnavailableError message of the last failed open (openDevice, or selectOutput's selection);
+   * SDL2 bounds SDL_GetError to 1024 bytes. */
+  char open_error[1280];
   int16_t *queued_pcm;
   size_t queued_count;
   qa_audio_output_format format;
@@ -466,8 +469,13 @@ static void seat_voice_observer(void *ctx,
   event.sample_rate = mixer_event->sample_rate;
   event.source_offset_seconds = mixer_event->source_offset_seconds;
   event.reason = mixer_event->reason;
-  for (size_t i = 0; i < audio->observer_count; i++)
+  /* Set iteration: an observer removed during the walk is skipped, one
+     added is visited, and removing the current one does not skip the next. */
+  for (size_t i = 0; i < audio->observer_count;) {
+    int64_t id = audio->observers[i].id;
     audio->observers[i].fn(audio->observers[i].ctx, &event);
+    if (i < audio->observer_count && audio->observers[i].id == id) i++;
+  }
 }
 static double engine_allocate_voice_id(void *ctx) {
   qa_unified_audio *audio = ctx;
@@ -509,6 +517,11 @@ qa_unified_audio *qa_unified_audio_create(
     format.channels = 2;
     format.sample_bits = 16;
   }
+  /* TS validates the rate after building the format and stream; checked
+     here before any allocation, which a raise would otherwise leak. */
+  if (!is_safe_integer(sample_rate) || sample_rate < 8000 ||
+      sample_rate > 192000)
+    qa_range_error("Invalid audio output rate");
   qa_unified_audio *audio = calloc(1, sizeof *audio);
   if (audio == NULL) return NULL;
   audio->output_stream = calloc(1, sizeof *audio->output_stream);
@@ -530,9 +543,6 @@ qa_unified_audio *qa_unified_audio_create(
     free(audio);
     return NULL;
   }
-  if (!is_safe_integer(sample_rate) || sample_rate < 8000 ||
-      sample_rate > 192000)
-    qa_range_error("Invalid audio output rate");
   audio->sample_rate = (int64_t)sample_rate;
   audio->options = *options;
   audio->max_actors = options->has_max_actors ? options->max_actors : 65536;
@@ -560,6 +570,9 @@ int64_t qa_unified_audio_queued_frames(qa_unified_audio *audio) {
 const char *qa_unified_audio_selected_output(const qa_unified_audio *audio) {
   if (audio->has_device) return audio->device.device_name;
   return audio->has_detached ? audio->detached_device_name : NULL;
+}
+const char *qa_unified_audio_open_error(const qa_unified_audio *audio) {
+  return audio->open_error;
 }
 
 static int64_t slice_start(size_t length, int64_t argument) {
@@ -1119,7 +1132,7 @@ void qa_unified_audio_release_q3_seat_owner(qa_unified_audio *audio,
   qa_unified_audio_clear_q3_seat_loops(audio, seat, true, owner);
   seat_audio *state = seat_or_throw(audio, seat);
   for (size_t i = 0; i < audio->actor_count; i++) {
-    if (audio->actors[i].has_owner &&
+    if (!audio->actors[i].retired && audio->actors[i].has_owner &&
         provider_equal(audio->actors[i].owner, owner))
       qa_audio_mixer_stop_entity(state->mixer, (double)i + 1);
   }
@@ -1305,6 +1318,18 @@ static void add_f64(double *output, const double *input, size_t count,
   for (size_t i = 0; i < count; i++) output[i] += input[i] * gain;
 }
 
+typedef struct mix_scratch {
+  double *output;
+  double *bus;
+  int16_t *pcm;
+} mix_scratch;
+static void mix_scratch_free(void *arg) {
+  mix_scratch *scratch = arg;
+  free(scratch->output);
+  free(scratch->bus);
+  free(scratch->pcm);
+}
+
 void qa_unified_audio_mix(qa_unified_audio *audio, double frames_value,
                           int16_t *out) {
   check_open(audio);
@@ -1313,19 +1338,24 @@ void qa_unified_audio_mix(qa_unified_audio *audio, double frames_value,
     qa_range_error("Mix request exceeds two seconds");
   int64_t frames = (int64_t)frames_value;
   size_t count = (size_t)frames * 2;
-  double *output = xcalloc(count, sizeof *output);
   if (audio->paused) {
     if (count > 0) memset(out, 0, count * sizeof *out);
-    free(output);
     return;
   }
+  /* Bus scratch, released if a mixer, stream or music bus raises. */
+  mix_scratch scratch = {xcalloc(count, sizeof(double)),
+                         xmalloc(count * sizeof(double)),
+                         xmalloc(count * sizeof(int16_t))};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, mix_scratch_free, &scratch);
+  double *output = scratch.output;
   for (size_t i = 0; i < audio->seat_count; i++) {
     seat_audio *state = audio->seats[i];
-    double *seat = xcalloc(count, sizeof *seat);
-    int16_t *mixed = xmalloc(count * sizeof *mixed);
+    double *seat = scratch.bus;
+    memset(seat, 0, count * sizeof *seat);
+    int16_t *mixed = scratch.pcm;
     qa_audio_mixer_mix(state->mixer, frames_value, mixed);
     add_i16(seat, mixed, count, 1);
-    free(mixed);
     const qa_efx_reverb_params *params =
         state->has_environment
             ? qa_environment_reverb_params(&state->environment)
@@ -1337,23 +1367,20 @@ void qa_unified_audio_mix(qa_unified_audio *audio, double frames_value,
     else
       qa_underwater_filter_reset(&state->underwater);
     add_f64(output, seat, count, state->listener.gain);
-    free(seat);
   }
   for (size_t i = 0; i < audio->stream_count; i++) {
-    double *mixed = xcalloc(count, sizeof *mixed);
+    double *mixed = scratch.bus;
     qa_raw_audio_stream_mix(&audio->streams[i].stream, frames,
                             audio->streams[i].target.gain, NULL, NULL, mixed);
     add_f64(output, mixed, count,
             audience_gain(audio, audio->streams[i].target.audience));
-    free(mixed);
   }
   for (size_t i = 0; i < audio->music_count; i++) {
-    double *mixed = xcalloc(count, sizeof *mixed);
+    double *mixed = scratch.bus;
     qa_music_player_mix(audio->music[i].player, frames, mixed);
     add_f64(output, mixed, count,
             audio->music[i].target.gain *
                 audience_gain(audio, audio->music[i].target.audience));
-    free(mixed);
   }
   audio->frame += frames;
   for (size_t i = 0; i < count; i++) {
@@ -1361,7 +1388,8 @@ void qa_unified_audio_mix(qa_unified_audio *audio, double frames_value,
     double clamped = value < -32768 ? -32768 : value > 32767 ? 32767 : value;
     out[i] = isnan(clamped) ? 0 : (int16_t)trunc(clamped);
   }
-  free(output);
+  qa_cleanup_pop(&guard);
+  mix_scratch_free(&scratch);
 }
 
 /* Malloc'd mix() result for the device path; count is frames*2. */
@@ -1437,9 +1465,9 @@ qa_sdl_audio_open_result qa_unified_audio_open_device(
   options.device_name = device_name;
   options.buffer_frames = buffer_frames;
   qa_sdl_audio_device device;
-  char error[256];
-  qa_sdl_audio_open_result result =
-      qa_sdl_audio_device_open(&options, &device, error, sizeof error);
+  audio->open_error[0] = '\0';
+  qa_sdl_audio_open_result result = qa_sdl_audio_device_open(
+      &options, &device, audio->open_error, sizeof audio->open_error);
   if (result == QA_SDL_AUDIO_OPEN_OK) {
     audio->device = device;
     audio->has_device = true;
@@ -1527,16 +1555,17 @@ static qa_sdl_audio_open_result open_with_pcm(const char *name,
                                               bool has_buffer,
                                               int64_t buffer_frames,
                                               const int16_t *pcm, size_t count,
-                                              qa_sdl_audio_device *out) {
+                                              qa_sdl_audio_device *out,
+                                              char *error, size_t error_size) {
   qa_sdl_audio_options options = {0};
   options.sample_rate = (double)format.sample_rate;
   options.channels = (double)format.channels;
   options.sample_bits = (double)format.sample_bits;
   options.device_name = name;
   options.buffer_frames = has_buffer ? (double)buffer_frames : 0;
-  char error[256];
+  error[0] = '\0';
   qa_sdl_audio_open_result result =
-      qa_sdl_audio_device_open(&options, out, error, sizeof error);
+      qa_sdl_audio_device_open(&options, out, error, error_size);
   if (result != QA_SDL_AUDIO_OPEN_OK) return result;
   queue_encoded(out, pcm, count, format);
   return QA_SDL_AUDIO_OPEN_OK;
@@ -1600,7 +1629,8 @@ qa_sdl_audio_open_result qa_unified_audio_select_output(
   memset(&replacement, 0, sizeof replacement);
   qa_sdl_audio_open_result result = open_with_pcm(
       device_name, format, has_buffer, old_buffer, converted,
-      converted_count, &replacement);
+      converted_count, &replacement, audio->open_error,
+      sizeof audio->open_error);
   if (result != QA_SDL_AUDIO_OPEN_OK) {
     if (result != QA_SDL_AUDIO_OPEN_UNAVAILABLE || !had_previous) {
       if (playing && had_previous) qa_sdl_audio_resume(&audio->device);
@@ -1614,14 +1644,16 @@ qa_sdl_audio_open_result qa_unified_audio_select_output(
     memset(&audio->device, 0, sizeof audio->device);
     audio->has_device = false;
     result = open_with_pcm(device_name, format, has_buffer, old_buffer,
-                           converted, converted_count, &replacement);
+                           converted, converted_count, &replacement,
+                           audio->open_error, sizeof audio->open_error);
     if (result != QA_SDL_AUDIO_OPEN_OK) {
       qa_sdl_audio_open_result selection = result;
       qa_sdl_audio_device restored;
       memset(&restored, 0, sizeof restored);
+      char restore_error[1280]; /* restoreError; the selection's stays in open_error */
       qa_sdl_audio_open_result restore = open_with_pcm(
           previous_name, old_format, has_buffer, old_buffer, retained,
-          retained_count, &restored);
+          retained_count, &restored, restore_error, sizeof restore_error);
       audio->has_previous_pump_frame = false;
       qa_bounded_queue_clear(&audio->pump_intervals);
       free(converted);
@@ -1883,6 +1915,7 @@ void qa_unified_audio_reset_round(qa_unified_audio *audio) {
   }
   audio->seat_count = 0;
   audio->actor_count = 0;
+  audio->free_actor_count = 0; /* TS freeActorEntities.length = 0 */
   for (size_t i = 0; i < audio->alias_count; i++) {
     free(audio->aliases[i].aliases);
     audio->aliases[i].aliases = NULL;
@@ -1895,9 +1928,13 @@ void qa_unified_audio_reset_round(qa_unified_audio *audio) {
   qa_bounded_queue_clear(&audio->pump_intervals);
 }
 
+static void close_stop_all(void *ctx) { qa_unified_audio_stop_all(ctx); }
+
 void qa_unified_audio_close(qa_unified_audio *audio) {
   if (audio->closed) return;
-  qa_unified_audio_stop_all(audio);
+  /* TS try { stopAll } finally { ... }: a raise still closes. */
+  qa_caught_error caught;
+  bool stopped = qa_try(close_stop_all, audio, &caught);
   audio->closed = true;
   audio->geometry = NULL;
   audio->geometry_ctx = NULL;
@@ -1919,6 +1956,7 @@ void qa_unified_audio_close(qa_unified_audio *audio) {
   free(audio->detached_device_name);
   audio->detached_device_name = NULL;
   audio->has_detached = false;
+  if (!stopped) qa_rethrow(&caught);
 }
 
 void qa_unified_audio_destroy(qa_unified_audio *audio) {

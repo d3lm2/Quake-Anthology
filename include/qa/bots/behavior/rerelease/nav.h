@@ -47,6 +47,10 @@ typedef struct qa_nav_plan_options {
  * real TS result, and plan_path returning false is TS null. */
 typedef struct qa_bot_navigation_iface {
   void *ctx;
+  /* Identity of the TS RuntimeNav object behind ctx (its node views array): nonzero and unique per
+     qa_source_rerelease_navigation_init, so storage reused for a new navigation never matches; zero
+     for other providers, which are then told apart by ctx. */
+  uint64_t identity;
   size_t (*node_count)(void *ctx);
   /* Fills caller array (cap from node_count); returns count written. */
   size_t (*nodes)(void *ctx, qa_nav_graph_node *out, size_t cap);
@@ -64,6 +68,7 @@ qa_bot_vec3 qa_steer_direction(qa_bot_vec3 from, qa_bot_vec3 to);
 typedef bool (*qa_nav_ground_fn)(void *ctx, qa_actor_id *out);
 typedef struct qa_source_rerelease_navigation {
   qa_navigation_runtime *runtime; /* borrowed */
+  uint64_t identity; /* see qa_bot_navigation_iface.identity */
   void *ground_ctx; qa_nav_ground_fn ground; /* NULL ground = TS () => null */
 } qa_source_rerelease_navigation;
 void qa_source_rerelease_navigation_init(qa_source_rerelease_navigation *nav, qa_navigation_runtime *runtime,

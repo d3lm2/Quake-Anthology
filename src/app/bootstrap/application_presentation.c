@@ -153,8 +153,10 @@ static void video_seat_publish(void *ctx, qa_app_application_q3_client *client) 
   (void)qa_app_world_seat_presentation_replace_q3_client(record->presentation, &view, &replaced);
   /* this.clientInputs = this.clientInputs.filter(event => !event.seat.equals(id)) */
   size_t kept = 0;
-  for (size_t i = 0; i < record->app->client_input_count; i++)
+  for (size_t i = 0; i < record->app->client_input_count; i++) {
     if (!qa_same_seat(record->app->client_inputs[i].seat, record->seat)) record->app->client_inputs[kept++] = record->app->client_inputs[i];
+    else qa_application_deferred_input_release(&record->app->client_inputs[i]);
+  }
   record->app->client_input_count = kept;
   qa_app_application_q3_client_destroy(previous); /* prepareVideoGuests closed it; the publisher frees it */
 }

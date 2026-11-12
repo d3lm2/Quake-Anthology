@@ -63,7 +63,7 @@ void qa_material_deform_state_reset(qa_material_deform_state *state) {
 void qa_material_deform_state_text_quad(const qa_material_deform_state *state,
                                         qa_material_vertex out[4]) {
   if (state->geometry.vertex_count < 4)
-    qa_range_error("Text deformation requires a four-vertex source quad");
+    qa_raise("Error", 0, 0, "Text deformation requires a four-vertex source quad");
   for (int i = 0; i < 4; i++) out[i] = state->geometry.vertices[i];
 }
 

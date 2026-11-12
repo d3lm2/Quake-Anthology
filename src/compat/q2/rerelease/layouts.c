@@ -50,7 +50,7 @@ static qa_guest_layout build(const char *name, const member_t *members, size_t m
 double qa_compat_q2_rerelease_field_offset(const qa_guest_layout *layout, const char *name) {
   qa_compat_q2_rerelease_layouts_ensure();
   for (size_t i = 0; i < layout->field_count; i++) if (strcmp(layout->fields[i].name, name) == 0) return layout->fields[i].byte_offset;
-  qa_range_error("Unknown %s field %s", layout->id, name);
+  qa_raise("Error", 0, 0, "Unknown %s field %s", layout->id, name);
 }
 
 qa_guest_layout qa_compat_q2_rerelease_vec2_layout, qa_compat_q2_rerelease_vec3_layout, qa_compat_q2_rerelease_plane_layout,
@@ -258,6 +258,7 @@ qa_guest_layout qa_compat_q2_rerelease_export_table_layout(const char *kind, con
       if (i == 20) for (size_t j = 0; j < 5; j++) push(&out, extra[j]);
       push(&out, list.items[i]);
     }
+    if (list.count <= 20) for (size_t j = 0; j < 5; j++) push(&out, extra[j]); /* splice past the end appends */
     free(list.items); list = out;
   }
   char name[128]; snprintf(name, sizeof name, "%s_export_t", kind);

@@ -8,12 +8,12 @@
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
 
-#define MAX_FRAMES 32
-
+/* TS frames: an array with no limit. Each frame is its own allocation so a
+ * nested hit that grows the list never moves a frame an outer hit holds. */
 struct qa_qvm_damage_scopes {
   qa_qvm_damage_scope_options options;
-  qa_qvm_damage_frame frames[MAX_FRAMES];
-  size_t frame_count;
+  qa_qvm_damage_frame **frames;
+  size_t frame_count, frame_capacity;
 };
 
 qa_qvm_damage_scopes *qa_qvm_damage_scopes_create(qa_qvm_damage_scope_options options) {
@@ -23,11 +23,15 @@ qa_qvm_damage_scopes *qa_qvm_damage_scopes_create(qa_qvm_damage_scope_options op
   return scopes;
 }
 
-void qa_qvm_damage_scopes_destroy(qa_qvm_damage_scopes *scopes) { free(scopes); }
+void qa_qvm_damage_scopes_destroy(qa_qvm_damage_scopes *scopes) {
+  if (scopes == NULL) return;
+  free(scopes->frames); /* each frame belongs to its run */
+  free(scopes);
+}
 
 qa_qvm_damage_frame *qa_qvm_damage_scopes_current(qa_qvm_damage_scopes *scopes, double pointer) {
   if (scopes->frame_count == 0) return NULL;
-  qa_qvm_damage_frame *frame = &scopes->frames[scopes->frame_count - 1];
+  qa_qvm_damage_frame *frame = scopes->frames[scopes->frame_count - 1];
   return frame->pointer == pointer && !frame->reacting ? frame : NULL;
 }
 
@@ -47,7 +51,7 @@ void qa_qvm_damage_scopes_cancel(qa_qvm_damage_scopes *scopes, qa_qvm_damage_fra
   /* TS: try { call.cancelFunction(...) } catch (error) { frame.cancelled = { error }; throw error; } */
   cancel_job job = {call, frame->cancellation};
   qa_caught_error caught;
-  if (qa_try(cancel_body, &job, &caught)) qa_range_error("QVM function scope cancelled");
+  if (qa_try(cancel_body, &job, &caught)) qa_raise("Error", 0, 0, "QVM function scope cancelled");
   frame->cancelled = true;
   snprintf(frame->cancelled_error, sizeof frame->cancelled_error, "%s", caught.message);
   qa_rethrow(&caught);
@@ -91,6 +95,8 @@ typedef struct run_ctx {
   } reactions[2];
   size_t watch;
   size_t refresh_watches[2];
+  bool has_watch, has_refresh_watch[2];
+  bool pushed; /* the frame is on the scope list */
   bool cleaned;
   qa_cleanup guard;
   struct reaction_ctx {
@@ -112,7 +118,7 @@ static bool actor_equal(qa_owned_actor a, qa_owned_actor b) {
 static bool run_current(run_ctx *run) {
   qa_qvm_damage_scopes *scopes = run->scopes;
   for (size_t index = scopes->frame_count; index-- > 0;) {
-    qa_qvm_damage_frame *entry = &scopes->frames[index];
+    qa_qvm_damage_frame *entry = scopes->frames[index];
     if (actor_equal(entry->actor, run->actor))
       return entry == run->frame && !run->frame->reacting &&
              scopes->options.live(scopes->options.ctx, run->actor);
@@ -288,18 +294,26 @@ static void run_cleanup(run_ctx *run) {
   if (run->cleaned) return;
   run->cleaned = true;
   qa_qvm_game *game = run->scopes->options.game;
-  qa_qvm_memory_writes_unobserve(&game->module.memory->writes, run->watch);
+  if (run->has_watch) qa_qvm_memory_writes_unobserve(&game->module.memory->writes, run->watch);
   for (int i = 0; i < 2; i++) {
     if (run->reactions[i].has_removal) qa_qvm_module_unbind(&game->module, run->reactions[i].removal);
     run->reactions[i].has_removal = false;
-    qa_qvm_memory_writes_unobserve(&game->module.memory->writes, run->refresh_watches[i]);
+    if (run->has_refresh_watch[i])
+      qa_qvm_memory_writes_unobserve(&game->module.memory->writes, run->refresh_watches[i]);
   }
-  run->frame->run = NULL;
-  run->scopes->frame_count--;
+  if (run->frame != NULL) run->frame->run = NULL;
+  if (run->pushed && run->scopes->frame_count != 0) run->scopes->frame_count--;
+  run->pushed = false;
 }
 
+/* TS call.words.getInt32(byteOffset, true): the DataView's own refusal. */
 static int32_t call_word(qa_qvm_module_function_call *call, double byte_index) {
-  return call_argument(call, byte_index / 4);
+  if (!(byte_index >= 0) || byte_index > (double)call->words_length - 4)
+    qa_range_error("Out of bounds access");
+  const uint8_t *p = call->words + (size_t)byte_index;
+  uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                  ((uint32_t)p[3] << 24);
+  return (int32_t)bits;
 }
 
 static void proceed_body(void *ctx) {
@@ -310,6 +324,7 @@ static void proceed_body(void *ctx) {
 static void run_free(run_ctx *run) {
   free(run->armor_ranges);
   free(run->ranges);
+  free(run->frame);
   free(run);
 }
 
@@ -326,28 +341,36 @@ qa_source_damage_result qa_qvm_damage_scopes_run(qa_qvm_damage_scopes *scopes,
                                                  qa_source_damage_observer observer) {
   qa_qvm_damage_scope_options *options = &scopes->options;
   qa_qvm_game *game = options->game;
-  if (scopes->frame_count >= MAX_FRAMES) qa_range_error("out of memory");
-  qa_qvm_damage_frame *frame = &scopes->frames[scopes->frame_count];
-  memset(frame, 0, sizeof *frame);
+  /* TS reads the entity record before it opens the cancellation scope. */
+  qa_qvm_writable_view entity;
+  qa_qvm_game_data_entity_bytes(&game->data, slot, &entity);
+  double pointer = call_word(call, options->target_argument * 4);
+  qa_qvm_cancellation_scope cancellation = call->cancellation_scope(call->call_ctx);
+  run_ctx *run = calloc(1, sizeof *run);
+  if (run == NULL) qa_range_error("out of memory");
+  /* TS finally, and before the push the GC: whatever raises from here on, the
+   * watches and reaction observers are removed, the frame leaves the list and
+   * the run is released. */
+  qa_cleanup_push(&run->guard, run_guard_unwind, run);
+  run->scopes = scopes;
+  qa_qvm_damage_frame *frame = calloc(1, sizeof *frame);
+  if (frame == NULL) qa_range_error("out of memory");
+  run->frame = frame;
   frame->actor = actor;
   frame->request = request;
   frame->call = call;
-  frame->pointer = call_word(call, options->target_argument * 4);
-  frame->cancellation = call->cancellation_scope(call->call_ctx);
-  run_ctx *run = calloc(1, sizeof *run);
-  if (run == NULL) qa_range_error("out of memory");
+  frame->pointer = pointer;
+  frame->cancellation = cancellation;
   size_t armor_capacity = 2 + options->mode_word_count;
   run->armor_ranges = malloc(armor_capacity * sizeof *run->armor_ranges);
   run->ranges = malloc((armor_capacity + 2) * sizeof *run->ranges);
   if (run->armor_ranges == NULL || run->ranges == NULL) qa_range_error("out of memory");
   frame->run = run;
-  run->scopes = scopes;
-  run->frame = frame;
   run->actor = actor;
   run->slot = slot;
   run->observer = observer;
   run->result.reaction = "none";
-  qa_qvm_game_data_entity_bytes(&game->data, slot, &run->entity);
+  run->entity = entity;
   int64_t entity_offset = run->entity.start;
   run->health_offset = (int64_t)options->health;
   run->health_range.byte_offset = entity_offset + run->health_offset;
@@ -383,13 +406,22 @@ qa_source_damage_result qa_qvm_damage_scopes_run(qa_qvm_damage_scopes *scopes,
   run->health = qa_qvm_writable_view_get_int32(&run->entity, run->health_offset, true);
   run->armor = options->armor(options->ctx, slot);
   run->velocity = read_velocity(run);
-  scopes->frame_count++;
+  if (scopes->frame_count == scopes->frame_capacity) {
+    size_t capacity = scopes->frame_capacity == 0 ? 8 : scopes->frame_capacity * 2;
+    qa_qvm_damage_frame **grown = realloc(scopes->frames, capacity * sizeof *grown);
+    if (grown == NULL) qa_range_error("out of memory");
+    scopes->frames = grown;
+    scopes->frame_capacity = capacity;
+  }
+  scopes->frames[scopes->frame_count++] = frame;
+  run->pushed = true;
   run->ranges[0] = run->health_range;
   run->ranges[1] = run->velocity_range;
   for (size_t i = 0; i < run->armor_range_count; i++) run->ranges[2 + i] = run->armor_ranges[i];
   run->watch = qa_qvm_memory_observe_writes(game->module.memory, run->ranges,
                                             2 + run->armor_range_count, write_observer, run,
                                             NULL, NULL);
+  run->has_watch = true;
   const double offsets[2] = {options->reactions.pain, options->reactions.die};
   const qa_qvm_reaction_call roles[2] = {options->reactions.pain_call, options->reactions.die_call};
   const char *names[2] = {"pain", "death"};
@@ -403,10 +435,10 @@ qa_source_damage_result qa_qvm_damage_scopes_run(qa_qvm_damage_scopes *scopes,
     run->refresh_watches[i] = qa_qvm_memory_observe_writes(game->module.memory, &range, 1,
                                                            refresh_observer, &run->refresh_contexts[i],
                                                            NULL, NULL);
+    run->has_refresh_watch[i] = true;
     reaction_refresh(run, i);
   }
   /* TS: try { call.proceed(); } catch (error) { if (frame.cancelled?.error !== error) throw error; } */
-  qa_cleanup_push(&run->guard, run_guard_unwind, run);
   qa_caught_error caught;
   if (!qa_try(proceed_body, call, &caught) &&
       !(frame->cancelled && strcmp(caught.message, frame->cancelled_error) == 0))

@@ -398,9 +398,11 @@ static attempt_kind load_from_file(qa_bot_character_library *l, qa_bot_character
   if (tokens == NULL) qa_range_error("out of memory");
   qa_bot_memory_allocation profile = new_profile(l);
   if (strlen(stored) >= MAX_QPATH) {
-    char *message = lib_strdup("character filename copy exceeds MAX_QPATH destination");
+    const char *message = "character filename copy exceeds MAX_QPATH destination";
     record(l, QA_CHARACTER_ERROR, QA_CHARACTER_INVALID_INPUT, stored, message, NULL);
-    qa_ui_script_plain_error("%s", message);
+    free(stored);
+    free(filename);
+    qa_raise("CharacterError", 0, 0, "%s", message); /* TS throw new CharacterError(issue) */
   }
   set_filename(&profile, stored);
   free(stored);
@@ -661,7 +663,7 @@ int64_t qa_bot_character_load_file(qa_bot_character_library *l, qa_bot_character
     const char *message = "character skill must be finite";
     record(l, QA_CHARACTER_ERROR, QA_CHARACTER_INVALID_INPUT, filename, message, NULL);
     free(filename);
-    qa_ui_script_plain_error("%s", message);
+    qa_raise("CharacterError", 0, 0, "%s", message); /* TS throw new CharacterError(issue) */
   }
   return load_transaction(l, file, desired, l->generation);
 }
@@ -745,7 +747,8 @@ int32_t qa_bot_character_integer(qa_bot_character_library *l, int64_t handle, in
 int32_t qa_bot_character_bounded_integer(qa_bot_character_library *l, int64_t handle, int64_t index,
                                          double minimum, double maximum) {
   if (profile_of(l, handle) == NULL) return 0;
-  if (trunc(minimum) != minimum || trunc(maximum) != maximum) {
+  /* TS !Number.isInteger: infinities are not integers. */
+  if (!isfinite(minimum) || !isfinite(maximum) || trunc(minimum) != minimum || trunc(maximum) != maximum) {
     emit(l, QA_CHARACTER_ERROR, QA_CHARACTER_INVALID_BOUNDS, profile_source(l, handle),
          "integer characteristic bounds must be integers");
     return 0;
@@ -822,6 +825,23 @@ qa_save_value *qa_bot_character_checkpoint(qa_bot_character_library *l, qa_bot_m
   lib_set(object, "profiles", profiles);
   return object;
 }
+typedef struct restore_image {
+  qa_character_diagnostic *reported;
+  size_t reported_count;
+  double *string_pointers, *string_references;
+  size_t string_count;
+  double *profiles; /* -1 is TS null */
+  size_t profile_count;
+} restore_image;
+static void restore_image_free(void *arg) {
+  restore_image *image = arg;
+  for (size_t i = 0; i < image->reported_count; i++) destroy_diagnostic(&image->reported[i]);
+  free(image->reported);
+  free(image->string_pointers);
+  free(image->string_references);
+  free(image->profiles);
+  memset(image, 0, sizeof *image);
+}
 void qa_bot_character_restore(qa_bot_character_library *l, const qa_save_value *value,
                               qa_bot_memory_restored *memory) {
   static const char *const severities[] = {"info", "warning", "error", "fatal"};
@@ -830,34 +850,80 @@ void qa_bot_character_restore(qa_bot_character_library *l, const qa_save_value *
                                       "uninitialized", "wrong-type", "invalid-bounds", "unsupported-log-format"};
   qa_save_reader reader, reported, strings, profiles;
   if (!qa_save_reader_init(&reader, value, "bot.characters")) qa_range_error("out of memory");
+  /* TS reads the whole image (a SaveFormatError for any malformed cell) before it validates or
+   * changes anything. */
+  restore_image image;
+  memset(&image, 0, sizeof image);
+  qa_cleanup image_cleanup;
+  qa_cleanup_push(&image_cleanup, restore_image_free, &image);
   double generation = lib_int_min(&reader, "generation", 0);
   double next = lib_int_min(&reader, "nextPointer", 1);
   lib_field(&reader, "reported", &reported);
+  size_t reported_count = qa_save_reader_list_count(&reported);
+  image.reported = lib_alloc(reported_count * sizeof *image.reported);
+  for (size_t i = 0; i < reported_count; i++) {
+    qa_save_reader entry, severity_reader, code_reader, location_reader;
+    lib_item(&reported, i, &entry);
+    lib_field(&entry, "severity", &severity_reader);
+    const char *severity = qa_save_reader_choice_string(&severity_reader, severities, 4);
+    lib_field(&entry, "code", &code_reader);
+    const char *code = qa_save_reader_choice_string(&code_reader, codes, 12);
+    qa_character_diagnostic *d = &image.reported[i];
+    *d = (qa_character_diagnostic){QA_CHARACTER_INFO, QA_CHARACTER_LOADED, NULL, NULL, false, {NULL, 0, 0}};
+    image.reported_count = i + 1;
+    for (int s = 0; s < 4; s++) if (strcmp(severity, severities[s]) == 0) d->severity = (qa_character_severity)s;
+    for (int c = 0; c < 12; c++) if (strcmp(code, codes[c]) == 0) d->code = (qa_character_code)c;
+    d->source = lib_read_string(&entry, "source");
+    d->message = lib_read_string(&entry, "message");
+    lib_field(&entry, "location", &location_reader);
+    if (!qa_save_reader_is_null(&location_reader)) {
+      d->location.path = lib_read_string(&location_reader, "path");
+      d->has_location = true;
+      d->location.line = (int64_t)lib_int(&location_reader, "line");
+      d->location.column = (int64_t)lib_int(&location_reader, "column");
+    }
+    qa_save_reader_destroy(&location_reader);
+    qa_save_reader_destroy(&code_reader);
+    qa_save_reader_destroy(&severity_reader);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&reported);
   lib_field(&reader, "strings", &strings);
+  image.string_count = qa_save_reader_list_count(&strings);
+  image.string_pointers = lib_alloc(image.string_count * sizeof *image.string_pointers);
+  image.string_references = lib_alloc(image.string_count * sizeof *image.string_references);
+  for (size_t i = 0; i < image.string_count; i++) {
+    qa_save_reader entry;
+    lib_item(&strings, i, &entry);
+    image.string_pointers[i] = lib_int_min(&entry, "pointer", 1);
+    image.string_references[i] = lib_int_min(&entry, "allocation", 0);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&strings);
   lib_field(&reader, "profiles", &profiles);
+  image.profile_count = qa_save_reader_list_count(&profiles);
+  image.profiles = lib_alloc(image.profile_count * sizeof *image.profiles);
+  for (size_t i = 0; i < image.profile_count; i++) {
+    qa_save_reader entry;
+    lib_item(&profiles, i, &entry);
+    image.profiles[i] = qa_save_reader_is_null(&entry) ? -1 : qa_save_reader_integer_min(&entry, 0);
+    qa_save_reader_destroy(&entry);
+  }
+  qa_save_reader_destroy(&profiles);
+  qa_save_reader_destroy(&reader);
   bool any = false;
   for (int64_t handle = 0; handle <= QA_MAX_BOT_CHARACTERS && !any; handle++) any = l->used[handle];
   for (size_t i = 0; i < l->string_capacity && !any; i++) any = l->strings[i].live;
-  bool first_null = false;
-  if (qa_save_reader_list_count(&profiles) == QA_MAX_BOT_CHARACTERS + 1) {
-    qa_save_reader first;
-    lib_item(&profiles, 0, &first);
-    first_null = qa_save_reader_is_null(&first);
-    qa_save_reader_destroy(&first);
-  }
-  if (any || !first_null || generation < 0 || next < 1 || next > 4294967296.0)
+  if (any || image.profile_count != QA_MAX_BOT_CHARACTERS + 1 || image.profiles[0] >= 0 || generation < 0 ||
+      next < 1 || next > 4294967296.0)
     qa_ui_script_plain_error("Invalid bot character restoration");
-  size_t string_count = qa_save_reader_list_count(&strings);
-  for (size_t i = 0; i < string_count; i++) {
-    qa_save_reader entry;
-    lib_item(&strings, i, &entry);
-    double pointer = lib_int_min(&entry, "pointer", 1);
-    double reference = lib_int_min(&entry, "allocation", 0);
-    qa_save_reader_destroy(&entry);
+  for (size_t i = 0; i < image.string_count; i++) {
+    double pointer = image.string_pointers[i];
     if (pointer < 1 || pointer >= next ||
         ((size_t)pointer < l->string_capacity && l->strings[(size_t)pointer].live))
       qa_ui_script_plain_error("Invalid saved bot character string pointer");
-    qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
+    qa_bot_memory_allocation allocation =
+        qa_bot_memory_restored_allocation(memory, (int64_t)image.string_references[i]);
     if (memchr(allocation.bytes, 0, allocation.length) == NULL)
       qa_ui_script_plain_error("Saved bot character string is unterminated");
     if ((size_t)pointer >= l->string_capacity) {
@@ -869,56 +935,28 @@ void qa_bot_character_restore(qa_bot_character_library *l, const qa_save_value *
     l->strings[(size_t)pointer] = (qa_character_string_cell){true, allocation};
   }
   for (size_t index = 0; index <= QA_MAX_BOT_CHARACTERS; index++) {
-    qa_save_reader entry;
-    lib_item(&profiles, index, &entry);
-    if (!qa_save_reader_is_null(&entry)) {
-      double reference = qa_save_reader_integer_min(&entry, 0);
-      qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
-      if (allocation.length != PROFILE_BYTES)
-        qa_ui_script_plain_error("Saved bot character allocation size mismatch");
-      for (int64_t characteristic = 0; characteristic < STORED_CHARACTERISTICS; characteristic++) {
-        const uint8_t *cell = cell_at(&allocation, characteristic);
-        if (cell_kind(cell) == KIND_STRING) (void)cell_string(l, cell);
-      }
-      l->profiles[index] = allocation;
-      l->used[index] = true;
+    if (image.profiles[index] < 0) continue;
+    qa_bot_memory_allocation allocation =
+        qa_bot_memory_restored_allocation(memory, (int64_t)image.profiles[index]);
+    if (allocation.length != PROFILE_BYTES)
+      qa_ui_script_plain_error("Saved bot character allocation size mismatch");
+    for (int64_t characteristic = 0; characteristic < STORED_CHARACTERISTICS; characteristic++) {
+      const uint8_t *cell = cell_at(&allocation, characteristic);
+      if (cell_kind(cell) == KIND_STRING) (void)cell_string(l, cell);
     }
-    qa_save_reader_destroy(&entry);
+    l->profiles[index] = allocation;
+    l->used[index] = true;
   }
   l->next_pointer = (int64_t)next;
   l->generation = (int64_t)generation;
-  size_t reported_count = qa_save_reader_list_count(&reported);
-  for (size_t i = 0; i < reported_count; i++) {
-    qa_save_reader entry, severity_reader, code_reader, location_reader;
-    lib_item(&reported, i, &entry);
-    lib_field(&entry, "severity", &severity_reader);
-    const char *severity = qa_save_reader_choice_string(&severity_reader, severities, 4);
-    lib_field(&entry, "code", &code_reader);
-    const char *code = qa_save_reader_choice_string(&code_reader, codes, 12);
-    char *source = lib_read_string(&entry, "source");
-    char *message = lib_read_string(&entry, "message");
-    lib_field(&entry, "location", &location_reader);
-    qa_character_diagnostic d = {QA_CHARACTER_INFO, QA_CHARACTER_LOADED, source, message, false, {NULL, 0, 0}};
-    for (int s = 0; s < 4; s++) if (strcmp(severity, severities[s]) == 0) d.severity = (qa_character_severity)s;
-    for (int c = 0; c < 12; c++) if (strcmp(code, codes[c]) == 0) d.code = (qa_character_code)c;
-    if (!qa_save_reader_is_null(&location_reader)) {
-      d.has_location = true;
-      d.location.path = lib_read_string(&location_reader, "path");
-      d.location.line = (int64_t)lib_int(&location_reader, "line");
-      d.location.column = (int64_t)lib_int(&location_reader, "column");
-    }
+  for (size_t i = 0; i < image.reported_count; i++) {
     if (l->reported_count == l->reported_capacity) {
       l->reported_capacity = lib_grow(l->reported_capacity, l->reported_count + 1);
       l->reported = lib_realloc(l->reported, l->reported_capacity * sizeof *l->reported);
     }
-    l->reported[l->reported_count++] = d;
-    qa_save_reader_destroy(&location_reader);
-    qa_save_reader_destroy(&code_reader);
-    qa_save_reader_destroy(&severity_reader);
-    qa_save_reader_destroy(&entry);
+    l->reported[l->reported_count++] = image.reported[i]; /* ownership moves */
   }
-  qa_save_reader_destroy(&reported);
-  qa_save_reader_destroy(&strings);
-  qa_save_reader_destroy(&profiles);
-  qa_save_reader_destroy(&reader);
+  image.reported_count = 0;
+  qa_cleanup_pop(&image_cleanup);
+  restore_image_free(&image);
 }

@@ -75,7 +75,7 @@ qa_save_value *qa_topology_capture_portal_checkpoint(qa_collision_topology*t){
 }
 static double word_(qa_save_reader*r){
   double v=qa_save_reader_integer_min(r,-2147483648.0);
-  if(v>2147483647.0)qa_save_format_error(r->path,"expected a signed 32-bit source word");
+  if(v>2147483647.0)qa_save_reader_fail(r,"expected a signed 32-bit source word");
   return v;
 }
 typedef struct{double*af,*afv,*pv;}restore_own;
@@ -107,9 +107,9 @@ void qa_topology_restore_portal_checkpoint(qa_collision_topology*t,const qa_save
   for(size_t i=0;i<pc;i++){qa_save_reader item;qa_save_reader_item(&f,i,&item);pv[i]=word_(&item);qa_save_reader_destroy(&item);}
   qa_save_reader_destroy(&f);
   size_t area_count=(size_t)t->area_count;
-  if(ac!=area_count||pc!=area_count*area_count)qa_save_format_error(r.path,"portal checkpoint belongs to another area table");
+  if(ac!=area_count||pc!=area_count*area_count)qa_save_reader_fail(&r,"portal checkpoint belongs to another area table");
   for(size_t a=0;a<area_count;a++)for(size_t b=a+1;b<area_count;b++)
-    if(pv[a*area_count+b]!=pv[b*area_count+a])qa_save_format_error(r.path,"asymmetric source portal references");
+    if(pv[a*area_count+b]!=pv[b*area_count+a])qa_save_reader_fail(&r,"asymmetric source portal references");
   qa_cleanup_pop(&node);
   for(size_t i=0;i<ac;i++){t->map->areas[i].flood=(int32_t)af[i];t->map->areas[i].flood_valid=(int32_t)afv[i];}
   for(size_t i=0;i<pc;i++)qa_collision_portals_set(t->map,(double)i,pv[i]);

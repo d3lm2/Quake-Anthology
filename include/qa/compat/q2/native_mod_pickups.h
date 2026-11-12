@@ -25,7 +25,7 @@ typedef struct qa_compat_q2_native_mod_pickup_operations {
 } qa_compat_q2_native_mod_pickup_operations;
 typedef struct qa_compat_q2_native_mod_pickups qa_compat_q2_native_mod_pickups;
 qa_compat_q2_native_mod_pickups *qa_compat_q2_native_mod_pickups_create(const qa_native_mod_pickup *definitions, size_t definition_count, const qa_mod_host_services *services, qa_provider_id owner, qa_compat_q2_native_mod_pickup_operations operations);
-/* TS protection(): the array stays valid until the next call. */
+/* TS protection(): the array belongs to the actor's rules and stays valid until the actor is released. */
 const qa_original_pickup_rule *qa_compat_q2_native_mod_pickups_protection(qa_compat_q2_native_mod_pickups *s, qa_actor_id actor, qa_protection_channel channel, size_t *out_count);
 void qa_compat_q2_native_mod_pickups_activate(qa_compat_q2_native_mod_pickups *s);
 void qa_compat_q2_native_mod_pickups_bind_actor(qa_compat_q2_native_mod_pickups *s, qa_actor_id actor);

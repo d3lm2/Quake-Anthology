@@ -78,7 +78,8 @@ qa_aas_entity_info_bots_a qa_bot_entity_observations_info(const qa_bot_entity_ob
   return o->records[n];
 }
 int64_t qa_bot_entity_observations_next_entity(const qa_bot_entity_observations *o, int64_t after) {
-  for (int64_t i = after + 1; i < o->capacity; i++)
+  /* TS records[number]?.valid: a negative slot is undefined, never read. */
+  for (int64_t i = after < -1 ? 0 : after + 1; i < o->capacity; i++)
     if (o->records[i].valid)
       return i;
   return 0;

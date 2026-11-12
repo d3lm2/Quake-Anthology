@@ -3,7 +3,8 @@
  * settings, the settings menu tree, and the input/audio/gamepad
  * binding factories. Also the umbrella for ui/settings re-exports.
  * C accommodations:
- *  - SettingCvars (a Pick<CvarRegistry>) is a qa_cvar_registry *.
+ *  - SettingCvars (a Pick<CvarRegistry>) is a qa_cvar_registry *, or a
+ *    qa_ui_setting_cvars view through the *_view entry points.
  *  - SettingBinding closures become fn ptr + one ctx. read_str /
  *    format_value return strings borrowed until the next call on
  *    the same binding. choices returns a borrowed array + count.
@@ -35,6 +36,21 @@
 #include "qa/settings/restart.h"
 #include "qa/settings/setting_spec.h"
 #include "qa/ui/common/controller.h"
+
+/** TS SettingCvars (a Pick<CvarRegistry>): a plain registry, or a view
+ * that reads its registry at each call (TS ApplicationInput.sharedSettings()
+ * follows publishSharedCvars). current NULL is the plain registry form;
+ * a view's current raises when its owner is gone. */
+typedef struct qa_ui_setting_cvars {
+  qa_cvar_registry *registry;
+  qa_cvar_registry *(*current)(void *ctx);
+  void *ctx;
+} qa_ui_setting_cvars;
+qa_ui_setting_cvars qa_ui_setting_cvars_of(qa_cvar_registry *registry);
+/** TS cvars !== null. */
+bool qa_ui_setting_cvars_present(const qa_ui_setting_cvars *cvars);
+/** The registry now (NULL only for an absent plain registry). */
+qa_cvar_registry *qa_ui_setting_cvars_get(const qa_ui_setting_cvars *cvars);
 
 /** TS SettingCategory, re-exported from settings/setting-spec. */
 typedef qa_setting_category qa_ui_setting_category;
@@ -100,6 +116,11 @@ bool qa_ui_bind_cvar_setting(qa_cvar_registry *registry,
                              const qa_ui_cvar_setting_spec *spec,
                              qa_restart_controls *restarts,
                              qa_ui_setting_binding *out);
+/** bindCvarSetting over a SettingCvars view (read at each call). */
+bool qa_ui_bind_cvar_setting_view(qa_ui_setting_cvars cvars,
+                                  const qa_ui_cvar_setting_spec *spec,
+                                  qa_restart_controls *restarts,
+                                  qa_ui_setting_binding *out);
 void qa_ui_cvar_setting_binding_dispose(qa_ui_setting_binding *binding);
 
 /** TS SettingsMenus {root, dispose()}. */
@@ -212,6 +233,12 @@ qa_ui_setting_bindings qa_ui_bind_music_playlist_settings(
     const char *const *(*tracks)(void *ctx, size_t *out_count), void *tracks_ctx);
 qa_ui_setting_bindings qa_ui_bind_audio_geometry_settings(
     qa_cvar_registry *registry);
+/** The two above over a SettingCvars view (absent yields none). */
+qa_ui_setting_bindings qa_ui_bind_music_playlist_settings_view(
+    qa_ui_setting_cvars cvars,
+    const char *const *(*tracks)(void *ctx, size_t *out_count), void *tracks_ctx);
+qa_ui_setting_bindings qa_ui_bind_audio_geometry_settings_view(
+    qa_ui_setting_cvars cvars);
 /** output NULL omits device/format bindings. */
 qa_ui_setting_bindings qa_ui_bind_audio_settings(
     const qa_ui_audio_settings_service *service,
@@ -240,13 +267,19 @@ typedef struct qa_ui_preference_values {
 /** TS SeatUiPreferences. cvars NULL keeps local values. */
 typedef struct qa_ui_seat_preferences {
   qa_seat_id seat;
-  qa_cvar_registry *cvars;
+  qa_ui_setting_cvars cvars;
   qa_ui_preference_values local;
   qa_ui_setting_binding bindings[QA_UI_PREFERENCE_BINDING_COUNT];
   void *binding_ctx[QA_UI_PREFERENCE_BINDING_COUNT];
 } qa_ui_seat_preferences;
 void qa_ui_seat_preferences_init(qa_ui_seat_preferences *prefs, qa_seat_id seat,
                                  qa_cvar_registry *cvars);
+/** new SeatUiPreferences(seat, view): reads the view's registry at each call. */
+void qa_ui_seat_preferences_init_view(qa_ui_seat_preferences *prefs, qa_seat_id seat,
+                                      qa_ui_setting_cvars cvars);
+/** Releases the binding contexts init allocated (the TS closures are collected). The bindings must not be used
+ * afterwards; calling it again, or on zeroed storage, does nothing. */
+void qa_ui_seat_preferences_destroy(qa_ui_seat_preferences *prefs);
 qa_ui_preference_values qa_ui_seat_preferences_values(
     const qa_ui_seat_preferences *prefs);
 void qa_ui_seat_preferences_set_values(qa_ui_seat_preferences *prefs,

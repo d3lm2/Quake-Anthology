@@ -6,7 +6,8 @@ const int QA_Q1_AXES[3] = { 0, 1, 2 };
 void qa_wire_vector_init(qa_wire_vector *vec) { vec->v[0] = vec->v[1] = vec->v[2] = 0.0f; }
 double qa_wire_vector_get(const qa_wire_vector *vec, size_t index) { return (double)vec->v[index]; }
 void qa_wire_vector_set(qa_wire_vector *vec, size_t index, double value) { vec->v[index] = (float)value; }
-void qa_q1_sys_error(const char *message) { qa_range_error("%s", message); }
+/* Sys_Error: `throw new Error(message)`. */
+void qa_q1_sys_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
 void qa_q1_wire_entity_state_init(qa_q1_wire_entity_state *s) {
   memset(s, 0, sizeof *s); s->alpha = 0; s->scale = 16;
 }

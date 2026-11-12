@@ -5,7 +5,8 @@
 #include <string.h>
 static const char *const ENC = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[]";
 static void checked_put(uint8_t *dest, size_t dest_len, size_t at, uint8_t v) {
-  if (at >= dest_len) qa_range_error("Offset is outside the bounds of the DataView");
+  /* TS output.setUint8(length++, ...): the native DataView refusal. */
+  if (at >= dest_len) qa_range_error("Out of bounds access");
   dest[at] = v;
 }
 size_t qa_rank_ascii_encode(uint8_t *dest, size_t dest_len, const uint8_t *source, size_t source_len) {

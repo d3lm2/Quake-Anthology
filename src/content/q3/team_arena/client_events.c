@@ -34,7 +34,7 @@ static void portal_destination_call(void *ctx, qa_q3_game_entity *entity) {
 void qa_q3_ta_client_events(qa_q3_ta_client_events_context *context, qa_q3_game_entity *entity,
     double old_event_sequence) {
   qa_q3_game_client *client = entity->client;
-  if (client == NULL) qa_range_error("ClientEvents requires a client entity");
+  if (client == NULL) qa_raise("Error", 0, 0, "ClientEvents requires a client entity");
   old_event_sequence = s32(old_event_sequence);
   double oldest = s32(client->ps.event_sequence - 2);
   if (old_event_sequence < oldest) old_event_sequence = oldest;
@@ -61,7 +61,7 @@ void qa_q3_ta_client_events(qa_q3_ta_client_events_context *context, qa_q3_game_
 
 void qa_q3_ta_use_holdable(qa_q3_ta_holdable_context *context, qa_q3_game_entity *entity, double event) {
   qa_q3_game_client *client = entity->client;
-  if (client == NULL) qa_range_error("Holdable effects require a client entity");
+  if (client == NULL) qa_raise("Error", 0, 0, "Holdable effects require a client entity");
   const qa_q3_base_stat_schema *schema = qa_q3_base_stat_schema_for(context->product);
   if (event == QA_Q3_EV_USE_ITEM1) {
     qa_q3_ranking_reports_use_holdable(&context->combat->entities->rankings, entity->slot, 1);
@@ -87,7 +87,7 @@ void qa_q3_ta_use_holdable(qa_q3_ta_holdable_context *context, qa_q3_game_entity
 
 void qa_q3_ta_drop_teleport_objectives(qa_q3_ta_teleport_objectives_context *context, qa_q3_game_entity *entity) {
   qa_q3_game_client *client = entity->client;
-  if (client == NULL) qa_range_error("Teleporter requires a client entity");
+  if (client == NULL) qa_raise("Error", 0, 0, "Teleporter requires a client entity");
   double powerup = slot_get(&client->ps.powerups, QA_Q3_PW_REDFLAG) ? QA_Q3_PW_REDFLAG :
       slot_get(&client->ps.powerups, QA_Q3_PW_BLUEFLAG) ? QA_Q3_PW_BLUEFLAG :
       slot_get(&client->ps.powerups, QA_Q3_PW_NEUTRALFLAG) ? QA_Q3_PW_NEUTRALFLAG : QA_Q3_PW_NONE;
@@ -116,7 +116,7 @@ void qa_q3_ta_drop_teleport_objectives(qa_q3_ta_teleport_objectives_context *con
 
 static void use_teleporter(qa_q3_ta_client_events_context *context, qa_q3_game_entity *entity) {
   qa_q3_game_client *client = entity->client;
-  if (client == NULL) qa_range_error("Teleporter requires a client entity");
+  if (client == NULL) qa_raise("Error", 0, 0, "Teleporter requires a client entity");
   qa_q3_ta_teleport_objectives_context objectives = {context->product, context->combat,
       context->ctx, context->drop_item};
   qa_q3_ta_drop_teleport_objectives(&objectives, entity);

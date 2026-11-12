@@ -1,7 +1,9 @@
 /* Port of src/app/bootstrap/local-lobby.ts. Async operations become
- * synchronous and return a borrowed error string or NULL; the TS
- * promise tail is therefore trivially serialized. Supersedes the
- * mirror in qa/ui/settings/local_lobby.h (see unresolved list).
+ * synchronous and return a borrowed error string or NULL (the message of
+ * the TS rejection, valid until the next operation; a raise inside the
+ * service or a transition rejects the operation, it does not propagate);
+ * the TS promise tail is therefore trivially serialized. Supersedes the
+ * vtable declared in qa/ui/settings/local_lobby.h.
  * GPL-2.0-or-later. */
 #ifndef QA_APP_BOOTSTRAP_LOCAL_LOBBY_H
 #define QA_APP_BOOTSTRAP_LOCAL_LOBBY_H
@@ -25,10 +27,11 @@ typedef struct qa_app_application_local_lobby {
   const qa_online_account *account;        /* borrowed */
   qa_app_local_lobby_transitions transitions;
   char *membership;                        /* owned LobbyId, NULL = TS null */
-  const qa_lobby *last_lobby;              /* borrowed from service */
+  const qa_lobby *last_lobby;              /* owned snapshot (TS keeps the Lobby value), NULL = TS null */
   double launched_generation;
   double completed_generation;
   bool closed;
+  char *error;                             /* owned text of the last rejected operation */
 } qa_app_application_local_lobby;
 /* service/account borrowed; account id/name must outlive the lobby. */
 void qa_app_application_local_lobby_init(qa_app_application_local_lobby *lobby,

@@ -56,7 +56,7 @@ bool qa_q2_save_actor(const qa_actor_id *actor, qa_saved_actor_id *out) {
 qa_owned_actor qa_q2_restore_actor(qa_q2_game_services *g, qa_saved_actor_id actor) {
   qa_owned_actor owner;
   if (!qa_session_actor_registry_resolve_saved(g->host->actors, actor, &owner))
-    qa_range_error("Q2 checkpoint references missing actor %s:%s", QA_JS_NUMBER(actor.slot), QA_JS_NUMBER(actor.generation));
+    qa_raise("Error", 0, 0, "Q2 checkpoint references missing actor %s:%s", QA_JS_NUMBER(actor.slot), QA_JS_NUMBER(actor.generation));
   return owner;
 }
 

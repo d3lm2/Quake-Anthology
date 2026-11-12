@@ -184,7 +184,7 @@ char *qa_q3_ta_client_presentation_config(qa_q3_game_client *client, const char 
 
 void qa_q3_ta_client_admission_runtime_init(qa_q3_ta_client_admission_runtime *r, qa_q3_ta_client_admission_host host) {
   if ((qa_q3_base_product)host.pool->options.product != host.product)
-    qa_range_error("Client admission product differs from its entity pool");
+    qa_raise("Error", 0, 0, "Client admission product differs from its entity pool");
   if (host.team_scores->length != QA_Q3_BASE_TEAM_NUM_TEAMS)
     qa_range_error("Client admission requires four shared team-score slots");
   r->host = host;
@@ -360,7 +360,7 @@ void qa_q3_ta_client_admission_runtime_disconnect(qa_q3_ta_client_admission_runt
   qa_q3_game_entity *entity = client_entity(r, client_num);
   bool is_bot = (qa_js_to_int32(entity->r.sv_flags) & QA_Q3_BASE_SVF_BOT) != 0;
   if (r->host.bots.kind == QA_Q3_TA_BOTS_AVAILABLE) r->host.bots.remove_queued_begin(r->host.bots.ctx, client_num);
-  else if (is_bot) qa_range_error("%s", r->host.bots.reason);
+  else if (is_bot) qa_raise("ClientCapabilityError", 0, 0, "%s", r->host.bots.reason); /* TS ClientCapabilityError */
   if (entity->client == NULL) return;
   qa_q3_game_client *client = entity->client;
   for (double index = 0; index < r->host.pool->max_clients; index++) {

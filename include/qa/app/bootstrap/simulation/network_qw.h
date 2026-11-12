@@ -23,12 +23,14 @@ typedef struct qa_app_sim_qw_server_binding_options {
   bool (*travel_userinfo)(void *ctx, qa_client_id client, qa_app_sim_quakec_info *out);
   double server_count;
   const void *administration;
-  const void *const *masters; size_t master_count;
+  /* TS `masters?: () => readonly NetworkAddress[]`, called on each heartbeat (NULL is absent). The rows are
+   * qa_net_address pointers, borrowed until the next call. */
+  void *masters_ctx; const void *const *(*masters)(void *ctx, size_t *out_count);
   void *print_ctx; void (*print)(void *ctx, const char *text);
 } qa_app_sim_qw_server_binding_options;
 
 /* host.ctx is owned; free with _destroy. TS authentication is a getter object: the
- * host refreshes the pointed-to values in observe() and admit(). `paused` reads
+ * host's authentication getters read the cvars live. `paused` reads
  * simulation.q1Paused live, as the TS getter. */
 qa_app_qw_server_host qa_app_sim_create_qw_application_server_host(qa_app_sim_qw_server_binding_options options);
 void qa_app_sim_qw_application_server_host_destroy(qa_app_qw_server_host host);

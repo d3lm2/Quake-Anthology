@@ -6,6 +6,8 @@
 #include <string.h>
 #include "qa/compat/q2/rerelease/body_shape.h"
 #include "qa/compat/q2/rerelease/equipment_movement.h"
+#include "qa/compat/q2/rerelease/imports.h"
+#include "qa/compat/q2/native_mod_entries.h"
 #include "qa/compat/q2/rerelease/player_state.h"
 #include "qa/foundation/js.h"
 
@@ -17,14 +19,15 @@ void qa_compat_q2_rerelease_missing_import_message(const qa_compat_q2_rerelease_
   snprintf(out, capacity, "Missing Q2 rerelease %s import %s at 0x%s", call->api, call->name, address);
 }
 noreturn void qa_compat_q2_rerelease_throw_missing_import(const qa_compat_q2_rerelease_import_call *call) {
+  /* class MissingRereleaseImport extends Error: error.name is "MissingRereleaseImport". */
   char message[512]; qa_compat_q2_rerelease_missing_import_message(call, message, sizeof message);
-  qa_range_error("%s", message);
+  qa_raise("MissingRereleaseImport", 0, 0, "%s", message);
 }
 qa_guest_call_value qa_compat_q2_rerelease_guest_pointer(bool has, qa_guest_address value) { return qa_compat_q2_call_pointer(has, value); }
 qa_guest_call_value qa_compat_q2_rerelease_guest_int(double value) { return qa_compat_q2_call_int32(value); }
 qa_guest_call_value qa_compat_q2_rerelease_guest_bool(bool value) { return qa_compat_q2_call_uint32(value ? 1 : 0); }
 bool qa_compat_q2_rerelease_result_pointer(qa_guest_call_result result, qa_guest_address *out) {
-  if (result.kind != QA_GUEST_VALUE_POINTER) qa_range_error("Guest pointer return required");
+  if (result.kind != QA_GUEST_VALUE_POINTER) qa_raise("TypeError", 0, 0, "Guest pointer return required");
   if (result.pointer_value.has_value && out) *out = result.pointer_value.value;
   return result.pointer_value.has_value;
 }
@@ -33,7 +36,8 @@ typedef struct cb_rec { char *id; qa_compat_q2_rerelease_guest_module *module; c
 typedef struct equip_rec { qa_raw_entity_view client; qa_equipment_movement value; bool applied; } equip_rec_t;
 struct qa_compat_q2_rerelease_guest_module {
   qa_compat_q2_rerelease_module_options options;
-  qa_guest_address command_records[32]; size_t command_record_count, command_depth; /* TS #commandRecords / #commandDepth */
+  /* TS #commandRecords / #commandDepth: one record per nesting depth, with no depth limit. */
+  qa_guest_address *command_records; size_t command_record_count, command_record_cap, command_depth;
   qa_compat_q2_memory *memory;
   const qa_compat_q2_rerelease_primary_world_profile *world_profile;
   qa_guest_address game_import_address, cgame_import_address;
@@ -42,17 +46,19 @@ struct qa_compat_q2_rerelease_guest_module {
   bool has_entity_fields; struct { qa_guest_address base, stride, count, capacity; } entity_fields;
   bool has_entity_table; qa_raw_entity_table entity_table;
   qa_raw_entity_table entity_private; /* ctx-bearing returned copy */
-  bool has_movement; qa_guest_address movement_address; uint64_t movement_binding;
+  /* TS #movement: the Pmove entry binding (bindNativeModEntry) and the address it was bound at. */
+  bool has_movement; qa_guest_address movement_address; qa_compat_q2_native_entry *movement_binding;
   bool has_input; void *input_ctx; qa_compat_q2_rerelease_input_boundary_fn input_boundary;
   void *active_ctx; bool (*active_fn)(void *); uint64_t input_handle;
-  equip_rec_t equipment[32]; size_t equipment_count;
+  /* TS #equipment: a stack with no depth limit. Each scope is its own allocation, so a nested ClientThink that grows
+   * the stack never moves a scope a running Pmove still reads. */
+  equip_rec_t **equipment; size_t equipment_count, equipment_cap;
   /* Closures behind returned entity tables and views (TS GC lifetime): one
    * table context per (base, stride, capacity) and one currentActor cell per
    * slot, owned until destroy. */
   struct table_ctx **tables; size_t table_count;
   struct slot_cell **cells; size_t cell_count;
 };
-static char *xstrdup(const char *s) { size_t n = strlen(s) + 1; char *p = malloc(n); if (p) memcpy(p, s, n); return p; }
 static qa_guest_call_result import_cb(void *ctx, const qa_guest_call_context *context, const qa_guest_call_value *args, size_t count) {
   cb_rec_t *rec = ctx; qa_compat_q2_rerelease_guest_module *m = rec->module;
   qa_compat_q2_rerelease_import_call call = {rec->api, rec->name, *context, args, count};
@@ -73,9 +79,11 @@ static qa_guest_address build_imports(qa_compat_q2_rerelease_guest_module *m, co
   if (grown == NULL) qa_range_error("Q2 rerelease module out of memory");
   m->callbacks = grown;
   for (size_t i = 0; i < count; i++) {
-    char id[512]; snprintf(id, sizeof id, "%s:q2-%s-%s", memory->module.id ? memory->module.id : "", api, entries[i].name);
-    cb_rec_t *rec = calloc(1, sizeof *rec); if (rec == NULL) qa_range_error("Q2 rerelease module out of memory");
-    m->callbacks[base + i] = rec; rec->id = xstrdup(id); rec->module = m; rec->api = api; rec->name = entries[i].name;
+    const char *module_id = memory->module.id ? memory->module.id : "";
+    size_t id_size = strlen(module_id) + strlen(api) + strlen(entries[i].name) + 6; char *id = malloc(id_size);
+    cb_rec_t *rec = calloc(1, sizeof *rec); if (rec == NULL || id == NULL) qa_range_error("Q2 rerelease module out of memory");
+    snprintf(id, id_size, "%s:q2-%s-%s", module_id, api, entries[i].name);
+    m->callbacks[base + i] = rec; rec->id = id; rec->module = m; rec->api = api; rec->name = entries[i].name;
     qa_guest_address callback = m->options.runner->bind(m->options.runner->ctx, rec->id, entries[i].signature, rec, import_cb);
     qa_compat_q2_mem_write_pointer(memory, qa_compat_q2_mem_offset(memory, address, (int64_t)qa_compat_q2_rerelease_field_offset(layout, entries[i].name)), true, callback);
   }
@@ -88,7 +96,7 @@ qa_compat_q2_rerelease_guest_module *qa_compat_q2_rerelease_guest_module_create(
   m->memory = options->runner->memory;
   m->world_profile = options->world_profile ? options->world_profile : qa_compat_q2_rerelease_get_primary_world_profile(m->memory->module.digest);
   if (m->world_profile) qa_compat_q2_validate_rerelease_primary_world_profile(m->world_profile, m->memory->module.digest);
-  if (m->memory->pointer_bytes != 8) qa_range_error("Rerelease Windows ABI requires 64-bit guest memory");
+  if (m->memory->pointer_bytes != 8) qa_raise("TypeError", 0, 0, "Rerelease Windows ABI requires 64-bit guest memory");
   size_t n_game, n_cgame;
   const qa_compat_q2_rerelease_api_entry *game = qa_compat_q2_rerelease_get_game_imports(&n_game);
   const qa_compat_q2_rerelease_api_entry *cgame = qa_compat_q2_rerelease_get_cgame_imports(&n_cgame);
@@ -101,13 +109,16 @@ void qa_compat_q2_rerelease_guest_module_destroy(qa_compat_q2_rerelease_guest_mo
   for (size_t i = 0; i < m->callback_count; i++) { free(m->callbacks[i]->id); free(m->callbacks[i]); }
   for (size_t i = 0; i < m->table_count; i++) free(m->tables[i]);
   for (size_t i = 0; i < m->cell_count; i++) free(m->cells[i]);
+  for (size_t i = 0; i < m->equipment_count; i++) free(m->equipment[i]);
+  if (m->has_movement) qa_compat_q2_native_entry_close(m->movement_binding);
+  free(m->equipment); free(m->command_records);
   free(m->tables); free(m->cells); free(m->callbacks); free(m);
 }
 const qa_compat_q2_rerelease_module_options *qa_compat_q2_rerelease_guest_module_get_options(const qa_compat_q2_rerelease_guest_module *m) { return &m->options; }
 qa_compat_q2_memory *qa_compat_q2_rerelease_guest_module_get_memory(const qa_compat_q2_rerelease_guest_module *m) { return m->memory; }
 const qa_compat_q2_rerelease_primary_world_profile *qa_compat_q2_rerelease_guest_module_get_world_profile(const qa_compat_q2_rerelease_guest_module *m) { return m->world_profile; }
 const qa_compat_q2_rerelease_primary_world_profile *qa_compat_q2_rerelease_guest_module_require_world_profile(qa_compat_q2_rerelease_guest_module *m) {
-  if (!m->world_profile) qa_range_error("Original API2023 world requires an artifact-qualified source profile");
+  if (!m->world_profile) qa_raise("Error", 0, 0, "Original API2023 world requires an artifact-qualified source profile");
   return m->world_profile;
 }
 qa_guest_address qa_compat_q2_rerelease_guest_module_get_game_import_address(const qa_compat_q2_rerelease_guest_module *m) { return m->game_import_address; }
@@ -129,7 +140,7 @@ qa_guest_call_result qa_compat_q2_rerelease_guest_module_invoke(qa_compat_q2_rer
 static qa_guest_address function_at(qa_compat_q2_rerelease_guest_module *m, qa_guest_address table, const qa_guest_layout *layout, const char *name) {
   qa_guest_address address;
   if (!qa_compat_q2_mem_read_pointer(m->memory, qa_compat_q2_mem_offset(m->memory, table, (int64_t)qa_compat_q2_rerelease_field_offset(layout, name)), &address))
-    qa_range_error("Q2 rerelease export %s is null", name);
+    qa_raise("Error", 0, 0, "Q2 rerelease export %s is null", name);
   m->memory->check(m->memory->ctx, address, 1, "execute");
   return address;
 }
@@ -138,9 +149,9 @@ qa_guest_address qa_compat_q2_rerelease_guest_module_bind_game(qa_compat_q2_rere
   qa_guest_call_value arg = qa_compat_q2_call_pointer(true, m->game_import_address);
   qa_guest_call_result result = qa_compat_q2_rerelease_guest_module_invoke(m, m->options.get_game_api, qa_compat_q2_rerelease_get_api_signature(), &arg, 1, NULL, NULL);
   qa_guest_address address;
-  if (!qa_compat_q2_rerelease_result_pointer(result, &address)) qa_range_error("GetGameAPI returned null");
+  if (!qa_compat_q2_rerelease_result_pointer(result, &address)) qa_raise("Error", 0, 0, "GetGameAPI returned null");
   m->memory->check(m->memory->ctx, address, qa_compat_q2_rerelease_get_game_export_layout()->byte_length, "read");
-  if (qa_compat_q2_mem_read_i32(m->memory, address) != 2023) qa_range_error("Q2 rerelease game API must be 2023");
+  if (qa_compat_q2_mem_read_i32(m->memory, address) != 2023) qa_raise("Error", 0, 0, "Q2 rerelease game API must be 2023");
   m->has_game = true; m->game = address; return address;
 }
 qa_guest_address qa_compat_q2_rerelease_guest_module_bind_cgame(qa_compat_q2_rerelease_guest_module *m) {
@@ -148,9 +159,9 @@ qa_guest_address qa_compat_q2_rerelease_guest_module_bind_cgame(qa_compat_q2_rer
   qa_guest_call_value arg = qa_compat_q2_call_pointer(true, m->cgame_import_address);
   qa_guest_call_result result = qa_compat_q2_rerelease_guest_module_invoke(m, m->options.get_cgame_api, qa_compat_q2_rerelease_get_api_signature(), &arg, 1, NULL, NULL);
   qa_guest_address address;
-  if (!qa_compat_q2_rerelease_result_pointer(result, &address)) qa_range_error("GetCGameAPI returned null");
+  if (!qa_compat_q2_rerelease_result_pointer(result, &address)) qa_raise("Error", 0, 0, "GetCGameAPI returned null");
   m->memory->check(m->memory->ctx, address, qa_compat_q2_rerelease_get_cgame_export_layout()->byte_length, "read");
-  if (qa_compat_q2_mem_read_i32(m->memory, address) != 2022) qa_range_error("Q2 rerelease cgame API must be 2022");
+  if (qa_compat_q2_mem_read_i32(m->memory, address) != 2022) qa_raise("Error", 0, 0, "Q2 rerelease cgame API must be 2022");
   m->has_cgame = true; m->cgame = address; return address;
 }
 qa_guest_call_result qa_compat_q2_rerelease_guest_module_call_game(qa_compat_q2_rerelease_guest_module *m, const char *name,
@@ -158,7 +169,7 @@ qa_guest_call_result qa_compat_q2_rerelease_guest_module_call_game(qa_compat_q2_
                                                                    const qa_raw_entity_view *self, const qa_raw_entity_view *other) {
   size_t n; const qa_compat_q2_rerelease_api_entry *entries = qa_compat_q2_rerelease_get_game_exports(&n);
   const qa_compat_q2_rerelease_api_entry *entry = qa_compat_q2_rerelease_find_entry(entries, n, name);
-  if (!entry) qa_range_error("Unknown game export %s", name);
+  if (!entry) qa_raise("Error", 0, 0, "Unknown game export %s", name);
   qa_guest_address table = qa_compat_q2_rerelease_guest_module_bind_game(m);
   const qa_guest_layout * layout = qa_compat_q2_rerelease_get_game_export_layout();
   return qa_compat_q2_rerelease_guest_module_invoke(m, function_at(m, table,
@@ -177,14 +188,14 @@ qa_guest_call_result qa_compat_q2_rerelease_guest_module_call_game_loading(qa_co
     qa_guest_call_value arg = qa_compat_q2_call_pointer(true, m->game_import_address);
     qa_guest_call_result result = invoke_loading(m, m->options.get_game_api, qa_compat_q2_rerelease_get_api_signature(), &arg, 1, next_frame, next_ctx, loading_budget);
     qa_guest_address address;
-    if (!qa_compat_q2_rerelease_result_pointer(result, &address)) qa_range_error("GetGameAPI returned null");
+    if (!qa_compat_q2_rerelease_result_pointer(result, &address)) qa_raise("Error", 0, 0, "GetGameAPI returned null");
     m->memory->check(m->memory->ctx, address, qa_compat_q2_rerelease_get_game_export_layout()->byte_length, "read");
-    if (qa_compat_q2_mem_read_i32(m->memory, address) != 2023) qa_range_error("Q2 rerelease game API must be 2023");
+    if (qa_compat_q2_mem_read_i32(m->memory, address) != 2023) qa_raise("Error", 0, 0, "Q2 rerelease game API must be 2023");
     m->has_game = true; m->game = address;
   }
   size_t n; const qa_compat_q2_rerelease_api_entry *entries = qa_compat_q2_rerelease_get_game_exports(&n);
   const qa_compat_q2_rerelease_api_entry *entry = qa_compat_q2_rerelease_find_entry(entries, n, name);
-  if (!entry) qa_range_error("Unknown game export %s", name);
+  if (!entry) qa_raise("Error", 0, 0, "Unknown game export %s", name);
   bool serialization = strcmp(name, "WriteGameJson") == 0 || strcmp(name, "WriteLevelJson") == 0 || strcmp(name, "ReadGameJson") == 0 || strcmp(name, "ReadLevelJson") == 0;
   double budget = serialization ? (m->options.has_serialization_budget ? m->options.serialization_instruction_budget : 100000000) : loading_budget;
   return invoke_loading(m, function_at(m, m->game, qa_compat_q2_rerelease_get_game_export_layout(), name), entry->signature, args, count, next_frame, next_ctx, budget);
@@ -193,7 +204,7 @@ qa_guest_call_result qa_compat_q2_rerelease_guest_module_call_cgame(qa_compat_q2
                                                                     const qa_guest_call_value *args, size_t count) {
   size_t n; const qa_compat_q2_rerelease_api_entry *entries = qa_compat_q2_rerelease_get_cgame_exports(&n);
   const qa_compat_q2_rerelease_api_entry *entry = qa_compat_q2_rerelease_find_entry(entries, n, name);
-  if (!entry) qa_range_error("Unknown cgame export %s", name);
+  if (!entry) qa_raise("Error", 0, 0, "Unknown cgame export %s", name);
   qa_guest_address table = qa_compat_q2_rerelease_guest_module_bind_cgame(m);
   const qa_guest_layout * layout = qa_compat_q2_rerelease_get_cgame_export_layout();
   return qa_compat_q2_rerelease_guest_module_invoke(m, function_at(m, table,
@@ -223,7 +234,10 @@ static qa_raw_entity_view table_at_slot(void *ctx, double slot) {
   table_ctx_t *t = ctx; qa_compat_q2_memory *memory = t->m->memory;
   if (slot != trunc(slot) || fabs(slot) > 9007199254740991.0 || slot < 0 || slot >= t->capacity)
     qa_range_error("Q2 edict slot is outside source capacity");
-  qa_guest_address address = qa_compat_q2_mem_offset(memory, t->base, (int64_t)(slot * t->stride_bytes));
+  /* base + BigInt(slot) * stride: the guest names both factors, so the product is exact or out of every mapping. */
+  uint64_t displacement = (uint64_t)INT64_MAX;
+  if ((uint64_t)slot <= (uint64_t)INT64_MAX / t->stride) displacement = (uint64_t)slot * t->stride; /* stride >= the edict size */
+  qa_guest_address address = qa_compat_q2_mem_offset(memory, t->base, (int64_t)displacement);
   qa_compat_q2_rerelease_guest_module *m = t->m; size_t index = (size_t)slot;
   if (index >= m->cell_count) {
     size_t count = index + 1 > m->cell_count * 2 ? index + 1 : m->cell_count * 2;
@@ -265,9 +279,9 @@ qa_raw_entity_table qa_compat_q2_rerelease_guest_module_entities(qa_compat_q2_re
   qa_guest_address base; bool has_base = qa_compat_q2_mem_read_pointer(m->memory, m->entity_fields.base, &base);
   uint64_t stride = qa_compat_q2_mem_read_u64(m->memory, m->entity_fields.stride);
   double count = qa_compat_q2_mem_read_u32(m->memory, m->entity_fields.count), capacity = qa_compat_q2_mem_read_u32(m->memory, m->entity_fields.capacity);
-  if (!has_base) qa_range_error("Q2 game edicts are not initialized");
+  if (!has_base) qa_raise("Error", 0, 0, "Q2 game edicts are not initialized");
   if (stride < (uint64_t)qa_compat_q2_rerelease_edict_layout.byte_length || stride > 9007199254740991ULL || count > capacity)
-    qa_range_error("Invalid Q2 rerelease edict table");
+    qa_raise("Error", 0, 0, "Invalid Q2 rerelease edict table");
   double stride_bytes = (double)stride;
   if (m->has_entity_table && m->entity_table.base.byte_offset == base.byte_offset && m->entity_table.stride_bytes == stride_bytes &&
       m->entity_table.count == count && m->entity_table.capacity == capacity) return m->entity_table;
@@ -288,40 +302,42 @@ qa_raw_entity_table qa_compat_q2_rerelease_guest_module_entities(qa_compat_q2_re
 }
 static void release_movement(qa_compat_q2_rerelease_guest_module *m) {
   if (m->has_input || m->equipment_count != 0) return;
-  if (m->has_movement) m->options.runner->remove_entry(m->options.runner->ctx, m->movement_binding);
-  m->has_movement = false;
+  if (m->has_movement) qa_compat_q2_native_entry_close(m->movement_binding);
+  m->has_movement = false; m->movement_binding = NULL;
 }
 typedef struct move_ctx { qa_compat_q2_rerelease_guest_module *m; const qa_guest_call_value *values; size_t count;
-  qa_guest_address entry; qa_compat_q2_guest_call_signature signature; } move_ctx_t;
+  qa_compat_q2_native_entry *binding; qa_guest_address movement; equip_rec_t *equipment; } move_ctx_t;
 typedef struct exec_ctx { move_ctx_t *move; } exec_ctx_t;
+/* TS execute(): original(values) re-enters the entry, bypassing this binding for that one frame. */
 static void move_execute(void *vctx) {
-  exec_ctx_t *ex = vctx; move_ctx_t *mv = ex->move; qa_compat_q2_rerelease_guest_module *m = mv->m;
-  qa_guest_call_result result = qa_compat_q2_rerelease_guest_module_invoke(m, mv->entry, mv->signature, mv->values, mv->count, NULL, NULL);
-  if (result.kind != QA_GUEST_VALUE_VOID) qa_range_error("Pmove returned a non-void result");
+  exec_ctx_t *ex = vctx; move_ctx_t *mv = ex->move;
+  qa_guest_call_result result = qa_compat_q2_native_entry_call_original(mv->binding, mv->values, mv->count);
+  if (result.kind != QA_GUEST_VALUE_VOID) qa_raise("Error", 0, 0, "Pmove returned a non-void result");
 }
 typedef struct equip_wrap { qa_compat_q2_rerelease_guest_module *m; qa_guest_address movement; const qa_equipment_movement *equipment; const qa_movement_body_shape *body; void *exec; } equip_wrap_t;
 static void body_wrap_run(void *vctx) {
   equip_wrap_t *w = vctx;
-  typedef struct { move_ctx_t *move; } e_t; e_t *ex = w->exec;
-  qa_compat_q2_with_rerelease_body_shape(w->m, w->movement, (w->equipment && w->equipment->pose) ? NULL : w->body, ex, move_execute);
+  qa_compat_q2_with_rerelease_body_shape(w->m, w->movement, (w->equipment && w->equipment->pose) ? NULL : w->body, w->exec, move_execute);
 }
+/* TS run(body). */
 static void move_run(void *vctx, const qa_movement_body_shape *body) {
   move_ctx_t *mv = vctx; qa_compat_q2_rerelease_guest_module *m = mv->m;
-  qa_guest_address movement = qa_compat_q2_guest_required_pointer(mv->values, mv->count, 0);
-  equip_rec_t *scope = m->equipment_count ? &m->equipment[m->equipment_count - 1] : NULL;
-  qa_guest_address player; bool has_player = qa_compat_q2_mem_read_pointer(m->memory,
-      qa_compat_q2_mem_offset(m->memory, movement, (int64_t)qa_compat_q2_rerelease_field_offset(&qa_compat_q2_rerelease_pmove_layout, "player")), &player);
-  equip_rec_t *equipment = scope && has_player && player.byte_offset == scope->client.address.byte_offset ? scope : NULL;
-  if (equipment && !equipment->applied) { qa_compat_q2_prepare_rerelease_equipment_movement(m, movement, &equipment->value); equipment->applied = true; }
   exec_ctx_t ex = {mv};
-  equip_wrap_t w = {m, movement, equipment ? &equipment->value : NULL, body, &ex};
-  qa_compat_q2_with_rerelease_equipment_movement(m, movement, w.equipment, &w, body_wrap_run);
+  equip_wrap_t w = {m, mv->movement, mv->equipment ? &mv->equipment->value : NULL, body, &ex};
+  qa_compat_q2_with_rerelease_equipment_movement(m, mv->movement, w.equipment, &w, body_wrap_run);
 }
-static qa_guest_call_result movement_invoke(void *ctx, const qa_guest_call_context *context, const qa_guest_call_value *values, size_t count) {
-  (void)context; move_ctx_t *mv_template = ctx; qa_compat_q2_rerelease_guest_module *m = mv_template->m;
-  move_ctx_t mv = *mv_template; mv.values = values; mv.count = count;
-  qa_guest_address movement = qa_compat_q2_guest_required_pointer(values, count, 0);
-  if (m->has_input && m->active_fn && m->active_fn(m->active_ctx)) m->input_boundary(m->input_ctx, movement, &mv, move_run);
+/* The bound Pmove entry. The equipment scope is matched and prepared before the input boundary runs, as in TS: the
+ * boundary sees the prepared pmove state. */
+static qa_guest_call_result movement_execute(void *ctx, const qa_guest_call_value *values, size_t count, qa_compat_q2_native_entry *binding) {
+  qa_compat_q2_rerelease_guest_module *m = ctx;
+  move_ctx_t mv; memset(&mv, 0, sizeof mv); mv.m = m; mv.values = values; mv.count = count; mv.binding = binding;
+  mv.movement = qa_compat_q2_guest_required_pointer(values, count, 0);
+  equip_rec_t *scope = m->equipment_count ? m->equipment[m->equipment_count - 1] : NULL;
+  qa_guest_address player; bool has_player = qa_compat_q2_mem_read_pointer(m->memory,
+      qa_compat_q2_mem_offset(m->memory, mv.movement, (int64_t)qa_compat_q2_rerelease_field_offset(&qa_compat_q2_rerelease_pmove_layout, "player")), &player);
+  mv.equipment = scope && has_player && player.byte_offset == scope->client.address.byte_offset ? scope : NULL;
+  if (mv.equipment && !mv.equipment->applied) { qa_compat_q2_prepare_rerelease_equipment_movement(m, mv.movement, &mv.equipment->value); mv.equipment->applied = true; }
+  if (m->has_input && m->active_fn && m->active_fn(m->active_ctx)) m->input_boundary(m->input_ctx, mv.movement, &mv, move_run);
   else move_run(&mv, NULL);
   return qa_compat_q2_call_void();
 }
@@ -329,29 +345,43 @@ static bool movement_accepts(void *ctx) {
   qa_compat_q2_rerelease_guest_module *m = ctx;
   return (m->has_input && m->active_fn && m->active_fn(m->active_ctx)) || m->equipment_count != 0;
 }
+/* TS `invoke: this.invoke.bind(this)` with no self or other record. */
+static qa_guest_call_result movement_original(void *ctx, qa_guest_address address, qa_compat_q2_guest_call_signature signature,
+                                              const qa_guest_call_value *values, size_t count) {
+  return qa_compat_q2_rerelease_guest_module_invoke(ctx, address, signature, values, count, NULL, NULL);
+}
 static void bind_movement(qa_compat_q2_rerelease_guest_module *m) {
   size_t n; const qa_compat_q2_rerelease_api_entry *entries = qa_compat_q2_rerelease_get_game_exports(&n);
   const qa_compat_q2_rerelease_api_entry *entry = qa_compat_q2_rerelease_find_entry(entries, n, "Pmove");
-  if (!entry) qa_range_error("API2023 has no Pmove signature");
-  qa_compat_q2_rerelease_guest_module * m2 = m;
+  if (!entry) qa_raise("Error", 0, 0, "API2023 has no Pmove signature");
   qa_guest_address table = qa_compat_q2_rerelease_guest_module_bind_game(m);
   const qa_guest_layout * layout = qa_compat_q2_rerelease_get_game_export_layout();
-  qa_guest_address address = function_at(m2, table, layout, "Pmove");
+  qa_guest_address address = function_at(m, table, layout, "Pmove");
   if (m->has_movement && m->movement_address.byte_offset == address.byte_offset) return;
-  if (m->has_movement) m->options.runner->remove_entry(m->options.runner->ctx, m->movement_binding);
-  m->has_movement = false;
-  move_ctx_t *mv = malloc(sizeof *mv); mv->m = m; mv->values = NULL; mv->count = 0; mv->entry = address; mv->signature = entry->signature;
-  char id[512]; snprintf(id, sizeof id, "%s:Pmove", m->memory->module.id ? m->memory->module.id : "");
-  m->movement_binding = m->options.runner->bind_entry(m->options.runner->ctx, address, xstrdup(id), entry->signature, mv, movement_invoke, m, movement_accepts);
+  if (m->has_movement) qa_compat_q2_native_entry_close(m->movement_binding);
+  m->has_movement = false; m->movement_binding = NULL;
+  const char *module_id = m->memory->module.id ? m->memory->module.id : "";
+  size_t id_size = strlen(module_id) + 7; char *id = malloc(id_size);
+  if (id == NULL) qa_range_error("Q2 rerelease module out of memory");
+  snprintf(id, id_size, "%s:Pmove", module_id);
+  qa_cleanup id_node; qa_cleanup_push(&id_node, free, id);
+  /* bindNativeModEntry: the entry is replaced except for the exact frame original() re-enters. */
+  m->movement_binding = qa_compat_q2_native_entry_bind(m->memory, m->options.runner, m, movement_original, address, id, entry->signature,
+                                                       m, movement_execute, m, movement_accepts);
+  qa_cleanup_pop(&id_node); free(id);
   m->movement_address = address; m->has_movement = true;
 }
+static void input_unbind_failed(void *v) { qa_compat_q2_rerelease_guest_module *m = v; m->has_input = false; }
 uint64_t qa_compat_q2_rerelease_guest_module_bind_input_movement(qa_compat_q2_rerelease_guest_module *m, void *ctx,
                                                                  qa_compat_q2_rerelease_input_boundary_fn boundary,
                                                                  void *active_ctx, bool (*active_fn)(void *)) {
-  if (m->has_input) qa_range_error("Native Pmove already has an input owner");
+  if (m->has_input) qa_raise("Error", 0, 0, "Native Pmove already has an input owner");
   m->has_input = true; m->input_ctx = ctx; m->input_boundary = boundary; m->active_ctx = active_ctx; m->active_fn = active_fn;
   m->input_handle++;
+  /* try { this.#bindMovement(); } catch (error) { this.#inputMovement = null; throw error; } */
+  qa_cleanup node; qa_cleanup_push(&node, input_unbind_failed, m);
   bind_movement(m);
+  qa_cleanup_pop(&node);
   return m->input_handle;
 }
 void qa_compat_q2_rerelease_guest_module_unbind_input_movement(qa_compat_q2_rerelease_guest_module *m, uint64_t handle) {
@@ -379,6 +409,12 @@ char *qa_compat_q2_fit_rerelease_text(const char *text, size_t capacity) {
   out[total] = '\0';
   return out;
 }
+typedef struct connect_scope { qa_compat_q2_rerelease_guest_module *m; qa_guest_address info, social; double social_bytes; } connect_scope;
+static void connect_finally(void *v) {
+  connect_scope *c = v;
+  c->m->memory->unmap(c->m->memory->ctx, c->info, 2048);
+  c->m->memory->unmap(c->m->memory->ctx, c->social, c->social_bytes);
+}
 qa_compat_q2_rerelease_client_connect qa_compat_q2_rerelease_guest_module_client_connect(
     qa_compat_q2_rerelease_guest_module *m, double slot, const char *requested_userinfo, const char *requested_social_id, bool is_bot) {
   char *userinfo = qa_compat_q2_fit_rerelease_text(requested_userinfo, 2048);
@@ -393,16 +429,20 @@ qa_compat_q2_rerelease_client_connect qa_compat_q2_rerelease_guest_module_client
   qa_raw_entity_table table = qa_compat_q2_rerelease_guest_module_entities(m);
   qa_raw_entity_view client = table.at_slot(table.ctx, slot);
   m->memory->write(m->memory->ctx, info, (const uint8_t *)userinfo, strlen(userinfo));
+  /* try { ... } finally { unmap(info, 2048); unmap(social, ...) } */
+  connect_scope scope = {m, info, social, qa_compat_q2_native_allocation_bytes((double)strlen(social_id) + 1)};
+  qa_cleanup scope_node; qa_cleanup_push(&scope_node, connect_finally, &scope);
   qa_guest_call_value args[] = {qa_compat_q2_call_pointer(true, client.address), qa_compat_q2_call_pointer(true, info),
                                 qa_compat_q2_call_pointer(true, social), qa_compat_q2_rerelease_guest_bool(is_bot)};
   qa_guest_call_result result = qa_compat_q2_rerelease_guest_module_call_game(m, "ClientConnect", args, 4, &client, NULL);
-  if (result.kind != QA_GUEST_VALUE_UINT32) qa_range_error("ClientConnect did not return its native boolean");
+  if (result.kind != QA_GUEST_VALUE_UINT32) qa_raise("TypeError", 0, 0, "ClientConnect did not return its native boolean");
   uint8_t output[2048]; m->memory->copy(m->memory->ctx, info, output, 2048);
   size_t end = 0; while (end < 2048 && output[end] != 0) end++;
-  if (end >= 2048) qa_range_error("ClientConnect returned unterminated userinfo");
-  char *text = malloc(end + 1); memcpy(text, output, end); text[end] = 0;
-  m->memory->unmap(m->memory->ctx, info, 2048);
-  m->memory->unmap(m->memory->ctx, social, qa_compat_q2_native_allocation_bytes((double)strlen(social_id) + 1));
+  if (end >= 2048) qa_raise("Error", 0, 0, "ClientConnect returned unterminated userinfo");
+  char *text = malloc(end + 1); if (text == NULL) qa_range_error("Q2 rerelease module out of memory");
+  memcpy(text, output, end); text[end] = 0;
+  text = qa_compat_q2_decode_guest_text(text, end); /* new TextDecoder().decode(output.subarray(0, end)) */
+  qa_cleanup_pop(&scope_node); connect_finally(&scope);
   qa_cleanup_pop(&social_scope);
   qa_cleanup_pop(&userinfo_scope);
   free(social_id); free(userinfo);
@@ -414,6 +454,13 @@ void qa_compat_q2_rerelease_guest_module_client_begin(qa_compat_q2_rerelease_gue
   qa_guest_call_value v = qa_compat_q2_call_pointer(true, client.address);
   (void)qa_compat_q2_rerelease_guest_module_call_game(m, "ClientBegin", &v, 1, &client, NULL);
 }
+typedef struct think_scope { qa_compat_q2_rerelease_guest_module *m; bool pushed; } think_scope;
+static void think_finally(void *v) {
+  think_scope *t = v; qa_compat_q2_rerelease_guest_module *m = t->m;
+  if (t->pushed) free(m->equipment[--m->equipment_count]);
+  release_movement(m);
+  m->command_depth--;
+}
 void qa_compat_q2_rerelease_guest_module_client_think(qa_compat_q2_rerelease_guest_module *m, double slot,
                                                       qa_q2_rerelease_user_command command, const qa_equipment_movement *equipment) {
   qa_compat_q2_rerelease_layouts_ensure();
@@ -423,7 +470,11 @@ void qa_compat_q2_rerelease_guest_module_client_think(qa_compat_q2_rerelease_gue
   const size_t depth = m->command_depth++;
   qa_guest_address address;
   if (depth >= m->command_record_count) {
-    if (m->command_record_count == 32) qa_range_error("Rerelease command nesting overflow");
+    if (m->command_record_count == m->command_record_cap) {
+      size_t cap = m->command_record_cap ? m->command_record_cap * 2 : 4; qa_guest_address *grown = realloc(m->command_records, cap * sizeof *grown);
+      if (grown == NULL) { m->command_depth--; qa_range_error("Q2 rerelease module out of memory"); }
+      m->command_records = grown; m->command_record_cap = cap;
+    }
     address = m->memory->allocate(m->memory->ctx, qa_compat_q2_rerelease_usercmd_layout.byte_length, true, 4, "Q2 client command");
     m->command_records[m->command_record_count++] = address;
   } else {
@@ -432,18 +483,25 @@ void qa_compat_q2_rerelease_guest_module_client_think(qa_compat_q2_rerelease_gue
     if (qa_compat_q2_rerelease_usercmd_layout.byte_length > sizeof zero) qa_range_error("Rerelease usercmd_t exceeds its scratch record");
     m->memory->write(m->memory->ctx, address, zero, qa_compat_q2_rerelease_usercmd_layout.byte_length);
   }
-  bool pushed = false;
+  think_scope scope = {m, false};
   if (equipment) {
-    if (m->equipment_count >= 32) qa_range_error("Rerelease equipment scope overflow");
-    m->equipment[m->equipment_count++] = (equip_rec_t){client, *equipment, false}; pushed = true;
+    if (m->equipment_count == m->equipment_cap) {
+      size_t cap = m->equipment_cap ? m->equipment_cap * 2 : 4; equip_rec_t **grown = realloc(m->equipment, cap * sizeof *grown);
+      if (grown == NULL) { m->command_depth--; qa_range_error("Q2 rerelease module out of memory"); }
+      m->equipment = grown; m->equipment_cap = cap;
+    }
+    equip_rec_t *record = malloc(sizeof *record);
+    if (record == NULL) { m->command_depth--; qa_range_error("Q2 rerelease module out of memory"); }
+    *record = (equip_rec_t){client, *equipment, false};
+    m->equipment[m->equipment_count++] = record; scope.pushed = true;
   }
+  /* try { ... } finally { if (equipment !== undefined) this.#equipment.pop(); this.#releaseMovement(); this.#commandDepth--; } */
+  qa_cleanup scope_node; qa_cleanup_push(&scope_node, think_finally, &scope);
   if (equipment || m->has_input) bind_movement(m);
   qa_compat_q2_write_rerelease_user_command(m->memory->borrow(m->memory->ctx, address, qa_compat_q2_rerelease_usercmd_layout.byte_length), command);
   qa_guest_call_value args[] = {qa_compat_q2_call_pointer(true, client.address), qa_compat_q2_call_pointer(true, address)};
   (void)qa_compat_q2_rerelease_guest_module_call_game(m, "ClientThink", args, 2, &client, NULL);
-  if (pushed) m->equipment_count--;
-  release_movement(m);
-  m->command_depth--;
+  qa_cleanup_pop(&scope_node); think_finally(&scope);
 }
 void qa_compat_q2_rerelease_guest_module_client_disconnect(qa_compat_q2_rerelease_guest_module *m, double slot) {
   qa_raw_entity_table table = qa_compat_q2_rerelease_guest_module_entities(m);
@@ -451,10 +509,18 @@ void qa_compat_q2_rerelease_guest_module_client_disconnect(qa_compat_q2_rereleas
   qa_guest_call_value v = qa_compat_q2_call_pointer(true, client.address);
   (void)qa_compat_q2_rerelease_guest_module_call_game(m, "ClientDisconnect", &v, 1, &client, NULL);
 }
+typedef struct spawn_scope { qa_compat_q2_rerelease_guest_module *m; const char *const *texts; const qa_guest_address *addrs; } spawn_scope;
+static void spawn_finally(void *v) {
+  spawn_scope *c = v;
+  for (int i = 0; i < 3; i++) c->m->memory->unmap(c->m->memory->ctx, c->addrs[i], qa_compat_q2_native_allocation_bytes((double)strlen(c->texts[i]) + 1));
+}
 void qa_compat_q2_rerelease_guest_module_spawn_entities(qa_compat_q2_rerelease_guest_module *m, const char *map, const char *entities, const char *spawnpoint) {
   const char *texts[] = {map, entities, spawnpoint};
   qa_guest_address addrs[3]; qa_guest_call_value args[3];
   for (int i = 0; i < 3; i++) { addrs[i] = qa_compat_q2_rerelease_guest_module_string(m, texts[i]); args[i] = qa_compat_q2_call_pointer(true, addrs[i]); }
+  /* try { this.callGame("SpawnEntities", ...) } finally { unmap each string } */
+  spawn_scope scope = {m, texts, addrs};
+  qa_cleanup scope_node; qa_cleanup_push(&scope_node, spawn_finally, &scope);
   (void)qa_compat_q2_rerelease_guest_module_call_game(m, "SpawnEntities", args, 3, NULL, NULL);
-  for (int i = 0; i < 3; i++) m->memory->unmap(m->memory->ctx, addrs[i], qa_compat_q2_native_allocation_bytes((double)strlen(texts[i]) + 1));
+  qa_cleanup_pop(&scope_node); spawn_finally(&scope);
 }

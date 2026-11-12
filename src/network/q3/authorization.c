@@ -86,14 +86,26 @@ void qa_q3_server_authorization_request(qa_q3_server_authorization *a, const qa_
   const char *game = a->options.game_directory(a->options.ctx);
   if (!game || !game[0]) game = "baseq3";
   if (strlen(game) >= 1024) { qa_q3_mirror_address_destroy(&client); qa_range_error("Q3 authorization game directory exceeds source buffer"); }
-  char buf[1400];
-  snprintf(buf, sizeof buf, "getIpAuthorize %lld %u.%u.%u.%u %s 0 %s", (long long)number,
-           client.host[0], client.host[1], client.host[2], client.host[3], game, a->options.strict_auth(a->options.ctx));
+  /* The whole template, however long sv_strictAuth is: encodeConnectionlessText raises past its
+   * source limit rather than cutting the text. */
+  const char *strict = a->options.strict_auth(a->options.ctx);
+  size_t n = strlen(game) + strlen(strict) + 96;
+  char *text = malloc(n);
+  if (!text) qa_range_error("Q3 authorization allocation failed");
+  snprintf(text, n, "getIpAuthorize %lld %u.%u.%u.%u %s 0 %s", (long long)number,
+           client.host[0], client.host[1], client.host[2], client.host[3], game, strict);
+  qa_cleanup text_guard;
+  qa_cleanup_push(&text_guard, free, text);
   uint8_t *packet = NULL; size_t len = 0;
-  if (qa_q3_encode_connectionless_text(buf, &packet, &len)) {
+  if (qa_q3_encode_connectionless_text(text, &packet, &len)) {
     qa_q3_address auth = authority;
+    qa_cleanup packet_guard;
+    qa_cleanup_push(&packet_guard, free, packet);
     a->options.send(a->options.ctx, &auth, packet, len);
+    qa_cleanup_pop(&packet_guard);
     free(packet);
   }
-  qa_q3_mirror_address_destroy(&client);
+  qa_cleanup_pop(&text_guard);
+  free(text);
+  qa_q3_mirror_address_destroy(&client); /* IPv4 here: owns nothing */
 }

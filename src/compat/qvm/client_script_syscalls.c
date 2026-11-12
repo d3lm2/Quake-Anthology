@@ -143,7 +143,7 @@ qa_qvm_client_script_services qa_qvm_client_scripts_get_services(
 }
 
 void qa_qvm_client_scripts_assert_current(qa_qvm_client_scripts *scripts) {
-  if (scripts->closed) qa_range_error("QVM client scripts have been closed");
+  if (scripts->closed) qa_raise("Error", 0, 0, "QVM client scripts have been closed");
   scripts->services.assert_current(scripts->services.ctx);
 }
 
@@ -186,14 +186,21 @@ static qa_ui_source_script_storage *load_source(qa_qvm_client_scripts *scripts,
   truncated[kept] = '\0';
   qa_content_opened_resource resource;
   bool found = qa_content_mounted_open(scripts->services.mounts, truncated, NULL, NULL, &resource);
+  /* The opened bytes are released when the owner check or the allocation raises. */
+  qa_cleanup opened;
+  qa_cleanup_push(&opened, free, found ? resource.bytes : NULL);
   qa_qvm_client_scripts_assert_current(scripts);
-  if (!found) return NULL;
+  if (!found) {
+    qa_cleanup_pop(&opened);
+    return NULL;
+  }
   qa_ui_source_script_storage *source = qa_ui_script_allocate_source(
       (int64_t)resource.byte_length, filename, &scripts->script_memory);
   if (source == NULL) qa_range_error("out of memory");
   size_t buffer_length = 0;
   uint8_t *buffer = qa_ui_source_script_buffer(source, &buffer_length);
   memcpy(buffer, resource.bytes, resource.byte_length);
+  qa_cleanup_pop(&opened);
   free(resource.bytes);
   qa_ui_source_script_compress(source);
   return source;
@@ -219,7 +226,10 @@ static bool resolve_include(void *ctx, const qa_ui_script_include_request *reque
     }
   }
   filename[used] = '\0';
+  qa_cleanup held_filename;
+  qa_cleanup_push(&held_filename, free, filename);
   qa_ui_source_script_storage *storage = load_source(scripts, filename);
+  qa_cleanup_pop(&held_filename);
   /* A TS ScriptSource carries the path it was allocated with: the
    * normalized name or the retry, never the raw requested spelling. */
   char *canonical = filename;
@@ -234,8 +244,11 @@ static bool resolve_include(void *ctx, const qa_ui_script_include_request *reque
     if (retry == NULL) qa_range_error("out of memory");
     strcpy(retry, prefix);
     strcat(retry, filename);
-    storage = load_source(scripts, retry);
     free(filename);
+    qa_cleanup held_retry;
+    qa_cleanup_push(&held_retry, free, retry);
+    storage = load_source(scripts, retry);
+    qa_cleanup_pop(&held_retry);
     canonical = retry;
   }
   free(scripts->include_path);
@@ -263,7 +276,7 @@ qa_save_value *qa_qvm_client_scripts_capture(qa_qvm_client_scripts *scripts) {
   bool any_pending = false;
   for (int i = 0; i < 64; i++) any_pending = any_pending || scripts->pending[i];
   if (scripts->operations != 0 || any_pending)
-    qa_range_error("Cannot checkpoint an active client script operation");
+    qa_raise("Error", 0, 0, "Cannot checkpoint an active client script operation");
   qa_bot_memory_capture bot_capture;
   if (!qa_bot_memory_checkpoint(&scripts->bot_memory, &bot_capture)) return NULL;
   qa_save_value *image = bot_capture.image;
@@ -336,7 +349,7 @@ void qa_qvm_client_scripts_restore(qa_qvm_client_scripts *scripts, const qa_save
     any_pending = any_pending || scripts->pending[i];
   }
   if (any || scripts->operations != 0 || any_pending)
-    qa_range_error("Client script restore requires an empty idle owner");
+    qa_raise("Error", 0, 0, "Client script restore requires an empty idle owner");
   qa_save_reader reader, memory_reader, globals_reader, readers_reader;
   if (!qa_save_reader_init(&reader, value, "client-scripts")) qa_range_error("out of memory");
   reader_field(&reader, "memory", &memory_reader);
@@ -353,6 +366,19 @@ void qa_qvm_client_scripts_restore(qa_qvm_client_scripts *scripts, const qa_save
   reader_field(&reader, "readers", &readers_reader);
   size_t count = qa_save_reader_list_count(&readers_reader);
   qa_ui_script_preprocessor_options options = reader_options(scripts);
+  /* TS r.field("readers").list(...) maps every row (its handle and state
+   * fields) before the loop restores the first reader: a malformed later row
+   * fails with no reader restored. */
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader item, handle_reader, state_reader;
+    if (!qa_save_reader_item(&readers_reader, i, &item)) qa_range_error("out of memory");
+    reader_field(&item, "handle", &handle_reader);
+    (void)qa_save_reader_integer_min(&handle_reader, 1);
+    qa_save_reader_destroy(&handle_reader);
+    reader_field(&item, "state", &state_reader);
+    qa_save_reader_destroy(&state_reader);
+    qa_save_reader_destroy(&item);
+  }
   for (size_t i = 0; i < count; i++) {
     qa_save_reader item, handle_reader, state_reader;
     if (!qa_save_reader_item(&readers_reader, i, &item)) qa_range_error("out of memory");
@@ -393,6 +419,42 @@ double qa_qvm_client_scripts_add_define(qa_qvm_client_scripts *scripts, const ch
   return qa_ui_script_global_defines_add(scripts->services.globals, text) ? 1 : 0;
 }
 
+typedef struct load_job {
+  qa_qvm_client_scripts *scripts;
+  const char *filename;
+  int handle;
+  double result;
+} load_job;
+
+static void dispose_root(void *arg) { qa_ui_source_script_destroy(arg); }
+
+static void load_body(void *ctx) {
+  load_job *job = ctx;
+  qa_qvm_client_scripts *scripts = job->scripts;
+  qa_ui_source_script_storage *root = load_source(scripts, job->filename);
+  if (root == NULL) return;
+  /* TS: try { assertCurrent() } catch { root.dispose(); throw }. */
+  qa_cleanup held_root;
+  qa_cleanup_push(&held_root, dispose_root, root);
+  qa_qvm_client_scripts_assert_current(scripts);
+  qa_cleanup_pop(&held_root);
+  qa_ui_script_source source;
+  memset(&source, 0, sizeof source);
+  source.path = job->filename;
+  source.storage = root;
+  qa_ui_script_preprocessor_options options = reader_options(scripts);
+  qa_ui_script_source_reader *reader =
+      qa_ui_script_source_reader_open(&source, resolve_include, scripts, &options);
+  if (reader == NULL) {
+    qa_ui_source_script_destroy(root);
+    qa_range_error("out of memory");
+  }
+  scripts->readers[job->handle] = reader;
+  scripts->occupied[job->handle] = true;
+  scripts->order[job->handle] = scripts->next_order++;
+  job->result = job->handle;
+}
+
 double qa_qvm_client_scripts_load(qa_qvm_client_scripts *scripts, const char *filename) {
   qa_qvm_client_scripts_assert_current(scripts);
   int handle = 1;
@@ -400,34 +462,15 @@ double qa_qvm_client_scripts_load(qa_qvm_client_scripts *scripts, const char *fi
   if (handle == 64) return 0;
   scripts->pending[handle] = true;
   scripts->operations++;
-  qa_ui_source_script_storage *root = load_source(scripts, filename);
-  if (root == NULL) {
-    scripts->pending[handle] = false;
-    completed(scripts);
-    return 0;
-  }
-  /* TS disposes the root when assertCurrent fails after loading;
-   * the C assert aborts, so only the OOM path below disposes it. */
-  qa_qvm_client_scripts_assert_current(scripts);
-  qa_ui_script_source source;
-  memset(&source, 0, sizeof source);
-  source.path = filename;
-  source.storage = root;
-  qa_ui_script_preprocessor_options options = reader_options(scripts);
-  qa_ui_script_source_reader *reader =
-      qa_ui_script_source_reader_open(&source, resolve_include, scripts, &options);
-  if (reader == NULL) {
-    qa_ui_source_script_destroy(root);
-    scripts->pending[handle] = false;
-    completed(scripts);
-    qa_range_error("out of memory");
-  }
-  scripts->readers[handle] = reader;
-  scripts->occupied[handle] = true;
-  scripts->order[handle] = scripts->next_order++;
+  /* TS try { ... } finally { pending.delete(handle); completed() }: a refused
+   * path, a stale owner or a failed open leaves the slot free and the owner idle. */
+  load_job job = {scripts, filename, handle, 0};
+  qa_caught_error caught;
+  bool ok = qa_try(load_body, &job, &caught);
   scripts->pending[handle] = false;
   completed(scripts);
-  return handle;
+  if (!ok) qa_rethrow(&caught);
+  return job.result;
 }
 
 /* TS readers is a Map<number, ...>: fractional/NaN handles miss. */
@@ -459,27 +502,44 @@ static void run_read_next(void *ctx) {
       next->reader, validate_current, next->scripts, &next->record);
 }
 
+typedef struct read_job {
+  qa_qvm_client_scripts *scripts;
+  qa_ui_script_source_reader *reader;
+  size_t handle;
+  qa_qvm_script_publish publish;
+  read_next_ctx next;
+  bool read;
+} read_job;
+
+static void read_body(void *ctx) {
+  read_job *job = ctx;
+  qa_qvm_client_scripts *scripts = job->scripts;
+  /* A TS source failure is caught here: read=false, and the partial
+   * token is still published below. */
+  bool completed_read = qa_ui_script_source_reader_catch(job->reader, run_read_next, &job->next);
+  job->read = completed_read && job->next.read;
+  qa_qvm_client_scripts_assert_current(scripts);
+  if (!scripts->occupied[job->handle] || scripts->readers[job->handle] != job->reader)
+    qa_raise("Error", 0, 0, "QVM source handle was freed during token read");
+  job->publish.call(job->publish.ctx, job->reader);
+}
+
 double qa_qvm_client_scripts_read(qa_qvm_client_scripts *scripts, double handle,
                                   qa_qvm_script_publish publish) {
   qa_qvm_client_scripts_assert_current(scripts);
   if (!occupied_handle(scripts, handle)) return 0;
   qa_ui_script_source_reader *reader = scripts->readers[(size_t)handle];
   scripts->operations++;
-  /* A TS source failure is caught here: read=false, and the partial
-   * token is still published below. */
-  read_next_ctx next = {scripts, reader, {0}, false};
-  bool completed_read = qa_ui_script_source_reader_catch(reader, run_read_next, &next);
-  bool read = completed_read && next.read;
-  qa_qvm_client_scripts_assert_current(scripts);
-  if (!scripts->occupied[(size_t)handle] || scripts->readers[(size_t)handle] != reader) {
-    if (read) qa_ui_script_token_record_release(&next.record);
-    completed(scripts);
-    qa_range_error("QVM source handle was freed during token read");
-  }
-  publish.call(publish.ctx, reader);
-  if (read) qa_ui_script_token_record_release(&next.record);
+  /* TS try { ... } finally { completed() }: a stale owner, a freed handle or a
+   * refused publication (a guest pointer outside the allocation) leaves the
+   * owner idle, so it can still checkpoint and close. */
+  read_job job = {scripts, reader, (size_t)handle, publish, {scripts, reader, {0}, false}, false};
+  qa_caught_error caught;
+  bool ok = qa_try(read_body, &job, &caught);
+  if (job.next.read) qa_ui_script_token_record_release(&job.next.record);
   completed(scripts);
-  return read ? 1 : 0;
+  if (!ok) qa_rethrow(&caught);
+  return job.read ? 1 : 0;
 }
 
 bool qa_qvm_client_scripts_position(qa_qvm_client_scripts *scripts, double handle,
@@ -513,7 +573,10 @@ bool qa_qvm_client_script_syscall(const qa_qvm_host_call *call, qa_qvm_client_sc
   if (call->code == define) {
     char *text = qa_qvm_memory_read_string(call->guest, qa_qvm_host_call_word(call, 1));
     if (text == NULL) qa_range_error("out of memory");
+    qa_cleanup held;
+    qa_cleanup_push(&held, free, text);
     double result = qa_qvm_client_scripts_add_define(scripts, text);
+    qa_cleanup_pop(&held);
     free(text);
     *out = qa_int32(result);
     return true;
@@ -522,7 +585,10 @@ bool qa_qvm_client_script_syscall(const qa_qvm_host_call *call, qa_qvm_client_sc
     case 0: {
       char *filename = qa_qvm_memory_read_string(call->guest, qa_qvm_host_call_word(call, 1));
       if (filename == NULL) qa_range_error("out of memory");
+      qa_cleanup held;
+      qa_cleanup_push(&held, free, filename);
       double result = qa_qvm_client_scripts_load(scripts, filename);
+      qa_cleanup_pop(&held);
       free(filename);
       *out = qa_int32(result);
       return true;

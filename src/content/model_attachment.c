@@ -1,5 +1,6 @@
 /* Port of src/content/model-attachment.ts. GPL-2.0-or-later. */
 #include "qa/content/model_attachment.h"
+#include "qa/content/json_text.h"
 
 #include "qa/foundation/support.h"
 #include <math.h>
@@ -50,10 +51,11 @@ qa_model_transform qa_read_model_grip(const qa_save_reader *grip) {
   qa_save_reader axis = field(grip, "axis");
   size_t axis_count = qa_save_reader_list_count(&axis);
   qa_vec3 axes[3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
-  size_t read_count = axis_count < 3 ? axis_count : 3;
-  for (size_t i = 0; i < read_count; i++) {
+  /* TS list(vector) reads every element before the count is checked. */
+  for (size_t i = 0; i < axis_count; i++) {
     qa_save_reader element = item(&axis, i);
-    axes[i] = read_vector(&element);
+    qa_vec3 vector = read_vector(&element);
+    if (i < 3) axes[i] = vector;
     qa_save_reader_destroy(&element);
   }
   qa_save_reader_destroy(&axis);
@@ -87,16 +89,41 @@ qa_model_transform qa_read_model_grip(const qa_save_reader *grip) {
   return transform;
 }
 
+typedef struct attachment_parse {
+  qa_save_value *input;
+  qa_model_attachment_definition *out;
+} attachment_parse;
+static void attachment_parse_release(void *arg) {
+  attachment_parse *parse = (attachment_parse *)arg;
+  qa_save_value_free(parse->input);
+  qa_content_model_attachment_free(parse->out);
+}
+static bool read_attachment(const qa_save_reader *root, qa_model_attachment_definition *out);
+
 bool qa_content_read_model_attachment(const uint8_t *bytes, size_t length,
                                       qa_model_attachment_definition *out) {
   memset(out, 0, sizeof *out);
-  qa_save_value *input = qa_parse_json_value(bytes, length, false);
+  qa_save_value *input = qa_content_parse_json_fatal(bytes, length);
   if (input == NULL) return false;
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, input, NULL)) {
     qa_save_value_free(input);
     return false;
   }
+  /* A malformed document raises: the parsed tree and what was read go. */
+  attachment_parse parse = {input, out};
+  qa_cleanup parse_node;
+  qa_cleanup_push(&parse_node, attachment_parse_release, &parse);
+  bool ok = read_attachment(&reader, out);
+  qa_cleanup_pop(&parse_node);
+  qa_save_reader_destroy(&reader);
+  qa_save_value_free(input);
+  if (!ok) qa_content_model_attachment_free(out);
+  return ok;
+}
+
+static bool read_attachment(const qa_save_reader *root, qa_model_attachment_definition *out) {
+  qa_save_reader reader = *root;
   qa_save_reader version = field(&reader, "version");
   (void)qa_save_reader_literal_number(&version, 1);
   qa_save_reader_destroy(&version);
@@ -106,11 +133,8 @@ bool qa_content_read_model_attachment(const uint8_t *bytes, size_t length,
   if (!qa_is_content_digest(digest_text))
     plain_error("Model attachment requires its source digest");
   char *digest = copy_text(digest_text);
-  if (digest == NULL) {
-    qa_save_reader_destroy(&reader);
-    qa_save_value_free(input);
-    return false;
-  }
+  if (digest == NULL) return false;
+  out->digest = digest; /* owned by *out from here: released if a later field raises */
   qa_save_reader grip_reader = field(&reader, "grip");
   qa_model_transform grip = qa_read_model_grip(&grip_reader);
   qa_save_reader_destroy(&grip_reader);
@@ -126,24 +150,20 @@ bool qa_content_read_model_attachment(const uint8_t *bytes, size_t length,
     qa_save_reader_destroy(&name_reader);
     char *name = copy_text(name_text);
     if (name == NULL) {
-      qa_content_model_attachment_free(out);
-      qa_save_reader_destroy(&reader);
-      qa_save_value_free(input);
       return false;
     }
     out->is_joint = true;
     out->name = name;
-    qa_save_reader_destroy(&reader);
-    qa_save_value_free(input);
     return true;
   }
   qa_save_reader vertices_reader = field(&reader, "vertices");
   size_t vertex_count = qa_save_reader_list_count(&vertices_reader);
   double vertices[3] = {0, 0, 0};
-  size_t read_count = vertex_count < 3 ? vertex_count : 3;
-  for (size_t i = 0; i < read_count; i++) {
+  /* TS list(value => value.integer(0)) reads every element first. */
+  for (size_t i = 0; i < vertex_count; i++) {
     qa_save_reader element = item(&vertices_reader, i);
-    vertices[i] = qa_save_reader_integer_min(&element, 0);
+    double vertex = qa_save_reader_integer_min(&element, 0);
+    if (i < 3) vertices[i] = vertex;
     qa_save_reader_destroy(&element);
   }
   qa_save_reader_destroy(&vertices_reader);
@@ -158,8 +178,6 @@ bool qa_content_read_model_attachment(const uint8_t *bytes, size_t length,
   out->vertices[0] = vertices[0];
   out->vertices[1] = vertices[1];
   out->vertices[2] = vertices[2];
-  qa_save_reader_destroy(&reader);
-  qa_save_value_free(input);
   return true;
 }
 

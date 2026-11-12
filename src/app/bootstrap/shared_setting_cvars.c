@@ -90,21 +90,6 @@ static char *gamma_validate(void *ctx, const char *value) {
   double n = qa_input_js_parse_number(value);
   return (n >= 0.5 && n <= 3) ? NULL : qa_input_dup("Brightness must be between 0.5 and 3");
 }
-static char *gamma_read(void *ctx, const char *value) {
-  (void)ctx;
-  return qa_input_js_number(1.0 / qa_input_js_parse_number(value));
-}
-static bool gamma_write(void *ctx, const char *value, char **out_value, char **out_message) {
-  char *f = finite_validate(ctx, value);
-  double n = qa_input_js_parse_number(value);
-  if (f != NULL || n < 1.0 / 3.0 || n > 2) {
-    free(f);
-    *out_message = qa_input_dup("Gamma must be between 1/3 and 2");
-    return false;
-  }
-  *out_value = qa_input_js_number(1.0 / n);
-  return true;
-}
 void qa_app_register_shared_client_settings(qa_cvar_registry *cvars, const qa_audio_output_format *output_format) {
   qa_app_register_render_settings(cvars);
   qa_register_input_device_cvars(cvars);
@@ -131,26 +116,8 @@ void qa_app_register_shared_client_settings(qa_cvar_registry *cvars, const qa_au
   qa_cvar_registry_bind_value(cvars, "bgmvolume", fin);
   qa_cvar_value_binding gam = {NULL, gamma_validate, changed_noop};
   qa_cvar_registry_bind_value(cvars, "r_gamma", gam);
-  qa_cvar_alias_conversion conv; memset(&conv, 0, sizeof conv); conv.read = gamma_read; conv.write = gamma_write;
-  { static const char *const ex[] = {"gamma 0.5"};
-    qa_cvar_alias a; memset(&a, 0, sizeof a); a.name = "gamma"; a.target = "r_gamma"; a.conversion = conv;
-    a.documentation = (qa_command_documentation){"Quake brightness convention: lower values brighten. Alias of r_gamma with gamma = 1 / r_gamma.", "gamma <1/3..2>", ex, 1, NULL, 0};
-    qa_cvar_registry_register_alias(cvars, a); }
-  { static const char *const ex[] = {"vid_gamma 0.5"};
-    qa_cvar_alias a; memset(&a, 0, sizeof a); a.name = "vid_gamma"; a.target = "r_gamma"; a.conversion = conv;
-    a.documentation = (qa_command_documentation){"Quake II brightness convention: lower values brighten. Alias of r_gamma with vid_gamma = 1 / r_gamma.", "vid_gamma <1/3..2>", ex, 1, NULL, 0};
-    qa_cvar_registry_register_alias(cvars, a); }
-  qa_cvar_alias_conversion ident; memset(&ident, 0, sizeof ident); ident.is_identity = true;
-  static const struct { const char *name, *target, *summary, *usage, *example; } aliases[3] = {
-      {"s_volume", "volume", "Alias of volume. Changes the same effects gain and audio menu preference.", "s_volume <0..1>", "s_volume 0.7"},
-      {"s_musicvolume", "bgmvolume", "Alias of bgmvolume. Changes the same music gain and audio menu preference.", "s_musicvolume <0..1>", "s_musicvolume 0.5"},
-      {"ogg_volume", "bgmvolume", "Quake II music volume. Alias of bgmvolume and the shared music gain.", "ogg_volume <0..1>", "ogg_volume 0.5"}};
-  for (int i = 0; i < 3; i++) {
-    qa_cvar_alias a; memset(&a, 0, sizeof a);
-    a.name = aliases[i].name; a.target = aliases[i].target; a.conversion = ident;
-    a.documentation = (qa_command_documentation){aliases[i].summary, aliases[i].usage, &aliases[i].example, 1, NULL, 0};
-    qa_cvar_registry_register_alias(cvars, a);
-  }
+  /* Every other spelling of these settings is declared once, in core/cvars/setting_declarations.c, and registered by
+   * the owner of the canonical cvar. */
   { static const char *const ex[] = {"volume 0.7", "volume 0"};
     qa_command_documentation doc = {"Effects volume shared with the audio menu. Output clamps to 0 through 1.", "volume <0..1>", ex, 2, NULL, 0};
     qa_cvar_registry_document(cvars, "volume", doc); }

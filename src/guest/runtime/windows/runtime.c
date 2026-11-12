@@ -29,8 +29,9 @@ static char *xstrdup(const char *text) {
   strcpy(copy, text);
   return copy;
 }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
+static void free_slot(void *slot) { free(*(void **)slot); }
 static qa_guest_core_address off(const qa_mapped_guest_memory *m, qa_guest_core_address a, int64_t d) {
   return qa_memory_offset(m, a, d);
 }
@@ -162,22 +163,46 @@ void qa_windows_guest_runtime_signature(qa_windows_guest_runtime *runtime, const
 }
 
 typedef struct wrap_state { import_entry *entry; } wrap_state;
+typedef struct wrap_call {
+  import_entry *entry;
+  const qa_guest_core_call_context *context;
+  const qa_call_value *args;
+  size_t count;
+  qa_call_result result;
+} wrap_call;
+static void wrap_run(void *arg) {
+  wrap_call *call = arg;
+  call->result = call->entry->implementation.invoke(call->entry->implementation.ctx, call->context,
+                                                    call->args, call->count);
+}
 static qa_call_result wrap_invoke(void *ctx, const qa_guest_core_call_context *context,
                                   const qa_call_value *args, size_t count) {
   wrap_state *state = ctx;
-  state->entry->reached++;
-  /* TS catches failures to record failed/lastFailure before rethrowing;
-   * a C abort cannot be observed after the fact, so they stay unchanged. */
-  return state->entry->implementation.invoke(state->entry->implementation.ctx, context, args,
-                                             count);
+  import_entry *entry = state->entry;
+  entry->reached++;
+  /* TS catch: a failure is counted and its message kept, then rethrown. */
+  wrap_call call = {entry, context, args, count, {0}};
+  qa_caught_error caught;
+  if (qa_try(wrap_run, &call, &caught)) return call.result;
+  entry->failed++;
+  char *message = malloc(strlen(caught.message) + 1);
+  if (message != NULL) {
+    strcpy(message, caught.message);
+    free(entry->last_failure);
+    entry->last_failure = message;
+  }
+  qa_rethrow(&caught);
 }
 static import_entry *register_import(qa_windows_guest_runtime *rt, const char *library,
                                      const char *name, qa_guest_call_signature signature,
                                      qa_windows_import_implementation implementation,
                                      bool supported) {
   char *normalized = canonical(library);
-  if (import_entry_of(rt, normalized, name) != NULL)
-    qa_range_error("Windows import already registered: %s!%s", normalized, name);
+  if (import_entry_of(rt, normalized, name) != NULL) {
+    qa_cleanup held;
+    qa_cleanup_push(&held, free_slot, &normalized);
+    qa_raise("Error", 0, 0, "Windows import already registered: %s!%s", normalized, name);
+  }
   import_entry *entry = xmalloc(sizeof *entry);
   memset(entry, 0, sizeof *entry);
   entry->library = normalized;
@@ -226,12 +251,6 @@ static const qa_pe_image *const *host_images(void *ctx, size_t *count) {
   if (count != NULL) *count = rt->image_count;
   return (const qa_pe_image *const *)rt->images;
 }
-void qa_windows_guest_runtime_charge_bytes(qa_windows_guest_runtime *runtime, size_t byte_length) {
-  if (runtime->runner_or_null != NULL) qa_guest_call_runner_charge_bytes(runtime->runner_or_null, byte_length);
-}
-static void host_charge_bytes(void *ctx, size_t byte_length) {
-  qa_windows_guest_runtime_charge_bytes((qa_windows_guest_runtime *)ctx, byte_length);
-}
 static uint32_t host_get_last_error(void *ctx) {
   qa_windows_guest_runtime *rt = ctx;
   qa_mapped_guest_memory *m = rt->options.memory;
@@ -253,10 +272,13 @@ static void host_service(void *ctx, const char *library, const char *name,
                          qa_windows_import_implementation implementation) {
   qa_windows_guest_runtime *rt = ctx;
   qa_abi_value_layout *layouts = xmalloc(parameter_count * sizeof *layouts);
+  qa_cleanup held;
+  qa_cleanup_push(&held, free_slot, &layouts);
   qa_guest_call_signature signature;
   qa_windows_guest_runtime_signature(rt, library, parameters, parameter_count, result_is_void,
                                      result, layouts, &signature);
   (void)register_import(rt, library, name, signature, implementation, true);
+  qa_cleanup_pop(&held);
   free(layouts);
 }
 static bool host_allocate(void *ctx, size_t size, uint64_t heap, qa_guest_core_address *out) {
@@ -288,6 +310,8 @@ static qa_call_result host_invoke(void *ctx, const qa_guest_core_call_context *c
   qa_windows_guest_runtime *rt = ctx;
   const char *library = system ? "kernel32.dll" : "ucrtbase.dll";
   qa_abi_value_layout *layouts = xmalloc(parameter_count * sizeof *layouts);
+  qa_cleanup held;
+  qa_cleanup_push(&held, free_slot, &layouts);
   qa_guest_call_signature signature;
   qa_windows_guest_runtime_signature(rt, library, parameters, parameter_count, result_is_void,
                                      result, layouts, &signature);
@@ -306,6 +330,7 @@ static qa_call_result host_invoke(void *ctx, const qa_guest_core_call_context *c
   request.instruction_budget = rt->budget;
   qa_call_result value = qa_guest_call_runner_invoke(qa_windows_guest_runtime_runner(rt),
                                                      &request);
+  qa_cleanup_pop(&held);
   free(layouts);
   return value;
 }
@@ -408,8 +433,11 @@ qa_guest_core_address qa_windows_guest_runtime_register_data(qa_windows_guest_ru
   char *normalized = canonical(library);
   qa_guest_core_address existing = {0};
   if (data_address_of(runtime, normalized, name, &existing) ||
-      import_entry_of(runtime, normalized, name) != NULL)
-    qa_range_error("Duplicate Windows data export %s!%s", normalized, name);
+      import_entry_of(runtime, normalized, name) != NULL) {
+    qa_cleanup held;
+    qa_cleanup_push(&held, free_slot, &normalized);
+    qa_raise("Error", 0, 0, "Duplicate Windows data export %s!%s", normalized, name);
+  }
   char *label = xmalloc(strlen(normalized) + strlen(name) + 2);
   (void)snprintf(label, strlen(normalized) + strlen(name) + 2, "%s!%s", normalized, name);
   qa_guest_core_address address = qa_gmem_allocate(runtime->options.memory_ext, len, true, 16,
@@ -843,6 +871,11 @@ static qa_call_result cfg_impl(void *ctx, const qa_guest_core_call_context *cont
                                 "i386 CFG dispatch convention is not implemented");
   return qa_call_void();
 }
+typedef struct cfg_patch { qa_mapped_guest_memory *memory; qa_guest_core_address slot, value; } cfg_patch;
+static void cfg_patch_write(void *arg) {
+  cfg_patch *patch = arg;
+  qa_write_pointer(patch->memory, patch->slot, true, patch->value);
+}
 static void prepare_cfg(qa_windows_guest_runtime *rt, qa_pe_image *image) {
   if (!image->has_load_configuration) return;
   qa_pe_load_configuration *config = &image->load_configuration;
@@ -863,7 +896,10 @@ static void prepare_cfg(qa_windows_guest_runtime *rt, qa_pe_image *image) {
   if (count != 0 && !has_base) plain_error("Null CFG target table");
   if (has_base) {
     size_t entries_len = (size_t)count * stride;
+    qa_memory_check(m, base, entries_len, QA_ACCESS_READ);
     uint8_t *entries = xmalloc(entries_len);
+    qa_cleanup held;
+    qa_cleanup_push(&held, free_slot, &entries);
     qa_memory_copy(m, base, entries, entries_len);
     int64_t previous = -1;
     for (uint64_t index = 0; index < count; index++) {
@@ -890,6 +926,7 @@ static void prepare_cfg(qa_windows_guest_runtime *rt, qa_pe_image *image) {
         rt->cfg_targets[rt->cfg_target_count++] = address.byte_offset;
       }
     }
+    qa_cleanup_pop(&held);
     free(entries);
   }
   if (!rt->has_cfg_check) {
@@ -944,15 +981,19 @@ static void prepare_cfg(qa_windows_guest_runtime *rt, qa_pe_image *image) {
     const qa_guest_mapping *mappings = qa_gmem_mappings(rt->options.memory_ext,
                                                         &mapping_count);
     const qa_guest_mapping *region = NULL;
-    for (size_t j = 0; j < mapping_count; j++)
+    for (size_t j = 0; j < mapping_count && region == NULL; j++)
       if (slot.byte_offset >= mappings[j].base &&
           slot.byte_offset + (uint64_t)width <= mappings[j].base + mappings[j].byte_length)
         region = &mappings[j];
     if (region == NULL) plain_error("Unmapped CFG pointer slot");
     qa_guest_permissions original = region->permissions;
     qa_gmem_protect(rt->options.memory_ext, slot, (size_t)width, QA_PERM_READ_WRITE);
-    qa_write_pointer(m, slot, true, patches[i].value);
+    /* TS try/finally: the slot gets its permissions back even when the write raises. */
+    cfg_patch patch = {m, slot, patches[i].value};
+    qa_caught_error caught;
+    const bool written = qa_try(cfg_patch_write, &patch, &caught);
     qa_gmem_protect(rt->options.memory_ext, slot, (size_t)width, original);
+    if (!written) qa_rethrow(&caught);
   }
 }
 void qa_windows_guest_runtime_prepare_image(qa_windows_guest_runtime *runtime,
@@ -1007,6 +1048,8 @@ static qa_call_result notification(qa_windows_guest_runtime *rt, qa_pe_image *im
                                    const qa_windows_initialize_options *options, bool is_void) {
   qa_abi_storage storages[] = {QA_STORAGE_POINTER, QA_STORAGE_UINT32, QA_STORAGE_POINTER};
   qa_abi_value_layout *layouts = xmalloc(3 * sizeof *layouts);
+  qa_cleanup held;
+  qa_cleanup_push(&held, free_slot, &layouts);
   qa_guest_call_signature signature;
   qa_windows_guest_runtime_signature(rt, "kernel32.dll", storages, 3, is_void,
                                      QA_STORAGE_INT32, layouts, &signature);
@@ -1028,6 +1071,7 @@ static qa_call_result notification(qa_windows_guest_runtime *rt, qa_pe_image *im
   request.instruction_budget = options->instruction_budget;
   qa_call_result value = qa_guest_call_runner_invoke(qa_windows_guest_runtime_runner(rt),
                                                      &request);
+  qa_cleanup_pop(&held);
   free(layouts);
   return value;
 }
@@ -1048,7 +1092,7 @@ void qa_windows_guest_runtime_initialize(qa_windows_guest_runtime *runtime, qa_p
     bool failed = result.kind != QA_CALL_INT32 || result.number == 0;
     qa_call_value_free(&result);
     if (failed)
-      qa_range_error("Windows DLL_PROCESS_ATTACH failed: %s", image->image.module.id);
+      qa_raise("Error", 0, 0, "Windows DLL_PROCESS_ATTACH failed: %s", image->image.module.id);
   }
   image_list_add(&runtime->initialized, &runtime->initialized_count,
                  &runtime->initialized_cap, image);
@@ -1105,7 +1149,6 @@ void qa_windows_guest_runtime_init(qa_windows_guest_runtime *runtime,
   host->library_name = host_library_name;
   host->own = host_own;
   host->tables = &runtime->tables;
-  host->charge_bytes = host_charge_bytes;
   runtime->teb = qa_gmem_allocate(options->memory_ext, 0x2000, true, 4096, false,
                                   QA_PERM_READ_WRITE, "Windows TEB");
   runtime->peb = qa_gmem_allocate(options->memory_ext, 0x1000, true, 4096, false,

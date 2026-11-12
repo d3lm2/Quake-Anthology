@@ -17,7 +17,10 @@
 #include "qa/foundation/js.h"
 
 static double s32(double v) { return qa_js_to_int32(v); }
-static double imul(double a, double b) { return (int32_t)(qa_js_to_int32(a) * qa_js_to_int32(b)); }
+/* Math.imul wraps; a signed C product of cvar-sized operands is undefined past 2^31. */
+static double imul(double a, double b) {
+  return qa_js_to_int32((double)((uint32_t)qa_js_to_int32(a) * (uint32_t)qa_js_to_int32(b)));
+}
 static double slot_get(qa_q3_base_player_state_slots *s, double i) { return qa_q3_base_player_state_slots_get(s, (size_t)i); }
 static void slot_set(qa_q3_base_player_state_slots *s, double i, double v) { qa_q3_base_player_state_slots_set(s, (size_t)i, v); }
 static char *dup_or_empty(const char *v) {
@@ -114,7 +117,7 @@ static void rs_sort(rank_sort *s, double start, double length) {
 void qa_q3_ta_match_runtime_init(qa_q3_ta_match_runtime *runtime, qa_q3_ta_match_host host,
     qa_q3_ta_match_module_state *module_state) {
   if ((qa_q3_base_product)host.pool->options.product != host.product)
-    qa_range_error("Match product differs from its entity pool");
+    qa_raise("Error", 0, 0, "Match product differs from its entity pool");
   if (host.team_scores->length != 4) qa_range_error("Match needs the shared four-team score storage");
   runtime->host = host;
   qa_q3_ta_match_module_state_init(&runtime->owned_module_state);
@@ -134,7 +137,7 @@ void qa_q3_ta_match_runtime_restore_save_state(qa_q3_ta_match_runtime *r, const 
 static qa_q3_ta_match_state *level(qa_q3_ta_match_runtime *r) { return r->host.state; }
 static qa_q3_game_client *owned_client(qa_q3_ta_match_runtime *r, qa_q3_game_entity *entity) {
   if (qa_q3_entity_pool_get(r->host.pool, entity->slot) != entity || entity->client == NULL)
-    qa_range_error("Match requires an owned client entity");
+    qa_raise("Error", 0, 0, "Match requires an owned client entity");
   return entity->client;
 }
 static double sorted_at(qa_q3_ta_match_runtime *r, double index) {
@@ -549,6 +552,8 @@ void qa_q3_ta_match_runtime_print_team(qa_q3_ta_match_runtime *r, qa_q3_base_tea
 }
 void qa_q3_ta_match_runtime_set_leader(qa_q3_ta_match_runtime *r, qa_q3_base_team team, double client_num) {
   qa_q3_game_client *client = qa_q3_entity_pool_client_at(r->host.pool, client_num);
+  /* The name is read where TS reads it: clientUserinfoChanged below replaces (and frees) the
+   * netname, so a pointer taken here would dangle by the last message. */
   qa_q3_game_format_arg a = qa_q3_game_format_string(client->pers.netname);
   if (client->pers.connected == QA_Q3_CONN_DISCONNECTED) {
     char *t = fmt("print \"%s is not connected\n\"", &a, 1, 1024);
@@ -565,6 +570,7 @@ void qa_q3_ta_match_runtime_set_leader(qa_q3_ta_match_runtime *r, qa_q3_base_tea
   }
   client->sess.team_leader = 1;
   r->host.client_userinfo_changed(r->host.ctx, client_num);
+  a = qa_q3_game_format_string(client->pers.netname);
   char *t = fmt("print \"%s is the new team leader\n\"", &a, 1, 1024);
   qa_q3_ta_match_runtime_print_team(r, team, t); free(t);
 }

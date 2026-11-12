@@ -23,9 +23,12 @@
 #include "qa/render/scene/models/prepare.h"
 #include "qa/render/scene/models/shadedots.h"
 #include "qa/render/scene/models/transform.h"
+#include "qa/render/scene/models/stencil_shadow.h"
 #include "qa/render/scene/skin.h"
+#include "qa/render/scene/view.h"
 #include "qa/foundation/js.h"
 
+#define RF_SHADOW_PLANE 256
 static double fr(double v) { return (double)(float)v; }
 static bool bit(double flags, int32_t mask) { return (qa_int32(flags) & mask) != 0; }
 static bool str_is(const char *a, const char *b) {
@@ -102,25 +105,6 @@ static qa_vec4 project_fn(void *ctx, qa_vec3 point) {
   if (pc->mirror) result.x = -result.x;
   return result;
 }
-static size_t camera_frustum(qa_scene_camera camera, qa_plane out[5]) {
-  size_t count = 0;
-  const int dirs[2] = {1, 2};
-  for (int d = 0; d < 2; d++) {
-    qa_vec3 direction = camera.axis.vectors[dirs[d]];
-    double scale = camera.projection.values[d == 0 ? 0 : 5];
-    for (int s = 0; s < 2; s++) {
-      double sign = s == 0 ? 1 : -1;
-      double inverse = 1 / hypot(1, scale);
-      qa_vec3 normal = qa_add3(qa_scale3(camera.axis.vectors[0], inverse),
-                               qa_scale3(direction, scale * inverse * sign));
-      out[count++] = (qa_plane){normal, qa_dot3(camera.origin, normal)};
-    }
-  }
-  /* TS order: left +/-, up +/- (same set, order as constructed) */
-  if (camera.clip_is_portal) out[count++] = camera.clip_plane;
-  return count;
-}
-
 /* --- Materials map --- */
 typedef struct material_entry {
   char *key; /* owned */
@@ -137,9 +121,6 @@ typedef struct mat_state {
   /* Individually allocated: registered textures keep views into them. */
   qa_model_image_scratch **scratches;
   size_t scratch_count, scratch_capacity;
-  /* world.materialContext results the prepared batches point into. */
-  qa_world_material_context **contexts;
-  size_t context_count, context_capacity;
 } mat_state;
 static mat_state *state_of(qa_scene_model_renderer *r) { return r->materials; }
 static void retain(qa_scene_model_renderer *r, uint8_t *bytes) {
@@ -166,19 +147,14 @@ static qa_model_image_scratch *new_scratch(qa_scene_model_renderer *r) {
   state->scratches[state->scratch_count++] = scratch;
   return scratch;
 }
-static qa_world_material_context *new_world_context(qa_scene_model_renderer *r) {
-  mat_state *state = state_of(r);
-  if (state->context_count == state->context_capacity) {
-    size_t capacity = state->context_capacity ? state->context_capacity * 2 : 16;
-    qa_world_material_context **grown = realloc(state->contexts, capacity * sizeof *grown);
-    if (grown == NULL) qa_range_error("Out of memory");
-    state->contexts = grown;
-    state->context_capacity = capacity;
-  }
-  qa_world_material_context *context = calloc(1, sizeof *context);
-  if (context == NULL) qa_range_error("Out of memory");
-  state->contexts[state->context_count++] = context;
-  return context;
+/* Storage a drawn group's batches view (TS keeps it alive through the batch). */
+static void group_own(qa_scene_model_group *group, void *storage) {
+  if (storage == NULL) return;
+  void **grown = realloc(group->owned_storage,
+                         (group->owned_storage_count + 1) * sizeof *grown);
+  if (grown == NULL) qa_range_error("Out of memory");
+  group->owned_storage = grown;
+  grown[group->owned_storage_count++] = storage;
 }
 
 qa_scene_texture_loader *qa_model_render_provider_textures(const qa_model_render_provider *provider) {
@@ -282,8 +258,6 @@ void qa_scene_model_renderer_destroy(qa_scene_model_renderer *renderer) {
     free(state->retained);
     for (size_t i = 0; i < state->scratch_count; i++) free(state->scratches[i]);
     free(state->scratches);
-    for (size_t i = 0; i < state->context_count; i++) free(state->contexts[i]);
-    free(state->contexts);
     free(state);
   }
   qa_model_light_sampler_destroy(&renderer->lighting);
@@ -357,6 +331,7 @@ static selection_list selections_of(const qa_resolved_resource_reference *resour
   noskin.reason = "no-skin";
   sel_push(&list, noskin);
   if (options->custom_shader != NULL) sel_external(&list, options->custom_shader);
+  /* options.customSkin ?? []: an empty array adds nothing either way */
   if (options->custom_skin != NULL)
     for (size_t i = 0; i < options->custom_skin_count; i++)
       sel_external(&list, options->custom_skin[i].shader);
@@ -740,8 +715,9 @@ struct prepare_call {
   bool q2_lighting;
   illum **states;
   size_t state_count, state_capacity;
-  /* light cache records (entity snapshot -> light) */
-  struct { qa_scene_entity entity; qa_vec3 light; } *lights;
+  /* TS lightCache: Map<SceneEntity, Vec3> by object identity. The identity here is the entity's prepared
+   * lighting state, which every surface of that entity carries (lighting_identity). */
+  struct { const void *identity; qa_vec3 light; } *lights;
   size_t light_count, light_capacity;
   /* options cache by entity pointer */
   struct { const qa_scene_entity *entity; qa_model_source_options options; } *option_cache;
@@ -751,33 +727,26 @@ struct prepare_call {
   projector projector;
 };
 
-static void record_light(prepare_call *call, const qa_scene_entity *entity,
+static void record_light(prepare_call *call, const void *identity,
                          qa_vec3 light) {
+  for (size_t i = 0; i < call->light_count; i++)
+    if (call->lights[i].identity == identity) { call->lights[i].light = light; return; }
   if (call->light_count == call->light_capacity) {
     call->light_capacity = call->light_capacity ? call->light_capacity * 2 : 16;
     call->lights = realloc(call->lights, call->light_capacity * sizeof *call->lights);
     if (call->lights == NULL) return;
   }
-  call->lights[call->light_count].entity = *entity;
+  call->lights[call->light_count].identity = identity;
   call->lights[call->light_count].light = light;
   call->light_count++;
 }
-static bool find_light(prepare_call *call, const qa_scene_entity *entity,
-                       qa_vec3 *out) {
-  for (size_t i = 0; i < call->light_count; i++) {
-    const qa_scene_entity *candidate = &call->lights[i].entity;
-    if (candidate->resource.id == entity->resource.id &&
-        candidate->transform.origin.x == entity->transform.origin.x &&
-        candidate->transform.origin.y == entity->transform.origin.y &&
-        candidate->transform.origin.z == entity->transform.origin.z &&
-        candidate->skin == entity->skin &&
-        candidate->previous_origin.x == entity->previous_origin.x &&
-        candidate->previous_origin.y == entity->previous_origin.y &&
-        candidate->previous_origin.z == entity->previous_origin.z) {
+static bool find_light(prepare_call *call, const void *identity, qa_vec3 *out) {
+  if (identity == NULL) return false;
+  for (size_t i = 0; i < call->light_count; i++)
+    if (call->lights[i].identity == identity) {
       *out = call->lights[i].light;
       return true;
     }
-  }
   return false;
 }
 
@@ -913,7 +882,7 @@ static qa_vec3 illuminate(void *ctx, qa_vec3 normal, qa_vec3 position, double co
       st->light = (qa_vec3){channels[0], channels[1], channels[2]};
     }
     st->has_light = true;
-    record_light(call, entity, st->light);
+    record_light(call, st, st->light);
   }
   if (flags_is(entity, "q2")) {
     qa_vec3 shell;
@@ -1129,29 +1098,17 @@ static void world_arrays(qa_material_geometry geometry, qa_vec3 **out_positions,
 static qa_vec4 divide_color(qa_vec4 color, double scale) {
   return (qa_vec4){color.x / scale, color.y / scale, color.z / scale, color.w};
 }
-/* Returns divided copy storage in *owned (single or pair vertices). */
+/* TS shadeDivided maps a new array; the batch owns its vertex storage here, so
+ * the same values are written in place. */
 static void shade_divide_batch(qa_draw_batch *batch, double scale) {
   if (!batch->texturing_is_pair) {
-    qa_render_vertex *copy = calloc(batch->vertex_count ? batch->vertex_count : 1,
-                                    sizeof *copy);
-    if (copy == NULL) return;
-    for (size_t i = 0; i < batch->vertex_count; i++) {
-      copy[i] = batch->vertices[i];
-      copy[i].color = divide_color(copy[i].color, scale);
-    }
-    /* Retained: batch vertex storage is owned by the batch array in
-     * the evaluate port; the replaced array is intentionally leaked
-     * with the original (destroy frees the current pointer). */
-    batch->vertices = copy;
+    qa_render_vertex *vertices = (qa_render_vertex *)batch->vertices;
+    for (size_t i = 0; i < batch->vertex_count; i++)
+      vertices[i].color = divide_color(vertices[i].color, scale);
   } else {
-    qa_multitexture_vertex *copy =
-        calloc(batch->pair_vertex_count ? batch->pair_vertex_count : 1, sizeof *copy);
-    if (copy == NULL) return;
-    for (size_t i = 0; i < batch->pair_vertex_count; i++) {
-      copy[i] = batch->pair_vertices[i];
-      copy[i].vertex.color = divide_color(copy[i].vertex.color, scale);
-    }
-    batch->pair_vertices = copy;
+    qa_multitexture_vertex *vertices = (qa_multitexture_vertex *)batch->pair_vertices;
+    for (size_t i = 0; i < batch->pair_vertex_count; i++)
+      vertices[i].vertex.color = divide_color(vertices[i].vertex.color, scale);
   }
 }
 
@@ -1160,6 +1117,7 @@ typedef struct cone_lighting_ctx {
   const qa_q2_fragment_light *cone_lights;
   size_t cone_count;
   const qa_q2_shadow_atlas *atlas;
+  qa_scene_model_group *group; /* owns the arrays the lighting views */
 } cone_lighting_ctx;
 static qa_batch_lighting cone_model_lighting(void *ctx, qa_material_geometry geometry) {
   cone_lighting_ctx *cone = ctx;
@@ -1182,6 +1140,9 @@ static qa_batch_lighting cone_model_lighting(void *ctx, qa_material_geometry geo
       positions[i] = qa_model_world_point(cone->transform, geometry.vertices[i].position);
       normals[i] = qa_normalize3(qa_model_world_direction(cone->transform, geometry.vertices[i].normal));
     }
+  group_own(cone->group, lights);
+  group_own(cone->group, positions);
+  group_own(cone->group, normals);
   lighting.lights = lights;
   lighting.light_count = cone->cone_count;
   lighting.world_positions = positions;
@@ -1208,13 +1169,127 @@ static const qa_mat_compiled_material *remapped(qa_registered_scene_material ori
   return qa_registered_scene_material_compiled(original);
 }
 
-static qa_scene_model_group *draw_surface(void *ctx,
-                                          const qa_prepared_model_surface *surface,
-                                          size_t *out_count);
+/* Forward: entityCastsShadow mirror (shadow-geometry.ts), defined below. */
+static bool entity_casts_shadow(const qa_scene_entity *entity, bool view_model);
 
+static void fill_shadow_order(qa_scene_model_group *group,
+                              const qa_model_source_options *options,
+                              const qa_prepared_model_surface *surface) {
+  if (!options->has_source) {
+    group->kind = "compiled";
+    return;
+  }
+  /* { ...options.source, surface: surface.surfaceIndex, fog: 0, dlight: 0 } */
+  group->kind = "source";
+  group->source_view = options->source_view;
+  group->source_entity = options->source_entity;
+  group->surface = surface->surface_index;
+  group->fog = 0;
+  group->dlight = 0;
+}
+static void release_stencil_volume(void *value) {
+  qa_stencil_shadow_volume_destroy(value);
+}
+
+/* TS modelShadowGroups: R_AddMD3Surfaces resubmits each opaque, unfogged
+ * surface with the stencil shadow shader (r_shadows 2) or, for
+ * RF_SHADOW_PLANE entities, the projection shadow shader (r_shadows 3).
+ * Returns false for TS []; on true *out is the one group. */
+static bool model_shadow_group(qa_scene_model_renderer *r,
+                               const qa_prepared_model_surface *surface,
+                               const qa_world_view_input *input,
+                               const qa_model_source_options *options,
+                               const qa_mat_compiled_material *compiled,
+                               const qa_material_draw_context *context,
+                               const projector *project, bool unfogged,
+                               bool personal_model, qa_scene_model_group *out) {
+  double mode = input->model_shadows; /* 0 is TS undefined */
+  const qa_entity_lighting *lighting = context->lighting;
+  const qa_scene_entity *entity = &surface->entity;
+  if (mode == 0 || !unfogged || compiled->finished.sort != 3 || lighting == NULL ||
+      r->provider.family != QA_GAME_FAMILY_Q3)
+    return false;
+  if (mode == 2) {
+    if (personal_model ||
+        !entity_casts_shadow(entity, options->has_view_model && options->view_model))
+      return false;
+    size_t count = surface->local_geometry.vertex_count;
+    qa_vec3 *local = malloc((count ? count : 1) * sizeof *local);
+    if (local == NULL) qa_range_error("Out of memory");
+    for (size_t i = 0; i < count; i++)
+      local[i] = surface->local_geometry.vertices[i].position;
+    qa_stencil_shadow_volume volume = {0};
+    bool made = qa_make_stencil_shadow_volume(
+        local, count, surface->local_geometry.indices,
+        surface->local_geometry.index_count, lighting->light_dir, &volume);
+    free(local);
+    if (!made) return false;
+    if (volume.index_count == 0) {
+      qa_stencil_shadow_volume_destroy(&volume);
+      return false;
+    }
+    /* The sourceMaterials getter throws before initialization. */
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, release_stencil_volume, &volume);
+    qa_registered_scene_material stencil =
+        qa_scene_shader_registry_source_materials(r->provider.shaders).stencil_shadow;
+    qa_cleanup_pop(&guard);
+    qa_vec4 *projected =
+        malloc((volume.position_count ? volume.position_count : 1) * sizeof *projected);
+    if (projected == NULL) qa_range_error("Out of memory");
+    for (size_t i = 0; i < volume.position_count; i++)
+      projected[i] = apply_projector(
+          project, qa_model_world_point(surface->transform, volume.positions[i]));
+    free(volume.positions);
+    out->is_shadow_volume = true;
+    out->shadow_positions = projected;
+    out->shadow_position_count = volume.position_count;
+    out->shadow_indices = volume.indices;
+    out->shadow_index_count = volume.index_count;
+    out->shadow_mirror = input->camera.clip_is_portal && input->camera.clip_mirror;
+    out->shadow_white_image = provider_textures(r)->white->image;
+    out->source_material = stencil;
+    out->material = qa_registered_scene_material_compiled(stencil);
+    fill_shadow_order(out, options, surface);
+    return true;
+  }
+  if (!flags_is(entity, "q3") || !bit(entity->flags_bits, RF_SHADOW_PLANE))
+    return false;
+  qa_registered_scene_material material =
+      qa_scene_shader_registry_source_materials(r->provider.shaders).projection_shadow;
+  double remap_offset = 0;
+  const qa_mat_compiled_material *projection = remapped(material, &remap_offset);
+  qa_axis axis = surface->transform.axis;
+  qa_vec3 scaled = surface->transform.scale;
+  qa_projection_shadow_context shadow = {
+      {{qa_scale3(axis.vectors[0], scaled.x), qa_scale3(axis.vectors[1], scaled.y),
+        qa_scale3(axis.vectors[2], scaled.z)}},
+      surface->transform.origin, entity->shadow_plane, lighting->light_dir};
+  qa_material_draw_context shadow_context = *context;
+  shadow_context.time_offset = context->time_offset + remap_offset;
+  shadow_context.projection_shadow = &shadow;
+  size_t batch_count = 0;
+  qa_draw_batch *batches = qa_prepare_material_batches(
+      projection, surface->local_geometry, &shadow_context, &batch_count);
+  out->batches = batches;
+  out->batch_count = batch_count;
+  out->material = projection;
+  out->source_material = material;
+  fill_shadow_order(out, options, surface);
+  return true;
+}
+
+static void release_drawn_groups(void *value) {
+  qa_scene_model_group *groups = value;
+  qa_scene_model_group_destroy(&groups[0]);
+  qa_scene_model_group_destroy(&groups[1]);
+  free(groups);
+}
+
+/* TS draw(surface, input, options, coneLights, shade, personalModel). */
 static qa_scene_model_group *draw_surface(void *ctx,
                                           const qa_prepared_model_surface *surface,
-                                          size_t *out_count) {
+                                          bool personal_model, size_t *out_count) {
   draw_call *dc = ctx;
   prepare_call *call = dc->call;
   qa_scene_model_renderer *r = call->renderer;
@@ -1236,8 +1311,11 @@ static qa_scene_model_group *draw_surface(void *ctx,
       !(options.has_view_model && options.view_model) &&
       ((qa_int32(flags) & (QA_Q2_SHELL_MASK | 8 | 4 | 16)) == 0) &&
       !((options.has_infrared && options.infrared) && bit(flags, 32768));
-  qa_scene_model_group *group = calloc(1, sizeof *group);
+  /* [0] the colour group, [1] its shadow group (q3 materials only). */
+  qa_scene_model_group *group = calloc(2, sizeof *group);
   if (group == NULL) return NULL;
+  qa_cleanup drawn_guard;
+  qa_cleanup_push(&drawn_guard, release_drawn_groups, group);
   if (material->is_q3) {
     double remap_offset = 0;
     const qa_mat_compiled_material *compiled = remapped(material->original, &remap_offset);
@@ -1247,14 +1325,18 @@ static qa_scene_model_group *draw_surface(void *ctx,
                             qa_scale3(axis.vectors[2], surface->transform.scale.z)}};
     const qa_fog_selection *fog = fog_for(r, surface);
     qa_scene_model_transform world_transform = {surface->transform.origin, scaled_axis, false, 0};
-    qa_world_material_context *base = new_world_context(r);
+    /* The batches point into the material context (polygon offset): the
+     * group that keeps them owns it. */
+    qa_world_material_context *base = calloc(1, sizeof *base);
+    if (base == NULL) qa_range_error("Out of memory");
+    group_own(group, base);
     qa_world_scene_material_context(r->world, input, &world_transform,
                                     fog != NULL ? &fog->volume : NULL, base);
     qa_material_draw_context context = base->context;
     cone_lighting_ctx cone = {surface->transform, call->cone_lights,
-                              call->cone_count, input->fragment_atlas};
+                              call->cone_count, input->fragment_atlas, group};
     if (receives_cone) {
-      /* Called only inside the batch prepare below. */
+      /* Called only inside the batch prepares below. */
       context.model_lighting = cone_model_lighting;
       context.model_lighting_ctx = &cone;
     }
@@ -1277,7 +1359,7 @@ static qa_scene_model_group *draw_surface(void *ctx,
     } else {
       context.deform_view.non_normalized_axis = NULL;
     }
-    /* Batches keep no projector: it runs only inside the prepare below. */
+    /* Batches keep no projector: it runs only inside the prepares below. */
     projector_ctx pc = {&call->projector, false, &surface->transform};
     context.project = (qa_mat_project_fn){&pc, project_fn};
     size_t batch_count = 0;
@@ -1285,6 +1367,38 @@ static qa_scene_model_group *draw_surface(void *ctx,
         compiled, surface->local_geometry, &context, &batch_count);
     group->batches = batches;
     group->batch_count = batch_count;
+    /* R_AddMD3Surfaces and R_AddAnimSurfaces submit no frontend dlight bits. */
+    cone.group = &group[1];
+    bool has_shadow_group = model_shadow_group(
+        r, surface, input, &options, compiled, &context, &call->projector,
+        fog == NULL, personal_model, &group[1]);
+    qa_cleanup_pop(&drawn_guard);
+    if (personal_model) {
+      /* if (personalModel) return shadowGroups: the colour batches are dropped;
+       * the shadow group takes the material context its batches point into. */
+      qa_mat_draw_batches_destroy(group->batches, group->batch_count);
+      if (!has_shadow_group) {
+        group->batches = NULL;
+        group->batch_count = 0;
+        release_drawn_groups(group);
+        return NULL;
+      }
+      void **storage = group->owned_storage;
+      size_t storage_count = group->owned_storage_count;
+      for (size_t i = 0; i < group[1].owned_storage_count; i++) {
+        void **grown = realloc(storage, (storage_count + 1) * sizeof *grown);
+        if (grown == NULL) qa_range_error("Out of memory");
+        storage = grown;
+        storage[storage_count++] = group[1].owned_storage[i];
+      }
+      free(group[1].owned_storage);
+      group[0] = group[1];
+      group[0].owned_storage = storage;
+      group[0].owned_storage_count = storage_count;
+      memset(&group[1], 0, sizeof group[1]);
+      *out_count = 1;
+      return group;
+    }
     if (!options.has_source) {
       group->kind = "compiled";
       group->material = compiled;
@@ -1297,7 +1411,7 @@ static qa_scene_model_group *draw_surface(void *ctx,
       group->fog = fog == NULL ? 0 : fog->index + 1;
       group->dlight = 0;
     }
-    *out_count = 1;
+    *out_count = has_shadow_group ? 2 : 1;
     return group;
   }
   /* Legacy path. */
@@ -1347,7 +1461,7 @@ static qa_scene_model_group *draw_surface(void *ctx,
                                                  &legacy_context, &batch_count);
   }
   qa_vec3 shade;
-  bool has_shade = find_light(call, &surface->entity, &shade);
+  bool has_shade = find_light(call, surface->lighting_identity, &shade);
   bool receives = r->provider.family == QA_GAME_FAMILY_Q2 && has_shade &&
                   has_shadows && input->fragment_atlas != NULL &&
                   !surface->unlit &&
@@ -1394,6 +1508,7 @@ static qa_scene_model_group *draw_surface(void *ctx,
       qa_vec3 *positions = NULL, *normals = NULL;
       world_arrays(surface->geometry, &positions, &normals);
       free(normals);
+      group_own(group, positions);
       batch->lighting.kind = "q2-model-shadow";
       batch->lighting.world_positions = positions;
       batch->lighting.world_position_count = surface->geometry.vertex_count;
@@ -1410,6 +1525,9 @@ static qa_scene_model_group *draw_surface(void *ctx,
       qa_q2_fragment_light *lights =
           calloc(input->fragment_light_count ? input->fragment_light_count : 1,
                  sizeof *lights);
+      group_own(group, positions);
+      group_own(group, normals);
+      group_own(group, lights);
       if (lights != NULL)
         for (size_t li = 0; li < input->fragment_light_count; li++) {
           lights[li] = input->fragment_lights[li];
@@ -1441,6 +1559,7 @@ static qa_scene_model_group *draw_surface(void *ctx,
     }
   }
   if (affecting_count == 0) free(affecting);
+  else group_own(group, affecting);
   /* Planar shadow (Q1). */
   if ((options.has_planar_shadow && options.planar_shadow) &&
       !(options.has_view_model && options.view_model) &&
@@ -1503,6 +1622,7 @@ static qa_scene_model_group *draw_surface(void *ctx,
       }
     }
   }
+  qa_cleanup_pop(&drawn_guard);
   group->kind = "sequence";
   group->sequence = alpha < 1 ? "translucent" : "opaque";
   group->batches = batches;
@@ -1571,7 +1691,7 @@ qa_scene_model_group *qa_scene_model_renderer_prepare(
     call.lighting_input = &call.lighting_input_storage;
   }
   qa_plane frustum[5];
-  size_t frustum_count = camera_frustum(input->camera, frustum);
+  size_t frustum_count = qa_scene_camera_frustum(input->camera, frustum);
   qa_model_preparation_context context = {0};
   context.skinning_frame = skinning_frame;
   context.camera = input->camera;

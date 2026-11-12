@@ -10,6 +10,7 @@
 #include "qa/core/commands/text.h"
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
+#include "qa/network/common/diagnostics.h"
 #include "qa/network/q3/configstrings.h"
 #include "qa/network/q3/connectionless.h"
 #include "qa/network/q3/discovery.h"
@@ -103,7 +104,9 @@ struct qa_app_q3_server_network {
   int server_flags;
   int64_t checksum_feed;
   bool changed_world;
-  const void **pending; size_t pending_count, pending_cap;
+  /* TS pending: ActorCommand[]. Each accepted command is copied in, so the host's input()
+   * result is borrowed only for the call (it kept every command until destroy). */
+  qa_actor_command *pending; size_t pending_count, pending_cap;
   peer **overflowed; size_t overflow_count, overflow_cap;
   peer **peers; size_t peer_count, peer_cap;
   qa_q3_snapshot_entities *entities;
@@ -113,7 +116,8 @@ struct qa_app_q3_server_network {
   qa_master_heartbeat_service heartbeat_service;
   qa_q3_discovery_wire_state discovery_wire; /* TS q3DiscoveryWire() closure state */
   qa_q3_admission_slot *slot_cache; size_t slot_cache_cap;
-  const void **poll_result; size_t poll_cap;
+  /* poll()'s result: copies of the drained queue, valid until the next poll. */
+  const void **poll_result; qa_actor_command *poll_values; size_t poll_cap;
   /* Disconnected peers stay allocated until the operation ends: connection
    * frames still on the stack read them after a drop (TS keeps them by GC). */
   peer **retired; size_t retired_count, retired_cap;
@@ -143,12 +147,6 @@ static bool diagnostic_allow(qa_app_q3_server_network *n) {
 }
 /* TS printablePeerText(text, 256): control characters other than tab and
  * newline become '?', then the text is bounded (UTF-16 units = bytes here). */
-static void printable_peer_text(const char *text, char *out, size_t capacity) {
-  size_t used = 0;
-  for (const unsigned char *s = (const unsigned char *)text; *s && used < 256 && used + 1 < capacity; s++)
-    out[used++] = ((*s <= 0x08) || (*s >= 0x0b && *s <= 0x1f) || *s == 0x7f) ? '?' : (char)*s;
-  out[used] = '\0';
-}
 
 static void require_supported(qa_app_q3_server_host *host) {
   const void *support = host->supports_source_wire ? host->supports_source_wire(host->ctx) : NULL;
@@ -325,13 +323,18 @@ static void snapshot_peer(qa_app_q3_server_network *n, peer *p) {
 }
 static bool disconnect_client(qa_app_q3_server_network *n, qa_client_id client, const char *reason);
 static void queue_disconnect(qa_app_q3_server_network *n, peer *p, const char *reason) {
-  char text[1200];
-  size_t used = (size_t)snprintf(text, sizeof text, "disconnect \"");
-  for (const char *s = reason; *s && used < sizeof text - 3; s++)
+  /* `disconnect "${reason.replace(/["\n\r]/g, "")}"`: no length bound. */
+  char *text = xmalloc(strlen(reason) + 16);
+  size_t used = (size_t)sprintf(text, "disconnect \"");
+  for (const char *s = reason; *s; s++)
     if (*s != '"' && *s != '\n' && *s != '\r') text[used++] = *s;
   text[used++] = '"';
   text[used] = '\0';
+  qa_cleanup text_guard;
+  qa_cleanup_push(&text_guard, free, text);
   qa_q3_server_reliable_commands_add(qa_q3_server_connection_reliable(p->connection), text);
+  qa_cleanup_pop(&text_guard);
+  free(text);
   qa_q3_channel_delivery_storage storage = {0};
   const qa_q3_channel_delivery *delivery = delivery_for(n, p, &storage);
   qa_q3_netchannel *channel = qa_q3_server_connection_channel(p->connection);
@@ -403,7 +406,7 @@ static void queue_disconnect_body(void *ctx) {
 }
 static bool disconnect_client(qa_app_q3_server_network *n, qa_client_id client, const char *reason) {
   peer *p = NULL;
-  for (size_t i = 0; i < n->peer_count; i++)
+  for (size_t i = 0; i < n->peer_count && !p; i++) /* TS find(): the first match */
     if (client_equal(n->peers[i]->player.client, client)) p = n->peers[i];
   if (!p) return false;
   qa_app_q3_server_host host = n->host;
@@ -416,8 +419,7 @@ static bool disconnect_client(qa_app_q3_server_network *n, qa_client_id client, 
   qa_q3_server_admission_disconnect(n->admission, &p->remote_q3);
   size_t kept = 0;
   for (size_t i = 0; i < n->pending_count; i++) {
-    const qa_actor_command *command = n->pending[i];
-    if (!qa_same_actor(command->actor, p->player.actor)) n->pending[kept++] = n->pending[i];
+    if (!qa_same_actor(n->pending[i].actor, p->player.actor)) n->pending[kept++] = n->pending[i];
   }
   n->pending_count = kept;
   /* try { download.close(); queueDisconnect() } finally { q3GameCallback(host.disconnect) };
@@ -450,11 +452,12 @@ static void input_peer(qa_app_q3_server_network *n, peer *p, const qa_q3_wire_us
       && qa_q3_server_connection_get_phase(p->connection) != QA_Q3_SERVER_PHASE_ZOMBIE
       && accepted) {
     if (n->pending_count == n->pending_cap) {
-      n->pending_cap = n->pending_cap ? n->pending_cap * 2 : 32;
-      n->pending = realloc(n->pending, n->pending_cap * sizeof *n->pending);
-      if (!n->pending) qa_range_error("out of memory");
+      size_t cap = n->pending_cap ? n->pending_cap * 2 : 32;
+      qa_actor_command *grown = realloc(n->pending, cap * sizeof *n->pending);
+      if (!grown) qa_range_error("out of memory");
+      n->pending = grown; n->pending_cap = cap;
     }
-    n->pending[n->pending_count++] = accepted;
+    n->pending[n->pending_count++] = *(const qa_actor_command *)accepted;
   }
 }
 typedef struct binding_ctx { qa_app_q3_server_network *n; peer *p; } binding_ctx;
@@ -576,7 +579,8 @@ static bool binding_command(void *ctx, const qa_q3_reliable_command *command, bo
   }
   if (strcmp(name, "userinfo") == 0) {
     /* TS q3PeerUserinfo((argv[1] ?? "").slice(0, 1023), peer.remote, print): the server stamps "ip".
-       slice counts UTF-16 units; this truncates bytes, which agrees for ASCII userinfo. */
+       slice counts UTF-16 units; Q3 wire text decodes one character per byte (message.ts
+       readString, String.fromCharCode(byte)), so cutting bytes is the same cut. */
     char *requested = copy_text(tokens.argc > 1 ? tokens.argv[1] : "");
     if (strlen(requested) > 1023) requested[1023] = '\0';
     qa_command_tokens_destroy(&tokens);
@@ -604,7 +608,8 @@ static bool binding_command(void *ctx, const qa_q3_reliable_command *command, bo
 }
 static void baseline_of(void *ctx, int64_t number, qa_q3_entity_state_record *out) {
   peer *p = ctx;
-  for (size_t i = 0; i < p->baseline_count; i++)
+  /* TS new Map(entries): a repeated number keeps the last entity. */
+  for (size_t i = p->baseline_count; i-- > 0;)
     if (p->baselines[i].number == number) {
       *out = p->baselines[i].entity;
       return;
@@ -907,6 +912,7 @@ void qa_app_q3_server_network_destroy(qa_app_q3_server_network *network) {
   free(network->overflowed);
   free(network->slot_cache);
   free(network->poll_result);
+  free(network->poll_values);
   free(network);
 }
 void qa_app_q3_server_network_heartbeat(qa_app_q3_server_network *n, double now) {
@@ -1089,9 +1095,13 @@ static void poll_body(void *ctx) {
       if (!qa_try(packet_body, &packet, &caught)) {
         if (n->ended) stop = true;
         else {
-          char text[260];
-          printable_peer_text(caught.message, text, sizeof text);
-          if (diagnostic_allow(n)) n->host.print(n->host.ctx, text);
+          /* printablePeerText: its 256 limit counts UTF-16 units. */
+          if (diagnostic_allow(n)) {
+            char *text = qa_printable_peer_text(caught.message, 256);
+            if (!text) qa_range_error("out of memory");
+            n->host.print(n->host.ctx, text);
+            free(text);
+          }
           /* A game fault raised by one peer's packet costs that peer its connection. If the game
            * itself is broken, the disconnect callback fails too and the application's frame
            * boundary takes over. */
@@ -1106,11 +1116,18 @@ static void poll_body(void *ctx) {
   }
   if (n->ended) { n->pending_count = 0; return; }
   if (n->poll_cap < n->pending_count) {
-    n->poll_result = realloc(n->poll_result, n->pending_count * sizeof *n->poll_result);
-    if (!n->poll_result) qa_range_error("out of memory");
+    const void **result = realloc(n->poll_result, n->pending_count * sizeof *n->poll_result);
+    if (!result) qa_range_error("out of memory");
+    n->poll_result = result;
+    qa_actor_command *values = realloc(n->poll_values, n->pending_count * sizeof *n->poll_values);
+    if (!values) qa_range_error("out of memory");
+    n->poll_values = values;
     n->poll_cap = n->pending_count;
   }
-  for (size_t i = 0; i < n->pending_count; i++) n->poll_result[i] = n->pending[i];
+  for (size_t i = 0; i < n->pending_count; i++) {
+    n->poll_values[i] = n->pending[i];
+    n->poll_result[i] = &n->poll_values[i];
+  }
   scope->count = n->pending_count;
   scope->returned = true;
   n->pending_count = 0;
@@ -1133,22 +1150,30 @@ static void receive_events(qa_app_q3_server_network *n, const void *const *event
     const qa_app_sim_presentation_event *item = events[i];
     if (!item->kind || strcmp(item->kind, "q3-source") != 0) continue;
     const qa_app_q3_source_event *event = item->q3_source;
-    for (size_t j = 0; j < n->peer_count;) {
-      if (n->ended) return;
-      peer *p = n->peers[j];
-      if (item->has_recipient && !qa_same_actor(item->recipient, p->player.actor)) { j++; continue; }
-      if (event->kind == QA_APP_Q3_EVENT_DROP_CLIENT && event->client == p->player.source_entity) {
+    /* TS iterates [...this.peers.values()] and skips a peer no longer in the table (a game
+     * disconnect callback may drop others). Retired peers stay allocated during an operation. */
+    size_t snapshot_count = n->peer_count;
+    peer **snapshot = xmalloc(snapshot_count * sizeof *snapshot);
+    if (snapshot_count) memcpy(snapshot, n->peers, snapshot_count * sizeof *snapshot);
+    qa_cleanup snapshot_guard;
+    qa_cleanup_push(&snapshot_guard, free, snapshot);
+    for (size_t j = 0; j < snapshot_count; j++) {
+      if (n->ended) break;
+      peer *p = snapshot[j];
+      if (peer_at(n, p->slot) != p) continue;
+      if (item->has_recipient && !qa_same_actor(item->recipient, p->player.actor)) continue;
+      if (event->kind == QA_APP_Q3_EVENT_DROP_CLIENT && event->client == p->player.source_entity)
         disconnect_client(n, p->player.client, event->reason ? event->reason : "");
-        continue;
-      }
-      if (event->kind == QA_APP_Q3_EVENT_SERVER_COMMAND
+      else if (event->kind == QA_APP_Q3_EVENT_SERVER_COMMAND
           && (event->client == -1 || event->client == p->player.source_entity))
         queue_reliable(n, p, event->text ? event->text : "");
       else if (event->kind == QA_APP_Q3_EVENT_CONFIGSTRING
           && qa_q3_server_connection_get_phase(p->connection) != QA_Q3_SERVER_PHASE_CONNECTED)
         configstring_peer(n, p, event->index, event->value ? event->value : "");
-      j++;
     }
+    qa_cleanup_pop(&snapshot_guard);
+    free(snapshot);
+    if (n->ended) return;
   }
 }
 typedef struct publish_scope { qa_app_q3_server_network *n; const void *const *events; size_t count; double now; } publish_scope;

@@ -113,8 +113,11 @@ const qa_held_weapon_declaration *qa_app_foreign_held_weapons_declaration(qa_app
   qa_cleanup_push(&guard, free, key);
   qa_content_mounted *mounts = weapons->assets.mounts(weapons->assets.ctx, source->content);
   char *path = text_join(source->path, ".held.json", "");
+  qa_cleanup path_guard;
+  qa_cleanup_push(&path_guard, free, path);
   qa_content_opened_resource file;
   bool opened = qa_content_mounted_open(mounts, path, NULL, NULL, &file);
+  qa_cleanup_pop(&path_guard);
   free(path);
   declaration_row *row = xcalloc(1, sizeof *row);
   if (opened) {

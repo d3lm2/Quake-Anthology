@@ -9,6 +9,8 @@
 #define QA_GUEST_RUNTIME_COMMON_FORMAT_SCAN_H
 
 #include <setjmp.h>
+
+#include "qa/foundation/support.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -16,7 +18,7 @@
 
 typedef struct qa_guest_scan_catch {
   jmp_buf buf;
-  char message[512];
+  char message[QA_CAUGHT_MESSAGE_CAPACITY]; /* the rethrown error carries no more than this */
 } qa_guest_scan_catch;
 
 typedef struct qa_scan_windows_buffer_options {

@@ -19,6 +19,10 @@ typedef struct qa_app_presentation_prediction_options {
   qa_q3_base_user_command (*relative_source_command)(void *ctx, qa_command_source source,
       qa_user_command_kind kind, qa_q3_base_user_command presented, qa_vec3 delta_angles);
   bool (*publish_event)(void *ctx, const char *animation_kind, double event);
+  /* TS `get profile()`: when set, the adapter reads the selected profile through it before every use (a Q1
+   * profile carries the player's current world gravity); NULL keeps movement.probe.profile. */
+  void *profile_ctx;
+  bool (*current_profile)(void *ctx, qa_movement_profile *out);
 } qa_app_presentation_prediction_options;
 
 qa_q3_base_user_command qa_app_presentation_source_command(qa_actor_command input, double milliseconds, double weapon);

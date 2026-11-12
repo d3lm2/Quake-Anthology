@@ -1,10 +1,8 @@
 /*
- * Shared shader types for the materials slice-a port. TS owners
- * src/materials/material.ts and src/materials/material-finish.ts are not
- * ported in this slice, so the types slice-a files consume are mirrored
- * here with collision-proof qa_mat_* names (contracts/render.h already
- * owns the semantic qa_waveform/qa_shader_stage forms). Reconcile when
- * material.ts/material-finish.ts land. GPL-2.0-or-later.
+ * Shared shader types of src/materials/material.ts and
+ * material-finish.ts, with collision-proof qa_mat_* names
+ * (contracts/render.h owns the semantic qa_waveform/qa_shader_stage
+ * forms). GPL-2.0-or-later.
  */
 #ifndef QA_MATERIALS_SHADER_TYPES_H
 #define QA_MATERIALS_SHADER_TYPES_H

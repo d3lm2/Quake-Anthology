@@ -135,12 +135,14 @@ static bool mission_enabled(pres *p, const char *name) {
 }
 static const char *config_string(void *ctx, double index) {
   pres *p = ctx;
-  if (index == trunc(index) && (index < 0 || index >= CONFIG_STRING_COUNT)) {
+  /* Number.isInteger: an infinity is not an integer, so it is the RangeError below. */
+  const bool is_integer = isfinite(index) && index == trunc(index);
+  if (is_integer && (index < 0 || index >= CONFIG_STRING_COUNT)) {
     char message[64];
     snprintf(message, sizeof message, "CG_ConfigString: bad index: %s", QA_JS_NUMBER(index));
     qa_common_error(QA_COMMON_ERROR_DROP, message);
   }
-  if (index != trunc(index) || (size_t)index >= p->string_count) qa_range_error("CG_ConfigString: bad index %s", QA_JS_NUMBER(index));
+  if (!is_integer || (size_t)index >= p->string_count) qa_range_error("CG_ConfigString: bad index %s", QA_JS_NUMBER(index));
   return p->strings[(size_t)index];
 }
 static void refresh_game_state(void *ctx) {
@@ -161,7 +163,7 @@ static void set_cvar(void *ctx, const char *name, const char *value) {
   if (qa_cvar_registry_set(p->common.session.cvars, name, value, true, &snapshot)) qa_cvar_read_free(&snapshot);
 }
 static qa_q3_pres_client_presentation_options *client_options(pres *p) {
-  if (p->scene_only) qa_range_error(PRIMARY_ONLY_ERROR);
+  if (p->scene_only) qa_raise("Error", 0, 0, "%s", PRIMARY_ONLY_ERROR); /* TS: new Error */
   return &p->primary;
 }
 static void send_client_command(void *ctx, const char *text) {
@@ -173,7 +175,7 @@ static void send_console_command(void *ctx, const char *text) {
   client_options(p)->common.session.append_console_command(p->common.session.ctx, text);
 }
 static qa_q3_pres_client_draw_status *draw_status(pres *p) {
-  if (!p->has_status) qa_range_error("Supplemental cgame cannot own primary status messages");
+  if (!p->has_status) qa_raise("Error", 0, 0, "Supplemental cgame cannot own primary status messages");
   return &p->status;
 }
 static void center_print(void *ctx, const char *text, double y, double width) {
@@ -358,7 +360,7 @@ static void update_screen(void *ctx) {
   pres *p = ctx;
   p->common.session.assert_current(p->common.session.ctx);
   if (p->common.session.server_message_sequence(p->common.session.ctx) != p->initial_message_sequence)
-    qa_range_error("Snapshot parsing must serialize behind cgame initialization");
+    qa_raise("Error", 0, 0, "Snapshot parsing must serialize behind cgame initialization");
   if (!p->scene_only) p->primary.update_loading_screen(p->common.ctx, draw_loading_information, p);
 }
 static void loading_string(pres *p, const char *text) {
@@ -434,12 +436,12 @@ static void clear_particles(void *ctx) {
 }
 static void sc_set_score_selection(void *ctx) {
   pres *p = ctx;
-  if (!p->has_menus) qa_range_error("Mission score selection called in baseq3");
+  if (!p->has_menus) qa_raise("Error", 0, 0, "Mission score selection called in baseq3");
   qa_q3_pres_mission_hud_set_score_selection(&p->menus);
 }
 static void sc_show_response_head(void *ctx) {
   pres *p = ctx;
-  if (!p->has_menus) qa_range_error("Mission response head called in baseq3");
+  if (!p->has_menus) qa_raise("Error", 0, 0, "Mission response head called in baseq3");
   qa_q3_pres_mission_hud_show_response_head(&p->menus);
 }
 /* ---- snapshots ---- */
@@ -462,7 +464,7 @@ static void lagometer_snapshot(void *ctx, const qa_q3_wire_snapshot *snapshot) {
   }
   double ping = 0;
   if (!p->common.session.snapshot_ping(p->common.session.ctx, (double)snapshot->message_number, &ping))
-    qa_range_error("Cgame snapshot has no engine-owned ping record");
+    qa_raise("Error", 0, 0, "Cgame snapshot has no engine-owned ping record");
   qa_q3_pres_lagometer_snapshot_sample sample = {ping, (double)snapshot->flags};
   qa_q3_pres_client_draw_status_add_lagometer_snapshot_info(draw_status(p), &sample);
 }
@@ -1215,8 +1217,9 @@ static bool register_media(pres *p) {
   p->static_state.flag_status = -1;
   refresh_game_state(p);
   if (strcmp(config_string(p, 20), "baseq3-1") != 0) {
-    char message[1200];
-    snprintf(message, sizeof message, "Client/Server game mismatch: baseq3-1/%.1024s", config_string(p, 20));
+    /* The whole configstring, up to what a caught error can carry. */
+    char message[QA_CAUGHT_MESSAGE_CAPACITY];
+    snprintf(message, sizeof message, "Client/Server game mismatch: baseq3-1/%s", config_string(p, 20));
     qa_common_error(QA_COMMON_ERROR_DROP, message);
   }
   p->static_state.level_start_time = qa_game_atoi(config_string(p, 21));
@@ -1593,11 +1596,20 @@ static bool create_hud_and_finish(pres *p) {
     qa_q3_pres_presentation_scene_host scene = {frame};
     qa_q3_pres_presentation_frame_runtime_init_scene(&p->frames, &p->state, scene);
   }
+  /* What TS reads through getters holds its first values before the first frame. */
+  refresh_live(p);
   p->common.session.assert_current(p->common.session.ctx);
   return true;
 }
+static void destroy_on_raise(void *raw) { qa_q3_pres_client_presentation_destroy(raw); }
 static pres *create_presentation(pres *p) {
-  if (!create_early(p) || !register_media(p) || !create_gameplay(p) || !create_hud_and_finish(p)) {
+  /* A throw during creation (a game mismatch drop, a failed registration)
+   * leaves the TS object to the collector. */
+  qa_cleanup node;
+  qa_cleanup_push(&node, destroy_on_raise, p);
+  bool created = create_early(p) && register_media(p) && create_gameplay(p) && create_hud_and_finish(p);
+  qa_cleanup_pop(&node);
+  if (!created) {
     qa_q3_pres_client_presentation_destroy(p);
     return NULL;
   }

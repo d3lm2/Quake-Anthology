@@ -35,8 +35,11 @@ typedef struct qa_app_sim_actor_host_world {
 typedef struct qa_app_sim_q1_actor_host_env { qa_q1_host bindings; qa_app_sim_actor_host_world world; } qa_app_sim_q1_actor_host_env;
 typedef struct qa_app_sim_q2_actor_host_env {
   qa_q2_foundation_host bindings; qa_app_sim_actor_host_world world;
-  qa_actor_id nearby_storage[256]; size_t nearby_count;
+  /* nearby()'s result (TS returns a fresh array): grows with the actor count, freed by
+   * qa_app_sim_q2_actor_host_env_release. */
+  qa_actor_id *nearby_storage; size_t nearby_count, nearby_capacity;
 } qa_app_sim_q2_actor_host_env;
+void qa_app_sim_q2_actor_host_env_release(qa_app_sim_q2_actor_host_env *env);
 qa_q1_host qa_app_sim_create_q1_actor_host(qa_app_sim_q1_actor_host_env *env, qa_q1_host bindings, qa_app_sim_actor_host_world world);
 qa_q2_foundation_host qa_app_sim_create_q2_actor_host(qa_app_sim_q2_actor_host_env *env, qa_q2_foundation_host bindings, qa_app_sim_actor_host_world world);
 #endif

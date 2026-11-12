@@ -25,7 +25,7 @@ static void owned_delete(A *a, qa_owned_actor actor) {
 }
 static void think_call(void *ctx, qa_owned_actor actor, qa_frame_context frame) {
   A *a = ctx;
-  if (!a->options.services->callbacks) qa_range_error("Scheduled mod actors require shared callbacks");
+  if (!a->options.services->callbacks) qa_raise("Error", 0, 0, "Scheduled mod actors require shared callbacks");
   qa_actor_callback_table_think(a->options.services->callbacks, actor, frame);
 }
 static bool sched_source_slot(void *ctx, qa_actor_id actor, int64_t *out) {
@@ -56,7 +56,7 @@ static qa_source_time slots_now(void *ctx) {
   return (qa_source_time){QA_SOURCE_TIME_SECONDS, now.kind == QA_SOURCE_TIME_SECONDS ? now.value : now.value / 1000};
 }
 static void slots_unlink(void *ctx, qa_owned_actor actor) { A *a = ctx; qa_shared_body_table_unlink(a->options.services->bodies, actor); }
-static void slots_exhausted(void *ctx, int64_t slot) { (void)ctx; (void)slot; qa_range_error("Gameplay mod source edicts exhausted"); }
+static void slots_exhausted(void *ctx, int64_t slot) { (void)ctx; (void)slot; qa_raise("Error", 0, 0, "Gameplay mod source edicts exhausted"); }
 static void remove_fn(void *ctx, qa_compat_qc_machine *m) {
   A *a = ctx;
   int64_t slot = qa_compat_qc_entity_memory_slot(m->entities, qa_compat_qc_machine_arg_int(m, 0));
@@ -124,7 +124,7 @@ static void cb_pain(void *ctx, qa_pain_reaction r) { CbCtx *c = ctx; c->a->optio
 static void cb_die(void *ctx, qa_death_reaction r) { CbCtx *c = ctx; c->a->options.die(c->a->options.ctx, r); }
 static void cb_think(void *ctx, qa_owned_actor actor, qa_frame_context frame) {
   CbCtx *c = ctx; A *a = c->a;
-  if (a->options.think < 0 || a->options.nextthink < 0) qa_range_error("Mod think needs explicit think/nextthink field mappings");
+  if (a->options.think < 0 || a->options.nextthink < 0) qa_raise("Error", 0, 0, "Mod think needs explicit think/nextthink field mappings");
   qa_compat_qc_words *fields = qa_compat_qc_entity_memory_at(a->options.machine->entities, c->slot);
   int32_t function_index = qa_compat_qc_words_int(fields, a->options.think);
   qa_compat_qc_words_set_float(fields, a->options.nextthink, 0);
@@ -141,8 +141,8 @@ void qa_compat_qc_mod_actors_admit(A *a, qa_owned_actor actor, int64_t slot) {
 }
 void qa_compat_qc_mod_actors_schedule(A *a, qa_owned_actor actor) {
   bool found; int64_t slot = owned_slot(a, actor, &found);
-  if (!found) qa_range_error("Mod scheduling requires its own source actor");
-  if (a->options.nextthink < 0) qa_range_error("Mod scheduling requires a nextthink binding");
+  if (!found) qa_raise("Error", 0, 0, "Mod scheduling requires its own source actor");
+  if (a->options.nextthink < 0) qa_raise("Error", 0, 0, "Mod scheduling requires a nextthink binding");
   double due = qa_compat_qc_words_float(qa_compat_qc_entity_memory_at(a->options.machine->entities, slot), a->options.nextthink);
   if (due <= 0) { qa_frame_scheduler_cancel(a->scheduler, actor); return; }
   qa_think_timing timing; memset(&timing, 0, sizeof timing);
@@ -170,7 +170,7 @@ void qa_compat_qc_mod_actors_restored(A *a) {
   size_t count = 0; const qa_owned_actor *owned = qa_session_actor_registry_owned_by(a->options.services->actors, a->options.provider, &count);
   for (size_t i = 0; i < count; i++) {
     qa_actor_source_result src = qa_session_actor_registry_source_of(a->options.services->actors, owned[i].id);
-    if (!src.has_value || strcmp(src.provider, a->options.provider) != 0) qa_range_error("Saved mod actor lost its source slot");
+    if (!src.has_value || strcmp(src.provider, a->options.provider) != 0) qa_raise("Error", 0, 0, "Saved mod actor lost its source slot");
     qa_shared_body_table_rebind(a->options.services->bodies, owned[i], a->options.body(a->options.ctx, src.slot));
     qa_compat_qc_mod_actors_admit(a, owned[i], src.slot);
     if (a->options.nextthink >= 0) qa_compat_qc_mod_actors_schedule(a, owned[i]);
@@ -189,5 +189,5 @@ void qa_compat_qc_mod_actors_close(A *a) {
     if (!qa_try(release_actor, &attempt, &caught)) errors++;
   }
   a->owned_count = 0;
-  if (errors) qa_range_error("Mod actor release failed");
+  if (errors) qa_raise("AggregateError", 0, 0, "Mod actor release failed");
 }

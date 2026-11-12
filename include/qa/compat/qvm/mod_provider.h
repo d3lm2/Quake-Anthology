@@ -154,6 +154,9 @@ struct qa_qvm_mod_provider {
   bool has_release_match;
   void *match_cells; /* opaque per-actor match player cells */
   size_t match_cell_count, match_cell_capacity;
+  qa_owned_actor *close_owned; /* close(): the snapshot of owned actors being released */
+  void *body_cells; /* opaque per-actor body binding cells (owned pointers) */
+  size_t body_cell_count, body_cell_capacity;
   int64_t release_subscription;
   bool has_release_subscription;
   size_t *hooks; /* module bindFunction removal ids */

@@ -6,7 +6,8 @@
 #include "qa/contracts/gameplay.h"
 #include "qa/foundation/support.h"
 
-/* TS RemovedNativeDamage message (Error subclass; C callers abort). */
+/* TS RemovedNativeDamage message (Error subclass): thrown with qa_compat_q2_native_throw, the token being the
+ * identity of its request (classic: the damage frame). */
 #define QA_COMPAT_Q2_REMOVED_NATIVE_DAMAGE_MESSAGE "Native damage target was removed during armor protection"
 typedef struct qa_compat_q2_native_damage_arguments_result { double damage_flags; qa_q2_native_cause native; } qa_compat_q2_native_damage_arguments_result;
 qa_armor_damage_flags qa_compat_q2_native_armor_flags(double flags);

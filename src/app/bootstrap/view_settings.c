@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/app/bootstrap/cvar_archives.h"
 #include "qa/app/bootstrap/shared_setting_cvars.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
@@ -22,7 +23,9 @@ struct qa_app_view_settings {
   void (*changed)(void *ctx, double value); void *ctx;
   bool has_selected; double selected;
   qa_cvar_registry *cvars; bool explicit; int64_t binding;
-  char *label;
+  /* The binding's label: TS reads a getter each time a control is built, so every binding handed out points here
+   * and the text is refreshed when a control asks for enabled() (settingControl reads both). */
+  char label[64];
 };
 qa_app_view_settings *qa_app_view_settings_create(void (*changed)(void *ctx, double value), void *ctx) {
   qa_app_view_settings *s = calloc(1, sizeof *s);
@@ -30,7 +33,7 @@ qa_app_view_settings *qa_app_view_settings_create(void (*changed)(void *ctx, dou
   s->changed = changed; s->ctx = ctx; s->binding = -1;
   return s;
 }
-void qa_app_view_settings_destroy(qa_app_view_settings *s) { if (s) { free(s->label); free(s); } }
+void qa_app_view_settings_destroy(qa_app_view_settings *s) { free(s); }
 double qa_app_view_settings_field_of_view(const qa_app_view_settings *s) {
   if (s->cvars == NULL) return s->has_selected ? s->selected : 90;
   char *text = qa_cvar_registry_variable_string(s->cvars, "fov");
@@ -55,7 +58,7 @@ static void fov_changed(void *ctx, const char *value) {
 }
 static bool dialect_q1(qa_command_dialect d) { return d == QA_COMMAND_DIALECT_Q1_NETQUAKE || d == QA_COMMAND_DIALECT_Q1_QUAKEWORLD; }
 void qa_app_view_settings_bind_cvars(qa_app_view_settings *s, qa_cvar_registry *cvars) {
-  if (s->cvars != NULL) qa_range_error("View settings already have a cvar owner");
+  if (s->cvars != NULL) qa_raise("Error", 0, 0, "View settings already have a cvar owner");
   qa_cvar_read existing; memset(&existing, 0, sizeof existing);
   bool found = qa_cvar_registry_find(cvars, "fov", &existing);
   bool stored = found && strcmp(existing.value, "90") != 0 && qa_app_validate_field_of_view(existing.value) == NULL;
@@ -102,15 +105,17 @@ void qa_app_view_settings_set_field_of_view(qa_app_view_settings *s, double valu
     free(num);
   }
 }
-static bool binding_enabled(void *ctx) { (void)ctx; return true; }
+static void refresh_label(qa_app_view_settings *s) {
+  char *num = qa_input_js_number(qa_app_view_settings_field_of_view(s));
+  if (num == NULL) qa_range_error("Out of memory");
+  snprintf(s->label, sizeof s->label, "Field of view (%s)", num);
+  free(num);
+}
+static bool binding_enabled(void *ctx) { refresh_label(ctx); return true; }
 static double binding_read(void *ctx) { return qa_app_view_settings_field_of_view((qa_app_view_settings *)ctx); }
 static void binding_write(void *ctx, double v) { qa_app_view_settings_set_field_of_view((qa_app_view_settings *)ctx, v); }
 qa_ui_setting_binding qa_app_view_settings_binding(qa_app_view_settings *s) {
-  char buf[96];
-  char *num = qa_input_js_number(qa_app_view_settings_field_of_view(s));
-  snprintf(buf, sizeof buf, "Field of view (%s)", num ? num : "90");
-  free(num);
-  free(s->label); s->label = qa_input_dup(buf);
+  refresh_label(s);
   qa_ui_setting_binding b; memset(&b, 0, sizeof b);
   b.id = "ui:view:field-of-view"; b.label = s->label; b.category = "display"; b.kind = "slider";
   b.ctx = s; b.enabled = binding_enabled; b.read_num = binding_read; b.write_num = binding_write;
@@ -151,9 +156,12 @@ void qa_app_view_settings_load_warn(qa_app_view_settings *s, const qa_config_sto
 }
 void qa_app_view_settings_save(qa_app_view_settings *s, const qa_config_store *store) {
   if (!s->explicit) return;
-  char *num = qa_input_js_number(qa_app_view_settings_field_of_view(s));
+  double fov = qa_app_view_settings_field_of_view(s);
+  char *num = isfinite(fov) ? qa_input_js_number(fov) : qa_input_dup("null"); /* JSON.stringify(NaN) is null */
+  if (num == NULL) qa_range_error("Out of memory");
   char buf[128];
-  snprintf(buf, sizeof buf, "{\"version\":1,\"fieldOfView\":%s}\n", num ? num : "90");
+  snprintf(buf, sizeof buf, "{\"version\":1,\"fieldOfView\":%s}\n", num);
   free(num);
-  qa_config_store_dump(store, "view.json", buf);
+  /* TS `await store.dump(...)`: a failed write rejects. */
+  qa_app_config_store_dump(store, "view.json", buf);
 }

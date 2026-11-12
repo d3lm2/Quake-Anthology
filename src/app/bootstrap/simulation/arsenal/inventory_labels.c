@@ -22,12 +22,12 @@ const char *qa_app_selected_ammo_label(const char *family, qa_item_id item) {
   } else {
     const qa_q3_weapon_item *weapon = NULL;
     for (size_t i = 0; i < QA_Q3_WEAPON_ITEM_COUNT; i++)
-      if (qa_q3_weapon_items[i].ammo && item && strcmp(qa_q3_weapon_items[i].ammo, item) == 0) weapon = &qa_q3_weapon_items[i];
+      if (qa_q3_weapon_items[i].ammo && item && strcmp(qa_q3_weapon_items[i].ammo, item) == 0) { weapon = &qa_q3_weapon_items[i]; break; }
     size_t count = 0;
     const qa_q3_base_item_definition *items = qa_q3_base_item_list(QA_Q3_BASE_PRODUCT_MISSIONPACK, &count);
     for (size_t i = 0; i < count; i++)
-      if (items[i].type == QA_Q3_BASE_IT_AMMO && weapon && items[i].tag == weapon->weapon) label = items[i].pickup_name;
+      if (items[i].type == QA_Q3_BASE_IT_AMMO && weapon && items[i].tag == weapon->weapon) { label = items[i].pickup_name; break; } /* find: first */
   }
-  if (!label) qa_range_error("Selected ammunition lacks a source catalog label: %s", item ? item : "");
+  if (!label) qa_raise("Error", 0, 0, "Selected ammunition lacks a source catalog label: %s", item ? item : "");
   return label;
 }

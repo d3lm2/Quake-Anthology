@@ -81,7 +81,7 @@ static qa_call_result vsprintf_impl(void *ctx, const qa_guest_core_call_context 
   request.memory_ext = host->memory_ext;
   request.dialect = QA_FORMAT_WINDOWS;
   request.has_buffer = qa_guest_pointer_argument(args, count, 1, &request.buffer);
-  request.capacity = qa_guest_integer(args, count, 2);
+  request.capacity = qa_guest_integer_u64(args, count, 2);
   request.has_format = qa_guest_pointer_argument(args, count, 3, &request.format);
   request.has_arguments = qa_guest_pointer_argument(args, count, 5, &request.arguments);
   request.termination = (options & 1) != 0 ? QA_TERMINATION_UCRT_LEGACY
@@ -134,8 +134,9 @@ static qa_call_result vsnprintf_impl(void *ctx, const qa_guest_core_call_context
   (void)context;
   qa_system_v_service_host *host = state->host;
   bool checked = state->checked;
-  int64_t capacity = qa_guest_integer(args, count, 1);
-  if (checked && qa_guest_integer(args, count, 3) < capacity)
+  /* size_t values compared as TS BigInts: unsigned, never negative. */
+  const uint64_t capacity = qa_guest_integer_u64(args, count, 1);
+  if (checked && qa_guest_integer_u64(args, count, 3) < capacity)
     qa_guest_format_fortify_failure("glibc __vsnprintf_chk destination size is smaller than maxlen");
   if (capacity > 0) qa_memory_write_u8(host->memory, qa_guest_required_pointer(args, count, 0), 0);
   qa_guest_format_request request; memset(&request, 0, sizeof request);
@@ -171,6 +172,7 @@ void qa_install_system_v_format(qa_system_v_service_host *host) {
     chk[3] = host->pointer_storage;
     system_v_format_state *state = xmalloc(sizeof *state);
     state->host = host; state->checked = checked;
+    qa_system_v_own(host, state, free);
     qa_system_v_implementation impl = {state, vsnprintf_impl};
     qa_system_v_service(host, "libc.so.6", name, versions, 2,
                         checked ? chk : plain, checked ? 6 : 4, false, QA_STORAGE_INT32, impl);

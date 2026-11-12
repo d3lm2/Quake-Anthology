@@ -48,6 +48,11 @@ static qa_guest_call_result entry_invoked(void *v, const qa_guest_call_context *
   qa_compat_q2_native_entry *b = v; (void)context;
   return b->execute(b->ctx, values, count, b);
 }
+static void entry_bind_failed(void *v) {
+  qa_compat_q2_native_entry *b = v;
+  b->runner->remove_entry(b->runner->ctx, b->observe);
+  free(b->id); free(b->frames); free(b);
+}
 qa_compat_q2_native_entry *qa_compat_q2_native_entry_bind(
     qa_compat_q2_memory *memory, qa_compat_q2_runner *runner, void *invoke_ctx, qa_compat_q2_native_entry_invoke_fn invoke,
     qa_guest_address address, const char *id, qa_compat_q2_guest_call_signature signature,
@@ -61,7 +66,10 @@ qa_compat_q2_native_entry *qa_compat_q2_native_entry_bind(
   b->address = address; b->id = owned; b->signature = signature;
   b->ctx = ctx; b->execute = execute; b->accepts_ctx = accepts_ctx; b->accepts = accepts;
   b->observe = runner->observe_entry(runner->ctx, address, b, entry_observed);
+  /* try { remove = callbacks.bindEntry(...) } catch (error) { observe(); throw error; } */
+  qa_cleanup node; qa_cleanup_push(&node, entry_bind_failed, b);
   b->bound = runner->bind_entry(runner->ctx, address, owned, signature, b, entry_invoked, b, entry_accepts);
+  qa_cleanup_pop(&node);
   return b;
 }
 typedef struct { qa_compat_q2_native_entry *b; const qa_guest_call_value *values; size_t count; qa_guest_call_result result; } original_call;

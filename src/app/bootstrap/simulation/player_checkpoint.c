@@ -3,6 +3,7 @@
 #include "qa/app/bootstrap/simulation/checkpoint_values.h"
 #include <stdlib.h>
 #include <string.h>
+#include "qa/content/q1/base/travel.h"
 #include "qa/content/q1/foundation/types.h"
 #include "qa/foundation/support.h"
 #include "qa/persistence/recipe.h"
@@ -21,15 +22,17 @@ static bool fbool(const qa_save_reader *r, const char *n) {
 static qa_vec3 fvec(const qa_save_reader *r, const char *n) {
   qa_save_reader f = fld(r, n); qa_vec3 v = qa_read_vector(&f); qa_save_reader_destroy(&f); return v;
 }
+/* triple: reader.list(value => value.number()) reads every item before the length check. */
 static qa_integer_triple ftriple(const qa_save_reader *r, const char *n) {
   qa_save_reader f = fld(r, n);
   size_t count = qa_save_reader_list_count(&f);
-  if (count != 3) qa_save_reader_fail(&f, "expected three numbers");
-  qa_integer_triple out;
-  for (size_t i = 0; i < 3; i++) {
+  qa_integer_triple out = {{0, 0, 0}};
+  for (size_t i = 0; i < count; i++) {
     qa_save_reader item; qa_save_reader_item(&f, i, &item);
-    out.values[i] = qa_save_reader_number(&item); qa_save_reader_destroy(&item);
+    double value = qa_save_reader_number(&item); qa_save_reader_destroy(&item);
+    if (i < 3) out.values[i] = value;
   }
+  if (count != 3) qa_save_reader_fail(&f, "expected three numbers");
   qa_save_reader_destroy(&f); return out;
 }
 static const char *fchoice(const qa_save_reader *r, const char *n, const char *const *c, size_t k) {
@@ -71,7 +74,9 @@ qa_trace_hit qa_app_sim_read_hit(const qa_save_reader *reader, qa_app_sim_actor_
   qa_save_reader_destroy(&f);
   return out;
 }
-static qa_movement_state read_movement(const qa_save_reader *reader, qa_app_sim_actor_reference_fn ref, void *ctx) {
+/* A Q3 jumpPad is returned in *jump_pad (the state's pointer is left NULL; the caller points it at storage it keeps). */
+static qa_movement_state read_movement(const qa_save_reader *reader, qa_app_sim_actor_reference_fn ref, void *ctx, bool *has_jump_pad,
+    qa_actor_id *jump_pad) {
   static const char *const kinds[] = {"q1-netquake", "q1-quakeworld", "q2-classic", "q2-rerelease", "q3"};
   const char *kind = fchoice(reader, "kind", kinds, 5);
   qa_movement_state out; memset(&out, 0, sizeof out);
@@ -114,9 +119,7 @@ static qa_movement_state read_movement(const qa_save_reader *reader, qa_app_sim_
     qa_save_reader g = fld(reader, "ground"); s->ground = qa_app_sim_read_hit(&g, ref, ctx); qa_save_reader_destroy(&g);
     s->predictable_event_sequence = fnum(reader, "predictableEventSequence");
     qa_save_reader jp = fld(reader, "jumpPad");
-    if (!qa_save_reader_is_null(&jp)) {
-      static qa_actor_id pad; pad = ref(ctx, qa_read_saved_actor(&jp)); s->jump_pad = &pad;
-    }
+    if (!qa_save_reader_is_null(&jp)) { *jump_pad = ref(ctx, qa_read_saved_actor(&jp)); *has_jump_pad = true; }
     qa_save_reader_destroy(&jp);
     s->movement_frame = fnum(reader, "movementFrame"); s->jump_pad_frame = fnum(reader, "jumpPadFrame");
   }
@@ -269,7 +272,9 @@ qa_save_value *qa_app_sim_capture_movement_player(const qa_app_sim_movement_play
     qa_save_value_set(o, "bodyShapeBase", b);
   } else qa_save_value_set(o, "bodyShapeBase", qa_save_value_null());
   qa_save_value_set(o, "fixedPoseActive", qa_save_value_boolean(player->fixed_pose_active));
-  if (!player->has_arsenal_intent || player->arsenal_intent.impulse == 0) qa_save_value_set(o, "arsenalIntent", qa_save_value_null());
+  /* intent?.impulse === undefined || intent.impulse === 0 ? null : {...} */
+  if (!player->has_arsenal_intent || !player->arsenal_intent.has_impulse || player->arsenal_intent.impulse == 0)
+    qa_save_value_set(o, "arsenalIntent", qa_save_value_null());
   else {
     qa_save_value *intent = qa_save_value_object();
     qa_save_value_set(intent, "provider", qa_save_value_string(player->arsenal_intent.provider));
@@ -400,7 +405,7 @@ qa_app_sim_saved_movement_player qa_app_sim_read_movement_player(const qa_save_r
   qa_save_reader_destroy(&fl);
   qa_save_reader af = fld(reader, "actor"); out.actor = qa_read_saved_actor(&af); qa_save_reader_destroy(&af);
   qa_save_reader cs = fld(reader, "clientSlot"); out.client_slot = qa_save_reader_integer_min(&cs, 0); qa_save_reader_destroy(&cs);
-  qa_save_reader st = fld(reader, "state"); out.state = read_movement(&st, ref, ctx); qa_save_reader_destroy(&st);
+  qa_save_reader st = fld(reader, "state"); out.state = read_movement(&st, ref, ctx, &out.has_jump_pad, &out.jump_pad); qa_save_reader_destroy(&st);
   qa_save_reader ar = fld(reader, "arsenal");
   qa_save_reader pf2 = fld(&ar, "provider"); out.arsenal.provider = qa_namespaced(&pf2); qa_save_reader_destroy(&pf2);
   out.arsenal.active_weapon = fnamespaced_nullable(&ar, "activeWeapon");
@@ -408,6 +413,9 @@ qa_app_sim_saved_movement_player qa_app_sim_read_movement_player(const qa_save_r
   qa_save_reader ammo = fld(&ar, "ammo");
   size_t ammo_count = qa_save_reader_list_count(&ammo);
   out.ammo = ammo_count ? malloc(ammo_count * sizeof *out.ammo) : NULL;
+  if (ammo_count != 0 && out.ammo == NULL) qa_range_error("Out of memory");
+  /* The caller frees out.ammo; a raise anywhere after this point frees it here. */
+  qa_cleanup ammo_node; qa_cleanup_push(&ammo_node, free, out.ammo);
   for (size_t i = 0; i < ammo_count; i++) {
     qa_save_reader e; qa_save_reader_item(&ammo, i, &e);
     out.ammo[i] = qa_read_inventory_entry(&e); qa_save_reader_destroy(&e);
@@ -434,6 +442,7 @@ qa_app_sim_saved_movement_player qa_app_sim_read_movement_player(const qa_save_r
     out.cutscene_origin = fvec(&cut, "origin"); out.cutscene_angles = fvec(&cut, "angles"); out.cutscene_view_offset = fvec(&cut, "viewOffset");
   }
   qa_save_reader_destroy(&cut);
+  qa_cleanup_pop(&ammo_node);
   return out;
 }
 qa_q3_character_checkpoint qa_app_sim_read_q3_character(const qa_save_reader *reader) {
@@ -454,6 +463,7 @@ qa_q3_character_checkpoint qa_app_sim_read_q3_character(const qa_save_reader *re
   out.dead = fbool(reader, "dead"); out.gibbed = fbool(reader, "gibbed"); out.initialized = fbool(reader, "initialized");
   return out;
 }
+static void free_q1_travel(void *state) { qa_q1_travel_state_destroy(state); }
 qa_q1_travel_state qa_app_sim_read_q1_travel(const qa_save_reader *reader) {
   qa_save_reader wf = fld(reader, "weapon");
   const char *weapon = qa_save_reader_string(&wf); qa_save_reader_destroy(&wf);
@@ -461,36 +471,49 @@ qa_q1_travel_state qa_app_sim_read_q1_travel(const qa_save_reader *reader) {
   for (int i = 0; i < 20; i++) if (is(QA_Q1_WEAPON_IDS[i], weapon)) selected = QA_Q1_WEAPON_IDS[i];
   if (selected == NULL) qa_save_reader_fail(reader, "Unknown Q1 saved weapon %s", weapon);
   qa_q1_travel_state out; memset(&out, 0, sizeof out);
+  /* A raise while reading frees what was read so far (qa_q1_travel_state_destroy over the counts filled). */
+  qa_cleanup out_node; qa_cleanup_push(&out_node, free_q1_travel, &out);
   out.health = fnum(reader, "health"); out.max_health = fnum(reader, "maxHealth");
   qa_save_reader af = fld(reader, "armor"); out.armor = qa_read_armor(&af); qa_save_reader_destroy(&af);
   qa_save_reader inv = fld(reader, "inventory");
-  out.inventory_count = qa_save_reader_list_count(&inv);
-  out.inventory = out.inventory_count ? malloc(out.inventory_count * sizeof *out.inventory) : NULL;
-  out.inventory_items = out.inventory_count ? malloc(out.inventory_count * sizeof *out.inventory_items) : NULL;
-  for (size_t i = 0; i < out.inventory_count; i++) {
+  size_t inventory_count = qa_save_reader_list_count(&inv);
+  out.inventory = inventory_count ? malloc(inventory_count * sizeof *out.inventory) : NULL;
+  out.inventory_items = inventory_count ? calloc(inventory_count, sizeof *out.inventory_items) : NULL;
+  if (inventory_count != 0 && (out.inventory == NULL || out.inventory_items == NULL)) qa_range_error("Out of memory");
+  for (size_t i = 0; i < inventory_count; i++) {
     qa_save_reader e; qa_save_reader_item(&inv, i, &e);
     out.inventory[i] = qa_read_inventory_entry(&e);
     /* owned parallel item strings */
-    size_t n = strlen(out.inventory[i].item); char *copy = malloc(n + 1); memcpy(copy, out.inventory[i].item, n + 1);
+    size_t n = strlen(out.inventory[i].item); char *copy = malloc(n + 1);
+    if (copy == NULL) qa_range_error("Out of memory");
+    memcpy(copy, out.inventory[i].item, n + 1);
     out.inventory_items[i] = copy; out.inventory[i].item = copy;
+    out.inventory_count = i + 1;
     qa_save_reader_destroy(&e);
   }
   qa_save_reader_destroy(&inv);
   out.weapon = selected;
   qa_save_reader ext = fld(reader, "extensions");
-  out.extension_count = qa_save_reader_list_count(&ext);
-  out.extensions = out.extension_count ? calloc(out.extension_count, sizeof *out.extensions) : NULL;
-  for (size_t i = 0; i < out.extension_count; i++) {
+  size_t extension_count = qa_save_reader_list_count(&ext);
+  out.extensions = extension_count ? calloc(extension_count, sizeof *out.extensions) : NULL;
+  if (extension_count != 0 && out.extensions == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < extension_count; i++) {
     qa_save_reader e, f;
     qa_save_reader_item(&ext, i, &e);
+    out.extension_count = i + 1;
     f = fld(&e, "id"); const char *id = qa_save_reader_string(&f); qa_save_reader_destroy(&f);
-    size_t idn = strlen(id); out.extensions[i].id = malloc(idn + 1); memcpy(out.extensions[i].id, id, idn + 1);
+    size_t idn = strlen(id); out.extensions[i].id = malloc(idn + 1);
+    if (out.extensions[i].id == NULL) qa_range_error("Out of memory");
+    memcpy(out.extensions[i].id, id, idn + 1);
     f = fld(&e, "bytes"); size_t len = 0; const uint8_t *bytes = qa_save_reader_bytes(&f, &len); qa_save_reader_destroy(&f);
-    out.extensions[i].bytes = len ? malloc(len) : NULL; if (len) memcpy(out.extensions[i].bytes, bytes, len);
+    out.extensions[i].bytes = len ? malloc(len) : NULL;
+    if (len != 0 && out.extensions[i].bytes == NULL) qa_range_error("Out of memory");
+    if (len) memcpy(out.extensions[i].bytes, bytes, len);
     out.extensions[i].length = len;
     qa_save_reader_destroy(&e);
   }
   qa_save_reader_destroy(&ext);
+  qa_cleanup_pop(&out_node);
   return out;
 }
 qa_q2_base_player_view qa_app_sim_read_q2_view(const qa_save_reader *reader) {

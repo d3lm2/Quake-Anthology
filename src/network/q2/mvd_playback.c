@@ -53,6 +53,7 @@ void qa_q2_mvd_playback_destroy(qa_q2_mvd_playback *p) {
   free(p->portal_bits);
   qa_q2_server_message_reader_destroy(&p->embedded);
   qa_q2_wire_codec_destroy(&p->wire);
+  qa_q2_server_data_result_clear(&p->data);
   memset(p, 0, sizeof *p);
 }
 
@@ -473,7 +474,8 @@ static bool emit_frame(qa_q2_mvd_playback *p, record_list *list, int64_t start) 
   return emit_record(p, list, 20, start, &event);
 }
 /* TS `yield* records; records.length = 0`: ownership of each record passes to the sink. */
-static void flush_records(record_list *list, qa_q2_mvd_record_sink sink, void *ctx) {
+static void flush_records(qa_q2_mvd_playback *p, record_list *list, qa_q2_mvd_record_sink sink,
+                          void *ctx) {
   size_t count = list->count;
   qa_q2_server_record *items = list->items;
   list->items = NULL;
@@ -486,10 +488,13 @@ static void flush_records(record_list *list, qa_q2_mvd_record_sink sink, void *c
     qa_q2_server_record record = items[i];
     memset(&items[i], 0, sizeof items[i]);
     sink(ctx, &record);
+    if (p->stopped) break;
   }
   qa_cleanup_pop(&node);
-  free(items);
+  /* Handed-over entries are zeroed; a stop leaves the rest to release here. */
+  record_list_release(&rest);
 }
+void qa_q2_mvd_playback_stop(qa_q2_mvd_playback *p) { p->stopped = true; }
 static bool embedded_init(qa_q2_mvd_playback *p, qa_q2_protocol_identity protocol,
                           double max_config_strings) {
   qa_q2_server_message_reader_destroy(&p->embedded);
@@ -500,6 +505,7 @@ static bool embedded_init(qa_q2_mvd_playback *p, qa_q2_protocol_identity protoco
   return qa_q2_server_message_reader_init(&p->embedded, protocol, options);
 }
 static void header_release(void *arg) { qa_q2_mvd_header_free((qa_q2_mvd_header *)arg); }
+static void data_release(void *arg) { qa_q2_server_data_result_clear((qa_q2_server_data_result *)arg); }
 static void bytes_release(void *arg) {
   uint8_t **bytes = (uint8_t **)arg;
   free(*bytes);
@@ -534,18 +540,28 @@ static bool read_serverdata(qa_q2_mvd_playback *p, const uint8_t *bytes, size_t 
     p->max_clients = header.max_clients;
     p->dummy = header.dummy;
   }
-  qa_q2_server_data_result data = header.data;
+  qa_q2_server_data_result data = header.data; /* takes the header's strings */
+  header.data.gamedir = NULL;
+  header.data.levelname = NULL;
   qa_cleanup_pop(&node);
   qa_q2_mvd_header_free(&header);
-  if (!ok || !read_frame(p, p->dummy)) return false;
+  qa_cleanup data_node;
+  qa_cleanup_push(&data_node, data_release, &data);
+  if (!ok || !read_frame(p, p->dummy)) {
+    qa_cleanup_pop(&data_node);
+    qa_q2_server_data_result_clear(&data);
+    return false;
+  }
   selected_or_first(p);
   data.clientnum = p->selected;
-  p->data = data;
-  p->has_data = true;
   qa_q2_server_event event;
   memset(&event, 0, sizeof event);
   event.kind = QA_Q2_SERVER_DATA;
-  event.data = data;
+  qa_q2_server_data_result_copy(&event.data, &data); /* the record owns its own copy */
+  qa_cleanup_pop(&data_node);
+  qa_q2_server_data_result_clear(&p->data);
+  p->data = data;
+  p->has_data = true;
   if (!emit_record(p, records, 12, start, &event)) return false;
   for (size_t i = 0; i < p->config_string_count; i++) {
     memset(&event, 0, sizeof event);
@@ -561,7 +577,8 @@ static bool read_serverdata(qa_q2_mvd_playback *p, const uint8_t *bytes, size_t 
   memset(&event, 0, sizeof event);
   event.kind = QA_Q2_SERVER_COMMAND_TEXT;
   if (!emit_text(p, records, 11, start, &event, text)) return false;
-  flush_records(records, sink, ctx);
+  flush_records(p, records, sink, ctx);
+  if (p->stopped) return true;
   return emit_frame(p, records, start);
 }
 
@@ -672,7 +689,8 @@ bool qa_q2_mvd_playback_read_records(qa_q2_mvd_playback *p, const uint8_t *bytes
   qa_cleanup node;
   qa_cleanup_push(&node, record_list_release, &records);
   bool ok = true;
-  while (ok && message->readcount < message->cursize) {
+  p->stopped = false;
+  while (ok && !p->stopped && message->readcount < message->cursize) {
     int64_t start = message->readcount;
     qa_q2_mvd_cmd command;
     qa_q2_msg_read_mvd_cmd(message, &command);
@@ -727,15 +745,15 @@ bool qa_q2_mvd_playback_read_records(qa_q2_mvd_playback *p, const uint8_t *bytes
       default:
         qa_q2_throw_error("Unsupported MVD command %s", QA_JS_NUMBER(command.op));
     }
-    if (ok) qa_q2_message_check_read(message);
+    if (ok && !p->stopped) qa_q2_message_check_read(message);
   }
-  if (ok) qa_q2_wire_codec_finish(&p->wire);
+  if (ok && !p->stopped) qa_q2_wire_codec_finish(&p->wire);
   qa_cleanup_pop(&node);
-  if (!ok) {
+  if (!ok || p->stopped) {
     record_list_release(&records);
-    return false;
+    return ok;
   }
-  flush_records(&records, sink, ctx);
+  flush_records(p, &records, sink, ctx);
   return true;
 }
 

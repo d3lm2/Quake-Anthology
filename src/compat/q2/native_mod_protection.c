@@ -45,7 +45,7 @@ static void add_counter(protection_t *s, const definition_t *d, const char *sele
     }
     break;
   }
-  if (!is_regular(d) && shared == NULL) qa_range_error("Native power fuel requires one declared canonical inventory field");
+  if (!is_regular(d) && shared == NULL) qa_raise("Error", 0, 0, "Native power fuel requires one declared canonical inventory field");
   counter_t *counter = qa_compat_q2_grow((void **)&s->counters, &s->counter_count, &s->counter_capacity, sizeof *counter);
   counter->channel = channel_of(d); counter->selection = selection; counter->field = field; counter->inventory = shared != NULL ? shared->item : NULL;
 }
@@ -60,8 +60,11 @@ static size_t collect_items(const protection_t *s, bool has_channel, qa_protecti
   }
   return count;
 }
+/* A constructor that throws leaves nothing behind in TS. */
+static void create_abandon(void *value) { protection_t *s = value; free(s->counters); free(s->items_all); free(s->items_channel[0]); free(s->items_channel[1]); free(s); }
 protection_t *qa_compat_q2_native_mod_protection_create(const definition_t *definitions, size_t definition_count, const qa_native_mod_declaration *declaration, const qa_mod_host_services *services, qa_provider_id instance, qa_compat_q2_native_protection_operations operations) {
   protection_t *s = calloc(1, sizeof *s); if (s == NULL) qa_range_error("Out of memory");
+  qa_cleanup abandon; qa_cleanup_push(&abandon, create_abandon, s);
   s->definitions = definitions; s->definition_count = definition_count; s->declaration = declaration; s->services = services; s->instance = instance; s->operations = operations;
   for (size_t i = 0; i < definition_count; i++) {
     const definition_t *d = &definitions[i];
@@ -74,6 +77,7 @@ protection_t *qa_compat_q2_native_mod_protection_create(const definition_t *defi
   s->items_all_count = collect_items(s, false, QA_PROTECTION_REGULAR, s->items_all);
   s->items_channel_count[QA_PROTECTION_REGULAR] = collect_items(s, true, QA_PROTECTION_REGULAR, s->items_channel[QA_PROTECTION_REGULAR]);
   s->items_channel_count[QA_PROTECTION_POWERED] = collect_items(s, true, QA_PROTECTION_POWERED, s->items_channel[QA_PROTECTION_POWERED]);
+  qa_cleanup_pop(&abandon);
   return s;
 }
 static qa_protection_claim claim_of(const protection_t *s, const definition_t *d) {
@@ -117,44 +121,62 @@ static bool client_matches(const protection_t *s, qa_actor_id actor, qa_client_i
 }
 static entry_t *require_entry(const protection_t *s, qa_actor_id actor) {
   entry_t *entry = find_entry(s, actor);
-  if (entry == NULL || !qa_session_actor_registry_is_live(s->services->actors, actor) || !client_matches(s, actor, entry->client)) qa_range_error("Native protection client is no longer live");
+  if (entry == NULL || !qa_session_actor_registry_is_live(s->services->actors, actor) || !client_matches(s, actor, entry->client)) qa_raise("Error", 0, 0, "Native protection client is no longer live");
   return entry;
 }
 void qa_compat_q2_native_mod_protection_reserve(protection_t *s) {
   const qa_mod_client_services *clients = s->services->clients;
-  if (clients == NULL) qa_range_error("Native protection requires canonical clients");
+  if (clients == NULL) qa_raise("Error", 0, 0, "Native protection requires canonical clients");
   size_t count = 0; const qa_mod_client_identity *listed = clients->clients(clients->ctx, &count);
   qa_mod_client_identity *identities = calloc(count + 1, sizeof *identities); if (identities == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < count; i++) identities[i] = listed[i];
+  qa_cleanup owned; qa_cleanup_push(&owned, free, identities);
   for (size_t i = 0; i < count; i++) qa_compat_q2_native_mod_protection_reserve_actor(s, identities[i].actor);
-  free(identities);
+  qa_cleanup_pop(&owned); free(identities);
 }
+typedef struct reserve_call { protection_t *s; entry_t *entry; qa_owned_actor owner; } reserve_call;
+static void reserve_body(void *value) {
+  reserve_call *c = value; protection_t *s = c->s; entry_t *entry = c->entry;
+  for (size_t i = 0; i < s->definition_count; i++) {
+    qa_protection_reservation reservation = qa_gameplay_authority_reserve_protection(s->services->combat, c->owner, channel_of(&s->definitions[i]), claim_of(s, &s->definitions[i]));
+    entry->reservations[entry->reservation_count++] = reservation;
+  }
+}
+static void reservation_close_body(void *value) { qa_protection_reservation *reservation = value; reservation->close(reservation->ctx); }
 void qa_compat_q2_native_mod_protection_reserve_actor(protection_t *s, qa_actor_id actor) {
   s->operations.current(s->operations.ctx);
   if (find_entry(s, actor) != NULL) { (void)require_entry(s, actor); return; }
   const qa_mod_client_services *clients = s->services->clients; qa_client_id client; qa_actor_id back; qa_owned_actor owner;
   bool has_client = clients != NULL && clients->for_actor(clients->ctx, actor, &client), has_owner = qa_session_actor_registry_resolve_owned(s->services->actors, actor, &owner);
-  if (!has_client || !has_owner || !clients->actor(clients->ctx, client, &back) || !qa_same_actor(back, actor)) qa_range_error("Native protection requires a live canonical client");
+  if (!has_client || !has_owner || !clients->actor(clients->ctx, client, &back) || !qa_same_actor(back, actor)) qa_raise("Error", 0, 0, "Native protection requires a live canonical client");
   size_t inventory_count = 0; const qa_inventory_entry *inventory = qa_shared_inventory_table_entries(s->services->inventory, actor, &inventory_count);
   for (size_t i = 0; i < s->items_all_count; i++) {
     bool found = false;
     for (size_t j = 0; j < inventory_count && !found; j++) found = !strcmp(inventory[j].item, s->items_all[i]);
-    if (!found) qa_range_error("Native protection item has no canonical inventory owner: %s", s->items_all[i]);
+    if (!found) qa_raise("Error", 0, 0, "Native protection item has no canonical inventory owner: %s", s->items_all[i]);
   }
   entry_t *entry = calloc(1, sizeof *entry); if (entry == NULL) qa_range_error("Out of memory");
   entry->actor = actor; entry->client = client; entry->identity = ++s->next_identity;
   entry->reservations = calloc(s->definition_count + 1, sizeof *entry->reservations); if (entry->reservations == NULL) qa_range_error("Out of memory");
-  for (size_t i = 0; i < s->definition_count; i++)
-    entry->reservations[entry->reservation_count++] = qa_gameplay_authority_reserve_protection(s->services->combat, owner, channel_of(&s->definitions[i]), claim_of(s, &s->definitions[i]));
+  /* TS try/catch: a reservation that throws closes the ones made before it, each in its own try; one failure
+   * leaves as it is, several as one AggregateError. */
+  reserve_call call = {s, entry, owner}; qa_caught_error caught;
+  if (!qa_try(reserve_body, &call, &caught)) {
+    size_t errors = 1; qa_caught_error failure;
+    for (size_t i = 0; i < entry->reservation_count; i++) if (!qa_try(reservation_close_body, &entry->reservations[i], &failure)) errors++;
+    free(entry->reservations); free(entry);
+    if (errors != 1) qa_raise("AggregateError", 0, 0, "Native protection reservation failed");
+    qa_rethrow(&caught);
+  }
   entry_t **slot = qa_compat_q2_grow((void **)&s->entries, &s->entry_count, &s->entry_capacity, sizeof *slot); *slot = entry;
 }
 typedef struct source_t { qa_compat_q2_native_mod_armor_state *storage; double slot; } source_t;
 static source_t source_of(protection_t *s, qa_actor_id actor) {
   s->operations.current(s->operations.ctx); (void)require_entry(s, actor);
-  if (!s->operations.eligible(s->operations.ctx, actor)) qa_range_error("Native protection client has not been admitted");
+  if (!s->operations.eligible(s->operations.ctx, actor)) qa_raise("Error", 0, 0, "Native protection client has not been admitted");
   double slot; qa_guest_address client;
-  if (!s->operations.slot(s->operations.ctx, actor, &slot) || !s->has_storage || s->host == NULL || !s->host->client(s->host->ctx, slot, &client)) qa_range_error("Native protection has no source client record");
-  if (!s->host->active(s->host->ctx, slot)) qa_range_error("Native protection requires an active source record retained by original saves");
+  if (!s->operations.slot(s->operations.ctx, actor, &slot) || !s->has_storage || s->host == NULL || !s->host->client(s->host->ctx, slot, &client)) qa_raise("Error", 0, 0, "Native protection has no source client record");
+  if (!s->host->active(s->host->ctx, slot)) qa_raise("Error", 0, 0, "Native protection requires an active source record retained by original saves");
   source_t source = {&s->storage, slot}; return source;
 }
 static const counter_t *counter_for(const protection_t *s, qa_protection_channel channel, qa_armor_state state) {
@@ -176,7 +198,7 @@ static qa_armor_state channel_merged(qa_armor_state current, qa_protection_chann
 }
 static void validate_write(protection_t *s, qa_actor_id actor, qa_protection_channel channel, qa_armor_state next) {
   source_t source = source_of(s, actor); qa_armor_state current = qa_compat_q2_native_mod_armor_read(source.storage, source.slot);
-  if (channel == QA_PROTECTION_POWERED && strcmp(current.powered.kind, next.powered.kind) != 0) qa_range_error("Native power activation requires its original source operation");
+  if (channel == QA_PROTECTION_POWERED && strcmp(current.powered.kind, next.powered.kind) != 0) qa_raise("Error", 0, 0, "Native power activation requires its original source operation");
   qa_compat_q2_native_mod_armor_validate_write(source.storage, source.slot, channel_merged(current, channel, next));
 }
 typedef struct suppress_call { protection_t *s; stage_t **stages; size_t count; void *ctx; void (*invoke)(void *); } suppress_call;
@@ -210,14 +232,13 @@ static void binding_validate_powered(void *ctx, qa_powered_protection_state powe
 static void binding_write_regular(void *ctx, qa_regular_armor_state regular) { binding_ctx *b = ctx; qa_armor_state next = read_armor(b->owner, b->actor); next.regular = regular; write_armor(b->owner, b->actor, QA_PROTECTION_REGULAR, next); }
 static void binding_write_powered(void *ctx, qa_powered_protection_state powered) { binding_ctx *b = ctx; qa_armor_state next = read_armor(b->owner, b->actor); next.powered = powered; write_armor(b->owner, b->actor, QA_PROTECTION_POWERED, next); }
 static qa_armor_stage_result binding_absorb(void *ctx, qa_armor_stage_input input, qa_protection_observer observer);
-void qa_compat_q2_native_mod_protection_bind_actor(protection_t *s, qa_actor_id actor) {
-  if (!s->active || !s->operations.eligible(s->operations.ctx, actor)) return;
-  entry_t *entry = require_entry(s, actor); if (entry->bound) return;
-  (void)source_of(s, actor);
+typedef struct bind_call { protection_t *s; entry_t *entry; qa_actor_id actor; } bind_call;
+static void bind_body(void *value) {
+  bind_call *c = value; protection_t *s = c->s; entry_t *entry = c->entry; qa_actor_id actor = c->actor;
   for (size_t i = 0; i < entry->reservation_count; i++) {
     qa_protection_reservation *reservation = &entry->reservations[i]; const definition_t *definition = NULL;
     for (size_t j = 0; j < s->definition_count && definition == NULL; j++) if (channel_of(&s->definitions[j]) == reservation->channel) definition = &s->definitions[j];
-    if (definition == NULL) qa_range_error("Native protection reservation has no declaration");
+    if (definition == NULL) qa_raise("Error", 0, 0, "Native protection reservation has no declaration");
     binding_ctx *context = calloc(1, sizeof *context); if (context == NULL) qa_range_error("Out of memory");
     context->owner = s; context->actor = actor; context->definition = definition; context->next = entry->contexts; entry->contexts = context;
     qa_protection_binding binding; memset(&binding, 0, sizeof binding);
@@ -231,6 +252,18 @@ void qa_compat_q2_native_mod_protection_bind_actor(protection_t *s, qa_actor_id 
   }
   entry->bound = true;
 }
+static void bind_release_body(void *value) { bind_call *c = value; qa_compat_q2_native_mod_protection_release(c->s, c->actor); }
+void qa_compat_q2_native_mod_protection_bind_actor(protection_t *s, qa_actor_id actor) {
+  if (!s->active || !s->operations.eligible(s->operations.ctx, actor)) return;
+  entry_t *entry = require_entry(s, actor); if (entry->bound) return;
+  (void)source_of(s, actor);
+  /* TS try/catch: a binding that throws releases the actor; a release that throws too leaves with it as one
+   * AggregateError. */
+  bind_call call = {s, entry, actor}; qa_caught_error caught, failure;
+  if (qa_try(bind_body, &call, &caught)) return;
+  if (!qa_try(bind_release_body, &call, &failure)) qa_raise("AggregateError", 0, 0, "Native protection binding failed");
+  qa_rethrow(&caught);
+}
 void qa_compat_q2_native_mod_protection_activate(protection_t *s) {
   qa_compat_q2_native_mod_protection_reserve(s); s->active = true;
   for (size_t i = 0; i < s->entry_count; i++) qa_compat_q2_native_mod_protection_bind_actor(s, s->entries[i]->actor);
@@ -243,7 +276,7 @@ void qa_compat_q2_native_mod_protection_validate_restored_inventory(protection_t
     qa_actor_id actor = s->entries[i]->actor; source_t source = source_of(s, actor);
     for (size_t j = 0; j < s->counter_count; j++) if (s->counters[j].inventory != NULL
         && (left = qa_compat_q2_native_mod_armor_read_count(source.storage, source.slot, s->counters[j].field), right = qa_shared_inventory_table_count(s->services->inventory, actor, s->counters[j].inventory), left != right))
-      qa_range_error("Restored native protection count differs from its canonical inventory");
+      qa_raise("Error", 0, 0, "Restored native protection count differs from its canonical inventory");
   }
 }
 /* --- observe(). --- */
@@ -276,7 +309,7 @@ static void commit_counts(void *value) {
 static void stage_committed(void *ctx, qa_inventory_committed_change change) {
   stage_t *stage = ctx; protection_t *s = stage->owner;
   stage_assert(stage); (void)source_of(s, stage->actor);
-  if (!change.has_before) qa_range_error("Native protection count lost its canonical baseline");
+  if (!change.has_before) qa_raise("Error", 0, 0, "Native protection count lost its canonical baseline");
   commit_write c = {stage, change};
   suppress_current(s, &c, commit_counts);
   stage_publish(stage);
@@ -355,9 +388,9 @@ static qa_mod_runtime_value vector_value(qa_vec3 value) { qa_mod_runtime_value v
 static qa_mod_runtime_value actor_value(const qa_actor_id *value) { qa_mod_runtime_value v; memset(&v, 0, sizeof v); v.kind = "actor"; v.actor_value = value; return v; }
 static qa_armor_stage_result binding_absorb(void *ctx, qa_armor_stage_input input, qa_protection_observer observer) {
   binding_ctx *b = ctx; protection_t *s = b->owner; const definition_t *d = b->definition; qa_actor_id actor = b->actor;
-  if (!qa_same_actor(input.request.target, actor)) qa_range_error("Native armor stage target differs from its binding");
+  if (!qa_same_actor(input.request.target, actor)) qa_raise("Error", 0, 0, "Native armor stage target differs from its binding");
   double scale = input.flags.has_regular_protection_scale ? input.flags.regular_protection_scale : 1;
-  if (is_regular(d) && scale != 1 && !absorb_names_scale(d)) qa_range_error("Native regular protection scale requires an explicit source input");
+  if (is_regular(d) && scale != 1 && !absorb_names_scale(d)) qa_raise("Error", 0, 0, "Native regular protection scale requires an explicit source input");
   qa_source_time time = qa_compat_q2_services_time(s->services);
   qa_compat_q2_native_pickup_input rows[11]; memset(rows, 0, sizeof rows);
   rows[0].name = "self"; rows[0].value = actor_value(&actor);
@@ -371,7 +404,7 @@ static qa_armor_stage_result binding_absorb(void *ctx, qa_armor_stage_input inpu
   rows[8].name = "direction"; rows[8].value = vector_value(input.direction);
   rows[9].name = "knockback"; rows[9].value = float_value(input.request.knockback);
   rows[10].name = "time"; rows[10].value = float_value(qa_compat_q2_time_seconds(time));
-  const char *record = s->declaration->entity_record; if (record == NULL) qa_range_error("Native protection requires a declared source entity");
+  const char *record = s->declaration->entity_record; if (record == NULL) qa_raise("Error", 0, 0, "Native protection requires a declared source entity");
   /* TS sourceCall. */
   qa_native_mod_source_call lowered; memset(&lowered, 0, sizeof lowered); qa_native_mod_value arguments[6];
   bool region = !strcmp(d->absorb_abi, "source-region"), direct = region || !strcmp(d->absorb_abi, "source-call");
@@ -407,18 +440,38 @@ static qa_armor_stage_result binding_absorb(void *ctx, qa_armor_stage_input inpu
 void qa_compat_q2_native_mod_protection_release(protection_t *s, qa_actor_id actor) {
   for (size_t i = 0; i < s->stage_count; i++) if (qa_same_actor(s->stages[i]->actor, actor)) stage_stop(s->stages[i]);
   entry_t *entry = find_entry(s, actor); if (entry == NULL) return;
-  for (size_t i = 0; i < entry->reservation_count; i++) entry->reservations[i].close(entry->reservations[i].ctx);
+  /* Every reservation is closed in its own try and the entry leaves the map whatever happened; the failures
+   * leave as one AggregateError. */
+  size_t errors = 0; qa_caught_error caught;
+  for (size_t i = 0; i < entry->reservation_count; i++) if (!qa_try(reservation_close_body, &entry->reservations[i], &caught)) errors++;
   for (size_t i = 0; i < s->entry_count; i++) if (s->entries[i] == entry) { memmove(&s->entries[i], &s->entries[i + 1], (s->entry_count - i - 1) * sizeof *s->entries); s->entry_count--; break; }
   while (entry->contexts != NULL) { binding_ctx *next = entry->contexts->next; free(entry->contexts); entry->contexts = next; }
   free(entry->reservations); free(entry);
+  if (errors != 0) qa_raise("AggregateError", 0, 0, "Native protection release failed");
 }
+typedef struct release_call { protection_t *s; qa_actor_id actor; } release_call;
+static void release_body(void *value) { release_call *c = value; qa_compat_q2_native_mod_protection_release(c->s, c->actor); }
+/* TS close(): every actor of [...entries.keys()] is released in its own try; the failures leave as one
+ * AggregateError. */
 void qa_compat_q2_native_mod_protection_close(protection_t *s) {
   s->active = false;
-  while (s->entry_count > 0) qa_compat_q2_native_mod_protection_release(s, s->entries[0]->actor);
+  size_t count = s->entry_count, errors = 0; qa_caught_error caught;
+  qa_actor_id *actors = calloc(count + 1, sizeof *actors); if (actors == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < count; i++) actors[i] = s->entries[i]->actor;
+  for (size_t i = 0; i < count; i++) { release_call call = {s, actors[i]}; if (!qa_try(release_body, &call, &caught)) errors++; }
+  free(actors);
+  if (errors != 0) qa_raise("AggregateError", 0, 0, "Native protection close failed");
 }
+static void destroy_close_body(void *value) { qa_compat_q2_native_mod_protection_close(value); }
 void qa_compat_q2_native_mod_protection_destroy(protection_t *s) {
   if (s == NULL) return;
-  qa_compat_q2_native_mod_protection_close(s);
+  /* C only: the owner has run TS close() already; whatever is left is released and a failure has no reader. */
+  qa_caught_error caught; (void)qa_try(destroy_close_body, s, &caught);
+  for (size_t i = 0; i < s->entry_count; i++) {
+    entry_t *entry = s->entries[i];
+    while (entry->contexts != NULL) { binding_ctx *next = entry->contexts->next; free(entry->contexts); entry->contexts = next; }
+    free(entry->reservations); free(entry);
+  }
   if (s->has_storage) qa_compat_q2_native_mod_armor_state_destroy(&s->storage);
   while (s->authorities != NULL) { authority_t *next = s->authorities->next; free(s->authorities); s->authorities = next; }
   free(s->flat_regular); free(s->flat_power); free(s->counters); free(s->entries); free(s->stages); free(s->items_all); free(s->items_channel[0]); free(s->items_channel[1]); free(s);

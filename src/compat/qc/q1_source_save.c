@@ -12,6 +12,13 @@ static noreturn void qa_error(const char *message) {
   qa_raise("Error", 0, 0, "%s", message);
 }
 
+/* TS comment.replace(/\s/g, "_"). The Q1 save text is one byte per TS character (persistence textBytes refuses
+ * characters above 255; persistence/q1.c reads byte 0xa0 as U+00A0), so the /\s/ characters a save can hold are
+ * TAB, LF, VT, FF, CR, SPACE and U+00A0 (C isspace missed 0xa0). */
+static void replace_js_space(char *text) {
+  for (unsigned char *c = (unsigned char *)text; *c != '\0'; c++)
+    if (*c == ' ' || (*c >= '\t' && *c <= '\r') || *c == 0xa0) *c = '_';
+}
 static char *dup_text(const char *text) {
   size_t length = strlen(text);
   char *copy = malloc(length + 1);
@@ -62,8 +69,7 @@ bool qa_capture_q1_source_save(qa_quakec_source *source, int format_version,
   }
   header.comment = dup_text(comment != NULL ? comment : "");
   if (header.comment == NULL) goto oom;
-  for (char *c = header.comment; *c != '\0'; c++)
-    if (isspace((unsigned char)*c)) *c = '_';
+  replace_js_space(header.comment);
   if (spawn_parameter_count > 0) {
     header.spawn_parameters =
         malloc(spawn_parameter_count * sizeof *header.spawn_parameters);

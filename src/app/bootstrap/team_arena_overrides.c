@@ -2,6 +2,7 @@
 #include "qa/app/bootstrap/team_arena_overrides.h"
 #include <stdlib.h>
 #include <string.h>
+#include "qa/app/bootstrap/simulation/save.h"
 #include "qa/app/bootstrap/team_arena_skirmish.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
@@ -36,7 +37,7 @@ static void require_seats(const qa_app_team_arena_overrides *state, const qa_app
       if (expected[j].seat == state->seats[i].seat && expected[j].client == state->seats[i].client) found = true;
     if (!found) bad = true;
   }
-  if (bad) qa_range_error("Saved Team Arena override seats do not match local clients");
+  if (bad) qa_raise("Error", 0, 0, "Saved Team Arena override seats do not match local clients");
 }
 static void require_seats_reg(const qa_app_team_arena_overrides *state, const qa_app_override_registry *expected, size_t count) {
   qa_app_override_seat *plain = calloc(count ? count : 1, sizeof *plain);
@@ -54,7 +55,7 @@ qa_app_team_arena_overrides qa_app_capture_team_arena_overrides(const qa_app_ove
   for (size_t i = 0; i < count; i++) {
     qa_cvar_read baseline; memset(&baseline, 0, sizeof baseline);
     if (!qa_cvar_registry_find(seats[i].cvars, "ui_drawTimer", &baseline))
-      qa_range_error("Team Arena timer baseline is missing");
+      qa_raise("Error", 0, 0, "Team Arena timer baseline is missing");
     state.seats[i].seat = seats[i].seat;
     state.seats[i].client = seats[i].client;
     state.seats[i].baseline = xdup(baseline.value);
@@ -66,17 +67,19 @@ qa_app_team_arena_overrides qa_app_capture_team_arena_overrides(const qa_app_ove
   return state;
 }
 bool qa_app_read_team_arena_overrides(const qa_save_image *image, const qa_app_override_seat *seats, size_t count, qa_app_team_arena_overrides *out) {
-  const qa_provider_checkpoint *checkpoint = NULL;
-  for (size_t i = 0; i < image->provider_count; i++)
-    if (strcmp(image->providers[i].schema, SCHEMA) == 0) checkpoint = &image->providers[i];
-  if (checkpoint == NULL) return false;
+  bool listed = false;
+  for (size_t i = 0; i < image->provider_count && !listed; i++)
+    if (strcmp(image->providers[i].schema, SCHEMA) == 0) listed = true;
+  if (!listed) return false;
   bool owner = false;
   for (size_t i = 0; i < image->recipe.execution_count; i++) {
     const qa_resolved_execution_module *module = &image->recipe.execution[i];
     if (module->kind == QA_EXECUTION_MODULE_TYPESCRIPT && module->api.kind == QA_GAME_API_Q3 && module->api.as.q3.kind == QA_Q3_API_QAGAME) owner = true;
   }
-  if (!owner) qa_range_error("Team Arena override checkpoint has no native Q3 owner");
-  qa_save_value *value = qa_decode_checkpoint_value(checkpoint->bytes.bytes, checkpoint->bytes.length);
+  if (!owner) qa_raise("Error", 0, 0, "Team Arena override checkpoint has no native Q3 owner");
+  /* simulationProviderCheckpoint: exactly one record, the map provider's, a supported version. */
+  qa_provider_checkpoint checkpoint = qa_app_sim_simulation_provider_checkpoint(*image, SCHEMA);
+  qa_save_value *value = qa_decode_checkpoint_value(checkpoint.bytes.bytes, checkpoint.bytes.length);
   if (value == NULL) qa_range_error("Out of memory");
   *out = qa_app_decode_team_arena_overrides(value, seats, count);
   qa_save_value_free(value);
@@ -138,7 +141,7 @@ qa_save_image qa_app_save_team_arena_overrides(qa_save_image image, const qa_app
   if (!qa_save_value_set(saved, "phase", phase_value)) qa_range_error("Out of memory");
   for (size_t i = 0; i < state->seat_count; i++) {
     const qa_app_override_registry *seat = find_seat(seats, count, state->seats[i].seat, state->seats[i].client);
-    if (seat == NULL) qa_range_error("Missing saved override seat");
+    if (seat == NULL) qa_raise("Error", 0, 0, "Missing saved override seat");
     char *effective = qa_cvar_registry_variable_string(seat->cvars, "cg_drawTimer");
     if (!effective) qa_range_error("Out of memory");
     qa_save_value *row = qa_save_value_object();
@@ -174,7 +177,7 @@ void qa_app_apply_team_arena_overrides(const qa_app_team_arena_overrides *state,
   if (strcmp(state->phase, "released") == 0) return;
   for (size_t i = 0; i < state->seat_count; i++) {
     const qa_app_override_registry *seat = find_seat(seats, count, state->seats[i].seat, state->seats[i].client);
-    if (seat == NULL) qa_range_error("Missing override seat");
+    if (seat == NULL) qa_raise("Error", 0, 0, "Missing override seat");
     cvar_set_(seat->cvars, "ui_drawTimer", state->seats[i].baseline, true);
     cvar_set_(seat->cvars, "cg_drawTimer", state->seats[i].effective, true);
   }
@@ -187,7 +190,7 @@ qa_app_team_arena_overrides qa_app_release_team_arena_overrides(const qa_app_tea
   require_seats_reg(state, seats, count);
   for (size_t i = 0; i < state->seat_count; i++) {
     const qa_app_override_registry *seat = find_seat(seats, count, state->seats[i].seat, state->seats[i].client);
-    if (seat == NULL) qa_range_error("Missing override seat");
+    if (seat == NULL) qa_raise("Error", 0, 0, "Missing override seat");
     cvar_set_(seat->cvars, "cg_drawTimer", state->seats[i].baseline, true);
   }
   qa_app_team_arena_overrides released; memset(&released, 0, sizeof released);
@@ -210,19 +213,19 @@ qa_cvar_archive_entry *qa_app_team_arena_archive_entries(qa_cvar_registry *regis
   for (size_t i = 0; i < count; i++) {
     if (has_seat) {
       const qa_app_team_arena_override_seat_row *saved = NULL;
-      for (size_t j = 0; j < state->seat_count; j++) if (state->seats[j].seat == seat) saved = &state->seats[j];
+      for (size_t j = 0; j < state->seat_count && saved == NULL; j++) if (state->seats[j].seat == seat) saved = &state->seats[j];
       if (ci_eq(entries[i].name, "cg_drawtimer") && saved != NULL) {
         free(entries[i].value);
         entries[i].value = xdup(saved->baseline);
       }
     } else {
       const char *saved_name = NULL;
-      for (size_t j = 0; j < 6; j++)
+      for (size_t j = 0; j < 6 && saved_name == NULL; j++)
         if (ci_eq(qa_app_team_arena_server_overrides[j].name, entries[i].name)) saved_name = qa_app_team_arena_server_overrides[j].saved;
       if (saved_name != NULL) {
         qa_cvar_read saved; memset(&saved, 0, sizeof saved);
         if (!qa_cvar_registry_find(registry, saved_name, &saved))
-          qa_range_error("Team Arena source archive baseline is missing");
+          qa_raise("Error", 0, 0, "Team Arena source archive baseline is missing");
         free(entries[i].value);
         entries[i].value = xdup(saved.value);
         qa_cvar_read_free(&saved);

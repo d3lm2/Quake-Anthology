@@ -57,6 +57,10 @@ typedef struct qa_app_qvm_application_scalars {
 } qa_app_qvm_application_scalars;
 void qa_app_qvm_application_scalars_init(qa_app_qvm_application_scalars *scalars,
                                          qa_app_qvm_application_scalar_options options);
+/* The nine int32 fields REAL_TIME writes for `now` (seconds since the epoch) in the local time zone: seconds,
+ * minutes, hours, date, month, year - 1900, weekday, day of the year and the DST flag
+ * (getTimezoneOffset() < Math.max(January 1's, July 1's)). */
+void qa_app_qvm_real_time_fields(int64_t now, int32_t fields[9]);
 /* TS dispatch(call, updateScreen): false is the TS null. */
 bool qa_app_qvm_application_scalars_dispatch(qa_app_qvm_application_scalars *scalars,
     const qa_qvm_host_call *call, void (*update_screen)(void *ctx), void *update_screen_ctx,

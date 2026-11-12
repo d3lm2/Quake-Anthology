@@ -3,8 +3,8 @@
  * C accommodations: init selects defaults (owned BotMemory); the TS constructor
  * arguments go through qa_bot_character_library_configure. A TS
  * `string | (() => string)` character file is qa_bot_character_file (the read
- * form returns text borrowed until its next call). TS CharacterError has no
- * catcher in the codebase: it records the diagnostic and aborts. destroy
+ * form returns text borrowed until its next call). TS CharacterError records the
+ * diagnostic and raises as class "CharacterError" (uncaught, it aborts). destroy
  * releases C bookkeeping and the owned memory only. GPL-2.0-or-later.
  */
 #ifndef QA_BOTS_BEHAVIOR_LIBRARY_CHARACTER_H

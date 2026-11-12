@@ -10,11 +10,17 @@
 #include "qa/formats/q1_map/records.h"
 #include "qa/foundation/support.h"
 
+/* Zeroed, so a raise partway through a lump finds every unfilled slot empty. */
 static void *xmalloc(size_t size) {
-  void *p = malloc(size == 0 ? 1 : size);
+  void *p = calloc(size == 0 ? 1 : size, 1);
   if (p == NULL) qa_range_error("Out of memory");
   return p;
 }
+
+/* Malformed BSPX data raises partway through a lump; the readers and the records
+ * read so far must not leak when the caller catches it. */
+static void reader_release(void *reader) { qa_binary_reader_destroy((qa_binary_reader *)reader); }
+static void free_slot(void *slot) { free(*(void **)slot); }
 
 static void *xrealloc(void *p, size_t size) {
   void *next = realloc(p, size == 0 ? 1 : size);
@@ -31,6 +37,18 @@ static qa_binary_reader make_reader(const uint8_t *data, size_t length, const ch
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)data, length, source)) qa_range_error("Out of memory");
   return reader;
+}
+
+typedef struct bspx_scratch {
+  qa_binary_reader directory, section;
+  qa_q1_bspx_lump *result;
+  size_t count;
+} bspx_scratch;
+static void bspx_scratch_release(void *arg) {
+  bspx_scratch *scratch = (bspx_scratch *)arg;
+  qa_binary_reader_destroy(&scratch->section);
+  qa_binary_reader_destroy(&scratch->directory);
+  qa_q1_bspx_destroy(scratch->result, scratch->count);
 }
 
 qa_q1_bspx_lump *qa_q1_read_bspx(qa_binary_reader *reader, const qa_q1_lump *lumps,
@@ -55,24 +73,29 @@ qa_q1_bspx_lump *qa_q1_read_bspx(qa_binary_reader *reader, const qa_q1_lump *lum
     bool is_bspx = magic_text != NULL && strcmp(magic_text, "BSPX") == 0;
     free(magic_text);
     if (!is_bspx) continue;
-    qa_binary_reader directory;
-    section_or_die(reader, (int64_t)offset + 4, (int64_t)reader->length - (int64_t)offset - 4, &directory);
-    uint32_t count = qa_binary_reader_u32(&directory);
-    if ((double)count > (double)qa_binary_reader_remaining(&directory) / 32) {
+    bspx_scratch scratch;
+    memset(&scratch, 0, sizeof scratch);
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, bspx_scratch_release, &scratch);
+    section_or_die(reader, (int64_t)offset + 4, (int64_t)reader->length - (int64_t)offset - 4, &scratch.directory);
+    uint32_t count = qa_binary_reader_u32(&scratch.directory);
+    if ((double)count > (double)qa_binary_reader_remaining(&scratch.directory) / 32) {
       qa_binary_error(reader->source, (int64_t)offset, "invalid BSPX count %u", (unsigned)count);
     }
     qa_q1_bspx_lump *result = xmalloc(count * sizeof *result);
+    scratch.result = result;
+    scratch.count = count;
     for (uint32_t i = 0; i < count; i++) {
-      result[i].name = qa_binary_reader_fixed_byte_string(&directory, 24);
-      result[i].offset = qa_binary_reader_u32(&directory);
-      result[i].length = qa_binary_reader_u32(&directory);
-      qa_binary_reader section;
-      section_or_die(reader, (int64_t)result[i].offset, (int64_t)result[i].length, &section);
-      result[i].data = qa_binary_reader_bytes(&section, (int64_t)result[i].length);
+      result[i].name = qa_binary_reader_fixed_byte_string(&scratch.directory, 24);
+      result[i].offset = qa_binary_reader_u32(&scratch.directory);
+      result[i].length = qa_binary_reader_u32(&scratch.directory);
+      section_or_die(reader, (int64_t)result[i].offset, (int64_t)result[i].length, &scratch.section);
+      result[i].data = qa_binary_reader_bytes(&scratch.section, (int64_t)result[i].length);
       result[i].data_length = (size_t)result[i].length;
-      qa_binary_reader_destroy(&section);
+      qa_binary_reader_destroy(&scratch.section);
     }
-    qa_binary_reader_destroy(&directory);
+    qa_cleanup_pop(&guard);
+    qa_binary_reader_destroy(&scratch.directory);
     *out_count = count;
     return result;
   }
@@ -97,11 +120,15 @@ bool qa_q1_read_decoupled_lightmaps(bool has_data, const uint8_t *data, size_t d
   *out_count = 0;
   if (!has_data) return false;
   qa_binary_reader reader = make_reader(data, data_length, "BSPX DECOUPLED_LM");
+  qa_cleanup reader_guard;
+  qa_cleanup_push(&reader_guard, reader_release, &reader);
   if ((double)data_length != face_count * 40) {
     qa_binary_error(reader.source, 0, "record count does not match faces");
   }
   size_t count = data_length / 40;
   qa_decoupled_lightmap *result = xmalloc(count * sizeof *result);
+  qa_cleanup result_guard;
+  qa_cleanup_push(&result_guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) {
     result[i].width = qa_binary_reader_u16(&reader);
     result[i].height = qa_binary_reader_u16(&reader);
@@ -113,10 +140,25 @@ bool qa_q1_read_decoupled_lightmaps(bool has_data, const uint8_t *data, size_t d
     result[i].offset.x = s.w;
     result[i].offset.y = t.w;
   }
+  qa_cleanup_pop(&result_guard);
+  qa_cleanup_pop(&reader_guard);
   qa_binary_reader_destroy(&reader);
   *out = result;
   *out_count = count;
   return true;
+}
+
+typedef struct brush_scratch {
+  qa_binary_reader reader;
+  qa_q1_brush_list_model *models;
+  size_t count;
+} brush_scratch;
+static void brush_scratch_release(void *arg) {
+  brush_scratch *scratch = (brush_scratch *)arg;
+  qa_q1_brush_list_destroy(scratch->models, scratch->count);
+  scratch->models = NULL;
+  scratch->count = 0;
+  qa_binary_reader_destroy(&scratch->reader);
 }
 
 bool qa_q1_read_brush_list(bool has_data, const uint8_t *data, size_t data_length,
@@ -124,14 +166,20 @@ bool qa_q1_read_brush_list(bool has_data, const uint8_t *data, size_t data_lengt
   *out = NULL;
   *out_count = 0;
   if (!has_data) return false;
-  qa_binary_reader reader = make_reader(data, data_length, "BSPX BRUSHLIST");
-  qa_q1_brush_list_model *models = NULL;
-  size_t count = 0, capacity = 0;
+  brush_scratch scratch;
+  memset(&scratch, 0, sizeof scratch);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, brush_scratch_release, &scratch);
+  scratch.reader = make_reader(data, data_length, "BSPX BRUSHLIST");
+#define reader scratch.reader
+#define models scratch.models
+#define count scratch.count
+  size_t capacity = 0;
   while (qa_binary_reader_remaining(&reader) > 0) {
     uint32_t version = qa_binary_reader_u32(&reader);
     if (version != 1) {
-      qa_q1_brush_list_destroy(models, count);
-      qa_binary_reader_destroy(&reader);
+      qa_cleanup_pop(&guard);
+      brush_scratch_release(&scratch);
       return false;
     }
     double model = qa_binary_reader_u32(&reader);
@@ -142,7 +190,16 @@ bool qa_q1_read_brush_list(bool has_data, const uint8_t *data, size_t data_lengt
     if ((double)brush_count > remaining / 28 || (double)expected_planes > (remaining - (double)brush_count * 28) / 16) {
       qa_binary_error(reader.source, (int64_t)reader.cursor, "brushes or planes exceed lump");
     }
+    if (count == capacity) {
+      capacity = capacity ? capacity * 2 : 4;
+      models = xrealloc(models, capacity * sizeof *models);
+    }
+    /* The model is attached before its brushes are read, so a raise finds them. */
     qa_q1_brush_list_brush *brushes = xmalloc(brush_count * sizeof *brushes);
+    models[count].model = model;
+    models[count].brushes = brushes;
+    models[count].brush_count = brush_count;
+    count++;
     double plane_total = 0;
     for (uint32_t i = 0; i < brush_count; i++) {
       brushes[i].bounds = qa_q1_read_bounds(&reader, true);
@@ -153,6 +210,7 @@ bool qa_q1_read_brush_list(bool has_data, const uint8_t *data, size_t data_lengt
         qa_binary_error(reader.source, (int64_t)reader.cursor, "brush plane count exceeds model total");
       }
       qa_plane *planes = xmalloc(plane_count * sizeof *planes);
+      brushes[i].planes = planes;
       for (uint16_t j = 0; j < plane_count; j++) {
         planes[j].normal = qa_q1_read_vec3(&reader);
         planes[j].distance = qa_binary_reader_finite_f32(&reader);
@@ -163,19 +221,15 @@ bool qa_q1_read_brush_list(bool has_data, const uint8_t *data, size_t data_lengt
     if (plane_total != expected_planes) {
       qa_binary_error(reader.source, (int64_t)reader.cursor, "brush plane count differs from model total");
     }
-    if (count == capacity) {
-      capacity = capacity ? capacity * 2 : 4;
-      models = xrealloc(models, capacity * sizeof *models);
-    }
-    models[count].model = model;
-    models[count].brushes = brushes;
-    models[count].brush_count = brush_count;
-    count++;
   }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   *out = models;
   *out_count = count;
   return true;
+#undef reader
+#undef models
+#undef count
 }
 
 static bool per_face_styles(bool has_data, const uint8_t *data, size_t data_length, double face_count,
@@ -184,9 +238,12 @@ static bool per_face_styles(bool has_data, const uint8_t *data, size_t data_leng
   *out_count = 0;
   if (!has_data) return false;
   qa_binary_reader reader = make_reader(data, data_length, wide ? "BSPX LMSTYLE16" : "BSPX LMSTYLE");
+  qa_cleanup reader_guard;
+  qa_cleanup_push(&reader_guard, reader_release, &reader);
   double width = wide ? 2 : 1;
   if (face_count == 0) {
     if (data_length > 0) qa_binary_error(reader.source, 0, "styles with no faces");
+    qa_cleanup_pop(&reader_guard);
     qa_binary_reader_destroy(&reader);
     *out = xmalloc(0);
     return true;
@@ -204,24 +261,46 @@ static bool per_face_styles(bool has_data, const uint8_t *data, size_t data_leng
       result[i].values[j] = wide ? qa_binary_reader_u16(&reader) : qa_binary_reader_u8(&reader);
     }
   }
+  qa_cleanup_pop(&reader_guard);
   qa_binary_reader_destroy(&reader);
   *out = result;
   *out_count = faces;
   return true;
 }
 
+typedef struct normals_scratch {
+  qa_binary_reader reader, section;
+  qa_q1_face_normals *result;
+} normals_scratch;
+static void normals_scratch_release(void *arg) {
+  normals_scratch *scratch = (normals_scratch *)arg;
+  qa_binary_reader_destroy(&scratch->section);
+  qa_binary_reader_destroy(&scratch->reader);
+  if (scratch->result != NULL) {
+    free(scratch->result->vectors);
+    free(scratch->result->indices);
+    free(scratch->result);
+  }
+}
+
 static qa_q1_face_normals *read_face_normals(bool has_data, const uint8_t *data, size_t data_length,
                                              double corner_count) {
   if (!has_data) return NULL;
-  qa_binary_reader reader = make_reader(data, data_length, "BSPX FACENORMALS");
+  normals_scratch scratch;
+  memset(&scratch, 0, sizeof scratch);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, normals_scratch_release, &scratch);
+  scratch.reader = make_reader(data, data_length, "BSPX FACENORMALS");
+  qa_binary_reader *reader_pointer = &scratch.reader;
+#define reader (*reader_pointer)
   uint32_t count = qa_binary_reader_u32(&reader);
-  qa_binary_reader section;
-  section_or_die(&reader, (int64_t)reader.cursor, (int64_t)count * 12, &section);
+  section_or_die(&reader, (int64_t)reader.cursor, (int64_t)count * 12, &scratch.section);
   qa_q1_face_normals *result = xmalloc(sizeof *result);
+  scratch.result = result;
   result->vectors = xmalloc(count * sizeof *result->vectors);
   result->vector_count = count;
-  for (uint32_t i = 0; i < count; i++) result->vectors[i] = qa_q1_read_vec3(&section);
-  qa_binary_reader_destroy(&section);
+  for (uint32_t i = 0; i < count; i++) result->vectors[i] = qa_q1_read_vec3(&scratch.section);
+  qa_binary_reader_destroy(&scratch.section);
   qa_binary_reader_skip(&reader, (int64_t)count * 12);
   size_t corners = (size_t)corner_count;
   /* TS grows the list one corner at a time and the reads fail at the end of
@@ -240,8 +319,10 @@ static qa_q1_face_normals *read_face_normals(bool has_data, const uint8_t *data,
     result->indices[i][1] = tangent;
     result->indices[i][2] = bitangent;
   }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   return result;
+#undef reader
 }
 
 static bool exact_lump(const qa_q1_bspx_lump *lumps, size_t lump_count, const char *name, double length,
@@ -298,8 +379,8 @@ void qa_q1_read_bspx_metadata(const qa_q1_bspx_lump *lumps, size_t lump_count, d
     out->rgb_lighting_length = length;
   }
   if (qa_q1_bspx_data(lumps, lump_count, "LIGHTING_E5BGR9", &data, &length)) {
+    if (length % 4 != 0) qa_binary_error("BSPX LIGHTING_E5BGR9", 0, "lump length %zu is not a multiple of 4", length);
     qa_binary_reader reader = make_reader(data, length, "BSPX LIGHTING_E5BGR9");
-    if (length % 4 != 0) qa_binary_error(reader.source, 0, "lump length %zu is not a multiple of 4", length);
     size_t count = length / 4;
     out->hdr_lighting = xmalloc(count * sizeof *out->hdr_lighting);
     out->hdr_lighting_count = count;
@@ -314,10 +395,13 @@ void qa_q1_read_bspx_metadata(const qa_q1_bspx_lump *lumps, size_t lump_count, d
     data = normals_data;
     length = normals_length;
     qa_binary_reader reader = make_reader(data, length, "BSPX VERTEXNORMALS");
+    qa_cleanup reader_guard;
+    qa_cleanup_push(&reader_guard, reader_release, &reader);
     size_t count = length / 12;
     out->vertex_normals = xmalloc(count * sizeof *out->vertex_normals);
     out->vertex_normal_count = count;
     for (size_t i = 0; i < count; i++) out->vertex_normals[i] = qa_q1_read_vec3(&reader);
+    qa_cleanup_pop(&reader_guard);
     qa_binary_reader_destroy(&reader);
   }
   has = qa_q1_bspx_data(lumps, lump_count, "FACENORMALS", &data, &length);

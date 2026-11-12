@@ -42,6 +42,7 @@ typedef struct rimpl {
   qa_scene_play_cinematic_fn play; void *play_ctx;
   char *family;
   qa_shader_replacement_stage *stage; int stage_owned;
+  qa_shader_replacement_stage *owned_stage; /* the stage replacement() began; commit clears `stage`, not this */
   /* owned compiled materials + backing storage */
   qa_compiled_material **owned_compiled; size_t nowned, cowned;
   qa_shader_script_inspection *inspections; size_t ninsp, cinsp;
@@ -49,6 +50,8 @@ typedef struct rimpl {
   qa_finish_shader_input_result *implicit_inputs; size_t nimp, cimp;
   qa_shader_registration_result *reg_results; size_t nreg, creg;
   void **scratch; size_t nscratch, cscratch;
+  /* Stages prepareRemapMaterials began on a live registry (TS: garbage once committed or discarded). */
+  qa_shader_replacement_stage **remap_stages; size_t nremap, cremap;
   qa_scene_shader_registry *self;
 } rimpl;
 static rimpl *ri(qa_scene_shader_registry *r) { return (rimpl *)r->_impl; }
@@ -144,6 +147,9 @@ static void host_warning(void *vctx, const char *message) {
   host_ctx *hc = vctx; warn_ctx *c = xalloc(sizeof *c); c->r = hc->r; c->message = xdup(message); effect_push(hc->effects, apply_warning, c);
 }
 typedef struct prepared_material { const qa_compiled_material *compiled; int defaulted; } prepared_material;
+/* An implicit material keeps the name it was compiled with (TS: the string). The caller's storage may be
+ * shorter-lived (an image request of a registry that is later replaced), so the registry keeps a copy. */
+static const char *own_name(rimpl *o, const char *name) { char *copy = xdup(name); scratch_add(o, copy); return copy; }
 static prepared_material compile_shader(qa_scene_shader_registry *r, const char *name, const qa_renderer_image *lightmap, double lightmap_index, const qa_scene_texture *base_texture, bool mipmap, effects *fx) {
   rimpl *o = ri(r);
   char *name_key = key_of(name);
@@ -157,7 +163,7 @@ static prepared_material compile_shader(qa_scene_shader_registry *r, const char 
       o->gen_texs[o->ngt++] = (gen_tex){ xdup(name_key), texture };
     }
     qa_mat_finish_implicit_input input; memset(&input, 0, sizeof input);
-    input.kind = "picture"; input.name = name; input.profile = r->profile;
+    input.kind = "picture"; input.name = own_name(o, name); input.profile = r->profile;
     input.base_image = loaded_stage(texture->image, 0);
     qa_compiled_material compiled = qa_compile_implicit_material(input, finish_service(o));
     free(name_key);
@@ -199,13 +205,13 @@ static prepared_material compile_shader(qa_scene_shader_registry *r, const char 
     sprintf(msg, "%s: missing shader image, using the source default material", name);
     warn_ctx *c = xalloc(sizeof *c); c->r = r; c->message = msg; effect_push(fx, apply_warning, c);
     qa_mat_finish_implicit_input input; memset(&input, 0, sizeof input);
-    input.kind = "default"; input.name = name; input.base_image = base; input.profile = r->profile;
+    input.kind = "default"; input.name = own_name(o, name); input.base_image = base; input.profile = r->profile;
     qa_compiled_material compiled = qa_compile_implicit_material(input, finish_service(o));
     free(name_key);
     return (prepared_material){ own_compiled(o, compiled), 1 };
   }
   qa_mat_finish_implicit_input input; memset(&input, 0, sizeof input);
-  input.name = name; input.base_image = base; input.profile = r->profile;
+  input.name = own_name(o, name); input.base_image = base; input.profile = r->profile;
   if (lightmap) { input.kind = "lightmap"; input.lightmap_index = lightmap_index; input.lightmap_image = loaded_stage(*lightmap, 1); }
   else if (lightmap_index == -2) { input.kind = "white"; input.white_image = loaded_stage(r->textures->white->image, 0); }
   else input.kind = lightmap_index == -4 ? "picture" : lightmap_index == -3 ? "vertex" : "dynamic";
@@ -327,10 +333,15 @@ static qa_registered_scene_material register_material(qa_scene_shader_registry *
   free(provider_key);
   for (size_t i = 0; i < o->ncomp; i++) if (!strcmp(o->compiled[i].key, cache_key)) return o->compiled[i].material;
   if (!binding.is_world) {
-    char * key2;
-    char * name2;
-    if (o->nreq == o->creq) { o->creq = o->creq ? o->creq * 2 : 8; o->img_reqs = xg(o->img_reqs, o->creq * sizeof *o->img_reqs); }
-    o->img_reqs[o->nreq++] = (key2 = xdup(cache_key), name2 = xdup(name), (img_req){ key2, name2, binding });
+    /* imageRequests.set(key, ...): a Map, so a repeated key replaces its entry in place. */
+    img_req *existing = NULL;
+    for (size_t i = 0; i < o->nreq; i++) if (!strcmp(o->img_reqs[i].key, cache_key)) existing = &o->img_reqs[i];
+    if (existing) { free(existing->name); existing->name = xdup(name); existing->binding = binding; }
+    else {
+      if (o->nreq == o->creq) { o->creq = o->creq ? o->creq * 2 : 8; o->img_reqs = xg(o->img_reqs, o->creq * sizeof *o->img_reqs); }
+      char *key2 = xdup(cache_key), *name2 = xdup(name);
+      o->img_reqs[o->nreq++] = (img_req){ key2, name2, binding };
+    }
   }
   qa_shader_registration *registration = reserve_with(r, logical);
   prepared_material current = compile_default_effects(r, name, lightmap, lightmap_index, base_texture, mipmap);
@@ -345,6 +356,14 @@ static qa_registered_scene_material register_material(qa_scene_shader_registry *
   o->compiled[o->ncomp++] = (compiled_entry){ xdup(cache_key), material, current.defaulted };
   return material;
 }
+/* TS registerBound: catch (error) { this.bindings.delete(material.registration); throw error; } */
+typedef struct bind_guard { qa_scene_shader_registry *registry; qa_shader_registration *registration; } bind_guard;
+static void bind_failed(void *arg) {
+  bind_guard *g = arg; rimpl *o = ri(g->registry);
+  for (size_t i = 0; i < o->nbind; i++) if (o->bindings[i].registration == g->registration) {
+    memmove(o->bindings + i, o->bindings + i + 1, (o->nbind - i - 1) * sizeof *o->bindings); o->nbind--; return;
+  }
+}
 static qa_registered_scene_material register_bound(qa_scene_shader_registry *r, qa_registered_scene_material material, qa_scene_shader_binding binding) {
   rimpl *o = ri(r);
   for (size_t i = 0; i < o->nbind; i++) if (o->bindings[i].registration == material.registration) return material;
@@ -352,7 +371,10 @@ static qa_registered_scene_material register_bound(qa_scene_shader_registry *r, 
   o->bindings[o->nbind++] = (binding_entry){ material.registration, material, binding };
   if (!o->stage) {
     qa_scene_remap_source source = qa_scene_shader_registry_remap_source(r);
+    bind_guard guard = { r, material.registration };
+    qa_cleanup node; qa_cleanup_push(&node, bind_failed, &guard);
     qa_scene_material_registrations_bind_material(r->registrations->owner, source, material, binding);
+    qa_cleanup_pop(&node);
   }
   return material;
 }
@@ -402,9 +424,11 @@ void qa_scene_shader_registry_destroy(qa_scene_shader_registry *r) {
   free(o->implicit_inputs);
   for (size_t i = 0; i < o->nreg; i++) qa_shader_registration_result_free(&o->reg_results[i]);
   free(o->reg_results);
+  for (size_t i = 0; i < o->nremap; i++) { qa_shader_replacement_stage_destroy(o->remap_stages[i]); free(o->remap_stages[i]); }
+  free(o->remap_stages);
   for (size_t i = 0; i < o->nscratch; i++) free(o->scratch[i]);
   free(o->scratch); free(o->family);
-  if (o->stage_owned) { qa_shader_replacement_stage_destroy(o->stage); free(o->stage); }
+  if (o->stage_owned) { qa_shader_replacement_stage_destroy(o->owned_stage); free(o->owned_stage); }
   free(o);
   for (size_t i = 0; i < r->warning_count; i++) free(r->warnings[i]);
   free(r->warnings);
@@ -412,7 +436,7 @@ void qa_scene_shader_registry_destroy(qa_scene_shader_registry *r) {
 }
 qa_source_scene_materials qa_scene_shader_registry_source_materials(qa_scene_shader_registry *r) {
   rimpl *o = ri(r);
-  if (!o->has_source) qa_range_error("Source materials have not finished initialization");
+  if (!o->has_source) qa_raise("Error", 0, 0, "Source materials have not finished initialization");
   return o->source_materials;
 }
 bool qa_scene_shader_registry_preparing_replacement(const qa_scene_shader_registry *r) { return ((rimpl *)r->_impl)->stage != NULL; }
@@ -451,7 +475,12 @@ void qa_scene_shader_registry_initialize_source_materials(qa_scene_shader_regist
   o->has_source = 1;
 }
 static void register_script_entry(rimpl *o, qa_shader_catalog_entry *entry) {
-  char *key = key_of(entry->name);
+  /* The entry name is decoded text (UTF-8); requested names (BSP, model, configstring) are TS
+     Latin-1 strings held as code-unit bytes. TS compares the strings, so the key is the name's
+     code units (gate-misc3). */
+  char *units = qa_shader_text_name_code_units(entry->name);
+  char *key = key_of(units);
+  free(units);
   int present = 0; for (size_t k = 0; k < o->nprog; k++) if (!strcmp(o->programs[k].key, key)) present = 1;
   if (present) { free(key); return; }
   if (o->nprog == o->cprog) { o->cprog = o->cprog ? o->cprog * 2 : 8; o->programs = xg(o->programs, o->cprog * sizeof *o->programs); }
@@ -460,6 +489,8 @@ static void register_script_entry(rimpl *o, qa_shader_catalog_entry *entry) {
     if (entry->definition.stages[s].stage.map.kind && !strcmp(entry->definition.stages[s].stage.map.kind, "video")) cinematic = 1;
   o->programs[o->nprog++] = (program_entry){ key, &entry->program, cinematic };
 }
+typedef struct inspect_scope { const char *text, *source; qa_shader_script_inspection *out; } inspect_scope;
+static void inspect_body(void *ctx) { inspect_scope *scope = ctx; qa_inspect_shader_script(scope->text, scope->source, NULL, scope->out); }
 void qa_scene_shader_registry_add_script(qa_scene_shader_registry *r, const char *text, const char *source) {
   qa_scene_shader_registry_add_script_files(r, &text, &source, 1);
 }
@@ -468,8 +499,8 @@ void qa_scene_shader_registry_add_script(qa_scene_shader_registry *r, const char
  * concatenation, which is built in reverse; the first hashed name wins. */
 void qa_scene_shader_registry_add_script_files(qa_scene_shader_registry *r, const char *const *texts, const char *const *sources, size_t count) {
   rimpl *o = ri(r);
-  /* Unlexable scripts contribute no shaders in TS (try/catch). The C inspector captures
-   * per-entry errors instead of throwing for bad entries, matching the observable program set.
+  /* A script whose lexing throws contributes no shaders and must not abort loading the rest
+   * (TS try/catch around inspectShaderScript). Bad entries are captured per entry by the inspector.
    * Inspections stay owned by the registry: programs point into them. */
   size_t first = o->ninsp;
   for (size_t f = 0; f < count; f++) {
@@ -477,7 +508,9 @@ void qa_scene_shader_registry_add_script_files(qa_scene_shader_registry *r, cons
     qa_shader_script_inspection *insp = &o->inspections[o->ninsp];
     memset(insp, 0, sizeof *insp);
     const char *source = sources != NULL && sources[f] != NULL ? sources[f] : "<shader>";
-    qa_inspect_shader_script(texts[f], source, NULL, insp);
+    inspect_scope scope = { texts[f], source, insp };
+    qa_caught_error caught;
+    if (!qa_try(inspect_body, &scope, &caught)) memset(insp, 0, sizeof *insp);
     o->ninsp++;
   }
   for (size_t f = 0; f + 1 < count; f++) {
@@ -515,9 +548,10 @@ typedef struct remap_ctx {
 static bool remap_current(void *v) { remap_ctx *c = v; return !c->finished && c->r->textures == c->textures && ((rimpl *)c->r->_impl)->stage == (c->parent_stage ? c->stage : ((rimpl *)c->r->_impl)->stage); }
 static void remap_commit(void *v) {
   remap_ctx *c = v;
-  if (!remap_current(v)) qa_range_error("Prepared shader remap belongs to retired images");
+  if (!remap_current(v)) qa_raise("Error", 0, 0, "Prepared shader remap belongs to retired images");
   if (!c->parent_stage) qa_shader_replacement_stage_commit(c->stage);
   for (size_t i = 0; i < c->fx.n; i++) c->fx.fns[i](c->fx.ctxs[i]), free(c->fx.ctxs[i]);
+  free(c->fx.fns); free(c->fx.ctxs); c->fx.fns = NULL; c->fx.ctxs = NULL; c->fx.cap = 0;
   c->fx.n = 0; c->finished = 1;
 }
 static void remap_discard(void *v) {
@@ -525,6 +559,7 @@ static void remap_discard(void *v) {
   if (c->finished) return;
   if (!c->parent_stage) qa_shader_replacement_stage_discard(c->stage);
   for (size_t i = 0; i < c->fx.n; i++) free(c->fx.ctxs[i]);
+  free(c->fx.fns); free(c->fx.ctxs); c->fx.fns = NULL; c->fx.ctxs = NULL; c->fx.cap = 0;
   c->fx.n = 0; c->finished = 1;
 }
 void qa_scene_shader_registry_prepare_remap_materials(qa_scene_shader_registry *r, const char *name, const qa_scene_shader_binding *bindings, size_t count, qa_prepared_scene_remap *out) {
@@ -534,7 +569,12 @@ void qa_scene_shader_registry_prepare_remap_materials(qa_scene_shader_registry *
   c->r = r; c->textures = r->textures; c->parent_stage = o->stage != NULL;
   qa_shader_replacement_stage *stage;
   if (c->parent_stage) stage = o->stage;
-  else { stage = xalloc(sizeof *stage); scratch_add(o, stage); qa_provider_shader_registrations_begin_replacement(r->registrations, stage); }
+  else {
+    stage = xalloc(sizeof *stage);
+    qa_provider_shader_registrations_begin_replacement(r->registrations, stage);
+    if (o->nremap == o->cremap) { o->cremap = o->cremap ? o->cremap * 2 : 4; o->remap_stages = xg(o->remap_stages, o->cremap * sizeof(void *)); }
+    o->remap_stages[o->nremap++] = stage;
+  }
   c->stage = stage; c->fx.deferred = 1; c->fx.registry = r;
   c->materials = xalloc((count ? count : 1) * sizeof *c->materials); scratch_add(o, c->materials);
   int accepted = 1;
@@ -561,7 +601,7 @@ void qa_scene_shader_registry_replacement(qa_scene_shader_registry *r, qa_scene_
   qa_shader_replacement_stage *stage = xalloc(sizeof *stage);
   qa_provider_shader_registrations_begin_replacement(r->registrations, stage);
   qa_scene_shader_registry_init(replacement, textures, r->registrations, &r->profile, o->play, o->play_ctx, o->family, stage);
-  rimpl *ro = ri(replacement); ro->stage_owned = 1;
+  rimpl *ro = ri(replacement); ro->stage_owned = 1; ro->owned_stage = stage;
   for (size_t i = 0; i < o->ngp; i++) {
     if (ro->ngp == ro->cgp) { ro->cgp = ro->cgp ? ro->cgp * 2 : 4; ro->gen_pics = xg(ro->gen_pics, ro->cgp * sizeof *ro->gen_pics); }
     ro->gen_pics[ro->ngp++] = (gen_pic){ xdup(o->gen_pics[i].key), o->gen_pics[i].image };
@@ -574,7 +614,7 @@ void qa_scene_shader_registry_replacement(qa_scene_shader_registry *r, qa_scene_
 void qa_scene_shader_registry_prepare_replacement(qa_scene_shader_registry *r, qa_scene_shader_registry *replacement) {
   rimpl *o = ri(r), *ro = ri(replacement);
   if (o->has_source) {
-    if (!ro->stage) qa_range_error("Source image replacement has no staging owner");
+    if (!ro->stage) qa_raise("Error", 0, 0, "Source image replacement has no staging owner");
     ro->source_request = o->source_request;
     ro->has_replacement_count = 1; ro->replacement_count = (double)o->nrec;
     for (size_t i = 0; i < o->nrec; i++) {
@@ -601,8 +641,8 @@ void qa_scene_shader_registry_prepare_replacement(qa_scene_shader_registry *r, q
     qa_registered_scene_material srcs[5] = { o->source_materials.default_material, o->source_materials.stencil_shadow, o->source_materials.projection_shadow, o->source_materials.flare, o->source_materials.sun };
     for (int k = 0; k < 5; k++) {
       int found = 0;
-      for (size_t i = 0; i < ro->nrec; i++) if (ro->records[i].material.registration == srcs[k].registration) { *fields[k] = ro->records[i].material; found = 1; }
-      if (!found) qa_range_error("Source internal material was not replaced");
+      for (size_t i = 0; i < ro->nrec && !found; i++) if (ro->records[i].material.registration == srcs[k].registration) { *fields[k] = ro->records[i].material; found = 1; }
+      if (!found) qa_raise("Error", 0, 0, "Source internal material was not replaced");
     }
     ro->source_materials = rebound; ro->has_source = 1;
     ro->source_default = rebound.default_material; ro->has_source_default = 1;
@@ -613,17 +653,17 @@ void qa_scene_shader_registry_prepare_replacement(qa_scene_shader_registry *r, q
 void qa_scene_shader_registry_validate_replacement(qa_scene_shader_registry *r, qa_scene_shader_registry *replacement) {
   rimpl *o = ri(r), *ro = ri(replacement);
   if (replacement->registrations != r->registrations || !ro->stage)
-    qa_range_error("Shader replacement belongs to another provider or is already complete");
+    qa_raise("Error", 0, 0, "Shader replacement belongs to another provider or is already complete");
   /* TS sourcePending is always 0 in the sync port. */
   if (ro->has_replacement_count && ro->replacement_count != (double)o->nrec)
-    qa_range_error("Source shader allocations changed during replacement");
+    qa_raise("Error", 0, 0, "Source shader allocations changed during replacement");
   qa_shader_replacement_stage_validate(ro->stage);
 }
 void qa_scene_shader_registry_commit_replacement(qa_scene_shader_registry *r, qa_scene_shader_registry *replacement) {
   qa_scene_shader_registry_validate_replacement(r, replacement);
   rimpl *o = ri(r), *ro = ri(replacement);
   qa_shader_replacement_stage *stage = ro->stage;
-  if (!stage) qa_range_error("Shader replacement lost its stage");
+  if (!stage) qa_raise("Error", 0, 0, "Shader replacement lost its stage");
   qa_shader_replacement_stage_commit(stage);
   ro->stage = NULL;
   qa_scene_material_registrations *owner = r->registrations->owner;
@@ -676,10 +716,27 @@ void qa_scene_shader_registry_commit_replacement(qa_scene_shader_registry *r, qa
     be.material = qa_scene_material_registrations_retained(owner, be.material.registration);
     o->bindings[o->nbind++] = be;
   }
+  /* The committed materials view the compiled shaders the replacement built. TS keeps them alive by
+   * reference; here the live registry takes them over, because the staging registry is destroyed
+   * once its refresh has committed. */
+  #define ADOPT(field, n, c) do { \
+    for (size_t i = 0; i < ro->n; i++) { \
+      if (o->n == o->c) { o->c = o->c ? o->c * 2 : 8; o->field = xg(o->field, o->c * sizeof *o->field); } \
+      o->field[o->n++] = ro->field[i]; \
+    } \
+    ro->n = 0; \
+  } while (0)
+  ADOPT(owned_compiled, nowned, cowned);
+  ADOPT(finishes, nfin, cfin);
+  ADOPT(implicit_inputs, nimp, cimp);
+  ADOPT(reg_results, nreg, creg);
+  ADOPT(inspections, ninsp, cinsp);
+  ADOPT(scratch, nscratch, cscratch);
+  #undef ADOPT
 }
 void qa_scene_shader_registry_discard_replacement(qa_scene_shader_registry *replacement) {
   rimpl *o = ri(replacement);
-  if (!o->stage) qa_range_error("Live shader registry cannot be discarded as a replacement");
+  if (!o->stage) qa_raise("Error", 0, 0, "Live shader registry cannot be discarded as a replacement");
   qa_shader_replacement_stage_discard(o->stage);
   for (size_t i = 0; i < o->ncomp; i++) free(o->compiled[i].key);
   o->ncomp = 0;

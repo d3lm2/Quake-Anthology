@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "qa/foundation/support.h"
+#include "qa/ui/common/controls.h"
 #include "qa/input/support.h"
 #include "qa/foundation/js_case.h"
 
@@ -63,7 +64,7 @@ static void clear_pool(lib_state *s) {
   s->pool_count = 0;
 }
 static bool blank_trim(const char *text) {
-  char *trimmed = qa_input_js_trim(text);
+  char *trimmed = qa_ui_js_trim(text);
   if (trimmed == NULL) qa_range_error("Out of memory");
   bool empty = trimmed[0] == '\0';
   free(trimmed);
@@ -326,6 +327,8 @@ static qa_ui_menu factory(void *v) {
   status_control->visible = true;
   status_control->activate_seat = on_activate;
   add_button(s, &at, "back", "Back", 48, 418, 544, L_BACK, true);
+  /* next_control may have moved the ctx array while the controls were added. */
+  for (size_t i = 0; i < at; i++) s->controls[i].ctx = &s->ctxs[i];
   free(entries);
   qa_ui_menu menu;
   memset(&menu, 0, sizeof menu);

@@ -18,5 +18,12 @@
 qa_resolved_gameplay_mod qa_read_gameplay_mod(const qa_save_reader *reader);
 qa_mod_identity qa_read_mod_identity(const qa_save_reader *reader);
 struct qa_mod_session_checkpoint qa_read_mod_session(const qa_save_reader *reader);
+/* Frees what qa_read_gameplay_mod allocated: the dependency selections and the declaration. */
+void qa_resolved_gameplay_mod_release(qa_resolved_gameplay_mod *mod);
+/* Frees what qa_read_mod_identity allocated (the module and provider arrays). */
+void qa_mod_identity_release(qa_mod_identity *identity);
+/* Frees what qa_read_mod_session allocated: every mod's identity lists, guest checkpoints
+ * (qa_guest_checkpoint_release) and provider array, and the mod array. */
+void qa_mod_session_checkpoint_release(struct qa_mod_session_checkpoint *session);
 
 #endif

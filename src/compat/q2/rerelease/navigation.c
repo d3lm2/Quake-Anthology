@@ -53,6 +53,8 @@ qa_guest_call_result qa_compat_q2_rerelease_navigation_imports_invoke(qa_compat_
   int64_t point_count = qa_compat_q2_mem_read_i64(memory, qa_compat_q2_mem_offset(memory, request, 72));
   if (point_count < 0 || point_count > 0x7fffffff || (point_count > 0 && !has_buffer)) qa_range_error("Invalid Q2 navigation point buffer");
   if (has_buffer) memory->check(memory->ctx, buffer, (double)point_count * 12, "write");
+  /* rereleasePathToGoal(this.services.runtime(), { ... }): the runtime is asked for before the request is read. */
+  void *runtime = n->services.runtime(n->services.ctx);
   qa_compat_q2_rerelease_path_request req;
   req.start = read_vector(memory, request); req.goal = read_vector(memory, qa_compat_q2_mem_offset(memory, request, 12));
   req.flags = qa_compat_q2_mem_read_u32(memory, qa_compat_q2_mem_offset(memory, request, 24));
@@ -61,7 +63,7 @@ qa_guest_call_result qa_compat_q2_rerelease_navigation_imports_invoke(qa_compat_
   req.min_height = read_finite(memory, request, 40); req.max_height = read_finite(memory, request, 44);
   req.radius = read_finite(memory, request, 48); req.drop_height = read_finite(memory, request, 52);
   req.jump_height = read_finite(memory, request, 56);
-  qa_compat_q2_rerelease_path_result result = n->services.path_to_goal(n->services.ctx, n->services.runtime(n->services.ctx), req);
+  qa_compat_q2_rerelease_path_result result = n->services.path_to_goal(n->services.ctx, runtime, req);
   size_t points_written = result.point_count < (size_t)point_count ? result.point_count : (size_t)point_count;
   if (has_buffer) for (size_t i = 0; i < points_written; i++)
     write_vector(memory, qa_compat_q2_mem_offset(memory, buffer, (int64_t)(i * 12)), result.points[i]);

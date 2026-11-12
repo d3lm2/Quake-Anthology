@@ -29,7 +29,7 @@ qa_app_arena_selection qa_app_arena_selection_make(const qa_app_base_arena_catal
     char tier[64];
     if (strcmp(special, "training") == 0) snprintf(tier, sizeof tier, "training");
     else if (strcmp(special, "final") == 0) snprintf(tier, sizeof tier, "final");
-    else snprintf(tier, sizeof tier, "%.0f", trunc(arena->number / 4) + 1);
+    else snprintf(tier, sizeof tier, "%s", QA_JS_NUMBER(trunc(arena->number / 4) + 1)); /* String(...) */
     bool known = false;
     for (size_t t = 0; t < out.tier_count; t++) if (strcmp(out.tiers[t].id, tier) == 0) known = true;
     if (!known) {
@@ -49,8 +49,13 @@ qa_app_arena_selection qa_app_arena_selection_make(const qa_app_base_arena_catal
         qa_app_base_arena_progression_level_available(progress, arena->number)};
   }
   /* current: saved selection (trimmed, Number()) else currentLevel map else first available. */
+  /* savedSelection.trim() === "": JS white space, as qa_js_string_to_number trims it. */
   bool blank = true;
-  for (const char *p = saved_selection; *p; p++) if (!isspace((unsigned char)*p)) blank = false;
+  for (const char *p = saved_selection; *p;) {
+    size_t space = qa_js_white_space_length(p);
+    if (space == 0) { blank = false; break; }
+    p += space;
+  }
   const char *current = NULL;
   if (!blank) {
     double wanted = qa_js_string_to_number(saved_selection); /* Number(savedSelection) */

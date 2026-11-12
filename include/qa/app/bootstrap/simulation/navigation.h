@@ -93,10 +93,10 @@ typedef struct qa_app_sim_navigation_simulation {
   /* The SharedSimulation view createPlayerMovementPrediction reads. */
   qa_app_sim_prediction_simulation (*prediction)(void *ctx);
   /* TS applicationTrainConnections(simulation, profile) (bot-mover-
-   * connections.ts, not yet ported in C); the array is borrowed. */
+   * connections.ts, bot_mover_connections.c); the array is borrowed. */
   const qa_navigation_connection *(*train_connections)(void *ctx, qa_navigation_profile profile, size_t *out_count);
   /* TS predictApplicationBotMovement(simulation, player, query, navigation)
-   * (bot-prediction.ts, not yet ported in C). */
+   * (bot-prediction.ts, bot_prediction.c). */
   qa_bot_travel_prediction_result (*predict_movement)(void *ctx, const qa_app_sim_nav_player *player,
       qa_bot_movement_prediction query, qa_navigation_runtime *navigation);
 } qa_app_sim_navigation_simulation;

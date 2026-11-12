@@ -29,17 +29,20 @@ struct qa_app_q3_mapped_ammo_regeneration {
   qa_app_inventory_access inventory;
   const qa_pickup_supply_owner *legacy_owners;
   size_t legacy_owner_count;
-  binding bindings[16];
+  binding *bindings; /* TS bindings (any count) */
   size_t binding_count;
-  actor_entry entries[64];
-  size_t entry_count;
+  actor_entry **entries; /* TS entries Map: one allocation per actor (timers point back at it) */
+  size_t entry_count, entry_capacity;
+  /* Entries taken out of the map whose views a caller may still hold (TS keeps the timer
+   * objects alive and their current() turns false): freed at a point where none is held. */
+  actor_entry **retired; size_t retired_count, retired_capacity;
   bool closed;
 };
 
 static bool item_eq(qa_item_id a, qa_item_id b) { return a && b && strcmp(a, b) == 0; }
 static actor_entry *find_entry(qa_app_q3_mapped_ammo_regeneration *regen, qa_owned_actor actor) {
   for (size_t i = 0; i < regen->entry_count; i++)
-    if (qa_same_actor(regen->entries[i].actor.id, actor.id) && regen->entries[i].actor.token == actor.token) return &regen->entries[i];
+    if (qa_same_actor(regen->entries[i]->actor.id, actor.id) && regen->entries[i]->actor.token == actor.token) return regen->entries[i];
   return NULL;
 }
 static bool timer_current(pool_timer *timer) {
@@ -49,12 +52,12 @@ static bool timer_current(pool_timer *timer) {
       && find_entry(regen, entry->actor) == entry;
 }
 static qa_inventory_entry read_entry(pool_timer *timer) {
-  if (!timer_current(timer)) qa_range_error("Mapped ammo timer actor is retired");
+  if (!timer_current(timer)) qa_raise("Error", 0, 0, "Mapped ammo timer actor is retired");
   actor_entry *entry = timer->entry;
   size_t count = 0;
   const qa_inventory_entry *entries = entry->owner->inventory.entries(entry->owner->inventory.ctx, entry->actor.id, &count);
   for (size_t i = 0; i < count; i++) if (item_eq(entries[i].item, timer->item)) return entries[i];
-  qa_range_error("Mapped ammo pool is not admitted by the selected inventory");
+  qa_raise("Error", 0, 0, "Mapped ammo pool is not admitted by the selected inventory");
 }
 static bool current_cb(void *v) { return timer_current((pool_timer *)v); }
 static double get_count_cb(void *v) { return read_entry((pool_timer *)v).count; }
@@ -67,14 +70,62 @@ static void set_count_cb(void *v, double value) {
 static double get_elapsed_cb(void *v) { return ((pool_timer *)v)->elapsed; }
 static void set_elapsed_cb(void *v, double value) { ((pool_timer *)v)->elapsed = value; }
 
+static void free_entry(actor_entry *entry) { free(entry->timers); free(entry->views); free(entry); }
+/* entries.delete(actor) for the entry at index. */
+static void delete_entry_at(qa_app_q3_mapped_ammo_regeneration *regen, size_t index) {
+  free_entry(regen->entries[index]);
+  memmove(regen->entries + index, regen->entries + index + 1, (regen->entry_count - index - 1) * sizeof *regen->entries);
+  regen->entry_count--;
+}
+/* entries.delete(actor) where a caller may hold the entry's views: the entry leaves the map
+ * (its views report current() false) and is freed by release_retired. */
+static void retire_entry_at(qa_app_q3_mapped_ammo_regeneration *regen, size_t index) {
+  if (regen->retired_count == regen->retired_capacity) {
+    size_t capacity = regen->retired_capacity ? regen->retired_capacity * 2 : 4;
+    actor_entry **grown = realloc(regen->retired, capacity * sizeof *grown);
+    if (!grown) qa_range_error("Out of memory");
+    regen->retired = grown; regen->retired_capacity = capacity;
+  }
+  regen->retired[regen->retired_count++] = regen->entries[index];
+  memmove(regen->entries + index, regen->entries + index + 1, (regen->entry_count - index - 1) * sizeof *regen->entries);
+  regen->entry_count--;
+}
+static void release_retired(qa_app_q3_mapped_ammo_regeneration *regen) {
+  for (size_t i = 0; i < regen->retired_count; i++) free_entry(regen->retired[i]);
+  regen->retired_count = 0;
+}
+/* TS actors.onRelease deletes a released actor's entry. The shared simulation does not route
+ * that release here, so before a lookup that can add an entry, the entries of actors that are
+ * no longer live are dropped (a released actor never resolves or passes assertOwned again, so
+ * no reader can tell the later drop from TS's). The views timers() returns are used by one
+ * client timer step, which never calls back into this owner, so no view is held here. */
+static void drop_released(qa_app_q3_mapped_ammo_regeneration *regen) {
+  release_retired(regen);
+  for (size_t i = 0; i < regen->entry_count;) {
+    if (regen->actors.is_live(regen->actors.ctx, regen->entries[i]->actor.id)) i++;
+    else delete_entry_at(regen, i);
+  }
+}
+/* catch { this.entries.delete(actor); throw error; } around the first reads of a new entry. */
+static void forget_new_entry(void *arg) {
+  actor_entry *entry = arg;
+  qa_app_q3_mapped_ammo_regeneration *regen = entry->owner;
+  for (size_t i = 0; i < regen->entry_count; i++) if (regen->entries[i] == entry) { delete_entry_at(regen, i); return; }
+}
 static actor_entry *require_entry(qa_app_q3_mapped_ammo_regeneration *regen, qa_owned_actor actor) {
-  if (regen->closed) qa_range_error("Mapped ammo timer owner is closed");
+  if (regen->closed) qa_raise("Error", 0, 0, "Mapped ammo timer owner is closed");
   regen->actors.assert_owned(regen->actors.ctx, actor);
+  drop_released(regen);
   actor_entry *retained = find_entry(regen, actor);
   if (retained) return retained;
-  if (regen->entry_count >= 64) qa_range_error("Out of memory");
-  actor_entry *entry = &regen->entries[regen->entry_count];
-  memset(entry, 0, sizeof *entry);
+  if (regen->entry_count == regen->entry_capacity) {
+    size_t capacity = regen->entry_capacity ? regen->entry_capacity * 2 : 16;
+    actor_entry **grown = realloc(regen->entries, capacity * sizeof *grown);
+    if (!grown) qa_range_error("Out of memory");
+    regen->entries = grown; regen->entry_capacity = capacity;
+  }
+  actor_entry *entry = calloc(1, sizeof *entry);
+  if (!entry) qa_range_error("Out of memory");
   entry->actor = actor; entry->owner = regen; entry->count = regen->binding_count;
   entry->timers = calloc(entry->count ? entry->count : 1, sizeof *entry->timers);
   entry->views = calloc(entry->count ? entry->count : 1, sizeof *entry->views);
@@ -89,12 +140,18 @@ static actor_entry *require_entry(qa_app_q3_mapped_ammo_regeneration *regen, qa_
     entry->views[i].set_elapsed = set_elapsed_cb;
     timer->view = entry->views[i];
   }
-  regen->entry_count++;
+  regen->entries[regen->entry_count++] = entry;
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, forget_new_entry, entry);
   for (size_t i = 0; i < entry->count; i++) (void)read_entry(&entry->timers[i]);
+  qa_cleanup_pop(&cleanup);
   return entry;
 }
-static void free_entry(actor_entry *entry) { free(entry->timers); free(entry->views); entry->timers = NULL; entry->views = NULL; }
 
+static void create_failed(void *arg) {
+  qa_app_q3_mapped_ammo_regeneration *regen = arg;
+  free(regen->bindings); free(regen);
+}
 qa_app_q3_mapped_ammo_regeneration *qa_app_q3_mapped_ammo_regeneration_create(qa_pickup_supply_profile profile,
     qa_app_ammo_actor_registry actors, qa_app_inventory_access inventory,
     const qa_pickup_supply_owner *legacy_owners, size_t legacy_owner_count) {
@@ -103,25 +160,31 @@ qa_app_q3_mapped_ammo_regeneration *qa_app_q3_mapped_ammo_regeneration_create(qa
   regen->profile = profile; regen->actors = actors; regen->inventory = inventory;
   regen->legacy_owners = legacy_owners; regen->legacy_owner_count = legacy_owner_count;
   size_t owner_count = profile.ammo_owners ? profile.ammo_owner_count : 0;
+  regen->bindings = calloc(owner_count ? owner_count : 1, sizeof *regen->bindings);
+  if (!regen->bindings) { free(regen); return NULL; }
+  qa_cleanup cleanup; /* a refused profile frees the owner (TS GC) */
+  qa_cleanup_push(&cleanup, create_failed, regen);
   for (size_t i = 0; i < owner_count; i++) {
     qa_pickup_supply_owner owner = profile.ammo_owners[i];
     for (size_t j = 0; j < regen->binding_count; j++)
-      if (item_eq(regen->bindings[j].item, owner.item)) qa_range_error("Periodic ammo pool has multiple owners");
-    const qa_q3_weapon_item *source = NULL;
-    for (size_t j = 0; j < QA_Q3_WEAPON_ITEM_COUNT; j++)
+      if (item_eq(regen->bindings[j].item, owner.item)) qa_raise("Error", 0, 0, "Periodic ammo pool has multiple owners");
+    const qa_q3_weapon_item *source = NULL; /* Q3_WEAPON_ITEMS.find(...): the first match */
+    for (size_t j = 0; j < QA_Q3_WEAPON_ITEM_COUNT && !source; j++)
       if (qa_q3_weapon_items[j].ammo && item_eq(qa_q3_weapon_items[j].ammo, owner.source)) source = &qa_q3_weapon_items[j];
-    if (!source) qa_range_error("Periodic ammo rule requires original source ammunition");
-    if (regen->binding_count >= 16) qa_range_error("Out of memory");
+    if (!source) qa_raise("Error", 0, 0, "Periodic ammo rule requires original source ammunition");
     regen->bindings[regen->binding_count].item = owner.item;
     regen->bindings[regen->binding_count].source = owner.source;
     regen->bindings[regen->binding_count].rule = qa_q3_ta_ammo_regeneration_rule_for(source->weapon);
     regen->binding_count++;
   }
+  qa_cleanup_pop(&cleanup);
   return regen;
 }
 void qa_app_q3_mapped_ammo_regeneration_destroy(qa_app_q3_mapped_ammo_regeneration *regen) {
   if (!regen) return;
   qa_app_q3_mapped_ammo_regeneration_close(regen);
+  release_retired(regen);
+  free(regen->entries); free(regen->retired); free(regen->bindings);
   free(regen);
 }
 const qa_pickup_supply_profile *qa_app_q3_mapped_ammo_regeneration_profile(const qa_app_q3_mapped_ammo_regeneration *regen) {
@@ -129,12 +192,8 @@ const qa_pickup_supply_profile *qa_app_q3_mapped_ammo_regeneration_profile(const
 }
 void qa_app_q3_mapped_ammo_regeneration_release_actor(qa_app_q3_mapped_ammo_regeneration *regen, qa_owned_actor actor) {
   for (size_t i = 0; i < regen->entry_count; i++) {
-    if (qa_same_actor(regen->entries[i].actor.id, actor.id) && regen->entries[i].actor.token == actor.token) {
-      free_entry(&regen->entries[i]);
-      memmove(regen->entries + i, regen->entries + i + 1, (regen->entry_count - i - 1) * sizeof *regen->entries);
-      regen->entry_count--;
-      for (size_t j = i; j < regen->entry_count; j++)
-        for (size_t k = 0; k < regen->entries[j].count; k++) regen->entries[j].timers[k].entry = &regen->entries[j];
+    if (qa_same_actor(regen->entries[i]->actor.id, actor.id) && regen->entries[i]->actor.token == actor.token) {
+      retire_entry_at(regen, i);
       return;
     }
   }
@@ -162,11 +221,20 @@ static qa_save_value *saved_actor_value(qa_saved_actor_id saved) {
   }
   return object;
 }
+typedef struct capture_values { qa_save_value *root, *list; } capture_values;
+static void capture_failed(void *arg) {
+  capture_values *values = arg;
+  qa_save_value_free(values->root); qa_save_value_free(values->list);
+}
 qa_save_value *qa_app_q3_mapped_ammo_regeneration_capture(qa_app_q3_mapped_ammo_regeneration *regen,
     const qa_owned_actor *actors, size_t actor_count) {
   qa_save_value *root = qa_save_value_object(), *list = qa_save_value_array();
   if (!root || !list) { qa_save_value_free(root); qa_save_value_free(list); return NULL; }
   bool ok = qa_save_value_set(root, "profile", qa_save_value_string(regen->profile.id));
+  /* require() raises for a retired or refused actor: the half-built capture goes with it. */
+  capture_values values = {root, list};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, capture_failed, &values);
   for (size_t i = 0; ok && i < actor_count; i++) {
     actor_entry *entry = require_entry(regen, actors[i]);
     qa_save_value *saved = qa_save_value_object(), *timers = qa_save_value_array();
@@ -183,6 +251,7 @@ qa_save_value *qa_app_q3_mapped_ammo_regeneration_capture(qa_app_q3_mapped_ammo_
     ok = ok && qa_save_value_set(saved, "timers", timers) && qa_save_value_push(list, saved);
     if (!ok) { qa_save_value_free(saved); if (timers && !qa_save_value_get(saved, "timers")) qa_save_value_free(timers); }
   }
+  qa_cleanup_pop(&cleanup);
   ok = ok && qa_save_value_set(root, "actors", list);
   if (!ok) { qa_save_value_free(root); return NULL; }
   return root;
@@ -219,8 +288,12 @@ void qa_app_q3_mapped_ammo_regeneration_restore(qa_app_q3_mapped_ammo_regenerati
   qa_save_reader_destroy(&profile);
   if (!profile_id || strcmp(profile_id, regen->profile.id) != 0)
     qa_save_reader_fail(reader, "Mapped ammo profile differs from selected supply");
-  bool remaining[64] = {0};
-  for (size_t i = 0; i < actor_count && i < 64; i++) remaining[i] = true;
+  /* new Set(actors): every actor starts remaining (any count). */
+  bool *remaining = malloc((actor_count ? actor_count : 1) * sizeof *remaining);
+  if (!remaining) qa_range_error("Out of memory");
+  for (size_t i = 0; i < actor_count; i++) remaining[i] = true;
+  qa_cleanup remaining_cleanup;
+  qa_cleanup_push(&remaining_cleanup, free, remaining);
   qa_save_reader saved_actors = field(reader, "actors");
   size_t saved_count = qa_save_reader_list_count(&saved_actors);
   for (size_t i = 0; i < saved_count; i++) {
@@ -232,13 +305,16 @@ void qa_app_q3_mapped_ammo_regeneration_restore(qa_app_q3_mapped_ammo_regenerati
     qa_owned_actor actor;
     long match = -1;
     if (regen->actors.resolve_saved(regen->actors.ctx, saved_id, &actor)) {
-      for (size_t j = 0; j < actor_count && j < 64; j++)
+      for (size_t j = 0; j < actor_count && match < 0; j++)
         if (remaining[j] && qa_same_actor(actors[j].id, actor.id) && actors[j].token == actor.token) match = (long)j;
     }
     if (match < 0) qa_save_reader_fail(&saved, "Mapped ammo actor is missing or duplicated");
     remaining[match] = false;
     actor_entry *entry = require_entry(regen, actors[match]);
-    bool used[16] = {0};
+    bool *used = calloc(entry->count ? entry->count : 1, sizeof *used);
+    if (!used) qa_range_error("Out of memory");
+    qa_cleanup used_cleanup;
+    qa_cleanup_push(&used_cleanup, free, used);
     qa_save_reader timers = field(&saved, "timers");
     size_t timer_count = qa_save_reader_list_count(&timers);
     for (size_t j = 0; j < timer_count; j++) {
@@ -247,7 +323,7 @@ void qa_app_q3_mapped_ammo_regeneration_restore(qa_app_q3_mapped_ammo_regenerati
       qa_save_reader item_reader = field(&value, "item"), source_reader = field(&value, "source");
       const char *item = qa_namespaced(&item_reader), *source = qa_namespaced(&source_reader);
       long found = -1;
-      for (size_t k = 0; k < entry->count; k++)
+      for (size_t k = 0; k < entry->count && found < 0; k++) /* timers.find(...): the first match */
         if (item_eq(entry->timers[k].item, item) && item_eq(entry->timers[k].source, source)) found = (long)k;
       if (found < 0 || used[found]) qa_save_reader_fail(&value, "Mapped ammo pool or original rule differs from selected supply");
       used[found] = true;
@@ -258,14 +334,18 @@ void qa_app_q3_mapped_ammo_regeneration_restore(qa_app_q3_mapped_ammo_regenerati
     }
     qa_save_reader_destroy(&timers);
     for (size_t j = 0; j < entry->count; j++) if (!used[j]) qa_save_reader_fail(&saved, "Saved mapped ammo pool is missing");
+    qa_cleanup_pop(&used_cleanup);
+    free(used);
     qa_save_reader_destroy(&saved);
   }
   qa_save_reader_destroy(&saved_actors);
-  for (size_t i = 0; i < actor_count && i < 64; i++) if (remaining[i]) qa_save_reader_fail(reader, "Saved mapped ammo actor is missing");
+  for (size_t i = 0; i < actor_count; i++) if (remaining[i]) qa_save_reader_fail(reader, "Saved mapped ammo actor is missing");
+  qa_cleanup_pop(&remaining_cleanup);
+  free(remaining);
 }
 void qa_app_q3_mapped_ammo_regeneration_close(qa_app_q3_mapped_ammo_regeneration *regen) {
   if (regen->closed) return;
   regen->closed = true;
-  for (size_t i = 0; i < regen->entry_count; i++) free_entry(&regen->entries[i]);
-  regen->entry_count = 0;
+  /* entries.clear(): a held view's current() is now false; the entries go at destroy. */
+  while (regen->entry_count > 0) retire_entry_at(regen, regen->entry_count - 1);
 }

@@ -222,11 +222,10 @@ static qa_q1_extended_entity_state sampled(qa_app_q1_remote *remote,
     qa_q1_extended_entity_state state) {
   const entity_entry *old = entity_find(remote->previous, remote->previous_count, state.base.number);
   if (state.step || !old) return state;
-  double dx = fabs(state.base.origin.x - old->state.base.origin.x);
-  double dy = fabs(state.base.origin.y - old->state.base.origin.y);
-  double dz = fabs(state.base.origin.z - old->state.base.origin.z);
-  double max_delta = dx > dy ? dx : dy;
-  if (dz > max_delta) max_delta = dz;
+  /* Math.max(|dx|, |dy|, |dz|) > 100: a NaN delta makes the maximum NaN (interpolated). */
+  double max_delta = qa_js_max(qa_js_max(fabs(state.base.origin.x - old->state.base.origin.x),
+      fabs(state.base.origin.y - old->state.base.origin.y)),
+      fabs(state.base.origin.z - old->state.base.origin.z));
   if (max_delta > 100) return state;
   state.base.origin = qa_lerp3_double(old->state.base.origin, state.base.origin, remote->fraction);
   state.base.angles = qa_lerp_angles_wrapped(old->state.base.angles, state.base.angles, remote->fraction);
@@ -284,8 +283,12 @@ static void publish_remote(qa_app_q1_remote *remote) {
   for (size_t i = 0; i < remote->style_count; i++) {
     const char *pattern = remote->styles[i].value;
     size_t length = strlen(pattern);
+    /* pattern.charCodeAt(Math.floor(time * 10) % pattern.length): a NaN position reads index 0
+     * (ToIntegerOrInfinity), a negative one reads NaN; the server's time is untrusted. */
+    double position = length == 0 ? 0 : fmod(floor(time * 10), (double)length);
+    if (isnan(position)) position = 0;
     double value = length == 0 ? 256
-        : ((double)(unsigned char)pattern[(size_t)floor(time * 10) % length] - 97) * 22;
+        : position >= 0 ? ((double)(unsigned char)pattern[(size_t)position] - 97) * 22 : NAN;
     qa_scene_light_style *style = &remote->published_styles[i];
     style->is_q2 = false;
     style->style = remote->styles[i].index;
@@ -647,6 +650,8 @@ void qa_app_q1_remote_receive(qa_app_q1_remote *remote,
           if (strncmp(remote->resources[j].key, "sound/", 6) == 0 && strcmp(remote->resources[j].key + 6, path) == 0)
             resource = &remote->resources[j].reference;
         if (!resource) qa_raise("Error", 0, 0, "Unresolved NetQuake sound %s", path);
+        /* TS evaluates the record literal (sequence: this.sequence++) before admit checks the ring. */
+        double sound_sequence = remote->sequence++;
         if (remote->sound_pending_count >= 8192)
           qa_range_error("Event ring capacity exhausted (8192 undrained records); drain before admitting more");
         if (remote->sound_pending_count == remote->sound_cap) {
@@ -668,7 +673,7 @@ void qa_app_q1_remote_receive(qa_app_q1_remote *remote,
         size_t slot_index = (remote->sound_head + remote->sound_pending_count) % remote->sound_cap;
         qa_simulation_event *sound = &remote->sounds_pending[slot_index];
         memset(sound, 0, sizeof *sound);
-        sound->sequence = remote->sequence++;
+        sound->sequence = sound_sequence;
         sound->time = (qa_source_time){QA_SOURCE_TIME_SECONDS, remote->seconds};
         sound->audience.kind = "client";
         sound->audience.client = remote->options.client;

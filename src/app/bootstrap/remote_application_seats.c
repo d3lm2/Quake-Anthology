@@ -229,9 +229,12 @@ static void bind_body(void *ctx) {
   for (size_t i = 0; i < count; i++) seats[i] = players[i].seat;
   qa_app_local_seat_preparation *prepared = qa_app_application_input_prepare_local_seats(b->controls, seats, count);
   free(seats);
+  qa_cleanup prepared_guard;
+  qa_cleanup_push(&prepared_guard, (void (*)(void *))qa_app_local_seat_preparation_destroy, prepared);
   bind_assert(b);
   qa_app_local_seat_preparation_publish(prepared, players, count, app->ownership.borrowed ? app->ownership.client : NULL,
       qa_remote_application_source_access(app), true);
+  qa_cleanup_pop(&prepared_guard);
   qa_app_local_seat_preparation_destroy(prepared);
   qa_cleanup_pop(&guard);
   free(players);
@@ -275,10 +278,11 @@ static void bind_body(void *ctx) {
   options.print = bind_print;
   b->view = qa_app_remote_seat_view_prepare(&options);
   if (b->view == NULL) qa_range_error("Out of memory");
+  /* TS try { assertCurrent(); view.publish(...); peer.view = view; cg_fov; publishRemoteLayouts() }
+   * catch { await view.close(); throw }: b->view stays set until that block ends. */
   bind_assert(b);
   qa_app_remote_seat_view_publish(b->view, bind_index(b), bind_count(b));
   peer->view = b->view;
-  b->view = NULL;
   double fov = 0;
   qa_app_application_q3_client *client = qa_remote_presentation_q3_client(qa_app_remote_seat_view_presentation(peer->view));
   if (client != NULL && qa_app_view_settings_override(app->view_settings, &fov)) {
@@ -287,6 +291,7 @@ static void bind_body(void *ctx) {
     qa_remote_cvar_set(qa_app_application_q3_client_cvars(client), "cg_fov", text, false);
   }
   qa_remote_application_publish_remote_layouts(app);
+  b->view = NULL;
   if (b->connection != NULL) {
     char *info = NULL;
     if (!qa_q3_client_game_state_storage_get(qa_q3_client_connection_game_state(b->connection), 1, &info) || info == NULL)
@@ -329,10 +334,12 @@ void qa_remote_application_bind_remote_seat(qa_remote_application *app, qa_remot
   if (!qa_try(bind_body, b, &caught)) {
     if (b->view != NULL) {
       qa_caught_error cleanup;
-      bool closed = qa_try(bind_close_view, b, &cleanup);
-      qa_app_remote_seat_view_destroy(b->view);
+      /* A failed close replaces the error, which the quiet-retirement check below still sees. */
+      if (!qa_try(bind_close_view, b, &cleanup)) caught = cleanup;
+      /* peer.view keeps the closed view when the failure came after it was published; the
+       * peer then owns it (every path that drops peer->view releases it). */
+      if (peer->view != b->view) qa_app_remote_seat_view_destroy(b->view);
       b->view = NULL;
-      if (!closed) qa_rethrow(&cleanup);
     }
     /* A seat retired while its view was still binding ends quietly; live failures still throw. */
     if (peer->closed || app->closed || app->closing) return;
@@ -419,6 +426,14 @@ static void join_close_scripts(void *ctx) {
   qa_app_console_script_files_close(qa_app_prepared_profile_scripts(((join_state *)ctx)->candidate->profile));
 }
 static void join_close_images(void *ctx) { qa_app_image_settings_close(((join_state *)ctx)->candidate->images.settings); }
+/* A raise before the admission try (content open, prepareRemoteConfiguration) drops the
+ * copied options with the state. */
+static void join_state_release(void *ctx) {
+  join_state *state = ctx;
+  qa_app_options_destroy(&state->options);
+  free(state->before);
+  free(state);
+}
 void qa_remote_application_join_remote_seat(qa_remote_application *app) {
   if (qa_remote_application_source(app)->kind != QA_REMOTE_SOURCE_LIVE) qa_raise("Error", 0, 0, "Recorded playback has one recorded viewpoint");
   if (app->configuration->seat_count >= 4) qa_raise("Error", 0, 0, "Four local players are already connected");
@@ -428,7 +443,7 @@ void qa_remote_application_join_remote_seat(qa_remote_application *app) {
   qa_app_application_input_save_settings(controls);
   join_state *state = seats_xcalloc(1, sizeof *state);
   qa_cleanup state_guard;
-  qa_cleanup_push(&state_guard, free, state);
+  qa_cleanup_push(&state_guard, join_state_release, state);
   state->app = app;
   state->previous = app->configuration;
   state->previous_scripts = app->client_command_owner != NULL ? app->client_command_owner->scripts : NULL;
@@ -452,17 +467,13 @@ void qa_remote_application_join_remote_seat(qa_remote_application *app) {
       void (*steps[])(void *) = {join_retire_peers, join_discard, join_close_scripts, join_close_images};
       for (size_t i = 0; i < sizeof steps / sizeof steps[0]; i++) if (!qa_try(steps[i], state, &cleanup)) aggregate = true;
     }
-    qa_app_options_destroy(&state->options);
-    free(state->before);
     qa_cleanup_pop(&state_guard);
-    free(state);
+    join_state_release(state);
     if (aggregate) qa_raise("AggregateError", 0, 0, "Remote player admission failed");
     qa_rethrow(&caught);
   }
-  qa_app_options_destroy(&state->options);
-  free(state->before);
   qa_cleanup_pop(&state_guard);
-  free(state);
+  join_state_release(state);
 }
 
 /* ---- dropRemoteSeat (TS 3366-3443) ------------------------------------- */
@@ -497,6 +508,7 @@ static qa_cvar_registry *const *promoted_visible(void *ctx, qa_command_context s
   *out_count = count;
   return routing->visible;
 }
+static void release_dropped_presentation(void *object) { qa_app_world_seat_presentation_destroy(object); }
 static void drop_forward(void *ctx, const char *name, const char *const *args, size_t arg_count, qa_command_context source) {
   const qa_command_origin *origin = &source.origin;
   while (origin->kind == QA_COMMAND_ORIGIN_SCRIPT && origin->caller != NULL) origin = origin->caller;
@@ -520,8 +532,10 @@ void qa_remote_application_drop_remote_seat(qa_remote_application *app, int64_t 
     for (size_t i = 0; i < app->remote_seat_count && replacement == NULL; i++) {
       qa_remote_seat_peer *peer = app->remote_seats[i];
       const char *map = app->launch_options.map;
+      /* peer.map === this.options.map: two absent maps are equal */
+      bool same_map = peer->map == NULL ? map == NULL : map != NULL && strcmp(peer->map, map) == 0;
       if (!peer->closed && peer != old_primary && peer->view != NULL && qa_app_remote_seat_channel_active(peer->channel)
-          && peer->map != NULL && map != NULL && strcmp(peer->map, map) == 0) replacement = peer;
+          && same_map) replacement = peer;
     }
   if (primary && replacement == NULL)
     qa_raise("Error", 0, 0, "Wait for another player to finish connecting before removing this player");
@@ -627,6 +641,8 @@ void qa_remote_application_drop_remote_seat(qa_remote_application *app, int64_t 
     qa_seat_presentation current;
     if (initial != NULL && qa_session_seat_presentation(seat, &current)
         && current.ctx == qa_app_world_seat_presentation_seat(initial).ctx) qa_session_seat_clear_presentation(seat);
+    /* TS drops the reference (GC); the application frees it at destroy, as clearSourcePresentation's does. */
+    if (initial != NULL) qa_remote_arena_add(&app->arena, release_dropped_presentation, initial);
     app->initial_presentation = NULL;
     qa_remote_application_close_qw_downloads(app);
     qa_remote_application_close_q3_downloads(app);
@@ -789,6 +805,7 @@ static qa_app_remote_content_mounts *hook_refresh_content(void *ctx, qa_app_remo
 typedef struct load_call {
   seat_record *record; const qa_app_q1_remote_world_info *world; const char *const *images; size_t image_count;
   qa_app_loaded_content *prepared; qa_app_loaded_content *result;
+  bool has_server_count; double server_count; /* TS serverCount?: number */
 } load_call;
 static void load_run(void *ctx) {
   load_call *call = ctx;
@@ -808,6 +825,10 @@ static void load_run(void *ctx) {
   peer->loaded_content = peer == app->primary_peer
       ? qa_remote_application_load_server_world(app, call->world, call->images, call->image_count, call->prepared, false)
       : call->prepared != NULL ? call->prepared : qa_remote_application_content(app);
+  if (peer == app->primary_peer && call->has_server_count) {
+    app->has_loaded_server_count = true;
+    app->loaded_server_count = call->server_count;
+  }
   if (peer == app->primary_peer && app->remote_content == NULL) peer->content = NULL;
   call->result = peer->loaded_content;
 }
@@ -820,13 +841,18 @@ static bool load_is_ready(void *ctx) {
   if (map == NULL) qa_range_error("Out of memory");
   bool same = strcmp(qa_app_loaded_content_recipe(app->loaded_content)->map.geometry.requested_path, map) == 0;
   free(map);
-  return same;
+  /* && (serverCount === undefined || this.loadedServerCount === serverCount) */
+  return same && (!call->has_server_count || (app->has_loaded_server_count && app->loaded_server_count == call->server_count));
+}
+static qa_app_loaded_content *seat_load_counted(seat_record *record, const qa_app_q1_remote_world_info *world,
+    const char *const *images, size_t image_count, qa_app_loaded_content *prepared, bool has_server_count, double server_count) {
+  load_call call = {record, world, images, image_count, prepared, NULL, has_server_count, server_count};
+  run_pumped(record_current(record), load_run, &call, load_is_ready);
+  return call.result;
 }
 static qa_app_loaded_content *seat_load(seat_record *record, const qa_app_q1_remote_world_info *world, const char *const *images,
     size_t image_count, qa_app_loaded_content *prepared) {
-  load_call call = {record, world, images, image_count, prepared, NULL};
-  run_pumped(record_current(record), load_run, &call, load_is_ready);
-  return call.result;
+  return seat_load_counted(record, world, images, image_count, prepared, false, 0);
 }
 static qa_app_loaded_content *hook_load_q1_world(void *ctx, const qa_app_q1_remote_world_info *world, bool refresh_content) {
   (void)refresh_content; /* TS loadQ1World: (world) => load(world) */
@@ -859,7 +885,8 @@ static qa_app_loaded_content *hook_load_q2_world(void *ctx, const qa_app_q2_game
   qa_app_q1_remote_world_info world = {map, names[0], counts[0], names[1], counts[1]};
   qa_cleanup guards[3];
   for (int k = 0; k < 3; k++) qa_cleanup_push(&guards[k], free, (void *)names[k]);
-  qa_app_loaded_content *content = seat_load(record, &world, names[2], counts[2], NULL);
+  qa_app_loaded_content *content = seat_load_counted(record, &world, names[2], counts[2], NULL, true,
+      ((const qa_q2_server_data_result *)state->data)->servercount);
   for (int k = 2; k >= 0; k--) { qa_cleanup_pop(&guards[k]); free((void *)names[k]); }
   return content;
 }
@@ -1071,19 +1098,17 @@ static void unified_publish_components(void *ctx, qa_app_unified_operation_fn op
   run_pumped(record_current(record), component_run, &call, NULL);
 }
 /* RemoteSeatPump source over the seat source's network (remote-seat-pump.ts). */
-typedef struct pump_source { qa_app_remote_seat_source *source; char error[QA_CAUGHT_MESSAGE_CAPACITY]; } pump_source;
+typedef struct pump_source { qa_app_remote_seat_source *source; qa_caught_error error; } pump_source;
 typedef struct pump_poll { pump_source *source; double now; } pump_poll;
 static void pump_poll_body(void *ctx) {
   pump_poll *poll = ctx;
   qa_app_remote_seat_network_poll(qa_app_remote_seat_source_network(poll->source->source), poll->now);
 }
-static const char *pump_network_poll(void *ctx, double now) {
+static const qa_caught_error *pump_network_poll(void *ctx, double now) {
   pump_source *source = ctx;
   pump_poll poll = {source, now};
-  qa_caught_error caught;
-  if (qa_try(pump_poll_body, &poll, &caught)) return NULL;
-  snprintf(source->error, sizeof source->error, "%s", caught.message);
-  return source->error;
+  if (qa_try(pump_poll_body, &poll, &source->error)) return NULL;
+  return &source->error;
 }
 static void pump_close(void *ctx) { qa_app_remote_seat_source_close(((pump_source *)ctx)->source); }
 static void release_peer(void *object) {
@@ -1155,6 +1180,9 @@ static void seat_prepare_body(void *ctx) {
   qa_cleanup_push(&peer_guard, release_peer, peer);
   peer->source = qa_app_remote_seat_source_create(&options);
   if (peer->source == NULL) qa_range_error("Out of memory");
+  /* From here the source owns the transport: release_peer closes it, so the caller's
+   * catch must not close and destroy it a second time. */
+  p->transport = NULL;
   qa_app_remote_seat_services services = {qa_app_remote_seat_source_network(peer->source), qa_app_remote_seat_source_remote(peer->source), cvars};
   peer->channel = qa_app_remote_seat_channel_create(p->seat, record->clock, services);
   if (peer->channel == NULL) qa_range_error("Out of memory");
@@ -1166,7 +1194,6 @@ static void seat_prepare_body(void *ctx) {
   qa_cleanup_pop(&peer_guard);
   record->created = peer;
   qa_remote_arena_add(&app->arena, release_peer, peer);
-  p->transport = NULL; /* the peer's source owns the transport from here */
   if (app->remote_seat_count == app->remote_seat_capacity) {
     size_t capacity = app->remote_seat_capacity == 0 ? 4 : app->remote_seat_capacity * 2;
     qa_remote_seat_peer **grown = realloc(app->remote_seats, capacity * sizeof *grown);

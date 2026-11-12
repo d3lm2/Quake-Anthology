@@ -59,6 +59,7 @@
 #include "qa/platform/sdl.h"
 #include "qa/settings/config.h"
 #include "qa/ui/settings/action_catalog.h"
+#include "qa/ui/settings/index.h"
 #include "qa/world/session/session.h"
 
 typedef struct qa_app_application_input qa_app_application_input;
@@ -203,6 +204,10 @@ qa_ui_binding_capabilities qa_app_application_input_binding_capabilities(qa_app_
 qa_cvar_registry *qa_app_application_input_shared_cvars(const qa_app_application_input *input);
 /* TS sharedSettings(): the current shared owner or NULL. */
 qa_cvar_registry *qa_app_application_input_shared_settings(const qa_app_application_input *input);
+/* TS sharedSettings() as the view it returns: absent when there is no shared owner now; otherwise each read takes the
+ * owner current at that read (it follows publishSharedCvars) and raises Error "Shared settings lost their owner" when
+ * there is none. Valid while the input lives. */
+qa_ui_setting_cvars qa_app_application_input_shared_settings_view(qa_app_application_input *input);
 /* TS guestCommands. */
 double qa_app_application_input_guest_execute_now(qa_app_application_input *input, const char *text,
     const qa_command_context *source);
@@ -259,6 +264,9 @@ void qa_app_application_input_poll_loading_events(qa_app_application_input *inpu
 void qa_app_application_input_validate_startup_adoption(qa_app_application_input *input);
 void qa_app_application_input_adopt_startup(qa_app_application_input *input);
 bool qa_app_application_input_can_reset_bindings(qa_app_application_input *input, qa_seat_id id);
+/* TS bindingScope(): the in-game binding menu's choice to keep edits to this game; they reach the layers when the
+ * game saves. False is the TS undefined (the scripts have no layers). */
+bool qa_app_application_input_binding_scope(qa_app_application_input *input, qa_ui_binding_scope *out);
 void qa_app_application_input_reset_bindings(qa_app_application_input *input, qa_seat_id id);
 bool qa_app_application_input_advance_startup(qa_app_application_input *input);
 void qa_app_application_input_pump(qa_app_application_input *input, bool execute_commands);
@@ -271,8 +279,9 @@ void qa_app_application_input_stop_haptics(qa_app_application_input *input);
 void qa_app_application_input_sound_haptics(qa_app_application_input *input, qa_content_id content,
     const char *sound, const qa_actor_id *actor, qa_audio_audience audience);
 /* TS build/buildForSeat: wall_elapsed defaults to elapsed. build returns a
- * malloc'd array the caller frees; the arsenal pointers reference storage
- * owned by the input until the next build. */
+ * malloc'd array the caller frees; a command's arsenal intent is storage owned
+ * by the input until the next build (copy it to keep it), and the intent's
+ * provider and weapon are interned strings that live for the process. */
 qa_actor_command *qa_app_application_input_build(qa_app_application_input *input, double elapsed_milliseconds,
     double server_milliseconds, double server_frame, double wall_elapsed_milliseconds, size_t *out_count);
 qa_actor_command qa_app_application_input_build_for_seat(qa_app_application_input *input, qa_seat_id seat,
@@ -321,4 +330,7 @@ void qa_app_application_input_rebind_players(qa_app_application_input *input, co
     size_t player_count, const qa_app_sim_presentation_access *simulation, bool world);
 void qa_app_application_input_save_settings(qa_app_application_input *input);
 void qa_app_application_input_close(qa_app_application_input *input);
+/* The seat console's chat: the field's UTF-8 text as the say argument, one byte per UTF-16 code unit (its low byte),
+ * as TS's byte writers keep it (input.c). Malloc'd. */
+char *qa_app_chat_console_text(const char *utf8);
 #endif

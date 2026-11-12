@@ -6,10 +6,13 @@
 #include <string.h>
 #include "qa/foundation/js.h"
 static double f32d(double v){ return (double)(float)v; }
-typedef struct cache_entry { const void *vertices; const double *indices; const char *lighting; bool pair; const void *world_positions; const void *normals; double seen; bool has_arrays; qa_gl_geometry_arrays arrays; } cache_entry;
-static cache_entry *g_cache; static size_t g_cache_count, g_cache_cap;
 void qa_gl_geometry_arrays_destroy(qa_gl_geometry_arrays *a){ free(a->positions);free(a->colors);free(a->coordinates);free(a->coordinates2);free(a->world_positions);free(a->normals);free(a->indices); memset(a,0,sizeof *a); }
-void qa_gl_packed_cache_clear(void){ for(size_t i=0;i<g_cache_count;i++)if(g_cache[i].has_arrays)qa_gl_geometry_arrays_destroy(&g_cache[i].arrays); free(g_cache); g_cache=NULL;g_cache_count=g_cache_cap=0; }
+/* TS packedCache is a WeakMap keyed by the identity of batch.vertices: an entry dies with
+ * its source arrays, so a later array can never be served another array's packed copy. A
+ * C pointer says nothing about lifetime (frame storage is freed and the next frame's
+ * arrays land on the same addresses), so a pointer-keyed cache served stale geometry and
+ * never shrank. The cache only skips work; every pack reads its batch. */
+void qa_gl_packed_cache_clear(void){ }
 static float *alloc_f(size_t n){ float *p=(float*)malloc((n?n:1)*sizeof(float)); if(!p)qa_range_error("OpenGL geometry allocation failed"); return p; }
 static qa_gl_geometry_arrays alloc_arrays(size_t verts,size_t indices,const char *lighting,float *storage){
   qa_gl_geometry_arrays a; memset(&a,0,sizeof a);
@@ -24,6 +27,7 @@ static qa_gl_geometry_arrays alloc_arrays(size_t verts,size_t indices,const char
   a.position_count=verts*4;a.color_count=verts*4;a.coordinate_count=verts*2;a.coordinate2_count=verts*2;
   a.world_position_count=world;a.normal_count=normals;a.index_count=indices; return a;
 }
+static void destroy_arrays_cleanup(void *arg){ qa_gl_geometry_arrays_destroy((qa_gl_geometry_arrays*)arg); }
 static qa_gl_geometry_arrays pack_into(qa_draw_batch batch,float *storage){
   size_t verts=batch.texturing_is_pair?batch.pair_vertex_count:batch.vertex_count;
   size_t size=batch.primitive_is_lines?2:3;
@@ -32,6 +36,8 @@ static qa_gl_geometry_arrays pack_into(qa_draw_batch batch,float *storage){
   if(batch.primitive_is_lines&&(!isfinite(f32d(batch.line_width))||batch.line_width<=0)) qa_range_error("OpenGL line width must be positive and finite");
   for(size_t i=0;i<batch.indices.count;i++){ double ix=batch.indices.values[i]; if(!(ix>=0)||ix>=(double)verts||ix!=(double)(int32_t)ix) qa_range_error("OpenGL vertex index is outside its allocation"); }
   qa_gl_geometry_arrays a=alloc_arrays(verts,batch.indices.count,batch.lighting.kind,storage);
+  /* A fresh allocation is the caller's only after a successful pack (TS: the GC takes a rejected one). */
+  qa_cleanup guard; if(!storage)qa_cleanup_push(&guard,destroy_arrays_cleanup,&a);
   for(size_t i=0;i<batch.indices.count;i++)a.indices[i]=(uint32_t)batch.indices.values[i];
   if(!batch.texturing_is_pair)memset(a.coordinates2,0,a.coordinate2_count*sizeof(float));
   double worst=0; size_t four=0,two=0;
@@ -62,6 +68,7 @@ static qa_gl_geometry_arrays pack_into(qa_draw_batch batch,float *storage){
     }
   }
   if(!(worst<3.4028235677973366e38)) qa_range_error("OpenGL attributes must be finite float32 values");
+  if(!storage)qa_cleanup_pop(&guard);
   return a;
 }
 qa_gl_geometry_arrays qa_pack_gl_geometry(qa_draw_batch batch){ return pack_into(batch,NULL); }
@@ -71,20 +78,6 @@ void qa_gl_geometry_buffer_destroy(qa_gl_geometry_buffer *b){ if(!b->impl)return
 qa_gl_geometry_arrays qa_gl_geometry_buffer_pack(qa_gl_geometry_buffer *b,qa_draw_batch batch){
   bimpl *p=(bimpl*)b->impl;
   size_t verts=batch.texturing_is_pair?batch.pair_vertex_count:batch.vertex_count;
-  const void *vkey=batch.texturing_is_pair?(const void*)batch.pair_vertices:(const void*)batch.vertices;
-  const void *wp=strcmp(batch.lighting.kind,"vertex")?(const void*)batch.lighting.world_positions:NULL;
-  const void *nm=!strcmp(batch.lighting.kind,"q2-world")?(const void*)batch.lighting.normals:NULL;
-  for(size_t i=0;i<g_cache_count;i++){ cache_entry *e=&g_cache[i];
-    if(e->vertices==vkey&&e->indices==batch.indices.values&&!strcmp(e->lighting,batch.lighting.kind)&&e->pair==batch.texturing_is_pair&&e->world_positions==wp&&e->normals==nm){
-      if(e->has_arrays)return e->arrays;
-      e->seen++; if(e->seen>=2){ e->arrays=pack_into(batch,NULL); e->has_arrays=true; return e->arrays; }
-      goto uncached; } }
-  if(verts>=64){
-    if(g_cache_count==g_cache_cap){ size_t nc=g_cache_cap?g_cache_cap*2:8; cache_entry *n=(cache_entry*)realloc(g_cache,nc*sizeof *n); if(!n)qa_range_error("OpenGL geometry allocation failed"); g_cache=n;g_cache_cap=nc; }
-    cache_entry *e=&g_cache[g_cache_count++]; memset(e,0,sizeof *e);
-    e->vertices=vkey;e->indices=batch.indices.values;e->lighting=batch.lighting.kind;e->pair=batch.texturing_is_pair;e->world_positions=wp;e->normals=nm;e->seen=1;
-  }
-uncached:;
   size_t world=strcmp(batch.lighting.kind,"vertex")?verts*3:0, normals=!strcmp(batch.lighting.kind,"q2-world")?verts*3:0;
   size_t need=verts*12+world+normals+batch.indices.count;
   if(p->storage_floats<need){ size_t nc=need>p->storage_floats*2?need:p->storage_floats*2; float *n=(float*)realloc(p->storage,(nc?nc:1)*sizeof(float)); if(!n)qa_range_error("OpenGL geometry allocation failed"); p->storage=n;p->storage_floats=nc; p->has_current=false; }

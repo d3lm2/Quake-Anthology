@@ -79,7 +79,7 @@ static bool check_attack_fn(void *ctx, qa_q2m_context *c) {
   qa_body_state body = q2rm_body(game, entity);
   if (body.origin.z + body.bounds.min.z + 125 < enemy.origin.z + enemy.bounds.min.z) return false;
   qa_vec3 delta = qa_sub3_double(body.origin, enemy.origin);
-  double distance = hypot(delta.x, delta.y);
+  double distance = qa_js_hypot2(delta.x, delta.y);
   if ((distance < 100 && state->melee_time <= q2rm_now(game)) || distance > 265
       || state->attack_finished >= q2rm_now(game) || q2rm_rnd(game) >= 0.5) return false;
   state->attack_state = QA_Q2M_ATTACK_MISSILE;

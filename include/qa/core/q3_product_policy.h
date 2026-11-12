@@ -4,9 +4,8 @@
  * sv_ccmds.c and ui_main.c. C accommodations: the discriminated
  * unions become kind enums plus payloads, with name/parse helpers
  * returning the exact TS strings. registerQ3ProductPolicy uses only
- * CvarRegistry.register (cvars/index, not yet ported), which becomes
- * a one-method callback interface; CvarFlag.Init (16) is passed
- * through it. GPL-2.0-or-later.
+ * CvarRegistry.register (cvars/index), which becomes a one-method
+ * callback interface; QA_CVAR_FLAG_INIT (16) is passed through it. GPL-2.0-or-later.
  */
 #ifndef QA_CORE_Q3_PRODUCT_POLICY_H
 #define QA_CORE_Q3_PRODUCT_POLICY_H

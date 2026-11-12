@@ -104,3 +104,6 @@ void qa_app_shared_sim_tick_horde_wave(qa_app_shared_simulation *sim) {
 done:
   free(bots); free(players);
 }
+/* Horde keeps no state a restart or save could not rebuild from the bot roster. */
+bool qa_app_foreign_horde_blocks_checkpoint(qa_app_shared_simulation *sim) { (void)sim; return false; }
+void qa_app_foreign_horde_release(qa_app_shared_simulation *sim, qa_actor_id actor) { (void)sim; (void)actor; } /* release(): void {} */

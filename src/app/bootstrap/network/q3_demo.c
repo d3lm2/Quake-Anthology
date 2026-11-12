@@ -1,5 +1,6 @@
 /* Port of src/app/bootstrap/network/q3-demo.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/network/q3_demo.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qa/foundation/support.h"
@@ -24,7 +25,7 @@ static void lc_cleared(void *ctx) {
 static void lc_primed(void *ctx) {
   qa_app_q3_demo_playback *p = ctx;
   if (p->options.host.downloading(p->options.host.ctx))
-    qa_range_error("Q3 demo cannot wait for package downloads");
+    qa_raise("Error", 0, 0, "Q3 demo cannot wait for package downloads");
   p->state = "primed";
 }
 static void lc_snapshot(void *ctx, const qa_q3_wire_snapshot *snapshot, double ping) {
@@ -64,6 +65,14 @@ const qa_app_q3_demo_playback_options *qa_app_q3_demo_playback_options_of(
     const qa_app_q3_demo_playback *playback) { return &playback->options; }
 const char *qa_app_q3_demo_playback_phase(const qa_app_q3_demo_playback *playback) {
   return playback->state;
+}
+/* TS hands realTime (a number) to the clock, whose sourceClock() refuses anything but an int32
+ * integer; the C clock takes int64, so a fraction, NaN or a value past int64 must raise here
+ * rather than be cast (the clock itself checks the int32 range). */
+static int64_t clock_time(double value) {
+  if (!(value == trunc(value)) || fabs(value) > 4e18)
+    qa_range_error("Q3 source clock arithmetic exceeds signed int32");
+  return (int64_t)value;
 }
 static void begin(qa_app_q3_demo_playback *p) {
   assert_current(p);
@@ -152,7 +161,7 @@ static qa_app_q3_demo_frame advance_frame(
     qa_q3_clock_options clock_options = {options.paused, options.time_nudge,
         options.timescale, true, options.freeze_demo, options.timedemo};
     int64_t time = 0;
-    if (!qa_q3_client_clock_advance(p->options.clock, (int64_t)real_time, &clock_options, &time))
+    if (!qa_q3_client_clock_advance(p->options.clock, clock_time(real_time), &clock_options, &time))
       goto done;
     while (qa_q3_client_clock_needs_demo_message(p->options.clock)) {
       if (read_one(p, real_time)) goto completed;
@@ -167,7 +176,7 @@ completed:
   frame.end = p->end; frame.has_end = true;
   if (options.timedemo) {
     int64_t frames = 0, elapsed = 0;
-    if (qa_q3_client_clock_demo_timing(p->options.clock, (int64_t)real_time, &frames, &elapsed)) {
+    if (qa_q3_client_clock_demo_timing(p->options.clock, clock_time(real_time), &frames, &elapsed)) {
       frame.has_timing = true;
       frame.timing.frames = (double)frames;
       frame.timing.elapsed_milliseconds = (double)elapsed;

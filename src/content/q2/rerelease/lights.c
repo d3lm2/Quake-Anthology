@@ -2,6 +2,7 @@
 #include "qa/content/q2/rerelease/lights.h"
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/core/numeric.h"
+#include "qa/foundation/support.h"
 #include "rr_internal.h"
 #include <math.h>
 #include <stdio.h>
@@ -13,11 +14,13 @@ double qa_q2_rerelease_color(const char *value) {
   if (!value || !strchr(value, ' ')) return (double)qa_native_atoi(value ? value : "");
   double comp[4] = {0, 0, 0, 1};
   /* tokens = trim().split(/\s+/) */
-  char buf[512]; snprintf(buf, sizeof buf, "%s", value);
+  char *buf = qa_q2rr_dup(value); /* authored text of any length */
+  if (!buf) qa_range_error("Out of memory");
   size_t idx = 0;
   char *save = NULL;
   for (char *tok = strtok_r(buf, " \t\r\n\f\v", &save); tok && idx < 4; tok = strtok_r(NULL, " \t\r\n\f\v", &save))
     comp[idx++] = qa_native_atof(tok);
+  free(buf);
   bool any = false; for (int i = 0; i < 4; i++) if (comp[i] > 1) any = true;
   double mult = any ? 1 : 255;
   /* channel(3) | channel(2) << 8 | channel(1) << 16 | channel(0) << 24: each channel
@@ -109,7 +112,7 @@ void qa_q2_rerelease_lights_destroy(qa_q2_rerelease_lights *l) { free(l->active)
 bool qa_q2_rerelease_lights_spawn(qa_q2_rerelease_lights *l, qa_q2_entity *e, qa_q2_game_services *g) {
   if (!e->classname || strcmp(e->classname, "target_light") != 0) return false;
   e->visible = false; e->server_flags = rr_bor(e->server_flags, 1);
-  e->frame = qa_q2_number_field(&e->spawn, "radius", 0) != 0 ? qa_q2_number_field(&e->spawn, "radius", 0) : 150;
+  e->frame = rr_or(qa_q2_number_field(&e->spawn, "radius", 0), 150);
   e->count = e->skin;
   qa_q2_rerelease_lights_set_active(l, e->actor.id, false);
   if (e->target && e->target[0]) {

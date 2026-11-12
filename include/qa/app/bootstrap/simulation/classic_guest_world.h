@@ -85,6 +85,7 @@ const qa_app_sim_configstring *qa_app_sim_classic_guest_world_configstrings(qa_a
 void qa_app_sim_classic_guest_world_restore_configstrings(qa_app_sim_classic_guest_world *world, const qa_app_sim_configstring *values, size_t count);
 void qa_app_sim_classic_guest_world_write_original(qa_app_sim_classic_guest_world *world, const char *game_path, const char *level_path, bool autosave);
 /* Source save files restore gameplay, not CPU/CRT process state. */
+/* level_path NULL is the TS null: no ReadLevel, the freshly spawned level stays. */
 void qa_app_sim_classic_guest_world_restore_original(qa_app_sim_classic_guest_world *world, const char *game_path, const char *level_path,
     qa_app_sim_classic_guest_map map, void (*restore_server_state)(void *), void *restore_ctx);
 void qa_app_sim_classic_guest_world_restore_original_loading(qa_app_sim_classic_guest_world *world, const char *game_path, const char *level_path,

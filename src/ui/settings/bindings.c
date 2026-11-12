@@ -10,6 +10,7 @@
 #include "qa/input/bindings.h"
 #include "qa/input/support.h"
 #include "qa/ui/common/layout.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
 
 static void oom(void) { qa_range_error("Out of memory"); }
@@ -48,14 +49,23 @@ static void target_key(qa_input_binding_target target, char *out, size_t size) {
 }
 
 typedef struct bind_state bind_state;
+typedef struct bctx { bind_state *state; int action; size_t row; } bctx;
 typedef struct brow {
   char *id;
   const qa_ui_binding_action *action;
   bool has_physical;
   qa_physical_input physical;
   qa_input_binding_target target;
+  bctx x_ctx; /* the row's "X" action; rows are not moved until the next build */
 } brow;
-typedef struct bctx { bind_state *state; int action; size_t row; } bctx;
+/* An owned copy of a row and its action, kept while a capture or a conflict is
+ * outstanding: a factory rebuild replaces the row and action storage, and a
+ * bind replaces the previous target's text. */
+typedef struct row_snapshot {
+  brow row;
+  qa_ui_binding_action action;
+  char *id, *label, *action_text, *target_text;
+} row_snapshot;
 struct bind_state {
   qa_native_ui_controller *controller;
   qa_seat_input *input;
@@ -65,20 +75,16 @@ struct bind_state {
   void *source_ctx;
   bool has_reset;
   qa_ui_binding_reset reset;
-  char query[256];
+  bool has_scope;
+  qa_ui_binding_scope scope;
+  char *query;
   char *selected;
   bool has_pending;
   qa_physical_input pending_physical;
-  brow pending_row;
+  row_snapshot pending;
   qa_input_binding_target pending_previous;
-  brow capture_row;
-  /* Stable snapshots of capture/pending rows: factory rebuilds
-   * pool-clear row/action storage while a capture is outstanding. */
-  qa_ui_binding_action capture_action, pending_action;
-  char capture_id[560], capture_label[1040];
-  char capture_action_text[1040], capture_target_text[1040];
-  char pending_id[560], pending_label[1040];
-  char pending_action_text[1040], pending_target_text[1040];
+  char *pending_previous_text;
+  row_snapshot capture;
   /* Rebuilt available actions (source + customs). */
   qa_ui_binding_action *available;
   size_t available_count, available_capacity;
@@ -92,7 +98,7 @@ struct bind_state {
   qa_ui_list_row *list_rows;
   const char **cells;
   qa_ui_list_row_action *row_actions;
-  bctx ctxs[1024];
+  bctx ctxs[16];
   size_t ctx_used;
   int handles[3];
   size_t handle_count;
@@ -124,7 +130,7 @@ static void pool_clear(bind_state *s) {
   s->ctx_used = 0;
 }
 static bctx *next_ctx(bind_state *s, int action, size_t row) {
-  if (s->ctx_used >= 1024) oom();
+  if (s->ctx_used >= sizeof s->ctxs / sizeof s->ctxs[0]) oom(); /* one per control */
   bctx *c = &s->ctxs[s->ctx_used++];
   c->state = s;
   c->action = action;
@@ -194,24 +200,34 @@ static const qa_ui_binding_action *available_actions(bind_state *s,
   *out_count = count;
   return s->available;
 }
-static const char *target_label(bind_state *s, qa_input_binding_target target,
-                                char *fallback, size_t size) {
+static const char *target_label(bind_state *s, qa_input_binding_target target) {
   size_t count = 0;
   const qa_ui_binding_action *actions = available_actions(s, &count);
   for (size_t i = 0; i < count; i++)
     if (qa_ui_binding_matches_action(target, &actions[i]))
       return actions[i].label;
-  snprintf(fallback, size, "%s", target.is_action ? target.action
-                                                  : target.text);
-  return fallback;
+  return target.is_action ? target.action : target.text;
 }
 static void set_selected(bind_state *s, const char *value) {
   free(s->selected);
   s->selected = value == NULL ? NULL : xstrdup(value);
 }
+/* scope?.local() === true */
+static bool scope_local(const bind_state *s) {
+  return s->has_scope && s->scope.local(s->scope.ctx);
+}
+static void note_local(const bind_state *s, const qa_physical_input *physical) {
+  if (scope_local(s) && s->scope.note_local != NULL) s->scope.note_local(s->scope.ctx, physical);
+}
+/* TS unbindKey: a local edit tells the scope of each key it touches. */
+static void unbind_key(bind_state *s, const qa_physical_input *physical) {
+  note_local(s, physical);
+  qa_seat_input_unbind(s->input, physical);
+}
 static void assign_row(bind_state *s, const brow *row,
                        qa_physical_input physical) {
-  if (row->has_physical) qa_seat_input_unbind(s->input, &row->physical);
+  if (row->has_physical) unbind_key(s, &row->physical);
+  note_local(s, &physical);
   qa_input_binding binding = { physical, row->target };
   if (!qa_seat_input_bind(s->input, &binding)) oom();
   char key[512], selected[1024];
@@ -219,89 +235,87 @@ static void assign_row(bind_state *s, const brow *row,
   snprintf(selected, sizeof selected, "%s:%s", row->action->id, key);
   set_selected(s, selected);
 }
-static void snapshot_row(const brow *row, qa_ui_binding_action *action,
-                         char *id, size_t id_size, char *label,
-                         size_t label_size, char *action_text,
-                         size_t action_text_size, char *target_text,
-                         size_t target_text_size, brow *out) {
-  *action = *row->action;
-  snprintf(id, id_size, "%s", row->action->id);
-  snprintf(label, label_size, "%s", row->action->label);
-  const char *at = row->action->target.is_action
-                       ? row->action->target.action
-                       : row->action->target.text;
-  snprintf(action_text, action_text_size, "%s", at != NULL ? at : "");
-  action->id = id;
-  action->label = label;
-  if (action->target.is_action) action->target.action = action_text;
-  else action->target.text = action_text;
-  const char *tt = row->target.is_action ? row->target.action
-                                         : row->target.text;
-  snprintf(target_text, target_text_size, "%s", tt != NULL ? tt : "");
-  *out = *row;
-  out->id = NULL;
-  out->action = action;
-  if (out->target.is_action) out->target.action = target_text;
-  else out->target.text = target_text;
+static void snapshot_free(row_snapshot *snapshot) {
+  free(snapshot->id);
+  free(snapshot->label);
+  free(snapshot->action_text);
+  free(snapshot->target_text);
+  memset(snapshot, 0, sizeof *snapshot);
+}
+/* Copies first, then replaces: `row` may live in the snapshot being replaced. */
+static void snapshot_row(row_snapshot *out, const brow *row) {
+  const char *at = row->action->target.is_action ? row->action->target.action
+                                                 : row->action->target.text;
+  const char *tt = row->target.is_action ? row->target.action : row->target.text;
+  row_snapshot next;
+  memset(&next, 0, sizeof next);
+  next.id = xstrdup(row->action->id);
+  next.label = xstrdup(row->action->label);
+  next.action_text = xstrdup(at != NULL ? at : "");
+  next.target_text = xstrdup(tt != NULL ? tt : "");
+  next.action = *row->action;
+  next.row = *row;
+  snapshot_free(out);
+  *out = next;
+  out->action.id = out->id;
+  out->action.label = out->label;
+  if (out->action.target.is_action) out->action.target.action = out->action_text;
+  else out->action.target.text = out->action_text;
+  out->row.id = NULL;
+  out->row.action = &out->action;
+  if (out->row.target.is_action) out->row.target.action = out->target_text;
+  else out->row.target.text = out->target_text;
 }
 static void capture_accept(void *v, qa_physical_input physical) {
   bind_state *s = v;
   const qa_input_binding_target *previous =
       qa_seat_input_binding(s->input, &physical);
   if (previous == NULL
-      || qa_ui_binding_matches_action(*previous, s->capture_row.action)) {
-    assign_row(s, &s->capture_row, physical);
+      || qa_ui_binding_matches_action(*previous, s->capture.row.action)) {
+    assign_row(s, &s->capture.row, physical);
   } else {
     s->has_pending = true;
     s->pending_physical = physical;
-    snapshot_row(&s->capture_row, &s->pending_action, s->pending_id,
-                 sizeof s->pending_id, s->pending_label,
-                 sizeof s->pending_label, s->pending_action_text,
-                 sizeof s->pending_action_text, s->pending_target_text,
-                 sizeof s->pending_target_text, &s->pending_row);
+    snapshot_row(&s->pending, &s->capture.row);
+    /* The conflict menu reads the previous target after a replace has bound
+       the key anew, so keep its text. */
+    char *text = xstrdup(previous->is_action ? previous->action : previous->text);
+    free(s->pending_previous_text);
+    s->pending_previous_text = text;
     s->pending_previous = *previous;
+    if (s->pending_previous.is_action) s->pending_previous.action = text;
+    else s->pending_previous.text = text;
     qa_native_ui_controller_open_menu(s->controller,
                                       "menu:bindings:conflict");
   }
 }
 static void capture_cancel(void *v) { (void)v; }
 static void start_capture(bind_state *s, const brow *row) {
-  snapshot_row(row, &s->capture_action, s->capture_id,
-               sizeof s->capture_id, s->capture_label,
-               sizeof s->capture_label, s->capture_action_text,
-               sizeof s->capture_action_text, s->capture_target_text,
-               sizeof s->capture_target_text, &s->capture_row);
+  snapshot_row(&s->capture, row);
   qa_native_ui_controller_capture_binding(s->controller, capture_accept,
                                           capture_cancel, s);
 }
-/* TS toLowerCase (Unicode) into a bounded buffer. */
-static void lower_into(char *out, size_t size, const char *in) {
-  char *lowered = qa_js_to_lower_case(in);
-  if (lowered == NULL) qa_range_error("Out of memory");
-  snprintf(out, size, "%s", lowered);
-  free(lowered);
-}
+/* query.toLocaleLowerCase().trim().split(/\s+/u), every term a substring of the
+ * searchable text; a blank query is [""] and matches everything. JS white space
+ * over UTF-8 (a lone 0xA0 byte is a continuation byte, not NBSP). */
 static bool terms_match(const char *searchable_lower, const char *query) {
-  char lowered[512];
-  lower_into(lowered, sizeof lowered, query);
-  /* Trim, then split on whitespace runs; an empty term list and a
-   * single "" term both match everything. */
-  char *trimmed = qa_input_js_trim(lowered);
-  if (trimmed == NULL) oom();
+  char *lowered = qa_js_to_lower_case(query);
+  if (lowered == NULL) oom();
   bool ok = true;
-  char *p = trimmed;
+  const char *p = lowered;
   while (*p != '\0') {
-    while (*p != '\0' && qa_input_js_space((unsigned char)*p)) p++;
+    size_t space;
+    while ((space = qa_js_white_space_length(p)) > 0) p += space;
     if (*p == '\0') break;
-    char *start = p;
-    while (*p != '\0' && !qa_input_js_space((unsigned char)*p)) p++;
+    const char *start = p;
+    while (*p != '\0' && qa_js_white_space_length(p) == 0) p++;
     size_t length = (size_t)(p - start);
     bool found = false;
     for (const char *h = searchable_lower; *h != '\0'; h++)
       if (strncmp(h, start, length) == 0) { found = true; break; }
     if (!found) ok = false;
   }
-  free(trimmed);
+  free(lowered);
   return ok;
 }
 static void build_rows(bind_state *s) {
@@ -313,22 +327,32 @@ static void build_rows(bind_state *s) {
   for (size_t a = 0; a < action_count; a++) {
     const qa_ui_binding_action *action = &actions[a];
     /* Searchable: label + physical labels of matching bindings. */
-    char searchable[2048];
-    snprintf(searchable, sizeof searchable, "%s ", action->label);
+    /* `${label} ${names.join(" ")}` */
+    size_t length = strlen(action->label) + 2;
+    char *searchable = malloc(length);
+    if (searchable == NULL) oom();
+    snprintf(searchable, length, "%s ", action->label);
     size_t matches = 0;
     for (size_t i = 0; i < binding_count; i++) {
       if (!qa_ui_binding_matches_action(bindings[i].target, action))
         continue;
-      matches++;
       char *name = qa_physical_input_name(&bindings[i].input);
       if (name == NULL) oom();
-      strncat(searchable, name, sizeof searchable - strlen(searchable) - 1);
-      strncat(searchable, " ", sizeof searchable - strlen(searchable) - 1);
+      length += strlen(name) + 1;
+      char *grown = realloc(searchable, length);
+      if (grown == NULL) oom();
+      searchable = grown;
+      if (matches > 0) strcat(searchable, " ");
+      strcat(searchable, name);
       free(name);
+      matches++;
     }
-    char lowered[2048];
-    lower_into(lowered, sizeof lowered, searchable);
-    if (!terms_match(lowered, s->query)) continue;
+    char *lowered = qa_js_to_lower_case(searchable);
+    free(searchable);
+    if (lowered == NULL) oom();
+    bool keep = terms_match(lowered, s->query != NULL ? s->query : "");
+    free(lowered);
+    if (!keep) continue;
     if (s->row_capacity < s->row_count + matches + 1) {
       size_t cap = s->row_capacity == 0 ? 32 : s->row_capacity * 2;
       while (cap < s->row_count + matches + 1) cap *= 2;
@@ -379,7 +403,7 @@ static void on_activate(void *v, qa_seat_id seat) {
       qa_native_ui_controller_close_menu(s->controller);
       break;
     case B_REPLACE:
-      assign_row(s, &s->pending_row, s->pending_physical);
+      assign_row(s, &s->pending.row, s->pending_physical);
       qa_native_ui_controller_close_menu(s->controller);
       break;
     case B_RESTORE:
@@ -404,7 +428,7 @@ static void on_activate(void *v, qa_seat_id seat) {
     case B_REMOVE: {
       const brow *current = current_row(s);
       if (current != NULL && current->has_physical)
-        qa_seat_input_unbind(s->input, &current->physical);
+        unbind_key(s, &current->physical);
       break;
     }
     case B_CLEAR: {
@@ -422,7 +446,7 @@ static void on_activate(void *v, qa_seat_id seat) {
                                            current->action))
             copy[kept++] = bindings[i].input;
         for (size_t i = 0; i < kept; i++)
-          qa_seat_input_unbind(s->input, &copy[i]);
+          unbind_key(s, &copy[i]);
         free(copy);
       }
       break;
@@ -435,12 +459,20 @@ static void on_row_x(void *v, qa_seat_id seat) {
   bctx *c = v;
   bind_state *s = c->state;
   if (c->row < s->row_count && s->rows[c->row].has_physical)
-    qa_seat_input_unbind(s->input, &s->rows[c->row].physical);
+    unbind_key(s, &s->rows[c->row].physical);
+}
+static void on_change_local(void *v, qa_seat_id seat, bool checked) {
+  (void)seat;
+  bctx *c = v;
+  bind_state *s = c->state;
+  s->scope.set_local(s->scope.ctx, checked);
 }
 static void on_change_search(void *v, qa_seat_id seat, const char *value) {
   (void)seat;
   bctx *c = v;
-  snprintf(c->state->query, sizeof c->state->query, "%s", value);
+  char *query = xstrdup(value);
+  free(c->state->query);
+  c->state->query = query;
   set_selected(c->state, NULL);
 }
 static void on_submit_noop(void *v, qa_seat_id seat, const char *value) {
@@ -483,14 +515,15 @@ static void conflict_close(void *v, qa_seat_id seat) {
 }
 static qa_ui_menu conflict_factory(void *v) {
   bind_state *s = v;
-  if (!s->has_pending) qa_range_error("No pending binding conflict");
+  if (!s->has_pending) qa_raise("Error", 0, 0, "No pending binding conflict");
   pool_clear(s);
-  char previous[1024], fallback[512];
-  snprintf(previous, sizeof previous, "Currently: %s",
-           target_label(s, s->pending_previous, fallback, sizeof fallback));
-  char next_label[1024];
-  snprintf(next_label, sizeof next_label, "Replace with: %s",
-           s->pending_row.action->label);
+  const char *label = target_label(s, s->pending_previous);
+  char *previous = malloc(strlen(label) + 12);
+  if (previous == NULL) oom();
+  sprintf(previous, "Currently: %s", label);
+  char *next_label = malloc(strlen(s->pending.row.action->label) + 15);
+  if (next_label == NULL) oom();
+  sprintf(next_label, "Replace with: %s", s->pending.row.action->label);
   char *name = qa_physical_input_name(&s->pending_physical);
   if (name == NULL) oom();
   snprintf(s->title, sizeof s->title, "%s is already bound", name);
@@ -500,6 +533,8 @@ static qa_ui_menu conflict_factory(void *v) {
                        qa_ui_menu_row_default(1), B_NONE, false);
   controls[1] = button(s, "ui:bindings:new", pool(s, next_label),
                        qa_ui_menu_row_default(2), B_NONE, false);
+  free(previous);
+  free(next_label);
   controls[2] = button(s, "ui:bindings:cancel", "Cancel",
                        qa_ui_menu_row_default(4), B_CANCEL, true);
   controls[3] = button(s, "ui:bindings:replace", "Replace binding",
@@ -549,7 +584,7 @@ static qa_ui_menu root_factory(void *v) {
   search.rect = (qa_rect){ 48, 80, 544, 28 };
   search.enabled = true;
   search.visible = true;
-  search.text = pool(s, s->query);
+  search.text = pool(s, s->query != NULL ? s->query : "");
   search.maximum_length = 80;
   search.ctx = next_ctx(s, B_SEARCH, 0);
   search.change_text = on_change_search;
@@ -584,7 +619,8 @@ static qa_ui_menu root_factory(void *v) {
         s->cells[i * 2 + 1] = pool(s, name);
         free(name);
         s->row_actions[i].label = "X";
-        s->row_actions[i].ctx = next_ctx(s, B_ROW_X, i);
+        s->rows[i].x_ctx = (bctx){ s, B_ROW_X, i };
+        s->row_actions[i].ctx = &s->rows[i].x_ctx;
         s->row_actions[i].activate = on_row_x;
         s->list_rows[i].action = &s->row_actions[i];
       } else {
@@ -625,6 +661,20 @@ static qa_ui_menu root_factory(void *v) {
   controls[at++] = button(s, "ui:bindings:clear", "Clear action",
                           (qa_rect){ 416, 380, 176, 28 }, B_CLEAR,
                           have_current && current->has_physical);
+  if (s->has_scope && s->scope.available(s->scope.ctx)) {
+    qa_ui_control local;
+    memset(&local, 0, sizeof local);
+    local.id = "ui:bindings:local";
+    local.kind = "toggle";
+    local.label = "Keep bindings to this game";
+    local.rect = (qa_rect){ 156, 412, 252, 28 };
+    local.enabled = true;
+    local.visible = true;
+    local.checked = s->scope.local(s->scope.ctx);
+    local.ctx = next_ctx(s, B_NONE, 0);
+    local.change_checked = on_change_local;
+    controls[at++] = local;
+  }
   if (s->has_reset)
     controls[at++] = button(s, "ui:bindings:reset", "Reset bindings",
                             (qa_rect){ 416, 412, 176, 28 }, B_RESET_OPEN,
@@ -655,6 +705,10 @@ static void bindings_dispose(qa_ui_settings_menus *menus) {
   free(s->cells);
   free(s->row_actions);
   free(s->selected);
+  free(s->query);
+  free(s->pending_previous_text);
+  snapshot_free(&s->capture);
+  snapshot_free(&s->pending);
   free(s);
   menus->state = NULL;
 }
@@ -664,9 +718,17 @@ qa_ui_settings_menus qa_ui_register_binding_menus(
     const qa_ui_binding_action *source, size_t source_count,
     const qa_ui_binding_action *(*get_source)(void *ctx, size_t *out_count),
     void *source_ctx, const qa_ui_binding_reset *reset) {
+  return qa_ui_register_binding_menus_scoped(controller, input, source, source_count, get_source, source_ctx,
+                                             reset, NULL);
+}
+qa_ui_settings_menus qa_ui_register_binding_menus_scoped(
+    qa_native_ui_controller *controller, qa_seat_input *input,
+    const qa_ui_binding_action *source, size_t source_count,
+    const qa_ui_binding_action *(*get_source)(void *ctx, size_t *out_count),
+    void *source_ctx, const qa_ui_binding_reset *reset, const qa_ui_binding_scope *scope) {
   if (!qa_same_seat(qa_native_ui_controller_get_seat(controller),
                     qa_seat_input_seat(input)))
-    qa_range_error("Binding menu belongs to another input seat");
+    qa_raise("Error", 0, 0, "Binding menu belongs to another input seat");
   bind_state *s = calloc(1, sizeof *s);
   if (s == NULL) oom();
   s->controller = controller;
@@ -678,6 +740,10 @@ qa_ui_settings_menus qa_ui_register_binding_menus(
   if (reset != NULL) {
     s->has_reset = true;
     s->reset = *reset;
+  }
+  if (scope != NULL) {
+    s->has_scope = true;
+    s->scope = *scope;
   }
   int handle = qa_native_ui_controller_register(
       controller, "menu:bindings:conflict", conflict_factory, s);

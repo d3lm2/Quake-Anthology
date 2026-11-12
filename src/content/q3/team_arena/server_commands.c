@@ -22,13 +22,14 @@ static char *dup_str(const char *v) {
 static void lower_inplace(char *text) {
   for (char *p = text; *p; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p + 32);
 }
-/* TS argument(): missing is "", truncated to 1023 bytes. Malloc'd. */
-static char *argument(const char *const *argv, size_t argc, size_t index) {
+/* TS argument(): missing is "", truncated to 1023 bytes. Written into the caller's 1024-byte
+ * buffer, so a raise from a command (an unavailable capability, a team change) leaves nothing
+ * allocated behind for the console dispatcher that catches it. */
+enum { ARGUMENT_BYTES = 1024 };
+static char *argument(char out[ARGUMENT_BYTES], const char *const *argv, size_t argc, size_t index) {
   const char *value = index < argc ? argv[index] : "";
   size_t n = strlen(value);
-  if (n > 1023) n = 1023;
-  char *out = malloc(n + 1);
-  if (!out) qa_range_error("out of memory");
+  if (n > ARGUMENT_BYTES - 1) n = ARGUMENT_BYTES - 1;
   memcpy(out, value, n);
   out[n] = '\0';
   return out;
@@ -113,13 +114,25 @@ qa_q3_ta_server_command_save_state qa_q3_ta_game_server_command_runtime_capture(
   out.ban_value = r->has_ban_vm_string ? dup_str(r->ban_value) : NULL;
   return out;
 }
+typedef struct restore_scratch { qa_q3_ta_ip_filter *filters; char *ban_value; } restore_scratch;
+static void restore_scratch_free(void *arg) {
+  restore_scratch *scratch = arg;
+  free(scratch->filters);
+  free(scratch->ban_value);
+}
 void qa_q3_ta_game_server_command_runtime_restore(qa_q3_ta_game_server_command_runtime *r, const qa_save_value *value) {
   qa_save_reader reader, filters_reader, ban;
   if (!qa_save_reader_init(&reader, value, "q3.serverCommands")) qa_range_error("out of memory");
   if (!qa_save_reader_field(&reader, "filters", &filters_reader)) qa_range_error("out of memory");
   size_t count = qa_save_reader_list_count(&filters_reader);
-  qa_q3_ta_ip_filter *filters = count ? malloc(count * sizeof *filters) : NULL;
+  /* TS reads every filter and the ban string, then validates; a decode error from a later
+   * row wins over "too many IP filters". The rows read so far are released if a reader raises. */
+  restore_scratch scratch = {count ? malloc(count * sizeof(qa_q3_ta_ip_filter)) : NULL, NULL};
+  qa_q3_ta_ip_filter *filters = scratch.filters;
   if (count && !filters) qa_range_error("out of memory");
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, restore_scratch_free, &scratch);
+  bool too_large = false;
   for (size_t i = 0; i < count; i++) {
     qa_save_reader item, mask, compare;
     if (!qa_save_reader_item(&filters_reader, i, &item)) qa_range_error("out of memory");
@@ -132,13 +145,7 @@ void qa_q3_ta_game_server_command_runtime_restore(qa_q3_ta_game_server_command_r
     qa_save_reader_destroy(&item);
     filters[i].mask = qa_js_to_uint32(mask_value);
     filters[i].compare = qa_js_to_uint32(compare_value);
-    if (mask_value > 4294967295.0 || compare_value > 4294967295.0) {
-      /* validated after the full read below, like the TS */
-      filters[i].mask = 0; /* placeholder, fail follows */
-      qa_save_reader_destroy(&filters_reader);
-      free(filters);
-      qa_save_reader_fail(&reader, "too many IP filters");
-    }
+    if (mask_value > 4294967295.0 || compare_value > 4294967295.0) too_large = true;
   }
   qa_save_reader_destroy(&filters_reader);
   if (!qa_save_reader_field(&reader, "banVmString", &ban)) qa_range_error("out of memory");
@@ -152,13 +159,12 @@ void qa_q3_ta_game_server_command_runtime_restore(qa_q3_ta_game_server_command_r
     qa_save_reader_destroy(&count_reader);
     if (!qa_save_reader_field(&ban, "value", &value_reader)) qa_range_error("out of memory");
     ban_value = dup_str(qa_save_reader_string(&value_reader));
+    scratch.ban_value = ban_value;
     qa_save_reader_destroy(&value_reader);
   }
   qa_save_reader_destroy(&ban);
-  if (count > QA_Q3_TA_MAX_IP_FILTERS) {
-    free(filters); free(ban_value);
-    qa_save_reader_fail(&reader, "too many IP filters");
-  }
+  if (count > QA_Q3_TA_MAX_IP_FILTERS || too_large) qa_save_reader_fail(&reader, "too many IP filters");
+  qa_cleanup_pop(&scratch_cleanup);
   qa_save_reader_destroy(&reader);
   free(r->state->filters);
   r->state->filters = filters;
@@ -299,22 +305,21 @@ bool qa_q3_ta_game_server_command_runtime_filter_packet(qa_q3_ta_game_server_com
 }
 static void remove_ip(qa_q3_ta_game_server_command_runtime *r, const char *const *argv, size_t argc) {
   if (argc < 2) { r->host.print(r->host.ctx, "Usage:  sv removeip <ip-mask>\n"); return; }
-  char *text = argument(argv, argc, 1);
+  char text_buffer[ARGUMENT_BYTES];
+  char *text = argument(text_buffer, argv, argc, 1);
   qa_q3_ta_ip_filter parsed;
-  if (!string_to_filter(r, text, &parsed)) { free(text); return; }
+  if (!string_to_filter(r, text, &parsed)) return;
   for (size_t i = 0; i < r->state->filter_count; i++) {
     qa_q3_ta_ip_filter *filter = &r->state->filters[i];
     if (filter->mask != parsed.mask || filter->compare != parsed.compare) continue;
     filter->compare = QA_Q3_TA_FREE_FILTER;
     r->host.print(r->host.ctx, "Removed.\n");
     update_ip_bans(r);
-    free(text);
     return;
   }
   char buffer[1200];
   (void)snprintf(buffer, sizeof buffer, "Didn't find %s.\n", text);
   r->host.print(r->host.ctx, buffer);
-  free(text);
 }
 qa_q3_game_client *qa_q3_ta_game_server_command_runtime_client_for_string(qa_q3_ta_game_server_command_runtime *r, const char *value) {
   if (is_digit(value[0])) {
@@ -379,28 +384,26 @@ static void capability(qa_q3_ta_game_server_command_runtime *r, qa_q3_ta_server_
     const char *const *argv, size_t argc) {
   (void)r;
   if (service->kind == QA_Q3_TA_CAP_UNAVAILABLE) {
-    char *command = argument(argv, argc, 0);
-    qa_range_error("%s unavailable: %s", command, service->reason);
+    char command[ARGUMENT_BYTES];
+    qa_raise("Error", 0, 0, "%s unavailable: %s", argument(command, argv, argc, 0), service->reason);
   }
   service->run(service->ctx, argv, argc);
 }
 bool qa_q3_ta_game_server_command_runtime_console_command(qa_q3_ta_game_server_command_runtime *r,
     const char *const *argv, size_t argc) {
-  char *command = argument(argv, argc, 0);
-  lower_inplace(command);
+  char command[ARGUMENT_BYTES];
+  lower_inplace(argument(command, argv, argc, 0));
   bool handled = true;
   if (strcmp(command, "entitylist") == 0) entity_list(r);
   else if (strcmp(command, "forceteam") == 0) {
-    char *arg1 = argument(argv, argc, 1);
-    qa_q3_game_client *client = qa_q3_ta_game_server_command_runtime_client_for_string(r, arg1);
-    free(arg1);
+    char arg1[ARGUMENT_BYTES], arg2[ARGUMENT_BYTES];
+    qa_q3_game_client *client =
+        qa_q3_ta_game_server_command_runtime_client_for_string(r, argument(arg1, argv, argc, 1));
     if (client != NULL) {
       double slot = -1;
       for (int i = 0; i < QA_Q3_MAX_CLIENTS; i++) if (r->pool->clients[i] == client) { slot = i; break; }
-      if (slot < 0) { free(command); qa_range_error("Console client belongs to another entity pool"); }
-      char *arg2 = argument(argv, argc, 2);
-      r->host.set_team(r->host.ctx, qa_q3_entity_pool_at(r->pool, slot), arg2);
-      free(arg2);
+      if (slot < 0) qa_raise("Error", 0, 0, "Console client belongs to another entity pool");
+      r->host.set_team(r->host.ctx, qa_q3_entity_pool_at(r->pool, slot), argument(arg2, argv, argc, 2));
     }
   }
   else if (strcmp(command, "game_memory") == 0) capability(r, &r->host.memory, argv, argc);
@@ -413,7 +416,7 @@ bool qa_q3_ta_game_server_command_runtime_console_command(qa_q3_ta_game_server_c
   }
   else if (strcmp(command, "addip") == 0) {
     if (argc < 2) r->host.print(r->host.ctx, "Usage:  addip <ip-mask>\n");
-    else { char *a = argument(argv, argc, 1); add_ip(r, a); free(a); }
+    else { char a[ARGUMENT_BYTES]; add_ip(r, argument(a, argv, argc, 1)); }
   }
   else if (strcmp(command, "removeip") == 0) remove_ip(r, argv, argc);
   else if (strcmp(command, "listip") == 0) r->host.execute_console_now(r->host.ctx, "g_banIPs\n");
@@ -431,6 +434,5 @@ bool qa_q3_ta_game_server_command_runtime_console_command(qa_q3_ta_game_server_c
       free(text);
     }
   }
-  free(command);
   return handled;
 }

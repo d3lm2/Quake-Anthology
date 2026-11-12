@@ -29,6 +29,7 @@
 #include "qa/app/bootstrap/network/q2_client_receiver.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
+#include "qa/formats/text_decoder.h"
 static void free_arg(void *arg) { free(arg); }
 /* TS `throw new Q2ServerDropError(message)`: Com_Error(ERR_DROP), the client leaves the server and
  * shows the message instead of ending the process. */
@@ -272,14 +273,28 @@ static void print_text(qa_app_q2_download_receiver *r, const char *a, const char
   r->print(r->print_ctx, text);
   free(text);
 }
+/* TS mkdir(path, { recursive: true }) as Bun runs it: the full path first; ENOENT walks up to the
+ * parent and retries; any other failure raises Bun's Error naming the path that failed (an
+ * existing non-directory is EEXIST). */
 static void mkdir_recursive(const char *path) {
-  char *copy = copy_text(path);
-  if (!copy) qa_range_error("out of memory");
-  for (char *p = copy + 1; *p; p++) {
-    if (*p == '/') { *p = '\0'; mkdir(copy, 0777); *p = '/'; }
+  if (mkdir(path, 0777) == 0) return;
+  int error = errno;
+  if (error == EEXIST) {
+    struct stat status;
+    if (stat(path, &status) == 0 && S_ISDIR(status.st_mode)) return;
+    qa_content_fs_error(EEXIST, "mkdir", path);
   }
-  mkdir(copy, 0777);
-  free(copy);
+  if (error != ENOENT) qa_content_fs_error(error, "mkdir", path);
+  const char *slash = strrchr(path, '/');
+  if (slash == NULL || slash == path) qa_content_fs_error(error, "mkdir", path);
+  char *parent = strndup(path, (size_t)(slash - path));
+  if (parent == NULL) qa_range_error("out of memory");
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_arg, parent);
+  mkdir_recursive(parent);
+  qa_cleanup_pop(&guard);
+  free(parent);
+  if (mkdir(path, 0777) != 0 && errno != EEXIST) qa_content_fs_error(errno, "mkdir", path);
 }
 static const char *path_basename(const char *path) {
   const char *slash = strrchr(path, '/');
@@ -486,9 +501,14 @@ static void http_validate_package(void *ctx, const char *staged) {
       qa_js_ends_with_ignore_case(v->path, ".pak") ? QA_ARCHIVE_FORMAT_PAK : QA_ARCHIVE_FORMAT_ZIP);
   qa_archive_destroy(archive);
 }
-static void http_asset_run(qa_app_q2_download_receiver *r, const char *path, bool package) {
+/* TS httpAsset up to `await http.enqueue(...)`: NULL when the asset is skipped (no queue entry),
+ * else the queue destination (owned). The validate context stays with the entry until it
+ * settles: *validate receives it (owned, with its path). */
+static char *http_asset_enqueue(qa_app_q2_download_receiver *r, const char *path, bool package,
+    validate_ctx **validate) {
+  *validate = NULL;
   if (!r->http || !r->server || !r->state || list_contains(&r->attempted, path)
-      || !permitted(r, QA_APP_DL_HTTP, qa_app_client_download_category_for(path))) return;
+      || !permitted(r, QA_APP_DL_HTTP, qa_app_client_download_category_for(path))) return NULL;
   list_push(&r->attempted, path);
   const char *gamedir = state_gamedir(r->state);
   const char *game = gamedir && gamedir[0] ? gamedir : "baseq2";
@@ -502,35 +522,105 @@ static void http_asset_run(qa_app_q2_download_receiver *r, const char *path, boo
   free(encoded_game); free(encoded_path);
   char *url = url_join(r->server, relative);
   free(relative);
+  qa_cleanup url_node;
+  qa_cleanup_push(&url_node, free_arg, url);
   char *destination = http_destination(r, path);
+  qa_cleanup destination_node;
+  qa_cleanup_push(&destination_node, free_arg, destination);
   http_paths_set(r, destination, path);
-  validate_ctx validate = {r, copy_text(path)};
-  qa_download_expectation expected = {true, NULL, 0,
-      package ? 1024.0 * 1024 * 1024 : 128.0 * 1024 * 1024}; /* MAX_HTTP_PACKAGE/ASSET_BYTES */
+  validate_ctx *context = malloc(sizeof *context);
+  if (!context) qa_range_error("out of memory");
+  context->r = r;
+  context->path = copy_text(path);
+  *validate = context;
+  /* HTTP downloads have no size limit; the completion bound is only the largest exact byte count
+   * (HTTP_DOWNLOAD_UNBOUNDED = Number.MAX_SAFE_INTEGER). */
+  qa_download_expectation expected = {true, NULL, 0, 9007199254740991.0};
   qa_http_download_request request = {destination, url, package ? "package" : "asset",
-      expected, package ? http_validate_package : http_validate, &validate};
+      expected, package ? http_validate_package : http_validate, context};
   qa_http_download_queue_enqueue(r->http, request);
-  qa_http_download_queue_pump(r->http);
-  qa_http_download_result result;
-  int have = qa_http_download_queue_result(r->http, destination, &result);
-  free(validate.path); free(url); free(destination);
-  if (!have) return;
-  if (strcmp(result.kind, "failed") == 0) {
-    const char *reason = result.reason ? result.reason : "HTTP download failed";
+  qa_cleanup_pop(&destination_node);
+  qa_cleanup_pop(&url_node);
+  free(url);
+  return destination;
+}
+/* TS httpAsset after its enqueue settles. */
+static void http_asset_settled(qa_app_q2_download_receiver *r, const char *path, bool package,
+    qa_http_download_result *result) {
+  if (strcmp(result->kind, "failed") == 0) {
+    const char *reason = result->reason ? result->reason : "HTTP download failed";
     char *message = copy_text(reason);
-    qa_http_download_result_destroy(&result);
+    qa_http_download_result_destroy(result);
     if (!message) qa_range_error("out of memory");
     qa_cleanup node;
     qa_cleanup_push(&node, free_arg, message);
     qa_raise("Error", 0, 0, "%s", message);
   }
-  bool fallback = strcmp(result.kind, "fallback") == 0;
-  qa_http_download_result_destroy(&result);
+  bool fallback = strcmp(result->kind, "fallback") == 0;
+  qa_http_download_result_destroy(result);
   const qa_app_q2_remote_mounts *content = r->content(r->content_ctx);
   content->mounts.invalidate_listings(content->mounts.ctx);
   if (fallback)
     print_text(r, "HTTP unavailable: ", path, "; ",
         package ? "continuing with individual files\n" : "using native download\n");
+}
+static void validate_free(validate_ctx *validate) {
+  if (!validate) return;
+  free(validate->path);
+  free(validate);
+}
+typedef struct asset_batch {
+  size_t count; char **destinations; validate_ctx **validates; bool *settled;
+} asset_batch;
+static void asset_batch_free(void *arg) {
+  asset_batch *batch = arg;
+  for (size_t i = 0; i < batch->count; i++) {
+    free(batch->destinations[i]);
+    validate_free(batch->validates[i]);
+  }
+  free(batch->destinations); free(batch->validates); free(batch->settled);
+  memset(batch, 0, sizeof *batch);
+}
+/* TS `await Promise.all(paths.map(path => this.httpAsset(path, kind)))`: every asset is marked
+ * attempted and enqueued before the queue runs (so its resolved checks precede any transfer and
+ * up to `concurrency` transfers run at once); each settled asset is handled as it settles (its
+ * print, or the first failure to settle rejecting the batch; the queue cancels the rest). Assets
+ * that settle in the same poll are handled in their order. */
+static void http_assets_run(qa_app_q2_download_receiver *r, char *const *paths, size_t count,
+    bool package) {
+  asset_batch batch = {0};
+  qa_cleanup node;
+  qa_cleanup_push(&node, asset_batch_free, &batch);
+  batch.destinations = calloc(count ? count : 1, sizeof *batch.destinations);
+  batch.validates = calloc(count ? count : 1, sizeof *batch.validates);
+  batch.settled = calloc(count ? count : 1, sizeof *batch.settled);
+  if (!batch.destinations || !batch.validates || !batch.settled) qa_range_error("out of memory");
+  batch.count = count;
+  for (size_t i = 0; i < count; i++) {
+    batch.destinations[i] = http_asset_enqueue(r, paths[i], package, &batch.validates[i]);
+    if (!batch.destinations[i]) batch.settled[i] = true;
+  }
+  for (;;) {
+    bool waiting = false;
+    for (size_t i = 0; i < count; i++) {
+      if (batch.settled[i]) continue;
+      qa_http_download_result result;
+      if (!qa_http_download_queue_result(r->http, batch.destinations[i], &result)) {
+        waiting = true;
+        continue;
+      }
+      batch.settled[i] = true;
+      http_asset_settled(r, paths[i], package, &result);
+    }
+    if (!waiting || qa_http_download_queue_idle(r->http)) break;
+    qa_http_download_queue_poll(r->http, 50);
+  }
+  qa_cleanup_pop(&node);
+  asset_batch_free(&batch);
+}
+static void http_asset_run(qa_app_q2_download_receiver *r, const char *path, bool package) {
+  char *one = (char *)path;
+  http_assets_run(r, &one, 1, package);
 }
 typedef struct filelist_entry {
   qa_app_q2_download_receiver *r;
@@ -538,7 +628,8 @@ typedef struct filelist_entry {
   size_t length;
   string_list *assets, *packages;
 } filelist_entry;
-/* One TS filelist try block. The line is a byte span; a NUL inside it fails validation. */
+/* One TS filelist try block. The line is a span of decoded text (a decoded U+0000 is C0 80,
+ * which the character checks refuse); a raw NUL cannot occur. */
 static void filelist_entry_body(void *arg) {
   filelist_entry *entry = (filelist_entry *)arg;
   char *line = malloc(entry->length + 1);
@@ -569,8 +660,24 @@ static void filelist_entry_body(void *arg) {
 /* httpInitial's locals, released when a validation or currency check raises out of it. */
 typedef struct initial_held {
   char *parent; string_list assets, packages, lists;
-  char *path; char *encoded_game; uint8_t *bytes;
+  char *path; char *encoded_game; uint8_t *bytes; char *text;
 } initial_held;
+/* line.slice(0, 128) of TextDecoder text: 128 UTF-16 units (a four-byte character is two); a
+ * cut through one leaves a lone surrogate, printed as U+FFFD. */
+static void filelist_shown(const char *line, size_t length, char out[3 * 128 + 4]) {
+  size_t used = 0, n = 0;
+  for (size_t i = 0; i < length && used < 128;) {
+    unsigned char c = (unsigned char)line[i];
+    size_t step = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1;
+    if (step > length - i) step = length - i;
+    if (step == 4 && used + 2 > 128) { memcpy(out + n, "\xef\xbf\xbd", 3); n += 3; break; }
+    memcpy(out + n, line + i, step);
+    n += step;
+    used += step == 4 ? 2 : 1;
+    i += step;
+  }
+  out[n] = '\0';
+}
 static void initial_held_release(void *arg) {
   initial_held *held = arg;
   free(held->parent); held->parent = NULL;
@@ -581,6 +688,7 @@ static void initial_held_release(void *arg) {
   free(held->path); held->path = NULL;
   free(held->encoded_game); held->encoded_game = NULL;
   free(held->bytes); held->bytes = NULL;
+  free(held->text); held->text = NULL;
 }
 static void http_initial_run(qa_app_q2_download_receiver *r, const qa_app_q2_game_state *state) {
   if (!r->server || !permitted(r, QA_APP_DL_HTTP, QA_APP_DL_METADATA)) return;
@@ -601,8 +709,6 @@ static void http_initial_run(qa_app_q2_download_receiver *r, const qa_app_q2_gam
   check_current(current);
   qa_http_queue_options options = {0};
   options.ctx = current;
-  options.has_total_budget_bytes = true;
-  options.total_budget_bytes = 2.0 * 1024 * 1024 * 1024; /* MAX_HTTP_SESSION_BYTES */
   options.assert_current = queue_assert_current;
   options.resolved = queue_resolved;
   options.refresh_package = queue_refresh_package;
@@ -660,9 +766,13 @@ static void http_initial_run(qa_app_q2_download_receiver *r, const qa_app_q2_gam
     free(held.path); held.path = NULL;
     check_current(current);
     if (!held.bytes) continue;
-    const uint8_t *bytes = held.bytes;
-    /* TS new TextDecoder().decode(bytes).split('\n'): every segment counts toward the entry
+    /* TS new TextDecoder().decode(bytes).split('\n'): the decoded text (BOM dropped, invalid
+     * sequences as U+FFFD) is validated and printed; every segment counts toward the entry
      * cap, including the empty one after a final newline. */
+    held.text = qa_text_decoder_decode(held.bytes, length, &length);
+    free(held.bytes); held.bytes = NULL;
+    if (!held.text) qa_range_error("out of memory");
+    const uint8_t *bytes = (const uint8_t *)held.text;
     size_t start = 0;
     while (start <= length) {
       const uint8_t *newline = memchr(bytes + start, '\n', length - start);
@@ -677,17 +787,15 @@ static void http_initial_run(qa_app_q2_download_receiver *r, const qa_app_q2_gam
         filelist_entry entry = {r, (const char *)bytes + start, line_length, &held.assets, &held.packages};
         qa_caught_error caught;
         if (!qa_try(filelist_entry_body, &entry, &caught)) {
-          char shown[129];
-          size_t shown_length = line_length > 128 ? 128 : line_length;
-          memcpy(shown, bytes + start, shown_length);
-          shown[shown_length] = '\0';
+          char shown[3 * 128 + 4];
+          filelist_shown((const char *)bytes + start, line_length, shown);
           print_text(r, "Ignoring invalid Q2 filelist entry: ", shown, "\n", "");
         }
       }
       if (!newline) break;
       start = end + 1;
     }
-    free(held.bytes); held.bytes = NULL;
+    free(held.text); held.text = NULL;
   }
   /* Native Q2 cannot download flat packages. Settle package publication/reload before assets. */
   for (size_t i = 0; i < held.packages.count; i++) {
@@ -719,7 +827,7 @@ static void http_initial_run(qa_app_q2_download_receiver *r, const qa_app_q2_gam
       free(held.path); held.path = NULL;
     }
   }
-  for (size_t i = 0; i < held.assets.count; i++) http_asset_run(r, held.assets.items[i], false);
+  http_assets_run(r, held.assets.items, held.assets.count, false);
   check_current(current);
   qa_cleanup_pop(&node);
   initial_held_release(&held);

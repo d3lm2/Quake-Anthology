@@ -1,7 +1,10 @@
 /* Port of src/console/commands.ts. GPL-2.0-or-later. */
 #include "qa/console/commands.h"
 
+#include "qa/core/commands/text.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
+#include "qa/settings/config.h"
 #include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,13 +112,39 @@ typedef struct dump_operation {
   char *contents;
 } dump_operation;
 
+/* store.dump's rejection, writeAtomic's Node fs error, caught so the caller can see it first. */
+static void raise_dump_failure(void *ctx) {
+  (void)ctx;
+  qa_settings_raise_write_failure();
+}
+typedef struct dump_failure {
+  const char *name; /* static */
+  int code;
+  long long detail;
+  char *message;
+} dump_failure;
+static dump_failure catch_dump_failure(void) {
+  qa_caught_error caught;
+  (void)qa_try(raise_dump_failure, NULL, &caught);
+  dump_failure failure = {caught.name, caught.code, caught.detail, dup_text(qa_caught_message(&caught))};
+  return failure;
+}
+/* The TS operation rethrows the rejection. */
+static noreturn void rethrow_dump_failure(dump_failure failure) {
+  if (failure.message == NULL) qa_range_error("Out of memory");
+  qa_cleanup node; /* the raise formats the text before it unwinds this node */
+  qa_cleanup_push(&node, free, failure.message);
+  qa_raise(failure.name, failure.code, failure.detail, "%s", failure.message);
+}
+
 static void condump_operation_run(void *op_ctx) {
   dump_operation *op = (dump_operation *)op_ctx;
   if (!qa_config_store_dump(op->store, op->path, op->contents)) {
+    dump_failure failure = catch_dump_failure();
     free(op->path);
     free(op->contents);
     free(op);
-    qa_error("condump write failed");
+    rethrow_dump_failure(failure);
   }
   size_t length = strlen(op->path) + 26;
   char *text = (char *)malloc(length);
@@ -145,7 +174,10 @@ static void condump_handler(void *ctx, qa_command_invocation *invocation) {
                        !ends_with(name, ".txt")
                    ? join2(name, ".txt")
                    : dup_text(name);
-  char *contents = qa_console_buffer_dump(&console->buffer);
+  /* The console buffer holds console text; store.dump writes the string as UTF-8 (core/commands/text.h). */
+  char *dumped = qa_console_buffer_dump(&console->buffer);
+  char *contents = dumped == NULL ? NULL : qa_command_text_to_utf8(dumped);
+  free(dumped);
   dump_operation *op = (dump_operation *)calloc(1, sizeof *op);
   if (op == NULL || path == NULL || contents == NULL) {
     free(op);
@@ -183,12 +215,12 @@ static void writeconfig_complete(writeconfig_operation *op,
 static void writeconfig_operation_run(void *op_ctx) {
   writeconfig_operation *op = (writeconfig_operation *)op_ctx;
   if (!qa_config_store_dump(op->store, op->path, op->contents)) {
-    writeconfig_complete(op, QA_CONFIGURATION_FAILED,
-                         "writeconfig write failed");
+    dump_failure failure = catch_dump_failure();
+    writeconfig_complete(op, QA_CONFIGURATION_FAILED, failure.message != NULL ? failure.message : "Out of memory");
     free(op->path);
     free(op->contents);
     free(op);
-    qa_error("writeconfig write failed");
+    rethrow_dump_failure(failure);
   }
   print_wrote(&op->services, op->path);
   writeconfig_complete(op, QA_CONFIGURATION_WRITTEN, NULL);
@@ -230,10 +262,15 @@ static void writeconfig_handler(void *ctx, qa_command_invocation *invocation) {
     free(error);
     free(op->path);
     free(op);
+    /* The raise formats the text before it unwinds this node. */
+    qa_cleanup copy_node;
+    if (copy != NULL) qa_cleanup_push(&copy_node, free, copy);
     qa_error(copy != NULL ? copy : "configuration failed");
   }
   op->store = reg->services.config(reg->services.ctx, seat);
-  op->contents = contents;
+  /* The configuration is console text (archived bindings and cvar values); store.dump writes it as UTF-8. */
+  op->contents = qa_command_text_to_utf8(contents);
+  free(contents);
   reg->services.queue(reg->services.ctx, writeconfig_operation_run, op, false);
 }
 

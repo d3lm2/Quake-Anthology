@@ -25,7 +25,8 @@ typedef struct qa_app_server_operator_host {
   const char *(*resolve_address)(void *ctx, const char *name, int64_t default_port, qa_net_address *out);
 } qa_app_server_operator_host;
 typedef struct qa_app_server_operator_state qa_app_server_operator_state;
-/* TS ServerOperatorState.open. store/scope borrowed (store outlives). */
+/* TS ServerOperatorState.open. The state keeps its own copy of the store (root copied, legacy
+ * borrowed) and of scope, as TS holds the ConfigStore it was given. */
 qa_app_server_operator_state *qa_app_server_operator_state_open(const qa_config_store *store, const char *scope);
 void qa_app_server_operator_state_destroy(qa_app_server_operator_state *s);
 typedef struct qa_app_limited_rcon { char *password; char **prefixes; size_t prefix_count; } qa_app_limited_rcon;

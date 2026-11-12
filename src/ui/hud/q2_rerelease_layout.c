@@ -69,19 +69,25 @@ static bool ends_with(const char *text, const char *suffix) {
          strcmp(text + length - suffix_length, suffix) == 0;
 }
 
-/* TS cell(): encode, cut at 23 bytes, decode (lossy). */
+/* TS cell(): decoder.decode(encoder.encode(value).subarray(0, 23)). A UTF-8
+ * sequence the cut leaves incomplete decodes as one U+FFFD, as TextDecoder
+ * (fatal: false) does at the end of its input. */
 static char *cell_text(const char *value) {
   size_t length = strlen(value);
   if (length <= 23) return xstrdup(value);
   length = 23;
-  /* Drop a trailing incomplete UTF-8 sequence (see header note). */
-  while (length > 0 && ((((unsigned char)value[length - 1]) & 0xC0) == 0x80))
-    length--;
-  if (length > 0) {
-    unsigned char lead = (unsigned char)value[length - 1];
-    if (lead >= 0xC2) length--;
-  }
-  return xdup_range(value, length);
+  size_t start = length;
+  while (start > 0 && ((((unsigned char)value[start - 1]) & 0xC0) == 0x80)) start--;
+  if (start == 0) return xdup_range(value, length);
+  unsigned char lead = (unsigned char)value[start - 1];
+  size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+  size_t have = length - (start - 1);
+  if (lead < 0xC0 || have >= need) return xdup_range(value, length);
+  char *out = malloc(start - 1 + 4);
+  if (out == NULL) qa_range_error("Out of memory");
+  memcpy(out, value, start - 1);
+  memcpy(out + start - 1, "\xEF\xBF\xBD", 4);
+  return out;
 }
 
 void qa_native_q2_hud_table_init(qa_native_q2_hud_table *table) {
@@ -144,6 +150,10 @@ static char *client_name(const qa_native_q2_hud_frame *frame, double slot) {
 }
 
 /* TS localized(): environment.localize, then ##P<n> client names. */
+static void free_ref(void *ref) {
+  free(*(char **)ref);
+  *(char **)ref = NULL;
+}
 static char *localized_text(const qa_native_q2_hud_frame *frame,
                             qa_native_q2_hud_environment *env,
                             const char *text, const char *const *args,
@@ -153,6 +163,9 @@ static char *localized_text(const qa_native_q2_hud_frame *frame,
   size_t capacity = strlen(base) + 32, length = 0;
   char *out = malloc(capacity);
   if (out == NULL) qa_range_error("Out of memory");
+  /* A ##P slot outside clientinfo raises from client_name. */
+  qa_cleanup out_cleanup;
+  qa_cleanup_push(&out_cleanup, free_ref, &out);
   const char *cursor = base;
   while (*cursor != '\0') {
     if (cursor[0] == '#' && cursor[1] == '#' && cursor[2] == 'P' &&
@@ -183,7 +196,35 @@ static char *localized_text(const qa_native_q2_hud_frame *frame,
     }
   }
   out[length] = '\0';
+  qa_cleanup_pop(&out_cleanup);
   return out;
+}
+
+/* Strings and arrays one layout command holds while it can still raise (a
+ * malformed token, a stat or clientinfo reference outside source limits).
+ * The TS drops them with the throw; here the unwind frees them, and each
+ * command frees its own when it finishes. */
+typedef struct rr_temps {
+  void **items;
+  size_t count, capacity;
+} rr_temps;
+static void *rr_keep(rr_temps *temps, void *pointer) {
+  if (temps->count == temps->capacity) {
+    size_t capacity = temps->capacity != 0 ? temps->capacity * 2 : 16;
+    void **grown = realloc(temps->items, capacity * sizeof *grown);
+    if (grown == NULL) {
+      free(pointer);
+      qa_range_error("Out of memory");
+    }
+    temps->items = grown;
+    temps->capacity = capacity;
+  }
+  temps->items[temps->count++] = pointer;
+  return pointer;
+}
+static void rr_temps_clear(rr_temps *temps) {
+  for (size_t i = 0; i < temps->count; i++) free(temps->items[i]);
+  temps->count = 0;
 }
 
 typedef struct rr_state {
@@ -338,6 +379,7 @@ typedef struct rr_layout_unwind {
   qa_native_q2_hud_table *scratch; /* NULL when the environment's table is used */
   bool **conditions;
   char **command;
+  rr_temps *temps;
 } rr_layout_unwind;
 static void rr_layout_unwind_run(void *ctx) {
   rr_layout_unwind *unwind = ctx;
@@ -347,6 +389,10 @@ static void rr_layout_unwind_run(void *ctx) {
   *unwind->conditions = NULL;
   free(*unwind->command);
   *unwind->command = NULL;
+  rr_temps_clear(unwind->temps);
+  free(unwind->temps->items);
+  unwind->temps->items = NULL;
+  unwind->temps->capacity = 0;
 }
 
 bool qa_q2_rerelease_layout_into(const char *source,
@@ -387,7 +433,8 @@ bool qa_q2_rerelease_layout_into(const char *source,
   char *command = NULL;
   /* A layout or parse error is caught by the HUD (NativeQ2HudLayoutError); this
    * frame's storage is released when it unwinds. */
-  rr_layout_unwind unwind = { &parser, scratch_used ? &scratch : NULL, &conditions, &command };
+  rr_temps temps = { NULL, 0, 0 };
+  rr_layout_unwind unwind = { &parser, scratch_used ? &scratch : NULL, &conditions, &command, &temps };
   qa_cleanup unwind_cleanup;
   qa_cleanup_push(&unwind_cleanup, rr_layout_unwind_run, &unwind);
   while (qa_tokenizer_next(&parser, true, &token)) {
@@ -539,7 +586,7 @@ bool qa_q2_rerelease_layout_into(const char *source,
         } else if (selected) {
           value = arsenal->selected_localized_label;
         } else {
-          owned_value = localized_text(frame, environment, raw, NULL, 0);
+          owned_value = rr_keep(&temps, localized_text(frame, environment, raw, NULL, 0));
           value = owned_value;
         }
         if (starts_with(command, "loc_stat_cstring")) {
@@ -551,7 +598,6 @@ bool qa_q2_rerelease_layout_into(const char *source,
                              : 0),
                   s.y, false);
         }
-        free(owned_value);
       }
     } else if (strcmp(command, "string") == 0 ||
                strcmp(command, "string2") == 0 ||
@@ -574,16 +620,16 @@ bool qa_q2_rerelease_layout_into(const char *source,
       char *a = NEXT_STR();
       int32_t size = rr_count(qa_game_atoi(a), 7);
       free(a);
-      char *base = NEXT_STR();
+      char *base = rr_keep(&temps, NEXT_STR());
       char **args = NULL;
       if (size > 0) {
-        args = malloc((size_t)size * sizeof *args);
+        args = rr_keep(&temps, calloc((size_t)size, sizeof *args));
         if (args == NULL) qa_range_error("Out of memory");
-        for (int32_t i = 0; i < size; i++) args[i] = NEXT_STR();
+        for (int32_t i = 0; i < size; i++) args[i] = rr_keep(&temps, NEXT_STR());
       }
       if (draw) {
-        char *value = localized_text(frame, environment, base,
-                                     (const char *const *)args, (size_t)size);
+        char *value = rr_keep(&temps, localized_text(frame, environment, base,
+                                                     (const char *const *)args, (size_t)size));
         bool alternate = ends_with(command, "2");
         if (starts_with(command, "loc_cstring"))
           rr_centered(&s, value, alternate, s.x, s.y);
@@ -593,11 +639,7 @@ bool qa_q2_rerelease_layout_into(const char *source,
                              ? rr_measure(&s, value, false)
                              : 0),
                   s.y, false);
-        free(value);
       }
-      for (int32_t i = 0; i < size; i++) free(args[i]);
-      free(args);
-      free(base);
     } else if (strcmp(command, "client") == 0) {
       int32_t values[5];
       for (size_t i = 0; i < 5; i++) {
@@ -628,7 +670,7 @@ bool qa_q2_rerelease_layout_into(const char *source,
         free(a);
       }
       if (values[4] > 999) values[4] = 999;
-      char *icon = NEXT_STR();
+      char *icon = rr_keep(&temps, NEXT_STR());
       if (draw) {
         s.x = trunc(width / 2) - 160 + values[0];
         s.y = trunc(height / 2) - 120 + values[1];
@@ -655,7 +697,6 @@ bool qa_q2_rerelease_layout_into(const char *source,
           rr_push(&s, op);
         }
       }
-      free(icon);
     } else if (strcmp(command, "time_limit") == 0) {
       char *a = NEXT_STR();
       int32_t end = qa_game_atoi(a);
@@ -672,18 +713,16 @@ bool qa_q2_rerelease_layout_into(const char *source,
         char *seconds_text = pad_start_zero(seconds_raw, 2);
         free(seconds_raw);
         size_t total = strlen(minutes) + strlen(seconds_text) + 2;
-        char *arg = malloc(total);
+        char *arg = rr_keep(&temps, malloc(total));
         if (arg == NULL) qa_range_error("Out of memory");
         snprintf(arg, total, "%s:%s", minutes, seconds_text);
         free(minutes);
         free(seconds_text);
         const char *args[1] = { arg };
-        char *value = localized_text(frame, environment, "$g_score_time",
-                                     args, 1);
+        char *value = rr_keep(&temps, localized_text(frame, environment, "$g_score_time",
+                                                     args, 1));
         rr_text(&s, value, true, s.x - rr_measure(&s, value, false), s.y,
                 false);
-        free(value);
-        free(arg);
       }
     } else if (strcmp(command, "dogtag") == 0) {
       char *a = NEXT_STR();
@@ -711,21 +750,24 @@ bool qa_q2_rerelease_layout_into(const char *source,
       free(a);
       char **headers = NULL;
       if (size > 0) {
-        headers = malloc((size_t)size * sizeof *headers);
+        headers = rr_keep(&temps, calloc((size_t)size, sizeof *headers));
         if (headers == NULL) qa_range_error("Out of memory");
-        for (int32_t i = 0; i < size; i++) headers[i] = NEXT_STR();
+        for (int32_t i = 0; i < size; i++) headers[i] = rr_keep(&temps, NEXT_STR());
       }
       if (draw) {
+        /* Localize every header first: a raise must not leave a half-built row. */
+        char **localized = NULL;
+        if (size > 0) {
+          localized = rr_keep(&temps, calloc((size_t)size, sizeof *localized));
+          if (localized == NULL) qa_range_error("Out of memory");
+          for (int32_t i = 0; i < size; i++)
+            localized[i] = rr_keep(&temps, localized_text(frame, environment, headers[i], NULL, 0));
+        }
         char **cells = NULL;
         if (size > 0) {
           cells = malloc((size_t)size * sizeof *cells);
           if (cells == NULL) qa_range_error("Out of memory");
-          for (int32_t i = 0; i < size; i++) {
-            char *value =
-                localized_text(frame, environment, headers[i], NULL, 0);
-            cells[i] = cell_text(value);
-            free(value);
-          }
+          for (int32_t i = 0; i < size; i++) cells[i] = cell_text(localized[i]);
         }
         table_clear_rows(s.table);
         table_push_row(s.table, cells, (size_t)size);
@@ -739,17 +781,15 @@ bool qa_q2_rerelease_layout_into(const char *source,
         table_set_columns(s.table, columns, (size_t)size);
         free(columns);
       }
-      for (int32_t i = 0; i < size; i++) free(headers[i]);
-      free(headers);
     } else if (strcmp(command, "table_row") == 0) {
       char *a = NEXT_STR();
       int32_t size = rr_count(qa_game_atoi(a), 6);
       free(a);
       char **values = NULL;
       if (size > 0) {
-        values = malloc((size_t)size * sizeof *values);
+        values = rr_keep(&temps, calloc((size_t)size, sizeof *values));
         if (values == NULL) qa_range_error("Out of memory");
-        for (int32_t i = 0; i < size; i++) values[i] = NEXT_STR();
+        for (int32_t i = 0; i < size; i++) values[i] = rr_keep(&temps, NEXT_STR());
       }
       if (draw) {
         if (s.table->row_count >= 11)
@@ -770,8 +810,6 @@ bool qa_q2_rerelease_layout_into(const char *source,
           if (measured > s.table->columns[i]) s.table->columns[i] = measured;
         }
       }
-      for (int32_t i = 0; i < size; i++) free(values[i]);
-      free(values);
     } else if (strcmp(command, "draw_table") == 0) {
       if (draw) {
         double space = trunc(environment->measure(environment->ctx, " ").x);
@@ -856,12 +894,11 @@ bool qa_q2_rerelease_layout_into(const char *source,
       }
     } else if (strcmp(command, "health_bars") == 0) {
       if (draw) {
-        char *label = localized_text(
+        char *label = rr_keep(&temps, localized_text(
             frame, environment,
             qa_native_q2_config_string_at(frame, CONFIG_HEALTH_BAR_NAME), NULL,
-            0);
+            0));
         rr_centered(&s, label, false, trunc(width / 2) - 160, s.y);
-        free(label);
         s.y += environment->font_line_height;
         double value = rr_stat(&s, STAT_HEALTH_BARS);
         double bar_width = width * 0.5;
@@ -911,11 +948,13 @@ bool qa_q2_rerelease_layout_into(const char *source,
     }
 #undef NEXT_STR
 #undef NEXT_INT
+    rr_temps_clear(&temps);
     free(command);
     command = NULL;
     if (!s.ok) break;
   }
   qa_cleanup_pop(&unwind_cleanup);
+  free(temps.items);
   free(conditions);
   qa_tokenizer_destroy(&parser);
   if (scratch_used) qa_native_q2_hud_table_destroy(&scratch);
@@ -955,6 +994,9 @@ bool qa_q2_rerelease_inventory_into(
   } inv_row;
   inv_row *items = NULL;
   size_t item_count = 0, item_capacity = 0;
+  /* A ##P name outside clientinfo raises from localized_text. */
+  qa_cleanup items_cleanup;
+  qa_cleanup_push(&items_cleanup, free_ref, &items);
   if (inventory != NULL) {
     item_count = inventory->item_count;
     items = malloc((item_count != 0 ? item_count : 1) * sizeof *items);
@@ -973,8 +1015,9 @@ bool qa_q2_rerelease_inventory_into(
       if (frame->inventory[i] == 0) continue;
       if (item_count == item_capacity) {
         item_capacity = item_capacity != 0 ? item_capacity * 2 : 16;
-        items = realloc(items, item_capacity * sizeof *items);
-        if (items == NULL) qa_range_error("Out of memory");
+        inv_row *grown = realloc(items, item_capacity * sizeof *grown);
+        if (grown == NULL) qa_range_error("Out of memory");
+        items = grown;
       }
       items[item_count].name =
           qa_native_q2_config_string_at(frame, s.config.items + (double)i);
@@ -1070,6 +1113,7 @@ bool qa_q2_rerelease_inventory_into(
     }
     free(name);
   }
+  qa_cleanup_pop(&items_cleanup);
   free(items);
   return s.ok;
 }

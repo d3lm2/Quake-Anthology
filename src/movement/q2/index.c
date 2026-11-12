@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "qa/contracts/world.h"
+#include "qa/core/math.h"
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
 #include "qa/movement/client_outputs.h"
@@ -13,7 +14,6 @@
 #include "qa/movement/q2/dimensions.h"
 #include "qa/movement/q2/math.h"
 
-static const qa_vec3 zero_vec = {0, 0, 0};
 
 static bool str_eq(const char *a, const char *b) {
   return a != NULL && b != NULL && strcmp(a, b) == 0;
@@ -129,8 +129,8 @@ static qa_q2_trace adapter_trace(trace_adapter *adapter, const qa_q2_vec3 start,
   }
   query.target.is_model = world_only;
   query.target.model = 0;
-  query.target.origin = zero_vec;
-  query.target.angles = zero_vec;
+  query.target.origin = qa_zero_vec3;
+  query.target.angles = qa_zero_vec3;
   query.policy.kind = "q2";
   query.policy.contents_mask = mask;
   query.policy.leaf_contents = adapter->leaf_contents;
@@ -535,7 +535,7 @@ static qa_q2_rerelease_movement_result move_q2_rerelease_physics(
                                  : input.state.as.q2_rerelease.type)
                      : QA_Q2_KEX_PM_FREEZE;
   source_vector(input.state.as.q2_rerelease.origin, pm.s.origin);
-  source_vector(pose == NULL ? input.state.as.q2_rerelease.velocity : zero_vec, pm.s.velocity);
+  source_vector(pose == NULL ? input.state.as.q2_rerelease.velocity : qa_zero_vec3, pm.s.velocity);
   pm.s.pm_flags = input.state.as.q2_rerelease.flags;
   pm.s.pm_time = input.state.as.q2_rerelease.time_milliseconds;
   pm.s.gravity = input.state.as.q2_rerelease.gravity;

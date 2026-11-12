@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
+
 /* Field reader or abort (OOM has no TS counterpart). */
 static qa_save_reader field(const qa_save_reader *reader, const char *name) {
   qa_save_reader out;
@@ -223,6 +225,8 @@ static double *field_double_list(const qa_save_reader *reader, const char *name,
   size_t count = qa_save_reader_list_count(&list);
   double *values = count > 0 ? (double *)malloc(count * sizeof *values) : NULL;
   if (count > 0 && values == NULL) qa_save_reader_fail(&list, "out of memory");
+  qa_cleanup values_node; /* a malformed word raises with the list released */
+  qa_cleanup_push(&values_node, free, values);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(&list, i, &item)) qa_save_reader_fail(&list, "out of memory");
@@ -230,6 +234,7 @@ static double *field_double_list(const qa_save_reader *reader, const char *name,
                              : qa_save_reader_integer(&item);
     qa_save_reader_destroy(&item);
   }
+  qa_cleanup_pop(&values_node);
   qa_save_reader_destroy(&list);
   *out_count = count;
   return values;
@@ -251,14 +256,19 @@ qa_random_state qa_read_random(const qa_save_reader *reader) {
     size_t count = 0;
     state.words.values = field_double_list(reader, "words", false, &count);
     state.words.count = count;
+    qa_cleanup words_node;
+    qa_cleanup_push(&words_node, free, (void *)state.words.values);
     state.front = field_integer_min(reader, "front", 0);
     state.rear = field_integer_min(reader, "rear", 0);
+    qa_cleanup_pop(&words_node);
   } else if (strcmp(kind, "q2-rerelease-mt19937") == 0) {
     state.kind = QA_RANDOM_STATE_Q2_RERELEASE_MT19937;
     qa_save_reader words = field(reader, "words");
     size_t count = qa_save_reader_list_count(&words);
     double *values = count > 0 ? (double *)malloc(count * sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&words, "out of memory");
+    qa_cleanup values_node; /* released if any later read raises */
+    qa_cleanup_push(&values_node, free, values);
     for (size_t i = 0; i < count; i++) {
       qa_save_reader item;
       if (!qa_save_reader_item(&words, i, &item)) qa_save_reader_fail(&words, "out of memory");
@@ -279,6 +289,7 @@ qa_random_state qa_read_random(const qa_save_reader *reader) {
     state.words.count = count;
     state.index = index_value;
     (void)field_literal(reader, "distribution", "msvc-2022-17.6");
+    qa_cleanup_pop(&values_node);
   } else {
     state.kind = QA_RANDOM_STATE_GUEST;
     state.module = field_string(reader, "module");
@@ -307,6 +318,8 @@ qa_frame_ordering qa_read_ordering(const qa_save_reader *reader) {
     size_t count = qa_save_reader_list_count(&providers);
     const char **values = count > 0 ? (const char **)malloc(count * sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&providers, "out of memory");
+    qa_cleanup values_node; /* released if any later read raises */
+    qa_cleanup_push(&values_node, free, (void *)values);
     for (size_t i = 0; i < count; i++) {
       qa_save_reader item;
       if (!qa_save_reader_item(&providers, i, &item))
@@ -319,6 +332,7 @@ qa_frame_ordering qa_read_ordering(const qa_save_reader *reader) {
     ordering.provider_count = count;
     (void)field_literal(reader, "entityOrder", "source-slot-order");
     (void)field_literal(reader, "ties", "provider-entity-invocation");
+    qa_cleanup_pop(&values_node);
   }
   return ordering;
 }

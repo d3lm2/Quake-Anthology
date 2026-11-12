@@ -82,7 +82,7 @@ static void gib(qa_q2m_context *c) {
     for (int p = 0; p < 2; p++) {
       qa_q2_entity *piece = qa_q2m_throw_gib(entity, game, arms[p], 500, skin_up);
       if (piece) {
-        piece->scale = (entity->scale != 0 ? entity->scale : 1) * factors[f];
+        piece->scale = q2rm_else(entity->scale, 1) * factors[f]; /* TS `||`: 0 and NaN take the fallback */
         game->show(game->ctx, piece);
       }
     }
@@ -161,7 +161,7 @@ static void rocket64_fn(void *ctx, qa_q2m_context *c) {
   qa_body_state enemy;
   if (!qa_q2m_enemy_body(c, &enemy)) return;
   qa_vec3 right = qa_math_angle_vectors_rule(q2rm_body(game, entity).angles, QA_ANGLE_RULE_NATIVE).right;
-  double size = entity->scale != 0 ? entity->scale : 1;
+  double size = q2rm_else(entity->scale, 1);
   qa_vec3 start = qa_q2m_project_flash_default(c, qa_q2m_muzzle_offset(QA_Q2_EDITION_RERELEASE, 78));
   start.z += 10 * size;
   start = qa_sub3_double(start, qa_scale3_double(right, (2 + fmod(entity->count, 4) * 8) * size));

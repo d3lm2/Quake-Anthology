@@ -15,11 +15,16 @@
 #include "qa/content/q2/foundation/monsters/infantry.h"
 #include "qa/core/math.h"
 #include "qa/foundation/support.h"
+#include "../diagnostic.h"
 #include "qa/foundation/js.h"
 
-typedef struct breach_entry { qa_q2_entity *e; qa_q2_base_turret_breach_state state; } breach_entry;
+/* TS WeakMap<Q2Entity, ...>: an entry dies with its entity. C keys by pointer, and a
+ * freed entity's address can be given to a later entity, so an entry counts only while
+ * the actor recorded with it is still that entity's. */
+typedef struct breach_entry { qa_q2_entity *e; qa_actor_id actor; qa_q2_base_turret_breach_state state; } breach_entry;
 typedef struct driver_entry {
   qa_q2_entity *e;
+  qa_actor_id actor;
   qa_q2m_context *context;
   qa_q2_die monster_die;
   bool has_breach;
@@ -32,6 +37,10 @@ struct qa_q2_turret_entities {
   breach_entry *breaches; size_t breach_count, breach_cap;
   driver_entry *drivers; size_t driver_count, driver_cap;
   qa_q2_entity **team; size_t team_cap;
+  /* TS WeakMap entries end with their entity: C drops them when the actor is released. */
+  bool connected;
+  qa_session_actor_registry *registry;
+  int64_t subscription;
   qa_q2_named_think thinks[4];
   qa_q2_named_die dies[1];
   qa_q2_named_blocked blockeds[1];
@@ -49,27 +58,36 @@ double qa_q2_snap_turret_eighth(double value) { return trunc(value * 8 + (value 
 static double normalize_angle(double value) { while (value > 360) value -= 360; while (value < 0) value += 360; return value; }
 static double short_angle(double value) { return value < -180 ? value + 360 : value > 180 ? value - 360 : value; }
 
-static qa_q2_base_turret_breach_state *find_breach(qa_q2_turret_entities *t, qa_q2_entity *e) {
-  for (size_t i = 0; i < t->breach_count; i++) if (t->breaches[i].e == e) return &t->breaches[i].state;
+static breach_entry *breach_slot(qa_q2_turret_entities *t, qa_q2_entity *e) {
+  for (size_t i = 0; i < t->breach_count; i++) if (t->breaches[i].e == e) return &t->breaches[i];
   return NULL;
 }
-static driver_entry *find_driver(qa_q2_turret_entities *t, qa_q2_entity *e) {
+static driver_entry *driver_slot(qa_q2_turret_entities *t, qa_q2_entity *e) {
   for (size_t i = 0; i < t->driver_count; i++) if (t->drivers[i].e == e) return &t->drivers[i];
   return NULL;
 }
+static qa_q2_base_turret_breach_state *find_breach(qa_q2_turret_entities *t, qa_q2_entity *e) {
+  breach_entry *slot = breach_slot(t, e);
+  return slot && qa_same_actor(slot->actor, e->actor.id) ? &slot->state : NULL;
+}
+static driver_entry *find_driver(qa_q2_turret_entities *t, qa_q2_entity *e) {
+  driver_entry *slot = driver_slot(t, e);
+  return slot && qa_same_actor(slot->actor, e->actor.id) ? slot : NULL;
+}
 static void set_breach(qa_q2_turret_entities *t, qa_q2_entity *e, qa_q2_base_turret_breach_state state) {
-  qa_q2_base_turret_breach_state *existing = find_breach(t, e);
-  if (existing) { *existing = state; return; }
+  breach_entry *existing = breach_slot(t, e);
+  if (existing) { existing->actor = e->actor.id; existing->state = state; return; }
   if (t->breach_count == t->breach_cap) {
     size_t cap = t->breach_cap ? t->breach_cap * 2 : 8;
     breach_entry *grown = realloc(t->breaches, cap * sizeof *grown);
     if (!grown) qa_range_error("Out of memory");
     t->breaches = grown; t->breach_cap = cap;
   }
-  t->breaches[t->breach_count++] = (breach_entry){e, state};
+  t->breaches[t->breach_count++] = (breach_entry){e, e->actor.id, state};
 }
 static driver_entry *set_driver(qa_q2_turret_entities *t, qa_q2_entity *e, driver_entry value) {
-  driver_entry *existing = find_driver(t, e);
+  value.e = e; value.actor = e->actor.id;
+  driver_entry *existing = driver_slot(t, e);
   if (existing) { *existing = value; return existing; }
   if (t->driver_count == t->driver_cap) {
     size_t cap = t->driver_cap ? t->driver_cap * 2 : 8;
@@ -80,6 +98,26 @@ static driver_entry *set_driver(qa_q2_turret_entities *t, qa_q2_entity *e, drive
   driver_entry *entry = &t->drivers[t->driver_count++];
   *entry = value;
   return entry;
+}
+
+static void turrets_release(void *ctx, qa_owned_actor actor) {
+  qa_q2_turret_entities *t = ctx;
+  for (size_t i = 0; i < t->breach_count; i++)
+    if (qa_same_actor(t->breaches[i].actor, actor.id)) {
+      memmove(&t->breaches[i], &t->breaches[i + 1], (t->breach_count - i - 1) * sizeof *t->breaches);
+      t->breach_count--; i--;
+    }
+  for (size_t i = 0; i < t->driver_count; i++)
+    if (qa_same_actor(t->drivers[i].actor, actor.id)) {
+      memmove(&t->drivers[i], &t->drivers[i + 1], (t->driver_count - i - 1) * sizeof *t->drivers);
+      t->driver_count--; i--;
+    }
+}
+static void turrets_connect(qa_q2_turret_entities *t, qa_q2_game_services *game) {
+  if (t->connected) return;
+  t->registry = game->host->actors;
+  t->subscription = qa_session_actor_registry_on_release(game->host->actors, turrets_release, t);
+  t->connected = true;
 }
 
 /* Borrowed scratch, valid until the next team() call. */
@@ -137,6 +175,7 @@ qa_q2_turret_entities *qa_q2_turret_entities_create(qa_q2_base_entity_hooks hook
 }
 void qa_q2_turret_entities_destroy(qa_q2_turret_entities *t) {
   if (!t) return;
+  if (t->connected) qa_session_actor_registry_off_release(t->registry, t->subscription);
   free(t->breaches); free(t->drivers); free(t->team); free(t);
 }
 qa_q2_callback_definitions qa_q2_turret_entities_callbacks(qa_q2_turret_entities *t) { return t->defs; }
@@ -156,7 +195,7 @@ qa_q2_turrets_checkpoint qa_q2_turret_entities_capture(qa_q2_turret_entities *t,
     }
     if (driver) {
       const char *monster_die = qa_q2_die_name(game->source_callbacks, driver->monster_die, driver->monster_die.fn != NULL);
-      if (!monster_die) qa_range_error("Turret driver has no named monster death callback");
+      if (!monster_die) qa_raise("Error", 0, 0, "Turret driver has no named monster death callback");
       if (out.driver_count == dcap) { dcap = dcap ? dcap * 2 : 8; out.drivers = realloc(out.drivers, dcap * sizeof *out.drivers); if (!out.drivers) qa_range_error("Out of memory"); }
       qa_q2_base_turret_driver_entry entry = {0};
       entry.actor = actor;
@@ -171,10 +210,11 @@ qa_q2_turrets_checkpoint qa_q2_turret_entities_capture(qa_q2_turret_entities *t,
 static qa_q2_entity *saved_turret(qa_q2_game_services *game, qa_saved_actor_id actor) {
   qa_owned_actor owner = qa_q2_restore_actor(game, actor);
   qa_q2_entity *entity = game->entity(game->ctx, &owner.id);
-  if (!entity) qa_range_error("Missing saved Q2 turret entity");
+  if (!entity) qa_raise("Error", 0, 0, "Missing saved Q2 turret entity");
   return entity;
 }
 void qa_q2_turret_entities_restore(qa_q2_turret_entities *t, qa_q2_game_services *game, qa_q2_turrets_checkpoint checkpoint) {
+  turrets_connect(t, game);
   t->breach_count = 0; t->driver_count = 0;
   for (size_t i = 0; i < checkpoint.breach_count; i++)
     set_breach(t, saved_turret(game, checkpoint.breaches[i].actor), checkpoint.breaches[i].state);
@@ -184,7 +224,7 @@ void qa_q2_turret_entities_restore(qa_q2_turret_entities *t, qa_q2_game_services
     qa_q2m_context *context = t->hooks.monster_context(t->hooks.ctx, entity->actor.id);
     bool has_die = false;
     qa_q2_die monster_die = qa_q2_die_resolve(game->source_callbacks, saved->monster_die, &has_die);
-    if (!context || !has_die) qa_range_error("Restore Q2 turret drivers after their monster state");
+    if (!context || !has_die) qa_raise("Error", 0, 0, "Restore Q2 turret drivers after their monster state");
     driver_entry entry = {0};
     entry.e = entity; entry.context = context; entry.monster_die = monster_die;
     entry.has_breach = saved->has_breach;
@@ -312,12 +352,10 @@ static void driver_think_fn(void *c, qa_q2_entity *entity, qa_q2_game_services *
 static void breach_init_fn(void *c, qa_q2_entity *self, qa_q2_game_services *services) {
   qa_q2_turret_entities *t = c;
   qa_q2_base_turret_breach_state *state = find_breach(t, self);
-  if (!state) qa_range_error("Turret breach initialization without source state");
+  if (!state) qa_raise("Error", 0, 0, "Turret breach initialization without source state");
   qa_q2_entity *muzzle = services->pick_target(services->ctx, self->target);
   if (!muzzle) {
-    char message[512];
-    (void)snprintf(message, sizeof message, "turret_breach missing muzzle target %s", self->target);
-    services->host->diagnostic(services->host->ctx, message);
+    q2b_diagnosticf(services, "turret_breach missing muzzle target %s", self->target);
   } else {
     qa_vec3 a = qa_q2_game_body(services, muzzle).origin;
     qa_vec3 b = qa_q2_game_body(services, self).origin;
@@ -334,7 +372,7 @@ static void breach_init_fn(void *c, qa_q2_entity *self, qa_q2_game_services *ser
 static void driver_die_fn(void *c, qa_q2_entity *self, qa_q2_game_services *services, qa_death_reaction reaction) {
   qa_q2_turret_entities *t = c;
   driver_entry *state = find_driver(t, self);
-  if (!state) qa_range_error("Turret driver death without source state");
+  if (!state) qa_raise("Error", 0, 0, "Turret driver death without source state");
   qa_q2m_context *context = state->context;
   qa_q2_die monster_die = state->monster_die;
   qa_q2_entity *turret = state->has_breach ? services->entity(services->ctx, &state->breach) : NULL;
@@ -369,12 +407,10 @@ static void driver_die_fn(void *c, qa_q2_entity *self, qa_q2_game_services *serv
 static void driver_link_fn(void *c, qa_q2_entity *self, qa_q2_game_services *services) {
   qa_q2_turret_entities *t = c;
   driver_entry *state = find_driver(t, self);
-  if (!state) qa_range_error("Turret driver link without source state");
+  if (!state) qa_raise("Error", 0, 0, "Turret driver link without source state");
   qa_q2_entity *breach = services->pick_target(services->ctx, self->target);
   if (!breach || !find_breach(t, breach)) {
-    char message[512];
-    (void)snprintf(message, sizeof message, "turret_driver has invalid breach %s", self->target);
-    services->host->diagnostic(services->host->ctx, message);
+    q2b_diagnosticf(services, "turret_driver has invalid breach %s", self->target);
     return;
   }
   state->has_breach = true; state->breach = breach->actor.id;
@@ -402,6 +438,7 @@ static void driver_link_fn(void *c, qa_q2_entity *self, qa_q2_game_services *ser
 }
 
 bool qa_q2_turret_entities_spawn(qa_q2_turret_entities *t, qa_q2_entity *entity, qa_q2_game_services *game) {
+  turrets_connect(t, game);
   const char *classname = entity->classname;
   if (strcmp(classname, "turret_base") == 0) { spawn_blocked(t, entity, game); return true; }
   if (strcmp(classname, "turret_breach") == 0) {
@@ -426,7 +463,7 @@ bool qa_q2_turret_entities_spawn(qa_q2_turret_entities *t, qa_q2_entity *entity,
     if (game->options.mode == QA_Q2_MODE_DEATHMATCH) { game->remove(game->ctx, entity); return true; }
     qa_q2m_context *context = t->hooks.turret_driver(t->hooks.ctx, entity, game);
     qa_q2_die monster_die = entity->die;
-    if (monster_die.fn == NULL) qa_range_error("Turret driver admission did not bind infantry death");
+    if (monster_die.fn == NULL) qa_raise("Error", 0, 0, "Turret driver admission did not bind infantry death");
     driver_entry entry = {0};
     entry.e = entity; entry.context = context; entry.monster_die = monster_die;
     (void)set_driver(t, entity, entry);

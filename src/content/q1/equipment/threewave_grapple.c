@@ -105,6 +105,20 @@ qa_q1_actor *qa_q1_threewave_hook(qa_q1_threewave_grapple *grapple, qa_actor_id 
   return NULL;
 }
 
+/* TS `for (const link of game.entities.values()) if (...) game.remove(link)`:
+ * the Map iterator visits every entry while entries are deleted. Removing an
+ * entity splices it out of game->entities, so the index only advances past an
+ * entry that is still in place (the three chain links are adjacent). */
+static void remove_links_of(qa_q1_services *game, qa_actor_id owner) {
+  for (size_t i = 0; i < game->entity_count;) {
+    qa_q1_actor *link = game->entities[i];
+    if (link != NULL && link->classname != NULL && !strcmp(link->classname, "ctf_hook_link") &&
+        link->has_owner && qa_same_actor(link->owner, owner))
+      qa_q1_remove(game, link);
+    if (i < game->entity_count && game->entities[i] == link) i++;
+  }
+}
+
 void qa_q1_threewave_release(qa_q1_threewave_grapple *grapple, qa_actor_id actor) {
   qa_q1_services *game = grapple->game;
   qa_q1_threewave_state *state = find_state(grapple, actor);
@@ -120,12 +134,7 @@ void qa_q1_threewave_release(qa_q1_threewave_grapple *grapple, qa_actor_id actor
   if (edition_classic(grapple) && is_live(game, actor))
     sound_weapon(grapple, owner_of(grapple, actor).id, "weapons/bounce2.wav");
   qa_shared_body_table_detach(game->host.bodies, hook->actor);
-  for (size_t i = 0; i < game->entity_count; i++) {
-    qa_q1_actor *link = game->entities[i];
-    if (link != NULL && link->classname != NULL && !strcmp(link->classname, "ctf_hook_link") &&
-        link->has_owner && qa_same_actor(link->owner, hook->actor.id))
-      qa_q1_remove(game, link);
-  }
+  remove_links_of(game, hook->actor.id);
   qa_q1_remove(game, hook);
 }
 
@@ -329,7 +338,7 @@ bool qa_q1_threewave_fire(qa_q1_threewave_grapple *grapple, qa_actor_id actor) {
     (void)qa_q1_actor_field_set(hook, "ctf.fired", text);
   }
   const double yaw = atan2(direction.y, direction.x) * 180 / 3.141592653589793;
-  const double pitch = atan2(direction.z, hypot(direction.x, direction.y)) * 180 / 3.141592653589793;
+  const double pitch = atan2(direction.z, qa_js_hypot2(direction.x, direction.y)) * 180 / 3.141592653589793;
   {
     qa_q1_body patch = qa_q1_get_body(game, hook);
     patch.origin = qa_q1_vadd(body.origin, qa_q1_vadd(qa_q1_vscale(forward, 16), v3(0, 0, 16)));
@@ -404,12 +413,7 @@ void qa_q1_threewave_on_release(qa_q1_threewave_grapple *grapple, qa_actor_id ac
       grapple->state_count--;
       break;
     }
-  for (size_t i = 0; i < game->entity_count; i++) {
-    qa_q1_actor *link = game->entities[i];
-    if (link != NULL && link->classname != NULL && !strcmp(link->classname, "ctf_hook_link") &&
-        link->has_owner && qa_same_actor(link->owner, actor))
-      qa_q1_remove(game, link);
-  }
+  remove_links_of(game, actor);
   for (size_t i = 0; i < grapple->state_count; i++) {
     qa_q1_threewave_state *state = &grapple->states[i].state;
     if (state->has_animation && qa_same_actor(state->animation, actor)) state->has_animation = false;
@@ -484,6 +488,22 @@ static bool capture_extension(void *ctx, uint8_t **out, size_t *out_len) {
 }
 
 static void q1_free_decoded_save(void *value) { qa_save_value_free(value); }
+static qa_save_reader restore_field(const qa_save_reader *reader, const char *name) {
+  qa_save_reader out;
+  if (!qa_save_reader_field(reader, name, &out)) qa_save_reader_fail(reader, "out of memory");
+  return out;
+}
+/* TS `{ slot: r.field("slot").integer(0), generation: r.field("generation").integer(0) }`. */
+static qa_saved_actor_id restore_identity(const qa_save_reader *reader) {
+  qa_saved_actor_id saved;
+  qa_save_reader field = restore_field(reader, "slot");
+  saved.slot = qa_save_reader_integer_min(&field, 0);
+  qa_save_reader_destroy(&field);
+  field = restore_field(reader, "generation");
+  saved.generation = qa_save_reader_integer_min(&field, 0);
+  qa_save_reader_destroy(&field);
+  return saved;
+}
 static void restore_extension(void *ctx, const uint8_t *bytes, size_t len) {
   qa_q1_threewave_grapple *grapple = ctx;
   qa_q1_services *game = grapple->game;
@@ -500,77 +520,51 @@ static void restore_extension(void *ctx, const uint8_t *bytes, size_t len) {
   }
   const size_t count = qa_save_reader_list_count(&reader);
   for (size_t i = 0; i < count; i++) {
-    qa_save_reader item, actor_reader, field;
-    if (!qa_save_reader_item(&reader, i, &item)) continue;
-    if (!qa_save_reader_field(&item, "actor", &actor_reader)) {
-      qa_save_reader_destroy(&item);
-      continue;
-    }
-    qa_save_reader slot_reader, generation_reader;
-    double slot = 0, generation = 0;
-    if (qa_save_reader_field(&actor_reader, "slot", &slot_reader)) {
-      slot = qa_save_reader_integer_min(&slot_reader, 0);
-      qa_save_reader_destroy(&slot_reader);
-    }
-    if (qa_save_reader_field(&actor_reader, "generation", &generation_reader)) {
-      generation = qa_save_reader_integer_min(&generation_reader, 0);
-      qa_save_reader_destroy(&generation_reader);
-    }
-    qa_save_reader_destroy(&actor_reader);
-    const qa_saved_actor_id saved = {slot, generation};
+    qa_save_reader item;
+    if (!qa_save_reader_item(&reader, i, &item)) qa_save_reader_fail(&reader, "out of memory");
+    /* TS order: the owner, the animation reference, then the scalar fields. */
+    qa_save_reader owner_reader = restore_field(&item, "actor");
+    const qa_saved_actor_id saved = restore_identity(&owner_reader);
+    qa_save_reader_destroy(&owner_reader);
     qa_owned_actor owner;
     if (!qa_session_actor_registry_resolve_saved(game->host.actors, saved, &owner))
       qa_save_reader_fail(&item, "missing grapple owner");
-    const qa_actor_id actor_id = owner.id;
-    if (grapple->state_count == grapple->state_capacity) {
-      const size_t grown = grapple->state_capacity ? grapple->state_capacity * 2 : 8;
-      void *next = realloc(grapple->states, grown * sizeof *grapple->states);
-      if (!next) {
-        qa_save_reader_destroy(&item);
-        continue;
-      }
-      grapple->states = next;
-      grapple->state_capacity = grown;
+    qa_q1_threewave_state restored;
+    memset(&restored, 0, sizeof restored);
+    qa_save_reader field = restore_field(&item, "animation");
+    if (!qa_save_reader_is_null(&field)) { /* TS nullable(): only null skips the read */
+      restored.has_animation = true;
+      restored.animation =
+          qa_session_actor_registry_reference_saved(game->host.actors, restore_identity(&field), NULL);
     }
-    qa_q1_threewave_state *state = &grapple->states[grapple->state_count].state;
-    grapple->states[grapple->state_count].actor = actor_id;
-    memset(state, 0, sizeof *state);
-    grapple->state_count++;
-    if (qa_save_reader_field(&item, "pulling", &field)) {
-      state->pulling = qa_save_reader_boolean(&field);
-      qa_save_reader_destroy(&field);
-    }
-    if (qa_save_reader_field(&item, "weaponFrame", &field)) {
-      state->weapon_frame = qa_save_reader_number(&field);
-      qa_save_reader_destroy(&field);
-    }
-    if (qa_save_reader_field(&item, "attackFinished", &field)) {
-      state->attack_finished = qa_save_reader_number(&field);
-      qa_save_reader_destroy(&field);
-    }
-    if (qa_save_reader_field(&item, "releaseTime", &field)) {
-      state->release_time = qa_save_reader_number(&field);
-      qa_save_reader_destroy(&field);
-    }
-    if (qa_save_reader_field(&item, "animation", &field)) {
-      if (!qa_save_reader_is_null(&field) && !qa_save_reader_is_undefined(&field)) {
-        qa_save_reader slot_r, gen_r;
-        double a_slot = 0, a_gen = 0;
-        if (qa_save_reader_field(&field, "slot", &slot_r)) {
-          a_slot = qa_save_reader_integer_min(&slot_r, 0);
-          qa_save_reader_destroy(&slot_r);
-        }
-        if (qa_save_reader_field(&field, "generation", &gen_r)) {
-          a_gen = qa_save_reader_integer_min(&gen_r, 0);
-          qa_save_reader_destroy(&gen_r);
-        }
-        const qa_saved_actor_id animation = {a_slot, a_gen};
-        state->has_animation = true;
-        state->animation = qa_session_actor_registry_reference_saved(game->host.actors, animation, NULL);
-      }
-      qa_save_reader_destroy(&field);
-    }
+    qa_save_reader_destroy(&field);
+    field = restore_field(&item, "pulling");
+    restored.pulling = qa_save_reader_boolean(&field);
+    qa_save_reader_destroy(&field);
+    field = restore_field(&item, "weaponFrame");
+    restored.weapon_frame = qa_save_reader_number(&field);
+    qa_save_reader_destroy(&field);
+    field = restore_field(&item, "attackFinished");
+    restored.attack_finished = qa_save_reader_number(&field);
+    qa_save_reader_destroy(&field);
+    field = restore_field(&item, "releaseTime");
+    restored.release_time = qa_save_reader_number(&field);
+    qa_save_reader_destroy(&field);
     qa_save_reader_destroy(&item);
+    /* TS Map.set: a repeated owner replaces its earlier entry. */
+    qa_q1_threewave_state *state = find_state(grapple, owner.id);
+    if (state == NULL) {
+      if (grapple->state_count == grapple->state_capacity) {
+        const size_t grown = grapple->state_capacity ? grapple->state_capacity * 2 : 8;
+        void *next = realloc(grapple->states, grown * sizeof *grapple->states);
+        if (!next) qa_range_error("out of memory");
+        grapple->states = next;
+        grapple->state_capacity = grown;
+      }
+      grapple->states[grapple->state_count].actor = owner.id;
+      state = &grapple->states[grapple->state_count++].state;
+    }
+    *state = restored;
   }
   qa_save_reader_destroy(&reader);
   qa_cleanup_pop(&decoded_cleanup);

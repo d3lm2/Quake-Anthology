@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "qa/input/key_codes.h"
 #include "qa/input/keys.h"
 #include "qa/input/mouse_buttons.h"
@@ -231,15 +232,39 @@ static char *quoted(const char *value) {
   return out;
 }
 
-char **qa_archived_bindings(const qa_input_binding *bindings, size_t count,
-                            bool include_controller_bindings, size_t *out_count) {
-  char **commands = (char **)calloc(count + 1, sizeof *commands);
-  if (commands == NULL) {
-    *out_count = 0;
-    return NULL;
+bool qa_native_config_carries(const qa_input_binding *binding) {
+  return !binding->target.is_action && (binding->input.kind == QA_PHYSICAL_INPUT_KEY ||
+                                        binding->input.kind == QA_PHYSICAL_INPUT_MOUSE_BUTTON);
+}
+
+void qa_binding_pairs_free(qa_binding_pair *pairs, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    free(pairs[i].key);
+    free(pairs[i].command);
   }
-  commands[0] = qa_input_dup("unbindall");
-  size_t written = 1;
+  free(pairs);
+}
+
+typedef struct pairs_unwind {
+  qa_binding_pair *pairs;
+  size_t capacity;
+} pairs_unwind;
+static void release_pairs(void *arg) {
+  pairs_unwind *unwind = (pairs_unwind *)arg;
+  qa_binding_pairs_free(unwind->pairs, unwind->capacity);
+}
+
+qa_binding_pair *qa_archived_binding_pairs(const qa_input_binding *bindings, size_t count,
+                                           bool include_controller_bindings, size_t *out_count) {
+  qa_binding_pair *pairs = (qa_binding_pair *)calloc(count + 1, sizeof *pairs);
+  *out_count = 0;
+  if (pairs == NULL) return NULL;
+  size_t written = 0;
+  /* quoted() raises a TS Error for a quote or newline: the pairs built so far
+     are released (calloc zeroed the rest). */
+  pairs_unwind unwind = {pairs, count + 1};
+  qa_cleanup pairs_node;
+  qa_cleanup_push(&pairs_node, release_pairs, &unwind);
   for (size_t i = 0; i < count; i++) {
     const qa_input_binding *binding = &bindings[i];
     if (binding->target.is_action) continue;
@@ -254,8 +279,11 @@ char **qa_archived_bindings(const qa_input_binding *bindings, size_t count,
          physical->kind == QA_PHYSICAL_INPUT_CONTROLLER_AXIS) &&
         physical->device == 0) {
       if (physical->kind == QA_PHYSICAL_INPUT_CONTROLLER_BUTTON) {
+        /* TS: name = controllerButtons.find(...)?.[0].toUpperCase() ?? null, replacing any earlier name. */
+        free(name);
+        name = NULL;
         for (size_t j = 0;
-             j < sizeof controller_buttons / sizeof controller_buttons[0]; j++) {
+             j < sizeof controller_buttons / sizeof controller_buttons[0] && name == NULL; j++) {
           if (controller_buttons[j].button == physical->button) {
             name = qa_input_dup(controller_buttons[j].command);
             if (name != NULL) {
@@ -270,27 +298,55 @@ char **qa_archived_bindings(const qa_input_binding *bindings, size_t count,
                  physical->axis != NULL &&
                  (strcmp(physical->axis, "left-trigger") == 0 ||
                   strcmp(physical->axis, "right-trigger") == 0)) {
+        free(name);
         name = qa_input_dup(strcmp(physical->axis, "left-trigger") == 0
                                 ? "GAMEPAD_LEFT_TRIGGER"
                                 : "GAMEPAD_RIGHT_TRIGGER");
       }
     }
     if (name != NULL) {
-      char *quoted_name = quoted(name);
-      char *quoted_text = quoted(binding->target.text != NULL
-                                     ? binding->target.text
-                                     : "");
-      size_t length = strlen(quoted_name) + strlen(quoted_text) + 8;
-      commands[written] = (char *)malloc(length);
-      if (commands[written] != NULL) {
-        snprintf(commands[written], length, "bind %s %s", quoted_name, quoted_text);
-        written++;
-      }
-      free(quoted_name);
-      free(quoted_text);
+      const char *text = binding->target.text != NULL ? binding->target.text : "";
+      /* quoted(name); quoted(text): only for the refusal of quotes and newlines. */
+      qa_cleanup name_node;
+      qa_cleanup_push(&name_node, free, name);
+      free(quoted(name));
+      free(quoted(text));
+      qa_cleanup_pop(&name_node);
+      pairs[written].key = name;
+      pairs[written].command = qa_input_dup(text);
+      written++;
     }
-    free(name);
   }
+  qa_cleanup_pop(&pairs_node);
+  *out_count = written;
+  return pairs;
+}
+
+char **qa_archived_bindings(const qa_input_binding *bindings, size_t count,
+                            bool include_controller_bindings, size_t *out_count) {
+  size_t pair_count = 0;
+  qa_binding_pair *pairs = qa_archived_binding_pairs(bindings, count, include_controller_bindings, &pair_count);
+  char **commands = pairs == NULL ? NULL : (char **)calloc(pair_count + 1, sizeof *commands);
+  if (commands == NULL) {
+    qa_binding_pairs_free(pairs, pair_count);
+    *out_count = 0;
+    return NULL;
+  }
+  commands[0] = qa_input_dup("unbindall");
+  size_t written = 1;
+  for (size_t i = 0; i < pair_count; i++) {
+    char *quoted_name = quoted(pairs[i].key);
+    char *quoted_text = quoted(pairs[i].command != NULL ? pairs[i].command : "");
+    size_t length = strlen(quoted_name != NULL ? quoted_name : "") + strlen(quoted_text != NULL ? quoted_text : "") + 8;
+    commands[written] = (char *)malloc(length);
+    if (commands[written] != NULL) {
+      snprintf(commands[written], length, "bind %s %s", quoted_name != NULL ? quoted_name : "", quoted_text != NULL ? quoted_text : "");
+      written++;
+    }
+    free(quoted_name);
+    free(quoted_text);
+  }
+  qa_binding_pairs_free(pairs, pair_count);
   *out_count = written;
   return commands;
 }
@@ -398,25 +454,26 @@ static void bind_handler(void *ctx, qa_command_invocation *invocation) {
   }
   qa_physical_input physical;
   if (!qa_named_physical_input(name, device, &physical)) {
-    char line[512];
-    snprintf(line, sizeof line, "Unknown key %s\n", name);
-    print_text(registration, line);
+    char *line = qa_input_format("Unknown key %s\n", name);
+    if (line != NULL) print_text(registration, line);
+    free(line);
     return;
   }
   if (invocation->argc == 2) {
     const qa_input_binding_target *binding = seat.binding(seat.ctx, &physical);
     char *display = qa_physical_input_name(&physical);
-    char line[1024];
+    char *line;
     if (binding == NULL) {
-      snprintf(line, sizeof line, "%s = Unbound\n", display != NULL ? display : "");
+      line = qa_input_format("%s = Unbound\n", display != NULL ? display : "");
     } else {
-      snprintf(line, sizeof line, "%s = %s\n", display != NULL ? display : "",
-               !binding->is_action
-                   ? (binding->text != NULL ? binding->text : "")
-                   : (binding->action != NULL ? binding->action : ""));
+      line = qa_input_format("%s = %s\n", display != NULL ? display : "",
+                             !binding->is_action
+                                 ? (binding->text != NULL ? binding->text : "")
+                                 : (binding->action != NULL ? binding->action : ""));
     }
-    print_text(registration, line);
     free(display);
+    if (line != NULL) print_text(registration, line);
+    free(line);
     return;
   }
   size_t length = 0;
@@ -455,9 +512,9 @@ static void unbind_handler(void *ctx, qa_command_invocation *invocation) {
   }
   qa_physical_input physical;
   if (!qa_named_physical_input(name, 0, &physical)) {
-    char line[512];
-    snprintf(line, sizeof line, "Unknown key %s\n", name);
-    print_text(registration, line);
+    char *line = qa_input_format("Unknown key %s\n", name);
+    if (line != NULL) print_text(registration, line);
+    free(line);
     return;
   }
   if (physical.kind == QA_PHYSICAL_INPUT_CONTROLLER_BUTTON ||
@@ -517,14 +574,14 @@ static void bindlist_handler(void *ctx, qa_command_invocation *invocation) {
   const qa_input_binding *bindings = seat.bindings(seat.ctx, &count);
   for (size_t i = 0; i < count; i++) {
     char *display = qa_physical_input_name(&bindings[i].input);
-    char line[2048];
-    snprintf(line, sizeof line, "%s = %s\n", display != NULL ? display : "",
-             !bindings[i].target.is_action
-                 ? (bindings[i].target.text != NULL ? bindings[i].target.text : "")
-                 : (bindings[i].target.action != NULL ? bindings[i].target.action
-                                                      : ""));
-    print_text(registration, line);
+    char *line = qa_input_format(
+        "%s = %s\n", display != NULL ? display : "",
+        !bindings[i].target.is_action
+            ? (bindings[i].target.text != NULL ? bindings[i].target.text : "")
+            : (bindings[i].target.action != NULL ? bindings[i].target.action : ""));
     free(display);
+    if (line != NULL) print_text(registration, line);
+    free(line);
   }
 }
 

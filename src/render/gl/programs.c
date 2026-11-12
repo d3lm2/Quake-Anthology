@@ -147,125 +147,203 @@ char *qa_gl_stage_fragment_shader(void){
   memcpy(out+off,FRAG_TAIL,strlen(FRAG_TAIL)); off+=strlen(FRAG_TAIL);
   out[off]=0; return out;
 }
+/* TS: new TextDecoder().decode(log).replace(/\0.*$/s, "") over a zero-filled buffer. */
+static void info_log_text(char log[8192]){ log[8191]=0; }
 uint32_t qa_gl_compile_program(qa_gl_programs *lib,const char *vertex,const char *fragment){
-  uint32_t shaders[2]={0,0}; uint32_t program=0;
+  uint32_t shaders[2]={0,0}; size_t shader_count=0; uint32_t program=0;
   const char *sources[2]={vertex,fragment}; const uint32_t kinds[2]={0x8b31,0x8b30};
-  for(int i=0;i<2;i++){
+  char log[8192]; memset(log,0,sizeof log); const char *failure=NULL;
+  for(int i=0;i<2&&failure==NULL;i++){
     uint32_t shader=lib->glCreateShader(kinds[i]);
-    if(shader==0){ for(int j=0;j<i;j++)lib->glDeleteShader(shaders[j]); qa_range_error("OpenGL could not allocate a shader"); }
-    shaders[i]=shader;
+    if(shader==0){ failure="OpenGL could not allocate a shader"; break; }
+    shaders[shader_count++]=shader;
     qa_gl_programs_shader_source(lib,shader,sources[i]);
     lib->glCompileShader(shader);
     int32_t status=0; lib->glGetShaderiv(shader,0x8b81,&status);
-    if(status!=1){ char log[8192]; int32_t size=0; lib->glGetShaderInfoLog(shader,8192,&size,log); log[8191]=0;
-      for(int j=0;j<2;j++)if(shaders[j])lib->glDeleteShader(shaders[j]);
-      qa_range_error("OpenGL shader compilation failed: %s",log); }
+    if(status!=1){ int32_t size=0; lib->glGetShaderInfoLog(shader,8192,&size,log); info_log_text(log); failure="OpenGL shader compilation failed: "; }
   }
-  program=lib->glCreateProgram();
-  if(program==0){ lib->glDeleteShader(shaders[0]);lib->glDeleteShader(shaders[1]); qa_range_error("OpenGL could not allocate a program"); }
-  lib->glAttachShader(program,shaders[0]); lib->glAttachShader(program,shaders[1]);
-  lib->glLinkProgram(program);
-  int32_t status=0; lib->glGetProgramiv(program,0x8b82,&status);
-  lib->glDeleteShader(shaders[0]); lib->glDeleteShader(shaders[1]);
-  if(status!=1){ char log[8192]; int32_t size=0; lib->glGetProgramInfoLog(program,8192,&size,log); log[8191]=0;
-    lib->glDeleteProgram(program); qa_range_error("OpenGL program linking failed: %s",log); }
+  if(failure==NULL){
+    program=lib->glCreateProgram();
+    if(program==0) failure="OpenGL could not allocate a program";
+    else {
+      for(size_t i=0;i<shader_count;i++)lib->glAttachShader(program,shaders[i]);
+      lib->glLinkProgram(program);
+      int32_t status=0; lib->glGetProgramiv(program,0x8b82,&status);
+      if(status!=1){ int32_t size=0; lib->glGetProgramInfoLog(program,8192,&size,log); info_log_text(log); failure="OpenGL program linking failed: "; }
+    }
+  }
+  /* TS catch: the program goes; finally: every shader goes, in creation order. */
+  if(failure!=NULL&&program!=0)lib->glDeleteProgram(program);
+  for(size_t i=0;i<shader_count;i++)lib->glDeleteShader(shaders[i]);
+  if(failure!=NULL)qa_raise("Error",0,0,"%s%s",failure,log);
   return program;
 }
-typedef struct simpl { qa_gl_programs library; uint32_t program, depth_program; bool closed; } simpl;
+/* TS StageProgram keeps the location of every uniform it has looked up and the last value it
+ * uploaded to each location, so a draw that repeats the previous state issues no uniform call. */
+enum { U_FOG_MODE, U_FOG_COLOR, U_FOG_AMOUNT, U_SECONDARY_MODE, U_ALPHA_MODE, U_LUMINANCE_ALPHA, U_LIGHTING_MODE, U_LIGHT_COUNT, U_SHADOW_TEXEL, U_SHADOW_NEAR, U_SHADE_SCALE, U_COUNT };
+static const char *const U_NAMES[U_COUNT]={"u_fog_mode","u_fog_color","u_fog_amount","secondaryMode","alphaMode","u_luminance_alpha","u_lighting_mode","u_light_count","u_shadow_texel","u_shadow_near","u_shade_scale"};
+enum { L_POS, L_RADIUS, L_COLOR, L_SCALE, L_CONE_COS, L_CONE_DIR, L_FRAC, L_SHADOW, L_ATLAS, L_MATRIX, L_COUNT };
+static const char *const L_NAMES[L_COUNT]={"u_light_pos","u_light_radius","u_light_color","u_light_scale","u_light_cone_cos","u_light_cone_dir","u_light_frac","u_light_shadow","u_light_atlas","u_light_matrix"};
+typedef enum { V_INTEGER, V_SCALAR, V_VECTOR3, V_VECTOR4, V_MATRIX, V_KINDS } value_kind;
+typedef struct value_entry { int32_t location; double values[16]; } value_entry;
+typedef struct value_map { value_entry *entries; size_t count, cap; } value_map;
+typedef struct simpl {
+  qa_gl_programs library; uint32_t program, depth_program; bool closed;
+  int32_t locations[U_COUNT]; bool has_location[U_COUNT];
+  int32_t light_locations[8][L_COUNT]; bool has_light_location[8][L_COUNT];
+  value_map values[V_KINDS]; /* TS integers, scalars, vectors3, vectors4, matrices */
+} simpl;
 static int32_t uniform_loc(simpl *p,const char *name){
   int32_t loc=p->library.glGetUniformLocation(p->program,name);
-  if(loc<0) qa_range_error("OpenGL stage uniform is missing: %s",name);
+  if(loc<0) qa_raise("Error", 0, 0, "OpenGL stage uniform is missing: %s",name);
   return loc;
+}
+/* this.locations.x ??= this.uniform("x") */
+static int32_t location_of(simpl *p,int which){
+  if(!p->has_location[which]){ p->locations[which]=uniform_loc(p,U_NAMES[which]); p->has_location[which]=true; }
+  return p->locations[which];
+}
+/* locations.x ??= this.uniform(`x[${index}]`) */
+static int32_t light_location_of(simpl *p,size_t index,int which){
+  if(!p->has_light_location[index][which]){
+    char name[64]; (void)snprintf(name,sizeof name,"%s[%zu]",L_NAMES[which],index);
+    p->light_locations[index][which]=uniform_loc(p,name); p->has_light_location[index][which]=true;
+  }
+  return p->light_locations[index][which];
+}
+/* Object.is over two numbers. */
+static bool same_value(double a,double b){ return (a!=a&&b!=b)||(a==b&&signbit(a)==signbit(b)); }
+/* True when `location` already holds these values; otherwise records them (TS sets the map after the upload). */
+static bool cached_value(simpl *p,value_kind kind,int32_t location,const double *values,size_t count){
+  value_map *map=&p->values[kind]; value_entry *entry=NULL;
+  for(size_t i=0;i<map->count;i++)if(map->entries[i].location==location){ entry=&map->entries[i]; break; }
+  if(entry!=NULL){
+    bool equal=true; for(size_t i=0;i<count;i++)if(!same_value(entry->values[i],values[i])){ equal=false; break; }
+    if(equal)return true;
+  } else {
+    if(map->count==map->cap){ size_t cap=map->cap?map->cap*2:32; value_entry *grown=(value_entry*)realloc(map->entries,cap*sizeof *grown); if(!grown)qa_range_error("OpenGL stage program allocation failed"); map->entries=grown; map->cap=cap; }
+    entry=&map->entries[map->count++]; entry->location=location;
+  }
+  memcpy(entry->values,values,count*sizeof *values);
+  return false;
+}
+static void set_integer(simpl *p,int32_t location,double value){
+  if(cached_value(p,V_INTEGER,location,&value,1))return;
+  p->library.glUniform1i(location,(int32_t)value);
+}
+static void set_scalar(simpl *p,int32_t location,double value){
+  if(cached_value(p,V_SCALAR,location,&value,1))return;
+  p->library.glUniform1f(location,(float)value);
+}
+static void set_vector3(simpl *p,int32_t location,double x,double y,double z){
+  double v[3]={x,y,z}; if(cached_value(p,V_VECTOR3,location,v,3))return;
+  p->library.glUniform3f(location,(float)x,(float)y,(float)z);
+}
+static void set_vector4(simpl *p,int32_t location,double x,double y,double z,double w){
+  double v[4]={x,y,z,w}; if(cached_value(p,V_VECTOR4,location,v,4))return;
+  p->library.glUniform4f(location,(float)x,(float)y,(float)z,(float)w);
+}
+static void set_matrix(simpl *p,int32_t location,const double values[16]){
+  if(cached_value(p,V_MATRIX,location,values,16))return;
+  float m[16]; for(int k=0;k<16;k++)m[k]=(float)values[k];
+  p->library.glUniformMatrix4fv(location,1,0,m);
 }
 static void finite4u(double a,double b,double c,double d){ double w=qa_js_max(qa_js_max(fabs(a),fabs(b)),qa_js_max(fabs(c),fabs(d))); if(!(w<3.4028235677973366e38))qa_range_error("OpenGL lighting uniforms must be finite float32 values"); }
 static void finite_arr(const double *v,size_t n){ double w=0; for(size_t i=0;i<n;i++)w=qa_js_max(w,fabs(v[i])); if(!(w<3.4028235677973366e38))qa_range_error("OpenGL lighting uniforms must be finite float32 values"); }
-bool qa_gl_stage_program_init(qa_gl_stage_program *program,const qa_gl_context *context){
-  simpl *p=(simpl*)calloc(1,sizeof *p); if(!p)return false; program->impl=p;
-  if(!qa_load_gl_programs(context,&p->library)){ free(p); program->impl=NULL; return false; }
+static void stage_init_body(void *ctx){
+  simpl *p=(simpl*)ctx;
   char *frag=qa_gl_stage_fragment_shader();
+  qa_cleanup guard; qa_cleanup_push(&guard,free,frag);
   p->program=qa_gl_compile_program(&p->library,QA_GL_STAGE_VERTEX_SHADER,frag);
-  free(frag);
+  qa_cleanup_pop(&guard); free(frag);
   p->depth_program=qa_gl_compile_program(&p->library,"#version 120\nvoid main() { gl_Position = gl_Vertex; }\n","#version 120\nvoid main() { gl_FragColor = vec4(1.0); }\n");
   p->library.glUseProgram(p->program);
   p->library.glUniform1i(uniform_loc(p,"primaryTexture"),0);
   p->library.glUniform1i(uniform_loc(p,"secondaryTexture"),1);
   p->library.glUniform1i(uniform_loc(p,"u_shadow_map"),2);
   p->library.glUseProgram(0);
+}
+bool qa_gl_stage_program_init(qa_gl_stage_program *program,const qa_gl_context *context){
+  simpl *p=(simpl*)calloc(1,sizeof *p); if(!p)return false; program->impl=p;
+  if(!qa_load_gl_programs(context,&p->library)){ free(p); program->impl=NULL; return false; }
+  /* TS constructor catch: delete what compiled, close the library, rethrow. */
+  qa_caught_error caught;
+  if(!qa_try(stage_init_body,p,&caught)){
+    if(p->program!=0)p->library.glDeleteProgram(p->program);
+    if(p->depth_program!=0)p->library.glDeleteProgram(p->depth_program);
+    qa_gl_programs_close(&p->library); free(p); program->impl=NULL;
+    qa_rethrow(&caught);
+  }
   return true;
 }
 static double alpha_mode(const char *t){ if(!strcmp(t,"gt0"))return 1; if(!strcmp(t,"lt128"))return 2; if(!strcmp(t,"ge128"))return 3; return 0; }
 static double secondary_mode(const char *e){ if(!strcmp(e,"modulate"))return 1; if(!strcmp(e,"add"))return 2; return 3; }
 void qa_gl_stage_program_use(qa_gl_stage_program *program,const char *environment,const char *alpha_test,qa_batch_lighting lighting,bool luminance_alpha,const qa_batch_fog *fog){
   simpl *p=(simpl*)program->impl;
-  if(p->closed) qa_range_error("OpenGL stage program is closed");
-  qa_gl_programs *gl=&p->library; gl->glUseProgram(p->program);
+  if(p==NULL||p->closed) qa_raise("Error", 0, 0, "OpenGL stage program is closed");
+  p->library.glUseProgram(p->program);
   double fog_mode=fog==NULL?0:!strcmp(fog->kind,"constant")?2:(fog->effect&&!strcmp(fog->effect,"none"))?0:(fog->effect&&!strcmp(fog->effect,"rgb"))?3:(fog->effect&&!strcmp(fog->effect,"alpha"))?4:(fog->effect&&!strcmp(fog->effect,"rgba"))?5:(fog->effect&&!strcmp(fog->effect,"overlay"))?6:1;
-  gl->glUniform1i(uniform_loc(p,"u_fog_mode"),(int32_t)fog_mode);
-  gl->glUniform3f(uniform_loc(p,"u_fog_color"),(float)(fog?fog->color.x:0),(float)(fog?fog->color.y:0),(float)(fog?fog->color.z:0));
-  int32_t value7 = uniform_loc(p,"u_fog_amount");
-  float value8 = (float)(fog==NULL?0:!strcmp(fog->kind,"exp2")?fog->density:fog->amount);
-  gl->glUniform1f(value7,value8);
-  int32_t value5 = uniform_loc(p,"secondaryMode");
-  int value6 = environment==NULL?0:(int32_t)secondary_mode(environment);
-  gl->glUniform1i(value5,value6);
-  int32_t value3 = uniform_loc(p,"alphaMode");
-  int32_t value4 = (int32_t)alpha_mode(alpha_test);
-  gl->glUniform1i(value3,value4);
-  gl->glUniform1i(uniform_loc(p,"u_luminance_alpha"),luminance_alpha?1:0);
-  double lmode=!strcmp(lighting.kind,"vertex")?0:!strcmp(lighting.kind,"q2-model-shadow")?3:(lighting.pass&&!strcmp(lighting.pass,"lightmap"))?1:(lighting.pass&&!strcmp(lighting.pass,"material-lightmap"))?4:(lighting.pass&&!strcmp(lighting.pass,"model"))?5:2;
-  gl->glUniform1i(uniform_loc(p,"u_lighting_mode"),(int32_t)lmode);
-  bool is_model_shadow=!strcmp(lighting.kind,"q2-model-shadow");
+  set_integer(p,location_of(p,U_FOG_MODE),fog_mode);
+  set_vector3(p,location_of(p,U_FOG_COLOR),fog?fog->color.x:0,fog?fog->color.y:0,fog?fog->color.z:0);
+  set_scalar(p,location_of(p,U_FOG_AMOUNT),fog==NULL?0:!strcmp(fog->kind,"exp2")?fog->density:fog->amount);
+  set_integer(p,location_of(p,U_SECONDARY_MODE),environment==NULL?0:secondary_mode(environment));
+  set_integer(p,location_of(p,U_ALPHA_MODE),alpha_mode(alpha_test));
+  set_integer(p,location_of(p,U_LUMINANCE_ALPHA),luminance_alpha?1:0);
+  bool is_vertex=!strcmp(lighting.kind,"vertex"), is_model_shadow=!strcmp(lighting.kind,"q2-model-shadow");
+  bool is_model_pass=!is_vertex&&!is_model_shadow&&lighting.pass&&!strcmp(lighting.pass,"model");
+  double lmode=is_vertex?0:is_model_shadow?3:(lighting.pass&&!strcmp(lighting.pass,"lightmap"))?1:(lighting.pass&&!strcmp(lighting.pass,"material-lightmap"))?4:is_model_pass?5:2;
+  set_integer(p,location_of(p,U_LIGHTING_MODE),lmode);
+  if(is_vertex){ set_integer(p,location_of(p,U_LIGHT_COUNT),0); return; }
   size_t light_count=is_model_shadow?lighting.model_shadow_light_count:lighting.light_count;
   const qa_q2_shadow_atlas *atlas=is_model_shadow?&lighting.atlas_value:lighting.atlas;
-  if(!strcmp(lighting.kind,"vertex")){ gl->glUniform1i(uniform_loc(p,"u_light_count"),0); return; }
   if(light_count>8) qa_range_error("Q2 fragment lighting accepts at most eight selected lights per draw");
-  gl->glUniform1i(uniform_loc(p,"u_light_count"),(int32_t)light_count);
-  if(atlas!=NULL&&(light_count>0||is_model_shadow)&&!(!is_model_shadow&&lighting.atlas==NULL)){
+  set_integer(p,location_of(p,U_LIGHT_COUNT),(double)light_count);
+  if(atlas!=NULL){
     finite4u(atlas->texel_size,atlas->near_plane,0,0);
     if(!isfinite(atlas->texel_size)||atlas->texel_size<=0||!isfinite(atlas->near_plane)||atlas->near_plane<=0) qa_range_error("Q2 shadow atlas texel size and near plane must be positive");
-    gl->glUniform1f(uniform_loc(p,"u_shadow_texel"),(float)atlas->texel_size);
-    gl->glUniform1f(uniform_loc(p,"u_shadow_near"),(float)atlas->near_plane);
+    set_scalar(p,location_of(p,U_SHADOW_TEXEL),atlas->texel_size);
+    set_scalar(p,location_of(p,U_SHADOW_NEAR),atlas->near_plane);
   }
-  if(is_model_shadow||(lighting.pass&&!strcmp(lighting.pass,"model"))){
+  if(is_model_shadow||is_model_pass){
     double scale=lighting.has_shade_scale?lighting.shade_scale:0; finite4u(scale,0,0,0);
-    gl->glUniform1f(uniform_loc(p,"u_shade_scale"),(float)scale);
+    set_scalar(p,location_of(p,U_SHADE_SCALE),scale);
   }
   for(size_t i=0;i<light_count;i++){
-    char name[64];
     qa_vec3 origin; double radius; qa_q2_shadow_projection shadow;
     const qa_q2_fragment_light *fl=NULL; const qa_q2_model_shadow_light *ml=NULL;
     if(is_model_shadow){ ml=&lighting.model_shadow_lights[i]; origin=ml->origin;radius=ml->radius;shadow=ml->shadow; }
     else { fl=&lighting.lights[i]; origin=fl->origin;radius=fl->radius;shadow=fl->shadow; }
     finite4u(origin.x,origin.y,origin.z,radius);
     if(radius<=0) qa_range_error("Q2 fragment light radius must be positive");
-    (void)snprintf(name,sizeof name,"u_light_pos[%zu]",i); gl->glUniform3f(uniform_loc(p,name),(float)origin.x,(float)origin.y,(float)origin.z);
-    (void)snprintf(name,sizeof name,"u_light_radius[%zu]",i); gl->glUniform1f(uniform_loc(p,name),(float)radius);
-    if(fl){ finite4u(fl->color.x,fl->color.y,fl->color.z,fl->scale);
+    set_vector3(p,light_location_of(p,i,L_POS),origin.x,origin.y,origin.z);
+    set_scalar(p,light_location_of(p,i,L_RADIUS),radius);
+    if(fl){ /* "color" in light */
+      finite4u(fl->color.x,fl->color.y,fl->color.z,fl->scale);
       if(fl->cone)finite4u(fl->cone->direction.x,fl->cone->direction.y,fl->cone->direction.z,fl->cone->cos_half_angle);
-      (void)snprintf(name,sizeof name,"u_light_color[%zu]",i); gl->glUniform3f(uniform_loc(p,name),(float)fl->color.x,(float)fl->color.y,(float)fl->color.z);
-      (void)snprintf(name,sizeof name,"u_light_scale[%zu]",i); gl->glUniform1f(uniform_loc(p,name),(float)fl->scale);
-      (void)snprintf(name,sizeof name,"u_light_cone_cos[%zu]",i); gl->glUniform1f(uniform_loc(p,name),(float)(fl->cone?fl->cone->cos_half_angle:0));
-      (void)snprintf(name,sizeof name,"u_light_cone_dir[%zu]",i); gl->glUniform3f(uniform_loc(p,name),(float)(fl->cone?fl->cone->direction.x:0),(float)(fl->cone?fl->cone->direction.y:0),(float)(fl->cone?fl->cone->direction.z:0));
-      qa_vec3 frac=fl->fraction; finite4u(frac.x,frac.y,frac.z,0);
-      (void)snprintf(name,sizeof name,"u_light_frac[%zu]",i);
-      if(lighting.pass&&!strcmp(lighting.pass,"model")) gl->glUniform3f(uniform_loc(p,name),(float)frac.x,(float)frac.y,(float)frac.z);
-      else gl->glUniform3f(uniform_loc(p,name),(float)frac.x,(float)frac.y,(float)frac.z);
-    } else if(ml){ finite4u(ml->fraction.x,ml->fraction.y,ml->fraction.z,0);
-      (void)snprintf(name,sizeof name,"u_light_frac[%zu]",i); gl->glUniform3f(uniform_loc(p,name),(float)ml->fraction.x,(float)ml->fraction.y,(float)ml->fraction.z);
+      set_vector3(p,light_location_of(p,i,L_COLOR),fl->color.x,fl->color.y,fl->color.z);
+      set_scalar(p,light_location_of(p,i,L_SCALE),fl->scale);
+      set_scalar(p,light_location_of(p,i,L_CONE_COS),fl->cone?fl->cone->cos_half_angle:0);
+      set_vector3(p,light_location_of(p,i,L_CONE_DIR),fl->cone?fl->cone->direction.x:0,fl->cone?fl->cone->direction.y:0,fl->cone?fl->cone->direction.z:0);
     }
-    if(strcmp(shadow.kind,"none")&&atlas==NULL) qa_range_error("Q2 shadow receiver is missing its atlas");
-    (void)snprintf(name,sizeof name,"u_light_shadow[%zu]",i); int32_t value = uniform_loc(p,name); float value2 = (float)(!strcmp(shadow.kind,"none")?0:!strcmp(shadow.kind,"cone")?1:2); gl->glUniform1f(value,value2);
+    /* "fraction" in light: model-shadow lights and the model pass's fragment lights carry one. */
+    if(ml||is_model_pass){
+      qa_vec3 frac=ml?ml->fraction:fl->fraction; finite4u(frac.x,frac.y,frac.z,0);
+      set_vector3(p,light_location_of(p,i,L_FRAC),frac.x,frac.y,frac.z);
+    } else set_vector3(p,light_location_of(p,i,L_FRAC),0,0,0);
+    if(strcmp(shadow.kind,"none")&&atlas==NULL) qa_raise("Error", 0, 0, "Q2 shadow receiver is missing its atlas");
+    set_scalar(p,light_location_of(p,i,L_SHADOW),!strcmp(shadow.kind,"none")?0:!strcmp(shadow.kind,"cone")?1:2);
     if(strcmp(shadow.kind,"none")){
       qa_vec4 rect=shadow.atlas_rect; finite4u(rect.x,rect.y,rect.z,rect.w);
-      (void)snprintf(name,sizeof name,"u_light_atlas[%zu]",i); gl->glUniform4f(uniform_loc(p,name),(float)rect.x,(float)rect.y,(float)rect.z,(float)rect.w);
-      if(!strcmp(shadow.kind,"cone")){ finite_arr(shadow.matrix.values,16);
-        float m[16]; for(int k=0;k<16;k++)m[k]=(float)shadow.matrix.values[k];
-        (void)snprintf(name,sizeof name,"u_light_matrix[%zu]",i); gl->glUniformMatrix4fv(uniform_loc(p,name),1,0,m); }
+      set_vector4(p,light_location_of(p,i,L_ATLAS),rect.x,rect.y,rect.z,rect.w);
+      if(!strcmp(shadow.kind,"cone")){ finite_arr(shadow.matrix.values,16); set_matrix(p,light_location_of(p,i,L_MATRIX),shadow.matrix.values); }
     }
   }
 }
 void qa_gl_stage_program_use_depth(qa_gl_stage_program *program){ simpl *p=(simpl*)program->impl; p->library.glUseProgram(p->depth_program); }
 void qa_gl_stage_program_restore(qa_gl_stage_program *program,double gl_program){ simpl *p=(simpl*)program->impl; p->library.glUseProgram((uint32_t)gl_program); }
+/* TS close() keeps the object, closed; C frees it, and use() reads a NULL impl as closed. */
 void qa_gl_stage_program_close(qa_gl_stage_program *program){ if(!program->impl)return; simpl *p=(simpl*)program->impl; if(p->closed)return;
   p->library.glUseProgram(0); p->library.glDeleteProgram(p->program); p->library.glDeleteProgram(p->depth_program);
-  qa_gl_programs_close(&p->library); p->closed=true; free(p); program->impl=NULL; }
+  qa_gl_programs_close(&p->library); p->closed=true;
+  for(int k=0;k<V_KINDS;k++)free(p->values[k].entries);
+  free(p); program->impl=NULL; }

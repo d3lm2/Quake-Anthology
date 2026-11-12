@@ -11,13 +11,14 @@ void qa_q3_callback_family_destroy(qa_q3_callback_family *f) {
 static int same_cb(qa_q3_entity_callback a, qa_q3_entity_callback b) { return a.fn == b.fn && a.ctx == b.ctx; }
 static char *dupstr(const char *v) { size_t n = strlen(v); char *d = malloc(n + 1); if (d) memcpy(d, v, n + 1); return d; }
 qa_q3_entity_callback qa_q3_callback_family_register(qa_q3_callback_family *f, const char *id, qa_q3_entity_callback cb) {
-  if (!id || !id[0]) qa_range_error("Q3 callback identity is empty");
-  for (size_t i = 0; i < f->count; i++) {
+  if (!id || !id[0]) qa_raise("Error", 0, 0, "Q3 callback identity is empty");
+  /* TS checks the identity map first, then the function map. */
+  for (size_t i = 0; i < f->count; i++)
     if (strcmp(f->entries[i].id, id) == 0 && !same_cb(f->entries[i].callback, cb))
-      qa_range_error("Duplicate Q3 callback identity %s", id);
+      qa_raise("Error", 0, 0, "Duplicate Q3 callback identity %s", id);
+  for (size_t i = 0; i < f->count; i++)
     if (same_cb(f->entries[i].callback, cb) && strcmp(f->entries[i].id, id) != 0)
-      qa_range_error("Q3 callback has two identities: %s, %s", f->entries[i].id, id);
-  }
+      qa_raise("Error", 0, 0, "Q3 callback has two identities: %s, %s", f->entries[i].id, id);
   for (size_t i = 0; i < f->count; i++) if (strcmp(f->entries[i].id, id) == 0) return cb;
   if (f->count == f->cap) { size_t cap = f->cap ? f->cap * 2 : 8; void *n = realloc(f->entries, cap * sizeof *f->entries); if (!n) qa_range_error("out of memory"); f->entries = n; f->cap = cap; }
   f->entries[f->count].id = dupstr(id); f->entries[f->count].callback = cb; f->count++; return cb;
@@ -29,12 +30,12 @@ qa_q3_entity_callback qa_q3_callback_family_intern(qa_q3_callback_family *f, con
 const char *qa_q3_callback_family_capture(qa_q3_callback_family *f, qa_q3_entity_callback cb) {
   if (!cb.fn) return NULL;
   for (size_t i = 0; i < f->count; i++) if (same_cb(f->entries[i].callback, cb)) return f->entries[i].id;
-  qa_range_error("Unregistered native Q3 callback cannot be saved");
+  qa_raise("Error", 0, 0, "Unregistered native Q3 callback cannot be saved");
 }
 qa_q3_entity_callback qa_q3_callback_family_resolve(qa_q3_callback_family *f, const char *id) {
   qa_q3_entity_callback none = {NULL, NULL}; if (!id) return none;
   for (size_t i = 0; i < f->count; i++) if (strcmp(f->entries[i].id, id) == 0) return f->entries[i].callback;
-  qa_range_error("Unknown native Q3 callback %s", id);
+  qa_raise("Error", 0, 0, "Unknown native Q3 callback %s", id);
 }
 void qa_q3_callback_catalog_init(qa_q3_callback_catalog *c) {
   c->retained = NULL; c->retained_count = c->retained_cap = 0;

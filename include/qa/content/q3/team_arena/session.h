@@ -1,6 +1,6 @@
 /* Port of src/content/q3/team-arena/session.ts. GPL-2.0-or-later.
- * SessionDataError (TS Error subclass) aborts via qa_range_error with the
- * same message, as every TS throw reaches the top-level crash handler. */
+ * SessionDataError (TS Error subclass) is raised with qa_raise under its own
+ * name and the same message. */
 #ifndef QA_CONTENT_Q3_TEAM_ARENA_SESSION_H
 #define QA_CONTENT_Q3_TEAM_ARENA_SESSION_H
 #include <stdbool.h>

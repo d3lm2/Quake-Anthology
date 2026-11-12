@@ -196,6 +196,7 @@ static void recorded_protocol(double version, qa_q2_sizebuf *message,
     qa_q2_vanilla_context_init(&vanilla, message);
     qa_q2_server_data_result scratch;
     vanilla.codec.read_server_data(&vanilla.codec, &scratch);
+    qa_q2_server_data_result_clear(&scratch); /* only the read position is wanted */
     if (version == 35) (void)qa_q2_msg_read_byte(message);
     int32_t revision = qa_q2_msg_read_word(message);
     qa_q2_message_check_read(message);
@@ -246,15 +247,20 @@ static void recorded_protocol(double version, qa_q2_sizebuf *message,
 typedef struct header_held {
   qa_q2_wire_codec *wire;
   bool wire_live;
+  qa_q2_server_data_result data; /* until it moves into the header */
 } header_held;
 static void header_release(void *arg) {
   header_held *held = (header_held *)arg;
   if (held->wire_live) qa_q2_wire_codec_destroy(held->wire);
   held->wire_live = false;
+  qa_q2_server_data_result_clear(&held->data);
 }
 
 /* Decode the recorded preamble without consuming or changing the replay input. Records are
  * read lazily as the TS generator does: a damaged record after the serverdata is never read. */
+void qa_q2_demo_header_free(qa_q2_demo_header *header) {
+  qa_q2_server_data_result_clear(&header->data);
+}
 bool qa_q2_read_demo_header(const uint8_t *bytes, size_t length,
                             qa_q2_demo_header *out) {
   size_t cursor = 0;
@@ -262,7 +268,9 @@ bool qa_q2_read_demo_header(const uint8_t *bytes, size_t length,
   qa_q2_sizebuf message;
   qa_q2_sizebuf_init_empty(&message);
   qa_q2_wire_codec wire;
-  header_held held = {&wire, false};
+  header_held held;
+  memset(&held, 0, sizeof held);
+  held.wire = &wire;
   qa_cleanup node;
   qa_cleanup_push(&node, header_release, &held);
   while (qa_q2_demo_next(bytes, length, &cursor, &record)) {
@@ -301,8 +309,7 @@ bool qa_q2_read_demo_header(const uint8_t *bytes, size_t length,
             return false;
           }
           wire.message.readcount = body;
-          qa_q2_server_data_result data;
-          wire.selected_codec->read_server_data(wire.selected_codec, &data);
+          wire.selected_codec->read_server_data(wire.selected_codec, &held.data);
           if (recorded_version == 34 && (size_t)(body + 4) < record.length &&
               record.bytes[body + 4] == 2) {
             qa_q2_throw_error(
@@ -311,7 +318,9 @@ bool qa_q2_read_demo_header(const uint8_t *bytes, size_t length,
           qa_q2_wire_codec_finish(&wire);
           out->recorded_version = recorded_version;
           out->protocol = protocol;
-          out->data = data;
+          out->data = held.data;
+          held.data.gamedir = NULL;
+          held.data.levelname = NULL;
           qa_cleanup_pop(&node);
           header_release(&held);
           return true;

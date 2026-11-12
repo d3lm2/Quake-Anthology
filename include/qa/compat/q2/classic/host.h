@@ -138,7 +138,8 @@ void qa_compat_q2_classic_guest_host_link_entity(qa_compat_q2_classic_guest_host
 size_t qa_compat_q2_classic_guest_host_observe_reload(qa_compat_q2_classic_guest_host *h, void (*observer)(void *ctx), void *ctx);
 void qa_compat_q2_classic_guest_host_unobserve_reload(qa_compat_q2_classic_guest_host *h, size_t handle);
 /* TS fitClassicUserinfo: SV_ConnectionlessPacket strncpy, peers supply userinfo, so oversized text is cut to the guest
- * buffer (capacity bytes with the terminator) rather than refused. Malloc'd. */
+ * buffer (capacity characters with the terminator) rather than refused. The text is the UTF-8 of the TS string; the
+ * malloc'd answer is the guest bytes writeClassicString stores, one per character, "?" for each unit above U+00FF. */
 char *qa_compat_q2_fit_classic_userinfo(const char *text, size_t capacity);
 
 #endif

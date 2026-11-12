@@ -157,6 +157,16 @@ static size_t binding_index(const qa_seat_input *input, const char *key) {
 }
 
 qa_seat_input *qa_seat_input_create(const qa_seat_input_options *options) {
+  /* TS throws from the constructor before anything is kept. */
+  bool same_session =
+      options->context.session.token == options->seat.session.token;
+  if (!same_session ||
+      options->context.origin.kind != QA_COMMAND_ORIGIN_LOCAL_SEAT ||
+      !qa_same_seat(options->context.origin.seat, options->seat)) {
+    qa_input_error("Input command context must belong to its local seat");
+  }
+  qa_validate_gamepad_tuning(options->gamepad != NULL ? options->gamepad
+                                                      : &qa_default_gamepad_tuning);
   qa_seat_input *input = (qa_seat_input *)calloc(1, sizeof *input);
   if (input == NULL) return NULL;
   input->options = *options;
@@ -181,13 +191,6 @@ qa_seat_input *qa_seat_input_create(const qa_seat_input_options *options) {
   input->ui_binding->callback_ctx = options->ui_event_ctx;
   input->ui_binding->focus_kind = "game";
   input->ui_binding->active = true;
-  bool same_session =
-      options->context.session.token == options->seat.session.token;
-  if (!same_session ||
-      options->context.origin.kind != QA_COMMAND_ORIGIN_LOCAL_SEAT ||
-      !qa_same_seat(options->context.origin.seat, options->seat)) {
-    qa_input_error("Input command context must belong to its local seat");
-  }
   qa_gamepad_input_init(&input->gamepad, options->gamepad);
   return input;
 }

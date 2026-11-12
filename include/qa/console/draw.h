@@ -9,18 +9,17 @@
  *    file calls on them are decomposed into the callbacks below,
  *    and the Draw2D (ported as qa_draw2d) is reached only through
  *    the draw target because the TS creates a clipped Draw2D
- *    wrapper first. No other module is stubbed: draw_character/
+ *    wrapper first. Nothing else is replaced: draw_character/
  *    draw_pic receive the TS console clip bounds and must draw
  *    through that clipped wrapper exactly as the TS does;
  *    layout_width is SeatTextPresentation.layout(...).width for
  *    one character.
- *  - ConsoleField (ported as qa_console_field, byte-counted) is
- *    read through a borrowed view the caller fills from it (text
- *    from qa_console_field_text()); this file counts code points
- *    as the TS does, so cursor/scroll in the view are code-point
- *    indices and can differ from the field's byte counts for
- *    non-ASCII text. Characters reach the callbacks as code
- *    points decoded from UTF-8 (invalid bytes are one each).
+ *  - ConsoleField (ported as qa_console_field) is read through a
+ *    borrowed view the caller fills from it (text from
+ *    qa_console_field_text()). The field holds console text, one
+ *    character per byte, so its bytes are the characters and its
+ *    cursor/scroll index them. Buffer lines reach the callbacks as
+ *    code points decoded from UTF-8 (invalid bytes are one each).
  *  - PictureAsset is an opaque borrowed pointer (NULL = null).
  * GPL-2.0-or-later.
  */

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/ui/common/layout.h"
@@ -58,12 +59,14 @@ static void clear_pool(lobby_state *s) {
     s->targets[i] = NULL;
   }
 }
+/* text.trim() === "": JS white space over UTF-8 code points. */
 static bool blank_trim(const char *text) {
-  char *trimmed = qa_input_js_trim(text);
-  if (trimmed == NULL) qa_range_error("Out of memory");
-  bool empty = trimmed[0] == '\0';
-  free(trimmed);
-  return empty;
+  for (const char *p = text; *p != '\0';) {
+    size_t space = qa_js_white_space_length(p);
+    if (space == 0) return false;
+    p += space;
+  }
+  return true;
 }
 static char *js_num(double value) {
   char *text = qa_input_js_number(value);
@@ -295,7 +298,7 @@ static qa_ui_menu factory(void *v) {
     at++;
   } else {
     const qa_lobby_member *member = NULL;
-    for (size_t i = 0; i < lobby->member_count; i++)
+    for (size_t i = 0; member == NULL && i < lobby->member_count; i++)
       if (strcmp(lobby->members[i].account.id, owner->account_id) == 0)
         member = &lobby->members[i];
     bool host = strcmp(lobby->owner, owner->account_id) == 0;

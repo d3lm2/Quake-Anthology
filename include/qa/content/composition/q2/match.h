@@ -40,6 +40,12 @@ typedef struct qa_q2_product_match {
   const qa_q2_composition_services *services;
   /* Strings the last DeathBall settings() read handed out. */
   char *settings_skins[2];
+  /* TS selection.travel: the match keeps the object. The rules are the LMCTF
+   * runtime's own (the same object in TS); the rest is copied here, since the
+   * caller's travel need not outlive a later capture. */
+  bool has_travel, travel_countdown, travel_paused;
+  qa_lmctf_travel_player *travel_players;
+  size_t travel_player_count;
 } qa_q2_product_match;
 
 /** TS constructor(selection, players, items, world, hooks, services).

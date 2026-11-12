@@ -10,6 +10,9 @@ struct qa_lmctf_flags {
   qa_lmctf_context *context;
   bool has_flag[3];
   qa_actor_id flag_actors[3];
+  /* TS flags is a Map<team, actor>: capture lists it in the order the teams were first set. */
+  int flag_order[2];
+  size_t flag_order_count;
   double last_taken_sound;
   qa_q2_named_think thinks[2];
   qa_q2_named_touch touches[2];
@@ -17,6 +20,12 @@ struct qa_lmctf_flags {
 };
 
 static void properties(qa_lmctf_flags *f, qa_q2_entity *flag, qa_q2_game_services *g);
+/* TS this.flags.set(team, actor): a team already present keeps its place. */
+static void set_flag(qa_lmctf_flags *f, int team, qa_actor_id actor) {
+  if (!f->has_flag[team]) f->flag_order[f->flag_order_count++] = team;
+  f->has_flag[team] = true;
+  f->flag_actors[team] = actor;
+}
 static bool pickup_impl(qa_lmctf_flags *f, qa_q2_entity *flag, qa_q2_game_services *g, qa_actor_id actor);
 static qa_lmctf_playing_team flag_team_of(qa_q2_entity *flag) {
   if (flag->count != 1 && flag->count != 2) qa_raise("Error", 0, 0, "LMCTF flag has no source team");
@@ -100,30 +109,26 @@ void qa_lmctf_flags_destroy(qa_lmctf_flags *f) { free(f); }
 qa_q2_callback_definitions qa_lmctf_flags_callbacks(qa_lmctf_flags *f) { return f->callbacks; }
 
 void qa_lmctf_flags_capture(qa_lmctf_flags *f, qa_lmctf_flags_checkpoint *out) {
-  size_t count = 0;
-  for (int team = 1; team <= 2; team++)
-    if (f->has_flag[team]) count++;
+  size_t count = f->flag_order_count;
   out->flags = qa_q2mp_xalloc(malloc((count == 0 ? 1 : count) * sizeof *out->flags));
   out->flag_count = count;
-  size_t at = 0;
-  for (int team = 1; team <= 2; team++)
-    if (f->has_flag[team]) {
-      out->flags[at].team = team;
-      out->flags[at].actor = qa_save_ctf_actor(f->flag_actors[team]);
-      at++;
-    }
+  for (size_t at = 0; at < count; at++) {
+    int team = f->flag_order[at];
+    out->flags[at].team = team;
+    out->flags[at].actor = qa_save_ctf_actor(f->flag_actors[team]);
+  }
   out->last_taken_sound = f->last_taken_sound;
 }
 
 void qa_lmctf_flags_restore(qa_lmctf_flags *f, qa_q2_game_services *g, qa_lmctf_flags_checkpoint saved) {
   f->has_flag[1] = false;
   f->has_flag[2] = false;
+  f->flag_order_count = 0;
   for (size_t i = 0; i < saved.flag_count; i++) {
     qa_owned_actor owned;
     if (!qa_session_actor_registry_resolve_saved(g->host->actors, saved.flags[i].actor, &owned))
       qa_raise("Error", 0, 0, "Saved LMCTF flag is absent");
-    f->has_flag[(int)saved.flags[i].team] = true;
-    f->flag_actors[(int)saved.flags[i].team] = owned.id;
+    set_flag(f, (int)saved.flags[i].team, owned.id);
   }
   f->last_taken_sound = saved.last_taken_sound;
 }
@@ -266,8 +271,7 @@ static void spawn_flag(qa_lmctf_flags *f, qa_lmctf_playing_team team, qa_q2_game
   flag->frame = f->context->rules->flag_init ? 173 : 0;
   flag->pos1 = body.origin;
   flag->pos2 = body.angles;
-  f->has_flag[(int)team] = true;
-  f->flag_actors[(int)team] = flag->actor.id;
+  set_flag(f, (int)team, flag->actor.id);
   qa_lmctf_flags_reset(f, flag, NULL, g);
   properties(f, flag, g);
   size_t n = 0;
@@ -284,8 +288,7 @@ bool qa_lmctf_flags_spawn(qa_lmctf_flags *f, qa_q2_entity *entity, qa_q2_game_se
   }
   if (strcmp(entity->classname, "flag") != 0) return false;
   if (entity->count == 1 || entity->count == 2) {
-    f->has_flag[(int)entity->count] = true;
-    f->flag_actors[(int)entity->count] = entity->actor.id;
+    set_flag(f, (int)entity->count, entity->actor.id);
     properties(f, entity, g);
   }
   return true;
@@ -306,6 +309,17 @@ static void announce(qa_lmctf_flags *f, qa_q2_game_services *g, qa_lmctf_playing
   }
 }
 
+/* announce() with two texts built for it (a player name has no length limit); frees both. */
+static void announce_format(qa_lmctf_flags *f, qa_q2_game_services *g, qa_lmctf_playing_team team, char *own, char *other) {
+  qa_cleanup own_cleanup, other_cleanup;
+  qa_cleanup_push(&own_cleanup, free, own);
+  qa_cleanup_push(&other_cleanup, free, other);
+  announce(f, g, team, own, other);
+  qa_cleanup_pop(&other_cleanup);
+  qa_cleanup_pop(&own_cleanup);
+  free(own);
+  free(other);
+}
 static void flag_sound(qa_lmctf_flags *f, qa_q2_entity *flag, qa_q2_game_services *g, const char *path, double volume) {
   (void)f;
   g->sound(g->ctx, flag->actor, path, 5, volume, 0);
@@ -338,10 +352,8 @@ static void capture_flag(qa_lmctf_flags *f, qa_q2_entity *home, qa_q2_game_servi
   const char *name = qa_lmctf_name(f->context, player->actor.id);
   const char *color = team == 1 ? "blue" : "red";
   double now = qa_q2mp_now(g);
-  char own[512], other[512];
-  snprintf(own, sizeof own, "%s captured your flag!\n", name);
-  snprintf(other, sizeof other, "%s captured the %s flag.\n", name, color);
-  announce(f, g, qa_other_ctf_team(team), own, other);
+  announce_format(f, g, qa_other_ctf_team(team), qa_q2mp_format("%s captured your flag!\n", name),
+                  qa_q2mp_format("%s captured the %s flag.\n", name, color));
   struct assist { int field; double window; const char *log_name; const char *reason; };
   static const struct assist assists[3] = {
       {0, 6, "FC Frag Assist", "killing the flag carrier"},
@@ -421,10 +433,8 @@ static bool pickup_impl(qa_lmctf_flags *f, qa_q2_entity *flag, qa_q2_game_servic
       qa_lmctf_stat(f->context, actor, "returns", 1);
       qa_lmctf_score(f->context, g, actor, 1, "F Return", NULL);
       state->return_flag_time = now;
-      char own[512], other[512];
-      snprintf(own, sizeof own, "%s returned your flag!\n", name);
-      snprintf(other, sizeof other, "%s returned the %s flag.\n", name, color);
-      announce(f, g, team, own, other);
+      announce_format(f, g, team, qa_q2mp_format("%s returned your flag!\n", name),
+                      qa_q2mp_format("%s returned the %s flag.\n", name, color));
       for (size_t i = 0; i < f->context->state_count; i++) {
         qa_actor_id other_actor = f->context->states[i].actor;
         qa_lmctf_player_state *member = &f->context->states[i].state;
@@ -442,10 +452,8 @@ static bool pickup_impl(qa_lmctf_flags *f, qa_q2_entity *flag, qa_q2_game_servic
   if ((qa_js_to_int32(f->context->rules->ref_flags) & qa_js_to_int32(team)) != 0) return false;
   player->effects = (double)(qa_js_to_int32(player->effects) | 0x100);
   player->render_flags = (double)(qa_js_to_int32(player->render_flags) | (team == 2 ? 1024 : 4096));
-  char own[512], other[512];
-  snprintf(own, sizeof own, "%s stole your flag!\n", name);
-  snprintf(other, sizeof other, "%s stole the %s flag.\n", name, color);
-  announce(f, g, team, own, other);
+  announce_format(f, g, team, qa_q2mp_format("%s stole your flag!\n", name),
+                  qa_q2mp_format("%s stole the %s flag.\n", name, color));
   qa_lmctf_stat(f->context, actor, "flag-taken", 1);
   qa_lmctf_score(f->context, g, actor, 0, "F Pickup", NULL);
   if (qa_lmctf_flags_at_home(f, flag, g)) {

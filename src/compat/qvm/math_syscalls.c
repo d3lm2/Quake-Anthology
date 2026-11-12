@@ -9,7 +9,7 @@
 
 static uint32_t word_bits(const uint8_t *words, size_t length, size_t offset) {
   if (offset > length || length - offset < 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   return (uint32_t)words[offset] | ((uint32_t)words[offset + 1] << 8) |
          ((uint32_t)words[offset + 2] << 16) | ((uint32_t)words[offset + 3] << 24);
 }
@@ -18,6 +18,11 @@ static float word_f32(const uint8_t *words, size_t length, size_t offset) {
   uint32_t bits = word_bits(words, length, offset);
   float value;
   memcpy(&value, &bits, sizeof value);
+  /* A NaN operand keeps its sign and payload. bun gives both answers for
+   * `sin(words.getFloat32(4))`: the interpreter tier reads the canonical quiet
+   * NaN, the optimizing tiers pass the payload through (measured with bun
+   * 1.3.14: sin of 0x7f800001 is 0x7fc00000 cold and 0x7fc00001 hot). The C
+   * form is the optimized one, which is what a running game executes. */
   return value;
 }
 

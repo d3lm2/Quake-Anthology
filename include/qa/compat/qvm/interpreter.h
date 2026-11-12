@@ -6,9 +6,14 @@
  *    interleavings have no C counterpart, see docs/PORTING.md). The
  *    frame's execution kind, validation chain and refusal of asynchronous
  *    children from a synchronous frame are retained.
- *  - Throws are qa_range_error, catchable with qa_range_error_catch at
- *    the same boundaries as a TS try. A cancellation is such a throw, so
- *    a hook's catch and cleanup run before its target returns zero.
+ *  - Throws are qa_raise with the TS class (Error, RangeError, CommonError
+ *    with its code), catchable with qa_try at the same boundaries as a TS
+ *    try; an error crossing a syscall, hook or scope keeps its class, code,
+ *    detail and text. A cancellation is such a throw, so a hook's catch and
+ *    cleanup run before its target returns zero.
+ *  - Nested invocations recurse on the C stack; past 1024 levels the call
+ *    raises RangeError "Maximum call stack size exceeded." as the JS stack
+ *    does in TS (at a depth of its own).
  *  - Structs handed to a callback (qa_qvm_function_call and friends) are
  *    valid only during that callback; TS detects use of a retained object
  *    after its call ended, C has no retained object to detect it on.

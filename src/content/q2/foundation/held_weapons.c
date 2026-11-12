@@ -30,7 +30,7 @@ static const row ROWS[] = {
   {"q2:weapon_boomer", "models/weapons/v_boomer/tris.md2", "w_ripper"},
   {"q2:weapon_phalanx", "models/weapons/v_shotx/tris.md2", "w_phalanx"},
   {"q2:ammo_tesla", "models/weapons/v_tesla/tris.md2", "a_tesla"},
-  {"q2:weapon_proxlauncher", "models/weapons/v_launch/tris.md2", "w_plauncher"},
+  {"q2:weapon_proxlauncher", "models/weapons/v_plaunch/tris.md2", "w_plauncher"},
   {"q2:weapon_chainfist", "models/weapons/v_chainf/tris.md2", "w_chainfist"},
   {"q2:weapon_disintegrator", "models/weapons/v_dist/tris.md2", "w_disrupt"},
   {"q2:weapon_etf_rifle", "models/weapons/v_etf_rifle/tris.md2", "w_etfrifle"},
@@ -43,7 +43,7 @@ bool qa_q2_held_weapon(const char *view_model, qa_item_id item, qa_held_weapon_m
     if (item == NULL ? strcmp(ROWS[i].view_model, view_model) == 0 : strcmp(ROWS[i].item, item) == 0) { found = &ROWS[i]; break; }
   }
   const char *name = found ? found->native
-      : (item == NULL && strcmp(view_model, "models/weapons/grapple/tris.md2") == 0 ? "w_grapple" : NULL);
+      : (strcmp(view_model, "models/weapons/grapple/tris.md2") == 0 ? "w_grapple" : NULL); /* also when an item was given and not found */
   /* TS: weapon found by viewModel but not in nativeModels -> null (all rows above are native). */
   if (!name) return false;
   snprintf(buf, buf_len, "players/male/%s.md2", name);

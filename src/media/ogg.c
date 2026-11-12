@@ -126,6 +126,18 @@ static int64_t read_i64_le(const uint8_t *bytes, size_t offset) {
   return result;
 }
 
+typedef struct decode_scratch {
+  logical_stream *streams;
+  const size_t *count;
+  qa_ogg_movie *out;
+} decode_scratch;
+
+static void decode_scratch_release(void *raw) {
+  decode_scratch *scratch = (decode_scratch *)raw;
+  for (size_t s = 0; s < *scratch->count; s++) stream_dispose(&scratch->streams[s]);
+  qa_ogg_movie_dispose(scratch->out);
+}
+
 bool qa_decode_ogg_movie(const uint8_t *bytes, size_t length,
                          qa_ogg_movie *out) {
   memset(out, 0, sizeof *out);
@@ -136,6 +148,10 @@ bool qa_decode_ogg_movie(const uint8_t *bytes, size_t length,
   logical_stream streams[8];
   memset(streams, 0, sizeof streams);
   size_t stream_count = 0;
+  /* Every refusal below raises; the partial streams are released. */
+  decode_scratch scratch = {streams, &stream_count, out};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decode_scratch_release, &scratch);
   bool oom = false;
   size_t offset = 0;
   while (offset < length && !oom) {
@@ -292,6 +308,7 @@ bool qa_decode_ogg_movie(const uint8_t *bytes, size_t length,
     streams[video_stream].packets = NULL;
     streams[video_stream].packet_count = 0;
   }
+  qa_cleanup_pop(&guard);
   for (size_t s = 0; s < stream_count; s++) stream_dispose(&streams[s]);
   if (oom) {
     qa_ogg_movie_dispose(out);

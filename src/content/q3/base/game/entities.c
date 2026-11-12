@@ -6,6 +6,7 @@
 #include <string.h>
 #include "qa/content/q3/base/game/format.h"
 #include "qa/content/q3/base/game/utilities.h"
+#include "qa/core/math.h"
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
@@ -21,8 +22,10 @@ void qa_q3_init_game_entity(qa_q3_game_entity *e) {
   qa_q3_game_entity_set_classname(e, "noclass"); e->s.number = e->slot; e->r.owner_num = QA_Q3_BASE_ENTITYNUM_NONE;
 }
 void qa_q3_set_origin(qa_q3_game_entity *e, qa_vec3 origin) {
-  qa_q3_base_trajectory pos = {QA_Q3_BASE_TR_STATIONARY, 0, 0, origin, {0, 0, 0}};
-  e->s.pos = pos; qa_q3_base_entity_shared_set_current_origin(&e->r, origin);
+  /* TS builds both copies with vec3(), which stores binary32 components. */
+  qa_vec3 stored = qa_math_vec3(origin.x, origin.y, origin.z);
+  qa_q3_base_trajectory pos = {QA_Q3_BASE_TR_STATIONARY, 0, 0, stored, {0, 0, 0}};
+  e->s.pos = pos; qa_q3_base_entity_shared_set_current_origin(&e->r, stored);
 }
 void qa_q3_run_think(qa_q3_game_entity *e, double time) {
   double think_time = (float)e->nextthink; if (think_time <= 0 || think_time > time) return;
@@ -52,7 +55,7 @@ void qa_q3_entity_pool_deactivate_client(qa_q3_entity_pool *pool, double slot) {
 void qa_q3_entity_pool_restore_counts(qa_q3_entity_pool *pool, qa_q3_pool_counts s) {
   if (s.num_entities != trunc(s.num_entities) || s.num_entities < QA_Q3_MAX_CLIENTS || s.num_entities > QA_Q3_BASE_ENTITYNUM_WORLD
       || s.max_clients != trunc(s.max_clients) || s.max_clients < 1 || s.max_clients > QA_Q3_MAX_CLIENTS)
-    qa_range_error("Invalid restored Q3 pool counts");
+    qa_raise("Error", 0, 0, "Invalid restored Q3 pool counts");
   pool->num_entities = s.num_entities; pool->max_clients = s.max_clients;
 }
 void qa_q3_entity_pool_clear_level(qa_q3_entity_pool *pool) { pool->num_entities = 0; pool->max_clients = 0; }
@@ -82,11 +85,12 @@ qa_q3_game_entity *qa_q3_entity_pool_at(qa_q3_entity_pool *pool, double n) {
   qa_q3_game_entity *e = qa_q3_entity_pool_get(pool, n); if (!e) qa_range_error("Game entity %s is unavailable", QA_JS_NUMBER(n)); return e;
 }
 qa_q3_game_client *qa_q3_entity_pool_client_at(qa_q3_entity_pool *pool, double n) {
-  if (n < 0 || n >= QA_Q3_MAX_CLIENTS || !pool->clients[qa_js_to_int32(n)]) qa_range_error("Game client %s is unavailable", QA_JS_NUMBER(n));
+  /* TS clients[n] is undefined for NaN and fractions too. */
+  if (n != trunc(n) || n < 0 || n >= QA_Q3_MAX_CLIENTS || !pool->clients[qa_js_to_int32(n)]) qa_range_error("Game client %s is unavailable", QA_JS_NUMBER(n));
   return pool->clients[qa_js_to_int32(n)];
 }
 static void owned(qa_q3_entity_pool *pool, qa_q3_game_entity *e) {
-  if (qa_q3_entity_pool_get(pool, e->slot) != e) qa_range_error("Game entity does not belong to this pool");
+  if (qa_q3_entity_pool_get(pool, e->slot) != e) qa_raise("Error", 0, 0, "Game entity does not belong to this pool");
 }
 static qa_q3_game_entity *initialize_slot(qa_q3_entity_pool *pool, double slot) {
   qa_q3_game_entity *e = pool->options.records.activate(pool->options.records.ctx, slot); qa_q3_init_game_entity(e); return e;
@@ -104,7 +108,7 @@ qa_q3_game_entity *qa_q3_entity_pool_spawn(qa_q3_entity_pool *pool) {
       if (!qa_q3_game_entity_classname(qa_q3_entity_pool_at(pool, i))) a[1] = qa_q3_game_format_null();
       pool_print(pool, qa_q3_game_format("%4i: %s\n", a, 2, 32000));
     }
-    qa_range_error("G_Spawn: no free entities");
+    qa_raise("Error", 0, 0, "G_Spawn: no free entities");
   }
   double slot = pool->num_entities; pool->num_entities++; return initialize_slot(pool, slot);
 }

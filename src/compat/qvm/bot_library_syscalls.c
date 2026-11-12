@@ -148,13 +148,15 @@ static const uint8_t *push_goal_bytes(void *ctx, qa_bot_goal *goal, size_t *out_
   *out_length = region.length;
   return region.bytes;
 }
-/* TS () => text(index), read once per call. */
-typedef struct text_ctx { const dispatch *d; size_t index; char *text; } text_ctx;
+/* TS () => text(index), read once per call. The string lives in the call's
+ * owned slot, so it is released when the library raises after reading it. */
+typedef struct text_ctx { const dispatch *d; size_t index; char **slot; } text_ctx;
 static const char *text_read(void *ctx) {
   text_ctx *text = ctx;
-  free(text->text);
-  text->text = wtext(text->d, text->index);
-  return text->text;
+  free(*text->slot);
+  *text->slot = NULL;
+  *text->slot = wtext(text->d, text->index);
+  return *text->slot;
 }
 
 /* TS message => guest.writeString(int(2), message, int(3)). */
@@ -185,7 +187,10 @@ static void match_write(void *ctx, int64_t offset, int64_t capacity) {
   match_ctx *match = ctx;
   char *text = qa_qvm_game_memory_read_string(match->d->guest, (int64_t)wint(match->d, 1) + offset);
   if (text == NULL) qa_range_error("Out of memory");
+  qa_cleanup held;
+  qa_cleanup_push(&held, free, text);
   qa_qvm_game_memory_write_string(match->d->guest, wint(match->d, 3), text, capacity);
+  qa_cleanup_pop(&held);
   free(text);
 }
 static void match_clear(void *ctx) {
@@ -197,8 +202,50 @@ static void match_clear(void *ctx) {
 
 static qa_qvm_host_result word(double value) { return qa_qvm_host_word(value); }
 
+/* TS returns float32ToBits(value) with no `| 0`: an unsigned word. The
+ * interpreter completes a trap with signedWord(), which refuses a value above
+ * INT32_MAX (any float with its sign bit set, -0 included) with RangeError
+ * "QVM host value must be a signed 32-bit integer"; a native module's trap
+ * return takes `value | 0`. */
+static qa_qvm_host_result float_bits(const qa_qvm_host_call *call, double value) {
+  const uint32_t bits = qa_float32_to_bits(value);
+  if (call->guest != NULL) return qa_qvm_host_word((double)bits);
+  return (int32_t)bits;
+}
+
+/* Strings a trap read from the guest, released when a later read or the
+ * library raises (TS leaves them to the collector). */
+typedef struct owned_strings {
+  char *a, *b;
+  char *list[8];
+} owned_strings;
+static void owned_strings_free(void *arg) {
+  owned_strings *owned = arg;
+  free(owned->a);
+  free(owned->b);
+  for (size_t i = 0; i < 8; i++) free(owned->list[i]);
+  memset(owned, 0, sizeof *owned);
+}
+
+static bool bot_library_dispatch(const qa_qvm_host_call *call, qa_qvm_bot_library_services *services,
+                                 qa_qvm_host_result *out, owned_strings *owned);
+
 bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library_services *services,
                                 qa_qvm_host_result *out) {
+  owned_strings owned;
+  memset(&owned, 0, sizeof owned);
+  qa_cleanup held;
+  qa_cleanup_push(&held, owned_strings_free, &owned);
+  const bool handled = bot_library_dispatch(call, services, out, &owned);
+  qa_cleanup_pop(&held);
+  owned_strings_free(&owned);
+  return handled;
+}
+
+#define text (owned->a)
+#define text2 (owned->b)
+static bool bot_library_dispatch(const qa_qvm_host_call *call, qa_qvm_bot_library_services *services,
+                                 qa_qvm_host_result *out, owned_strings *owned) {
   int32_t legacy = 0;
   if (qa_qvm_legacy_bot_library_syscall(call, services, &legacy)) {
     *out = legacy;
@@ -211,7 +258,6 @@ bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library
   const dispatch *d = &storage;
   qa_bot_library_bots_a *library = services->library;
   qa_chat_buffer_writes writes = chat_writes(guest);
-  char *text = NULL, *text2 = NULL;
   *out = 0;
   switch (call->code) {
     case QA_QVM_GAME_IMPORT_G_BOT_ALLOCATE_CLIENT:
@@ -335,11 +381,11 @@ bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library
       break;
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_FREE_CHARACTER: qa_bot_character_free(&library->characters, wint(d, 1)); return true;
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_CHARACTERISTIC_FLOAT:
-      *out = (int32_t)qa_float32_to_bits(qa_bot_character_float(&library->characters, wint(d, 1), wint(d, 2)));
+      *out = float_bits(call, qa_bot_character_float(&library->characters, wint(d, 1), wint(d, 2)));
       return true;
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_CHARACTERISTIC_BFLOAT:
-      *out = (int32_t)qa_float32_to_bits(
-          qa_bot_character_bounded_float(&library->characters, wint(d, 1), wint(d, 2), wfloat(d, 3), wfloat(d, 4)));
+      *out = float_bits(
+          call, qa_bot_character_bounded_float(&library->characters, wint(d, 1), wint(d, 2), wfloat(d, 3), wfloat(d, 4)));
       return true;
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_CHARACTERISTIC_INTEGER:
       *out = qa_bot_character_integer(&library->characters, wint(d, 1), wint(d, 2));
@@ -390,7 +436,7 @@ bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library
       text = reply ? wtext(d, 2) : wnullable(d, 2);
       int32_t first = wint(d, 3), second = reply ? wint(d, 4) : 0;
       size_t start = reply ? 5 : 4;
-      char *texts[8];
+      char **texts = owned->list;
       qa_chat_text_source variables[8];
       for (size_t i = 0; i < 8; i++) {
         texts[i] = wnullable(d, start + i);
@@ -399,7 +445,6 @@ bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library
       qa_chat_text_source name = source_text(text);
       if (reply) *out = qa_bot_chat_library_reply_chat(&library->chat, handle, name, first, second, variables) ? 1 : 0;
       else qa_bot_chat_library_initial_chat(&library->chat, handle, name, first, variables);
-      for (size_t i = 0; i < 8; i++) free(texts[i]);
       break;
     }
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_NUM_INITIAL_CHATS: {
@@ -480,7 +525,7 @@ bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library
       return true;
     }
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_AVOID_GOAL_TIME:
-      *out = (int32_t)qa_float32_to_bits(qa_bot_goal_avoid_goal_time(&library->goals, wint(d, 1), wint(d, 2)));
+      *out = float_bits(call, qa_bot_goal_avoid_goal_time(&library->goals, wint(d, 1), wint(d, 2)));
       return true;
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_SET_AVOID_GOAL_TIME:
       qa_bot_goal_set_avoid_goal_time(&library->goals, wint(d, 1), wint(d, 2), wfloat(d, 3));
@@ -489,9 +534,8 @@ bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library
       qa_bot_goal_remove_from_avoid_goals(&library->goals, wint(d, 1), wint(d, 2));
       return true;
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_LOAD_ITEM_WEIGHTS: {
-      text_ctx filename = {d, 2, NULL};
+      text_ctx filename = {d, 2, &text};
       int64_t result = qa_bot_goal_load_item_weights_fn(&library->goals, wint(d, 1), text_read, &filename);
-      free(filename.text);
       *out = word((double)result);
       return true;
     }
@@ -537,9 +581,8 @@ bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_FREE_WEAPON_STATE: qa_weapon_ai_free_state(&library->weapons, wint(d, 1)); return true;
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_RESET_WEAPON_STATE: qa_weapon_ai_reset_state(&library->weapons, wint(d, 1)); return true;
     case QA_QVM_GAME_IMPORT_BOTLIB_AI_LOAD_WEAPON_WEIGHTS: {
-      text_ctx filename = {d, 2, NULL};
+      text_ctx filename = {d, 2, &text};
       qa_weapon_load_result result = qa_weapon_ai_load_weights_fn(&library->weapons, wint(d, 1), text_read, &filename);
-      free(filename.text);
       *out = (int32_t)result;
       return true;
     }
@@ -695,7 +738,7 @@ bool qa_qvm_bot_library_syscall(const qa_qvm_host_call *call, qa_qvm_bot_library
     default:
       return false;
   }
-  free(text);
-  free(text2);
   return true;
 }
+#undef text
+#undef text2

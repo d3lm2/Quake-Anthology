@@ -29,16 +29,33 @@ qa_llm_json *qa_llm_json_string(const char *value) { qa_llm_json *json = json_ne
 qa_llm_json *qa_llm_json_array(void) { return json_new(QA_LLM_JSON_ARRAY); }
 qa_llm_json *qa_llm_json_object(void) { return json_new(QA_LLM_JSON_OBJECT); }
 
+/* Iterative: JSON.parse output is nested only as deep as memory allows, so the
+ * release must not recurse on the C stack. */
 void qa_llm_json_free(qa_llm_json *value) {
   if (value == NULL) return;
-  free(value->string);
-  for (size_t i = 0; i < value->count; i++) {
-    qa_llm_json_free(value->items[i]);
-    if (value->keys != NULL) free(value->keys[i]);
+  size_t count = 0, capacity = 16;
+  qa_llm_json **stack = malloc(capacity * sizeof *stack);
+  if (stack == NULL) qa_llm_oom();
+  stack[count++] = value;
+  while (count > 0) {
+    qa_llm_json *node = stack[--count];
+    free(node->string);
+    for (size_t i = 0; i < node->count; i++) {
+      if (node->keys != NULL) free(node->keys[i]);
+      if (node->items[i] == NULL) continue;
+      if (count == capacity) {
+        capacity *= 2;
+        qa_llm_json **grown = realloc(stack, capacity * sizeof *stack);
+        if (grown == NULL) qa_llm_oom();
+        stack = grown;
+      }
+      stack[count++] = node->items[i];
+    }
+    free(node->items);
+    free(node->keys);
+    free(node);
   }
-  free(value->items);
-  free(value->keys);
-  free(value);
+  free(stack);
 }
 
 static void json_grow(qa_llm_json *value) {
@@ -91,12 +108,12 @@ bool qa_llm_record(const qa_llm_json *value, qa_llm_error *error) {
   return true;
 }
 
-/* JSON.parse */
+/* JSON.parse. Iterative: JavaScriptCore has no nesting limit (Bun parses a
+ * million levels), so open containers live on a heap stack, not the C stack. */
 typedef struct json_parser {
   const char *text;
   size_t length;
   size_t pos;
-  int depth;
 } json_parser;
 
 static void json_skip_ws(json_parser *parser) {
@@ -107,11 +124,13 @@ static void json_skip_ws(json_parser *parser) {
   }
 }
 
-static bool json_parse_value(json_parser *parser, qa_llm_json **out);
-
 static void utf8_encode(qa_llm_strbuf *out, uint32_t value) {
   char bytes[4];
-  if (value < 0x80) {
+  if (value == 0) {
+    /* Decoded text keeps U+0000 as C0 80 (the project convention), so a
+     * "\u0000" escape does not end the C string. */
+    qa_llm_strbuf_append_n(out, "\xc0\x80", 2);
+  } else if (value < 0x80) {
     qa_llm_strbuf_append_char(out, (char)value);
   } else if (value < 0x800) {
     bytes[0] = (char)(0xc0 | (value >> 6));
@@ -154,7 +173,11 @@ static bool json_parse_string_raw(json_parser *parser, char **out) {
   while (parser->pos < parser->length) {
     uint8_t c = (uint8_t)parser->text[parser->pos++];
     if (c == '"') { *out = qa_llm_strbuf_steal(&text); return true; }
-    if (c < 0x20) { qa_llm_strbuf_free(&text); return false; }
+    /* A raw control character (C0 80 is a raw U+0000 in decoded text). */
+    if (c < 0x20 || (c == 0xc0 && parser->pos < parser->length && (uint8_t)parser->text[parser->pos] == 0x80)) {
+      qa_llm_strbuf_free(&text);
+      return false;
+    }
     if (c != '\\') { qa_llm_strbuf_append_char(&text, (char)c); continue; }
     if (parser->pos >= parser->length) break;
     char escape = parser->text[parser->pos++];
@@ -193,105 +216,159 @@ static bool json_parse_string_raw(json_parser *parser, char **out) {
   return false;
 }
 
-static bool json_parse_value(json_parser *parser, qa_llm_json **out) {
-  if (++parser->depth > 512) return false;
-  json_skip_ws(parser);
-  bool ok = false;
-  if (parser->pos >= parser->length) goto done;
+/* A scalar at parser->pos, or false. */
+static bool json_parse_scalar(json_parser *parser, qa_llm_json **out) {
   char c = parser->text[parser->pos];
-  if (c == '{') {
-    parser->pos++;
-    qa_llm_json *object = qa_llm_json_object();
-    json_skip_ws(parser);
-    if (parser->pos < parser->length && parser->text[parser->pos] == '}') { parser->pos++; *out = object; ok = true; goto done; }
-    for (;;) {
-      json_skip_ws(parser);
-      char *key = NULL;
-      if (!json_parse_string_raw(parser, &key)) { qa_llm_json_free(object); goto done; }
-      json_skip_ws(parser);
-      if (parser->pos >= parser->length || parser->text[parser->pos] != ':') { free(key); qa_llm_json_free(object); goto done; }
-      parser->pos++;
-      qa_llm_json *item = NULL;
-      if (!json_parse_value(parser, &item)) { free(key); qa_llm_json_free(object); goto done; }
-      qa_llm_json_object_set(object, key, item);
-      free(key);
-      json_skip_ws(parser);
-      if (parser->pos < parser->length && parser->text[parser->pos] == ',') { parser->pos++; continue; }
-      if (parser->pos < parser->length && parser->text[parser->pos] == '}') { parser->pos++; *out = object; ok = true; }
-      else qa_llm_json_free(object);
-      goto done;
-    }
-  }
-  if (c == '[') {
-    parser->pos++;
-    qa_llm_json *array = qa_llm_json_array();
-    json_skip_ws(parser);
-    if (parser->pos < parser->length && parser->text[parser->pos] == ']') { parser->pos++; *out = array; ok = true; goto done; }
-    for (;;) {
-      qa_llm_json *item = NULL;
-      if (!json_parse_value(parser, &item)) { qa_llm_json_free(array); goto done; }
-      qa_llm_json_array_push(array, item);
-      json_skip_ws(parser);
-      if (parser->pos < parser->length && parser->text[parser->pos] == ',') { parser->pos++; continue; }
-      if (parser->pos < parser->length && parser->text[parser->pos] == ']') { parser->pos++; *out = array; ok = true; }
-      else qa_llm_json_free(array);
-      goto done;
-    }
-  }
   if (c == '"') {
     char *text = NULL;
-    if (!json_parse_string_raw(parser, &text)) goto done;
-    qa_llm_json *value = qa_llm_json_string(text);
+    if (!json_parse_string_raw(parser, &text)) return false;
+    *out = qa_llm_json_string(text);
     free(text);
-    *out = value;
-    ok = true;
-    goto done;
+    return true;
   }
   if (parser->length - parser->pos >= 4 && memcmp(parser->text + parser->pos, "true", 4) == 0) {
-    parser->pos += 4; *out = qa_llm_json_bool(true); ok = true; goto done;
+    parser->pos += 4; *out = qa_llm_json_bool(true); return true;
   }
   if (parser->length - parser->pos >= 5 && memcmp(parser->text + parser->pos, "false", 5) == 0) {
-    parser->pos += 5; *out = qa_llm_json_bool(false); ok = true; goto done;
+    parser->pos += 5; *out = qa_llm_json_bool(false); return true;
   }
   if (parser->length - parser->pos >= 4 && memcmp(parser->text + parser->pos, "null", 4) == 0) {
-    parser->pos += 4; *out = qa_llm_json_null(); ok = true; goto done;
+    parser->pos += 4; *out = qa_llm_json_null(); return true;
   }
-  {
-    /* JSON number grammar, then strtod over the accepted span. */
-    size_t start = parser->pos;
-    size_t pos = start;
-    if (pos < parser->length && parser->text[pos] == '-') pos++;
-    if (pos < parser->length && parser->text[pos] == '0') pos++;
-    else if (pos < parser->length && parser->text[pos] >= '1' && parser->text[pos] <= '9') {
-      while (pos < parser->length && isdigit((uint8_t)parser->text[pos])) pos++;
-    } else goto done;
-    if (pos < parser->length && parser->text[pos] == '.') {
-      pos++;
-      if (pos >= parser->length || !isdigit((uint8_t)parser->text[pos])) goto done;
-      while (pos < parser->length && isdigit((uint8_t)parser->text[pos])) pos++;
+  /* JSON number grammar, then strtod over the accepted span. */
+  size_t start = parser->pos;
+  size_t pos = start;
+  if (pos < parser->length && parser->text[pos] == '-') pos++;
+  if (pos < parser->length && parser->text[pos] == '0') pos++;
+  else if (pos < parser->length && parser->text[pos] >= '1' && parser->text[pos] <= '9') {
+    while (pos < parser->length && isdigit((uint8_t)parser->text[pos])) pos++;
+  } else return false;
+  if (pos < parser->length && parser->text[pos] == '.') {
+    pos++;
+    if (pos >= parser->length || !isdigit((uint8_t)parser->text[pos])) return false;
+    while (pos < parser->length && isdigit((uint8_t)parser->text[pos])) pos++;
+  }
+  if (pos < parser->length && (parser->text[pos] == 'e' || parser->text[pos] == 'E')) {
+    pos++;
+    if (pos < parser->length && (parser->text[pos] == '+' || parser->text[pos] == '-')) pos++;
+    if (pos >= parser->length || !isdigit((uint8_t)parser->text[pos])) return false;
+    while (pos < parser->length && isdigit((uint8_t)parser->text[pos])) pos++;
+  }
+  char *digits = qa_llm_strndup(parser->text + start, pos - start);
+  double number = strtod(digits, NULL);
+  free(digits);
+  parser->pos = pos;
+  *out = qa_llm_json_number(number);
+  return true;
+}
+
+/* One open array or object; `key` is the member name awaiting its value. */
+typedef struct json_frame {
+  qa_llm_json *container;
+  char *key;
+} json_frame;
+
+typedef struct json_frames {
+  json_frame *v;
+  size_t count;
+  size_t capacity;
+} json_frames;
+
+static void json_frames_push(json_frames *frames, qa_llm_json *container) {
+  if (frames->count == frames->capacity) {
+    frames->capacity = frames->capacity == 0 ? 16 : frames->capacity * 2;
+    json_frame *grown = realloc(frames->v, frames->capacity * sizeof *grown);
+    if (grown == NULL) qa_llm_oom();
+    frames->v = grown;
+  }
+  frames->v[frames->count].container = container;
+  frames->v[frames->count].key = NULL;
+  frames->count++;
+}
+
+/* `"key" :` inside an object, leaving the parser at the member value. */
+static bool json_parse_member_name(json_parser *parser, json_frame *frame) {
+  json_skip_ws(parser);
+  if (!json_parse_string_raw(parser, &frame->key)) return false;
+  json_skip_ws(parser);
+  if (parser->pos >= parser->length || parser->text[parser->pos] != ':') return false;
+  parser->pos++;
+  return true;
+}
+
+static bool json_parse_document(json_parser *parser, qa_llm_json **out) {
+  json_frames frames = {NULL, 0, 0};
+  qa_llm_json *value = NULL;
+  bool ok = false;
+  for (;;) {
+    /* Parse one value: open a container, or complete a scalar or empty one. */
+    json_skip_ws(parser);
+    if (parser->pos >= parser->length) goto fail;
+    char c = parser->text[parser->pos];
+    if (c == '{' || c == '[') {
+      parser->pos++;
+      bool object = c == '{';
+      qa_llm_json *container = object ? qa_llm_json_object() : qa_llm_json_array();
+      json_skip_ws(parser);
+      if (parser->pos < parser->length && parser->text[parser->pos] == (object ? '}' : ']')) {
+        parser->pos++;
+        value = container;
+      } else {
+        json_frames_push(&frames, container);
+        if (object && !json_parse_member_name(parser, &frames.v[frames.count - 1])) goto fail;
+        continue;
+      }
+    } else if (!json_parse_scalar(parser, &value)) {
+      goto fail;
     }
-    if (pos < parser->length && (parser->text[pos] == 'e' || parser->text[pos] == 'E')) {
-      pos++;
-      if (pos < parser->length && (parser->text[pos] == '+' || parser->text[pos] == '-')) pos++;
-      if (pos >= parser->length || !isdigit((uint8_t)parser->text[pos])) goto done;
-      while (pos < parser->length && isdigit((uint8_t)parser->text[pos])) pos++;
+    /* Attach the completed value, closing every container it completes. */
+    for (;;) {
+      if (frames.count == 0) {
+        *out = value;
+        value = NULL;
+        ok = true;
+        goto done;
+      }
+      json_frame *top = &frames.v[frames.count - 1];
+      bool object = top->container->kind == QA_LLM_JSON_OBJECT;
+      if (object) {
+        qa_llm_json_object_set(top->container, top->key, value);
+        free(top->key);
+        top->key = NULL;
+      } else {
+        qa_llm_json_array_push(top->container, value);
+      }
+      value = NULL;
+      json_skip_ws(parser);
+      if (parser->pos < parser->length && parser->text[parser->pos] == ',') {
+        parser->pos++;
+        if (object && !json_parse_member_name(parser, top)) goto fail;
+        break; /* the next member value */
+      }
+      if (parser->pos < parser->length && parser->text[parser->pos] == (object ? '}' : ']')) {
+        parser->pos++;
+        value = top->container;
+        frames.count--;
+        continue;
+      }
+      goto fail;
     }
-    char *digits = qa_llm_strndup(parser->text + start, pos - start);
-    double number = strtod(digits, NULL);
-    free(digits);
-    parser->pos = pos;
-    *out = qa_llm_json_number(number);
-    ok = true;
+  }
+fail:
+  qa_llm_json_free(value);
+  for (size_t i = 0; i < frames.count; i++) {
+    free(frames.v[i].key);
+    qa_llm_json_free(frames.v[i].container);
   }
 done:
-  parser->depth--;
+  free(frames.v);
   return ok;
 }
 
 bool qa_llm_json_parse(const char *text, size_t length, qa_llm_json **out) {
-  json_parser parser = { text, length, 0, 0 };
+  json_parser parser = { text, length, 0 };
   *out = NULL;
-  if (!json_parse_value(&parser, out)) return false;
+  if (!json_parse_document(&parser, out)) return false;
   json_skip_ws(&parser);
   if (parser.pos != parser.length) {
     qa_llm_json_free(*out);
@@ -314,6 +391,7 @@ static void json_stringify_string(qa_llm_strbuf *out, const char *text) {
       case '\t': qa_llm_strbuf_append(out, "\\t"); break;
       default:
         if (*p < 0x20) qa_llm_strbuf_appendf(out, "\\u%04x", *p);
+        else if (*p == 0xc0 && p[1] == 0x80) { qa_llm_strbuf_append(out, "\\u0000"); p++; }
         else qa_llm_strbuf_append_char(out, (char)*p);
     }
   }

@@ -118,6 +118,8 @@ static qa_q2_turrets_checkpoint read_turrets(const qa_save_reader *turrets, qa_p
 
 qa_q2_base_entities_module_checkpoint qa_read_q2_base_entities_checkpoint(const qa_save_reader *reader,
                                                                           qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2_base_entities_module_checkpoint out;
   memset(&out, 0, sizeof out);
   qa_save_reader version = q2c_field(reader, "version");
@@ -142,6 +144,7 @@ qa_q2_base_entities_module_checkpoint qa_read_q2_base_entities_checkpoint(const 
     qa_save_reader_destroy(&value);
   }
   qa_save_reader_destroy(&winds);
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 
@@ -255,9 +258,12 @@ uint8_t *qa_encode_q2_base_entities_checkpoint(const qa_q2_base_entities_module_
 
 bool qa_decode_q2_base_entities_checkpoint(const uint8_t *bytes, size_t length,
                                            qa_q2_base_entities_module_checkpoint *out, qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_save_reader reader;
-  if (!q2c_open(bytes, length, "q2-base-entities", owner, &reader)) return false;
+  if (!q2c_open(bytes, length, "q2-base-entities", owner, &reader)) { qa_persist_decoded_leave(&owner_scope); return false; }
   *out = qa_read_q2_base_entities_checkpoint(&reader, owner);
   qa_save_reader_destroy(&reader);
+  qa_persist_decoded_leave(&owner_scope);
   return true;
 }

@@ -42,7 +42,7 @@ static char *xdup_range(const char *first, size_t length) {
 }
 static float fr(double v) { return (float)v; }
 
-/* JS Number(string), restricted to ASCII whitespace trimming. */
+/* JS Number(string). */
 static double js_number(const char *s) { return qa_js_string_to_number(s); }
 
 static void format_number(double value, char *buf, size_t size) {
@@ -72,8 +72,11 @@ static void tokens_init(tokens *t, const char *text) {
   char **raw = NULL;
   size_t count = 0, cap = 0;
   const char *p = text;
+  /* The token regex's \s is every JS WhiteSpace and LineTerminator code point
+   * (U+00A0, U+2028, U+3000, U+FEFF, ...), not only ASCII space. */
+  size_t space;
   while (*p != '\0') {
-    if (isspace((unsigned char)*p)) { p++; continue; }
+    if ((space = qa_js_white_space_length(p)) != 0) { p += space; continue; }
     if (p[0] == '/' && p[1] == '*') {
       const char *e = strstr(p + 2, "*/");
       if (e != NULL) { tokens_push(t, &raw, &count, &cap, p, (size_t)(e + 2 - p)); p = e + 2; continue; }
@@ -96,7 +99,7 @@ static void tokens_init(tokens *t, const char *text) {
       continue;
     }
     const char *e = p;
-    while (*e != '\0' && !isspace((unsigned char)*e) &&
+    while (*e != '\0' && qa_js_white_space_length(e) == 0 &&
            strchr("{}()", *e) == NULL)
       e++;
     tokens_push(t, &raw, &count, &cap, p, (size_t)(e - p));
@@ -158,9 +161,11 @@ static void tokens_expect(tokens *t, const char *value) {
 static double tokens_number(tokens *t) {
   const char *token = tokens_next(t);
   double value = js_number(token);
-  bool blank = true;
-  for (const char *c = token; *c != '\0'; c++)
-    if (!isspace((unsigned char)*c)) blank = false;
+  /* token.trim() === "": JS white space, as Number() trims it. */
+  const char *c = token;
+  size_t space;
+  while ((space = qa_js_white_space_length(c)) != 0) c += space;
+  bool blank = *c == '\0';
   if (blank || !isfinite(value))
     camera_error("Invalid camera number %s", token);
   return value;

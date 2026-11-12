@@ -19,7 +19,10 @@
 enum { CONTENTS_SOLID = 1, CONTENTS_PLAYERCLIP = 0x10000, CONTENTS_BODY = 0x2000000,
   RANK_TIED_FLAG = 0x4000, MAX_STRING_CHARS = 1024, TIMER_GESTURE = 34 * 66 + 50 };
 static double s32(double v) { return qa_js_to_int32(v); }
-static double imul(double a, double b) { return (int32_t)(qa_js_to_int32(a) * qa_js_to_int32(b)); }
+/* Math.imul wraps; a signed C product of cvar-sized operands is undefined past 2^31. */
+static double imul(double a, double b) {
+  return qa_js_to_int32((double)((uint32_t)qa_js_to_int32(a) * (uint32_t)qa_js_to_int32(b)));
+}
 static double slot_get(qa_q3_base_player_state_slots *s, double i) { return qa_q3_base_player_state_slots_get(s, (size_t)i); }
 static qa_q3_ta_match_state *level(qa_q3_ta_arena_runtime *r) { return r->host.match->host.state; }
 static qa_q3_entity_pool *pool_of(qa_q3_ta_arena_runtime *r) { return r->host.match->host.pool; }
@@ -29,7 +32,7 @@ static double sorted_at(qa_q3_ta_arena_runtime *r, double index) {
   return level(r)->sorted_clients[(size_t)index];
 }
 static qa_q3_game_client *client_of(qa_q3_game_entity *entity) {
-  if (entity->client == NULL) qa_range_error("Arena entity has no source client pointer");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "Arena entity has no source client pointer");
   return entity->client;
 }
 static double score_of(qa_q3_ta_arena_runtime *r, double number) {
@@ -38,7 +41,7 @@ static double score_of(qa_q3_ta_arena_runtime *r, double number) {
 static double cvar_integer(qa_q3_ta_arena_runtime *r, const char *name) {
   qa_cvar_snapshot snap;
   if (!qa_cvar_registry_get(r->host.cvars, name, &snap))
-    qa_range_error("Arena requires registered cvar %s", name);
+    qa_raise("Error", 0, 0, "Arena requires registered cvar %s", name);
   double value = snap.integer_value;
   qa_cvar_read_free(&snap);
   return value;

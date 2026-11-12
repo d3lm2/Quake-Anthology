@@ -269,7 +269,8 @@ static void green_touch_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services 
   bool hurt = q2mp_can_hurt(game, contact.other);
   if (entity->damage >= 5) {
     size_t n = 0;
-    const qa_actor_id *actors = game->host->nearby(game->host->ctx, origin, entity->damage_radius, &n);
+    /* Copied: the damage below can run another nearby() query, which reuses the host's result buffer. */
+    qa_actor_id *actors = qa_q2_game_nearby_copy(game, origin, entity->damage_radius, &n);
     for (size_t i = 0; i < n; i++) {
       qa_actor_id actor = actors[i];
       if (entity->has_owner && qa_same_actor(actor, entity->owner)) continue;
@@ -283,6 +284,7 @@ static void green_touch_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services 
         q2mp_damage(game, actor, entity, entity->actor.id, entity->has_owner ? &entity->owner : NULL, trunc(points),
                     trunc(points), q2mp_sub(body.value.origin, origin), origin, q2mp_zero(), 0, true, q2mp_rr(game) ? 5 : 1, NULL);
     }
+    free(actors);
   }
   if (hurt)
     (target = contact.other, inf_actor = entity->actor.id, attacker = entity->has_owner ? &entity->owner : NULL, amount = entity->damage, dir = q2mp_body(game, entity).velocity, normal = q2mp_cnormal(&contact), mod = entity->has_owner && game->host->is_player(game->host->ctx, entity->owner) ? QA_Q2MP_MOD_DEFENDER_SPHERE : QA_Q2MP_MOD_BLASTER2, q2mp_damage(game, target, entity, inf_actor, attacker, amount, 1,

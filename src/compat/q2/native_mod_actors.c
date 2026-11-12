@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/compat/q2/classic/records.h"
+#include "qa/compat/q2/native_throw.h"
 #include "qa/compat/q2/rerelease/public_state.h"
 #include "qa/foundation/js.h"
 
@@ -99,12 +100,16 @@ static void bind_actor(actors_t *s, double slot, qa_owned_actor actor) {
   qa_shared_body_table_rebind(s->services->bodies, actor, binding);
   if (s->services->callbacks != NULL) qa_actor_callback_table_bind(s->services->callbacks, actor, qa_compat_q2_native_mod_combat_bind(s->behavior, slot, actor));
 }
+typedef struct adopt_call { actors_t *s; double slot; qa_owned_actor actor; } adopt_call;
+static void adopt_bind_body(void *ctx) { adopt_call *c = ctx; bind_actor(c->s, c->slot, c->actor); }
 static void adopt(actors_t *s, double slot) {
   if (reserved(s, slot) || !s->host->active(s->host->ctx, slot)) return;
   if (find_slot(s, slot) != NULL) return;
   qa_owned_actor actor = qa_session_actor_registry_allocate_at_source(s->services->actors, s->instance, (int64_t)slot, "native:mod-actor");
   owned_slot *entry = qa_compat_q2_grow((void **)&s->slots, &s->slot_count, &s->slot_capacity, sizeof *entry); entry->slot = slot; entry->actor = actor;
-  bind_actor(s, slot, actor);
+  /* TS catch: an actor whose bindings fail is retired again. */
+  adopt_call call = {s, slot, actor}; qa_compat_q2_native_thrown thrown;
+  if (!qa_compat_q2_native_try(adopt_bind_body, &call, &thrown)) { retire(s, slot); qa_compat_q2_native_rethrow(&thrown); }
 }
 static qa_guest_call_result allocate_invoked(void *ctx, const qa_guest_call_value *values, size_t count, qa_compat_q2_native_entry *binding) {
   actors_t *s = ctx; qa_guest_call_result result = qa_compat_q2_native_entry_call_original(binding, values, count);
@@ -123,7 +128,7 @@ static qa_guest_call_result release_invoked(void *ctx, const qa_guest_call_value
 static bool combat_eligible(void *ctx, qa_actor_id actor) { actors_t *s = ctx; return s->calls.combat.eligible(s->calls.combat.ctx, actor); }
 static qa_actor_id combat_actor(void *ctx, qa_guest_address address) {
   actors_t *s = ctx; qa_actor_id actor;
-  if (!s->calls.actor_at(s->calls.ctx, slot_of_address(s, address), &actor)) qa_range_error("Native callback references an unowned source actor");
+  if (!s->calls.actor_at(s->calls.ctx, slot_of_address(s, address), &actor)) qa_raise("Error", 0, 0, "Native callback references an unowned source actor");
   return actor;
 }
 static qa_guest_address combat_address(void *ctx, qa_actor_id actor) { actors_t *s = ctx; return s->calls.address(s->calls.ctx, actor); }
@@ -132,23 +137,48 @@ static double combat_scalar(void *ctx, qa_guest_address base, qa_native_mod_scal
 static void combat_transfer(void *ctx, void (*invoke)(void *), void *invoke_ctx) { actors_t *s = ctx; s->calls.combat.transfer(s->calls.combat.ctx, invoke, invoke_ctx); }
 static qa_compat_q2_native_mod_invocation_kind combat_source_execution(void *ctx, const qa_actor_id *actor, void (*invoke)(void *), void *invoke_ctx) { actors_t *s = ctx; return s->calls.combat.source_execution(s->calls.combat.ctx, actor, invoke, invoke_ctx); }
 static void combat_synchronize(void *ctx) { actors_t *s = ctx; s->calls.combat.synchronize(s->calls.combat.ctx); }
+/* `${instance}:source-${name}` with no length limit; the entry binding copies the id. */
+static qa_compat_q2_native_entry *intercept(actors_t *s, qa_native_mod_entry entry, const char *name, qa_compat_q2_guest_call_signature signature, qa_compat_q2_native_entry_execute_fn execute) {
+  qa_guest_address address = qa_compat_q2_native_mod_entry_address(s->host, entry);
+  const char *instance = s->instance != NULL ? s->instance : "";
+  size_t need = strlen(instance) + strlen(name) + 9;
+  char *id = malloc(need); if (id == NULL) qa_range_error("Out of memory");
+  (void)snprintf(id, need, "%s:source-%s", instance, name);
+  qa_cleanup node; qa_cleanup_push(&node, free, id);
+  qa_compat_q2_native_entry *binding = qa_compat_q2_native_mod_bind_entry(s->host, address, id, signature, s, execute, NULL, NULL);
+  qa_cleanup_pop(&node); free(id);
+  return binding;
+}
+static void create_body(void *ctx) {
+  actors_t *s = ctx;
+  qa_compat_q2_guest_call_signature signature; memset(&signature, 0, sizeof signature);
+  signature.abi = s->declaration->target.abi; signature.parameters = &pointer_layout; signature.parameter_count = 0; signature.result_is_void = false; signature.result = pointer_layout; signature.variadic = false;
+  s->allocate_entry = intercept(s, s->definition->allocate, "allocate", signature, allocate_invoked);
+  qa_compat_q2_native_mod_combat_calls combat; memset(&combat, 0, sizeof combat);
+  combat.ctx = s; combat.eligible = combat_eligible; combat.actor = combat_actor; combat.address = combat_address; combat.owner = combat_owner; combat.scalar = combat_scalar;
+  combat.transfer = combat_transfer; combat.source_execution = combat_source_execution; combat.synchronize = combat_synchronize;
+  s->behavior = qa_compat_q2_native_mod_combat_create(s->definition, s->declaration, s->host, s->services, s->instance, combat);
+  signature.parameter_count = 1; signature.result_is_void = true; memset(&signature.result, 0, sizeof signature.result);
+  s->release_entry = intercept(s, s->definition->release, "release", signature, release_invoked);
+}
 actors_t *qa_compat_q2_native_mod_actors_create(const qa_native_mod_source_actors *definition, const qa_native_mod_declaration *declaration,
     const qa_compat_q2_native_mod_host *host, const qa_mod_host_services *services, qa_provider_id instance, qa_compat_q2_native_mod_source_calls calls) {
   actors_t *s = calloc(1, sizeof *s); if (s == NULL) qa_range_error("Out of memory");
   s->definition = definition; s->declaration = declaration; s->host = host; s->services = services; s->instance = instance; s->calls = calls;
+  qa_cleanup node; qa_cleanup_push(&node, free, s);
   s->next_frame = now_seconds(s) + definition->frame_seconds;
   s->subscription = qa_session_actor_registry_on_release(services->actors, on_release, s); s->subscribed = true;
-  char id[320]; qa_compat_q2_guest_call_signature signature; memset(&signature, 0, sizeof signature);
-  signature.abi = declaration->target.abi; signature.parameters = &pointer_layout; signature.parameter_count = 0; signature.result_is_void = false; signature.result = pointer_layout; signature.variadic = false;
-  (void)snprintf(id, sizeof id, "%s:source-allocate", instance);
-  s->allocate_entry = qa_compat_q2_native_mod_bind_entry(host, qa_compat_q2_native_mod_entry_address(host, definition->allocate), id, signature, s, allocate_invoked, NULL, NULL);
-  qa_compat_q2_native_mod_combat_calls combat; memset(&combat, 0, sizeof combat);
-  combat.ctx = s; combat.eligible = combat_eligible; combat.actor = combat_actor; combat.address = combat_address; combat.owner = combat_owner; combat.scalar = combat_scalar;
-  combat.transfer = combat_transfer; combat.source_execution = combat_source_execution; combat.synchronize = combat_synchronize;
-  s->behavior = qa_compat_q2_native_mod_combat_create(definition, declaration, host, services, instance, combat);
-  signature.parameter_count = 1; signature.result_is_void = true; memset(&signature.result, 0, sizeof signature.result);
-  (void)snprintf(id, sizeof id, "%s:source-release", instance);
-  s->release_entry = qa_compat_q2_native_mod_bind_entry(host, qa_compat_q2_native_mod_entry_address(host, definition->release), id, signature, s, release_invoked, NULL, NULL);
+  qa_cleanup_pop(&node);
+  /* TS catch: the combat behavior is closed, the release subscription ends and the entries bound so far are removed. */
+  qa_caught_error caught;
+  if (!qa_try(create_body, s, &caught)) {
+    if (s->behavior != NULL) { qa_compat_q2_native_mod_combat_close(s->behavior); qa_compat_q2_native_mod_combat_destroy(s->behavior); }
+    qa_session_actor_registry_off_release(services->actors, s->subscription);
+    if (s->release_entry != NULL) qa_compat_q2_native_entry_close(s->release_entry);
+    if (s->allocate_entry != NULL) qa_compat_q2_native_entry_close(s->allocate_entry);
+    free(s);
+    qa_rethrow(&caught);
+  }
   return s;
 }
 bool qa_compat_q2_native_mod_actors_advancing(const actors_t *s) { return s->has_tick; }
@@ -186,7 +216,7 @@ void qa_compat_q2_native_mod_actors_validate(actors_t *s) {
   double checks[5][2] = {{f->velocity, 12}, {f->ground, pointer_bytes}, {f->think, pointer_bytes}, {f->has_use ? f->use : 0, pointer_bytes}, {f->nextthink.offset, qa_compat_q2_native_scalar_bytes(f->nextthink.encoding)}};
   for (int i = 0; i < 5; i++) {
     double offset = checks[i][0];
-    if (!isfinite(offset) || offset != trunc(offset) || fabs(offset) > (double)QA_MAX_SAFE_INTEGER || offset < 0 || offset + checks[i][1] > stride) qa_range_error("Native owned-actor field exceeds the source stride");
+    if (!isfinite(offset) || offset != trunc(offset) || fabs(offset) > (double)QA_MAX_SAFE_INTEGER || offset < 0 || offset + checks[i][1] > stride) qa_raise("Error", 0, 0, "Native owned-actor field exceeds the source stride");
   }
   s->host->memory->check(s->host->memory->ctx, qa_compat_q2_native_mod_entry_address(s->host, s->definition->update.entry), 1, "execute");
   qa_compat_q2_native_mod_combat_validate(s->behavior);
@@ -195,6 +225,7 @@ void qa_compat_q2_native_mod_actors_validate(actors_t *s) {
 void qa_compat_q2_native_mod_actors_drain_releases(actors_t *s) {
   if (s->suspended) return;
   size_t count = s->pending_count; double *snapshot = calloc(count + 1, sizeof *snapshot); if (snapshot == NULL) qa_range_error("Out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, free, snapshot); /* a source release can raise */
   if (count != 0) memcpy(snapshot, s->pending, count * sizeof *snapshot);
   for (size_t i = 0; i < count; i++) {
     double slot = snapshot[i];
@@ -202,10 +233,10 @@ void qa_compat_q2_native_mod_actors_drain_releases(actors_t *s) {
       qa_guest_call_value value = qa_compat_q2_call_pointer(true, s->host->entity(s->host->ctx, slot).address); qa_guest_call_result out;
       (void)s->calls.invoke(s->calls.ctx, qa_compat_q2_native_mod_entry_address(s->host, s->definition->release), &value, 1, "void", NULL, &out);
     }
-    if (!s->closing && s->host->active(s->host->ctx, slot)) qa_range_error("Native source refused to release its owned actor");
+    if (!s->closing && s->host->active(s->host->ctx, slot)) qa_raise("Error", 0, 0, "Native source refused to release its owned actor");
     retire(s, slot);
   }
-  free(snapshot);
+  qa_cleanup_pop(&node); free(snapshot);
 }
 typedef struct tick_call { actors_t *s; } tick_call;
 static void tick_body(void *ctx) {
@@ -251,6 +282,7 @@ void qa_compat_q2_saved_native_actors_free(qa_compat_q2_saved_native_actors *sav
 qa_compat_q2_native_owned_saved *qa_compat_q2_native_mod_actors_validate_saved(actors_t *s, const qa_compat_q2_saved_native_actors *saved, size_t *out_count) {
   qa_compat_q2_native_mod_combat_validate_saved(s->behavior, saved->deferred, saved->deferred_count);
   qa_compat_q2_native_owned_saved *rows = calloc(saved->actor_count + 1, sizeof *rows); if (rows == NULL) qa_range_error("Out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, free, rows); /* a saved actor that does not belong here raises */
   for (size_t i = 0; i < saved->actor_count; i++) {
     const qa_compat_q2_saved_native_actor *entry = &saved->actors[i];
     qa_actor_id id = s->services->reference_saved != NULL ? s->services->reference_saved(s->services->ctx, entry->actor) : qa_session_actor_registry_reference_saved(s->services->actors, entry->actor, "current");
@@ -258,30 +290,38 @@ qa_compat_q2_native_owned_saved *qa_compat_q2_native_mod_actors_validate_saved(a
     qa_actor_source_result source = qa_session_actor_registry_source_of(s->services->actors, id);
     if (!has || !qa_compat_q2_text_equal(actor.owner, s->instance) || reserved(s, entry->slot) || !source.has_value || (double)source.slot != entry->slot) {
       char source_text[32] = "unbound"; if (source.has_value) (void)snprintf(source_text, sizeof source_text, "%lld", (long long)source.slot);
-      qa_range_error("Saved native owned actor %.0f/%.0f does not belong to %s/%.0f: %s/%s", entry->actor.slot, entry->actor.generation, s->instance, entry->slot, has ? actor.owner : "expired", source_text);
+      qa_raise("Error", 0, 0, "Saved native owned actor %.0f/%.0f does not belong to %s/%.0f: %s/%s", entry->actor.slot, entry->actor.generation, s->instance, entry->slot, has ? actor.owner : "expired", source_text);
     }
     rows[i].actor = actor; rows[i].slot = entry->slot; rows[i].linked = entry->linked;
   }
+  qa_cleanup_pop(&node);
   *out_count = saved->actor_count; return rows;
 }
 void qa_compat_q2_native_mod_actors_restore(actors_t *s, const qa_compat_q2_saved_native_actors *saved, const qa_compat_q2_native_owned_saved *actors, size_t count) {
-  for (size_t i = 0; i < count; i++) if (actors[i].slot >= s->host->entities(s->host->ctx).count || !s->host->active(s->host->ctx, actors[i].slot)) qa_range_error("Original native save lost an owned source actor");
+  for (size_t i = 0; i < count; i++) if (actors[i].slot >= s->host->entities(s->host->ctx).count || !s->host->active(s->host->ctx, actors[i].slot)) qa_raise("Error", 0, 0, "Original native save lost an owned source actor");
   s->slot_count = 0; s->pending_count = 0; s->frame = saved->frame; s->next_frame = saved->next_frame;
   for (size_t i = 0; i < count; i++) { owned_slot *entry = qa_compat_q2_grow((void **)&s->slots, &s->slot_count, &s->slot_capacity, sizeof *entry); entry->slot = actors[i].slot; entry->actor = actors[i].actor; }
   for (size_t i = 0; i < count; i++) { bind_actor(s, actors[i].slot, actors[i].actor); if (actors[i].linked) qa_shared_body_table_link(s->services->bodies, actors[i].actor, NULL); }
   qa_compat_q2_native_mod_combat_restore(s->behavior, saved->deferred, saved->deferred_count);
 }
+static void close_drain_body(void *ctx) {
+  actors_t *s = ctx;
+  for (size_t i = 0; i < s->slot_count; i++) pending_add(s, s->slots[i].slot);
+  qa_compat_q2_native_mod_actors_drain_releases(s);
+}
 void qa_compat_q2_native_mod_actors_close(actors_t *s) {
   if (s->closing) return;
   s->closing = true;
-  for (size_t i = 0; i < s->slot_count; i++) pending_add(s, s->slots[i].slot);
-  qa_compat_q2_native_mod_actors_drain_releases(s);
+  /* TS try { drain } finally { the rest }: a release that raises still ends the subscription and retires the actors. */
+  qa_compat_q2_native_thrown thrown;
+  bool drained = qa_compat_q2_native_try(close_drain_body, s, &thrown);
   if (s->subscribed) { qa_session_actor_registry_off_release(s->services->actors, s->subscription); s->subscribed = false; }
   while (s->slot_count > 0) retire(s, s->slots[0].slot);
   qa_compat_q2_native_mod_combat_close(s->behavior);
   /* removals.invokeReverse(): release, then allocate. */
   if (s->release_entry != NULL) { qa_compat_q2_native_entry_close(s->release_entry); s->release_entry = NULL; }
   if (s->allocate_entry != NULL) { qa_compat_q2_native_entry_close(s->allocate_entry); s->allocate_entry = NULL; }
+  if (!drained) qa_compat_q2_native_rethrow(&thrown);
 }
 void qa_compat_q2_native_mod_actors_destroy(actors_t *s) {
   if (s == NULL) return;

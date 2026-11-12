@@ -9,6 +9,8 @@
 #include "qa/contracts/common.h"
 #include "qa/contracts/identity.h"
 #include "qa/settings/config.h"
+#include "qa/settings/layers.h"
+#include "qa/settings/native_config.h"
 /* TS sourceScriptReader services: owners are the product chain from
  * source through baseProduct (host walks the landed catalog); open
  * reads through the reordered mounts limited to those owners. */
@@ -31,6 +33,9 @@ typedef struct qa_app_read_console_script_options {
   qa_app_source_script_reader mounted; bool has_mounted;
   qa_app_source_script_reader mounted_script; bool has_mounted_script;
   bool has_legacy_config; qa_app_legacy_console_config_sources legacy_config;
+  /* TS native: a stock game's own configuration files, which answer the saved-configuration script before any
+   * user-store copy. Borrowed; NULL = undefined. */
+  qa_native_config *native;
 } qa_app_read_console_script_options;
 typedef struct qa_app_console_script_files qa_app_console_script_files;
 typedef struct qa_app_console_script_files_options {
@@ -44,6 +49,11 @@ typedef struct qa_app_console_script_files_options {
   bool (*mounted_resource)(void *ctx, const char *path, uint8_t **out_bytes, size_t *out_count);
   bool has_legacy_config; qa_app_legacy_console_config_sources legacy_config;
   const char *(*retire_mounted)(void *ctx);
+  /* TS native / mixedLayers: a stock game's own configuration files, or the layers of a mixed combination, which
+   * has no native file (a stock game's layers belong to `native`). Borrowed; NULL = undefined. The construction
+   * site owns them and frees them in `release`. */
+  qa_native_config *native;
+  qa_game_layers *mixed_layers;
   /* C-only: frees the construction site's adapter storage when the files are
    * destroyed (TS lets the closures go with the object). NULL when none. */
   void (*release)(void *ctx); void *release_ctx;
@@ -57,6 +67,11 @@ char *qa_app_read_console_script(qa_app_read_console_script_options options);
 qa_app_console_script_files *qa_app_console_script_files_create(qa_app_console_script_files_options options);
 void qa_app_console_script_files_destroy(qa_app_console_script_files *files);
 const char *qa_app_console_script_files_root(const qa_app_console_script_files *files);
+/* TS get native: NULL is the TS null. */
+qa_native_config *qa_app_console_script_files_native(const qa_app_console_script_files *files);
+/* TS get layers: the settings layers this game reads and writes through: its native file's, or a mixed
+ * combination's own. NULL is the TS undefined. */
+qa_game_layers *qa_app_console_script_files_layers(const qa_app_console_script_files *files);
 qa_app_console_script_entry *qa_app_console_script_files_list(qa_app_console_script_files *files, qa_command_context source, size_t *out_count);
 void qa_app_console_script_entries_free(qa_app_console_script_entry *entries, size_t count);
 char *qa_app_console_script_files_read(qa_app_console_script_files *files, const char *name, qa_command_context source);

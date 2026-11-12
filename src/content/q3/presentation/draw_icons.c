@@ -17,8 +17,8 @@ void qa_q3_pres_client_draw_icons_init(qa_q3_pres_client_draw_icons *icons, qa_q
     qa_q3_pres_client_draw_tools *tools, qa_q3_pres_draw_icons_media media,
     qa_q3_pres_client_draw_icon_settings (*settings)(void *ctx), void *settings_ctx, const void *commands_token) {
   if (tools->draw.commands.ctx != commands_token)
-    qa_range_error("Draw icons and command buffer must share the engine drawing queue");
-  if (state->product != media.product) qa_range_error("Draw icons and media products differ");
+    qa_raise("Error", 0, 0, "Draw icons and command buffer must share the engine drawing queue");
+  if (state->product != media.product) qa_raise("Error", 0, 0, "Draw icons and media products differ");
   icons->state = state;
   icons->tools = tools;
   icons->media = media;
@@ -34,7 +34,8 @@ void qa_q3_pres_client_draw_icons_draw_3d_model(qa_q3_pres_client_draw_icons *ic
   qa_q3_pres_refdef refdef = qa_q3_pres_create_refdef();
   qa_q3_pres_ref_model_entity entity = qa_q3_pres_create_model_entity(model);
   entity.axis = qa_qvm_angles_to_axis(angles);
-  entity.origin = origin;
+  /* TS vec3(origin.x, origin.y, origin.z) rounds to binary32. */
+  entity.origin = (qa_vec3){f32(origin.x), f32(origin.y), f32(origin.z)};
   entity.custom_skin = skin;
   entity.shading.render_flags = QA_Q3_PRES_RF_NOSHADOW;
   refdef.render_flags = QA_Q3_PRES_RDF_NOWORLDMODEL;
@@ -97,7 +98,7 @@ void qa_q3_pres_client_draw_icons_draw_flag_model(qa_q3_pres_client_draw_icons *
       size_t index = (size_t)(item - items);
       size_t visual_count = 0;
       const qa_q3_pres_packet_item_visual *visuals = icons->media.items(icons->media.items_ctx, &visual_count);
-      if (index >= visual_count) qa_range_error("Flag item has no cgame visual slot");
+      if (index >= visual_count) qa_raise("Error", 0, 0, "Flag item has no cgame visual slot");
       (void)visuals;
       qa_q3_pres_client_draw_tools_draw_pic(icons->tools, rect, visuals[index].icon);
     }

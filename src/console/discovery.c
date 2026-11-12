@@ -9,6 +9,7 @@
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
+#include "qa/input/support.h"
 
 static char *dup_text(const char *text) {
   if (text == NULL) return NULL;
@@ -324,17 +325,10 @@ static bool lines_push(char ***lines, size_t *count, size_t *capacity,
   return true;
 }
 
+/* value.trimEnd(): every JS white space and line terminator, by code point (the console's
+ * UTF-8 text; ASCII-only trimming kept U+00A0, U+2028 and the other Unicode spaces). */
 static char *trim_end_dup(const char *text) {
-  size_t length = strlen(text);
-  while (length > 0) {
-    char ch = text[length - 1];
-    if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' && ch != '\v' &&
-        ch != '\f') {
-      break;
-    }
-    length--;
-  }
-  return dup_range(text, length);
+  return dup_range(text, (size_t)(qa_input_js_trim_end(text) - text));
 }
 
 char **qa_console_entry_help(const qa_console_discovery_entry *entry,

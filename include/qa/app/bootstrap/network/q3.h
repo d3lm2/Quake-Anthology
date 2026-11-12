@@ -36,6 +36,8 @@ bool qa_app_q3_server_network_address(qa_app_q3_server_network *network, qa_net_
 qa_app_network_phase qa_app_q3_server_network_phase(const qa_app_q3_server_network *network);
 size_t qa_app_q3_server_network_clients(qa_app_q3_server_network *network,
     qa_app_q3_player *out, size_t capacity);
+/* The accepted qa_actor_command values since the last poll; owned by the network and valid
+ * until the next poll or destroy. */
 const void *const *qa_app_q3_server_network_poll(qa_app_q3_server_network *network,
     double now, size_t *out_count);
 void qa_app_q3_server_network_submit(qa_app_q3_server_network *network,

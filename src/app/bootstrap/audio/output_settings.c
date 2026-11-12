@@ -143,13 +143,14 @@ qa_audio_output_format qa_app_read_audio_output_cvars(qa_cvar_registry *cvars) {
   double raw[3] = {0, 0, 0};
   for (size_t i = 0; i < 3; i++) {
     double value = qa_cvar_registry_variable_value(cvars, fields[i].name);
-    set_field(&out, fields[i].field, value);
     if (fields[i].field == 0) raw[0] = value;
     else if (fields[i].field == 1) raw[1] = value;
     else raw[2] = value;
   }
+  /* validated before the integer fields are written: a NaN or out-of-range double is never cast */
   if (!format_valid(out, raw))
     qa_range_error("Audio output requires 8000\xe2\x80\x93" "192000 Hz, 1 or 2 channels, and 8 or 16 bits");
+  for (size_t i = 0; i < 3; i++) set_field(&out, fields[i].field, raw[fields[i].field]);
   return out;
 }
 void qa_app_write_audio_output_cvars(qa_cvar_registry *cvars, qa_audio_output_format format) {

@@ -362,24 +362,35 @@ const qa_q1_id1_program_binding *qa_q1_derive_native_program_binding(const qa_q1
 const qa_q1_id1_program_binding *qa_q1_id1_program_binding_get(
     const qa_q1qc_program *program, const qa_mod_source_call *declared_damage) {
   ensure_pinned_calls();
-  qa_q1_id1_program_binding *pinned = strcmp(program->digest, NQ_BINDING.digest) == 0 ? &NQ_BINDING
+  qa_q1_id1_program_binding *pinned = program->digest == NULL ? NULL
+                                      : strcmp(program->digest, NQ_BINDING.digest) == 0 ? &NQ_BINDING
                                       : strcmp(program->digest, QW_BINDING.digest) == 0 ? &QW_BINDING : NULL;
   if (pinned == NULL) return derive_native_binding(program, declared_damage);
   if (declared_damage != NULL) {
     qa_q1qc_damage_call_layout *call = qa_q1qc_damage_call_layout_create(program, declared_damage);
     if (call->function_index != pinned->damage_index ||
-        !qa_q1qc_damage_roles_equal(call, pinned->damage_call))
+        !qa_q1qc_damage_roles_equal(call, pinned->damage_call)) {
+      qa_q1qc_damage_call_layout_destroy(call);
       qa_q1qc_error("progs.dat", "Pinned QC damage declaration differs from its original ABI");
+    }
     qa_q1_id1_program_binding *cached = cache_get(program);
     const qa_mod_source_call *cached_declaration =
         cached != NULL && cached->damage_call->has_declaration ? cached->damage_call->declaration : NULL;
-    if (cached_declaration != NULL && !qa_q1qc_source_call_equal(cached_declaration, declared_damage))
+    if (cached_declaration != NULL && !qa_q1qc_source_call_equal(cached_declaration, declared_damage)) {
+      qa_q1qc_damage_call_layout_destroy(call);
       qa_q1qc_error("progs.dat", "QC program already has a different qualified combat call");
-    qa_q1_id1_program_binding *copy = malloc(sizeof *copy);
-    if (copy == NULL) qa_range_error("out of memory");
-    *copy = *pinned;
-    copy->damage_call = call;
-    cache_put(program, copy);
+    }
+    if (cached_declaration != NULL) {
+      /* TS stores a new, deep-equal binding object; the cached one is that value
+       * and earlier callers still hold it, so it stays and the new layout goes. */
+      qa_q1qc_damage_call_layout_destroy(call);
+    } else {
+      qa_q1_id1_program_binding *copy = malloc(sizeof *copy);
+      if (copy == NULL) qa_range_error("out of memory");
+      *copy = *pinned;
+      copy->damage_call = call;
+      cache_put(program, copy);
+    }
   }
   bool program_qw = strcmp(program->api_kind, "q1-quakeworld") == 0;
   bool binding_qw = strcmp(pinned->kind, "quakeworld") == 0;

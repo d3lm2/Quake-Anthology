@@ -49,6 +49,7 @@ static void connection_send(void *vctx, const uint8_t *bytes, size_t length) {
   if (!send_all(c->socket_fd, bytes, length)) {
     qa_q2_throw_error("GTV transport failed");
   }
+  c->activity_ms = now_ms();
 }
 static void dispatch(qa_q2_gtv_connection *c, const qa_q2_gtv_event *event) {
   if (c->options.event != NULL) c->options.event(c->options.event_ctx, event);
@@ -153,6 +154,7 @@ static bool receive_step(qa_q2_gtv_connection *c, size_t *dispatched) {
     return false;
   }
   if (c->closed) return false;
+  c->activity_ms = now_ms();
   /* TS processing.catch(error => fail(error)): a malformed stream or a failing event handler
    * fails this connection with that error's message. */
   chunk_scope scope = {c, buffer, (size_t)n, 0};
@@ -178,6 +180,8 @@ bool qa_q2_gtv_connection_connect(qa_q2_gtv_connection *c,
   memset(c, 0, sizeof *c);
   c->socket_fd = -1;
   c->options = options;
+  c->timeout_ms = timeout;
+  c->activity_ms = now_ms();
   if (!qa_q2_gtv_client_init(&c->client, connection_send, c, options.identity,
                              -1)) {
     return false;
@@ -218,6 +222,7 @@ bool qa_q2_gtv_connection_connect(qa_q2_gtv_connection *c,
     return false;
   }
   c->socket_fd = fd;
+  c->activity_ms = now_ms();
   qa_q2_gtv_client_start(&c->client);
   while (!c->opened) {
     if (options.aborted != NULL && *options.aborted) {
@@ -272,7 +277,12 @@ size_t qa_q2_gtv_connection_poll(qa_q2_gtv_connection *c,
   /* poll() needs an int: NaN and negatives wait 0, huge waits saturate. */
   int wait = !(wait_milliseconds > 0) ? 0 : wait_milliseconds >= 2147483647.0 ? 2147483647 : (int)wait_milliseconds;
   int ready = poll(&item, 1, wait);
-  if (ready <= 0) return 0;
+  if (ready <= 0) {
+    /* TS socket.setTimeout(timeout): no read or write for that long fails the connection. */
+    if (ready == 0 && now_ms() - c->activity_ms >= c->timeout_ms)
+      connection_fail(c, "GTV transport timed out");
+    return 0;
+  }
   if ((item.revents & (POLLERR | POLLNVAL)) != 0) {
     connection_fail(c, "GTV transport failed");
     return 0;

@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "qa/compat/qvm/entity_record.h"
+#include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
 #include "qa/network/common/js_number.h"
 
@@ -42,7 +43,7 @@ static int32_t word(qa_qvm_grapple_provider *p, double pointer, double offset) {
 static void write_word(qa_qvm_grapple_provider *p, double pointer, double value) {
   qa_qvm_writable_view view;
   qa_qvm_memory_view(p->game->module.memory, (int64_t)pointer, 4, 0, &view);
-  qa_qvm_writable_view_set_int32(&view, 0, (int32_t)value, true);
+  qa_qvm_writable_view_set_int32(&view, 0, qa_int32(value), true); /* setInt32: ToInt32 */
 }
 static qa_vec3 read_vector(qa_qvm_grapple_provider *p, double pointer) {
   qa_qvm_writable_view view;
@@ -63,7 +64,7 @@ static void write_vector(qa_qvm_grapple_provider *p, double pointer, qa_vec3 val
 static void validate_layout(qa_qvm_grapple_provider *p) {
   if (qa_qvm_game_data_get_entity_stride_bytes(&p->game->data) != p->profile.entity_stride ||
       qa_qvm_game_data_get_client_stride_bytes(&p->game->data) != p->profile.client_stride)
-    qa_range_error("Grapple profile differs from located entity or client records");
+    qa_raise("Error", 0, 0, "Grapple profile differs from located entity or client records");
 }
 
 typedef struct owner_record { int32_t entity; int32_t client; } owner_record;
@@ -71,10 +72,10 @@ static owner_record owner_of(qa_qvm_grapple_provider *p, qa_actor_id actor) {
   double entity = 0;
   bool has = p->bridge.entity(p->bridge.ctx, actor, &entity);
   if (!has || word(p, entity, p->profile.fields.inuse) == 0)
-    qa_range_error("Grapple owner has no live source entity");
+    qa_raise("Error", 0, 0, "Grapple owner has no live source entity");
   (void)qa_qvm_game_data_number_from_pointer(&p->game->data, entity);
   int32_t client = word(p, entity, p->profile.fields.client);
-  if (client == 0) qa_range_error("Grapple owner has no source player record");
+  if (client == 0) qa_raise("Error", 0, 0, "Grapple owner has no source player record");
   qa_qvm_writable_view view;
   qa_qvm_memory_view(p->game->module.memory, client, (int64_t)p->profile.client_stride, 0, &view);
   owner_record record = {(int32_t)entity, client};
@@ -89,7 +90,7 @@ static bool hook_of(qa_qvm_grapple_provider *p, qa_actor_id actor, int32_t *out)
   (void)qa_qvm_game_data_number_from_pointer(&p->game->data, hook);
   if (word_at(p, hook, (int64_t)p->profile.fields.inuse) == 0 ||
       word_at(p, hook, (int64_t)p->profile.fields.parent) != player.entity)
-    qa_range_error("Source grapple points at an inactive or differently owned hook");
+    qa_raise("Error", 0, 0, "Source grapple points at an inactive or differently owned hook");
   *out = hook;
   return true;
 }
@@ -239,6 +240,14 @@ static char *stringify_declaration(const qa_save_value *declaration) {
   return text.bytes;
 }
 
+static bool same_text(const char *a, const char *b) {
+  if (a == NULL || b == NULL) return a == b;
+  return strcmp(a, b) == 0;
+}
+
+static void destroy_on_raise(void *arg) { qa_qvm_grapple_provider_destroy(arg); }
+static void free_declared(void *arg) { qa_save_value_free(arg); }
+
 qa_qvm_grapple_provider *qa_qvm_grapple_provider_create(qa_qvm_game *game,
                                                         const qa_resolved_qvm_artifact *artifact,
                                                         qa_qvm_grapple_profile profile,
@@ -248,42 +257,47 @@ qa_qvm_grapple_provider *qa_qvm_grapple_provider_create(qa_qvm_game *game,
   p->game = game;
   p->profile = profile;
   p->bridge = bridge;
+  /* TS throws out of the constructor and the half-built provider goes to the GC. */
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, destroy_on_raise, p);
+  /* TS: this.profile = readQvmGrappleProfile(declaration); declaration =
+   * JSON.stringify(...), before anything else is checked. The read revalidates
+   * every field. Strings in the validated copy borrow from the tree, so the
+   * caller's profile, unchanged by the read, stays the stored one. */
+  qa_save_value *declared = qa_qvm_grapple_profile_declaration(&p->profile);
+  qa_cleanup declared_cleanup;
+  qa_cleanup_push(&declared_cleanup, free_declared, declared);
+  qa_qvm_grapple_profile *validated =
+      declared == NULL ? NULL : qa_qvm_read_grapple_profile(declared, artifact);
+  if (validated != NULL) {
+    qa_qvm_grapple_profile_free(validated);
+    p->declaration = stringify_declaration(declared);
+  }
+  qa_cleanup_pop(&declared_cleanup);
+  qa_save_value_free(declared);
+  if (p->declaration == NULL) {
+    qa_cleanup_pop(&refused);
+    qa_qvm_grapple_provider_destroy(p);
+    return NULL;
+  }
   const qa_module_identity *actual = &game->module.profile.module;
   const qa_module_identity *expected = &p->profile.module;
-  if (strcmp(actual->id, expected->id) != 0 || strcmp(actual->digest, expected->digest) != 0 ||
-      strcmp(actual->artifact_path, expected->artifact_path) != 0 ||
-      strcmp(actual->revision, expected->revision) != 0 ||
-      strcmp(qa_qvm_module_get_abi_profile(&game->module), p->profile.abi_profile) != 0)
-    qa_range_error("Grapple module differs from its declared artifact");
+  if (!same_text(actual->id, expected->id) || !same_text(actual->digest, expected->digest) ||
+      !same_text(actual->artifact_path, expected->artifact_path) ||
+      !same_text(actual->revision, expected->revision) ||
+      !same_text(qa_qvm_module_get_abi_profile(&game->module), p->profile.abi_profile))
+    qa_raise("Error", 0, 0, "Grapple module differs from its declared artifact");
   validate_layout(p);
   int64_t source_end = artifact->image.data_length + artifact->image.literal_length +
                        artifact->image.bss_length;
   double required = profile.movement.byte_length > 16 ? profile.movement.byte_length : 16;
   if (!is_safe_integer(bridge.scratch_word) || (int64_t)bridge.scratch_word % 4 != 0 ||
       bridge.scratch_word < (double)source_end || bridge.scratch_byte_length < required)
-    qa_range_error("Grapple scratch must be a reserved span beyond declared source data");
+    qa_raise("Error", 0, 0, "Grapple scratch must be a reserved span beyond declared source data");
   qa_qvm_writable_view view;
   qa_qvm_memory_view(game->module.memory, (int64_t)bridge.scratch_word,
                      (int64_t)bridge.scratch_byte_length, 0, &view);
-  /* TS: this.profile = readQvmGrappleProfile(declaration); declaration =
-   * JSON.stringify(...). The read revalidates every field; a rejected declaration
-   * aborts. Strings in the validated copy borrow from the tree, so the caller's
-   * profile, unchanged by the read, stays the stored one. */
-  qa_save_value *declared = qa_qvm_grapple_profile_declaration(&p->profile);
-  qa_qvm_grapple_profile *validated =
-      declared == NULL ? NULL : qa_qvm_read_grapple_profile(declared, artifact);
-  if (validated == NULL) {
-    qa_save_value_free(declared);
-    free(p);
-    return NULL;
-  }
-  qa_qvm_grapple_profile_free(validated);
-  p->declaration = stringify_declaration(declared);
-  qa_save_value_free(declared);
-  if (p->declaration == NULL) {
-    free(p);
-    return NULL;
-  }
+  qa_cleanup_pop(&refused);
   return p;
 }
 
@@ -300,7 +314,7 @@ void qa_qvm_grapple_provider_begin_frame(qa_qvm_grapple_provider *provider,
       time_milliseconds < word(provider, provider->profile.globals.time, 0) ||
       time_milliseconds > 0x7fffffff || !is_integer(frame) ||
       frame < word(provider, provider->profile.globals.frame, 0) || frame > 0x7fffffff)
-    qa_range_error("Invalid grapple source frame");
+    qa_raise("Error", 0, 0, "Invalid grapple source frame");
   write_word(provider, provider->profile.globals.time, time_milliseconds);
   write_word(provider, provider->profile.globals.frame, frame);
   provider->bridge.synchronize(provider->bridge.ctx);
@@ -318,9 +332,12 @@ void qa_qvm_grapple_provider_fire(qa_qvm_grapple_provider *provider, qa_actor_id
     if (words == NULL) qa_range_error("QVM memory allocation failed");
     words[0] = owner.entity;
     for (size_t i = 0; i < provider->profile.fire_arguments.count; i++)
-      words[1 + i] = (int32_t)provider->profile.fire_arguments.values[i];
+      words[1 + i] = qa_int32(provider->profile.fire_arguments.values[i]);
+    qa_cleanup words_cleanup;
+    qa_cleanup_push(&words_cleanup, free, words);
     (void)qa_qvm_module_call(&provider->game->module, words, count,
                              (int64_t)provider->profile.callbacks.fire);
+    qa_cleanup_pop(&words_cleanup);
     free(words);
   }
   publish(provider, actor);
@@ -346,6 +363,8 @@ void qa_qvm_grapple_provider_step(qa_qvm_grapple_provider *provider) {
   qa_actor_id *snapshot = malloc((count == 0 ? 1 : count) * sizeof *snapshot);
   if (snapshot == NULL) qa_range_error("QVM memory allocation failed");
   memcpy(snapshot, provider->owners, count * sizeof *snapshot);
+  qa_cleanup snapshot_cleanup;
+  qa_cleanup_push(&snapshot_cleanup, free, snapshot);
   for (size_t i = 0; i < count; i++) {
     qa_actor_id actor = snapshot[i];
     if (word_at(provider, owner_of(provider, actor).entity,
@@ -375,7 +394,36 @@ void qa_qvm_grapple_provider_step(qa_qvm_grapple_provider *provider) {
     int32_t after = 0;
     if (!hook_of(provider, actor, &after)) owners_delete(provider, actor);
   }
+  qa_cleanup_pop(&snapshot_cleanup);
   free(snapshot);
+}
+
+typedef struct pull_job {
+  qa_qvm_grapple_provider *provider;
+  qa_actor_id actor;
+  qa_vec3 forward;
+  double scratch;
+  int64_t scratch_offset, scratch_length;
+  owner_record player;
+  qa_vec3 result;
+} pull_job;
+
+/* TS try block of pull(). */
+static void pull_body(void *ctx) {
+  pull_job *job = ctx;
+  qa_qvm_grapple_provider *provider = job->provider;
+  const qa_qvm_grapple_globals *globals = &provider->profile.globals;
+  qa_qvm_memory_fill_bytes(provider->game->module.memory, job->scratch_offset, job->scratch_length, 0);
+  for (size_t i = 0; i < provider->profile.movement.word_count; i++)
+    write_word(provider, job->scratch + provider->profile.movement.words[i].offset,
+               provider->profile.movement.words[i].value);
+  write_word(provider, job->scratch, job->player.client);
+  write_word(provider, globals->movement, job->scratch);
+  write_vector(provider, globals->forward, job->forward);
+  (void)qa_qvm_module_call(&provider->game->module, NULL, 0,
+                           (int64_t)provider->profile.callbacks.pull);
+  publish(provider, job->actor);
+  job->result = read_vector(provider, (double)job->player.client + 32);
 }
 
 bool qa_qvm_grapple_provider_pull(qa_qvm_grapple_provider *provider, qa_actor_id actor,
@@ -389,39 +437,52 @@ bool qa_qvm_grapple_provider_pull(qa_qvm_grapple_provider *provider, qa_actor_id
   int32_t movement = word(provider, globals->movement, 0);
   qa_qvm_memory_span forward_span =
       qa_qvm_memory_get_span(memory, (int64_t)globals->forward, 12, 0);
-  uint8_t *saved_forward = malloc(12);
-  int64_t scratch_length = (int64_t)provider->profile.movement.byte_length;
-  uint8_t *saved_scratch = malloc(scratch_length > 0 ? (size_t)scratch_length : 1);
-  if (saved_forward == NULL || saved_scratch == NULL)
-    qa_range_error("QVM memory allocation failed");
+  uint8_t saved_forward[12];
   memcpy(saved_forward, memory->bytes + forward_span.byte_offset, 12);
   int32_t ground_plane = word(provider, globals->ground_plane, 0);
+  int64_t scratch_length = (int64_t)provider->profile.movement.byte_length;
   qa_qvm_memory_span scratch_span =
       qa_qvm_memory_get_span(memory, (int64_t)scratch, scratch_length, 0);
+  uint8_t *saved_scratch = malloc(scratch_length > 0 ? (size_t)scratch_length : 1);
+  if (saved_scratch == NULL) qa_range_error("QVM memory allocation failed");
+  qa_cleanup saved_cleanup;
+  qa_cleanup_push(&saved_cleanup, free, saved_scratch);
   memcpy(saved_scratch, memory->bytes + scratch_span.byte_offset,
          scratch_length > 0 ? (size_t)scratch_length : 0);
-  owner_record player = owner_of(provider, actor);
-  /* TS try/finally: a throw is fatal in C, so restoring after the
-   * call on the normal path preserves observable behavior. */
-  qa_qvm_memory_fill_bytes(memory, scratch_span.byte_offset, scratch_length, 0);
-  for (size_t i = 0; i < provider->profile.movement.word_count; i++)
-    write_word(provider, scratch + provider->profile.movement.words[i].offset,
-               provider->profile.movement.words[i].value);
-  write_word(provider, scratch, player.client);
-  write_word(provider, globals->movement, scratch);
-  write_vector(provider, globals->forward, forward);
-  (void)qa_qvm_module_call(&provider->game->module, NULL, 0,
-                           (int64_t)provider->profile.callbacks.pull);
-  publish(provider, actor);
-  *out = read_vector(provider, (double)player.client + 32);
+  pull_job job = {provider, actor, forward, scratch, scratch_span.byte_offset, scratch_length,
+                  owner_of(provider, actor), {0, 0, 0}};
+  /* TS try { ... } finally { restore the movement global, the forward vector,
+   * the ground plane and the scratch record }: the guest's pull routine can
+   * raise, and the source words are put back either way. */
+  qa_caught_error failure;
+  bool ok = qa_try(pull_body, &job, &failure);
   write_word(provider, globals->movement, movement);
   qa_qvm_memory_write_bytes(memory, forward_span.byte_offset, saved_forward, 12);
   write_word(provider, globals->ground_plane, ground_plane);
   qa_qvm_memory_write_bytes(memory, scratch_span.byte_offset, saved_scratch,
                             scratch_length > 0 ? (size_t)scratch_length : 0);
-  free(saved_forward);
+  qa_cleanup_pop(&saved_cleanup);
   free(saved_scratch);
+  if (!ok) qa_rethrow(&failure);
+  *out = job.result;
   return true;
+}
+
+typedef struct mover_job {
+  qa_qvm_grapple_provider *provider;
+  double mover, scratch;
+  qa_vec3 translation;
+} mover_job;
+
+/* TS try block of moverMoved(). */
+static void mover_body(void *ctx) {
+  mover_job *job = ctx;
+  qa_qvm_grapple_provider *provider = job->provider;
+  write_vector(provider, job->scratch, job->translation);
+  int32_t words[2] = {qa_int32(job->mover), qa_int32(job->scratch)};
+  (void)qa_qvm_module_call(&provider->game->module, words, 2,
+                           (int64_t)provider->profile.callbacks.move_mover_hooks);
+  for (size_t i = 0; i < provider->owner_count; i++) publish(provider, provider->owners[i]);
 }
 
 void qa_qvm_grapple_provider_mover_moved(qa_qvm_grapple_provider *provider, qa_actor_id actor,
@@ -429,18 +490,18 @@ void qa_qvm_grapple_provider_mover_moved(qa_qvm_grapple_provider *provider, qa_a
   if (!provider->profile.callbacks.has_move_mover_hooks) return;
   double mover = 0;
   if (!provider->bridge.entity(provider->bridge.ctx, actor, &mover))
-    qa_range_error("Grapple mover has no source entity");
+    qa_raise("Error", 0, 0, "Grapple mover has no source entity");
   qa_qvm_memory *memory = provider->game->module.memory;
   double scratch = provider->bridge.scratch_word;
   qa_qvm_memory_span span = qa_qvm_memory_get_span(memory, (int64_t)scratch, 12, 0);
   uint8_t saved[12];
   memcpy(saved, memory->bytes + span.byte_offset, 12);
-  write_vector(provider, scratch, translation);
-  int32_t words[2] = {(int32_t)mover, (int32_t)scratch};
-  (void)qa_qvm_module_call(&provider->game->module, words, 2,
-                           (int64_t)provider->profile.callbacks.move_mover_hooks);
-  for (size_t i = 0; i < provider->owner_count; i++) publish(provider, provider->owners[i]);
+  /* TS try { ... } finally { restore the scratch vector }. */
+  mover_job job = {provider, mover, scratch, translation};
+  qa_caught_error failure;
+  bool ok = qa_try(mover_body, &job, &failure);
   qa_qvm_memory_write_bytes(memory, span.byte_offset, saved, 12);
+  if (!ok) qa_rethrow(&failure);
 }
 
 void qa_qvm_grapple_provider_actor_released(qa_qvm_grapple_provider *provider,
@@ -449,6 +510,8 @@ void qa_qvm_grapple_provider_actor_released(qa_qvm_grapple_provider *provider,
   qa_actor_id *snapshot = malloc((count == 0 ? 1 : count) * sizeof *snapshot);
   if (snapshot == NULL) qa_range_error("QVM memory allocation failed");
   memcpy(snapshot, provider->owners, count * sizeof *snapshot);
+  qa_cleanup snapshot_cleanup;
+  qa_cleanup_push(&snapshot_cleanup, free, snapshot);
   for (size_t i = 0; i < count; i++) {
     qa_qvm_grapple_projection state;
     bool has = projection_of(provider, snapshot[i], &state);
@@ -457,6 +520,7 @@ void qa_qvm_grapple_provider_actor_released(qa_qvm_grapple_provider *provider,
         (has && state.has_mover && qa_same_actor(state.mover, actor)))
       qa_qvm_grapple_provider_release(provider, snapshot[i], true);
   }
+  qa_cleanup_pop(&snapshot_cleanup);
   free(snapshot);
 }
 
@@ -487,18 +551,18 @@ void qa_qvm_grapple_provider_restore(qa_qvm_grapple_provider *provider,
                                      const qa_qvm_grapple_checkpoint *checkpoint) {
   if (checkpoint->version != 1 || checkpoint->profile == NULL ||
       strcmp(checkpoint->profile, provider->declaration) != 0)
-    qa_range_error("Saved grapple profile differs from its source declaration");
+    qa_raise("Error", 0, 0, "Saved grapple profile differs from its source declaration");
   qa_actor_id *owners =
       malloc((checkpoint->owner_count == 0 ? 1 : checkpoint->owner_count) * sizeof *owners);
   if (owners == NULL) qa_range_error("QVM memory allocation failed");
+  qa_cleanup owners_cleanup;
+  qa_cleanup_push(&owners_cleanup, free, owners);
   for (size_t i = 0; i < checkpoint->owner_count; i++)
     owners[i] = provider->bridge.restore_actor(provider->bridge.ctx, checkpoint->owners[i]);
   for (size_t i = 0; i < checkpoint->owner_count; i++)
     for (size_t j = i + 1; j < checkpoint->owner_count; j++)
-      if (qa_same_actor(owners[i], owners[j])) {
-        free(owners);
-        qa_range_error("Saved grapple has duplicate owners");
-      }
+      if (qa_same_actor(owners[i], owners[j]))
+        qa_raise("Error", 0, 0, "Saved grapple has duplicate owners");
   qa_qvm_module_restore(&provider->game->module, &checkpoint->module);
   validate_layout(provider);
   for (size_t i = 0; i < provider->owner_count; i++)
@@ -508,6 +572,7 @@ void qa_qvm_grapple_provider_restore(qa_qvm_grapple_provider *provider,
     owners_add(provider, owners[i]);
     publish(provider, owners[i]);
   }
+  qa_cleanup_pop(&owners_cleanup);
   free(owners);
 }
 
@@ -516,6 +581,9 @@ void qa_qvm_grapple_provider_close(qa_qvm_grapple_provider *provider) {
   qa_actor_id *snapshot = malloc((count == 0 ? 1 : count) * sizeof *snapshot);
   if (snapshot == NULL) qa_range_error("QVM memory allocation failed");
   memcpy(snapshot, provider->owners, count * sizeof *snapshot);
+  qa_cleanup snapshot_cleanup;
+  qa_cleanup_push(&snapshot_cleanup, free, snapshot);
   for (size_t i = 0; i < count; i++) qa_qvm_grapple_provider_release(provider, snapshot[i], true);
+  qa_cleanup_pop(&snapshot_cleanup);
   free(snapshot);
 }

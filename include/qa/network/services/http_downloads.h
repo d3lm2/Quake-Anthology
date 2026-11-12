@@ -25,8 +25,6 @@ typedef struct qa_http_download_result {
 void qa_http_download_result_destroy(qa_http_download_result *r);
 typedef struct qa_http_queue_options {
   const char *root; double concurrency, range_streams; bool has_concurrency, has_range_streams;
-  /* TS totalBudgetBytes: total bytes the queue may receive over its lifetime. */
-  bool has_total_budget_bytes; double total_budget_bytes;
   void *ctx;
   void (*assert_current)(void *ctx);
   bool (*resolved)(void *ctx, const char *path);

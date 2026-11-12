@@ -2,7 +2,7 @@
  * Port of src/core/commands/filter.ts (sourceFilter): id Software's
  * common.c Com_Filter. Source matching accepts a prefix and searches
  * star runs without backtracking. C accommodation: the TS calls
- * sourceCommandText (from commands/text.ts, not yet ported) to cut at
+ * sourceCommandText (commands/text.ts) to cut at
  * an embedded NUL and reject charCodes above 255; both are inherent
  * to NUL-terminated C byte strings. Reads the TS guards with its
  * RangeError byte() helper abort identically here.

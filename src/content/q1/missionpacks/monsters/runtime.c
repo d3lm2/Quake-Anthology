@@ -688,6 +688,7 @@ static double field_integer(const qa_save_reader *reader, const char *name) {
   return value;
 }
 static void q1_free_decoded_save(void *value) { qa_save_value_free(value); }
+static void free_unset_monster(void *monster) { qa_q1_base_monster_destroy(&((qa_q1mpm_mission_monster *)monster)->base); }
 static void runtime_restore(void *ctx, const uint8_t *bytes, size_t length) {
   qa_q1mpm_runtime *runtime = ctx;
   qa_q1_services *game = runtime->game;
@@ -727,10 +728,13 @@ static void runtime_restore(void *ctx, const uint8_t *bytes, size_t length) {
     qa_save_reader_destroy(&definition_reader);
     if (registered == NULL) qa_save_reader_fail(&saved, "unknown saved mission pack monster");
     qa_q1mpm_mission_monster *monster = qa_q1mpm_mission_monster_create(game, entity, registered->definition, runtime);
+    qa_cleanup monster_cleanup; /* not in the map yet: a bad saved state raises out of the load */
+    qa_cleanup_push(&monster_cleanup, free_unset_monster, monster);
     qa_save_reader state;
     must_field(&saved, "state", &state);
     qa_q1_base_monster_restore(&monster->base, &state);
     qa_save_reader_destroy(&state);
+    qa_cleanup_pop(&monster_cleanup);
     qa_q1mpm_runtime_set_monster(runtime, actor, monster);
     qa_save_reader_destroy(&saved);
   }

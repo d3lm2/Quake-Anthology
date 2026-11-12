@@ -89,6 +89,9 @@ typedef struct qa_catalog_discovered_product {
   size_t archive_count;
   char *loose_root; /* owned, nullable */
   qa_catalog_directory_content *user_content;  /* nullable */
+  /* TS redirectedContent: where tests redirect the game folder's writes (including
+   * downloads); mounted above the user store. NULL outside a redirect. */
+  qa_catalog_directory_content *redirected_content;
   qa_catalog_directory_content *addon_content; /* nullable */
   qa_catalog_content_map *maps; /* owned */
   size_t map_count;
@@ -150,7 +153,24 @@ typedef struct qa_discover_content_options {
   bool discover_mods; /* TS discoverMods !== false */
   const qa_remote_content_selection *remote_content; /* nullable */
   qa_catalog_archive_inspector inspector; /* inspect NULL: no archives */
+  /* TS gameWriteRoot: redirects the game folders' writes, as `QTS_TEST_GAME_WRITE_ROOT`
+   * does for sandboxes; NULL defaults to that variable. */
+  const char *game_write_root;
 } qa_discover_content_options;
+
+/* TS gameWriteRedirect: the test redirect for writes into game folders, from the
+ * option or `QTS_TEST_GAME_WRITE_ROOT`. The variable is one root shared by every
+ * install a test run opens, so each install root gets its own folder beneath it.
+ * `explicit_root` NULL is undefined. Malloc'd; NULL is the TS undefined (no
+ * redirect). */
+char *qa_game_write_redirect(const char *explicit_root, const char *corpus_root);
+/* TS gameDownloadDirectory: the folder a product's downloads are written to: the
+ * original clients download into the game's own folder (`id1`, `qw`, `baseq2`,
+ * `baseq3`, a mod's folder), never a separate store. Tests redirect it beneath
+ * the redirect root with the same relative layout; the folder is created when
+ * missing. Malloc'd; raises Error when the folder cannot be made. */
+char *qa_game_download_directory(const char *corpus_root, qa_game_family family,
+                                 const char *content_directory, const char *redirect);
 
 /* TS MountPlanSelection. rules NULL = undefined. */
 typedef struct qa_catalog_mount_plan_selection {

@@ -280,6 +280,10 @@ static void warn_print(void *ctx, const char *text) {
   view->options.print(view->options.ctx, text);
 }
 
+/* content.c (declared in application_internal.h): loadQ3Character(await content.forContent(appearance), { model,
+ * skin: "default", ... }), owned by the content. */
+const qa_q3_character_assets *qa_app_load_q3_character_for_content(qa_app_loaded_content *content, qa_content_id appearance,
+    const char *model);
 typedef struct prepare_state {
   qa_app_remote_seat_view *view;
   qa_app_seat_ui *ui;
@@ -394,6 +398,13 @@ static void prepare_body(void *ctx) {
     if (view->q3 == NULL) qa_range_error("Out of memory");
     options->assert_current(options->ctx);
   }
+  /* characters = remote instanceof UnifiedRemotePresentation && options.character === "q3" ? await loadQ3Character(...) : null */
+  const qa_q3_character_assets *characters =
+      remote->family == QA_APP_REMOTE_FAMILY_UNIFIED && options->options->character == QA_GAME_FAMILY_Q3
+          ? qa_app_load_q3_character_for_content(options->content,
+                qa_app_loaded_content_recipe(options->content)->character.appearance.content,
+                options->options->character_model)
+          : NULL;
   options->assert_current(options->ctx);
   qa_app_world_seat_presentation_options *p = &state->presentation_options;
   memset(p, 0, sizeof *p);
@@ -403,7 +414,7 @@ static void prepare_body(void *ctx) {
   p->simulation = &view->access;
   p->seat_count = options->count(options->ctx);
   p->font = font;
-  p->characters = NULL; /* TS: Q3 characters only for the unified replica */
+  p->characters = characters;
   p->ui = state->ui;
   p->effects = view->effects;
   if (view->q3 != NULL) {
@@ -418,7 +429,9 @@ static void prepare_body(void *ctx) {
   p->console_scale_ctx = view;
   view->presentation = qa_app_world_seat_presentation_create(p);
   if (view->presentation == NULL) qa_range_error("Out of memory");
-  state->ui = NULL; /* closed by the presentation from here */
+  /* closed by the presentation from here; the view still frees it after the presentation (view_free) */
+  view->ui = state->ui;
+  state->ui = NULL;
   /* TS publishLayout(options.index(), options.count()): index first */
   double index = options->index(options->ctx);
   double count = options->count(options->ctx);
@@ -571,7 +584,6 @@ qa_app_remote_seat_view *qa_app_remote_seat_view_prepare(const qa_app_remote_sea
     if (failed) qa_raise("AggregateError", 0, 0, "Remote seat view preparation failed");
     qa_rethrow(&caught);
   }
-  view->ui = state.ui;
   /* new RemoteSeatView(...): the constructor builds the unified replica's component view. */
   qa_caught_error created;
   if (!qa_try(create_components_body, view, &created)) { view_free(view); qa_rethrow(&created); }

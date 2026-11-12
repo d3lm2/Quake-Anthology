@@ -28,7 +28,7 @@ char *qa_app_q2_player_name_tokens(const char *text, const double *slots, const 
 /* TS new ApplicationRereleasePresentation(assets, seats, languageSettings = null): assets and language_settings
  * (NULL is TS null) are borrowed for the presentation's life; seat languages are copied. */
 qa_app_rerelease_presentation *qa_app_rerelease_presentation_create(qa_app_application_assets *assets,
-    const qa_app_rerelease_seat *seats, size_t seat_count, qa_cvar_registry *language_settings);
+    const qa_app_rerelease_seat *seats, size_t seat_count, qa_ui_setting_cvars language_settings);
 void qa_app_rerelease_presentation_destroy(qa_app_rerelease_presentation *p);
 typedef struct qa_app_rerelease_refresh qa_app_rerelease_refresh;
 /* TS prepareImageRefresh(images): the skies load through the prepared images' providers. */

@@ -13,12 +13,20 @@
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
 
+/* TS `throw new Error(text)`: the whole text, whatever its length (a cvar or alias name is not
+ * bounded). The formatted copy is released by a cleanup node once the raise has copied it. */
 static noreturn void qa_error(const char *format, ...) {
-  char text[1536];
-  va_list args;
+  va_list args, measure;
   va_start(args, format);
-  vsnprintf(text, sizeof text, format, args);
+  va_copy(measure, args);
+  int needed = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  char *text = malloc(needed < 0 ? 1 : (size_t)needed + 1);
+  if (text == NULL) qa_raise("Error", 0, 0, "%s", "out of memory");
+  vsnprintf(text, (size_t)(needed < 0 ? 0 : needed) + 1, format, args);
   va_end(args);
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, text);
   qa_raise("Error", 0, 0, "%s", text);
 }
 
@@ -62,7 +70,7 @@ typedef struct cvar_state {
   char *value;
   char *reset_value;
   char *latched_value; /* NULL = undefined */
-  int32_t flags;
+  double flags; /* TS number: a restored or fullSet value is kept as is; bit operations see ToInt32 */
   bool modified;
   double modification_count;
   double numeric_value;
@@ -104,7 +112,7 @@ struct qa_cvar_registry {
   size_t index_count;
   size_t index_capacity;
   int64_t first; /* state index, -1 nil */
-  int32_t changed_flags;
+  double changed_flags; /* TS changedFlags: kept as restored until a bit operation */
   bool cheats_enabled;
   bool server_active;
   bool client_connected;
@@ -269,7 +277,8 @@ static bool snapshot_state(const cvar_state *state, qa_cvar_read *out) {
   out->value = dup_text(state->value);
   out->reset_value = dup_text(state->reset_value);
   out->latched_value = state->latched_value != NULL ? dup_text(state->latched_value) : NULL;
-  out->flags = state->flags;
+  out->flags = qa_int32(state->flags);
+  out->flags_value = state->flags;
   out->modified = state->modified;
   out->modification_count = state->modification_count;
   out->numeric_value = state->numeric_value;
@@ -449,7 +458,7 @@ static void game_directory(qa_cvar_registry *r, cvar_state *state) {
 static void propagate(qa_cvar_registry *r, cvar_state *state, const char *value, bool changed) {
   qa_command_dialect dialect = r->options.dialect;
   if (dialect == QA_COMMAND_DIALECT_Q1_NETQUAKE) {
-    if ((state->flags & QA_CVAR_FLAG_SERVER_INFO) != 0 && changed && r->server_active) {
+    if ((qa_int32(state->flags) & QA_CVAR_FLAG_SERVER_INFO) != 0 && changed && r->server_active) {
       qa_cvar_effect effect;
       memset(&effect, 0, sizeof effect);
       effect.kind = QA_CVAR_EFFECT_BROADCAST;
@@ -475,7 +484,7 @@ static void propagate(qa_cvar_registry *r, cvar_state *state, const char *value,
     qa_cvar_info_target target = targets[i];
     int32_t flag = target == QA_CVAR_INFO_CLIENT_USERINFO ? QA_CVAR_FLAG_USER_INFO
                                                           : QA_CVAR_FLAG_SERVER_INFO;
-    if ((state->flags & flag) == 0) continue;
+    if ((qa_int32(state->flags) & flag) == 0) continue;
     qa_info_options options;
     options.dialect = dialect;
     options.maximum_length = target == QA_CVAR_INFO_CLIENT_USERINFO ? 196 : 512;
@@ -556,7 +565,8 @@ static bool projected_read(qa_cvar_registry *r, alias_entry *alias, cvar_state *
   out->reset_value = alias_value(alias, state->reset_value);
   out->latched_value = state->latched_value != NULL
       ? alias_value(alias, state->latched_value) : NULL;
-  out->flags = state->flags;
+  out->flags = qa_int32(state->flags);
+  out->flags_value = state->flags;
   out->modified = state->modified;
   out->modification_count = state->modification_count;
   if (out->value != NULL)
@@ -622,7 +632,7 @@ void qa_cvar_registry_register_alias(qa_cvar_registry *r, qa_cvar_alias alias) {
     qa_cleanup key_node, target_node;
     qa_cleanup_push(&key_node, free, key);
     qa_cleanup_push(&target_node, free, target_key);
-    reject_alias_info_flags(r, alias.name, target_state->flags);
+    reject_alias_info_flags(r, alias.name, qa_int32(target_state->flags));
     qa_cleanup_pop(&target_node);
     qa_cleanup_pop(&key_node);
   }
@@ -659,6 +669,8 @@ static bool validate_binding_values(qa_cvar_value_binding *binding, const char *
   for (size_t i = 0; i < count; i++) {
     char *error = binding->validate != NULL ? binding->validate(binding->ctx, values[i]) : NULL;
     if (error != NULL) {
+      qa_cleanup node;
+      qa_cleanup_push(&node, free, error);
       qa_error("%s: %s", name, error);
     }
   }
@@ -668,15 +680,20 @@ int64_t qa_cvar_registry_bind_value(qa_cvar_registry *r, const char *name,
                                     qa_cvar_value_binding binding) {
   if (find_alias(r, name) != NULL) {
     char *canonical = qa_cvar_registry_canonical_name(r, name);
+    qa_cleanup canonical_node;
+    qa_cleanup_push(&canonical_node, free, canonical);
     qa_error("Bind the canonical cvar %s instead of alias %s",
              canonical != NULL ? canonical : "", name);
   }
   char *key = registry_key(r, name);
+  qa_cleanup key_node;
+  qa_cleanup_push(&key_node, free, key);
   cvar_state *state = key != NULL ? find_state_by_key(r, key) : NULL;
   if (state == NULL) qa_error("Cannot bind unregistered cvar %s", name);
   if (find_binding_by_key(r, key) != NULL)
     qa_error("Cvar %s already has a value binding", name);
   (void)validate_binding_values(&binding, name, state);
+  qa_cleanup_pop(&key_node);
   if (r->binding_count == r->binding_capacity) {
     size_t cap = r->binding_capacity == 0 ? 8 : r->binding_capacity * 2;
     binding_entry *items = (binding_entry *)realloc(r->bindings, cap * sizeof *items);
@@ -825,7 +842,7 @@ static bool allow_cheats(qa_cvar_registry *r) {
   return allowed;
 }
 static cvar_state *create_state(qa_cvar_registry *r, const char *name, const char *key,
-                                const char *default_value, int32_t flags) {
+                                const char *default_value, double flags) {
   cvar_state *state = (cvar_state *)calloc(1, sizeof *state);
   if (state == NULL) return NULL;
   state->index = (int64_t)r->index_count;
@@ -858,7 +875,10 @@ bool qa_cvar_registry_register(qa_cvar_registry *r, const char *name_input,
   if (name == NULL) return false;
   qa_command_dialect dialect = r->options.dialect;
   if (find_alias(r, name) != NULL) {
+    qa_cleanup name_node;
+    qa_cleanup_push(&name_node, free, name);
     reject_alias_info_flags(r, name, flags);
+    qa_cleanup_pop(&name_node);
     bool found = qa_cvar_registry_get(r, name, out);
     free(name);
     return found;
@@ -889,7 +909,7 @@ bool qa_cvar_registry_register(qa_cvar_registry *r, const char *name_input,
     if (qa_command_dialect_is_q1(dialect)) {
       if (console_delete(r, key)) {
         (void)set_owned(&existing->reset_value, default_value);
-        existing->flags |= flags;
+        existing->flags = (double)(qa_int32(existing->flags) | flags);
         if (dialect == QA_COMMAND_DIALECT_Q1_QUAKEWORLD)
           propagate(r, existing, existing->value, true);
       } else {
@@ -900,20 +920,20 @@ bool qa_cvar_registry_register(qa_cvar_registry *r, const char *name_input,
       return ok;
     }
     if (dialect == QA_COMMAND_DIALECT_Q3) {
-      if ((existing->flags & QA_CVAR_FLAG_USER_CREATED) != 0 &&
+      if ((qa_int32(existing->flags) & QA_CVAR_FLAG_USER_CREATED) != 0 &&
           (flags & QA_CVAR_FLAG_USER_CREATED) == 0 && default_value[0] != '\0') {
-        existing->flags &= ~QA_CVAR_FLAG_USER_CREATED;
+        existing->flags = (double)(qa_int32(existing->flags) & ~QA_CVAR_FLAG_USER_CREATED);
         (void)set_owned(&existing->reset_value, default_value);
-        r->changed_flags |= flags;
+        r->changed_flags = (double)(qa_int32(r->changed_flags) | flags);
       }
       if (existing->reset_value[0] == '\0')
         (void)set_owned(&existing->reset_value, default_value);
     }
     if (qa_command_dialect_is_q2(dialect) &&
-        (existing->flags & QA_Q2_CVAR_FLAG_CUSTOM) != 0 &&
+        (qa_int32(existing->flags) & QA_Q2_CVAR_FLAG_CUSTOM) != 0 &&
         (flags & QA_Q2_CVAR_FLAG_CUSTOM) == 0) {
       (void)set_owned(&existing->reset_value, default_value);
-      existing->flags &= ~QA_Q2_CVAR_FLAG_CUSTOM;
+      existing->flags = (double)(qa_int32(existing->flags) & ~QA_Q2_CVAR_FLAG_CUSTOM);
       if ((flags & (QA_Q2_CVAR_FLAG_READ_ONLY | QA_Q2_CVAR_FLAG_NO_SET)) != 0 ||
           ((flags & QA_Q2_CVAR_FLAG_CHEAT) != 0 && !allow_cheats(r)) ||
           ((flags & (QA_Q2_CVAR_FLAG_USER_INFO | QA_Q2_CVAR_FLAG_SERVER_INFO)) != 0 &&
@@ -923,9 +943,9 @@ bool qa_cvar_registry_register(qa_cvar_registry *r, const char *name_input,
         qa_cvar_read_free(&ignored);
       }
     }
-    existing->flags |= flags;
+    existing->flags = (double)(qa_int32(existing->flags) | flags);
     if (qa_command_dialect_is_q2(dialect) && (flags & Q2_NO_ARCHIVE) != 0)
-      existing->flags &= ~QA_Q2_CVAR_FLAG_ARCHIVE;
+      existing->flags = (double)(qa_int32(existing->flags) & ~QA_Q2_CVAR_FLAG_ARCHIVE);
     if (dialect == QA_COMMAND_DIALECT_Q3 && existing->latched_value != NULL) {
       char *value = existing->latched_value;
       existing->latched_value = NULL;
@@ -949,9 +969,11 @@ bool qa_cvar_registry_register(qa_cvar_registry *r, const char *name_input,
     free(name); free(default_value); free(key);
     return false;
   }
-  if (dialect == QA_COMMAND_DIALECT_Q3 && r->index_count == 1024)
+  if (dialect == QA_COMMAND_DIALECT_Q3 && r->index_count == 1024) {
+    free(name); free(default_value); free(key);
     qa_range_error("MAX_CVARS");
-  cvar_state *state = create_state(r, name, key != NULL ? key : name, default_value, flags);
+  }
+  cvar_state *state = create_state(r, name, key != NULL ? key : name, default_value, flags_in);
   free(name); free(default_value); free(key);
   if (state == NULL) return false;
   if (dialect == QA_COMMAND_DIALECT_Q1_QUAKEWORLD)
@@ -1010,32 +1032,32 @@ bool qa_cvar_registry_set(qa_cvar_registry *r, const char *name_input,
     return ok;
   }
   if (qa_command_dialect_is_q2(dialect)) {
-    if ((state->flags & 6) != 0 && !valid_info(value)) {
+    if ((qa_int32(state->flags) & 6) != 0 && !valid_info(value)) {
       registry_print(r, "invalid info cvar value\n");
       bool ok = snapshot_or_false(state, out);
       free(name); free(value);
       return ok;
     }
     if (!force) {
-      if ((state->flags & QA_Q2_CVAR_FLAG_READ_ONLY) != 0) {
+      if ((qa_int32(state->flags) & QA_Q2_CVAR_FLAG_READ_ONLY) != 0) {
         registry_print_format(r, "%s is read only.\n", name);
         bool ok = snapshot_or_false(state, out);
         free(name); free(value);
         return ok;
       }
-      if ((state->flags & QA_Q2_CVAR_FLAG_CHEAT) != 0 && !allow_cheats(r)) {
+      if ((qa_int32(state->flags) & QA_Q2_CVAR_FLAG_CHEAT) != 0 && !allow_cheats(r)) {
         registry_print_format(r, "%s is cheat protected.\n", name);
         bool ok = snapshot_or_false(state, out);
         free(name); free(value);
         return ok;
       }
-      if ((state->flags & QA_Q2_CVAR_FLAG_NO_SET) != 0) {
+      if ((qa_int32(state->flags) & QA_Q2_CVAR_FLAG_NO_SET) != 0) {
         registry_print_format(r, "%s is write protected.\n", name);
         bool ok = snapshot_or_false(state, out);
         free(name); free(value);
         return ok;
       }
-      if ((state->flags & QA_Q2_CVAR_FLAG_LATCH) != 0) {
+      if ((qa_int32(state->flags) & QA_Q2_CVAR_FLAG_LATCH) != 0) {
         const char *current = state->latched_value != NULL ? state->latched_value : state->value;
         if (strcmp(value, current) == 0) {
           bool ok = snapshot_or_false(state, out);
@@ -1066,21 +1088,21 @@ bool qa_cvar_registry_set(qa_cvar_registry *r, const char *name_input,
       free(name); free(value);
       return ok;
     }
-    r->changed_flags |= state->flags;
+    r->changed_flags = (double)(qa_int32(r->changed_flags) | qa_int32(state->flags));
     if (!force) {
-      if ((state->flags & QA_CVAR_FLAG_READ_ONLY) != 0) {
+      if ((qa_int32(state->flags) & QA_CVAR_FLAG_READ_ONLY) != 0) {
         registry_print_format(r, "%s is read only.\n", name);
         bool ok = snapshot_or_false(state, out);
         free(name); free(value);
         return ok;
       }
-      if ((state->flags & QA_CVAR_FLAG_INIT) != 0) {
+      if ((qa_int32(state->flags) & QA_CVAR_FLAG_INIT) != 0) {
         registry_print_format(r, "%s is write protected.\n", name);
         bool ok = snapshot_or_false(state, out);
         free(name); free(value);
         return ok;
       }
-      if ((state->flags & QA_CVAR_FLAG_LATCH) != 0) {
+      if ((qa_int32(state->flags) & QA_CVAR_FLAG_LATCH) != 0) {
         if (state->latched_value != NULL && strcmp(state->latched_value, value) == 0) {
           bool ok = snapshot_or_false(state, out);
           free(name); free(value);
@@ -1094,7 +1116,7 @@ bool qa_cvar_registry_set(qa_cvar_registry *r, const char *name_input,
         free(name); free(value);
         return ok;
       }
-      if ((state->flags & QA_CVAR_FLAG_CHEAT) != 0 && !allow_cheats(r)) {
+      if ((qa_int32(state->flags) & QA_CVAR_FLAG_CHEAT) != 0 && !allow_cheats(r)) {
         registry_print_format(r, "%s is cheat protected.\n", name);
         bool ok = snapshot_or_false(state, out);
         free(name); free(value);
@@ -1107,7 +1129,7 @@ bool qa_cvar_registry_set(qa_cvar_registry *r, const char *name_input,
   }
   if (strcmp(state->value, value) != 0) {
     apply_value(r, state, value, true);
-    if (qa_command_dialect_is_q2(dialect) && (state->flags & QA_CVAR_FLAG_USER_INFO) != 0)
+    if (qa_command_dialect_is_q2(dialect) && (qa_int32(state->flags) & QA_CVAR_FLAG_USER_INFO) != 0)
       r->userinfo_dirty = true;
   } else {
     binding_changed(r, state->key, value);
@@ -1174,7 +1196,7 @@ void qa_cvar_registry_set_command_flags(qa_cvar_registry *r, const char *name,
           ? (q2 ? QA_Q2_CVAR_FLAG_USER_INFO : QA_CVAR_FLAG_USER_INFO)
           : (q2 ? QA_Q2_CVAR_FLAG_SERVER_INFO : QA_CVAR_FLAG_SERVER_INFO);
   cvar_state *state = find_state(r, name);
-  int32_t previous_flags = state != NULL ? state->flags : 0;
+  int32_t previous_flags = state != NULL ? qa_int32(state->flags) : 0;
   if (kind != QA_CVAR_COMMAND_FLAG_ARCHIVE &&
       (!valid_info(name) || !valid_info(value) ||
        (q2 && (strlen(name) >= 64 || strlen(value) >= 64)))) {
@@ -1200,14 +1222,14 @@ void qa_cvar_registry_set_command_flags(qa_cvar_registry *r, const char *name,
       return;
     }
     if (kind != QA_CVAR_COMMAND_FLAG_ARCHIVE && q2)
-      state->flags &= ~(QA_Q2_CVAR_FLAG_USER_INFO | QA_Q2_CVAR_FLAG_SERVER_INFO);
-    if (kind != QA_CVAR_COMMAND_FLAG_ARCHIVE || !q2 || (state->flags & Q2_NO_ARCHIVE) == 0)
-      state->flags |= flag;
+      state->flags = (double)(qa_int32(state->flags) & ~(QA_Q2_CVAR_FLAG_USER_INFO | QA_Q2_CVAR_FLAG_SERVER_INFO));
+    if (kind != QA_CVAR_COMMAND_FLAG_ARCHIVE || !q2 || (qa_int32(state->flags) & Q2_NO_ARCHIVE) == 0)
+      state->flags = (double)(qa_int32(state->flags) | flag);
   }
-  if (q2 && (state->flags & Q2_NO_ARCHIVE) != 0) state->flags &= ~QA_Q2_CVAR_FLAG_ARCHIVE;
+  if (q2 && (qa_int32(state->flags) & Q2_NO_ARCHIVE) != 0) state->flags = (double)(qa_int32(state->flags) & ~QA_Q2_CVAR_FLAG_ARCHIVE);
   if (kind != QA_CVAR_COMMAND_FLAG_ARCHIVE) {
     if (q2) {
-      if (((previous_flags | state->flags) & QA_Q2_CVAR_FLAG_USER_INFO) != 0)
+      if (((previous_flags | qa_int32(state->flags)) & QA_Q2_CVAR_FLAG_USER_INFO) != 0)
         r->userinfo_dirty = true;
     } else propagate(r, state, state->value, true);
   }
@@ -1261,12 +1283,12 @@ bool qa_cvar_registry_full_set(qa_cvar_registry *r, const char *name,
   }
   free(checked);
   if (state == NULL) return qa_cvar_registry_register(r, name, value, flags_in, out);
-  if ((state->flags & QA_CVAR_FLAG_USER_INFO) != 0) r->userinfo_dirty = true;
+  if ((qa_int32(state->flags) & QA_CVAR_FLAG_USER_INFO) != 0) r->userinfo_dirty = true;
   char *text = qa_source_command_text(value);
   if (text == NULL) return false;
   apply_value(r, state, text, true);
   free(text);
-  state->flags = flags;
+  state->flags = flags_in; /* TS state.flags = flags (the number as given) */
   return snapshot_or_false(state, out);
 }
 bool qa_cvar_registry_set_value(qa_cvar_registry *r, const char *name, double value,
@@ -1275,8 +1297,10 @@ bool qa_cvar_registry_set_value(qa_cvar_registry *r, const char *name, double va
   if (text == NULL) { memset(out, 0, sizeof *out); return false; }
   size_t length = strlen(text);
   if (length >= 32) {
-    if (qa_command_dialect_is_q1(r->options.dialect))
+    if (qa_command_dialect_is_q1(r->options.dialect)) {
+      free(text);
       qa_range_error("Cvar_SetValue overflows source val[32]");
+    }
     registry_print_format(r, "Com_sprintf: overflow of %zu in 32\n", length);
   }
   if (length > 31) text[31] = '\0';
@@ -1306,18 +1330,25 @@ bool qa_cvar_registry_stage(qa_cvar_registry *r, const char *name, const char *i
   }
   cvar_state *state = find_state(r, name);
   char *value = qa_source_command_text(input);
-  if (state == NULL) qa_error("Cannot stage an unregistered cvar %s", name);
+  if (state == NULL) {
+    free(value);
+    qa_error("Cannot stage an unregistered cvar %s", name);
+  }
   if (value == NULL || !valid_bound_value(r, name, value)) {
     free(value);
     return snapshot_or_false(state, out);
   }
   bool q2 = qa_command_dialect_is_q2(r->options.dialect);
   if (r->options.dialect == QA_COMMAND_DIALECT_Q3
-          ? (state->flags & (QA_CVAR_FLAG_READ_ONLY | QA_CVAR_FLAG_INIT)) != 0
-          : q2 && (state->flags & QA_Q2_CVAR_FLAG_NO_SET) != 0)
+          ? (qa_int32(state->flags) & (QA_CVAR_FLAG_READ_ONLY | QA_CVAR_FLAG_INIT)) != 0
+          : q2 && (qa_int32(state->flags) & QA_Q2_CVAR_FLAG_NO_SET) != 0) {
+    free(value);
     qa_error("Cannot stage a protected cvar %s", name);
-  if (q2 && (state->flags & 6) != 0 && !valid_info(value))
+  }
+  if (q2 && (qa_int32(state->flags) & 6) != 0 && !valid_info(value)) {
+    free(value);
     qa_error("Invalid staged info cvar %s", name);
+  }
   bool has_pending = strcmp(value, state->value) != 0;
   bool differs = has_pending != (state->latched_value != NULL) ||
       (has_pending && strcmp(state->latched_value, value) != 0);
@@ -1326,7 +1357,7 @@ bool qa_cvar_registry_stage(qa_cvar_registry *r, const char *name, const char *i
     state->latched_value = has_pending ? dup_text(value) : NULL;
     state->modified = true;
     state->modification_count++;
-    if (r->options.dialect == QA_COMMAND_DIALECT_Q3) r->changed_flags |= state->flags;
+    if (r->options.dialect == QA_COMMAND_DIALECT_Q3) r->changed_flags = (double)(qa_int32(r->changed_flags) | qa_int32(state->flags));
   }
   free(value);
   return snapshot_or_false(state, out);
@@ -1390,12 +1421,12 @@ void qa_cvar_registry_reset_all(qa_cvar_registry *r) {
     int64_t index = previous < 0 ? r->first : state_at(r, previous)->next;
     cvar_state *state = state_at(r, index);
     if (state == NULL) break;
-    if ((state->flags & (QA_CVAR_FLAG_READ_ONLY | QA_CVAR_FLAG_INIT |
+    if ((qa_int32(state->flags) & (QA_CVAR_FLAG_READ_ONLY | QA_CVAR_FLAG_INIT |
                          QA_CVAR_FLAG_NO_RESTART)) != 0) {
       previous = index;
       continue;
     }
-    if ((state->flags & QA_CVAR_FLAG_USER_CREATED) != 0) {
+    if ((qa_int32(state->flags) & QA_CVAR_FLAG_USER_CREATED) != 0) {
       int64_t next = state->next;
       if (previous < 0) r->first = next;
       else state_at(r, previous)->next = next;
@@ -1428,7 +1459,7 @@ void qa_cvar_registry_set_cheats_enabled(qa_cvar_registry *r, bool enabled) {
     cvar_state *state = state_at(r, index);
     if (state == NULL) break;
     int64_t next = state->next;
-    if ((state->flags & QA_CVAR_FLAG_CHEAT) != 0) {
+    if ((qa_int32(state->flags) & QA_CVAR_FLAG_CHEAT) != 0) {
       free(state->latched_value);
       state->latched_value = NULL;
       qa_cvar_snapshot ignored;
@@ -1451,7 +1482,7 @@ qa_cvar_snapshot *qa_cvar_registry_canonical_snapshots(qa_cvar_registry *r,
     cvar_state *state = state_at(r, index);
     if (state == NULL) break;
     int64_t next = state->next;
-    if (flags == 0 || (state->flags & flags) != 0) {
+    if (flags == 0 || (qa_int32(state->flags) & flags) != 0) {
       if (count == capacity) {
         size_t cap = capacity == 0 ? 8 : capacity * 2;
         qa_cvar_snapshot *items = (qa_cvar_snapshot *)realloc(values, cap * sizeof *items);
@@ -1532,9 +1563,9 @@ char *qa_cvar_registry_info_string(qa_cvar_registry *r, double flags_in,
     cvar_state *state = state_at(r, index);
     if (state == NULL) break;
     int64_t next = state->next;
-    if ((state->flags & flags) != 0 &&
+    if ((qa_int32(state->flags) & flags) != 0 &&
         !(qa_command_dialect_is_q2(r->options.dialect) &&
-          (state->flags & QA_Q2_CVAR_FLAG_PRIVATE) != 0)) {
+          (qa_int32(state->flags) & QA_Q2_CVAR_FLAG_PRIVATE) != 0)) {
       qa_info_options options;
       options.dialect = r->options.dialect;
       options.maximum_length = maximum_length;
@@ -1558,9 +1589,9 @@ char *qa_cvar_registry_propagated_info(qa_cvar_registry *r, qa_cvar_info_target 
 static bool archive_includes(qa_cvar_registry *r, cvar_state *state,
                              qa_cvar_include_fn include, void *include_ctx) {
   if (include != NULL && !include(include_ctx, state->name)) return false;
-  if (qa_command_dialect_is_q2(r->options.dialect) && (state->flags & Q2_NO_ARCHIVE) != 0)
+  if (qa_command_dialect_is_q2(r->options.dialect) && (qa_int32(state->flags) & Q2_NO_ARCHIVE) != 0)
     return false;
-  if ((state->flags & QA_CVAR_FLAG_ARCHIVE) == 0) return false;
+  if ((qa_int32(state->flags) & QA_CVAR_FLAG_ARCHIVE) == 0) return false;
   if (r->options.dialect == QA_COMMAND_DIALECT_Q3) {
     char *folded = qa_ascii_fold(state->name);
     bool is_cdkey = folded != NULL && strcmp(folded, "cl_cdkey") == 0;
@@ -1625,13 +1656,13 @@ char **qa_cvar_registry_archive_commands(qa_cvar_registry *r,
       bool q2 = qa_command_dialect_is_q2(r->options.dialect);
       const char *prefix = r->options.dialect == QA_COMMAND_DIALECT_Q3 ||
               console_has(r, state->key) ||
-              (q2 && (state->flags & QA_Q2_CVAR_FLAG_CUSTOM) != 0)
+              (q2 && (qa_int32(state->flags) & QA_Q2_CVAR_FLAG_CUSTOM) != 0)
           ? "seta " : q2 ? "set " : "";
       /* This file runs as a script at the next launch and servers can force
          values, so nothing may end the quoted token or line: names matching
-         /[\s";]/ are skipped (ASCII whitespace; names are byte strings) and
-         ", CR and LF are dropped from the value. */
-      if (strpbrk(state->name, " \t\n\v\f\r\";") != NULL) {
+         /[\s";]/ are skipped (names are byte strings, one byte per TS character, so \s is
+         the ASCII white space and byte 0xa0, U+00A0) and ", CR and LF are dropped from the value. */
+      if (strpbrk(state->name, " \t\n\v\f\r\";\xa0") != NULL) {
         index = next;
         continue;
       }
@@ -1684,20 +1715,22 @@ void qa_cvar_registry_write_variables(qa_cvar_registry *r, qa_cvar_write_fn writ
   free(commands);
 }
 double qa_cvar_registry_take_modified_flags(qa_cvar_registry *r) {
-  int32_t flags = r->changed_flags;
+  double flags = r->changed_flags;
   if (flags != 0) r->mutation_revision++;
   r->changed_flags = 0;
-  return (double)flags;
+  return flags;
 }
 void qa_cvar_registry_mark_modified_flags(qa_cvar_registry *r, double flags_in) {
   int32_t flags = qa_int32(flags_in);
-  if ((r->changed_flags | flags) != r->changed_flags) r->mutation_revision++;
-  r->changed_flags |= flags;
+  int32_t changed = qa_int32(r->changed_flags);
+  if ((double)(changed | flags) != r->changed_flags) r->mutation_revision++;
+  r->changed_flags = (double)(changed | flags);
 }
 void qa_cvar_registry_clear_modified_flags(qa_cvar_registry *r, double flags_in) {
   int32_t flags = qa_int32(flags_in);
-  if ((r->changed_flags & flags) != 0) r->mutation_revision++;
-  r->changed_flags &= ~flags;
+  int32_t changed = qa_int32(r->changed_flags);
+  if ((changed & flags) != 0) r->mutation_revision++;
+  r->changed_flags = (double)(changed & ~flags);
 }
 void qa_cvar_registry_clear_userinfo_modified(qa_cvar_registry *r) {
   if (r->userinfo_dirty) r->mutation_revision++;
@@ -1710,7 +1743,7 @@ void qa_cvar_registry_add_flags(qa_cvar_registry *r, const char *name, double fl
   char *canonical = qa_cvar_registry_canonical_name(r, name);
   cvar_state *state = canonical != NULL ? find_state(r, canonical) : NULL;
   free(canonical);
-  if (state != NULL) state->flags |= flags;
+  if (state != NULL) state->flags = (double)(qa_int32(state->flags) | flags);
 }
 void qa_cvar_registry_clear_modified(qa_cvar_registry *r, const char *name) {
   char *canonical = qa_cvar_registry_canonical_name(r, name);
@@ -1818,8 +1851,10 @@ void qa_vm_cvar_update(qa_vm_cvar *vm) {
   if (!qa_cvar_registry_read_vm(vm->registry, (double)vm->handle, &source)) return;
   if (source.modification_count == vm->count) { qa_cvar_read_free(&source); return; }
   vm->count = source.modification_count;
-  if (strlen(source.value) > 255)
+  if (strlen(source.value) > 255) {
+    qa_cvar_read_free(&source);
     qa_range_error("Cvar_Update: value exceeds MAX_CVAR_VALUE_STRING");
+  }
   (void)set_owned(&vm->text, source.value);
   vm->numeric = source.numeric_value;
   vm->integer = source.integer_value;
@@ -1855,6 +1890,20 @@ static bool value_set(qa_save_value *object, const char *key, qa_save_value *chi
   }
   return true;
 }
+/* The registry holds one byte per character (TS byte characters U+0000..U+00FF); the checkpoint tree holds the
+ * UTF-8 of the TS string, which is what TS's JSON form writes. Every registry text crosses that boundary here. */
+static qa_save_value *checkpoint_string(const char *bytes) {
+  char *utf8 = qa_command_text_to_utf8(bytes);
+  qa_save_value *value = qa_save_value_string(utf8);
+  free(utf8);
+  return value;
+}
+static char *registry_text_of(const qa_save_reader *reader) {
+  char *bytes = NULL;
+  if (!qa_command_text_from_utf8(qa_save_reader_string(reader), &bytes))
+    qa_save_reader_fail(reader, "cvar text requires byte characters");
+  return bytes;
+}
 static qa_save_value *snapshot_registry_state(qa_cvar_registry *r) {
   qa_save_value *root = qa_save_value_object();
   qa_save_value *variables = qa_save_value_array();
@@ -1869,11 +1918,11 @@ static qa_save_value *snapshot_registry_state(qa_cvar_registry *r) {
     }
     qa_save_value *entry = qa_save_value_object();
     if (entry == NULL ||
-        !value_set(entry, "name", qa_save_value_string(state->name)) ||
-        !value_set(entry, "value", qa_save_value_string(state->value)) ||
-        !value_set(entry, "resetValue", qa_save_value_string(state->reset_value)) ||
+        !value_set(entry, "name", checkpoint_string(state->name)) ||
+        !value_set(entry, "value", checkpoint_string(state->value)) ||
+        !value_set(entry, "resetValue", checkpoint_string(state->reset_value)) ||
         !value_set(entry, "latchedValue",
-            state->latched_value != NULL ? qa_save_value_string(state->latched_value)
+            state->latched_value != NULL ? checkpoint_string(state->latched_value)
                                          : qa_save_value_null()) ||
         !value_set(entry, "flags", qa_save_value_number((double)state->flags)) ||
         !value_set(entry, "modified", qa_save_value_boolean(state->modified)) ||
@@ -1889,11 +1938,11 @@ static qa_save_value *snapshot_registry_state(qa_cvar_registry *r) {
   for (int64_t index = r->first; index >= 0;) {
     cvar_state *state = state_at(r, index);
     if (state == NULL) break;
-    if (!qa_save_value_push(order, qa_save_value_string(state->name))) goto oom;
+    if (!qa_save_value_push(order, checkpoint_string(state->name))) goto oom;
     index = state->next;
   }
   for (size_t i = 0; i < r->console_count; i++)
-    if (!qa_save_value_push(console, qa_save_value_string(r->console_variables[i])))
+    if (!qa_save_value_push(console, checkpoint_string(r->console_variables[i])))
       goto oom;
   if (!value_set(root, "variables", variables) ||
       !value_set(root, "order", order) ||
@@ -1902,8 +1951,8 @@ static qa_save_value *snapshot_registry_state(qa_cvar_registry *r) {
       !value_set(root, "serverActive", qa_save_value_boolean(r->server_active)) ||
       !value_set(root, "clientConnected", qa_save_value_boolean(r->client_connected)) ||
       !value_set(root, "highCharacters", qa_save_value_boolean(r->high_characters)) ||
-      !value_set(root, "clientInfo", qa_save_value_string(r->client_info)) ||
-      !value_set(root, "serverInfo", qa_save_value_string(r->server_info)) ||
+      !value_set(root, "clientInfo", checkpoint_string(r->client_info)) ||
+      !value_set(root, "serverInfo", checkpoint_string(r->server_info)) ||
       !value_set(root, "userinfoDirty", qa_save_value_boolean(r->userinfo_dirty)) ||
       !value_set(root, "consoleVariables", console)) goto oom;
   if (r->alias_handle_count != 0) {
@@ -1914,7 +1963,7 @@ static qa_save_value *snapshot_registry_state(qa_cvar_registry *r) {
       if (entry == NULL ||
           !value_set(entry, "handle",
               qa_save_value_number((double)r->alias_handles[i].handle)) ||
-          !value_set(entry, "name", qa_save_value_string(r->alias_handles[i].name)) ||
+          !value_set(entry, "name", checkpoint_string(r->alias_handles[i].name)) ||
           !qa_save_value_push(handles, entry)) {
         qa_save_value_free(entry);
         qa_save_value_free(handles);
@@ -1981,7 +2030,7 @@ typedef struct prepared_restore {
   int64_t first;
   alias_handle *alias_handles;
   size_t alias_handle_count;
-  int32_t changed_flags;
+  double changed_flags; /* TS changedFlags: kept as restored until a bit operation */
   bool cheats_enabled, server_active, client_connected, high_characters;
   char *client_info;
   char *server_info;
@@ -2000,6 +2049,8 @@ static void prepared_free(prepared_restore *p) {
   free(p->console_variables);
   free(p);
 }
+static void release_prepared(void *raw) { prepared_free((prepared_restore *)raw); }
+static void release_save_value(void *raw) { qa_save_value_free((qa_save_value *)raw); }
 static qa_save_reader save_field(const qa_save_reader *reader, const char *name) {
   qa_save_reader out;
   if (!qa_save_reader_field(reader, name, &out))
@@ -2011,6 +2062,15 @@ static qa_save_reader save_item(const qa_save_reader *reader, size_t index) {
   if (!qa_save_reader_item(reader, index, &out))
     qa_save_reader_fail(reader, "out of memory");
   return out;
+}
+typedef struct order_key_list {
+  char **keys;
+  size_t count;
+} order_key_list;
+static void order_keys_free(void *raw) {
+  order_key_list *list = (order_key_list *)raw;
+  for (size_t i = 0; i < list->count; i++) free(list->keys[i]);
+  free(list->keys);
 }
 static alias_entry *find_alias_in(alias_entry *aliases, size_t count, const char *key) {
   for (size_t i = 0; i < count; i++)
@@ -2030,6 +2090,10 @@ static prepared_restore *prepare_registry_restore(qa_cvar_registry *r,
   prepared_restore *prepared = (prepared_restore *)calloc(1, sizeof *prepared);
   if (prepared == NULL) qa_range_error("out of memory");
   prepared->first = -1;
+  /* A malformed save raises SaveFormatError from any read below; the partial restore is
+   * released with it (TS leaves it to the collector). */
+  qa_cleanup prepared_node;
+  qa_cleanup_push(&prepared_node, release_prepared, prepared);
   qa_save_reader variables = save_field(&reader, "variables");
   size_t variable_count = qa_save_reader_list_count(&variables);
   prepared->indexes = variable_count > 0
@@ -2048,16 +2112,15 @@ static prepared_restore *prepare_registry_restore(qa_cvar_registry *r,
     qa_save_reader count_r = save_field(&entry, "modificationCount");
     qa_save_reader numeric_r = save_field(&entry, "numericValue");
     qa_save_reader integer_r = save_field(&entry, "integerValue");
-    const char *name = qa_save_reader_string(&name_r);
     cvar_state *state = (cvar_state *)calloc(1, sizeof *state);
     if (state == NULL) qa_range_error("out of memory");
+    prepared->indexes[index] = state; /* owned by the partial restore from here */
     state->index = (int64_t)index;
-    state->name = dup_text(name);
-    state->value = dup_text(qa_save_reader_string(&value_r));
-    state->reset_value = dup_text(qa_save_reader_string(&reset_r));
-    state->latched_value = qa_save_reader_is_null(&latched_r)
-        ? NULL : dup_text(qa_save_reader_string(&latched_r));
-    state->flags = qa_int32(qa_save_reader_integer_min(&flags_r, 0));
+    state->name = registry_text_of(&name_r);
+    state->value = registry_text_of(&value_r);
+    state->reset_value = registry_text_of(&reset_r);
+    state->latched_value = qa_save_reader_is_null(&latched_r) ? NULL : registry_text_of(&latched_r);
+    state->flags = qa_save_reader_integer_min(&flags_r, 0); /* TS keeps the safe integer */
     state->modified = qa_save_reader_boolean(&modified_r);
     state->modification_count = qa_save_reader_integer_min(&count_r, 0);
     state->numeric_value = qa_save_reader_number(&numeric_r);
@@ -2079,17 +2142,21 @@ static prepared_restore *prepare_registry_restore(qa_cvar_registry *r,
     for (size_t i = 0; i < index; i++)
       if (prepared->indexes[i] != NULL && strcmp(prepared->indexes[i]->key, state->key) == 0)
         qa_save_reader_fail(&reader, "duplicate cvar");
-    prepared->indexes[index] = state;
     state_count++;
   }
   qa_save_reader_destroy(&variables);
   qa_save_reader order = save_field(&reader, "order");
   size_t order_count = qa_save_reader_list_count(&order);
   char **order_keys = order_count > 0 ? (char **)calloc(order_count, sizeof *order_keys) : NULL;
+  order_key_list order_list = {order_keys, order_count};
+  qa_cleanup order_node;
+  qa_cleanup_push(&order_node, order_keys_free, &order_list);
   size_t distinct = 0;
   for (size_t i = 0; i < order_count; i++) {
     qa_save_reader item = save_item(&order, i);
-    order_keys[i] = registry_key(r, qa_save_reader_string(&item));
+    char *name = registry_text_of(&item);
+    order_keys[i] = registry_key(r, name);
+    free(name);
     qa_save_reader_destroy(&item);
     bool seen = false;
     for (size_t j = 0; j < i; j++)
@@ -2109,11 +2176,11 @@ static prepared_restore *prepare_registry_restore(qa_cvar_registry *r,
     first = found->index;
   }
   prepared->first = first;
-  for (size_t i = 0; i < order_count; i++) free(order_keys[i]);
-  free(order_keys);
+  qa_cleanup_pop(&order_node);
+  order_keys_free(&order_list);
   qa_save_reader_destroy(&order);
   qa_save_reader changed = save_field(&reader, "changedFlags");
-  prepared->changed_flags = qa_int32(qa_save_reader_integer_min(&changed, 0));
+  prepared->changed_flags = qa_save_reader_integer_min(&changed, 0);
   qa_save_reader_destroy(&changed);
   qa_save_reader cheats = save_field(&reader, "cheatsEnabled");
   prepared->cheats_enabled = qa_save_reader_boolean(&cheats);
@@ -2128,10 +2195,10 @@ static prepared_restore *prepare_registry_restore(qa_cvar_registry *r,
   prepared->high_characters = qa_save_reader_boolean(&high);
   qa_save_reader_destroy(&high);
   qa_save_reader client_info = save_field(&reader, "clientInfo");
-  prepared->client_info = dup_text(qa_save_reader_string(&client_info));
+  prepared->client_info = registry_text_of(&client_info);
   qa_save_reader_destroy(&client_info);
   qa_save_reader server_info = save_field(&reader, "serverInfo");
-  prepared->server_info = dup_text(qa_save_reader_string(&server_info));
+  prepared->server_info = registry_text_of(&server_info);
   qa_save_reader_destroy(&server_info);
   qa_save_reader dirty = save_field(&reader, "userinfoDirty");
   prepared->userinfo_dirty = qa_save_reader_boolean(&dirty);
@@ -2141,27 +2208,43 @@ static prepared_restore *prepare_registry_restore(qa_cvar_registry *r,
   prepared->console_variables =
       console_count > 0 ? (char **)calloc(console_count, sizeof(char *)) : NULL;
   prepared->console_count = console_count;
+  /* TS reads the whole list, then checks it for duplicates. */
   for (size_t i = 0; i < console_count; i++) {
     qa_save_reader item = save_item(&console, i);
-    prepared->console_variables[i] = dup_text(qa_save_reader_string(&item));
+    prepared->console_variables[i] = registry_text_of(&item);
     qa_save_reader_destroy(&item);
+  }
+  for (size_t i = 0; i < console_count; i++)
     for (size_t j = 0; j < i; j++)
       if (strcmp(prepared->console_variables[j], prepared->console_variables[i]) == 0)
         qa_save_reader_fail(&reader, "duplicate console variable");
-  }
   qa_save_reader_destroy(&console);
   qa_save_reader handles = save_field(&reader, "aliasHandles");
   if (!qa_save_reader_is_undefined(&handles)) {
     size_t handle_count = qa_save_reader_list_count(&handles);
     prepared->alias_handles =
         handle_count > 0 ? (alias_handle *)calloc(handle_count, sizeof(alias_handle)) : NULL;
+    /* TS reads every entry (handle, then name) before it validates any. */
+    double *handle_values = handle_count > 0 ? (double *)calloc(handle_count, sizeof *handle_values) : NULL;
+    qa_cleanup handle_values_node;
+    qa_cleanup_push(&handle_values_node, free, handle_values);
     for (size_t i = 0; i < handle_count; i++) {
       qa_save_reader item = save_item(&handles, i);
       qa_save_reader handle_r = save_field(&item, "handle");
       qa_save_reader name_r = save_field(&item, "name");
-      double handle = qa_save_reader_integer_min(&handle_r, 0);
-      const char *handle_name = qa_save_reader_string(&name_r);
+      handle_values[i] = qa_save_reader_integer_min(&handle_r, 0);
+      prepared->alias_handles[i].name = registry_text_of(&name_r);
+      prepared->alias_handle_count++;
+      qa_save_reader_destroy(&handle_r);
+      qa_save_reader_destroy(&name_r);
+      qa_save_reader_destroy(&item);
+    }
+    for (size_t i = 0; i < handle_count; i++) {
+      double handle = handle_values[i];
+      const char *handle_name = prepared->alias_handles[i].name;
       char *handle_key = registry_key(r, handle_name);
+      qa_cleanup handle_key_node;
+      qa_cleanup_push(&handle_key_node, free, handle_key);
       alias_entry *alias = find_alias_in(aliases, alias_count, handle_key);
       bool duplicate = false;
       for (size_t j = 0; j < i; j++)
@@ -2179,13 +2262,11 @@ static prepared_restore *prepare_registry_restore(qa_cvar_registry *r,
           !target_known || !target_present)
         qa_save_reader_fail(&reader, "invalid cvar alias handle");
       prepared->alias_handles[i].handle = (int64_t)handle;
-      prepared->alias_handles[i].name = dup_text(handle_name);
-      prepared->alias_handle_count++;
+      qa_cleanup_pop(&handle_key_node);
       free(handle_key);
-      qa_save_reader_destroy(&handle_r);
-      qa_save_reader_destroy(&name_r);
-      qa_save_reader_destroy(&item);
     }
+    qa_cleanup_pop(&handle_values_node);
+    free(handle_values);
   }
   qa_save_reader_destroy(&handles);
   for (size_t i = 0; i < r->binding_count; i++) {
@@ -2201,11 +2282,15 @@ static prepared_restore *prepare_registry_restore(qa_cvar_registry *r,
     for (size_t t = 0; t < text_count; t++) {
       char *error = binding->binding.validate != NULL
           ? binding->binding.validate(binding->binding.ctx, texts[t]) : NULL;
-      if (error != NULL)
+      if (error != NULL) {
+        qa_cleanup error_node;
+        qa_cleanup_push(&error_node, free, error);
         qa_save_reader_fail(&reader, "%s: %s", binding->key, error);
+      }
     }
   }
   qa_save_reader_destroy(&reader);
+  qa_cleanup_pop(&prepared_node);
   return prepared;
 }
 static void apply_prepared(qa_cvar_registry *r, prepared_restore *prepared,
@@ -2356,8 +2441,11 @@ static void transfer_validate(void *ctx) {
     qa_error("Cvar owner changed during preparation");
   qa_save_value *candidate_state =
       qa_cvar_registry_capture_world_transfer_state(t->candidate);
+  qa_cleanup state_node;
+  qa_cleanup_push(&state_node, release_save_value, candidate_state);
   prepared_restore *prepared = prepare_registry_restore(
       owner, candidate_state, t->candidate->aliases, t->candidate->alias_count);
+  qa_cleanup_pop(&state_node);
   prepared_free(prepared);
   qa_save_value_free(candidate_state);
 }
@@ -2367,8 +2455,11 @@ static void transfer_publish(void *ctx) {
   transfer_validate(ctx);
   qa_save_value *candidate_state =
       qa_cvar_registry_capture_world_transfer_state(t->candidate);
+  qa_cleanup state_node;
+  qa_cleanup_push(&state_node, release_save_value, candidate_state);
   prepared_restore *prepared = prepare_registry_restore(
       owner, candidate_state, t->candidate->aliases, t->candidate->alias_count);
+  qa_cleanup_pop(&state_node);
   qa_save_value_free(candidate_state);
   size_t pending_count = t->candidate->effect_count;
   qa_cvar_effect *pending = pending_count > 0
@@ -2449,8 +2540,10 @@ static void transfer_destroy(void *ctx) {
 static qa_cvar_transfer *make_transfer(qa_cvar_registry *owner, qa_cvar_registry *candidate,
                                        bool owns_candidate) {
   if (candidate == owner || candidate->options.dialect != owner->options.dialect ||
-      !same_session(candidate->options.context, owner->options.context))
+      !same_session(candidate->options.context, owner->options.context)) {
+    if (owns_candidate) qa_cvar_registry_destroy(candidate);
     qa_error("Cvar transfer requires a separate owner in the same session and dialect");
+  }
   transfer_ctx *t = (transfer_ctx *)calloc(1, sizeof *t);
   if (t == NULL) return NULL;
   t->owner = owner;
@@ -2517,8 +2610,15 @@ static qa_cvar_transfer *make_transfer(qa_cvar_registry *owner, qa_cvar_registry
         owner->documents[i].documentation;
     candidate->document_count++;
   }
+  /* The candidate restore can raise (a value binding refuses the owner's value): the transfer
+   * state, the candidate it owns and the captured tree go with the raise. */
   qa_save_value *state = qa_cvar_registry_capture_world_transfer_state(owner);
+  qa_cleanup transfer_node, state_node;
+  qa_cleanup_push(&transfer_node, transfer_destroy, t);
+  qa_cleanup_push(&state_node, release_save_value, state);
   qa_cvar_registry_restore_save_state(candidate, state);
+  qa_cleanup_pop(&state_node);
+  qa_cleanup_pop(&transfer_node);
   qa_save_value_free(state);
   qa_cvar_transfer *transfer = (qa_cvar_transfer *)calloc(1, sizeof *transfer);
   if (transfer == NULL) { transfer_destroy(t); return NULL; }

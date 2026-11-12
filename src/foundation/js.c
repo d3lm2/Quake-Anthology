@@ -236,6 +236,62 @@ double qa_js_string_to_number(const char *text) {
   return decimal_of(start, length);
 }
 
+/* Parses "d.ddde[+-]x" into the digit run (no point) and the exponent. */
+static int split_scientific(const char *text, char *digits, int *count) {
+  int k = 0;
+  const char *cursor = text;
+  for (; *cursor != '\0' && *cursor != 'e'; cursor++)
+    if (*cursor != '.') digits[k++] = *cursor;
+  digits[k] = '\0';
+  *count = k;
+  return atoi(cursor + 1);
+}
+/* The value of the k-digit decimal `digits` x 10^(exponent - k + 1). */
+static double digits_value(const char *digits, int count, int exponent) {
+  char text[48];
+  snprintf(text, sizeof text, "%c.%se%d", digits[0], count > 1 ? digits + 1 : "0", exponent);
+  return strtod(text, NULL);
+}
+int qa_js_shortest_digits(double value, char *digits) {
+  double magnitude = fabs(value);
+  char text[40];
+  int count = 0, exponent = 0;
+  for (int precision = 0; precision < 17; precision++) {
+    snprintf(text, sizeof text, "%.*e", precision, magnitude);
+    exponent = split_scientific(text, digits, &count);
+    double read = strtod(text, NULL);
+    if (read == magnitude) break;
+    if (precision == 16) break; /* 17 digits always round-trip */
+    /* The nearest k-digit decimal missed; only its neighbour on the value's
+     * side can still lie inside the round-trip interval. */
+    char neighbour[24];
+    int neighbour_exponent = exponent;
+    memcpy(neighbour, digits, (size_t)count + 1);
+    if (read < magnitude) {
+      int i = count - 1;
+      while (i >= 0 && neighbour[i] == '9') neighbour[i--] = '0';
+      if (i >= 0) neighbour[i]++;
+      else { neighbour[0] = '1'; neighbour_exponent++; } /* 9.99 -> 1.00 x 10 */
+    } else {
+      int i = count - 1;
+      while (i >= 0 && neighbour[i] == '0') neighbour[i--] = '9';
+      if (i >= 0) neighbour[i]--;
+      if (neighbour[0] == '0') { /* 1.00 -> 9.99 / 10 */
+        memset(neighbour, '9', (size_t)count);
+        neighbour_exponent--;
+      }
+    }
+    if (digits_value(neighbour, count, neighbour_exponent) == magnitude) {
+      memcpy(digits, neighbour, (size_t)count + 1);
+      exponent = neighbour_exponent;
+      break;
+    }
+  }
+  while (count > 1 && digits[count - 1] == '0') count--;
+  digits[count] = '\0';
+  return exponent;
+}
+
 size_t qa_js_to_fixed(double value, int digits, char *buffer, size_t capacity) {
   if (digits < 0 || digits > 100) qa_range_error("toFixed() argument must be between 0 and 100");
   char text[1200];
@@ -245,25 +301,9 @@ size_t qa_js_to_fixed(double value, int digits, char *buffer, size_t capacity) {
     else if (isinf(value)) snprintf(text, sizeof text, value < 0 ? "-Infinity" : "Infinity");
     else {
       /* Shortest round-trip digits in exponent form, as Number::toString. */
-      int precision = 1;
-      for (; precision <= 17; precision++) {
-        snprintf(text, sizeof text, "%.*e", precision - 1, value);
-        if (strtod(text, NULL) == value) break;
-      }
-      char mantissa[40];
-      int exponent = 0;
-      char *e = strchr(text, 'e');
-      exponent = atoi(e + 1);
-      *e = '\0';
-      size_t m = 0;
-      for (const char *p = text; *p != '\0'; p++) {
-        if (*p != '.') mantissa[m++] = *p;
-      }
-      mantissa[m] = '\0';
-      /* Trim trailing zeros of the significand. */
-      while (m > 1 && mantissa[m - 1] == '0' && mantissa[m - 2] != '-') mantissa[--m] = '\0';
-      const char *sign = mantissa[0] == '-' ? "-" : "";
-      const char *significand = mantissa[0] == '-' ? mantissa + 1 : mantissa;
+      char significand[24];
+      int exponent = qa_js_shortest_digits(value, significand);
+      const char *sign = value < 0 ? "-" : "";
       if (strlen(significand) == 1) snprintf(text, sizeof text, "%s%se+%d", sign, significand, exponent);
       else snprintf(text, sizeof text, "%s%c.%se+%d", sign, significand[0], significand + 1, exponent);
     }

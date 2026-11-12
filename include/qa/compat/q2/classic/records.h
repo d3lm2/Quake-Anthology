@@ -33,6 +33,11 @@ qa_compat_q2_classic_edicts *qa_compat_q2_classic_edicts_create(
     qa_provider_id provider, void *bind_ctx, void (*bind)(void *ctx, qa_raw_entity_view record, qa_owned_actor actor),
     const qa_compat_q2_classic_actor_projection *projection);
 void qa_compat_q2_classic_edicts_destroy(qa_compat_q2_classic_edicts *e);
+/* TS `new ClassicQ2Edicts(...)` over the same exports (ClassicQ2GuestHost.rebindWorld): validates the export table
+ * again, takes the current services and empties the retained/retired client sets. Raises as the constructor does. */
+void qa_compat_q2_classic_edicts_rebind(qa_compat_q2_classic_edicts *e, qa_session_actor_registry *actors, qa_provider_id provider,
+                                        void *bind_ctx, void (*bind)(void *ctx, qa_raw_entity_view record, qa_owned_actor actor),
+                                        const qa_compat_q2_classic_actor_projection *projection);
 void qa_compat_q2_classic_edicts_retire_input_client(qa_compat_q2_classic_edicts *e, double slot);
 void qa_compat_q2_classic_edicts_finish_input_retirement(qa_compat_q2_classic_edicts *e, double slot);
 qa_compat_q2_classic_edict_descriptor qa_compat_q2_classic_edicts_descriptor(qa_compat_q2_classic_edicts *e);

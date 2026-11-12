@@ -6,6 +6,7 @@
 
 #include "qa/content/q2/base/monsters/boss_common.h"
 #include "qa/content/q2/base/monsters/makron.h"
+#include "qa/content/q2/foundation/checkpoint.h"
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/content/q2/foundation/monsters/ai.h"
 #include "qa/content/q2/foundation/monsters/gibs.h"
@@ -71,7 +72,8 @@ qa_actor_id qa_q2rm_toss_rerelease_makron(qa_q2m_context *context, qa_q2m_monste
   qa_q2_entity *entity = context->entity;
   qa_q2_game_services *game = context->game;
   qa_q2_entity *child = game->create(game->ctx, "monster_makron", NULL, 0);
-  child->target = entity->target;
+  /* A copy: Jorg's spawn fields own the text and Jorg is released while the Makron lives on. */
+  child->target = qa_q2_intern(entity->target ? entity->target : "");
   child->enemy = entity->enemy;
   child->has_enemy = entity->has_enemy;
   qa_q2_body_changes change;

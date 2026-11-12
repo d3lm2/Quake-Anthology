@@ -143,6 +143,10 @@ void qa_qvm_game_data_restore(qa_qvm_game_data *data, qa_qvm_game_data_state sta
 }
 
 static bool word_offset(qa_qvm_game_data *data, double word, int64_t *out) {
+  /* TS memory.address(word) -> pointer(word): a fraction, NaN or a value outside
+   * int32 (a restored descriptor can hold any number) is refused before any cast. */
+  if (!is_integer(word) || word < -2147483648.0 || word > 2147483647.0)
+    qa_range_error("QVM pointer must be a signed 32-bit word");
   return qa_qvm_game_memory_address(&data->memory, (int64_t)word, out);
 }
 

@@ -7,6 +7,7 @@
 #define QA_APP_BOOTSTRAP_SIMULATION_SAVE_H
 #include <stdbool.h>
 #include <stddef.h>
+#include "qa/app/bootstrap/simulation/native_q2_rerelease_save.h"
 #include "qa/content/q3/foundation/arsenal.h"
 #include "qa/contracts/execution.h"
 #include "qa/contracts/session.h"
@@ -26,6 +27,9 @@ const qa_guest_checkpoint *qa_app_sim_simulation_guest_checkpoint(qa_save_image 
 bool qa_app_sim_native_q2_original_save(qa_save_image image, const qa_module_identity *expected, qa_q2_classic_original_save *out);
 typedef struct qa_app_sim_rerelease_native_save_view { qa_save_value *value; qa_byte_view cvars; } qa_app_sim_rerelease_native_save_view;
 bool qa_app_sim_native_q2_rerelease_save(qa_save_image image, const qa_module_identity *expected, qa_app_sim_rerelease_native_save_view *out);
+/* TS nativeQ2RereleaseSave as the decoded save; release with qa_app_sim_q2_rerelease_native_save_free. */
+bool qa_app_sim_native_q2_rerelease_save_decoded(qa_save_image image, const qa_module_identity *expected,
+    qa_app_sim_q2_rerelease_native_save *out);
 typedef struct qa_app_sim_native_saved_client { double client_slot; const char *phase; const char *userinfo; } qa_app_sim_native_saved_client;
 /* Malloc'd; strings borrow the decoded tree kept in *keep_alive. */
 qa_app_sim_native_saved_client *qa_app_sim_native_q2_saved_clients(qa_save_image image, size_t *out_count, qa_save_value **keep_alive);

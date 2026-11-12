@@ -29,33 +29,98 @@ static char *dup_text(const char *text) {
 static char *dup_range(const char *text, size_t length) {
   char *out = (char *)malloc(length + 1);
   if (out != NULL) {
-    memcpy(out, text, length);
+    if (length > 0) memcpy(out, text, length); /* an empty field has no buffer */
     out[length] = '\0';
   }
   return out;
 }
-/* The TS field is an array of code points: cursor, scroll and
- * maximumLength count code points. The C buffer keeps UTF-8 bytes and
- * converts positions; a byte that does not start a valid sequence is
- * one code point, as the console buffer decodes it. */
+/* The TS field is an array of characters (code points) and its text a JS string. The C field holds that text
+ * as UTF-8 (always well formed: every entry point decodes its input), so a character above U+00FF stays in the
+ * field as TS keeps it; cursor, scroll and maximumLength count code points. The text becomes console text
+ * (one byte per character, core/commands/text.h) where TS hands it to a command (SeatConsole.submit). */
 static size_t cp_step(const char *text, size_t length, size_t at) {
-  const unsigned char *bytes = (const unsigned char *)text;
-  unsigned char first = bytes[at];
-  size_t extra = (first & 0xe0) == 0xc0 ? 1 : (first & 0xf0) == 0xe0 ? 2 : (first & 0xf8) == 0xf0 ? 3 : 0;
-  if (extra == 0 || at + extra >= length) return 1;
-  for (size_t i = 1; i <= extra; i++) {
-    if ((bytes[at + i] & 0xc0) != 0x80) return 1;
-  }
-  return extra + 1;
+  unsigned char lead = (unsigned char)text[at];
+  size_t step = lead < 0xc0 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+  return at + step <= length ? step : length - at;
 }
 
 static uint32_t cp_decode(const char *text, size_t length, size_t at, size_t *step) {
-  const unsigned char *bytes = (const unsigned char *)text;
+  const unsigned char *bytes = (const unsigned char *)text + at;
   *step = cp_step(text, length, at);
-  if (*step == 1) return bytes[at];
-  uint32_t value = bytes[at] & (*step == 2 ? 0x1fu : *step == 3 ? 0x0fu : 0x07u);
-  for (size_t i = 1; i < *step; i++) value = (value << 6) | (bytes[at + i] & 0x3fu);
-  return value;
+  switch (*step) {
+    case 2: return ((uint32_t)(bytes[0] & 0x1f) << 6) | (bytes[1] & 0x3f);
+    case 3: return ((uint32_t)(bytes[0] & 0x0f) << 12) | ((uint32_t)(bytes[1] & 0x3f) << 6) | (bytes[2] & 0x3f);
+    case 4:
+      return ((uint32_t)(bytes[0] & 0x07) << 18) | ((uint32_t)(bytes[1] & 0x3f) << 12) |
+             ((uint32_t)(bytes[2] & 0x3f) << 6) | (bytes[3] & 0x3f);
+    default: return bytes[0];
+  }
+}
+
+static size_t cp_encode(uint32_t cp, char *out) {
+  if (cp < 0x80) {
+    out[0] = (char)cp;
+    return 1;
+  }
+  if (cp < 0x800) {
+    out[0] = (char)(0xc0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3f));
+    return 2;
+  }
+  if (cp < 0x10000) {
+    out[0] = (char)(0xe0 | (cp >> 12));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    out[2] = (char)(0x80 | (cp & 0x3f));
+    return 3;
+  }
+  out[0] = (char)(0xf0 | (cp >> 18));
+  out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+  out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+  out[3] = (char)(0x80 | (cp & 0x3f));
+  return 4;
+}
+
+/* One code point of platform text, decoded as TextDecoder does (WHATWG UTF-8: an ill-formed sequence is one
+ * U+FFFD over its maximal subpart). */
+static size_t input_decode(const unsigned char *bytes, size_t length, size_t at, uint32_t *cp) {
+  unsigned char lead = bytes[at];
+  if (lead < 0x80) {
+    *cp = lead;
+    return 1;
+  }
+  size_t need = 0;
+  uint32_t value = 0;
+  unsigned char lower = 0x80, upper = 0xbf;
+  if (lead >= 0xc2 && lead <= 0xdf) {
+    need = 1;
+    value = lead & 0x1f;
+  } else if (lead >= 0xe0 && lead <= 0xef) {
+    need = 2;
+    value = lead & 0x0f;
+    if (lead == 0xe0) lower = 0xa0;
+    if (lead == 0xed) upper = 0x9f;
+  } else if (lead >= 0xf0 && lead <= 0xf4) {
+    need = 3;
+    value = lead & 0x07;
+    if (lead == 0xf0) lower = 0x90;
+    if (lead == 0xf4) upper = 0x8f;
+  } else {
+    *cp = 0xfffd;
+    return 1;
+  }
+  size_t used = 1;
+  for (size_t i = 0; i < need; i++) {
+    if (at + used >= length || bytes[at + used] < lower || bytes[at + used] > upper) {
+      *cp = 0xfffd;
+      return used;
+    }
+    value = (value << 6) | (bytes[at + used] & 0x3f);
+    used++;
+    lower = 0x80;
+    upper = 0xbf;
+  }
+  *cp = value;
+  return used;
 }
 
 static size_t cp_count(const char *text, size_t length) {
@@ -87,6 +152,33 @@ static bool folded_starts_with(const char *text, const char *prefix, size_t pref
     if (text[i] == '\0' || fold_byte(text[i]) != fold_byte(prefix[i])) return false;
   }
   return true;
+}
+
+/* A console-text name (one byte per character) starts with a UTF-8 field prefix, A-Z folded (foldCompletion). */
+static bool name_starts_with_field(const char *name, const char *prefix, size_t prefix_length) {
+  size_t n = 0;
+  for (size_t at = 0; at < prefix_length;) {
+    size_t step = 0;
+    uint32_t cp = cp_decode(prefix, prefix_length, at, &step);
+    at += step;
+    uint32_t c = (unsigned char)name[n];
+    if (c == 0) return false;
+    if (cp >= 'A' && cp <= 'Z') cp += 'a' - 'A';
+    if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    if (c != cp) return false;
+    n++;
+  }
+  return true;
+}
+/* Console text as UTF-8 (each byte is its code point). */
+static char *console_to_field(const char *text) {
+  size_t length = strlen(text);
+  char *out = (char *)malloc(length * 2 + 1);
+  if (out == NULL) return NULL;
+  size_t at = 0;
+  for (size_t i = 0; i < length; i++) at += cp_encode((unsigned char)text[i], out + at);
+  out[at] = '\0';
+  return out;
 }
 
 static bool field_grow(qa_console_field *field, size_t needed) {
@@ -155,11 +247,14 @@ void qa_console_field_set_text(qa_console_field *field, const char *text) {
   completion_clear(field);
   /* text.replace(/[\x00-\x1f\x7f]/g, "") as code points, sliced to maximumLength. */
   size_t text_length = strlen(text);
-  char *clean = (char *)malloc(text_length + 1);
+  char *clean = (char *)malloc(text_length * 3 + 1); /* U+FFFD for one byte at most */
   if (clean == NULL) return; /* OOM only */
   size_t clean_length = 0;
-  for (size_t i = 0; i < text_length; i++)
-    if (!((unsigned char)text[i] <= 0x1f || text[i] == '\x7f')) clean[clean_length++] = text[i];
+  for (size_t i = 0; i < text_length;) {
+    uint32_t cp = 0;
+    i += input_decode((const unsigned char *)text, text_length, i, &cp);
+    if (!(cp <= 0x1f || cp == 0x7f)) clean_length += cp_encode(cp, clean + clean_length);
+  }
   int64_t maximum = field->maximum_length > 0 ? field->maximum_length : 0;
   size_t keep = cp_offset(clean, clean_length, maximum);
   if (!field_grow(field, keep == 0 ? 1 : keep)) {
@@ -198,11 +293,12 @@ void qa_console_field_insert(qa_console_field *field, const char *text) {
   completion_clear(field);
   size_t text_length = strlen(text);
   for (size_t p = 0; p < text_length;) {
-    size_t step = cp_step(text, text_length, p);
-    const char *character = text + p;
-    p += step;
+    uint32_t cp = 0;
+    p += input_decode((const unsigned char *)text, text_length, p, &cp);
     /* character < " " compares the first UTF-16 unit. */
-    if (step == 1 && ((unsigned char)character[0] < ' ' || character[0] == '\x7f')) continue;
+    if (cp < ' ' || cp == 0x7f) continue;
+    char character[4];
+    size_t step = cp_encode(cp, character);
     int64_t count = field_count(field);
     if (field->overstrike && field->cursor >= 0 && field->cursor < count) {
       size_t from = cp_offset(field->characters, field->length, field->cursor);
@@ -286,11 +382,12 @@ bool qa_console_field_key(qa_console_field *field, int64_t code, bool control, b
       ((code == KEY_INSERT || code == KEY_KEYPAD_INSERT) && shift)) {
     const char *text = clipboard(clipboard_ctx);
     if (text != NULL) {
+      /* text.split(/[\r\n\0]/, 1)[0]; the platform's text is UTF-8. */
       size_t length = strcspn(text, "\r\n");
-      char *first = dup_range(text, length);
-      if (first != NULL) {
-        qa_console_field_insert(field, first);
-        free(first);
+      char *line = dup_range(text, length);
+      if (line != NULL) {
+        qa_console_field_insert(field, line);
+        free(line);
       }
     }
     return true;
@@ -316,14 +413,15 @@ bool qa_console_field_key(qa_console_field *field, int64_t code, bool control, b
   return navigation(field, code, false);
 }
 
-/* ^([\\/]?)([^\s]*)(.*)$ over a byte range. */
-static void parse_line(const char *text, size_t length, size_t *token_start,
+/* ^([\\/]?)([^\s]*)(.*)$ over a byte range: the field's UTF-8 text, or console text (one byte per character). */
+static void parse_line(const char *text, size_t length, bool utf8, size_t *token_start,
                        size_t *token_end) {
   size_t start = length > 0 && (text[0] == '/' || text[0] == '\\') ? 1 : 0;
   size_t end = start;
   while (end < length) {
-    size_t step = 0;
-    if (is_js_space(cp_decode(text, length, end, &step))) break;
+    size_t step = 1;
+    uint32_t cp = utf8 ? cp_decode(text, length, end, &step) : (unsigned char)text[end];
+    if (is_js_space(cp)) break;
     end += step;
   }
   *token_start = start;
@@ -348,7 +446,7 @@ void qa_console_field_complete(qa_console_field *field, const char *const *names
   if (fresh) {
     completion_clear(field);
     size_t token_start = 0, token_end = 0;
-    parse_line(field->characters == NULL ? "" : field->characters, field->length,
+    parse_line(field->characters == NULL ? "" : field->characters, field->length, true,
                &token_start, &token_end);
     /* tokenStart/tokenEnd and the cursor count code points. */
     const char *chars = field->characters == NULL ? "" : field->characters;
@@ -361,7 +459,7 @@ void qa_console_field_complete(qa_console_field *field, const char *const *names
     size_t count = 0, capacity = 0;
     for (size_t i = 0; i < name_count; i++) {
       const char *name = names[i];
-      if (!folded_starts_with(name, field->characters + token_start, prefix_length)) continue;
+      if (!name_starts_with_field(name, field->characters + token_start, prefix_length)) continue;
       char *folded = dup_text(name);
       if (folded == NULL) continue; /* OOM only */
       for (char *p = folded; *p != '\0'; p++) *p = fold_byte(*p);
@@ -416,10 +514,14 @@ void qa_console_field_complete(qa_console_field *field, const char *const *names
   int64_t total = (int64_t)field->completion_match_count;
   int64_t index = (field->completion_index + (reverse ? -1 : 1) + total) % total;
   const char *selected = field->completion_matches[index];
-  size_t text_length = 1 + strlen(selected) + strlen(field->completion_tail);
-  int64_t text_points = 1 + (int64_t)cp_count(selected, strlen(selected)) +
+  /* The names are console text: each byte is one character, and the field text holds it as UTF-8. */
+  char *selected_text = console_to_field(selected);
+  if (selected_text == NULL) return; /* OOM only */
+  size_t text_length = 1 + strlen(selected_text) + strlen(field->completion_tail);
+  int64_t text_points = 1 + (int64_t)strlen(selected) +
                         (int64_t)cp_count(field->completion_tail, strlen(field->completion_tail));
   if (text_points > field->maximum_length) {
+    free(selected_text);
     if (fresh) completion_clear(field); /* TS keeps the fresh cycle unassigned. */
     return;
   }
@@ -428,9 +530,11 @@ void qa_console_field_complete(qa_console_field *field, const char *const *names
   if (text == NULL || selected_copy == NULL) {
     free(text);
     free(selected_copy);
+    free(selected_text);
     return; /* OOM only */
   }
-  sprintf(text, "/%s%s", selected, field->completion_tail);
+  sprintf(text, "/%s%s", selected_text, field->completion_tail);
+  free(selected_text);
   /* setText clears the cycle in TS; steal it across the call. */
   char *tail = field->completion_tail;
   char **matches = field->completion_matches;
@@ -439,7 +543,7 @@ void qa_console_field_complete(qa_console_field *field, const char *const *names
   field->completion_matches = NULL;
   field->completion_match_count = 0;
   qa_console_field_set_text(field, text);
-  field->cursor = 1 + (int64_t)cp_count(selected_copy, strlen(selected_copy));
+  field->cursor = 1 + (int64_t)strlen(selected_copy);
   keep_visible(field);
   field->completion_text = text;
   field->completion_tail = tail;
@@ -457,7 +561,7 @@ bool qa_complete_command(const char *text, const char *const *names, size_t name
   memset(out, 0, sizeof *out);
   size_t length = strlen(text);
   size_t token_start = 0, token_end = 0;
-  parse_line(text, length, &token_start, &token_end);
+  parse_line(text, length, false, &token_start, &token_end);
   size_t prefix_length = token_end - token_start;
   if (prefix_length == 0) {
     out->text = dup_text(text);
@@ -501,8 +605,6 @@ bool qa_complete_command(const char *text, const char *const *names, size_t name
     while (at < common && fold_byte(first[at]) == fold_byte(matches[i][at])) at++;
     common = at;
   }
-  /* TS compares whole characters: never end inside a UTF-8 sequence. */
-  while (common > 0 && common < strlen(first) && ((unsigned char)first[common] & 0xc0) == 0x80) common--;
   size_t tail_length = length - token_end;
   const char *suffix = tail_length > 0 ? text + token_end : (count == 1 ? " " : "");
   size_t suffix_length = tail_length > 0 ? tail_length : strlen(suffix);

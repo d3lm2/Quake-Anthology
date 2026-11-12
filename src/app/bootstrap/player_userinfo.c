@@ -1,6 +1,5 @@
 /* Port of src/app/bootstrap/player-userinfo.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/player_userinfo.h"
-#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,9 +74,16 @@ void qa_app_register_player_userinfo(qa_cvar_registry *cvars, double index, cons
   }
   register_cvar(cvars, "spectator", "0", QA_CVAR_FLAG_USER_INFO);
   register_cvar(cvars, "password", "", QA_CVAR_FLAG_USER_INFO);
-  char skin[256];
-  snprintf(skin, sizeof skin, "%s/%s", model, is(model, "female") ? "athena" : is(model, "cyborg") ? "oni911" : "grunt");
+  const char *variant = is(model, "female") ? "athena" : is(model, "cyborg") ? "oni911" : "grunt";
+  size_t skin_size = strlen(model) + strlen(variant) + 2;
+  char *skin = malloc(skin_size);
+  if (skin == NULL) qa_range_error("Out of memory");
+  snprintf(skin, skin_size, "%s/%s", model, variant);
+  qa_cleanup skin_guard;
+  qa_cleanup_push(&skin_guard, free, skin);
   register_cvar(cvars, "skin", skin, flags);
+  qa_cleanup_pop(&skin_guard);
+  free(skin);
   register_cvar(cvars, "rate", "25000", flags);
   register_cvar(cvars, "msg", "1", flags);
   register_cvar(cvars, "hand", "0", flags);
@@ -150,11 +156,17 @@ void qa_app_apply_character_appearance(qa_cvar_registry *cvars, qa_app_character
     set_if_present(cvars, "bottomcolor", bottom_text);
   }
   if (options.character_skin == NULL) return;
-  /* TS trim(): JS whitespace; ASCII whitespace is the practical set. */
+  /* TS trim(): JS white space (UTF-8 code points, U+00A0, U+FEFF and the Zs set included). */
   const char *start = options.character_skin;
-  while (*start != '\0' && isspace((unsigned char)*start)) start++;
-  size_t len = strlen(start);
-  while (len > 0 && isspace((unsigned char)start[len - 1])) len--;
+  for (size_t space; (space = qa_js_white_space_length(start)) != 0;) start += space;
+  size_t len = 0;
+  for (size_t at = 0; start[at] != '\0';) {
+    size_t space = qa_js_white_space_length(start + at);
+    if (space != 0) { at += space; continue; }
+    at++;
+    while ((start[at] & 0xc0) == 0x80) at++; /* the rest of this code point */
+    len = at;
+  }
   if (len == 0) return;
   char *skin = malloc(len + 1);
   if (skin == NULL) qa_range_error("Out of memory");

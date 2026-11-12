@@ -7,14 +7,16 @@
  *    and ShadowCaster/ShadowMesh (TS owner: shadows.ts) are mirrored here
  *    with collision-proof names; async preloads are synchronous and the
  *    pending/WeakMap batch caches are dropped (values identical).
- *  - floodSkin (skin.ts), cameraFrustum/createViewProjector
- *    (view.ts), entityCastsShadow/shadowMaterialGeometry
- *    (shadow-geometry.ts) and shadowCaster/shadowMesh (shadows.ts)
- *    are mirrored locally in renderer.c.
+ *  - createViewProjector (view.ts), entityCastsShadow/
+ *    shadowMaterialGeometry (shadow-geometry.ts) and shadowCaster/
+ *    shadowMesh (shadows.ts) are mirrored locally in renderer.c.
  *  - The per-entity light cache keys on entity identity fields
  *    (resource id pointer + origin + skin); TS keys on the object.
- *  - Material contexts from world.materialContext stay with the renderer
- *    until it is destroyed: prepared batches point into them.
+ *  - A drawn group owns the world.materialContext its batches point into
+ *    and the lighting arrays they view (qa_scene_model_group.owned_storage).
+ *  - Q3 model shadows (TS modelShadowGroups): a prepare with
+ *    input.model_shadows 2 returns shadow-volume groups (is_shadow_volume),
+ *    3 returns projection-shadow draw groups for RF_SHADOW_PLANE entities.
  * GPL-2.0-or-later.
  */
 #ifndef QA_RENDER_SCENE_MODELS_RENDERER_H

@@ -44,6 +44,9 @@ typedef struct peer {
   double required_reliable;
   qa_app_unified_component_publisher *components;
   bool closing; double closing_since;
+  /* TS drop() deleted it from the peer Map after a failed farewell: lookups, counts and
+   * iteration no longer see it; the poll loop frees it. */
+  bool deleted;
   double created;
   qa_movement_budget budget;
   bool in_host_call; /* TS UnifiedHostFailure: the raise came from a host callback */
@@ -112,11 +115,11 @@ typedef struct flush_scope {
 static void flush_body(void *ctx) {
   flush_scope *scope = ctx;
   scope->packets = qa_unified_channel_flush(&scope->p->channel, scope->now, &scope->lengths, &scope->count);
-  if (scope->p->channel.failure) qa_range_error("%s", scope->p->channel.failure);
+  if (scope->p->channel.failure) qa_raise("Error", 0, 0, "%s", scope->p->channel.failure);
   qa_datagram_transport *transport = scope->n->options.transport;
   for (size_t i = 0; i < scope->count; i++)
     if (!transport->send(transport->ctx, &scope->p->address, scope->packets[i], scope->lengths[i]))
-      qa_range_error("Unified transport rejected an outgoing datagram");
+      qa_raise("Error", 0, 0, "Unified transport rejected an outgoing datagram");
 }
 /* NULL, or the message of the error TS flush() throws and its callers catch. */
 static const char *flush_peer(qa_app_unified_server_network *n, peer *p, double now) {
@@ -150,11 +153,35 @@ static void remove_peer(qa_app_unified_server_network *n, peer *p) {
 typedef struct farewell_scope {
   qa_app_unified_server_network *n; peer *p; const qa_app_unified_control *control; double now;
 } farewell_scope;
+/* TS hostCall(() => host.disconnect(player)): a failure leaves drop() as a UnifiedHostFailure. */
+typedef struct disconnect_scope { qa_app_unified_server_network *n; qa_app_unified_player player; } disconnect_scope;
+static void disconnect_body(void *ctx) {
+  disconnect_scope *scope = ctx;
+  scope->n->host.disconnect(scope->n->host.ctx, scope->player);
+}
+/* reason.slice(0, 1024): the bound counts UTF-16 units; a cut through a four-byte
+ * character leaves a lone surrogate, which the control encoder writes as U+FFFD. */
+static void slice_units(const char *text, size_t limit, char *out) {
+  size_t used = 0, n = 0;
+  for (size_t i = 0; text[i] != '\0' && used < limit;) {
+    /* A well-formed sequence is one character (two units for four bytes); a stray byte is one. */
+    unsigned char c = (unsigned char)text[i];
+    size_t step = c < 0x80 ? 1 : c >= 0xc2 && c < 0xe0 ? 2 : c >= 0xe0 && c < 0xf0 ? 3 : c >= 0xf0 && c < 0xf5 ? 4 : 1;
+    for (size_t k = 1; k < step; k++)
+      if (((unsigned char)text[i + k] & 0xc0) != 0x80) { step = 1; break; }
+    if (step == 4 && used + 2 > limit) { memcpy(out + n, "\xef\xbf\xbd", 3); n += 3; break; }
+    memcpy(out + n, text + i, step);
+    n += step;
+    used += step == 4 ? 2 : 1;
+    i += step;
+  }
+  out[n] = '\0';
+}
 static void farewell_body(void *ctx) {
   farewell_scope *scope = ctx;
   queue_control(scope->p, scope->control);
   const char *failure = flush_peer(scope->n, scope->p, scope->now);
-  if (failure) qa_range_error("%s", failure);
+  if (failure) qa_raise("Error", 0, 0, "%s", failure);
 }
 static void drop_peer(qa_app_unified_server_network *n, peer *p, const char *reason, double now) {
   if (p->closing) return;
@@ -171,7 +198,10 @@ static void drop_peer(qa_app_unified_server_network *n, peer *p, const char *rea
       else queued_command_clear(&n->commands[i]);
     }
     n->command_count = kept;
-    n->host.disconnect(n->host.ctx, player);
+    disconnect_scope scope = {n, player};
+    qa_caught_error caught;
+    if (!qa_try(disconnect_body, &scope, &caught))
+      qa_raise("UnifiedHostFailure", 0, 0, "Unified authoritative host callback failed");
   }
   char *key = qa_net_address_key(&p->address, true);
   if (!key) qa_range_error("out of memory");
@@ -184,21 +214,17 @@ static void drop_peer(qa_app_unified_server_network *n, peer *p, const char *rea
   free(key);
   n->options.print(n->options.print_ctx, text);
   free(text);
-  char trimmed[1025];
-  size_t length = strlen(reason);
-  if (length > 1024) length = 1024;
-  memcpy(trimmed, reason, length);
-  trimmed[length] = '\0';
+  char trimmed[1024 * 3 + 4];
+  slice_units(reason, 1024, trimmed);
   qa_app_unified_control control = {0};
   control.kind = QA_APP_UNIFIED_DISCONNECT;
   control.reason = trimmed;
-  /* TS catches a queue or flush failure, closes the channel, and deletes the peer. A
-   * closing time past the grace period has the poll loop delete it. */
+  /* TS catches a queue or flush failure, closes the channel, and deletes the peer. */
   farewell_scope scope = {n, p, &control, now};
   qa_caught_error caught;
   if (!qa_try(farewell_body, &scope, &caught)) {
     qa_unified_channel_close(&p->channel);
-    p->closing_since = now - 1001;
+    p->deleted = true;
   }
 }
 static void cleanup_control(void *arg) { qa_app_unified_control_free(arg); }
@@ -220,12 +246,12 @@ static void accept_decoded(qa_app_unified_server_network *n, peer *p,
   if (control->kind == QA_APP_UNIFIED_READY) {
     if (!control->composition_digest
         || strcmp(control->composition_digest, n->composition->digest) != 0)
-      qa_range_error("Client content composition differs from the server");
+      qa_raise("Error", 0, 0, "Client content composition differs from the server");
     if (p->ready) return;
     if (!p->has_player) {
       qa_app_unified_admission admission =
           n->host.admit(n->host.ctx, &p->address, control->userinfo);
-      if (!admission.accepted) qa_range_error("%s", admission.reason ? admission.reason : "rejected");
+      if (!admission.accepted) qa_raise("Error", 0, 0, "%s", admission.reason ? admission.reason : "rejected");
       p->player = admission.player;
       p->has_player = true;
     } else n->host.userinfo(n->host.ctx, p->player, control->userinfo);
@@ -273,17 +299,17 @@ static void accept_decoded(qa_app_unified_server_network *n, peer *p,
     p->ready = true;
     return;
   }
-  if (!p->has_player || !p->ready) qa_range_error("Client command arrived before world admission");
+  if (!p->has_player || !p->ready) qa_raise("Error", 0, 0, "Client command arrived before world admission");
   if (control->kind == QA_APP_UNIFIED_COMPONENT_COMMAND) {
-    if (!n->host.component_command) qa_range_error("No component command receiver");
+    if (!n->host.component_command) qa_raise("Error", 0, 0, "No component command receiver");
     if (!n->host.component_command(n->host.ctx, p->player, control->owner,
             control->generation, control->args, control->arg_count))
-      qa_range_error("Component command source or recipient is not admitted");
+      qa_raise("Error", 0, 0, "Component command source or recipient is not admitted");
   } else if (control->kind == QA_APP_UNIFIED_COMMAND)
     n->host.command(n->host.ctx, p->player, control->name, control->args, control->arg_count);
   else if (control->kind == QA_APP_UNIFIED_USERINFO)
     n->host.userinfo(n->host.ctx, p->player, control->value);
-  else qa_range_error("Client sent a server-only control message");
+  else qa_raise("Error", 0, 0, "Client sent a server-only control message");
 }
 static void accept_control(qa_app_unified_server_network *n, peer *p,
     const uint8_t *bytes, size_t length, double now) {
@@ -354,7 +380,7 @@ static void receive_body(void *ctx) {
   peer *p = scope->p;
   scope->deliveries = qa_unified_channel_receive(&p->channel, scope->event->payload,
       scope->event->length, scope->now, &scope->count);
-  if (p->channel.failure) qa_range_error("%s", p->channel.failure);
+  if (p->channel.failure) qa_raise("Error", 0, 0, "%s", p->channel.failure);
   for (size_t i = 0; i < scope->count; i++) {
     if (p->closing) break;
     qa_unified_delivery *message = &scope->deliveries[i];
@@ -442,7 +468,7 @@ static void cookie(const qa_app_unified_server_network *n, const qa_net_address 
 }
 static peer *find_peer(qa_app_unified_server_network *n, const char *token) {
   for (size_t i = 0; i < n->peer_count; i++)
-    if (strcmp(n->peers[i]->token, token) == 0) return n->peers[i];
+    if (!n->peers[i]->deleted && strcmp(n->peers[i]->token, token) == 0) return n->peers[i];
   return NULL;
 }
 const qa_actor_command *qa_app_unified_server_network_poll(
@@ -482,8 +508,9 @@ const qa_actor_command *qa_app_unified_server_network_poll(
       qa_caught_error caught;
       bool received = qa_try(receive_body, &scope, &caught);
       qa_unified_deliveries_destroy(scope.deliveries, scope.count);
-      if (!received) drop_peer(n, p, caught.message, now);
+      /* drop() can raise a host failure out of poll: release the datagram first. */
       qa_receive_event_destroy(&event);
+      if (!received) drop_peer(n, p, caught.message, now);
       continue;
     }
     qa_app_unified_handshake handshake;
@@ -514,18 +541,21 @@ const qa_actor_command *qa_app_unified_server_network_poll(
       if (existing && strcmp(existing->nonce, handshake.nonce) == 0
           && qa_net_same_address(&existing->address, &event.from, true)) {
         const char *failure = flush_peer(n, existing, now);
-        if (failure) drop_peer(n, existing, failure, now);
         qa_app_unified_handshake_free(&handshake);
         qa_receive_event_destroy(&event);
+        if (failure) drop_peer(n, existing, failure, now);
         continue;
       }
-      size_t same_source = 0;
-      for (size_t i = 0; i < n->peer_count; i++)
+      size_t same_source = 0, live = 0;
+      for (size_t i = 0; i < n->peer_count; i++) {
+        if (n->peers[i]->deleted) continue;
+        live++;
         if (qa_net_same_address(&n->peers[i]->address, &event.from, false)) same_source++;
+      }
       char current[33], previous[33];
       cookie(n, &event.from, handshake.nonce, now, 0, current);
       cookie(n, &event.from, handshake.nonce, now, 1, previous);
-      if ((double)n->peer_count >= n->host.max_clients + 8 || same_source >= MAX_PEERS_PER_ADDRESS
+      if ((double)live >= n->host.max_clients + 8 || same_source >= MAX_PEERS_PER_ADDRESS
           || (strcmp(handshake.token, current) != 0 && strcmp(handshake.token, previous) != 0)) {
         qa_app_unified_handshake_free(&handshake);
         qa_receive_event_destroy(&event);
@@ -562,8 +592,8 @@ const qa_actor_command *qa_app_unified_server_network_poll(
   }
   for (size_t i = 0; i < n->peer_count;) {
     peer *p = n->peers[i];
-    if (p->closing && (now - p->closing_since > 1000
-        || (double)qa_unified_channel_acknowledged_reliable_sequence(&p->channel) >= p->required_reliable)) {
+    if (p->deleted || (p->closing && (now - p->closing_since > 1000
+        || (double)qa_unified_channel_acknowledged_reliable_sequence(&p->channel) >= p->required_reliable))) {
       remove_peer(n, p);
       continue;
     }
@@ -672,7 +702,7 @@ const qa_actor_command *qa_app_unified_server_network_poll(
 void qa_app_unified_server_network_submit(qa_app_unified_server_network *network,
     const void *const *commands, size_t count, double now) {
   (void)network; (void)commands; (void)count; (void)now;
-  qa_range_error("Server input belongs to its authoritative simulation");
+  qa_raise("Error", 0, 0, "Server input belongs to its authoritative simulation");
 }
 typedef struct publish_scope {
   qa_app_unified_server_network *n; peer *p;
@@ -815,7 +845,7 @@ static void publish_body(void *ctx) {
   qa_cleanup_pop(&frame_guard);
   qa_app_unified_presentation_frame_free(&frame);
   const char *failure = flush_peer(n, p, scope->now);
-  if (failure) qa_range_error("%s", failure);
+  if (failure) qa_raise("Error", 0, 0, "%s", failure);
 }
 void qa_app_unified_server_network_publish(qa_app_unified_server_network *n,
     const void *output, const void *const *events, size_t count, double now) {
@@ -835,8 +865,8 @@ void qa_app_unified_server_network_publish(qa_app_unified_server_network *n,
 }
 void qa_app_unified_server_network_change_world(qa_app_unified_server_network *n,
     qa_app_unified_server_host host, qa_app_unified_composition *composition) {
-  if (n->ended) qa_range_error("Unified server is closed");
-  if (n->epoch == 4294967295.0) qa_range_error("Unified world sequence exhausted");
+  if (n->ended) qa_raise("Error", 0, 0, "Unified server is closed");
+  if (n->epoch == 4294967295.0) qa_raise("Error", 0, 0, "Unified world sequence exhausted");
   n->host = host;
   n->composition = composition;
   n->epoch++;
@@ -874,7 +904,7 @@ void qa_app_unified_server_network_close(qa_app_unified_server_network *n) {
   n->command_count = 0;
   close_step step = {n, NULL};
   if (!qa_try(close_transport_body, &step, &caught)) failures++;
-  if (failures > 0) qa_range_error("Unified server shutdown failed");
+  if (failures > 0) qa_raise("AggregateError", 0, 0, "Unified server shutdown failed");
 }
 static qa_app_network_phase net_phase(void *ctx) {
   return qa_app_unified_server_network_phase(ctx);

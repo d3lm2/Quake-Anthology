@@ -52,7 +52,7 @@ static double cvar_numeric(qa_q3_pres_client_hud *hud, qa_q3_pres_hud_cvar name)
 static bool enabled(qa_q3_pres_client_hud *hud, qa_q3_pres_hud_cvar name) { return cvar_integer(hud, name) != 0; }
 static qa_q3_pres_client_draw_tools *tools_of(qa_q3_pres_client_hud *hud) { return hud->host.icons->tools; }
 static qa_q3_base_source_player_state *snapshot_of(qa_q3_pres_client_hud *hud) {
-  if (!hud->state->snap) qa_range_error("CG_Draw2D requires a current snapshot");
+  if (!hud->state->snap) qa_raise("Error", 0, 0, "CG_Draw2D requires a current snapshot");
   return &hud->state->snap->player_state;
 }
 static qa_q3_pres_client_info *client_at(qa_q3_pres_client_hud *hud, double index) {
@@ -66,7 +66,7 @@ static qa_q3_pres_client_reward *reward_at(qa_q3_pres_client_hud *hud, double in
   return &hud->state->rewards[(size_t)index];
 }
 static void base_only(qa_q3_pres_client_hud *hud, const char *operation) {
-  if (hud->variant.kind != QA_Q3_BASE_PRODUCT_BASEQ3) qa_range_error("%s is excluded from the missionpack build", operation);
+  if (hud->variant.kind != QA_Q3_BASE_PRODUCT_BASEQ3) qa_raise("Error", 0, 0, "%s is excluded from the missionpack build", operation);
 }
 static void set_color(qa_q3_pres_client_hud *hud, const qa_vec4 *color) { qa_draw2d_set_color(&tools_of(hud)->draw, color); }
 static qa_rect make_rect(double x, double y, double width, double height) {
@@ -82,16 +82,16 @@ void qa_q3_pres_client_hud_init(qa_q3_pres_client_hud *hud, qa_q3_pres_client_ga
       host.corners->static_state != static_state || host.corners->icons != host.icons ||
       host.prediction->state != state || host.weapons->selection.state != state ||
       host.weapons->registry != host.weapon_registry)
-    qa_range_error("HUD services must share canonical cgame state, drawing and weapon media");
+    qa_raise("Error", 0, 0, "HUD services must share canonical cgame state, drawing and weapon media");
   if (variant.kind == QA_Q3_BASE_PRODUCT_BASEQ3 &&
       (variant.scoreboard->state != state || variant.scoreboard->host.icons != host.icons))
-    qa_range_error("HUD scoreboard must share canonical drawing and state");
+    qa_raise("Error", 0, 0, "HUD scoreboard must share canonical drawing and state");
   if (variant.kind == QA_Q3_BASE_PRODUCT_MISSIONPACK && variant.fonts->profile != QA_Q3_FONT_CGAME)
-    qa_range_error("Missionpack HUD requires cgame fonts");
+    qa_raise("Error", 0, 0, "Missionpack HUD requires cgame fonts");
   if (variant.kind == QA_Q3_BASE_PRODUCT_MISSIONPACK &&
       (variant.menus->state != state || variant.menus->static_state != static_state ||
        variant.menus->host.icons != host.icons || variant.fonts != &variant.menus->fonts))
-    qa_range_error("Missionpack HUD must share its menu, font and drawing owners");
+    qa_raise("Error", 0, 0, "Missionpack HUD must share its menu, font and drawing owners");
   memset(hud, 0, sizeof *hud);
   hud->state = state;
   hud->static_state = static_state;
@@ -226,7 +226,7 @@ static void fixed_text(qa_q3_pres_client_hud *hud, double x, double y, const cha
 }
 static void proportional(qa_q3_pres_client_hud *hud, const char *text, double y, double scale, qa_vec4 color,
                          int32_t style, bool integer_width) {
-  if (hud->variant.kind != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("Proportional HUD text requires missionpack fonts");
+  if (hud->variant.kind != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "Proportional HUD text requires missionpack fonts");
   const qa_q3_font_set *fonts = qa_q3_pres_mission_hud_fonts(hud->variant.menus);
   double width = qa_q3_text_width(fonts, text, scale, 0);
   double half = integer_width ? trunc(width / 2) : f32(width / 2);
@@ -266,7 +266,7 @@ void qa_q3_pres_client_hud_draw_reward(qa_q3_pres_client_hud *hud) {
     qa_q3_pres_client_draw_tools_draw_pic(tools_of(hud), make_rect(296, 56, 44, 44), reward->shader);
     qa_q3_game_format_arg args[] = {qa_q3_game_format_number(reward->count)};
     char *text = format_alloc("%d", args, 1, 32);
-    if (!has_color) qa_range_error("CG_DrawReward: source null text color at zero reward time");
+    if (!has_color) qa_raise("Error", 0, 0, "CG_DrawReward: source null text color at zero reward time");
     fixed_text(hud, (640 - 8 * qa_q3_pres_draw_strlen(text)) / 2, 104, text, 8, 16, color, false);
     free(text);
   } else {
@@ -401,7 +401,7 @@ void qa_q3_pres_client_hud_draw_ammo_warning(qa_q3_pres_client_hud *hud) {
   qa_q3_pres_client_draw_tools_draw_big_string(tools_of(hud), 320 - qa_q3_pres_draw_strlen(text) * 8, 64, text, 1);
 }
 void qa_q3_pres_client_hud_draw_prox_warning(qa_q3_pres_client_hud *hud) {
-  if (hud->variant.kind != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("CG_DrawProxWarning is excluded from the baseq3 build");
+  if (hud->variant.kind != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "CG_DrawProxWarning is excluded from the baseq3 build");
   if (!(qa_int32(snapshot_of(hud)->e_flags) & 2)) {
     hud->prox_time = 0;
     return;
@@ -495,7 +495,7 @@ void qa_q3_pres_client_hud_draw_warmup(qa_q3_pres_client_hud *hud) {
   free(text);
 }
 void qa_q3_pres_client_hud_draw_timed_menus(qa_q3_pres_client_hud *hud) {
-  if (hud->variant.kind != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("CG_DrawTimedMenus is excluded from baseq3");
+  if (hud->variant.kind != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "CG_DrawTimedMenus is excluded from baseq3");
   qa_q3_pres_mission_hud_draw_timed_menus(hud->variant.menus);
 }
 bool qa_q3_pres_client_hud_draw_scoreboard(qa_q3_pres_client_hud *hud) {

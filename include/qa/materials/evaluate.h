@@ -1,8 +1,8 @@
 /*
  * Port of src/materials/evaluate.ts. Batches (vertices, indices, fog)
  * are malloc'd; free with qa_mat_draw_batches_destroy. evaluateTexCoords
- * and stageState (TS owner: material.ts, unported in this slice) are
- * mirrored locally in evaluate.c. GPL-2.0-or-later.
+ * and stageState (TS owner: material.ts) have local copies in
+ * evaluate.c. GPL-2.0-or-later.
  */
 #ifndef QA_MATERIALS_EVALUATE_H
 #define QA_MATERIALS_EVALUATE_H

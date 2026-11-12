@@ -123,7 +123,8 @@ bool qa_bot_get_air_goal_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state_bot
   if (surface.fraction > 0) {
     int64_t area = qa_bot_point_area_num_bots_a(ctx, surface.end);
     if (area != 0) {
-      goal->origin = qa_math_vec3(surface.end.x, surface.end.y, surface.end.z - 2);
+      /* TS goal is a BotGoalState: the origin is stored as float32. */
+      goal->origin = ai_fv(qa_math_vec3(surface.end.x, surface.end.y, surface.end.z - 2));
       goal->area = area;
       goal->mins = qa_math_vec3(-15, -15, -1);
       goal->maxs = qa_math_vec3(15, 15, 1);
@@ -149,7 +150,7 @@ bool qa_bot_go_for_air_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_
                                        flags, long_term_goal, range)) {
       qa_bot_goal nearby;
       if (!qa_bot_goal_get_top_goal(ai_goals(ctx), state->src->gs, &nearby))
-        qa_range_error("Selected nearby item has no goal stack entry");
+        qa_raise("Error", 0, 0, "Selected nearby item has no goal stack entry");
       if ((ai_host_point_contents(ctx, nearby.origin) & LIQUID) == 0)
         return true;
       qa_bot_goal_pop_goal(ai_goals(ctx), state->src->gs);
@@ -705,14 +706,14 @@ static bool patrol_goal(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_a *sta
     /* TS builds the route with string +=; the C string grows with the list. */
     size_t capacity = 1;
     for (const qa_bot_waypoint_bots_a *point = state->patrol_points; point != NULL; point = point->next)
-      capacity += strlen(point->name) + 4;
+      capacity += strlen(qa_bot_waypoint_name_bots_a(point)) + 4;
     char *route = malloc(capacity);
     if (route == NULL)
       qa_range_error("Out of memory building patrol route");
     size_t length = 0;
     route[0] = 0;
     for (const qa_bot_waypoint_bots_a *point = state->patrol_points; point != NULL; point = point->next)
-      length += (size_t)sprintf(route + length, "%s%s", point->name, point->next == NULL ? "" : " to ");
+      length += (size_t)sprintf(route + length, "%s%s", qa_bot_waypoint_name_bots_a(point), point->next == NULL ? "" : " to ");
     acknowledge(ctx, state, "patrol_start", route);
     free(route);
   }
@@ -1157,7 +1158,7 @@ bool qa_ai_node_seek_activate_entity_bots_a(qa_game_ai_context_bots_a *ctx, qa_b
   /* BotAIBlocked may push an activation; the source rereads the stack here. */
   activation = state->activate_stack;
   if (activation == NULL)
-    qa_range_error("Activation movement cleared the source activation stack");
+    qa_raise("Error", 0, 0, "Activation movement cleared the source activation stack");
   if (activation->src->shoot) {
     if ((result.flags & QA_BOT_MRF_MOVEMENTVIEW) == 0) {
       result.ideal_view_angles = qa_vector_to_angles(qa_sub3(qa_bot_v3(activation->src->target), eye));
@@ -1318,7 +1319,7 @@ static bool scripted_goal(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_a *s
     return false;
   }
   state->scripted_order.progress = QA_BOT_ORDER_IN_PROGRESS;
-  goal->origin = destination;
+  goal->origin = ai_fv(destination); /* BotGoalState float32 cell */
   goal->area = area;
   goal->mins = ai_fv(qa_math_vec3(-radius, -radius, -radius));
   goal->maxs = ai_fv(qa_math_vec3(radius, radius, radius));
@@ -1725,5 +1726,5 @@ bool qa_run_ai_node_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_a *
   case QA_AI_NODE_NONE:
     break;
   }
-  qa_range_error("BotDeathmatchAI must enter an AI node before dispatch");
+  qa_raise("Error", 0, 0, "BotDeathmatchAI must enter an AI node before dispatch");
 }

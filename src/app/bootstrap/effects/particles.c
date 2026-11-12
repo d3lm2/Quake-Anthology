@@ -132,7 +132,7 @@ void qa_app_source_particles_q1_entity(qa_app_source_particles *p, qa_vec3 origi
   }
   for (size_t index = 0; index < normal_count; index++) {
     if ((double)p->q1_count == p->capacity) return;
-    if (index >= p->angular_count) qa_range_error("Missing Q1 particle angular velocity");
+    if (index >= p->angular_count) qa_raise("Error", 0, 0, "Missing Q1 particle angular velocity");
     qa_vec3 velocity = p->angular[index];
     double yaw = fr(seconds * velocity.x), pitch = fr(seconds * velocity.y);
     double cp = fr(cos(pitch)), sp = fr(sin(pitch)), cy = fr(cos(yaw)), sy = fr(sin(yaw));
@@ -197,24 +197,25 @@ void qa_app_source_particles_q1_explosion(qa_app_source_particles *p, qa_vec3 or
     double die = seconds + (blob ? 1 + (double)(rand_i(p) & 8) * 0.05 : 5);
     double ramp = blob ? 0 : (double)(rand_i(p) & 3);
     double color = blob ? (i & 1 ? 66 : 150) + (double)(rand_i(p) % 6) : 111;
-    double ox = origin.x + (double)(rand_i(p) % 32 - 16), vx = (double)(rand_i(p) % 512 - 256);
-    double oy = origin.y + (double)(rand_i(p) % 32 - 16), vy = (double)(rand_i(p) % 512 - 256);
-    double oz = origin.z + (double)(rand_i(p) % 32 - 16), vz = (double)(rand_i(p) % 512 - 256);
+    double ox = origin.x + (double)(rand_i(p) % 32) - 16, vx = (double)(rand_i(p) % 512 - 256);
+    double oy = origin.y + (double)(rand_i(p) % 32) - 16, vy = (double)(rand_i(p) % 512 - 256);
+    double oz = origin.z + (double)(rand_i(p) % 32) - 16, vz = (double)(rand_i(p) % 512 - 256);
     const char *type = blob ? (i & 1 ? "blob" : "blob2") : (i & 1 ? "explode" : "explode2");
     if (!first(p, (qa_q1_particle_state){{ox, oy, oz}, {vx, vy, vz}, color, ramp, die, type})) return;
   }
 }
 void qa_app_source_particles_q1_color_explosion(qa_app_source_particles *p, qa_vec3 origin, double seconds,
                                                 double color_start, double color_length) {
-  if (color_start != trunc(color_start) || color_start < 0 || color_start > 255
-      || color_length != trunc(color_length) || color_length > 255)
+  /* Number.isInteger: NaN and both infinities fail. */
+  if (!isfinite(color_start) || color_start != trunc(color_start) || color_start < 0 || color_start > 255
+      || !isfinite(color_length) || color_length != trunc(color_length) || color_length > 255)
     qa_raise("Error", 0, 0, "Invalid Quake colored explosion palette range");
   /* A zero-length range divides by zero in the source; the explosion is dropped. */
   if (color_length < 1) return;
   for (int i = 0; i < 512 && (double)p->q1_count < p->capacity; i++) {
-    double ox = origin.x + (double)(rand_i(p) % 32 - 16), vx = (double)(rand_i(p) % 512 - 256);
-    double oy = origin.y + (double)(rand_i(p) % 32 - 16), vy = (double)(rand_i(p) % 512 - 256);
-    double oz = origin.z + (double)(rand_i(p) % 32 - 16), vz = (double)(rand_i(p) % 512 - 256);
+    double ox = origin.x + (double)(rand_i(p) % 32) - 16, vx = (double)(rand_i(p) % 512 - 256);
+    double oy = origin.y + (double)(rand_i(p) % 32) - 16, vy = (double)(rand_i(p) % 512 - 256);
+    double oz = origin.z + (double)(rand_i(p) % 32) - 16, vz = (double)(rand_i(p) % 512 - 256);
     double color = color_start + (double)(i % (int)color_length);
     first(p, (qa_q1_particle_state){{ox, oy, oz}, {vx, vy, vz}, color, 0, seconds + 0.3, "blob"});
   }
@@ -264,19 +265,19 @@ void qa_app_source_particles_q2_impact(qa_app_source_particles *p, qa_vec3 origi
 void qa_app_source_particles_q2_explosion(qa_app_source_particles *p, qa_vec3 origin, double seconds, bool bfg) {
   for (int i = 0; i < 256; i++) {
     double color = (bfg ? 0xd0 : 0xe0) + (double)(rand_i(p) & 7);
-    double ox = origin.x + (double)(rand_i(p) % 32 - 16), vx = (double)(rand_i(p) % 384 - 192);
-    double oy = origin.y + (double)(rand_i(p) % 32 - 16), vy = (double)(rand_i(p) % 384 - 192);
-    double oz = origin.z + (double)(rand_i(p) % 32 - 16), vz = (double)(rand_i(p) % 384 - 192);
+    double ox = origin.x + (double)(rand_i(p) % 32) - 16, vx = (double)(rand_i(p) % 384 - 192);
+    double oy = origin.y + (double)(rand_i(p) % 32) - 16, vy = (double)(rand_i(p) % 384 - 192);
+    double oz = origin.z + (double)(rand_i(p) % 32) - 16, vz = (double)(rand_i(p) % 384 - 192);
     if (!second(p, (qa_q2_particle_state){seconds * 1000, {ox, oy, oz}, {vx, vy, vz}, gravity_v, color, 1, -0.8 / (0.5 + unit(p) * 0.3)})) return;
   }
 }
 void qa_app_source_particles_q2_color_explosion(qa_app_source_particles *p, qa_vec3 origin, double seconds,
                                                 double color, double run) {
   for (int i = 0; i < 128 && (double)p->q2_count < p->capacity; i++) {
-    double shade = color + (double)(rand_i(p) % (int64_t)run);
-    double ox = origin.x + (double)(rand_i(p) % 32 - 16), vx = (double)(rand_i(p) % 256 - 128);
-    double oy = origin.y + (double)(rand_i(p) % 32 - 16), vy = (double)(rand_i(p) % 256 - 128);
-    double oz = origin.z + (double)(rand_i(p) % 32 - 16), vz = (double)(rand_i(p) % 256 - 128);
+    double shade = color + fmod((double)rand_i(p), run); /* JS %: a zero run is NaN */
+    double ox = origin.x + (double)(rand_i(p) % 32) - 16, vx = (double)(rand_i(p) % 256 - 128);
+    double oy = origin.y + (double)(rand_i(p) % 32) - 16, vy = (double)(rand_i(p) % 256 - 128);
+    double oz = origin.z + (double)(rand_i(p) % 32) - 16, vz = (double)(rand_i(p) % 256 - 128);
     second(p, (qa_q2_particle_state){seconds * 1000, {ox, oy, oz}, {vx, vy, vz}, gravity_v, shade, 1, -0.4 / (0.6 + unit(p) * 0.2)});
   }
 }
@@ -339,7 +340,7 @@ void qa_app_source_particles_q2_tracker_trail(qa_app_source_particles *p, qa_vec
   qa_vec3 delta = qa_sub3(end, start);
   double length = qa_length3(delta);
   qa_vec3 direction = qa_normalize3_or_zero(delta);
-  double horizontal = hypot(direction.x, direction.y);
+  double horizontal = qa_js_hypot2(direction.x, direction.y);
   qa_axis axis = qa_angles_to_axis((qa_vec3){-atan2(direction.z, horizontal) * 180 / M_PI,
     horizontal == 0 ? 0 : atan2(direction.y, direction.x) * 180 / M_PI, 0});
   for (double distance = 0; distance < length && (double)p->q2_count < p->capacity; distance += 3) {

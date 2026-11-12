@@ -185,7 +185,7 @@ static void body_model(presenter_t *p, qa_q3_pres_client_entity *entity, qa_q3_p
 void qa_q3_pres_packet_entity_presenter_init(presenter_t *presenter, qa_q3_pres_client_game_state *state,
     const qa_q3_pres_packet_entity_media *media, qa_q3_pres_packet_entity_imports imports) {
   if (state->product != media->product) {
-    qa_range_error("packet entity media product differs from cgame state");
+    qa_raise("Error", 0, 0, "packet entity media product differs from cgame state");
   }
   presenter->state = state;
   presenter->media = media;
@@ -205,7 +205,7 @@ void qa_q3_pres_packet_entity_presenter_calculate_lerp_positions(presenter_t *pr
     qa_q3_pres_client_entity *entity, bool smooth_clients) {
   qa_q3_pres_client_game_state *state = presenter->state;
   qa_q3_pres_retail_snapshot *snap = state->snap;
-  if (snap == NULL) qa_range_error("CG_CalcEntityLerpPositions: cg.snap == NULL");
+  if (snap == NULL) qa_raise("Error", 0, 0, "CG_CalcEntityLerpPositions: cg.snap == NULL");
   qa_q3_base_entity_state *current = &entity->current_state;
   if (!smooth_clients && current->number < 64) {
     current->pos.type = QA_Q3_BASE_TR_INTERPOLATE;
@@ -587,7 +587,7 @@ void qa_q3_pres_packet_entity_presenter_add_packet_entities(presenter_t *present
     qa_q3_pres_packet_entity_options options) {
   qa_q3_pres_client_game_state *state = presenter->state;
   qa_q3_pres_retail_snapshot *snap = state->snap;
-  if (snap == NULL) qa_range_error("CG_AddPacketEntities: cg.snap == NULL");
+  if (snap == NULL) qa_raise("Error", 0, 0, "CG_AddPacketEntities: cg.snap == NULL");
   int32_t delta = state->next_snap == NULL ? 0
       : to_int32((double)state->next_snap->server_time - (double)snap->server_time);
   state->frame_interpolation = delta == 0 ? 0

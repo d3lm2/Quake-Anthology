@@ -80,7 +80,7 @@ char *qa_app_q3_download_path(const char *path, const qa_app_q3_download_mounts 
   free(write_parent); free(base_parent);
   if (!same_family) {
     free(write_dir); free(base_dir);
-    qa_range_error("Q3 download roots must belong to the selected Q3 family");
+    qa_raise("Error", 0, 0, "Q3 download roots must belong to the selected Q3 family");
   }
   const char *separator = strchr(path, '/');
   if (separator == NULL) { free(write_dir); free(base_dir); return copy_text(path); }
@@ -186,7 +186,7 @@ static void downloads_close(qa_app_q3_client_downloads *d) {
 static void binding_assert_current(void *ctx) {
   qa_app_q3_client_downloads *d = ctx;
   d->bindings.assert_current(d->bindings.ctx);
-  if (!permitted(d)) qa_range_error("Q3 package download permission denied");
+  if (!permitted(d)) qa_raise("Error", 0, 0, "Q3 package download permission denied");
 }
 static void write_bytes(void *ctx, const uint8_t *bytes, size_t length) {
   qa_app_q3_client_downloads *d = ctx;
@@ -195,14 +195,14 @@ static void write_bytes(void *ctx, const uint8_t *bytes, size_t length) {
 static void write_close(void *ctx) { (void)ctx; }
 static bool binding_open_temporary(void *ctx, const char *path, qa_q3_download_write_file *out) {
   qa_app_q3_client_downloads *d = ctx;
-  if (!d->has_current || d->size <= 0) qa_range_error("Unexpected Q3 download temporary request");
+  if (!d->has_current || d->size <= 0) qa_raise("Error", 0, 0, "Unexpected Q3 download temporary request");
   size_t n = strlen(d->current.local) + 5;
   char *expected = malloc(n);
   if (!expected) return false;
   snprintf(expected, n, "%s.tmp", d->current.local);
   bool match = strcmp(path, expected) == 0;
   free(expected);
-  if (!match) qa_range_error("Unexpected Q3 download temporary request");
+  if (!match) qa_raise("Error", 0, 0, "Unexpected Q3 download temporary request");
   char *dest = destination(d, d->current.local);
   if (!dest) return false;
   qa_download_expectation expectation = {true, NULL, 0, d->size};
@@ -241,15 +241,15 @@ static void binding_publish_temporary(void *ctx, const char *temporary, const ch
       free(expected);
     }
   }
-  if (!match) qa_range_error("Q3 download publication does not match the current package");
+  if (!match) qa_raise("Error", 0, 0, "Q3 download publication does not match the current package");
   if (qa_download_sink_byte_length(&d->sink) != d->size)
-    qa_range_error("Q3 download ended before its advertised size");
+    qa_raise("Error", 0, 0, "Q3 download ended before its advertised size");
   inspect_ctx inspect = {d->current.checksum};
   qa_download_sink_inspect_staged(&d->sink, inspect_staged, &inspect);
   d->bindings.assert_current(d->bindings.ctx);
-  if (!permitted(d)) qa_range_error("Q3 package download permission denied");
+  if (!permitted(d)) qa_raise("Error", 0, 0, "Q3 package download permission denied");
   if (generation != d->generation || !d->has_sink)
-    qa_range_error("Q3 download was retired during validation");
+    qa_raise("Error", 0, 0, "Q3 download was retired during validation");
   char *digest = qa_download_sink_finish(&d->sink);
   free(digest);
   sink_cleanup(d);
@@ -274,7 +274,7 @@ static void binding_completed(void *ctx) {
   d->bindings.reload_packages(d->bindings.ctx);
   d->bindings.assert_current(d->bindings.ctx);
   if (generation != d->generation)
-    qa_range_error("Q3 downloads retired during filesystem refresh");
+    qa_raise("Error", 0, 0, "Q3 downloads retired during filesystem refresh");
   d->bindings.reliable(d->bindings.ctx, "donedl");
 }
 qa_app_q3_client_downloads *qa_app_q3_client_downloads_create(const char *root,
@@ -285,7 +285,7 @@ qa_app_q3_client_downloads *qa_app_q3_client_downloads_create(const char *root,
     if (write_root) dirname_in_place(write_root);
     bool match = resolved_root && write_root && strcmp(resolved_root, write_root) == 0;
     free(resolved_root); free(write_root);
-    if (!match) qa_range_error("Q3 download root differs from the selected mount family");
+    if (!match) qa_raise("Error", 0, 0, "Q3 download root differs from the selected mount family");
   }
   qa_app_q3_client_downloads *d = calloc(1, sizeof *d);
   if (!d) return NULL;
@@ -455,7 +455,7 @@ bool qa_app_q3_client_downloads_begin(qa_app_q3_client_downloads *downloads,
 double qa_app_q3_client_downloads_publish_size(qa_app_q3_client_downloads *downloads, double size) {
   downloads->bindings.assert_current(downloads->bindings.ctx);
   if (downloads->has_sink && size != downloads->size)
-    qa_range_error("Q3 download size changed during transfer");
+    qa_raise("Error", 0, 0, "Q3 download size changed during transfer");
   downloads->size = size;
   return (double)qa_q3_client_download_publish_size(downloads->source, (int64_t)size);
 }
@@ -468,7 +468,7 @@ typedef struct close_scope { qa_app_q3_client_downloads *d; } close_scope;
 static void close_body(void *ctx) { downloads_close(((close_scope *)ctx)->d); }
 void qa_app_q3_client_downloads_receive(qa_app_q3_client_downloads *downloads,
     const qa_q3_download_block *download) {
-  if (downloads->receiving) qa_range_error("Q3 download block processing is already active");
+  if (downloads->receiving) qa_raise("Error", 0, 0, "Q3 download block processing is already active");
   if (!permitted(downloads)) { qa_app_q3_client_downloads_cancel(downloads); return; }
   downloads->receiving = true;
   double generation = downloads->generation;

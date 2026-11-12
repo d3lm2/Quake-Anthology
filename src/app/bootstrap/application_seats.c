@@ -3,6 +3,7 @@
  * docs/application_layout.md. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "application_internal.h"
+#include "qa/foundation/js_case.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -391,7 +392,7 @@ static char *announcer_name(const char *netname) {
   size_t n = 0;
   for (size_t i = 0; i < length; i++) {
     if (netname[i] == '^' && netname[i + 1] >= '0' && netname[i + 1] <= '9') { i++; continue; }
-    out[n++] = (char)tolower((unsigned char)netname[i]);
+    out[n++] = (char)qa_js_latin1_lower((unsigned char)netname[i]); /* toLowerCase of the byte-string name */
   }
   out[n] = '\0';
   return out;
@@ -742,10 +743,17 @@ static char *dup_seat_text(const char *text) {
   return copy;
 }
 /* Keeps an already allocated record with the application's seat records (TS GC). */
+/* An object the application keeps whose release frees the object itself (a cvar registry, a record with its own
+ * free): qa_application_seats_free frees each record after its release, so the object rides in a holder record. */
+typedef struct kept_holder { void *value; void (*release)(void *value); } kept_holder;
+static void kept_holder_release(void *record) {
+  kept_holder *holder = record;
+  if (holder->release != NULL) holder->release(holder->value);
+}
 static void *seat_record_keep(qa_application *app, void *record, void (*release)(void *record)) {
-  grow((void **)&app->seat_records, &app->seat_record_capacity, app->seat_record_count + 1, sizeof *app->seat_records);
-  app->seat_records[app->seat_record_count].record = record;
-  app->seat_records[app->seat_record_count++].release = release;
+  kept_holder *holder = seat_record(app, sizeof *holder, kept_holder_release);
+  holder->value = record;
+  holder->release = release;
   return record;
 }
 
@@ -936,6 +944,8 @@ void qa_application_prepare_local_guest_seat(qa_application *app, qa_application
       world->seats = checked(realloc(world->seats, world->seat_capacity * sizeof *world->seats));
     }
     world->seat_count++;
+  } else {
+    free(world->seats[index].userinfo); /* Map.set replaces the seat's record */
   }
   world->seat_ids[index] = id;
   world->seats[index].state = state;
@@ -1011,6 +1021,7 @@ static qa_session_client *saved_resolve_bot(void *ctx, qa_client_id saved) {
     if (r->bot_slots[i] == (double)saved.slot) return r->bot_generations[i] == (double)saved.generation ? r->bot_clients[i] : NULL;
   return NULL;
 }
+static void saved_client_close(void *client) { qa_session_client_close(client); }
 typedef struct saved_clients_call {
   qa_application *app;
   saved_clients_record *record;
@@ -1095,8 +1106,12 @@ qa_application_saved_clients *qa_application_prepare_saved_clients(qa_applicatio
   c.record = r;
   qa_caught_error error;
   if (!qa_try(saved_clients_body, &c, &error)) {
+    /* catch: each added client closes; a close failure joins the error in an AggregateError. */
     size_t failures = 1;
-    for (size_t i = 0; i < c.added_count; i++) qa_session_client_close(r->added[i]);
+    for (size_t i = 0; i < c.added_count; i++) {
+      qa_caught_error failure;
+      if (!qa_try(saved_client_close, r->added[i], &failure)) failures++;
+    }
     free(humans);
     saved_clients_release(r);
     if (failures > 1) qa_raise("AggregateError", 0, (long long)failures, "Saved client preparation failed");

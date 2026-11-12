@@ -70,9 +70,9 @@ void qa_q2_base_player_state_init(qa_q2_base_player_state *state, double slot, d
   state->entered_at = entered_at;
   state->use_q2_weapons = true;
   state->use_q2_inventory = true;
-  state->userinfo[0] = '\0';
-  state->name[0] = '\0';
-  (void)snprintf(state->skin, sizeof state->skin, "male/grunt");
+  qa_q2_base_player_state_set_name(state, "");
+  qa_q2_base_player_state_set_userinfo(state, "");
+  qa_q2_base_player_state_set_skin(state, "male/grunt", 10);
   state->gender = "male";
   state->fov = 90;
   state->hand = "right";
@@ -93,4 +93,61 @@ void qa_q2_base_player_state_destroy(qa_q2_base_player_state *state) {
   state->flood_times = NULL;
   state->flood_time_count = 0;
   state->flood_time_cap = 0;
+  free(state->userinfo);
+  state->userinfo = NULL;
+  free(state->skin);
+  state->skin = NULL;
+  free(state->name);
+  state->name = NULL;
+}
+
+static char *copy_bytes(const char *text, size_t length) {
+  char *copy = malloc(length + 1);
+  if (!copy) qa_range_error("Out of memory");
+  memcpy(copy, text, length);
+  copy[length] = '\0';
+  return copy;
+}
+void qa_q2_base_player_state_set_userinfo(qa_q2_base_player_state *state, const char *text) {
+  char *copy = copy_bytes(text, strlen(text));
+  free(state->userinfo);
+  state->userinfo = copy;
+}
+void qa_q2_base_player_state_set_skin(qa_q2_base_player_state *state, const char *text, size_t length) {
+  char *copy = copy_bytes(text, length);
+  free(state->skin);
+  state->skin = copy;
+}
+void qa_q2_base_player_state_set_name(qa_q2_base_player_state *state, const char *text) {
+  char *copy = copy_bytes(text, strlen(text));
+  free(state->name);
+  state->name = copy;
+}
+
+char *qa_q2_text_slice_units(const char *text, size_t length, size_t units) {
+  const unsigned char *bytes = (const unsigned char *)text;
+  char *out = malloc(length + 1);
+  if (!out) qa_range_error("Out of memory");
+  size_t at = 0, used = 0, written = 0;
+  while (at < length && used < units) {
+    unsigned char lead = bytes[at];
+    size_t size = lead < 0x80 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 1;
+    if (size > length - at) size = length - at;
+    if (size == 4) {
+      if (used + 2 > units) {
+        uint32_t code = ((uint32_t)(lead & 0x07) << 18) | ((uint32_t)(bytes[at + 1] & 0x3F) << 12)
+            | ((uint32_t)(bytes[at + 2] & 0x3F) << 6) | (uint32_t)(bytes[at + 3] & 0x3F);
+        uint32_t high = 0xD800 + ((code - 0x10000) >> 10);
+        out[written++] = (char)(0xE0 | (high >> 12));
+        out[written++] = (char)(0x80 | ((high >> 6) & 0x3F));
+        out[written++] = (char)(0x80 | (high & 0x3F));
+        break;
+      }
+      used += 2;
+    } else used++;
+    memcpy(out + written, bytes + at, size);
+    written += size; at += size;
+  }
+  out[written] = '\0';
+  return out;
 }

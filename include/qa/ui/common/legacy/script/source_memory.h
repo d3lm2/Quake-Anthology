@@ -51,6 +51,9 @@ qa_save_value *qa_ui_source_record_capture_save_state(
     qa_ui_source_record *record,
     const qa_ui_script_memory_capture *capture);
 void qa_ui_source_record_destroy(qa_ui_source_record *record);
+/* Frees the C record of a failed restore without freeing allocations of its
+   memory owner (TS drops the object). */
+void qa_ui_source_record_discard(qa_ui_source_record *record);
 
 qa_ui_precomp_token *qa_ui_source_record_token(qa_ui_source_record *record);
 /* Malloc'd; NULL only on OOM. */

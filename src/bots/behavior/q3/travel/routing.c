@@ -124,7 +124,13 @@ qa_travel_reachability qa_travel_graph_describe(const qa_travel_graph *g,
   r.reach.end = edge->end;
   r.reach.travel_type = source_type(edge);
   double seconds = trunc(edge->travel_seconds * 100);
-  r.reach.travel_time = record != NULL ? record->travel_time : (int64_t)qa_js_max(1, seconds);
+  r.travel_time_number = record != NULL ? (double)record->travel_time : qa_js_max(1, seconds);
+  /* A C cast of NaN or a value past int64 is undefined; the integer field is only a view. */
+  double time = r.travel_time_number;
+  r.reach.travel_time = record != NULL ? record->travel_time
+                        : isnan(time)  ? 0
+                        : time >= 9223372036854775807.0 ? INT64_MAX
+                                                         : (int64_t)time;
   r.reach.padding = record != NULL ? record->padding : 0;
   r.graph_edge = *edge;
   return r;
@@ -200,7 +206,7 @@ qa_travel_selection qa_travel_graph_select_from(qa_travel_graph *g, const qa_bot
       continue;
     }
     /* TS (a + b) | 0, then a stable sort by time. */
-    int32_t time = qa_js_to_int32(tail.travel_time + (double)reach.reach.travel_time);
+    int32_t time = qa_js_to_int32(tail.travel_time + reach.travel_time_number);
     size_t at = count++;
     while (at > 0 && candidates[at - 1].time > time) {
       candidates[at] = candidates[at - 1];

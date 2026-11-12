@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "qa/contracts/common.h"
+#include "qa/core/commands/text.h"
 #include "qa/foundation/support.h"
 #include <math.h>
 #include "qa/network/common/js_number.h"
@@ -157,12 +158,21 @@ void qa_app_q3_server_state_clear_client(qa_app_q3_server_state *state, double s
   state->has_commands[(size_t)slot] = false;
 }
 
+/* Configstrings and userinfo are Q3 byte strings (one byte per TS character); the checkpoint JSON holds the UTF-8 of
+ * the TS string, so the text crosses that boundary here and in the restore below. */
 static qa_save_value *slot_string(double slot, const char *value) {
   qa_save_value *object = qa_save_value_object();
   if (!object) return NULL;
-  if (!qa_save_value_set(object, "slot", qa_save_value_number(slot))
-      || !qa_save_value_set(object, "value", qa_save_value_string(value))) { qa_save_value_free(object); return NULL; }
+  char *utf8 = qa_command_text_to_utf8(value);
+  bool ok = qa_save_value_set(object, "slot", qa_save_value_number(slot)) && qa_save_value_set(object, "value", qa_save_value_string(utf8));
+  free(utf8);
+  if (!ok) { qa_save_value_free(object); return NULL; }
   return object;
+}
+static char *byte_text(const qa_save_reader *reader, const char *utf8) {
+  char *bytes = NULL;
+  if (!qa_command_text_from_utf8(utf8, &bytes)) qa_save_reader_fail(reader, "source text requires byte characters");
+  return bytes;
 }
 qa_save_value *qa_app_q3_server_state_capture_save_state(qa_app_q3_server_state *state) {
   qa_save_value *root = qa_save_value_object();
@@ -213,10 +223,12 @@ static qa_app_q3_wire_user_command read_command(const qa_save_reader *reader) {
   qa_save_reader angles = field(reader, "angles");
   size_t count = qa_save_reader_list_count(&angles);
   double values[3] = {0, 0, 0};
-  for (size_t i = 0; i < count && i < 3; i++) {
+  /* reader.field("angles").list(value => value.integer()): every entry is read before the length check. */
+  for (size_t i = 0; i < count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(&angles, i, &item)) qa_range_error("Out of memory");
-    values[i] = qa_save_reader_integer(&item);
+    double angle = qa_save_reader_integer(&item);
+    if (i < 3) values[i] = angle;
     qa_save_reader_destroy(&item);
   }
   qa_save_reader_destroy(&angles);
@@ -235,6 +247,8 @@ void qa_app_q3_server_state_restore_save_state(qa_app_q3_server_state *state, co
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, value, "q3.server")) qa_range_error("Out of memory");
   typedef struct slot_value { double slot; const char *text; qa_app_q3_wire_user_command command; } slot_value;
+  /* readSlots: the whole list is read (slot, then value, per entry) before any slot is checked. After the checks each
+   * group holds at most its maximum, so the tables below are bounded. */
   slot_value config[1024]; size_t config_count = 0;
   slot_value info[64]; size_t info_count = 0;
   slot_value cmds[64]; size_t cmd_count = 0;
@@ -243,25 +257,32 @@ void qa_app_q3_server_state_restore_save_state(qa_app_q3_server_state *state, co
   for (int group = 0; group < 3; group++) {
     qa_save_reader list = field(&reader, names[group]);
     size_t count = qa_save_reader_list_count(&list);
-    bool seen[1024] = {0};
+    slot_value *parsed = calloc(count ? count : 1, sizeof *parsed);
+    if (parsed == NULL) qa_range_error("Out of memory");
+    qa_cleanup parsed_node; qa_cleanup_push(&parsed_node, free, parsed);
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry;
       if (!qa_save_reader_item(&list, i, &entry)) qa_range_error("Out of memory");
       qa_save_reader slot_reader = field(&entry, "slot");
-      double slot = qa_save_reader_integer_min(&slot_reader, 0);
+      parsed[i].slot = qa_save_reader_integer_min(&slot_reader, 0);
       qa_save_reader_destroy(&slot_reader);
-      if (slot >= maxima[group] || seen[(size_t)slot]) qa_save_reader_fail(&list, "invalid or duplicate source storage slot");
-      seen[(size_t)slot] = true;
       qa_save_reader value_reader = field(&entry, "value");
-      slot_value parsed; memset(&parsed, 0, sizeof parsed); parsed.slot = slot;
-      if (group == 2) parsed.command = read_command(&value_reader);
-      else parsed.text = qa_save_reader_string(&value_reader);
+      if (group == 2) parsed[i].command = read_command(&value_reader);
+      else { parsed[i].text = qa_save_reader_string(&value_reader); free(byte_text(&value_reader, parsed[i].text)); }
       qa_save_reader_destroy(&value_reader);
-      if (group == 0) config[config_count++] = parsed;
-      else if (group == 1) info[info_count++] = parsed;
-      else cmds[cmd_count++] = parsed;
       qa_save_reader_destroy(&entry);
     }
+    bool seen[1024] = {0};
+    for (size_t i = 0; i < count; i++) {
+      double slot = parsed[i].slot;
+      if (slot >= maxima[group] || seen[(size_t)slot]) qa_save_reader_fail(&list, "invalid or duplicate source storage slot");
+      seen[(size_t)slot] = true;
+      if (group == 0) config[config_count++] = parsed[i];
+      else if (group == 1) info[info_count++] = parsed[i];
+      else cmds[cmd_count++] = parsed[i];
+    }
+    qa_cleanup_pop(&parsed_node);
+    free(parsed);
     qa_save_reader_destroy(&list);
   }
   qa_save_reader cvars = field(&reader, "cvars");
@@ -270,7 +291,7 @@ void qa_app_q3_server_state_restore_save_state(qa_app_q3_server_state *state, co
   for (size_t i = 0; i < 1024; i++) { free(state->values[i]); state->values[i] = NULL; state->has_values[i] = false; }
   state->value_order_count = 0;
   for (size_t i = 0; i < config_count; i++) {
-    state->values[(size_t)config[i].slot] = dup_str(config[i].text);
+    state->values[(size_t)config[i].slot] = byte_text(&reader, config[i].text); /* checked when read */
     state->has_values[(size_t)config[i].slot] = true;
     order_add16(state->value_order, &state->value_order_count, (size_t)config[i].slot);
   }
@@ -278,7 +299,7 @@ void qa_app_q3_server_state_restore_save_state(qa_app_q3_server_state *state, co
   state->userinfo_order_count = 0;
   state->command_order_count = 0;
   for (size_t i = 0; i < info_count; i++) {
-    state->userinfo[(size_t)info[i].slot] = dup_str(info[i].text);
+    state->userinfo[(size_t)info[i].slot] = byte_text(&reader, info[i].text); /* checked when read */
     order_add8(state->userinfo_order, &state->userinfo_order_count, (size_t)info[i].slot);
   }
   for (size_t i = 0; i < cmd_count; i++) {

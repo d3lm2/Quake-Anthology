@@ -616,7 +616,8 @@ void qa_selected_weapon_timing_free(qa_provider_timing *values, size_t count) {
 void qa_admit_weapon_timing(qa_catalog_timing_list *timing,
                             qa_provider_timing weapon) {
   qa_provider_timing *existing = NULL;
-  for (size_t i = 0; i < timing->count; i++)
+  /* timing.find: the first entry of this provider. */
+  for (size_t i = 0; i < timing->count && existing == NULL; i++)
     if (strcmp(timing->values[i].provider, weapon.provider) == 0)
       existing = &timing->values[i];
   if (existing == NULL) {

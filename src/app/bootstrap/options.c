@@ -1,5 +1,6 @@
 /* Port of src/app/bootstrap/options.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/options.h"
+#include "qa/content/roots.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -20,6 +21,7 @@ static char *dup_text(const char *text) {
   return out;
 }
 static void set_owned(char **slot, const char *text) { free(*slot); *slot = dup_text(text); }
+static char *checked_dup(const char *text) { return dup_text(text); }
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 const char *const qa_app_application_help =
     "Quake\n\nUsage: bun run src/main.ts [options]\n\n"
@@ -51,6 +53,7 @@ const char *const qa_app_application_help =
     "  --skill 0|1|2|3            Quake I/II gameplay difficulty\n"
     "  --bot-skill 1|2|3|4|5      Quake III bot difficulty (default 2)\n"
     "  --dedicated                Run without a window or local seats\n"
+    "  -condebug                  Quake: append the console to qconsole.log in the game folder\n"
     "  --listen-unified PORT      Host the selected mixed-game recipe\n"
     "  --connect-unified ADDRESS  Join a mixed-game server\n"
     "  --listen PORT              Host the selected game's native source protocol\n"
@@ -79,7 +82,7 @@ void qa_app_options_destroy(qa_app_options *o) {
   for (size_t i = 0; i < o->startup_command_count; i++) free(o->startup_commands[i]);
   free(o->startup_commands);
   free(o->remote_content.directory);
-  free(o->server_profile_path); free(o->corpus_root); free(o->user_content_root);
+  free(o->server_profile_path); free(o->corpus_root); free(o->user_content_root); free(o->native_config_root);
   qa_nightdive_addon_roots_free(o->addon_content_roots, o->addon_content_root_count);
   free(o->product); free(o->map_product); free(o->map); free(o->quakec_program);
   free(o->q2_game_library); free(o->weapon_behavior_product); free(o->weapon_behavior_id);
@@ -164,61 +167,81 @@ static qa_q2_protocol_identity parse_q2_protocol(const char *value) {
     case 1015: case 1017: case 1018: case 1019: case 1020: case 1021: case 1022: case 1023: case 1024: case 1025: case 1026:
       out.kind = "q2-q2pro"; out.version = 36; out.revision = revision; return out;
     default:
-      qa_range_error("--q2-protocol requires 34, 35:1904/1905, 36:1015/1017..1026, 4038, 1038 or 2023");
+      qa_raise("Error", 0, 0, "--q2-protocol requires 34, 35:1904/1905, 36:1015/1017..1026, 4038, 1038 or 2023");
   }
 }
 /* Internal mirror of startup-commands.ts readStartupCommand /
- * startupRequestsWorld (other slice) on landed text helpers. */
+ * startupRequestsWorld (other slice) on landed text helpers. The arguments are UTF-8 (TS decodes them to strings);
+ * the command text is one byte per code unit, and sourceCommandText refuses a character above U+00FF. */
+static char *startup_source_text(const char *argument) {
+  char *bytes = NULL;
+  if (!qa_command_text_from_utf8(argument, &bytes)) qa_range_error("Command text requires source bytes");
+  return bytes;
+}
+static void startup_text_free(void *raw) { free(*(char **)raw); }
 static char *read_startup_command(const char *const *argv, size_t argc, size_t index, size_t *out_end) {
   const char *first = argv[index];
-  if (first[0] != '+' || first[1] == '\0') qa_range_error("Expected +command");
-  size_t capacity = strlen(first) + 1, end = index;
-  for (size_t i = index + 1; i < argc; i++) {
-    if (argv[i][0] == '+' || strncmp(argv[i], "--", 2) == 0) break;
-    capacity += strlen(argv[i]) + 4; end = i;
-  }
-  char *text = malloc(capacity + 1);
-  if (text == NULL) qa_range_error("Out of memory");
-  snprintf(text, capacity + 1, "%s", first + 1);
-  for (size_t i = index + 1; i <= end; i++) {
-    const char *value = argv[i];
-    char *checked = qa_source_command_text(value); free(checked);
+  if (first[0] != '+' || first[1] == '\0') qa_raise("Error", 0, 0, "Expected +command");
+  /* `rest` holds the operands, each ` "value"`; text = first.slice(1) + rest. */
+  char *rest = checked_dup(""), *text = NULL;
+  qa_cleanup rest_guard, text_guard;
+  qa_cleanup_push(&rest_guard, startup_text_free, &rest);
+  qa_cleanup_push(&text_guard, startup_text_free, &text);
+  size_t length = 0, end = index;
+  while (end + 1 < argc) {
+    const char *next = argv[end + 1];
+    if (next[0] == '+' || strncmp(next, "--", 2) == 0) break;
+    char *value = startup_source_text(next);
     if (strchr(value, '"') != NULL || strchr(value, '\r') != NULL || strchr(value, '\n') != NULL) {
-      free(text);
-      qa_range_error("Startup argument cannot contain quotes or line breaks; use a quoted +command batch or exec a cfg file.");
+      free(value);
+      qa_raise("Error", 0, 0, "Startup argument cannot contain quotes or line breaks; use a quoted +command batch or exec a cfg file.");
     }
-    strncat(text, " \"", capacity - strlen(text));
-    strncat(text, value, capacity - strlen(text));
-    strncat(text, "\"", capacity - strlen(text));
+    size_t value_length = strlen(value);
+    char *grown = realloc(rest, length + value_length + 4);
+    if (grown == NULL) { free(value); qa_range_error("Out of memory"); }
+    rest = grown;
+    rest[length++] = ' ';
+    rest[length++] = '"';
+    memcpy(rest + length, value, value_length);
+    length += value_length;
+    rest[length++] = '"';
+    rest[length] = '\0';
+    free(value);
+    end++;
   }
-  char *checked = qa_source_command_text(text); free(checked);
+  /* sourceCommandText(text): the operands are checked; the first argument's own characters remain. */
+  char *head = startup_source_text(first + 1);
+  size_t head_length = strlen(head);
+  text = malloc(head_length + length + 1);
+  if (text == NULL) { free(head); qa_range_error("Out of memory"); }
+  memcpy(text, head, head_length);
+  memcpy(text + head_length, rest, length + 1);
+  free(head);
   if (strchr(text, '\r') != NULL || strchr(text, '\n') != NULL
-      || qa_command_separator_offset(text, QA_COMMAND_DIALECT_Q3) < strlen(text)) {
-    free(text);
-    qa_range_error("Use a separate +command for each startup command.");
-  }
+      || qa_command_separator_offset(text, QA_COMMAND_DIALECT_Q3) < strlen(text))
+    qa_raise("Error", 0, 0, "Use a separate +command for each startup command.");
   qa_command_tokens tokens = {0};
   if (!qa_tokenize_command(text, QA_COMMAND_DIALECT_Q3, QA_COMMAND_TEXT_SOURCE, &tokens) || tokens.argc == 0) {
-    qa_command_tokens_destroy(&tokens); free(text);
-    qa_range_error("Expected +command");
+    qa_command_tokens_destroy(&tokens);
+    qa_raise("Error", 0, 0, "Expected +command");
   }
-  char *head = qa_ascii_fold(tokens.argv[0]);
-  if (is(head, "connect")) {
-    free(head); qa_command_tokens_destroy(&tokens); free(text);
-    qa_range_error("Ordered +connect startup is unsupported; use --connect-q1, --connect-qw, --connect-q2 or --connect-q3.");
-  }
-  if (is(head, "set") && tokens.argc > 1) {
-    char *second = qa_ascii_fold(tokens.argv[1]);
-    bool fs = is(second, "game") || is(second, "fs_game") || is(second, "basedir") || is(second, "cddir")
+  char *name = qa_ascii_fold(tokens.argv[0]);
+  bool connect = is(name, "connect"), filesystem = false;
+  if (is(name, "set")) {
+    char *second = qa_ascii_fold(tokens.argc > 1 ? tokens.argv[1] : "");
+    filesystem = is(second, "game") || is(second, "fs_game") || is(second, "basedir") || is(second, "cddir")
         || is(second, "fs_basepath") || is(second, "fs_homepath") || is(second, "fs_cdpath");
     free(second);
-    if (fs) {
-      free(head); qa_command_tokens_destroy(&tokens); free(text);
-      qa_range_error("Filesystem +set selection is unsupported; use --game with an installed catalog product and --content-root or --user-content-root.");
-    }
   }
-  free(head);
+  free(name);
   qa_command_tokens_destroy(&tokens);
+  if (connect)
+    qa_raise("Error", 0, 0, "Ordered +connect startup is unsupported; use --connect-q1, --connect-qw, --connect-q2 or --connect-q3.");
+  if (filesystem)
+    qa_raise("Error", 0, 0, "Filesystem +set selection is unsupported; use --game with an installed catalog product and --content-root or --user-content-root.");
+  qa_cleanup_pop(&text_guard);
+  qa_cleanup_pop(&rest_guard);
+  free(rest);
   *out_end = end;
   return text;
 }
@@ -256,6 +279,12 @@ static void push_mod(qa_app_options *o, const char *value) {
   if (!qa_read_mod_selection(value, &o->mods[o->mod_count])) qa_range_error("Out of memory");
   o->mod_count++;
 }
+typedef struct parse_owned { qa_app_options *o; char **bind, **remote, **content_root_path; } parse_owned;
+static void parse_owned_free(void *raw) {
+  parse_owned *owned = raw;
+  free(*owned->bind); free(*owned->remote); free(*owned->content_root_path);
+  qa_app_options_destroy(owned->o);
+}
 qa_app_application_command qa_app_parse_application_command(const char *const *argv, size_t argc,
     qa_content_root_search search, const qa_app_options_host *host) {
   qa_app_application_command command = {0};
@@ -287,8 +316,13 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
   char *bind = dup_text("0.0.0.0");
   bool has_listen = false; double listen_port = 0;
   char *remote = NULL;
+  /* C: a raise frees what the parse built (TS GC). */
+  parse_owned owned = {&o, &bind, &remote, &content_root_path};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, parse_owned_free, &owned);
   static const char *const non_launch[] = {"--content-root", "--steam", "--user-content-root",
-      "--renderer", "--render-worker", "--gamma", "--width", "--height", "--hidden", "--list-content"};
+      "--renderer", "--render-worker", "--gamma", "--width", "--height", "--hidden", "-condebug", "--condebug",
+      "--list-content"};
   for (size_t index = 0; index < argc; index++) {
     const char *flag = argv[index];
     if (flag[0] == '+') {
@@ -304,31 +338,34 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
       if (is(flag, non_launch[i])) launches = false;
     if (launches) explicit_launch = true;
     if (is(flag, "--help") || is(flag, "-h")) {
+      qa_cleanup_pop(&guard);
       free(bind); free(remote); free(content_root_path); qa_app_options_destroy(&o);
       command.kind = "help"; return command;
     }
     if (is(flag, "--version")) {
+      qa_cleanup_pop(&guard);
       free(bind); free(remote); free(content_root_path); qa_app_options_destroy(&o);
       command.kind = "version"; return command;
     }
     if (is(flag, "--lan-only")) { o.trusted_networks_only = true; continue; }
     if (is(flag, "--dedicated")) { o.dedicated = true; continue; }
+    if (is(flag, "-condebug") || is(flag, "--condebug")) { o.console_debug = true; continue; }
     if (is(flag, "--hidden")) { o.hidden = true; continue; }
     if (is(flag, "--allow-load-paths")) { o.allow_load_paths = true; continue; }
     if (is(flag, "--list-content")) { list = true; continue; }
     if (is(flag, "--ipx-native")) {
-      if (o.network_transport_kind[0] != '\0') qa_range_error("Choose one IPX transport");
+      if (o.network_transport_kind[0] != '\0') qa_raise("Error", 0, 0, "Choose one IPX transport");
       o.network_transport_kind = "ipx-native"; continue;
     }
     /* A flag swallowing the next flag as its value would silently disable what the user asked for. */
-    if (++index >= argc || strncmp(argv[index], "--", 2) == 0) qa_range_error("Missing value for %s", flag);
+    if (++index >= argc || strncmp(argv[index], "--", 2) == 0) qa_raise("Error", 0, 0, "Missing value for %s", flag);
     const char *value = argv[index];
     if (is(flag, "--ipx-dosbox")) {
-      if (o.network_transport_kind[0] != '\0') qa_range_error("Choose one IPX transport");
+      if (o.network_transport_kind[0] != '\0') qa_raise("Error", 0, 0, "Choose one IPX transport");
       bool blank = true;
       for (const char *p = value; *p != '\0'; p++) if (!isspace((unsigned char)*p)) blank = false;
       if (blank || strncmp(value, "--", 2) == 0)
-        qa_range_error("--ipx-dosbox requires a relay hostname or IPv4 address");
+        qa_raise("Error", 0, 0, "--ipx-dosbox requires a relay hostname or IPv4 address");
       o.network_transport_kind = "ipx-dosbox"; set_owned(&o.network_transport_relay, value);
     } else if (is(flag, "--preset")) {
       free(o.movement_product); o.movement_product = NULL;
@@ -338,7 +375,7 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
       } else if (is(value, "q1-q2")) {
         set_owned(&o.product, "q1-rerelease-id1"); set_owned(&o.map, "maps/e1m1.bsp");
         o.movement = QA_GAME_FAMILY_Q2; o.character = QA_GAME_FAMILY_Q2; set_owned(&o.character_model, "male");
-      } else qa_range_error("Unknown launch preset: %s", value);
+      } else qa_raise("Error", 0, 0, "Unknown launch preset: %s", value);
     } else if (is(flag, "--user-content-root")) { free(o.user_content_root); o.user_content_root = resolve_arg(host, value);
     } else if (is(flag, "--content-root")) { content_root_kind = 2; free(content_root_path); content_root_path = resolve_arg(host, value);
     } else if (is(flag, "--map-game")) set_owned(&o.map_product, value);
@@ -350,7 +387,7 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
       bool space = false;
       for (const char *p = value; *p != '\0'; p++) if (isspace((unsigned char)*p)) space = true;
       if (slash == NULL || slash == value || slash[1] == '\0' || space || strchr(slash + 1, ':') == NULL)
-        qa_range_error("Weapon behavior must be PRODUCT/DECLARED_ID");
+        qa_raise("Error", 0, 0, "Weapon behavior must be PRODUCT/DECLARED_ID");
       o.has_weapon_behavior = true;
       free(o.weapon_behavior_product);
       o.weapon_behavior_product = malloc((size_t)(slash - value) + 1);
@@ -362,13 +399,13 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
       char *path = qa_normalize_resource_path(value);
       if (path == NULL) qa_range_error("Out of memory");
       size_t plen = strlen(path);
-      if (!(plen >= 4 && strcmp(path + plen - 4, ".dll") == 0)) { free(path); qa_range_error("--q2-game requires a mounted .dll artifact"); }
+      if (!(plen >= 4 && strcmp(path + plen - 4, ".dll") == 0)) { free(path); qa_raise("Error", 0, 0, "--q2-game requires a mounted .dll artifact"); }
       free(o.q2_game_library); o.q2_game_library = path;
     } else if (is(flag, "--progs")) {
       char *path = qa_normalize_resource_path(value);
       if (path == NULL) qa_range_error("Out of memory");
       size_t plen = strlen(path);
-      if (!(plen >= 4 && strcmp(path + plen - 4, ".dat") == 0)) { free(path); qa_range_error("--progs requires a mounted .dat artifact"); }
+      if (!(plen >= 4 && strcmp(path + plen - 4, ".dat") == 0)) { free(path); qa_raise("Error", 0, 0, "--progs requires a mounted .dat artifact"); }
       free(o.quakec_program); o.quakec_program = path;
     } else if (is(flag, "--movement")) {
       free(o.movement_product); o.movement_product = NULL;
@@ -378,7 +415,7 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
         bool ok = value[0] != '\0' && isalnum((unsigned char)value[0]);
         for (const char *p = value; ok && *p != '\0'; p++)
           if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '_' || *p == '+' || *p == '-')) ok = false;
-        if (!ok) qa_range_error("Invalid movement product: %s", value);
+        if (!ok) qa_raise("Error", 0, 0, "Invalid movement product: %s", value);
         o.movement_product = dup_text(is(value, "qw") ? "q1-quakeworld" : value);
       }
     } else if (is(flag, "--character")) {
@@ -388,13 +425,13 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
       bool ok = value[0] != '\0';
       for (const char *p = value; ok && *p != '\0'; p++)
         if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '-')) ok = false;
-      if (!ok) qa_range_error("Invalid character model: %s", value);
+      if (!ok) qa_raise("Error", 0, 0, "Invalid character model: %s", value);
       set_owned(&o.character_model, value);
     } else if (is(flag, "--render-worker")) {
       if (!is(value, "0") && !is(value, "1")) qa_range_error("Render worker must be 0 or 1");
       o.has_render_worker = true; o.render_worker = is(value, "1");
     } else if (is(flag, "--renderer")) {
-      if (!is(value, "cpu") && !is(value, "gl")) qa_range_error("Unknown renderer: %s", value);
+      if (!is(value, "cpu") && !is(value, "gl")) qa_raise("Error", 0, 0, "Unknown renderer: %s", value);
       o.renderer = is(value, "cpu") ? "cpu" : "gl"; o.renderer_selection = "explicit";
     } else if (is(flag, "--width")) {
       o.width = integer_value(value, flag, 64, 16384);
@@ -412,12 +449,12 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
     else if (is(flag, "--frames")) { o.has_frame_limit = true; o.frame_limit = integer_value(value, flag, 1, 9007199254740991.0); }
     else if (is(flag, "--listen") || is(flag, "--listen-q2") || is(flag, "--listen-unified")) {
       const char *kind = is(flag, "--listen-unified") ? "unified-server" : is(flag, "--listen") ? "native-server" : "q2-server";
-      if (has_listen && !is(listen_kind, kind)) qa_range_error("Choose one server listener");
+      if (has_listen && !is(listen_kind, kind)) qa_raise("Error", 0, 0, "Choose one server listener");
       listen_kind = kind; has_listen = true; listen_port = integer_value(value, flag, 0, 65535);
     } else if (is(flag, "--q2-protocol")) { o.has_q2_protocol = true; o.q2_protocol = parse_q2_protocol(value); }
     else if (is(flag, "--q1-protocol")) { o.has_q1_protocol = true; o.q1_protocol = qa_default_netquake_profile(integer_value(value, flag, 15, 999)); }
     else if (is(flag, "--connect-qw") || is(flag, "--connect-q1") || is(flag, "--connect-q2") || is(flag, "--connect-q3") || is(flag, "--connect-unified")) {
-      if (remote != NULL) qa_range_error("Choose one remote connection");
+      if (remote != NULL) qa_raise("Error", 0, 0, "Choose one remote connection");
       remote_kind = is(flag, "--connect-unified") ? "unified-client" : is(flag, "--connect-qw") ? "qw-client"
           : is(flag, "--connect-q1") ? "q1-client" : is(flag, "--connect-q3") ? "q3-client" : "q2-client";
       remote = dup_text(value);
@@ -426,11 +463,11 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
       bool ok = value[0] != '\0';
       for (const char *p = value; ok && *p != '\0'; p++)
         if (!(isalnum((unsigned char)*p) && (unsigned char)*p < 0x80) && strchr("._:[]-", *p) == NULL) ok = false;
-      if (!ok) qa_range_error("Invalid bind address: %s", value);
+      if (!ok) qa_raise("Error", 0, 0, "Invalid bind address: %s", value);
       set_owned(&bind, value);
     } else if (is(flag, "--vm-game")) {
       if (!is(value, "0") && !is(value, "1") && !is(value, "2"))
-        qa_range_error("--vm-game requires 0 (native module), 1 (interpreted) or 2 (compiled)");
+        qa_raise("Error", 0, 0, "--vm-game requires 0 (native module), 1 (interpreted) or 2 (compiled)");
       o.has_vm_game = true; o.vm_game = value[0] - '0';
     }
     else if (is(flag, "--skill")) {
@@ -440,15 +477,15 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
     } else if (is(flag, "--server-profile")) { free(o.server_profile_path); o.server_profile_path = resolve_arg(host, value); }
     else if (is(flag, "--rules")) {
       if (!is(value, "standard") && !is(value, "ctf") && !is(value, "lmctf") && !is(value, "tag") && !is(value, "deathball") && !is(value, "horde"))
-        qa_range_error("Unknown match rules: %s", value);
+        qa_raise("Error", 0, 0, "Unknown match rules: %s", value);
       o.rules = is(value, "ctf") ? "ctf" : is(value, "lmctf") ? "lmctf" : is(value, "tag") ? "tag"
           : is(value, "deathball") ? "deathball" : is(value, "horde") ? "horde" : "standard";
     } else if (is(flag, "--mode")) {
       if (!is(value, "singleplayer") && !is(value, "coop") && !is(value, "deathmatch"))
-        qa_range_error("Unknown game mode: %s", value);
+        qa_raise("Error", 0, 0, "Unknown game mode: %s", value);
       o.mode = is(value, "coop") ? "coop" : is(value, "deathmatch") ? "deathmatch" : "singleplayer";
       o.explicit_mode = true;
-    } else qa_range_error("Unknown option: %s", flag);
+    } else qa_raise("Error", 0, 0, "Unknown option: %s", flag);
   }
   if (is(o.rules, "ctf") || is(o.rules, "lmctf")
       || (o.rules == NULL && (is(o.product, "q2-classic-ctf") || is(o.product, "q2-classic-lmctf"))))
@@ -458,45 +495,49 @@ qa_app_application_command qa_app_parse_application_command(const char *const *a
       : qa_resolve_default_content_root(search, content_root_kind == 1);
   if (o.corpus_root == NULL) qa_range_error("Out of memory");
   content_root_path = NULL;
+  if (o.user_content_root != NULL && qa_is_install_root(o.user_content_root, o.corpus_root))
+    qa_raise("Error", 0, 0, "--user-content-root %s is a game install; choose a separate writable folder", o.user_content_root);
   explicit_launch = explicit_launch || startup_requests_world(o.startup_commands, o.startup_command_count);
   if (list) {
+    qa_cleanup_pop(&guard);
     command.kind = "list-content";
     command.corpus_root = o.corpus_root; o.corpus_root = NULL;
     free(bind); free(remote); free(content_root_path); qa_app_options_destroy(&o);
     return command;
   }
-  if (has_listen && remote != NULL) qa_range_error("Choose a server listener or a remote connection");
+  if (has_listen && remote != NULL) qa_raise("Error", 0, 0, "Choose a server listener or a remote connection");
   if (has_listen) {
     o.network_kind = listen_kind; o.network_host = bind; bind = NULL; o.network_port = listen_port;
-  } else if (!is(bind, "0.0.0.0")) qa_range_error("--bind requires --listen, --listen-q2 or --listen-unified");
+  } else if (!is(bind, "0.0.0.0")) qa_raise("Error", 0, 0, "--bind requires --listen, --listen-q2 or --listen-unified");
   if (remote != NULL) {
-    if (o.dedicated) qa_range_error("A dedicated server cannot connect to a remote server");
-    if (o.has_bot_skill) qa_range_error("--bot-skill sets bot difficulty on the host and cannot be used when joining a server");
+    if (o.dedicated) qa_raise("Error", 0, 0, "A dedicated server cannot connect to a remote server");
+    if (o.has_bot_skill) qa_raise("Error", 0, 0, "--bot-skill sets bot difficulty on the host and cannot be used when joining a server");
     o.network_kind = remote_kind; o.network_remote = remote; remote = NULL;
   }
   if (o.network_transport_kind[0] != '\0' && (is(o.network_kind, "unified-server") || is(o.network_kind, "unified-client")))
-    qa_range_error("Unified networking uses UDP; IPX applies to native game protocols");
+    qa_raise("Error", 0, 0, "Unified networking uses UDP; IPX applies to native game protocols");
   if (o.network_transport_kind[0] != '\0' && is(o.network_kind, "offline"))
-    qa_range_error("IPX selection requires --listen, --listen-q2 or a native client connection");
+    qa_raise("Error", 0, 0, "IPX selection requires --listen, --listen-q2 or a native client connection");
   if (is(o.network_transport_kind, "ipx-native") && bind != NULL && !is(bind, "0.0.0.0"))
-    qa_range_error("--bind selects an IP interface and cannot bind native AF_IPX");
+    qa_raise("Error", 0, 0, "--bind selects an IP interface and cannot bind native AF_IPX");
   if (o.network_transport_kind[0] != '\0' && is(o.network_kind, "qw-client"))
-    qa_range_error("QuakeWorld uses UDP; IPX is not a QuakeWorld transport");
+    qa_raise("Error", 0, 0, "QuakeWorld uses UDP; IPX is not a QuakeWorld transport");
   if (o.has_q2_protocol && !is(o.network_kind, "q2-client") && !is(o.network_kind, "q2-server") && !is(o.network_kind, "native-server"))
-    qa_range_error("--q2-protocol requires --connect-q2, --listen-q2 or --listen");
+    qa_raise("Error", 0, 0, "--q2-protocol requires --connect-q2, --listen-q2 or --listen");
   if (o.has_q1_protocol && !is(o.network_kind, "native-server"))
-    qa_range_error("--q1-protocol requires --listen for a Quake I host");
+    qa_raise("Error", 0, 0, "--q1-protocol requires --listen for a Quake I host");
   if (o.has_q1_protocol && is(o.product, "q1-quakeworld"))
-    qa_range_error("--q1-protocol selects NetQuake; QuakeWorld uses native protocol 28");
+    qa_raise("Error", 0, 0, "--q1-protocol selects NetQuake; QuakeWorld uses native protocol 28");
   if (o.explicit_mode && is(o.mode, "singleplayer") && (o.seats > 1 || !is(o.network_kind, "offline")))
-    qa_range_error("--mode singleplayer conflicts with --seats above 1 and with network options");
+    qa_raise("Error", 0, 0, "--mode singleplayer conflicts with --seats above 1 and with network options");
   if (!is(o.network_kind, "offline") && is(o.mode, "singleplayer"))
     o.mode = (is(o.network_kind, "native-server") || is(o.network_kind, "unified-server"))
             && (strncmp(o.product, "q3-", 3) == 0 || is(o.product, "q1-quakeworld")) ? "deathmatch" : "coop";
   if (o.seats > 1 && is(o.mode, "singleplayer")) o.mode = "coop";
   if (is(o.rules, "ctf") || is(o.rules, "lmctf") || is(o.rules, "tag") || is(o.rules, "deathball")) o.mode = "deathmatch";
   if (menu && (o.dedicated || !is(o.network_kind, "offline")))
-    qa_range_error("--menu requires a local, non-dedicated application");
+    qa_raise("Error", 0, 0, "--menu requires a local, non-dedicated application");
+  qa_cleanup_pop(&guard);
   free(bind); free(remote); free(content_root_path);
   command.kind = menu || !explicit_launch ? "menu" : "run";
   command.options = o;

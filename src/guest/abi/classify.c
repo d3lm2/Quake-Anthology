@@ -6,8 +6,7 @@
 
 #include "qa/foundation/support.h"
 
-/* TS TypeError/Error have no RangeError channel distinction in C: abort. */
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
 
 const char *qa_eightbyte_class_name(qa_eightbyte_class kind) {
   switch (kind) {
@@ -166,6 +165,8 @@ static qa_abi_argument assign(builder *b, qa_abi_value_layout layout, bool is_hi
   return stack_assign(b, layout, false);
 }
 
+static void release_partial(void *plan) { qa_abi_call_plan_free(plan); }
+
 bool qa_plan_guest_call(qa_abi_call_plan *out, const qa_guest_call_signature *signature,
                         const qa_abi_value_layout *layouts, size_t layout_count) {
   memset(out, 0, sizeof *out);
@@ -206,12 +207,21 @@ bool qa_plan_guest_call(qa_abi_call_plan *out, const qa_guest_call_signature *si
 
   qa_abi_argument *arguments_ = (qa_abi_argument *)calloc(layout_count == 0 ? 1 : layout_count, sizeof(qa_abi_argument));
   if (arguments_ == NULL) return false;
+  /* The plan under construction; a raise (thiscall's TypeError, a register overflow) releases it. */
+  qa_abi_call_plan partial;
+  memset(&partial, 0, sizeof partial);
+  partial.arguments = arguments_; partial.argument_count = layout_count;
+  qa_cleanup partial_node;
+  qa_cleanup_push(&partial_node, release_partial, &partial);
   bool have_first = false;
   qa_abi_argument first_argument; memset(&first_argument, 0, sizeof first_argument);
-  if (this_before_hidden && layout_count > 0) { first_argument = assign(&b, layouts[0], false, 0); have_first = true; }
+  if (this_before_hidden && layout_count > 0) {
+    first_argument = assign(&b, layouts[0], false, 0); have_first = true;
+    arguments_[0] = first_argument; /* owned by the partial plan from here */
+  }
   qa_abi_argument hidden_pointer; memset(&hidden_pointer, 0, sizeof hidden_pointer);
   bool have_hidden = false;
-  if (hidden) { hidden_pointer = assign(&b, pointer_layout, true, -1); have_hidden = true; }
+  if (hidden) { hidden_pointer = assign(&b, pointer_layout, true, -1); have_hidden = true; partial.result.pointer = hidden_pointer; }
   for (size_t i = 0; i < layout_count; i++)
     arguments_[i] = (i == 0 && have_first) ? first_argument : assign(&b, layouts[i], false, (int)i);
 
@@ -230,7 +240,7 @@ bool qa_plan_guest_call(qa_abi_call_plan *out, const qa_guest_call_signature *si
     if (b.system64) {
       qa_eightbyte_class classes[2]; size_t count = 0;
       if (!qa_classify_system_v_aggregate(&signature->result, classes, &count))
-        qa_range_error("Memory result lacks hidden pointer");
+        qa_raise("Error", 0, 0, "Memory result lacks hidden pointer"); /* the partial plan is released */
       int integer_return = 0, vector_return = 0;
       for (size_t i = 0; i < count; i++) {
         int64_t offset = (int64_t)i * 8, bytes = size - offset < 8 ? size - offset : 8;
@@ -258,6 +268,7 @@ bool qa_plan_guest_call(qa_abi_call_plan *out, const qa_guest_call_signature *si
     if (result.locations == NULL) b.oom = true;
     else { memcpy(result.locations, locations, sizeof(qa_abi_location) * n); result.location_count = n; }
   }
+  qa_cleanup_pop(&partial_node);
   if (b.oom) {
     for (size_t i = 0; i < layout_count; i++) free(arguments_[i].locations);
     free(arguments_); free(result.locations); free(result.pointer.locations);

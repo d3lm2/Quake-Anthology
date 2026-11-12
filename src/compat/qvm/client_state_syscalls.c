@@ -74,7 +74,7 @@ bool qa_qvm_client_state_syscall(const qa_qvm_host_call *call,
       }
       double ping;
       if (!services.snapshot_ping(services.ctx, number, &ping))
-        qa_range_error("Retained snapshot has no source ping");
+        qa_raise("Error", 0, 0, "Retained snapshot has no source ping");
       qa_qvm_writable_view storage;
       qa_qvmx_view view = guest_view(call, pointer, (int64_t)qa_qvm_snapshot_bytes_for(profile), &storage);
       qa_qvm_write_snapshot(&memory, view, &snapshot, ping, profile);

@@ -20,8 +20,29 @@ static char *xstrdup(const char *text) {
   strcpy(copy, text);
   return copy;
 }
-static void type_error(const char *message) { qa_range_error("%s", message); }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+/* A host buffer held across guest reads/writes that can fault: freed by the raise. */
+typedef struct held { void *items[2]; qa_cleanup node; } held;
+static void held_release(void *arg) { held *h = arg; free(h->items[0]); free(h->items[1]); }
+static void hold(held *h, void *first, void *second) {
+  h->items[0] = first; h->items[1] = second;
+  qa_cleanup_push(&h->node, held_release, h);
+}
+static void release(held *h) { qa_cleanup_pop(&h->node); held_release(h); }
+/* TS integer(args, index) as a BigInt: sign and magnitude (uint64 kinds above 2^63 stay positive). */
+static uint64_t integer_magnitude(const qa_call_value *args, size_t count, size_t index, bool *negative) {
+  const uint64_t raw = qa_guest_integer_u64(args, count, index);
+  const qa_call_value_kind kind = args[index].kind;
+  *negative = (kind == QA_CALL_INT32 || kind == QA_CALL_INT64) && (int64_t)raw < 0;
+  return *negative ? ~raw + 1 : raw;
+}
+/* TS `BigInt(n) > integer(args, index)`. */
+static bool exceeds(size_t n, const qa_call_value *args, size_t count, size_t index) {
+  bool negative = false;
+  const uint64_t limit = integer_magnitude(args, count, index, &negative);
+  return negative || (uint64_t)n > limit;
+}
 static qa_guest_core_address off(const qa_mapped_guest_memory *m, qa_guest_core_address a, int64_t d) {
   return qa_memory_offset(m, a, d);
 }
@@ -63,6 +84,7 @@ enum {
 };
 static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *context,
                                 const qa_call_value *args, size_t count);
+static void free_state(void *resource) { libc_state *state = resource; free(state->name); free(state); }
 static void reg(libc_state *proto, int kind, const char *library, const char *name,
                 const char *const *versions, size_t version_count,
                 const qa_abi_storage *parameters, size_t parameter_count, bool result_is_void,
@@ -71,11 +93,24 @@ static void reg(libc_state *proto, int kind, const char *library, const char *na
   *state = *proto;
   state->kind = kind;
   state->name = xstrdup(name);
+  qa_system_v_own(state->host, state, free_state);
   qa_system_v_implementation impl = {state, libc_impl};
   qa_system_v_service(state->host, library, name, versions, version_count, parameters,
                       parameter_count, result_is_void, result, impl);
 }
 
+/* TS qsort swap(a, b): copy a, copy b, write a, write b. */
+static void qsort_swap(qa_mapped_guest_memory *m, qa_guest_core_address base, size_t size,
+                       size_t a, size_t b) {
+  uint8_t *first = xmalloc(size), *second = xmalloc(size);
+  held h;
+  hold(&h, first, second);
+  qa_memory_copy(m, off(m, base, (int64_t)(a * size)), first, size);
+  qa_memory_copy(m, off(m, base, (int64_t)(b * size)), second, size);
+  qa_memory_write(m, off(m, base, (int64_t)(a * size)), second, size);
+  qa_memory_write(m, off(m, base, (int64_t)(b * size)), first, size);
+  release(&h);
+}
 static char *read_str(libc_state *state, qa_guest_core_address address) {
   return qa_read_string(state->host->memory, state->host->memory_ext, address, 1048576);
 }
@@ -97,18 +132,21 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
     case L_MALLOC:
       return qa_call_pointer(true, qa_system_v_allocate(host, qa_guest_count(args, count, 0)));
     case L_CALLOC: {
-      int64_t a = qa_guest_integer(args, count, 0);
-      int64_t b = qa_guest_integer(args, count, 1);
-      /* TS BigInt product compared against 0x10000000. */
-      bool too_big = a > 0 && b > 0 && a > 0x10000000 / b;
-      if (a > 0 && b > 0 && !too_big && a * b > 0x10000000) too_big = true;
-      if (too_big) {
+      /* TS BigInt product compared against 0x10000000 (no 64-bit wrap). */
+      bool a_negative = false, b_negative = false;
+      const uint64_t a = integer_magnitude(args, count, 0, &a_negative);
+      const uint64_t b = integer_magnitude(args, count, 1, &b_negative);
+      const bool negative = a != 0 && b != 0 && a_negative != b_negative;
+      const bool too_big = a != 0 && b > 0x10000000u / a;
+      const uint64_t total = too_big ? 0 : a * b;
+      if (!negative && (too_big || total > 0x10000000u)) {
         qa_system_v_errno_set(host, 12);
         qa_guest_core_address none = {0};
         return qa_call_pointer(false, none);
       }
       /* A negative total reaches allocate() and RangeErrors there, as in TS. */
-      return qa_call_pointer(true, qa_system_v_allocate(host, (size_t)(a * b)));
+      if (negative) qa_range_error("System V guest allocation exceeds supported size");
+      return qa_call_pointer(true, qa_system_v_allocate(host, (size_t)total));
     }
     case L_FREE: {
       qa_guest_core_address address = {0};
@@ -142,8 +180,8 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       bool has_source = qa_guest_pointer_argument(args, count, 1, &source);
       size_t length = qa_guest_count(args, count, 2);
       bool checked = state->name[0] == '_' && state->name[1] == '_';
-      if (checked && (int64_t)length > qa_guest_integer(args, count, 3))
-        qa_range_error("%s detected guest buffer overflow", state->name);
+      if (checked && exceeds(length, args, count, 3))
+        qa_raise("Error", 0, 0, "%s detected guest buffer overflow", state->name);
       if (length != 0) {
         if (!has_destination || !has_source) type_error("Nonnull guest memory arguments required");
         qa_move_bytes(m, host->memory_ext, destination, source, length);
@@ -165,22 +203,26 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       size_t length = qa_guest_count(args, count, 2);
       if (length == 0) return qa_call_int32(0);
       uint8_t *a = xmalloc(length), *b = xmalloc(length);
+      held h;
+      hold(&h, a, b);
       qa_memory_copy(m, qa_guest_required_pointer(args, count, 0), a, length);
       qa_memory_copy(m, qa_guest_required_pointer(args, count, 1), b, length);
       int result = 0;
       for (size_t i = 0; i < length; i++)
         if (a[i] != b[i]) { result = (int)a[i] - (int)b[i]; break; }
-      free(a); free(b);
+      release(&h);
       return qa_call_int32(result);
     }
     case L_STRLEN:
       return size_value(host, qa_string_length(m, host->memory_ext,
                                                qa_guest_required_pointer(args, count, 0), 1048576));
     case L_STRCMP: {
-      char *a = read_str(state, qa_guest_required_pointer(args, count, 0));
-      char *b = read_str(state, qa_guest_required_pointer(args, count, 1));
-      int result = compare_strings(a, b);
-      free(a); free(b);
+      held h;
+      hold(&h, NULL, NULL);
+      h.items[0] = read_str(state, qa_guest_required_pointer(args, count, 0));
+      h.items[1] = read_str(state, qa_guest_required_pointer(args, count, 1));
+      int result = compare_strings(h.items[0], h.items[1]);
+      release(&h);
       return qa_call_int32(result);
     }
     case L_STRCPY: {
@@ -189,15 +231,17 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       bool end = strstr(state->name, "stpcpy") != NULL;
       qa_guest_core_address destination = qa_guest_required_pointer(args, count, 0);
       char *text = read_str(state, qa_guest_required_pointer(args, count, 1));
+      held h;
+      hold(&h, text, NULL);
       size_t prefix = concatenate ? qa_string_length(m, host->memory_ext, destination, 1048576) : 0;
-      if (checked && (int64_t)(prefix + strlen(text) + 1) > qa_guest_integer(args, count, 2))
-        qa_range_error("%s detected guest buffer overflow", state->name);
+      if (checked && exceeds(prefix + strlen(text) + 1, args, count, 2))
+        qa_raise("Error", 0, 0, "%s detected guest buffer overflow", state->name);
       size_t len = 0;
       uint8_t *bytes = qa_string_bytes(text, false, &len);
+      h.items[1] = bytes;
       qa_memory_write(m, off(m, destination, (int64_t)prefix), bytes, len);
-      free(bytes);
       qa_guest_core_address result = end ? off(m, destination, (int64_t)strlen(text)) : destination;
-      free(text);
+      release(&h);
       return qa_call_pointer(true, result);
     }
     case L_STRNCPY: {
@@ -208,6 +252,8 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       if (!has_destination) type_error("Nonnull strncpy destination required");
       qa_guest_core_address source = qa_guest_required_pointer(args, count, 1);
       uint8_t *bytes = xmalloc(length);
+      held h;
+      hold(&h, bytes, NULL);
       memset(bytes, 0, length);
       for (size_t i = 0; i < length; i++) {
         uint8_t byte = qa_memory_read_u8(m, off(m, source, (int64_t)i));
@@ -215,7 +261,7 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
         bytes[i] = byte;
       }
       qa_memory_write(m, destination, bytes, length);
-      free(bytes);
+      release(&h);
       return qa_call_pointer(true, destination);
     }
     case L_STRCHR: {
@@ -240,7 +286,10 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
     case L_STRSTR: {
       qa_guest_core_address source = qa_guest_required_pointer(args, count, 0);
       char *text = read_str(state, source);
+      held h;
+      hold(&h, text, NULL);
       char *needle = read_str(state, qa_guest_required_pointer(args, count, 1));
+      h.items[1] = needle;
       int64_t index = -1;
       if (strcmp(state->name, "strstr") == 0) {
         const char *found = strstr(text, needle);
@@ -249,7 +298,7 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
         for (size_t i = 0; text[i] != '\0'; i++)
           if (strchr(needle, text[i]) != NULL) { index = (int64_t)i; break; }
       }
-      free(text); free(needle);
+      release(&h);
       qa_guest_core_address none = {0};
       return index < 0 ? qa_call_pointer(false, none)
                        : qa_call_pointer(true, off(m, source, index));
@@ -261,12 +310,15 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       char *delimiters = read_str(state, qa_guest_required_pointer(args, count, 1));
       qa_guest_core_address none = {0};
       if (!has_source) { free(delimiters); return qa_call_pointer(false, none); }
+      held h;
+      hold(&h, delimiters, NULL);
       char *text = read_str(state, source);
+      h.items[1] = text;
       size_t length = strlen(text), start = 0;
       while (start < length && strchr(delimiters, text[start]) != NULL) start++;
       if (start == length) {
         qa_gmem_write_pointer(m, state->token_slot, false, none);
-        free(text); free(delimiters);
+        release(&h);
         return qa_call_pointer(false, none);
       }
       size_t end = start;
@@ -277,7 +329,7 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       } else {
         qa_gmem_write_pointer(m, state->token_slot, false, none);
       }
-      free(text); free(delimiters);
+      release(&h);
       return qa_call_pointer(true, off(m, source, (int64_t)start));
     }
     case L_STRTOL: {
@@ -285,6 +337,8 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       qa_guest_core_address end_pointer = {0};
       bool has_end = qa_guest_pointer_argument(args, count, 1, &end_pointer);
       char *text = read_str(state, source);
+      held h;
+      hold(&h, text, NULL);
       size_t length = strlen(text);
       int radix = (int)qa_guest_integer(args, count, 2);
       size_t index = 0;
@@ -292,7 +346,7 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       if (radix != 0 && (radix < 2 || radix > 36)) {
         qa_system_v_errno_set(host, 22);
         if (has_end) qa_gmem_write_pointer(m, end_pointer, true, source);
-        free(text);
+        release(&h);
         return signed_size_value(host, 0);
       }
       while (index < length && strchr(" \t\n\r\v\f", text[index]) != NULL) index++;
@@ -326,7 +380,7 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
       if (has_end)
         qa_gmem_write_pointer(m, end_pointer, true,
                               off(m, source, (int64_t)(index == first ? 0 : index)));
-      free(text);
+      release(&h);
       if (sign > 0 && value >= limit) {
         qa_system_v_errno_set(host, 34);
         return signed_size_value(host, (int64_t)(limit - 1));
@@ -362,7 +416,6 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
         qa_range_error("qsort range outside supported guest memory");
       qa_memory_check(m, base, length * size, QA_ACCESS_WRITE);
       /* Heap sort exactly as TS: less() invokes the guest comparator. */
-      for (size_t pass = 0; pass < 2; pass++) { (void)pass; break; }
       {
         /* sift/swap inlined as loops below via helper macros would hide the
          * comparator calls; implement with explicit loops. */
@@ -390,24 +443,12 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
               if (r.kind != QA_CALL_INT32) type_error("qsort comparator returned wrong type");
               if (!(r.number < 0)) break;
             }
-            uint8_t *tmp = xmalloc(size);
-            qa_memory_copy(m, off(m, base, (int64_t)(root * size)), tmp, size);
-            uint8_t *other = xmalloc(size);
-            qa_memory_copy(m, off(m, base, (int64_t)(child * size)), other, size);
-            qa_memory_write(m, off(m, base, (int64_t)(root * size)), other, size);
-            qa_memory_write(m, off(m, base, (int64_t)(child * size)), tmp, size);
-            free(tmp); free(other);
+            qsort_swap(m, base, size, root, child);
             root = child;
           }
         }
         for (size_t end = n - 1; end > 0; end--) {
-          uint8_t *tmp = xmalloc(size);
-          qa_memory_copy(m, base, tmp, size);
-          uint8_t *other = xmalloc(size);
-          qa_memory_copy(m, off(m, base, (int64_t)(end * size)), other, size);
-          qa_memory_write(m, base, other, size);
-          qa_memory_write(m, off(m, base, (int64_t)(end * size)), tmp, size);
-          free(tmp); free(other);
+          qsort_swap(m, base, size, 0, end);
           size_t root = 0;
           for (;;) {
             size_t child = root * 2 + 1;
@@ -430,13 +471,7 @@ static qa_call_result libc_impl(void *ctx, const qa_guest_core_call_context *con
               if (r.kind != QA_CALL_INT32) type_error("qsort comparator returned wrong type");
               if (!(r.number < 0)) break;
             }
-            uint8_t *tmp2 = xmalloc(size);
-            qa_memory_copy(m, off(m, base, (int64_t)(root * size)), tmp2, size);
-            uint8_t *other2 = xmalloc(size);
-            qa_memory_copy(m, off(m, base, (int64_t)(child * size)), other2, size);
-            qa_memory_write(m, off(m, base, (int64_t)(root * size)), other2, size);
-            qa_memory_write(m, off(m, base, (int64_t)(child * size)), tmp2, size);
-            free(tmp2); free(other2);
+            qsort_swap(m, base, size, root, child);
             root = child;
           }
         }

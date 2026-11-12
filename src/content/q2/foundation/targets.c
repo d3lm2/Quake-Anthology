@@ -108,7 +108,7 @@ static void speaker(qa_q2_entity *e, qa_q2_game_services *g) {
   const char *noise = qa_q2_spawn_get(&e->spawn, "noise");
   if (!noise) { g->host->diagnostic(g->host->ctx, "target_speaker has no noise"); return; }
   /* noise with .wav appended needs retained storage */
-  static _Thread_local char buf[512];
+  static _Thread_local char buf[520]; /* a 511-byte rerelease value plus ".wav" */
   const char *n = noise;
   if (!strstr(noise, ".wav")) { snprintf(buf, sizeof buf, "%s.wav", noise); n = buf; }
   e->noise = qa_q2_intern(n); /* the noise path outlives the spawn values */
@@ -209,7 +209,7 @@ static bool spawn_target(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
     if (!key) { g->host->diagnostic(g->host->ctx, "trigger_key has no item"); return true; }
     const char *pickup = g->item_name(g->ctx, key);
     if (!pickup || e->target[0] == '\0') {
-      static _Thread_local char buf[512];
+      static _Thread_local char buf[600];
       snprintf(buf, sizeof buf, "Q2 trigger_key has unknown item or no target: %s", key);
       g->host->diagnostic(g->host->ctx, buf);
       return true;
@@ -377,11 +377,11 @@ USE(trigger_key_use) {
   (void)c; (void)o;
   const char *key_name = qa_q2_spawn_get(&e->spawn, "item");
   if (!key_name) key_name = "";
-  static _Thread_local char key_buf[512], text_buf[512];
+  static _Thread_local char key_buf[520], text_buf[512];
   snprintf(key_buf, sizeof key_buf, "q2:%s", key_name);
   qa_item_id key = key_buf;
   const char *pickup = g->item_name(g->ctx, key_name);
-  if (!pickup) qa_range_error("Q2 saved key references missing item %s", key_name);
+  if (!pickup) qa_raise("Error", 0, 0, "Q2 saved key references missing item %s", key_name);
   if (!a || !g->host->is_player(g->host->ctx, *a)) return;
   if (qa_shared_inventory_table_count(g->host->inventory, *a, key) == 0) {
     if (g->host->now(g->host->ctx) < e->timestamp) return;

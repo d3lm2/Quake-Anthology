@@ -45,6 +45,18 @@ static double num(const qa_save_reader *r, const char *name) {
   qa_save_reader_destroy(&cell);
   return v;
 }
+/* A saved number held in an int64 cell: NaN and values outside int64 have no defined
+ * C conversion (TS keeps the number), so they are pinned instead. */
+static int64_t num_i64(const qa_save_reader *r, const char *name) {
+  double v = num(r, name);
+  if (v != v)
+    return 0;
+  if (v >= 9223372036854775807.0)
+    return INT64_MAX;
+  if (v <= -9223372036854775808.0)
+    return INT64_MIN;
+  return (int64_t)v;
+}
 static double integer(const qa_save_reader *r, const char *name) {
   qa_save_reader cell;
   field(r, name, &cell);
@@ -206,6 +218,10 @@ void qa_game_ai_context_bots_a_destroy(qa_game_ai_context_bots_a *c) {
   free(c->vm_cvars);
   c->vm_cvars = NULL;
   c->vm_cvar_count = c->vm_cvar_capacity = 0;
+  for (size_t i = 0; i < QA_MAX_WAYPOINTS_BOTS_A; i++) {
+    free(c->deathmatch.waypoints[i].name);
+    c->deathmatch.waypoints[i].name = NULL;
+  }
   for (size_t i = 0; i < c->restored_name_count; i++)
     free(c->restored_names[i]);
   free(c->restored_names);
@@ -312,7 +328,7 @@ static int64_t waypoint_id(void *ctx, const qa_bot_waypoint_bots_a *value) {
     return -1;
   ptrdiff_t id = value - c->deathmatch.waypoints;
   if (id < 0 || id >= QA_MAX_WAYPOINTS_BOTS_A)
-    qa_range_error("Waypoint pointer escapes AI heap");
+    qa_raise("Error", 0, 0, "Waypoint pointer escapes AI heap");
   return id;
 }
 static qa_save_value *id_value(int64_t id) {
@@ -433,7 +449,7 @@ qa_save_value *qa_game_ai_context_capture_save_state(qa_game_ai_context_bots_a *
     const qa_bot_waypoint_bots_a *w = &dm->waypoints[i];
     qa_save_value *o = sv(qa_save_value_object());
     set(o, "inuse", sv(qa_save_value_boolean(w->inuse)));
-    set(o, "name", sv(qa_save_value_string(w->name)));
+    set(o, "name", sv(qa_save_value_string(qa_bot_waypoint_name_bots_a(w))));
     set(o, "goal", goal_value(qa_bot_goal_state_get(&w->goal)));
     set(o, "next", id_value(waypoint_id(c, w->next)));
     set(o, "prev", id_value(waypoint_id(c, w->prev)));
@@ -612,6 +628,11 @@ static void observations_restore(qa_bot_entity_observations *o, const qa_save_va
   free(slots);
   qa_save_reader_destroy(&reader);
 }
+static qa_bot_goal goal_cell_field(const qa_save_reader *r, const char *name) {
+  qa_bot_goal_state_bots_a cell;
+  qa_bot_goal_state_copy_from(&cell, goal_field(r, name));
+  return qa_bot_goal_state_get(&cell);
+}
 void qa_game_ai_context_restore_save_state(qa_game_ai_context_bots_a *c, const qa_save_value *value,
                                            qa_bot_remap_observation_fn remap, void *remap_ctx) {
   qa_save_reader reader, dm, team, list, cell, leaf;
@@ -630,9 +651,7 @@ void qa_game_ai_context_restore_save_state(qa_game_ai_context_bots_a *c, const q
     w->inuse = boolean(&cell, "inuse");
     field(&cell, "name", &leaf);
     const char *name = qa_save_reader_string(&leaf);
-    if (strlen(name) >= sizeof w->name)
-      qa_save_reader_fail(&cell, "waypoint name exceeds storage");
-    snprintf(w->name, sizeof w->name, "%s", name);
+    qa_bot_waypoint_set_name_bots_a(w, name, strlen(name));
     qa_save_reader_destroy(&leaf);
     qa_bot_goal_state_copy_from(&w->goal, goal_field(&cell, "goal"));
     w->next = waypoint_at(c, nullable_id(&cell, "next"));
@@ -646,17 +665,18 @@ void qa_game_ai_context_restore_save_state(qa_game_ai_context_bots_a *c, const q
   c->num_bots = num(&reader, "numBots");
   c->interbreed = boolean(&reader, "interbreed");
   c->interbreed_match_count = num(&reader, "interbreedMatchCount");
-  d->gametype = (int64_t)num(&dm, "gametype");
-  d->maxclients = (int64_t)num(&dm, "maxclients");
+  d->gametype = num_i64(&dm, "gametype");
+  d->maxclients = num_i64(&dm, "maxclients");
   d->last_teleport_time = num(&dm, "lastTeleportTime");
-  d->max_bsp_model_index = (int64_t)num(&dm, "maxBspModelIndex");
+  d->max_bsp_model_index = num_i64(&dm, "maxBspModelIndex");
   d->alternate_routes_setup = boolean(&dm, "alternateRoutesSetup");
-  d->ctf_red_flag = goal_field(&dm, "ctfRedFlag");
-  d->ctf_blue_flag = goal_field(&dm, "ctfBlueFlag");
-  d->ctf_neutral_flag = goal_field(&dm, "ctfNeutralFlag");
-  d->red_obelisk = goal_field(&dm, "redObelisk");
-  d->blue_obelisk = goal_field(&dm, "blueObelisk");
-  d->neutral_obelisk = goal_field(&dm, "neutralObelisk");
+  /* TS copyFrom into BotGoalState cells: float32 vectors and int32 fields. */
+  d->ctf_red_flag = goal_cell_field(&dm, "ctfRedFlag");
+  d->ctf_blue_flag = goal_cell_field(&dm, "ctfBlueFlag");
+  d->ctf_neutral_flag = goal_cell_field(&dm, "ctfNeutralFlag");
+  d->red_obelisk = goal_cell_field(&dm, "redObelisk");
+  d->blue_obelisk = goal_cell_field(&dm, "blueObelisk");
+  d->neutral_obelisk = goal_cell_field(&dm, "neutralObelisk");
   d->last_teleport_origin = vec_field(&dm, "lastTeleportOrigin");
   d->red_alternate_goal_count = alternatives_field(&dm, "redAlternateGoals", d->red_alternate_goals);
   d->blue_alternate_goal_count =

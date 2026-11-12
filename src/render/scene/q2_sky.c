@@ -74,7 +74,7 @@ qa_render_operation *qa_q2_sky_sides(qa_material_geometry geometry, qa_vec3 orig
                                      qa_q2_sky_operations *out, size_t *out_count) {
   memset(out, 0, sizeof *out);
   /* TS plain Error -> qa_range_error (identical observable abort). */
-  if (sky.image_count != 6) qa_range_error("Q2 sky requires six registered images");
+  if (sky.image_count != 6) qa_raise("Error", 0, 0, "Q2 sky requires six registered images");
   fb bounds[6];
   for (int i = 0; i < 6; i++) bounds[i] = (fb){ 9999, 9999, -9999, -9999 };
   for (size_t index = 0; index + 2 < geometry.index_count + ((geometry.index_count % 3) ? 3 : 0) && index < geometry.index_count; index += 3) {

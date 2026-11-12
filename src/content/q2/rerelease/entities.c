@@ -157,21 +157,27 @@ static void changelevel_use(void *c, qa_q2_entity *e, qa_q2_game_services *g, co
   qa_q2_rerelease_players_begin_rerelease_intermission(m->players, g, e->map ? e->map : "", lm, e->spawnflags);
 }
 
-static size_t team_list(qa_q2_entity *e, qa_q2_game_services *g, qa_q2_entity **buf, size_t cap) {
+/* TS team(): a malloc'd list with no cap (free it); [entity] without a team name. */
+static qa_q2_entity **team_list(qa_q2_entity *e, qa_q2_game_services *g, size_t *out_count) {
   const char *name = qa_q2_spawn_get(&e->spawn, "team");
-  if (!name || !name[0]) { if (cap) buf[0] = e; return 1; }
-  size_t n = 0, en = 0; qa_q2_entity *const *ents = g->entities(g->ctx, &en);
+  size_t n = 0, en = 0;
+  qa_q2_entity *const *ents = (!name || !name[0]) ? NULL : g->entities(g->ctx, &en);
+  qa_q2_entity **list = malloc((en ? en : 1) * sizeof *list);
+  if (!list) qa_range_error("Out of memory");
+  if (!name || !name[0]) list[n++] = e;
   for (size_t i = 0; i < en; i++) {
     const char *tn = qa_q2_spawn_get(&ents[i]->spawn, "team");
-    if (tn && strcmp(tn, name) == 0) { if (n < cap) buf[n] = ents[i]; n++; }
+    if (tn && strcmp(tn, name) == 0) list[n++] = ents[i];
   }
-  return n;
+  *out_count = n;
+  return list;
 }
 static void poi_setup(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   (void)c;
   if (rr_band(e->spawnflags, 5) != 0) {
-    qa_q2_entity *team[256]; size_t n = team_list(e, g, team, 256); if (n > 256) n = 256;
+    size_t n = 0; qa_q2_entity **team = team_list(e, g, &n);
     for (size_t i = 0; i < n; i++) team[i]->spawnflags = rr_bor(team[i]->spawnflags, rr_band(e->spawnflags, 5));
+    free(team);
   }
 }
 static void poi_use(void *c, qa_q2_entity *source, qa_q2_game_services *g, const qa_actor_id *other, const qa_actor_id *act) {
@@ -179,7 +185,7 @@ static void poi_use(void *c, qa_q2_entity *source, qa_q2_game_services *g, const
   source->spawnflags = rr_bnot_and(source->spawnflags, 8);
   if (source->count != 0 && m->poi_stage > source->count) return;
   qa_q2_entity *selected = source;
-  qa_q2_entity *team[256]; size_t tn = team_list(source, g, team, 256); if (tn > 256) tn = 256;
+  size_t tn = 0; qa_q2_entity **team = team_list(source, g, &tn);
   qa_q2_entity *master = tn ? team[0] : source;
   if (qa_q2_spawn_has(&source->spawn, "team")) {
     selected = NULL;
@@ -207,13 +213,13 @@ static void poi_use(void *c, qa_q2_entity *source, qa_q2_game_services *g, const
     }
     if (!selected && fallback && rr_band(fallback->spawnflags, 4) != 0) selected = fallback;
   }
-  if (!selected) return;
-  if (selected->classname && strcmp(selected->classname, "target_poi") == 0 &&
-      rr_band(selected->spawnflags, 2) != 0 && rr_band(selected->spawnflags, 4) == 0) return;
+  if (!selected || (selected->classname && strcmp(selected->classname, "target_poi") == 0 &&
+      rr_band(selected->spawnflags, 2) != 0 && rr_band(selected->spawnflags, 4) == 0)) { free(team); return; }
   if (selected->count != 0) m->poi_stage = selected->count;
   bool has_dyn = false; qa_actor_id dyn = {0};
   if (rr_band(selected->spawnflags, 4) != 0)
     for (size_t i = 0; i < tn; i++) if (rr_band(team[i]->spawnflags, 2) != 0) { has_dyn = true; dyn = team[i]->actor.id; break; }
+  free(team);
   const char *image = qa_q2_spawn_get(&selected->spawn, "image");
   free(m->poi.image);
   m->poi.has = true; m->poi.actor = selected->actor.id; m->poi.origin = rr_body_of(g, selected).origin;
@@ -266,8 +272,11 @@ static void coop_relay_think(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   for (size_t i = 0; i < n; i++) if (bounds_intersect(bounds, abs_bounds(inside[i], g))) inside[in_n++] = inside[i];
   if (in_n == n) {
     free(inside);
+    /* players()[0] by value: the targets can run another players() query on the host's buffer. */
     size_t pn = 0; const qa_actor_id *pls = g->host->players(g->host->ctx, &pn);
-    fire_relay(e, g, pn ? &pls[0] : NULL); g->remove(g->ctx, e); return;
+    qa_actor_id first = {0};
+    if (pn) first = pls[0];
+    fire_relay(e, g, pn ? &first : NULL); g->remove(g->ctx, e); return;
   }
   if (in_n != 0 && e->timestamp < rr_now(g)) {
     size_t pn = 0; const qa_actor_id *pls = g->host->players(g->host->ctx, &pn);
@@ -303,7 +312,7 @@ static void fog_touch(void *c, qa_q2_entity *e, qa_q2_game_services *g, qa_touch
   qa_body_state_result br = qa_shared_body_table_read(g->host->bodies, contact.other);
   if (!br.has_value) return;
   qa_body_state body = br.value;
-  extra->fog_transition = rr_band(e->spawnflags, 4) != 0 ? 0 : (values->delay != 0 ? values->delay : 0.5);
+  extra->fog_transition = rr_band(e->spawnflags, 4) != 0 ? 0 : rr_or(values->delay, 0.5);
   qa_q2_fog_state value;
   if (rr_band(e->spawnflags, 16) != 0) {
     qa_bounds bounds = abs_bounds(e, g);
@@ -337,7 +346,7 @@ static void world_text_think(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   double yaw = qa_angle_mod(body.angles.y) + 180;
   double radius = qa_q2_number_field(&e->spawn, "radius", 0);
   if (radius < 0) { g->schedule(g->ctx, e, rr_frame(g), m->world_text_think); return; }
-  char textbuf[160];
+  char textbuf[256];
   qa_vec3 fixed_angles = rr_v3(0, yaw > 360 ? yaw - 360 : yaw, 0);
   qa_world_text wt = qa_q2_world_text(body.origin, body.angles.y == -3 ? NULL : &fixed_angles,
                                       e->message ? e->message : "", color, radius == 0 ? 0.2 : radius, true,
@@ -345,9 +354,9 @@ static void world_text_think(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_rerelease_event ev; memset(&ev, 0, sizeof ev);
   ev.kind = "world-text"; ev.lifetime = rr_frame(g); ev.text_value = wt;
   /* text buffer is stack-local: copy into event via static ring */
-  static char ring[8][160]; static size_t ring_i;
+  static char ring[8][256]; static size_t ring_i;
   char *slot = ring[ring_i++ % 8];
-  snprintf(slot, 160, "%s", textbuf); ev.text_value.text = slot;
+  snprintf(slot, 256, "%s", textbuf); ev.text_value.text = slot;
   rr_emit_rr(&m->hooks, ev);
   g->schedule(g->ctx, e, rr_frame(g), m->world_text_think);
 }
@@ -426,7 +435,8 @@ bool qa_q2_rerelease_entities_spawn(qa_q2_rerelease_entities *m, qa_q2_entity *e
   }
   if (strcmp(name, "misc_flare") == 0) {
     int32_t sf = qa_js_to_int32(e->spawnflags); /* (int32_t) of a double is UB out of range */
-    int32_t rf = 0x200000 | ((sf & 7) << 10) | ((sf & 8) != 0 ? 1 : 0) | (qa_q2_spawn_get(&e->spawn, "image") ? 256 : 0);
+    const char *image = qa_q2_spawn_get(&e->spawn, "image"); /* TS truthiness: an empty image is no image */
+    int32_t rf = 0x200000 | ((sf & 7) << 10) | ((sf & 8) != 0 ? 1 : 0) | (image && image[0] ? 256 : 0);
     e->render_flags = (double)rf;
     e->scale = qa_q2_number_field(&e->spawn, "radius", 0);
     g->solid(g->ctx, e, "none");
@@ -446,7 +456,7 @@ bool qa_q2_rerelease_entities_spawn(qa_q2_rerelease_entities *m, qa_q2_entity *e
     ent_trigger(e, g); e->movedir.z = qa_q2_number_field(&e->spawn, "height", 0); e->touch = m->flashlight_touch; return true;
   }
   if (strcmp(name, "trigger_fog") == 0) {
-    ent_trigger(e, g); if (e->delay == 0) e->delay = 0.5;
+    ent_trigger(e, g); e->delay = rr_or(e->delay, 0.5);
     qa_q2_entity *t = g->pick_target(g->ctx, e->target ? e->target : "");
     e->has_goal = t != NULL; if (t) e->goal = t->actor.id;
     e->touch = m->fog_touch;
@@ -457,7 +467,7 @@ bool qa_q2_rerelease_entities_spawn(qa_q2_rerelease_entities *m, qa_q2_entity *e
     ent_trigger(e, g);
     if (!e->message || !e->message[0]) e->message = "$g_coop_wait_for_players";
     if (!e->map || !e->map[0]) e->map = "$g_coop_players_waiting_for_you";
-    if (e->wait == 0) e->wait = 1;
+    e->wait = rr_or(e->wait, 1);
     if (rr_band(e->spawnflags, 1) != 0) g->schedule(g->ctx, e, e->wait, m->coop_relay_think);
     else e->use = m->coop_relay_use;
     return true;
@@ -480,7 +490,7 @@ bool qa_q2_rerelease_entities_spawn(qa_q2_rerelease_entities *m, qa_q2_entity *e
     if (g->options.mode == QA_Q2_MODE_DEATHMATCH) { g->remove(g->ctx, e); return true; }
     e->visible = false; e->server_flags = rr_bor(e->server_flags, 1);
     if (strcmp(name, "target_crossunit_trigger") == 0) e->use = m->cross_unit_use;
-    else if (strcmp(name, "target_crossunit_target") == 0) { if (e->delay == 0) e->delay = 1; g->schedule(g->ctx, e, e->delay, m->cross_unit_think); }
+    else if (strcmp(name, "target_crossunit_target") == 0) { e->delay = rr_or(e->delay, 1); g->schedule(g->ctx, e, e->delay, m->cross_unit_think); }
     else if (strcmp(name, "target_autosave") == 0) e->use = m->autosave_use;
     else if (strcmp(name, "target_achievement") == 0) e->use = m->achievement_use;
     else if (strcmp(name, "target_story") == 0) e->use = m->story_use;

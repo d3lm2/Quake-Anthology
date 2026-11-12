@@ -34,10 +34,17 @@ void qa_app_initialize_q3_client_cvars(qa_cvar_registry *cvars, qa_app_q3_client
   reg_ignored(cvars, "cl_packetdup", "1", QA_CVAR_FLAG_ARCHIVE);
   reg_ignored(cvars, "snaps", "20", QA_CVAR_FLAG_ARCHIVE | QA_CVAR_FLAG_USER_INFO);
   reg_ignored(cvars, "name", identity.name, QA_CVAR_FLAG_ARCHIVE | QA_CVAR_FLAG_USER_INFO);
-  char model_default[1024];
-  snprintf(model_default, sizeof model_default, "%s/default", identity.model);
+  /* `${identity.model}/default`, uncut */
+  size_t model_length = strlen(identity.model) + 9;
+  char *model_default = malloc(model_length);
+  if (model_default == NULL) qa_range_error("Out of memory");
+  snprintf(model_default, model_length, "%s/default", identity.model);
+  qa_cleanup model_guard;
+  qa_cleanup_push(&model_guard, free, model_default);
   for (size_t i = 0; i < 4; i++)
     reg_ignored(cvars, model_names[i], model_default, QA_CVAR_FLAG_ARCHIVE | QA_CVAR_FLAG_USER_INFO);
+  qa_cleanup_pop(&model_guard);
+  free(model_default);
   static const char *const pairs[][2] = {{"color1", "4"}, {"color2", "5"}, {"sex", "male"},
                                          {"cl_anonymous", "0"}, {"cg_predictItems", "1"}};
   for (size_t i = 0; i < sizeof pairs / sizeof pairs[0]; i++)
@@ -57,6 +64,9 @@ void qa_app_apply_server_system_info(qa_cvar_registry *cvars, const char *info,
   char *copy = strdup(info);
   char **fields = malloc(count * sizeof *fields);
   if (copy == NULL || fields == NULL) { free(copy); free(fields); qa_range_error("Out of memory"); }
+  qa_cleanup copy_guard, fields_guard;
+  qa_cleanup_push(&copy_guard, free, copy);
+  qa_cleanup_push(&fields_guard, free, fields);
   size_t n = 0;
   fields[n++] = copy;
   for (char *p = copy; *p != '\0'; p++)
@@ -78,6 +88,8 @@ void qa_app_apply_server_system_info(qa_cvar_registry *cvars, const char *info,
     if ((flags & QA_CVAR_FLAG_ARCHIVE) != 0) continue;
     set_ignored(cvars, name, value, true);
   }
+  qa_cleanup_pop(&fields_guard);
+  qa_cleanup_pop(&copy_guard);
   free(fields);
   free(copy);
 }

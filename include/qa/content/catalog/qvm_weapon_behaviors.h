@@ -46,6 +46,11 @@ typedef struct qa_qvm_weapon_behavior_services {
   bool (*read_profile)(void *ctx, const qa_save_value *declaration,
                        const qa_catalog_qvm_artifact *artifact,
                        qa_catalog_qvm_weapon_profile *out);
+  /* C ownership (TS GC): frees the service values resolve_artifact and
+   * read_profile stored (either may be NULL). qa_load_qvm_weapon_behavior
+   * calls it when a raise or a false return drops them. NULL = nothing to free. */
+  void (*release)(void *ctx, qa_catalog_qvm_artifact *artifact,
+                  qa_catalog_qvm_weapon_profile *profile);
 } qa_qvm_weapon_behavior_services;
 
 typedef struct qa_mounted_qvm_weapon_behavior {

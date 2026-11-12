@@ -81,10 +81,58 @@ static void add_value(records *out, const char *schema, qa_save_value *value) {
 }
 
 /* The match selection as TS encodes the selection object: its own keys
- * (kind, and the DeathBall getters or LMCTF travel when present). */
-static qa_save_value *selection_value(const qa_q2_match_selection *selection) {
+ * (kind, and the DeathBall getters or the LMCTF travel when present). */
+static qa_save_value *travel_value(qa_q2_product_match *match) {
+  /* travel.rules is the object the LMCTF runtime took as its rules, so it
+   * reads as the live rules; its keys stand in createLmctfRules order. */
+  const qa_lmctf_rules *rules = qa_q2_lmctf_get_rules(match->lmctf);
+  qa_save_value *saved_rules = object_value();
+  put(saved_rules, "ctfFlags", qa_save_value_number(rules->ctf_flags));
+  put(saved_rules, "refFlags", qa_save_value_number(rules->ref_flags));
+  put(saved_rules, "runes", qa_save_value_number(rules->runes));
+  put(saved_rules, "skinSet", qa_save_value_number(rules->skin_set));
+  put(saved_rules, "flagInit", qa_save_value_boolean(rules->flag_init));
+  put(saved_rules, "disabledWeapons", qa_save_value_number(rules->disabled_weapons));
+  put(saved_rules, "timeLimitMinutes", qa_save_value_number(rules->time_limit_minutes));
+  put(saved_rules, "fragLimit", qa_save_value_number(rules->frag_limit));
+  qa_save_value *maps = qa_save_value_array();
+  if (maps == NULL) qa_range_error("out of memory");
+  for (size_t i = 0; i < rules->map_count; i++) {
+    qa_save_value *map = qa_save_value_string(rules->map_list[i]);
+    if (map == NULL || !qa_save_value_push(maps, map)) qa_range_error("out of memory");
+  }
+  put(saved_rules, "mapList", maps);
+  put(saved_rules, "rconPassword", qa_save_value_string(rules->rcon_password != NULL ? rules->rcon_password : ""));
+  put(saved_rules, "fastSwitch", qa_save_value_boolean(rules->fast_switch));
+  put(saved_rules, "refPassword", qa_save_value_string(rules->ref_password != NULL ? rules->ref_password : ""));
+  put(saved_rules, "autoLock", qa_save_value_boolean(rules->auto_lock));
+  put(saved_rules, "countdownSeconds", qa_save_value_number(rules->countdown_seconds));
+  put(saved_rules, "quadSeconds", qa_save_value_number(rules->quad_seconds));
+  qa_save_value *travel = object_value();
+  put(travel, "rules", saved_rules);
+  put(travel, "countdown", qa_save_value_boolean(match->travel_countdown));
+  put(travel, "paused", qa_save_value_boolean(match->travel_paused));
+  qa_save_value *players = qa_save_value_array();
+  if (players == NULL) qa_range_error("out of memory");
+  for (size_t i = 0; i < match->travel_player_count; i++) {
+    const qa_lmctf_travel_player *carried = &match->travel_players[i];
+    qa_save_value *player = object_value();
+    put(player, "slot", qa_save_value_number(carried->slot));
+    put(player, "team", qa_save_value_number((double)carried->team));
+    put(player, "observerTeam", qa_save_value_number((double)carried->observer_team));
+    put(player, "extraFlags", qa_save_value_number(carried->extra_flags));
+    if (!qa_save_value_push(players, player)) qa_range_error("out of memory");
+  }
+  put(travel, "players", players);
+  return travel;
+}
+
+qa_save_value *qa_q2_product_match_selection_value(qa_q2_product_match *match) {
+  const qa_q2_match_selection *selection = &match->selection;
   qa_save_value *value = object_value();
   put(value, "kind", qa_save_value_string(qa_q2_match_kind_name(selection->kind)));
+  if (selection->kind == QA_Q2_MATCH_LMCTF && match->has_travel && match->lmctf != NULL)
+    put(value, "travel", travel_value(match));
   if (selection->kind == QA_Q2_MATCH_DEATHBALL) {
     char *skin1 = qa_q2_match_selection_team1_skin(selection), *skin2 = qa_q2_match_selection_team2_skin(selection);
     put(value, "team1Skin", qa_save_value_string(skin1));
@@ -149,7 +197,7 @@ qa_provider_checkpoint *qa_capture_q2_product(qa_q2_product_runtime *source, siz
   put(composition, "edition", qa_save_value_string(source->configuration.edition == QA_Q2_EDITION_RERELEASE ? "rerelease"
                                                                                                          : "classic"));
   put(composition, "program", qa_save_value_string(qa_q2_program_name(source->configuration.program)));
-  put(composition, "match", selection_value(&source->match.selection));
+  put(composition, "match", qa_q2_product_match_selection_value(&source->match));
   put(composition, "deathmatchFlags", qa_save_value_number(qa_q2_options_deathmatch_flags(&game->options)));
   add_value(&out, "q2:composition", composition);
   size_t length = 0;

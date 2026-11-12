@@ -105,15 +105,26 @@ static void print_severity(AasClustering *cl, int64_t severity, const char *text
   (void)severity;
   print_text(cl, text);
 }
+typedef struct { uint8_t *connected; I64List pending; } ConnectedScratch;
+static void connected_scratch_free(void *arg) {
+  ConnectedScratch *scratch = arg;
+  free(scratch->connected);
+  free(scratch->pending.v);
+  scratch->connected = NULL;
+  scratch->pending.v = NULL;
+}
 static bool connected_areas(ClusteringWorld *world, const I64List *area_numbers) {
   if (area_numbers->count < 1) return false;
   if (area_numbers->count == 1) return true;
-  uint8_t *connected = calloc(MAX_PORTAL_AREAS, 1);
-  if (!connected) qa_range_error("Out of memory");
-  I64List pending = {0, 0, 0};
-  list_push(&pending, 0);
-  while (pending.count != 0) {
-    int64_t current = pending.v[--pending.count];
+  ConnectedScratch scratch = {calloc(MAX_PORTAL_AREAS, 1), {0, 0, 0}};
+  if (!scratch.connected) qa_range_error("Out of memory");
+  /* An at() RangeError inside the walk frees both buffers (TS: garbage). */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, connected_scratch_free, &scratch);
+  uint8_t *connected = scratch.connected;
+  list_push(&scratch.pending, 0);
+  while (scratch.pending.count != 0) {
+    int64_t current = scratch.pending.v[--scratch.pending.count];
     if (current < 0 || current >= MAX_PORTAL_AREAS) at_fail(current, MAX_PORTAL_AREAS);
     if (connected[current] != 0) continue;
     connected[current] = 1;
@@ -126,17 +137,17 @@ static bool connected_areas(ClusteringWorld *world, const I64List *area_numbers)
       int64_t other_index = list_index_of(area_numbers, other_area);
       if (other_index >= 0) {
         if (other_index >= MAX_PORTAL_AREAS) at_fail(other_index, MAX_PORTAL_AREAS);
-        if (connected[other_index] == 0) list_push(&pending, other_index);
+        if (connected[other_index] == 0) list_push(&scratch.pending, other_index);
       }
     }
   }
-  free(pending.v);
   bool all = true;
   for (size_t index = 0; index < area_numbers->count; index++) {
     if (index >= MAX_PORTAL_AREAS) at_fail((int64_t)index, MAX_PORTAL_AREAS);
     if (connected[index] == 0) all = false;
   }
-  free(connected);
+  qa_cleanup_pop(&guard);
+  connected_scratch_free(&scratch);
   return all;
 }
 static void remove_cluster_areas(AasClustering *cl) {
@@ -177,14 +188,21 @@ static bool update_portal(AasClustering *cl, int64_t area, int64_t cluster_numbe
 }
 enum { FRAME_ENTER = 0, FRAME_FACES = 1, FRAME_REACH = 2 };
 typedef struct { int kind; int64_t area_number, index; } FloodFrame;
+typedef struct { FloodFrame *frames; } FloodStack;
+static void flood_stack_free(void *arg) { FloodStack *flood = arg; free(flood->frames); flood->frames = NULL; }
 static bool flood_cluster_areas(AasClustering *cl, int64_t area_number, int64_t cluster_number) {
   ClusteringWorld *w = cl->world;
   char message[256];
+  FloodStack flood = {NULL};
   FloodFrame *stack = NULL;
   size_t count = 0, cap = 0;
+  /* at() raises (RangeError) mid-walk free the frame stack. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, flood_stack_free, &flood);
 #define PUSH_FRAME(f) do { \
     if (count == cap) { cap = cap ? cap * 2 : 32; FloodFrame *p = realloc(stack, cap * sizeof *p); \
-      if (!p) { free(stack); qa_range_error("Out of memory"); } stack = p; } \
+      if (!p) { qa_range_error("Out of memory"); } \
+      stack = p; flood.frames = p; } \
     stack[count++] = (f); } while (0)
   PUSH_FRAME(((FloodFrame){FRAME_ENTER, area_number, 0}));
   bool ok = true;
@@ -232,6 +250,7 @@ static bool flood_cluster_areas(AasClustering *cl, int64_t area_number, int64_t 
       if (other_area != 0) PUSH_FRAME(((FloodFrame){FRAME_ENTER, other_area, 0}));
     }
   }
+  qa_cleanup_pop(&guard);
   free(stack);
 #undef PUSH_FRAME
   return ok;
@@ -346,30 +365,45 @@ static int64_t adjacent_areas(AasClustering *cl, I64List *area_numbers, int64_t 
   }
   return (int64_t)area_numbers->count;
 }
+typedef struct {
+  I64List area_numbers, front_faces, back_faces, front_areas, back_areas;
+  int32_t *front_counts, *back_counts;
+} PortalScratch;
+static void portal_scratch_free(void *arg) {
+  PortalScratch *scratch = arg;
+  free(scratch->area_numbers.v); free(scratch->front_faces.v); free(scratch->back_faces.v);
+  free(scratch->front_areas.v); free(scratch->back_areas.v);
+  free(scratch->front_counts); free(scratch->back_counts);
+  memset(scratch, 0, sizeof *scratch);
+}
 static int64_t check_area_for_portals(AasClustering *cl, int64_t area_number) {
   ClusteringWorld *w = cl->world;
   char message[256];
   qa_aas_setting_rec *settings = at_setting(w, area_number);
   if ((settings->contents & CLUSTER_PORTAL) != 0 || (settings->flags & AREA_GROUNDED) == 0) return 0;
-  I64List area_numbers = {0, 0, 0}, front_faces = {0, 0, 0}, back_faces = {0, 0, 0};
-  I64List front_areas = {0, 0, 0}, back_areas = {0, 0, 0};
-  int32_t *front_counts = calloc(MAX_PORTAL_AREAS, sizeof *front_counts);
-  int32_t *back_counts = calloc(MAX_PORTAL_AREAS, sizeof *back_counts);
-  if (!front_counts || !back_counts) qa_range_error("Out of memory");
+  PortalScratch scratch;
+  memset(&scratch, 0, sizeof scratch);
+  /* Every at()/portalAreaPush RangeError below frees the scratch lists. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, portal_scratch_free, &scratch);
+  scratch.front_counts = calloc(MAX_PORTAL_AREAS, sizeof *scratch.front_counts);
+  scratch.back_counts = calloc(MAX_PORTAL_AREAS, sizeof *scratch.back_counts);
+  if (!scratch.front_counts || !scratch.back_counts) qa_range_error("Out of memory");
+  int32_t *front_counts = scratch.front_counts, *back_counts = scratch.back_counts;
   int64_t front_plane = -1, back_plane = -1;
   int64_t result = 0;
-  adjacent_areas(cl, &area_numbers, area_number);
-  for (size_t index = 0; index < area_numbers.count; index++) {
-    int64_t current_area = at_i64(area_numbers.v, area_numbers.count, (int64_t)index);
+  adjacent_areas(cl, &scratch.area_numbers, area_number);
+  for (size_t index = 0; index < scratch.area_numbers.count; index++) {
+    int64_t current_area = at_i64(scratch.area_numbers.v, scratch.area_numbers.count, (int64_t)index);
     const qa_aas_area_rec *area = at_area(w, current_area);
     for (int64_t face_index = 0; face_index < area->face_count; face_index++) {
       int64_t face_number = abs64(at_i64(w->asset->face_indexes, w->asset->face_index_count, area->first_face + face_index));
       const qa_aas_face_rec *face = at_face(w, face_number);
       if ((face->flags & FACE_SOLID) != 0) continue;
       bool touches_other = false;
-      for (size_t oi = 0; oi < area_numbers.count; oi++) {
+      for (size_t oi = 0; oi < scratch.area_numbers.count; oi++) {
         if (oi == index) continue;
-        int64_t other = area_numbers.v[oi];
+        int64_t other = scratch.area_numbers.v[oi];
         if (face->front_area == other || face->back_area == other) touches_other = true;
       }
       if (touches_other) continue;
@@ -379,43 +413,43 @@ static int64_t check_area_for_portals(AasClustering *cl, int64_t area_number) {
       if (index >= MAX_PORTAL_AREAS) at_fail((int64_t)index, MAX_PORTAL_AREAS);
       if (front_plane < 0 || plane == front_plane) {
         front_plane = plane;
-        portal_area_push(&front_faces, face_number, "frontfacenums");
-        if (!list_contains(&front_areas, other_area)) portal_area_push(&front_areas, other_area, "frontareanums");
+        portal_area_push(&scratch.front_faces, face_number, "frontfacenums");
+        if (!list_contains(&scratch.front_areas, other_area)) portal_area_push(&scratch.front_areas, other_area, "frontareanums");
         front_counts[index] = front_counts[index] + 1;
       } else if (back_plane < 0 || plane == back_plane) {
         back_plane = plane;
-        portal_area_push(&back_faces, face_number, "backfacenums");
-        if (!list_contains(&back_areas, other_area)) portal_area_push(&back_areas, other_area, "backareanums");
+        portal_area_push(&scratch.back_faces, face_number, "backfacenums");
+        if (!list_contains(&scratch.back_areas, other_area)) portal_area_push(&scratch.back_areas, other_area, "backareanums");
         back_counts[index] = back_counts[index] + 1;
       } else goto done;
     }
   }
-  for (size_t index = 0; index < area_numbers.count; index++) {
+  for (size_t index = 0; index < scratch.area_numbers.count; index++) {
     if (front_counts[index] == 0 || back_counts[index] == 0) goto done;
   }
-  if (!connected_areas(w, &front_areas) || !connected_areas(w, &back_areas)) goto done;
-  for (size_t fi = 0; fi < front_faces.count; fi++) {
-    const qa_aas_face_rec *front = at_face(w, front_faces.v[fi]);
+  if (!connected_areas(w, &scratch.front_areas) || !connected_areas(w, &scratch.back_areas)) goto done;
+  for (size_t fi = 0; fi < scratch.front_faces.count; fi++) {
+    const qa_aas_face_rec *front = at_face(w, scratch.front_faces.v[fi]);
     for (int64_t front_edge = 0; front_edge < front->edge_count; front_edge++) {
       int64_t edge_number = abs64(at_i64(w->asset->edge_indexes, w->asset->edge_index_count, front->first_edge + front_edge));
-      for (size_t bi = 0; bi < back_faces.count; bi++) {
-        const qa_aas_face_rec *back = at_face(w, back_faces.v[bi]);
+      for (size_t bi = 0; bi < scratch.back_faces.count; bi++) {
+        const qa_aas_face_rec *back = at_face(w, scratch.back_faces.v[bi]);
         for (int64_t back_edge = 0; back_edge < back->edge_count; back_edge++)
           if (edge_number == abs64(at_i64(w->asset->edge_indexes, w->asset->edge_index_count, back->first_edge + back_edge))) goto done;
       }
     }
   }
-  for (size_t i = 0; i < area_numbers.count; i++) {
-    int64_t area = area_numbers.v[i];
+  for (size_t i = 0; i < scratch.area_numbers.count; i++) {
+    int64_t area = scratch.area_numbers.v[i];
     at_setting(w, area)->contents |= CLUSTER_PORTAL;
     at_setting(w, area)->contents |= ROUTE_PORTAL;
     snprintf(message, sizeof message, "possible portal: %lld\r\n", (long long)area);
     print_text(cl, message);
   }
-  result = (int64_t)area_numbers.count;
+  result = (int64_t)scratch.area_numbers.count;
 done:
-  free(area_numbers.v); free(front_faces.v); free(back_faces.v); free(front_areas.v); free(back_areas.v);
-  free(front_counts); free(back_counts);
+  qa_cleanup_pop(&guard);
+  portal_scratch_free(&scratch);
   return result;
 }
 static int32_t to_i32(int64_t v) { return (int32_t)(uint32_t)v; }
@@ -540,6 +574,11 @@ static void initialize_clustering(AasClustering *cl, double (*get_value)(const c
   print_severity(cl, 1, message);
 }
 static double always_one(const char *name) { (void)name; return 1; }
+static void clustering_world_free(void *arg) {
+  ClusteringWorld *world = arg;
+  free(world->settings); free(world->portals); free(world->portal_indexes); free(world->clusters);
+  world->settings = NULL; world->portals = NULL; world->portal_indexes = NULL; world->clusters = NULL;
+}
 void qa_aas_clustering_result_destroy(qa_aas_asset *asset) {
   if (!asset) return;
   free(asset->settings);
@@ -564,7 +603,11 @@ bool qa_cluster_aas(qa_aas_asset *out, const qa_aas_asset *asset, void *print_ct
   clustering.print_ctx = print_ctx;
   clustering.print_text = print;
   clustering.no_face_flood = true;
+  /* clusterAas throws (RangeError) out of a malformed asset; the copies go with it. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, clustering_world_free, &world);
   initialize_clustering(&clustering, always_one);
+  qa_cleanup_pop(&guard);
   qa_aas_portal_rec *portals = NULL;
   qa_aas_cluster_rec *clusters = NULL;
   int64_t *portal_indexes = NULL;

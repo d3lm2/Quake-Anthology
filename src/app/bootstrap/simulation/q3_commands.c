@@ -1,5 +1,5 @@
 /* Port of src/app/bootstrap/simulation/q3-commands.ts. Mirrored copies
- * exist in src/compat/qvm/mod_clients.c (parent reconciliation).
+ * exist in src/compat/qvm/mod_clients.c.
  * GPL-2.0-or-later. */
 #include "qa/app/bootstrap/simulation/q3_commands.h"
 #include <math.h>

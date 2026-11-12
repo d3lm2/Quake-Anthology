@@ -182,13 +182,37 @@ char *qa_client_skin_bots_a(qa_game_ai_context_bots_a *ctx, int64_t client, int6
   return out;
 }
 
-/* botCleanString(configstring) with its "n" value equal to name, case-insensitively. */
+/* TS value.toLowerCase() === name.toLowerCase() where value is cleaned to printable ASCII. Only
+   ASCII letters fold, and of every non-ASCII code point only U+212A KELVIN SIGN (UTF-8 E2 84 AA)
+   lowercases to pure ASCII ("k"); any other non-ASCII byte in name can never equal the value. */
+static bool lower_equal_ascii(const char *value, const char *name) {
+  size_t i = 0, j = 0;
+  for (;;) {
+    int left = (uint8_t)value[i];
+    int right = (uint8_t)name[j];
+    if (left >= 'A' && left <= 'Z')
+      left += 32;
+    if (right == 0xe2 && (uint8_t)name[j + 1] == 0x84 && (uint8_t)name[j + 2] == 0xaa) {
+      right = 'k';
+      j += 2;
+    } else if (right >= 'A' && right <= 'Z')
+      right += 32;
+    if (left != right)
+      return false;
+    if (left == 0)
+      return true;
+    i++;
+    j++;
+  }
+}
+
+/* botCleanString(configstring) with its "n" value equal to name under toLowerCase. */
 static bool configstring_name_matches(qa_game_ai_context_bots_a *ctx, int64_t client,
                                       const char *name) {
   char info[QA_AI_INFO_SIZE], clean[QA_AI_INFO_SIZE], value[QA_AI_INFO_SIZE];
   qa_bot_clean_string_bots_a(qa_ai_configstring_bots_a(ctx, QA_AI_CS_PLAYERS + client, info), clean,
                              sizeof clean);
-  return qa_ai_fold_equal_bots_a(qa_ai_info_value_bots_a(clean, "n", value), name);
+  return lower_equal_ascii(qa_ai_info_value_bots_a(clean, "n", value), name);
 }
 
 int64_t qa_client_from_name_bots_a(qa_game_ai_context_bots_a *ctx, const char *name) {

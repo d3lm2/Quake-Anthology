@@ -6,7 +6,6 @@
 #include "qa/foundation/support.h"
 #include "qa/persistence/recipe.h"
 #include "qa/persistence/save_image.h"
-#define MAX_ACTORS 64
 typedef struct retained {
   bool has_player; qa_actor_id player;
   qa_q1_fog_state state; double sky_factor;
@@ -16,9 +15,18 @@ struct qa_app_sim_q1_fog {
   qa_app_sim_q1_fog_options options;
   qa_q1_fog_transition initial;
   retained global;
-  retained actors[MAX_ACTORS]; size_t actor_count;
-  qa_app_sim_presentation_event out[MAX_ACTORS + 1]; size_t out_count;
+  retained *actors; size_t actor_count, actor_capacity; /* TS Map: no bound */
+  qa_app_sim_presentation_event *out; size_t out_count, out_capacity;
 };
+static void *grow(void *items, size_t *capacity, size_t need, size_t size) {
+  if (need <= *capacity) return items;
+  size_t next = *capacity == 0 ? 8 : *capacity;
+  while (next < need) next *= 2;
+  void *grown = realloc(items, next * size);
+  if (grown == NULL) qa_range_error("Out of memory");
+  *capacity = next;
+  return grown;
+}
 static bool same_actor(qa_actor_id a, qa_actor_id b) { return qa_same_actor(a, b); }
 static retained *find_actor(qa_app_sim_q1_fog *f, qa_actor_id actor) {
   for (size_t i = 0; i < f->actor_count; i++) if (same_actor(f->actors[i].player, actor)) return &f->actors[i];
@@ -26,6 +34,7 @@ static retained *find_actor(qa_app_sim_q1_fog *f, qa_actor_id actor) {
 }
 static void emit(qa_app_sim_q1_fog *f, retained *value) {
   if (!value->has_context) return;
+  f->out = grow(f->out, &f->out_capacity, f->out_count + 1, sizeof *f->out);
   qa_app_sim_presentation_event *e = &f->out[f->out_count++];
   memset(e, 0, sizeof *e);
   e->kind = "q1-fog"; e->q1_fog.kind = "transition";
@@ -44,7 +53,10 @@ qa_app_sim_q1_fog *qa_app_sim_q1_fog_create(qa_app_sim_q1_fog_options options) {
   f->global.sky_factor = 0.5;
   return f;
 }
-void qa_app_sim_q1_fog_destroy(qa_app_sim_q1_fog *fog) { free(fog); }
+void qa_app_sim_q1_fog_destroy(qa_app_sim_q1_fog *fog) {
+  if (fog == NULL) return;
+  free(fog->actors); free(fog->out); free(fog);
+}
 void qa_app_sim_q1_fog_reset(qa_app_sim_q1_fog *fog) {
   qa_q1_fog_state_install(&fog->global.state, fog->initial);
   fog->global.sky_factor = 0.5; fog->global.has_context = false; fog->actor_count = 0;
@@ -93,7 +105,7 @@ const qa_app_sim_presentation_event *qa_app_sim_q1_fog_update(qa_app_sim_q1_fog 
     } else if (alive_of(fog, event.player)) {
       retained *v = find_actor(fog, event.player);
       if (v == NULL) {
-        if (fog->actor_count >= MAX_ACTORS) qa_range_error("Out of memory");
+        fog->actors = grow(fog->actors, &fog->actor_capacity, fog->actor_count + 1, sizeof *fog->actors);
         v = &fog->actors[fog->actor_count++];
         memset(v, 0, sizeof *v); v->has_player = true; v->player = event.player;
         qa_q1_fog_state_init(&v->state);
@@ -123,10 +135,13 @@ static qa_save_value *fog_value(qa_q1_fog v) {
   qa_save_value_set(o, "color", c);
   return o;
 }
-static qa_save_value *capture_value(retained *value) {
+/* { player?, transition, skyFactor, context }: an actor entry is { player: savedActorId(...), ...capture(value) }, so its
+ * player key comes first. */
+static qa_save_value *capture_value(retained *value, qa_save_value *player) {
   qa_q1_fog_transition t = qa_q1_fog_state_capture(&value->state);
   qa_save_value *o = qa_save_value_object(), *tr = qa_save_value_object();
   if (!o || !tr) qa_range_error("Out of memory");
+  if (player != NULL) qa_save_value_set(o, "player", player);
   qa_save_value_set(tr, "previous", fog_value(t.previous));
   qa_save_value_set(tr, "target", fog_value(t.target));
   qa_save_value_set(tr, "start", qa_save_value_number(t.start));
@@ -150,18 +165,16 @@ qa_save_value *qa_app_sim_q1_fog_capture(qa_app_sim_q1_fog *fog) {
   qa_save_value *o = qa_save_value_object(), *actors = qa_save_value_array();
   if (!o || !actors) qa_range_error("Out of memory");
   qa_save_value_set(o, "content", qa_save_value_string(fog->options.content));
-  qa_save_value_set(o, "global", capture_value(&fog->global));
+  qa_save_value_set(o, "global", capture_value(&fog->global, NULL));
   for (size_t i = 0; i < fog->actor_count; i++) {
     retained *v = &fog->actors[i];
     if (!v->has_player || !alive_of(fog, v->player)) continue;
-    qa_save_value *entry = capture_value(v);
     qa_saved_actor_id saved = qa_saved_actor_id_of(v->player);
     qa_save_value *actor = qa_save_value_object();
     if (!actor) qa_range_error("Out of memory");
     qa_save_value_set(actor, "slot", qa_save_value_number(saved.slot));
     qa_save_value_set(actor, "generation", qa_save_value_number(saved.generation));
-    qa_save_value_set(entry, "player", actor);
-    qa_save_value_push(actors, entry);
+    qa_save_value_push(actors, capture_value(v, actor));
   }
   qa_save_value_set(o, "actors", actors);
   return o;
@@ -222,7 +235,8 @@ const qa_app_sim_presentation_event *qa_app_sim_q1_fog_restore(qa_app_sim_q1_fog
   qa_save_reader gf = fld(reader, "global");
   qa_actor_id none; memset(&none, 0, sizeof none);
   retained global = read_retained(fog, &gf, false, none); qa_save_reader_destroy(&gf);
-  retained actors[MAX_ACTORS]; size_t count = 0;
+  retained *actors = NULL; size_t count = 0, capacity = 0;
+  qa_cleanup actors_node; qa_cleanup_push(&actors_node, free, NULL); /* refreshed as the list grows */
   qa_save_reader af = fld(reader, "actors");
   size_t n = qa_save_reader_list_count(&af);
   for (size_t i = 0; i < n; i++) {
@@ -232,13 +246,16 @@ const qa_app_sim_presentation_event *qa_app_sim_q1_fog_restore(qa_app_sim_q1_fog
     qa_actor_id player = reference(reference_ctx, saved);
     if (!alive_of(fog, player)) qa_save_reader_fail(&entry, "fog actor is not alive");
     for (size_t k = 0; k < count; k++) if (same_actor(actors[k].player, player)) qa_save_reader_fail(&entry, "duplicate fog actor");
-    if (count >= MAX_ACTORS) qa_save_reader_fail(&entry, "out of memory");
+    actors = grow(actors, &capacity, count + 1, sizeof *actors);
+    actors_node.arg = actors;
     actors[count++] = read_retained(fog, &entry, true, player);
     qa_save_reader_destroy(&entry);
   }
   qa_save_reader_destroy(&af);
   fog->global.state = global.state; fog->global.sky_factor = global.sky_factor;
   fog->global.has_context = global.has_context; fog->global.context = global.context;
-  memcpy(fog->actors, actors, count * sizeof(retained)); fog->actor_count = count;
+  qa_cleanup_pop(&actors_node);
+  free(fog->actors);
+  fog->actors = actors; fog->actor_count = count; fog->actor_capacity = capacity;
   return qa_app_sim_q1_fog_presentation(fog, out_count);
 }

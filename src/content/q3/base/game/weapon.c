@@ -18,12 +18,12 @@ typedef qa_q3_weapon_runtime RT;
 typedef qa_q3_bullet_attack Attack;
 static qa_q3_entity_callback mkcb(const void *fn, void *ctx) { qa_q3_entity_callback cb; memcpy(&cb.fn, fn, sizeof cb.fn); cb.ctx = ctx; return cb; }
 static qa_q3_game_client *client_of(qa_q3_game_entity *e) {
-  if (!e->client) qa_range_error("Weapon attack requires a client entity");
+  if (!e->client) qa_raise("Error", 0, 0, "Weapon attack requires a client entity");
   return e->client;
 }
 static void owned(RT *r, qa_q3_game_entity *e) {
   if (qa_q3_entity_pool_get(r->host.combat->entities, e->slot) != e)
-    qa_range_error("Weapon entity does not belong to this pool");
+    qa_raise("Error", 0, 0, "Weapon entity does not belong to this pool");
 }
 double qa_q3_weapon_damage_factor(qa_q3_game_client *client, double quad_factor, qa_q3_base_product product) {
   double factor = qa_q3_base_player_state_slots_get(&client->ps.powerups, QA_Q3_PW_QUAD) != 0 ? (float)quad_factor : 1;
@@ -32,7 +32,7 @@ double qa_q3_weapon_damage_factor(qa_q3_game_client *client, double quad_factor,
   return factor;
 }
 qa_q3_sphere_intersections qa_q3_ray_sphere_intersections(qa_vec3 origin, double radius, qa_vec3 point, qa_q3_missile_direction *direction) {
-  qa_vec3 dir = qa_normalize3((qa_vec3){direction->x, direction->y, direction->z});
+  qa_vec3 dir = qa_normalize3(qa_math_vec3(direction->x, direction->y, direction->z)); /* TS vec3(): binary32 */
   direction->x = dir.x; direction->y = dir.y; direction->z = dir.z;
   qa_vec3 offset = qa_sub3(point, origin);
   double b = (float)(2 * qa_dot3(dir, offset));
@@ -48,7 +48,7 @@ qa_q3_sphere_intersections qa_q3_ray_sphere_intersections(qa_vec3 origin, double
 }
 qa_q3_weapon_invuln_impact qa_q3_invulnerability_effect(qa_q3_entity_pool *pool, qa_q3_game_entity *target, qa_vec3 direction, qa_vec3 point) {
   qa_q3_weapon_invuln_impact miss = {QA_Q3_WEAPON_INVULN_MISS, {0, 0, 0}, {0, 0, 0}};
-  if (pool->options.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("Invulnerability effects require missionpack");
+  if (pool->options.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "Invulnerability effects require missionpack");
   if (!target->client) return miss;
   qa_q3_missile_direction backwards = {-direction.x, -direction.y, -direction.z};
   qa_q3_sphere_intersections hits = qa_q3_ray_sphere_intersections(qa_q3_base_player_state_record_origin(&target->client->ps), 42, point, &backwards);
@@ -81,7 +81,7 @@ static double quad_of(RT *r, qa_q3_game_entity *e) {
 }
 static Attack attack_of(qa_q3_game_entity *e, double quad) {
   qa_q3_game_client *c = client_of(e); qa_angle_vectors v = qa_qvm_angle_vectors(c->ps.viewangles);
-  qa_vec3 eye = {e->s.pos.base.x, e->s.pos.base.y, (float)(e->s.pos.base.z + c->ps.viewheight)};
+  qa_vec3 eye = qa_math_vec3(e->s.pos.base.x, e->s.pos.base.y, (float)(e->s.pos.base.z + c->ps.viewheight)); /* TS vec3(): binary32 */
   Attack a; a.forward = v.forward; a.right = v.right; a.up = v.up;
   a.muzzle = qa_q3_snap_vector(qa_add3(eye, qa_scale3(v.forward, 14))); a.quad = quad; return a;
 }
@@ -120,7 +120,7 @@ static void ad_damage_method(void *ctx, qa_actor_id target, qa_vec3 dir, qa_vec3
 static qa_q3_invuln_impact ad_invuln(void *ctx, qa_actor_id actor, qa_vec3 dir, qa_vec3 point) {
   adapter *ad = ctx; RT *r = ad->runtime;
   qa_q3_damage_participant target = r->host.participant(r->host.ctx, actor);
-  if (!target.entity) qa_range_error("Q3 invulnerability requires its actual client behavior");
+  if (!target.entity) qa_raise("Error", 0, 0, "Q3 invulnerability requires its actual client behavior");
   qa_q3_weapon_invuln_impact w = qa_q3_invulnerability_effect(r->host.combat->entities, target.entity, dir, point);
   qa_q3_invuln_impact out = {w.kind == QA_Q3_WEAPON_INVULN_HIT ? QA_Q3_INVULN_HIT : QA_Q3_INVULN_MISS, w.impact_point, w.bounce_direction};
   return out;
@@ -138,7 +138,7 @@ static void ad_bullet_emit(void *ctx, qa_q3_bullet_event hit) {
   qa_q3_game_entity *ev = qa_q3_entity_pool_temp_entity(pool, hit.point, hit.flesh ? QA_Q3_EV_BULLET_HIT_FLESH : QA_Q3_EV_BULLET_HIT_WALL);
   if (hit.flesh && hit.has_target) {
     qa_q3_damage_participant target = r->host.participant(r->host.ctx, hit.target);
-    if (!target.entity || !target.entity->client) qa_range_error("Admitted Q3 map player has no native client behavior record");
+    if (!target.entity || !target.entity->client) qa_raise("Error", 0, 0, "Admitted Q3 map player has no native client behavior record");
     ev->s.event_parm = target.entity->s.number;
   } else ev->s.event_parm = qa_q3_base_direction_to_byte(&hit.normal);
   ev->s.other_entity_num = ad->entity->s.number;
@@ -154,7 +154,7 @@ static void ad_contact_emit(void *ctx, qa_q3_contact_event hit) {
       (ref = &qa_q3_entity_pool_temp_entity(pool, hit.point, QA_Q3_EV_MISSILE_MISS)->s.event_parm, *ref = qa_q3_base_direction_to_byte(&hit.normal)); return;
     case QA_Q3_CONTACT_HIT: {
       qa_q3_damage_participant target = r->host.participant(r->host.ctx, hit.target);
-      if (!target.entity || !target.entity->client) qa_range_error("Admitted Q3 map player has no native client behavior record");
+      if (!target.entity || !target.entity->client) qa_raise("Error", 0, 0, "Admitted Q3 map player has no native client behavior record");
       qa_q3_game_entity *ev = qa_q3_entity_pool_temp_entity(pool, hit.point, QA_Q3_EV_MISSILE_HIT);
       ev->s.other_entity_num = target.entity->s.number;
       ev->s.event_parm = qa_q3_base_direction_to_byte(&hit.normal); ev->s.weapon = ad->firing_weapon; return;
@@ -274,11 +274,11 @@ void qa_q3_weapon_fire(RT *r, qa_q3_game_entity *e) {
 }
 qa_q3_game_entity *qa_q3_weapon_start_kamikaze(RT *r, qa_q3_game_entity *e) {
   owned(r, e); qa_q3_game_combat_context *combat = r->host.combat; qa_q3_entity_pool *pool = combat->entities;
-  if (combat->product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("Kamikaze requires missionpack");
+  if (combat->product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "Kamikaze requires missionpack");
   qa_q3_game_entity *ex = qa_q3_entity_pool_spawn(pool);
   ex->s.e_type = 13 + QA_Q3_EV_KAMIKAZE; /* ET_EVENTS + EV_KAMIKAZE */ ex->event_time = combat->time;
   qa_q3_game_entity *source = e->client ? e : e->activator;
-  if (!source) qa_range_error("Kamikaze timer requires its activator");
+  if (!source) qa_raise("Error", 0, 0, "Kamikaze timer requires its activator");
   qa_vec3 position = qa_q3_snap_vector(source->s.pos.base);
   qa_q3_set_origin(ex, position); qa_q3_game_entity_set_classname(ex, "kamikaze");
   ex->kamikaze_time = combat->time;
@@ -313,7 +313,7 @@ static void kamikaze_area(RT *r, qa_vec3 origin, qa_q3_game_entity *attacker, do
     double ax = origin.x < link.min.x ? link.min.x - origin.x : origin.x > link.max.x ? origin.x - link.max.x : 0;
     double ay = origin.y < link.min.y ? link.min.y - origin.y : origin.y > link.max.y ? origin.y - link.max.y : 0;
     double az = origin.z < link.min.z ? link.min.z - origin.z : origin.z > link.max.z ? origin.z - link.max.z : 0;
-    if (qa_length3((qa_vec3){ax, ay, az}) >= radius) continue;
+    if (qa_length3(qa_math_vec3(ax, ay, az)) >= radius) continue; /* TS vec3(): binary32 */
     qa_vec3 offset = qa_sub3(qa_q3_base_entity_shared_current_origin(&target->r), origin);
     qa_vec3 direction = {offset.x, offset.y, (float)(offset.z + 24)};
     qa_q3_damage_participant tp = qa_q3_participant_entity(target);

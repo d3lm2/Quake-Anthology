@@ -246,11 +246,21 @@ void qa_mod_selection_set_set_enabled(qa_mod_selection_set *set,
     set->selected_count = resolved_count;
     return;
   }
-  /* Remove the selection plus everything that (transitively)
-   * requires it. */
-  bool *removed = set->selected_count > 0
-      ? (bool *)calloc(set->selected_count, sizeof *removed) : NULL;
-  if (set->selected_count > 0 && removed == NULL) qa_error("out of memory");
+  /* Remove the selection plus everything that (transitively) requires it.
+   * TS keeps a set of removed keys that starts with the given selection
+   * whether or not it is enabled, so an enabled mod that requires it goes
+   * even when the selection itself is absent from the enabled list. */
+  size_t removed_capacity = set->selected_count + 1;
+  qa_mod_selection *removed_keys =
+      (qa_mod_selection *)malloc(removed_capacity * sizeof *removed_keys);
+  bool *removed = (bool *)calloc(removed_capacity, sizeof *removed);
+  if (removed_keys == NULL || removed == NULL) {
+    free(removed_keys);
+    free(removed);
+    qa_error("out of memory");
+  }
+  size_t removed_count = 0;
+  removed_keys[removed_count++] = selection;
   for (size_t i = 0; i < set->selected_count; i++)
     removed[i] = same_selection(set->selected[i], selection);
   bool changed = true;
@@ -262,13 +272,11 @@ void qa_mod_selection_set_set_enabled(qa_mod_selection_set *set,
           find_description(set, set->selected[i]);
       if (description == NULL) continue;
       for (size_t j = 0; j < description->requires_count && !removed[i]; j++)
-        for (size_t k = 0; k < set->selected_count; k++)
-          if (removed[k] &&
-              same_selection(description->requires[j], set->selected[k])) {
-            removed[i] = true;
-            changed = true;
-            break;
-          }
+        if (list_has(removed_keys, removed_count, description->requires[j])) {
+          removed[i] = true;
+          removed_keys[removed_count++] = set->selected[i];
+          changed = true;
+        }
     }
   }
   size_t count = 0;
@@ -276,8 +284,8 @@ void qa_mod_selection_set_set_enabled(qa_mod_selection_set *set,
     if (!removed[i]) set->selected[count++] = set->selected[i];
   set->selected_count = count;
   free(removed);
+  free(removed_keys);
 }
-
 void qa_mod_selection_set_validate(const qa_mod_selection_set *set) {
   size_t count = 0;
   qa_mod_selection *resolved = resolve(set, set->selected, set->selected_count, &count);

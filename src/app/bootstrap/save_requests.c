@@ -7,7 +7,7 @@ qa_app_save_request qa_app_parse_save_request(const char *const *args, size_t co
   const char *format = count > 1 ? args[1] : "shared";
   if (name == NULL || name[0] == '\0' || count > 2 ||
       (strcmp(format, "shared") != 0 && strcmp(format, "v5") != 0 && strcmp(format, "v6") != 0))
-    qa_range_error("Usage: save <name or path> [shared|v5|v6]");
+    qa_raise("Error", 0, 0, "Usage: save <name or path> [shared|v5|v6]");
   qa_app_save_request r = {name, format};
   return r;
 }
@@ -15,7 +15,7 @@ qa_app_load_request qa_app_parse_load_request(const char *const *args, size_t co
   const char *name = count > 0 ? args[0] : NULL;
   const char *source = count > 1 ? args[1] : NULL;
   if (name == NULL || name[0] == '\0' || count > 2 || (source != NULL && source[0] == '\0'))
-    qa_range_error("Usage: load <name or path> [source-product]");
+    qa_raise("Error", 0, 0, "Usage: load <name or path> [source-product]");
   qa_app_load_request r = {name, source};
   return r;
 }

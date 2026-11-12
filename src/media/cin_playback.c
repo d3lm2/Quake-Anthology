@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "qa/foundation/support.h"
+#include "qa/network/common/js_number.h"
 
 static noreturn void media_error(const char *format, ...) {
   char text[1536];
@@ -107,6 +108,17 @@ static qa_save_value *save_frame(bool has, const qa_cin_frame *frame) {
   return object;
 }
 
+typedef struct frame_scratch {
+  qa_cin_frame *frame;
+  double *values;
+} frame_scratch;
+
+static void frame_scratch_release(void *raw) {
+  frame_scratch *scratch = (frame_scratch *)raw;
+  free(scratch->values);
+  qa_cin_frame_dispose(scratch->frame);
+}
+
 /* False when the value is null; on true *out owns its buffers. */
 static bool read_frame(const qa_save_reader *reader, int64_t pixels,
                        qa_cin_frame *out) {
@@ -115,6 +127,10 @@ static bool read_frame(const qa_save_reader *reader, int64_t pixels,
   qa_save_reader f;
   qa_cin_frame frame;
   memset(&frame, 0, sizeof frame);
+  /* A refused field raises; the partial frame is released (TS: garbage). */
+  frame_scratch scratch = {&frame, NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, frame_scratch_release, &scratch);
   read_field(reader, "pixels", &f);
   size_t pixels_length = 0;
   const uint8_t *image = qa_save_reader_bytes(&f, &pixels_length);
@@ -153,6 +169,7 @@ static bool read_frame(const qa_save_reader *reader, int64_t pixels,
     size_t count = qa_save_reader_list_count(&g);
     double *values = (double *)malloc((count == 0 ? 1 : count) * sizeof(double));
     if (values == NULL) media_error("out of memory");
+    scratch.values = values;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader item;
       if (!qa_save_reader_item(&g, i, &item)) media_error("out of memory");
@@ -188,6 +205,7 @@ static bool read_frame(const qa_save_reader *reader, int64_t pixels,
       }
     }
     free(values);
+    scratch.values = NULL;
     read_field(&f, "sampleRate", &g);
     frame.audio.sample_rate = (int64_t)qa_save_reader_integer_min(&g, 1);
     qa_save_reader_destroy(&g);
@@ -196,6 +214,7 @@ static bool read_frame(const qa_save_reader *reader, int64_t pixels,
     qa_save_reader_destroy(&g);
   }
   qa_save_reader_destroy(&f);
+  qa_cleanup_pop(&guard);
   *out = frame;
   return true;
 }
@@ -226,6 +245,7 @@ static bool playback_read(qa_cin_playback *playback, qa_cin_frame *out,
     audio.time = (double)playback->epoch + source_time;
     audio.loop = playback->pass;
     audio.reset_stream = frame.audio.source_sample == 0;
+    audio.key_order = QA_CINEMATIC_AUDIO_KEYS_CIN;
     playback->options.on_audio(playback->options.on_audio_ctx, &audio);
   }
   *out = frame;
@@ -281,6 +301,26 @@ static bool playback_start(qa_cin_playback *playback,
   return true;
 }
 
+/* TS constructor catch: this.decoder.close(); throw error. The frames read
+ * so far are released with it. */
+static void playback_start_unwind(void *raw) {
+  qa_cin_playback *playback = (qa_cin_playback *)raw;
+  if (playback->has_picture) qa_cin_frame_dispose(&playback->picture);
+  if (playback->has_pending) qa_cin_frame_dispose(&playback->pending);
+  playback->has_picture = false;
+  playback->has_pending = false;
+  qa_cin_decoder_destroy(&playback->decoder);
+}
+
+static bool playback_start_guarded(qa_cin_playback *playback,
+                                   const qa_save_value *checkpoint) {
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, playback_start_unwind, playback);
+  bool ok = playback_start(playback, checkpoint);
+  qa_cleanup_pop(&guard);
+  return ok;
+}
+
 bool qa_cin_playback_init(qa_cin_playback *playback, qa_media_input *input,
                           const qa_cin_playback_options *options,
                           const qa_save_value *checkpoint) {
@@ -290,7 +330,7 @@ bool qa_cin_playback_init(qa_cin_playback *playback, qa_media_input *input,
   if (!qa_cin_decoder_init(&playback->decoder, input, options->source)) {
     return false;
   }
-  if (!playback_start(playback, checkpoint)) {
+  if (!playback_start_guarded(playback, checkpoint)) {
     qa_cin_decoder_close(&playback->decoder);
     return false;
   }
@@ -308,7 +348,7 @@ bool qa_cin_playback_init_bytes(qa_cin_playback *playback,
                                  options->source)) {
     return false;
   }
-  if (!playback_start(playback, checkpoint)) {
+  if (!playback_start_guarded(playback, checkpoint)) {
     qa_cin_decoder_close(&playback->decoder);
     return false;
   }
@@ -391,15 +431,60 @@ bool qa_cin_playback_restart(qa_cin_playback *playback,
     playback->has_pending = false;
   }
   playback->state = QA_CIN_PLAYBACK_PLAYING;
-  if (playback->has_picture) {
-    qa_cin_frame_dispose(&playback->picture);
-    playback->has_picture = false;
-  }
-  if (!playback_read(playback, &playback->picture, &playback->has_picture)) {
-    return false;
-  }
+  /* TS `this.picture = this.read()`: a throwing read leaves the picture. */
+  qa_cin_frame next;
+  bool has_next = false;
+  if (!playback_read(playback, &next, &has_next)) return false;
+  if (playback->has_picture) qa_cin_frame_dispose(&playback->picture);
+  playback->picture = next;
+  playback->has_picture = has_next;
   if (!playback->has_picture) playback->state = QA_CIN_PLAYBACK_ENDED;
   return true;
+}
+
+/* TS run() after `this.picture = this.pending` when `this.read()` throws: the
+ * picture is the old pending frame, which pending still names, and the old
+ * picture is dropped. */
+typedef struct run_unwind_state {
+  qa_cin_playback *playback;
+} run_unwind_state;
+
+static bool copy_cin_frame(const qa_cin_frame *frame, qa_cin_frame *out) {
+  *out = *frame;
+  out->pixels = NULL;
+  out->audio.samples_s16 = NULL;
+  out->audio.samples_u8 = NULL;
+  size_t pixels = frame->pixels_length == 0 ? 1 : frame->pixels_length;
+  out->pixels = (uint8_t *)malloc(pixels);
+  if (out->pixels == NULL) goto oom;
+  if (frame->pixels_length != 0) memcpy(out->pixels, frame->pixels, frame->pixels_length);
+  if (frame->has_audio && frame->audio.samples_s16 != NULL) {
+    size_t count = frame->audio.sample_count == 0 ? 1 : frame->audio.sample_count;
+    out->audio.samples_s16 = (int16_t *)malloc(count * sizeof(int16_t));
+    if (out->audio.samples_s16 == NULL) goto oom;
+    memcpy(out->audio.samples_s16, frame->audio.samples_s16,
+           frame->audio.sample_count * sizeof(int16_t));
+  }
+  if (frame->has_audio && frame->audio.samples_u8 != NULL) {
+    size_t count = frame->audio.sample_count == 0 ? 1 : frame->audio.sample_count;
+    out->audio.samples_u8 = (uint8_t *)malloc(count);
+    if (out->audio.samples_u8 == NULL) goto oom;
+    memcpy(out->audio.samples_u8, frame->audio.samples_u8, frame->audio.sample_count);
+  }
+  return true;
+oom:
+  qa_cin_frame_dispose(out);
+  return false;
+}
+
+static void run_read_unwind(void *raw) {
+  run_unwind_state *state = (run_unwind_state *)raw;
+  qa_cin_playback *playback = state->playback;
+  if (playback->has_picture) qa_cin_frame_dispose(&playback->picture);
+  playback->has_picture = false;
+  if (playback->has_pending) {
+    playback->has_picture = copy_cin_frame(&playback->pending, &playback->picture);
+  }
 }
 
 bool qa_cin_playback_run(qa_cin_playback *playback, qa_media_clock clock,
@@ -413,28 +498,40 @@ bool qa_cin_playback_run(qa_cin_playback *playback, qa_media_clock clock,
   }
   int64_t time = milliseconds(clock);
   int64_t decoded = qa_cin_decoder_next_frame_index(&playback->decoder);
+  /* TS number arithmetic: decoded and epoch can be any restored safe integer,
+   * so the products round as doubles. */
   if (focus != QA_MEDIA_FOCUS_GAME) {
-    playback->epoch = time - decoded * 1000 / 14;
+    playback->epoch = (int64_t)((double)time - trunc((double)decoded * 1000.0 / 14.0));
     out->status = playback->state;
     out->update_kind = QA_CIN_UPDATE_UNCHANGED;
     return true;
   }
-  int64_t frame = (time - playback->epoch) * 14 / 1000;
-  if (frame <= decoded) {
+  double frame = trunc((double)(time - playback->epoch) * 14.0 / 1000.0);
+  if (frame <= (double)decoded) {
     out->status = playback->state;
     out->update_kind = QA_CIN_UPDATE_UNCHANGED;
     return true;
   }
-  if (frame > decoded + 1) {
+  if (frame > (double)decoded + 1) {
     if (playback->options.developer_print != NULL) {
-      char message[96];
-      snprintf(message, sizeof message, "Dropped frame: %lld > %lld\n",
-               (long long)frame, (long long)(decoded + 1));
+      char message[128];
+      snprintf(message, sizeof message, "Dropped frame: %s > %s\n",
+               QA_JS_NUMBER(frame), QA_JS_NUMBER((double)decoded + 1));
       playback->options.developer_print(
           playback->options.developer_print_ctx, message);
     }
-    playback->epoch = time - decoded * 1000 / 14;
+    playback->epoch = (int64_t)((double)time - trunc((double)decoded * 1000.0 / 14.0));
   }
+  /* Read first; the swap below is what TS did before its read, and a
+   * throwing read is mapped onto the TS state by run_read_unwind. */
+  qa_cin_frame next;
+  bool has_next = false;
+  run_unwind_state unwind = {playback};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, run_read_unwind, &unwind);
+  bool read_ok = playback_read(playback, &next, &has_next);
+  qa_cleanup_pop(&guard);
+  if (!read_ok) return false;
   qa_cin_frame previous;
   bool has_previous = playback->has_picture;
   if (has_previous) {
@@ -444,12 +541,8 @@ bool qa_cin_playback_run(qa_cin_playback *playback, qa_media_clock clock,
   }
   playback->picture = playback->pending;
   playback->has_picture = playback->has_pending;
-  memset(&playback->pending, 0, sizeof playback->pending);
-  playback->has_pending = false;
-  if (!playback_read(playback, &playback->pending, &playback->has_pending)) {
-    if (has_previous) qa_cin_frame_dispose(&previous);
-    return false;
-  }
+  playback->pending = next;
+  playback->has_pending = has_next;
   if (!playback->has_pending) {
     if (playback->options.hold) {
       if (!playback->has_picture && has_previous) {
@@ -460,10 +553,6 @@ bool qa_cin_playback_run(qa_cin_playback *playback, qa_media_clock clock,
       playback->state = QA_CIN_PLAYBACK_HELD;
     } else if (playback->options.loop) {
       playback->pass++;
-      if (playback->has_picture) {
-        qa_cin_frame_dispose(&playback->picture);
-        playback->has_picture = false;
-      }
       if (!qa_cin_playback_restart(playback, clock)) {
         if (has_previous) qa_cin_frame_dispose(&previous);
         return false;

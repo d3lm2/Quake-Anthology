@@ -2,6 +2,7 @@
 #include "qa/network/q3/download.h"
 #include "qa/core/common_error.h"
 #include "qa/core/numeric.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/network/q3/pure.h"
 #include <math.h>
@@ -108,15 +109,14 @@ void qa_q3_server_download_write(qa_q3_server_download *d, qa_q3_message_writer 
     d->current_block = (int32_t)((uint32_t)d->current_block + 1u);
   }
   if (d->count == d->size && !d->eof && (int64_t)d->current_block - d->client_block < 8) {
-    d->block_sizes[d->current_block % 8] = 0;
+    /* A negative Int32Array index is no store in TS. */
+    if (d->current_block % 8 >= 0) d->block_sizes[d->current_block % 8] = 0;
     d->current_block = (int32_t)((uint32_t)d->current_block + 1u);
     d->eof = true;
   }
   double rate = settings->rate;
-  if (settings->max_rate != 0) {
-    double cap = settings->max_rate < 1000 ? 1000 : settings->max_rate;
-    rate = rate < cap ? rate : cap;
-  }
+  /* Math.min(rate, Math.max(1000, maxRate)): a NaN operand stays NaN (one block below). */
+  if (settings->max_rate != 0) rate = qa_js_min(rate, qa_js_max(1000, settings->max_rate));
   int64_t blocks;
   if (rate == 0) blocks = 1;
   else {

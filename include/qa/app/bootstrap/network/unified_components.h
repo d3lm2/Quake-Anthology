@@ -1,9 +1,8 @@
 /* Port of src/app/bootstrap/network/unified-components.ts.
- * ModIdentity has no landed writer: identities carry their wire
+ * ModIdentity is written from its wire tree: identities carry their
  * qa_save_value tree alongside the parsed form (read fills both;
  * write clones the tree). Player-state slot storage (64 doubles)
- * rides beside each qa_q3_player_state as the landed record codec
- * requires. GPL-2.0-or-later. */
+ * rides beside each qa_q3_player_state as the record codec requires. GPL-2.0-or-later. */
 #ifndef QA_APP_BOOTSTRAP_NETWORK_UNIFIED_COMPONENTS_H
 #define QA_APP_BOOTSTRAP_NETWORK_UNIFIED_COMPONENTS_H
 #include <stdbool.h>
@@ -75,4 +74,10 @@ qa_save_value *qa_app_unified_write_component_frames(const qa_app_unified_compon
 qa_app_unified_component_frames qa_app_unified_read_component_frames(
     const qa_save_reader *reader, const qa_app_unified_identity_decoder *identity);
 void qa_app_unified_component_frames_free(qa_app_unified_component_frames *frames);
+/* An owned copy of an identity's strings and lists (owner, mod identity, abi, runtime; NULL
+ * strings stay NULL) in one allocation returned through *block, released with free(). The wire
+ * tree is not copied (identity_wire is NULL). Consumers keep these so a decoded update or frame
+ * can be freed once it is applied (TS entries hold the objects themselves). */
+qa_app_unified_component_identity qa_app_unified_component_identity_clone(
+    const qa_app_unified_component_identity *source, void **block);
 #endif

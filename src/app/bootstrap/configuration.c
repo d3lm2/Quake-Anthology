@@ -1,6 +1,8 @@
 /* Port of src/app/bootstrap/configuration.ts. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "qa/app/bootstrap/configuration.h"
+#include "qa/app/bootstrap/native_settings.h"
+#include "qa/app/bootstrap/seat_profile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,63 +34,6 @@ qa_command_dialect qa_app_configuration_dialect_for(qa_game_family family, const
   if (family == QA_GAME_FAMILY_Q2) return edition && strcmp(edition, "rerelease") == 0 ? QA_COMMAND_DIALECT_Q2_RERELEASE : QA_COMMAND_DIALECT_Q2_CLASSIC;
   return QA_COMMAND_DIALECT_Q3;
 }
-qa_command_dialect qa_app_configuration_dialect(qa_app_configuration_host host, const qa_app_configuration_content *content) {
-  qa_app_application_configuration_selection selection = qa_app_configuration_content_selection(content);
-  qa_game_family family = QA_GAME_FAMILY_Q1;
-  const char *edition = NULL, *directory = NULL, *user_root = NULL, *base = NULL;
-  host.product(host.ctx, selection.engine_behavior.content, &family, &edition, &directory, &user_root, &base);
-  return qa_app_configuration_dialect_for(family, edition);
-}
-bool qa_app_configuration_store(qa_app_configuration_host host, const qa_app_options *options,
-                                const qa_app_configuration_content *content, const char *reference, qa_config_store *out) {
-  (void)content;
-  qa_game_family family = QA_GAME_FAMILY_Q1;
-  const char *edition = NULL, *directory = NULL, *user_root = NULL, *base = NULL;
-  host.product(host.ctx, reference, &family, &edition, &directory, &user_root, &base);
-  if (user_root) return qa_config_store_init(out, user_root);
-  char *fallback = options->user_content_root ? NULL : qa_default_user_content_root();
-  char *path = qa_user_product_directory(options->user_content_root ? options->user_content_root : fallback, directory);
-  bool ok = qa_config_store_init(out, path);
-  free(path);
-  free(fallback);
-  return ok;
-}
-bool qa_app_legacy_configuration_options(qa_app_configuration_host host, const qa_app_options *options, const char *reference,
-                                         qa_app_legacy_console_config_sources *out, const char **roots_storage, size_t capacity, char **owned_storage) {
-  qa_game_family family = QA_GAME_FAMILY_Q1;
-  const char *edition = NULL, *directory = NULL, *user_root = NULL, *base = NULL;
-  host.product(host.ctx, reference, &family, &edition, &directory, &user_root, &base);
-  if (family != QA_GAME_FAMILY_Q1 || (edition && strcmp(edition, "quakeworld") == 0)) return false;
-  char *fallback = options->user_content_root ? NULL : qa_default_user_content_root();
-  const char *shared_root = options->user_content_root ? options->user_content_root : fallback;
-  owned_storage[0] = fallback;
-  const char *directories[64];
-  const char *roots[64];
-  size_t count = host.q1_products(host.ctx, directories, roots, 64);
-  size_t written = 0;
-  /* Selected product first, then every q1 non-quakeworld product. */
-  const char *selected_root = user_root;
-  char *selected_owned = NULL;
-  if (!selected_root) selected_owned = qa_user_product_directory(shared_root, directory);
-  roots_storage[written++] = selected_root ? selected_root : selected_owned;
-  owned_storage[1] = selected_owned;
-  for (size_t i = 0; i < count && written < capacity; i++) {
-    const char *root = roots[i];
-    char *owned = NULL;
-    if (!root) owned = qa_user_product_directory(shared_root, directories[i]);
-    const char *value = root ? root : owned;
-    bool seen = false;
-    for (size_t j = 0; j < written; j++) if (strcmp(roots_storage[j], value) == 0) seen = true;
-    if (seen) { free(owned); continue; }
-    roots_storage[written] = value;
-    owned_storage[1 + written] = owned;
-    written++;
-  }
-  out->shared_root = shared_root;
-  out->game_roots = roots_storage;
-  out->game_root_count = written;
-  return true;
-}
 static const char *const routed_commands[] = {
     "save", "load", "weapnext", "weapprev", "use", "weapon", "say", "say_team", "connect", "disconnect", "quit",
     "mvdconnect", "mvdisconnect", "in_restart", "midiinfo", "local_join", "local_drop", "downloadstatus", "stopdownload",
@@ -98,17 +43,6 @@ static const char *const routed_commands[] = {
 const char *const *qa_app_configuration_routed_commands(size_t *out_count) {
   *out_count = sizeof routed_commands / sizeof routed_commands[0];
   return routed_commands;
-}
-qa_app_configuration_content *qa_app_open_initial_configuration_content(qa_app_configuration_host host, qa_app_content_host content_host,
-                                                                        qa_app_options options, const qa_executable_recipe *recipe, bool has_recipe) {
-  (void)options; (void)recipe; (void)has_recipe;
-  qa_app_configuration_request request = {has_recipe ? "recipe" : "launch", NULL, {0}};
-  qa_app_configuration_content *content = qa_app_open_application_configuration_content(content_host, request);
-  if (content && host.open_initial) {
-    const char *error = host.open_initial(host.ctx, content);
-    if (error) qa_range_error("%s", error);
-  }
-  return content;
 }
 const char *qa_app_configuration_dialect_name(qa_command_dialect dialect) {
   switch (dialect) {
@@ -143,7 +77,7 @@ qa_command_dialect qa_app_configuration_movement_dialect_for(const qa_provider_t
   for (size_t i = 0; i < timing_count; i++)
     if (timing[i].provider && movement_provider && strcmp(timing[i].provider, movement_provider) == 0)
       return dialect_for_clock(timing[i].clock.kind);
-  qa_range_error("Configuration has no timing for %s", movement_provider ? movement_provider : "");
+  qa_raise("Error", 0, 0, "Configuration has no timing for %s", movement_provider ? movement_provider : "");
 }
 qa_command_dialect qa_app_configuration_movement_dialect(const qa_app_application_configuration_selection *selection) {
   return qa_app_configuration_movement_dialect_for(&selection->timing, 1, selection->movement.provider);
@@ -193,6 +127,57 @@ bool qa_app_legacy_configuration_options_for_catalog(const qa_content_catalog *c
   out->game_root_count = written;
   return true;
 }
+qa_app_configuration_layering qa_app_configuration_layering_open(const qa_content_catalog *catalog,
+    const qa_app_options *options, const char *reference, const char *const *components, size_t component_count) {
+  const char *single[1] = {reference};
+  if (components == NULL) { components = single; component_count = 1; }
+  qa_app_configuration_layering layering = {NULL, NULL};
+  layering.native = qa_app_stock_native_config(catalog, reference, components, component_count,
+      options->native_config_root, true, options->user_content_root);
+  if (layering.native == NULL) layering.mixed = qa_app_mixed_game_layers(catalog, reference, options->user_content_root);
+  return layering;
+}
+void qa_app_configuration_layering_apply(const qa_app_configuration_layering *layering,
+    qa_app_console_script_files_options *files) {
+  files->native = layering->native != NULL ? &layering->native->config : NULL;
+  files->mixed_layers = layering->mixed != NULL ? &layering->mixed->layers : NULL;
+}
+void qa_app_configuration_layering_destroy(qa_app_configuration_layering *layering) {
+  qa_app_stock_native_destroy(layering->native);
+  qa_app_mixed_layers_destroy(layering->mixed);
+  layering->native = NULL;
+  layering->mixed = NULL;
+}
+void qa_app_selection_components(const qa_app_application_configuration_selection *selection,
+    const char *out[QA_APP_SELECTION_COMPONENT_COUNT]) {
+  out[0] = selection->source.content;
+  out[1] = selection->engine_behavior.content;
+  out[2] = selection->match.content;
+  out[3] = selection->combat.content;
+  out[4] = selection->movement.content;
+}
+const qa_config_store *qa_app_movement_configuration_store(const qa_content_catalog *catalog, const qa_app_options *options,
+    const qa_app_application_configuration_selection *selection, const qa_config_store *settings,
+    qa_config_store *storage, bool *out_owned) {
+  *out_owned = false;
+  const char *owner = selection->movement.content;
+  if (strcmp(owner, selection->engine_behavior.content) == 0) return settings;
+  const qa_catalog_discovered_product *product = qa_content_catalog_product(catalog, owner);
+  bool ok;
+  if (product->user_content && product->user_content->root) {
+    ok = qa_config_store_init_legacy(storage, product->user_content->root, settings);
+  } else {
+    char *fallback = options->user_content_root ? NULL : qa_default_user_content_root();
+    char *path = qa_user_product_directory(options->user_content_root ? options->user_content_root : fallback,
+                                           product->expectation.content_directory);
+    ok = path != NULL && qa_config_store_init_legacy(storage, path, settings);
+    free(path);
+    free(fallback);
+  }
+  if (!ok) qa_range_error("Out of memory");
+  *out_owned = true;
+  return storage;
+}
 /* ---- TS sourceConsoleScripts ---- */
 typedef struct source_scripts {
   qa_app_main_mount_lease lease; bool released;
@@ -200,6 +185,7 @@ typedef struct source_scripts {
   qa_app_source_script_reader reader;
   const char **game_roots; char **owned_roots; size_t owned_count;
   char *console_root;
+  qa_app_configuration_layering layering;
 } source_scripts;
 static bool source_scripts_open(void *ctx, const char *name, uint8_t **out_bytes, size_t *out_count) {
   source_scripts *scripts = ctx;
@@ -226,6 +212,7 @@ static void source_scripts_release(void *ctx) {
   qa_app_source_script_reader_destroy(scripts->reader);
   for (size_t i = 0; i < scripts->owned_count; i++) free(scripts->owned_roots[i]);
   free(scripts->owned_roots); free(scripts->game_roots); free(scripts->console_root);
+  qa_app_configuration_layering_destroy(&scripts->layering);
   free(scripts);
 }
 qa_app_console_script_files *qa_app_source_console_scripts(qa_app_loaded_content *content, const qa_app_options *options,
@@ -244,6 +231,10 @@ qa_app_console_script_files *qa_app_source_console_scripts(qa_app_loaded_content
   scripts->owned_count = capacity + 1;
   scripts->console_root = qa_app_console_config_root(options->user_content_root);
   if (scripts->game_roots == NULL || scripts->owned_roots == NULL || scripts->console_root == NULL) qa_range_error("Out of memory");
+  const char *components[QA_APP_RECIPE_COMPONENT_COUNT];
+  qa_app_recipe_components(qa_app_loaded_content_recipe(content), components);
+  scripts->layering = qa_app_configuration_layering_open(catalog, options, source, components, QA_APP_RECIPE_COMPONENT_COUNT);
+  qa_app_configuration_layering_apply(&scripts->layering, &files);
   files.has_legacy_config = qa_app_legacy_configuration_options_for_catalog(catalog, options, source, &files.legacy_config,
       scripts->game_roots, capacity, scripts->owned_roots);
   files.console_root = scripts->console_root;
@@ -324,31 +315,6 @@ qa_app_configuration_command_request qa_app_configuration_make_request(const cha
   request.source = source;
   return request;
 }
-qa_app_configuration_content *qa_app_open_initial_configuration_content_for_catalog(qa_app_content_host content_host,
-    const qa_content_catalog *catalog, qa_app_options *options, const qa_executable_recipe *recipe, bool has_recipe,
-    const qa_app_q3_product_host *q3_host) {
-  const char *content_id = has_recipe && recipe ? recipe->map.entities.content : options->product;
-  qa_app_prepared_q3_product prepared = qa_app_prepare_q3_application_product(catalog, content_id, options, q3_host);
-  catalog = prepared.catalog;
-  if (prepared.has_q3_product) {
-    options->has_q3_product = true;
-    options->q3_product = prepared.q3_product;
-  }
-  qa_app_configuration_content *content;
-  if (has_recipe) {
-    qa_app_configuration_request request = {"recipe", NULL, {0}};
-    content = qa_app_open_application_configuration_content(content_host, request);
-  } else {
-    qa_launch_preset preset = qa_app_application_configuration_preset(content_host, options);
-    qa_app_configuration_request request = {"launch", &preset, qa_preset_choice(preset.id)};
-    content = qa_app_open_application_configuration_content(content_host, request);
-  }
-  if (content) {
-    qa_app_configuration_content_set_catalog(content, catalog);
-    if (options->has_q3_product) qa_app_configuration_content_set_q3_product(content, &options->q3_product);
-  }
-  return content;
-}
 /* --- configurationScriptReader --- */
 static uint8_t *reader_mounted(void *ctx, const char *name, size_t *out_length) {
   uint8_t *bytes = NULL;
@@ -394,6 +360,9 @@ struct qa_app_prepared_initial {
   qa_app_prepared_startup *prepared;
   qa_app_image_settings *image;
   qa_app_options options;
+  /* The options prepareInitialConfiguration was called with (with the content's q3Product): applyLaunchOptions
+   * resolves from these each time it runs (TS closure), not from the previous result. */
+  qa_app_options launch_options;
   double max_clients;
   qa_app_configuration_command_request *requests;
   size_t request_count, request_capacity;
@@ -409,8 +378,10 @@ struct qa_app_prepared_initial {
   qa_cvar_archive_entry *movement_archive; size_t movement_archive_count;
   qa_cvar_archive_entry *fallback_archive; size_t fallback_archive_count;
   char **shared_names; size_t shared_name_count;
-  /* applyLaunchOptions closure state. */
+  /* applyLaunchOptions closure state. The prepared startup prints through `args` for its lifetime, so the
+   * configuration keeps its own copy (the caller's arguments are usually on its stack). */
   const qa_app_prepare_initial_args *args;
+  qa_app_prepare_initial_args args_copy;
   qa_app_application_configuration_selection selection;
   qa_app_team_arena_launch_overrides *team_arena;
   bool resolved;
@@ -490,7 +461,7 @@ static void set_image_number(qa_app_prepared_initial *initial, const char *name,
 }
 static void initial_apply_launch(void *ctx) {
   qa_app_prepared_initial *initial = ctx;
-  const qa_app_options *options = &initial->options;
+  const qa_app_options *options = &initial->launch_options;
   const char *original_mode = options->mode;
   const void *original_skirmish = options->team_arena_skirmish;
   if (initial->team_arena != NULL) {
@@ -523,18 +494,20 @@ static void initial_apply_launch(void *ctx) {
   if (original_skirmish != NULL) initial->options.mode = original_mode;
   if (initial->image != NULL) {
     qa_cvar_registry *image_cvars = qa_app_image_settings_cvars(initial->image);
-    if (initial->options.has_render_worker)
-      set_cvar_text(image_cvars, "r_smp", initial->options.render_worker ? "1" : "0", true);
-    if (initial->options.has_display_width) set_image_number(initial, "r_customwidth", initial->options.display_width);
-    if (initial->options.has_display_height) set_image_number(initial, "r_customheight", initial->options.display_height);
-    if (initial->options.has_display_gamma) set_image_number(initial, "r_gamma", initial->options.display_gamma);
+    if (options->has_render_worker)
+      set_cvar_text(image_cvars, "r_smp", options->render_worker ? "1" : "0", true);
+    if (options->has_display_width) set_image_number(initial, "r_customwidth", options->display_width);
+    if (options->has_display_height) set_image_number(initial, "r_customheight", options->display_height);
+    if (options->has_display_gamma) set_image_number(initial, "r_gamma", options->display_gamma);
   }
 }
 qa_app_prepared_initial *qa_app_prepare_initial_configuration(qa_app_options *options_in,
     const qa_app_prepare_initial_args *args) {
   qa_app_prepared_initial *initial = calloc(1, sizeof *initial);
   if (!initial) qa_range_error("Out of memory");
-  initial->args = args;
+  if (args->pending != NULL) *args->pending = initial;
+  initial->args_copy = *args;
+  args = initial->args = &initial->args_copy;
   initial->scripts = args->scripts;
   qa_app_options options = *options_in;
   qa_q3_application_product content_q3;
@@ -543,7 +516,12 @@ qa_app_prepared_initial *qa_app_prepare_initial_configuration(qa_app_options *op
     options.q3_product = content_q3;
   }
   initial->options = options;
+  initial->launch_options = options;
   initial->selection = qa_app_configuration_content_selection(args->content);
+  qa_config_store input_store_storage = {NULL};
+  bool owns_input_store = false;
+  const qa_config_store *input_store = qa_app_movement_configuration_store(args->catalog, &options, &initial->selection,
+      args->settings, &input_store_storage, &owns_input_store);
   qa_command_dialect dialect = qa_app_configuration_dialect_in_catalog(args->catalog, args->content);
   qa_command_dialect movement = qa_app_configuration_movement_dialect(&initial->selection);
   qa_command_context context = {0};
@@ -701,16 +679,14 @@ qa_app_prepared_initial *qa_app_prepare_initial_configuration(qa_app_options *op
     initial->mouse_cvars[index] = mouse_cvars;
     qa_mouse_settings mouse = {NULL};
     qa_mouse_settings_init(&mouse, mouse_cvars);
-    char *profile_name = qa_app_configuration_seat_profile_name(index);
     initial->has_profile[index] = !options.dedicated
-        && qa_config_store_load_seat(args->settings, profile_name, &initial->profiles[index]);
-    free(profile_name);
+        && qa_app_load_seat_profile(input_store, options.user_content_root, (double)index, &initial->profiles[index]);
     if (!options.dedicated && has_client_store)
       initial->archives[index] = qa_app_configuration_load_client_archive(&client_store,
           initial->selection.engine_behavior.content, initial->selection.engine_behavior.provider,
           index, dialect, &initial->archive_counts[index]);
     if (!options.dedicated)
-      initial->mouse_archives[index] = qa_app_configuration_load_input_archive(args->settings, index,
+      initial->mouse_archives[index] = qa_app_configuration_load_input_archive(input_store, index,
           dialect, &initial->mouse_archive_counts[index]);
     configs[index].context = seat_context;
     configs[index].id = id;
@@ -760,10 +736,8 @@ qa_app_prepared_initial *qa_app_prepare_initial_configuration(qa_app_options *op
   }
   initial->max_clients = args->default_capacity;
   if (args->on_prepared) args->on_prepared(args->on_prepared_ctx, initial->prepared);
-  if (!options.dedicated) {
-    initial->movement_archive = qa_app_configuration_load_movement_archive(args->settings, movement, &initial->movement_archive_count);
-    initial->fallback_archive = qa_app_configuration_load_fallback_archive(args->settings, dialect, &initial->fallback_archive_count);
-  }
+  initial->movement_archive = qa_app_configuration_load_movement_archive(input_store, movement, &initial->movement_archive_count);
+  initial->fallback_archive = qa_app_configuration_load_fallback_archive(input_store, dialect, &initial->fallback_archive_count);
   qa_app_prepared_scoped_read_fn read = NULL;
   void *read_ctx = NULL;
   qa_app_configuration_script_reader(args->catalog, &initial->selection, &options, args->scripts, &read, &read_ctx);
@@ -785,6 +759,7 @@ qa_app_prepared_initial *qa_app_prepare_initial_configuration(qa_app_options *op
   execute.fallback_archive = initial->fallback_archive;
   execute.fallback_archive_count = initial->fallback_archive_count;
   qa_app_prepared_startup_execute(initial->prepared, &execute);
+  if (owns_input_store) qa_config_store_destroy(&input_store_storage);
   free(audio.menu_track);
   free(audio.device_name);
   return initial;
@@ -877,7 +852,10 @@ typedef struct profile_named {
   const char *name;
 } profile_named;
 struct qa_app_prepared_profile {
+  /* The continuation reads the arguments after the call returns: the profile keeps a copy (and of its seats). */
   const qa_app_prepare_profile_args *args;
+  qa_app_prepare_profile_args args_copy;
+  qa_app_profile_seat *seats_copy;
   qa_app_options options;
   qa_app_application_configuration_selection selection;
   qa_command_dialect dialect, movement_dialect;
@@ -910,6 +888,10 @@ struct qa_app_prepared_profile {
   qa_cvar_archive_entry *fallback_archive; size_t fallback_archive_count;
   qa_cvar_archive_entry *shared_archive; size_t shared_archive_count;
   profile_named **named; size_t named_count, named_capacity;
+  /* TS inputStore (movementConfigurationStore) and mixedHigh. */
+  const qa_config_store *input_store; qa_config_store input_store_storage; bool owns_input_store;
+  const qa_effective_set *mixed_high; /* NULL = TS null; points at mixed_high_storage */
+  qa_effective_set mixed_high_storage;
   qa_app_q1_client_commands *q1_registration;
   qa_app_q2_client_commands *q2_registration;
   /* Routing server() snapshot-name storage (rebuilt per call). */
@@ -1029,7 +1011,7 @@ static profile_current_seat profile_current(qa_app_prepared_profile *profile, qa
         return out;
       }
   }
-  qa_range_error("Configuration seat has retired");
+  qa_raise("Error", 0, 0, "Configuration seat has retired");
 }
 static bool profile_bindings(qa_app_prepared_profile *profile, qa_seat_id id, qa_binding_command_seat *out) {
   if (profile->published == NULL)
@@ -1052,7 +1034,7 @@ static void profile_apply_defaults(qa_app_prepared_profile *profile, qa_seat_id 
   profile_choice *choices = profile_choice_for(profile, id);
   qa_binding_command_seat bindings = {0};
   bool has_bindings = profile_bindings(profile, id, &bindings);
-  if (choices == NULL || !has_bindings) qa_range_error("Profile defaults belong to another seat");
+  if (choices == NULL || !has_bindings) qa_raise("Error", 0, 0, "Profile defaults belong to another seat");
   choices->selected = defaults;
   choices->selected_count = default_count;
   profile_publish_choices(profile, id);
@@ -1112,15 +1094,19 @@ static void profile_execute_client(void *ctx, const char *name, const char *cons
   (void)seat;
   profile_dispatch(ctx, name, arguments, argument_count, source);
 }
+typedef struct profile_read_call {
+  qa_app_prepared_profile *profile; const char *name; qa_command_context source; char *text;
+} profile_read_call;
+static void profile_read_body(void *ctx) {
+  profile_read_call *call = ctx;
+  call->text = call->profile->active != NULL ? qa_app_startup_config_read_script(call->profile->active, call->name, call->source)
+      : qa_app_console_script_files_read(call->profile->args->scripts, call->name, call->source);
+}
+/* TS readScript: active?.readScript(name, context) ?? scripts.read(name, context), a promise; a read that rejects
+ * settles the exec as failed (qa_app_script_read_settle). */
 static qa_script_read_result profile_read_script(void *ctx, const char *name, qa_command_context source) {
-  qa_app_prepared_profile *profile = ctx;
-  qa_script_read_result result = {0};
-  result.kind = QA_SCRIPT_READ_READY;
-  result.has_text = true;
-  result.text = profile->active != NULL ? qa_app_startup_config_read_script(profile->active, name, source)
-      : qa_app_console_script_files_read(profile->args->scripts, name, source);
-  if (result.text == NULL) result.has_text = false;
-  return result;
+  profile_read_call call = {ctx, name, source, NULL};
+  return qa_app_script_read_settle(profile_read_body, &call, &call.text);
 }
 static void profile_script_complete(void *ctx, const qa_script_completion *event) {
   qa_app_prepared_profile *profile = ctx;
@@ -1209,7 +1195,7 @@ static void profile_apply_startup_variables(qa_app_prepared_profile *profile) {
     set_cvar_text(owner, variable->name, variable->value, true);
     qa_cvar_snapshot registered = {0};
     if (!qa_cvar_registry_register(owner, variable->name, "", 0, &registered))
-      qa_range_error("Q3 startup variable registration rejected: %s", variable->name);
+      qa_raise("Error", 0, 0, "Q3 startup variable registration rejected: %s", variable->name);
     qa_cvar_registry_add_flags(owner, registered.name, QA_CVAR_FLAG_USER_CREATED);
     qa_cvar_read_free(&registered);
   }
@@ -1238,8 +1224,49 @@ static bool profile_weapon_text(const qa_input_binding *binding) {
 static qa_binding_command_seat profile_seat_bindings(qa_app_prepared_profile *profile) {
   qa_binding_command_seat bindings = {0};
   if (!profile_bindings(profile, profile->seats[profile->index].id, &bindings))
-    qa_range_error("Prepared configuration has no binding owner");
+    qa_raise("Error", 0, 0, "Prepared configuration has no binding owner");
   return bindings;
+}
+/* TS `owned(entries)`: native?.filterArchive(entries) ?? entries, applied. */
+static void apply_archive_owned(const qa_native_config *native, qa_cvar_registry *registry,
+    const qa_cvar_archive_entry *entries, size_t count) {
+  if (native == NULL || count == 0) {
+    qa_cvar_registry_apply_archive(registry, entries, count);
+    return;
+  }
+  qa_cvar_archive_entry *kept = profile_xcalloc(count, sizeof *kept);
+  size_t kept_count = 0;
+  for (size_t i = 0; i < count; i++)
+    if (qa_native_config_keeps_archive_entry(native, entries[i].name)) kept[kept_count++] = entries[i];
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, kept);
+  qa_cvar_registry_apply_archive(registry, kept, kept_count);
+  qa_cleanup_pop(&guard);
+  free(kept);
+}
+/* scripts.layers?.noteDefaultBinds(archivedBindingPairs(bindings())) */
+static void note_default_binds(qa_game_layers *layers, const qa_input_binding *bindings, size_t count) {
+  if (layers == NULL) return;
+  size_t pair_count = 0;
+  qa_binding_pair *pairs = qa_archived_binding_pairs(bindings, count, false, &pair_count);
+  if (pairs == NULL && pair_count > 0) qa_range_error("Out of memory");
+  qa_layer_pair *view = profile_xcalloc(pair_count + 1, sizeof *view);
+  for (size_t i = 0; i < pair_count; i++) view[i] = (qa_layer_pair){pairs[i].key, pairs[i].command};
+  qa_game_layers_note_default_binds(layers, view, pair_count);
+  free(view);
+  qa_binding_pairs_free(pairs, pair_count);
+}
+/* bindings().bind(binding); choices.overridden.add(physicalInputKey(binding.input)) for what the native file cannot carry. */
+static void bind_uncarried(qa_binding_command_seat bindings, profile_choice *choices,
+    const qa_input_binding *list, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    if (qa_native_config_carries(&list[i])) continue;
+    if (!bindings.bind(bindings.ctx, &list[i])) qa_range_error("Out of memory");
+    char *key = qa_physical_input_key(&list[i].input);
+    if (!key) qa_range_error("Out of memory");
+    choice_overridden_add(choices, key);
+    free(key);
+  }
 }
 static void profile_apply_selected_defaults(void *ctx) {
   qa_app_prepared_profile *profile = ctx;
@@ -1266,6 +1293,10 @@ static void profile_apply_selected_defaults(void *ctx) {
   choices->authored = profile_map_values(&authored, &choices->authored_count);
   choices->has_authored = true;
   profile_map_free(&authored);
+  if (index == 0) {
+    current = bindings.bindings(bindings.ctx, &current_count);
+    note_default_binds(qa_app_console_script_files_layers(profile->args->scripts), current, current_count);
+  }
   profile->collecting = true;
   profile_publish_choices(profile, profile->seats[index].id);
 }
@@ -1278,12 +1309,53 @@ static bool profile_target_equal(const qa_input_binding_target *left, bool has_l
   if (left->text == NULL || right->text == NULL) return left->text == right->text;
   return strcmp(left->text, right->text) == 0;
 }
+/* A layers value (UTF-8, from JSON) as console text, one byte per code unit; a character above U+00FF keeps the
+ * UTF-8 (TS holds the string as it is). */
+static char *layer_console_text(const char *utf8) {
+  char *bytes = NULL;
+  if (qa_command_text_from_utf8(utf8, &bytes)) return bytes;
+  char *copy = strdup(utf8);
+  if (copy == NULL) qa_range_error("Out of memory");
+  return copy;
+}
 static void profile_apply_archive(void *ctx) {
   qa_app_prepared_profile *profile = ctx;
   size_t index = profile->index;
   qa_seat_id id = profile->seats[index].id;
   profile_choice *choices = &profile->choices[index];
   const qa_app_profile_client_source *client = profile->args->client_source;
+  const qa_native_config *native = qa_app_console_script_files_native(profile->args->scripts);
+  if (index == 0 && profile->mixed_high != NULL) {
+    const qa_effective_set *layered = profile->mixed_high;
+    for (size_t i = 0; i < layered->cvars.count; i++) {
+      const qa_layer_entry *entry = &layered->cvars.entries[i];
+      qa_cvar_registry *owner = qa_app_console_routing_owner(profile->routing, entry->name, profile->seats[index].context);
+      qa_cvar_read found;
+      if (qa_cvar_registry_find(owner, entry->name, &found)) {
+        qa_cvar_read_free(&found);
+        char *value = layer_console_text(entry->value);
+        qa_cvar_registry_set_command_flags(owner, entry->name, value, QA_CVAR_COMMAND_FLAG_ARCHIVE);
+        free(value);
+      }
+    }
+    qa_binding_command_seat layered_bindings = profile_seat_bindings(profile);
+    for (size_t i = 0; i < layered->unbound.count; i++) {
+      qa_physical_input input;
+      if (qa_named_physical_input(layered->unbound.entries[i].name, 0, &input))
+        layered_bindings.unbind(layered_bindings.ctx, &input);
+    }
+    for (size_t i = 0; i < layered->binds.count; i++) {
+      const qa_layer_entry *bind = &layered->binds.entries[i];
+      qa_input_binding binding = {0};
+      if (!qa_named_physical_input(bind->name, 0, &binding.input) || bind->value == NULL) continue;
+      binding.target.is_action = false;
+      char *command = layer_console_text(bind->value);
+      binding.target.text = command;
+      bool bound = layered_bindings.bind(layered_bindings.ctx, &binding);
+      free(command);
+      if (!bound) qa_range_error("Out of memory");
+    }
+  }
   if (index == 0) {
     qa_cvar_registry *source = profile->published != NULL
         ? qa_app_prepared_startup_source(profile->published) : profile->source;
@@ -1294,15 +1366,15 @@ static void profile_apply_archive(void *ctx) {
     qa_cvar_registry *shared = profile->published != NULL
         ? qa_app_prepared_startup_shared_cvars(profile->published) : profile->args->shared;
     if (client == NULL)
-      qa_cvar_registry_apply_archive(source, profile->args->source_archive, profile->args->source_archive_count);
-    qa_cvar_registry_apply_archive(movement, profile->movement_archive, profile->movement_archive_count);
-    qa_cvar_registry_apply_archive(fallback, profile->fallback_archive, profile->fallback_archive_count);
+      apply_archive_owned(native, source, profile->args->source_archive, profile->args->source_archive_count);
+    apply_archive_owned(native, movement, profile->movement_archive, profile->movement_archive_count);
+    apply_archive_owned(native, fallback, profile->fallback_archive, profile->fallback_archive_count);
     if (shared != NULL)
       qa_cvar_registry_apply_archive(shared, profile->shared_archive, profile->shared_archive_count);
   }
   profile_current_seat seat = profile_current(profile, id);
-  qa_cvar_registry_apply_archive(seat.cvars, profile->seats[index].archive, profile->seats[index].archive_count);
-  qa_cvar_registry_apply_archive(seat.mouse->cvars, profile->seats[index].mouse_archive,
+  apply_archive_owned(native, seat.cvars, profile->seats[index].archive, profile->seats[index].archive_count);
+  apply_archive_owned(native, seat.mouse->cvars, profile->seats[index].mouse_archive,
       profile->seats[index].mouse_archive_count);
   if (client != NULL) {
     const qa_cvar_archive_entry *entries = NULL;
@@ -1314,14 +1386,20 @@ static void profile_apply_archive(void *ctx) {
       entries = profile->args->source_archive;
       count = profile->args->source_archive_count;
     }
-    qa_cvar_registry_apply_archive(seat.cvars, entries, count);
+    apply_archive_owned(native, seat.cvars, entries, count);
   }
   profile_retained *retained = &profile->retained[index];
-  if (retained->present) {
+  /* A stock game's own files hold its bindings; a product's saved profile outranks bindings carried over from
+   * another product's front end. */
+  bool native_bindings = index == 0 && native != NULL && qa_native_config_suppresses_profile_bindings(native);
+  bool carried = retained->present && (!profile->has_profile[index] || native_bindings);
+  if (retained->present && carried) {
     qa_binding_command_seat bindings = profile_seat_bindings(profile);
-    bindings.unbind_all(bindings.ctx);
-    for (size_t i = 0; i < retained->binding_count; i++)
-      if (!bindings.bind(bindings.ctx, &retained->bindings[i])) qa_range_error("Out of memory");
+    if (!native_bindings) {
+      bindings.unbind_all(bindings.ctx);
+      for (size_t i = 0; i < retained->binding_count; i++)
+        if (!bindings.bind(bindings.ctx, &retained->bindings[i])) qa_range_error("Out of memory");
+    } else bind_uncarried(bindings, choices, retained->bindings, retained->binding_count);
     choices->all = retained->all;
     for (size_t i = 0; i < retained->overridden_count; i++) choice_overridden_add(choices, retained->overridden[i]);
     /* TS compares JSON.stringify of expected/current targets per key. */
@@ -1348,11 +1426,15 @@ static void profile_apply_archive(void *ctx) {
       }
     }
     profile_current_seat current_seat = profile_current(profile, id);
-    qa_mouse_settings_write(current_seat.mouse, retained->mouse);
-    if (retained->has_run)
+    if (!native_bindings) qa_mouse_settings_write(current_seat.mouse, retained->mouse);
+    if (retained->has_run && !native_bindings)
       qa_cvar_registry_set_command_flags(current_seat.mouse->cvars, "cl_run", retained->run,
           QA_CVAR_COMMAND_FLAG_ARCHIVE);
-  } else if (profile->has_profile[index]) {
+  } else if (profile->has_profile[index] && native_bindings) {
+    /* The game's own file holds its key and mouse bindings; controller and action bindings stay with the seat. */
+    const qa_seat_settings *seat_profile = &profile->profiles[index];
+    bind_uncarried(profile_seat_bindings(profile), choices, seat_profile->bindings, seat_profile->binding_count);
+  } else if (profile->has_profile[index] && !native_bindings) {
     const qa_seat_settings *seat_profile = &profile->profiles[index];
     qa_binding_command_seat bindings = profile_seat_bindings(profile);
     bindings.unbind_all(bindings.ctx);
@@ -1360,7 +1442,7 @@ static void profile_apply_archive(void *ctx) {
       if (!bindings.bind(bindings.ctx, &seat_profile->bindings[i])) qa_range_error("Out of memory");
     choices->all = true;
     profile_current_seat current_seat = profile_current(profile, id);
-    qa_mouse_settings_write(current_seat.mouse, seat_profile->mouse);
+    qa_mouse_settings_write(current_seat.mouse, retained->present ? retained->mouse : seat_profile->mouse);
     if (seat_profile->has_always_run)
       qa_cvar_registry_set_command_flags(current_seat.mouse->cvars, "cl_run",
           seat_profile->always_run ? "1" : "0", QA_CVAR_COMMAND_FLAG_ARCHIVE);
@@ -1543,7 +1625,7 @@ static qa_app_startup_config *profile_continuation_active(void *ctx) {
 }
 static bool profile_continuation_advance(void *ctx, qa_app_prepared_startup *owner) {
   qa_app_prepared_profile *profile = ctx;
-  if (owner != profile->published) qa_range_error("Configuration continuation belongs to another client");
+  if (owner != profile->published) qa_raise("Error", 0, 0, "Configuration continuation belongs to another client");
   return profile_run_step(profile);
 }
 static void profile_register_named(qa_app_prepared_profile *profile, const char *name) {
@@ -1566,7 +1648,12 @@ static void profile_register_named(qa_app_prepared_profile *profile, const char 
 qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *options_in,
     const qa_app_prepare_profile_args *args) {
   qa_app_prepared_profile *profile = profile_xcalloc(1, sizeof *profile);
-  profile->args = args;
+  if (args->pending != NULL) *args->pending = profile;
+  profile->args_copy = *args;
+  profile->seats_copy = profile_xcalloc(args->seat_count + 1, sizeof *profile->seats_copy);
+  for (size_t i = 0; i < args->seat_count; i++) profile->seats_copy[i] = args->seats[i];
+  profile->args_copy.seats = profile->seats_copy;
+  args = profile->args = &profile->args_copy;
   profile->seat_count = args->seat_count;
   qa_app_prepared_startup *prepared = args->prepared;
   const qa_app_profile_client_source *client = args->client_source;
@@ -1578,6 +1665,8 @@ qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *op
   }
   profile->options = options;
   profile->selection = qa_app_configuration_content_selection(args->content);
+  profile->input_store = qa_app_movement_configuration_store(args->catalog, options_in, &profile->selection, args->settings,
+      &profile->input_store_storage, &profile->owns_input_store);
   profile->dialect = qa_app_configuration_dialect_in_catalog(args->catalog, args->content);
   size_t timing_count = 0;
   const qa_provider_timing *timing = qa_app_configuration_content_timing(args->content, &timing_count);
@@ -1605,7 +1694,7 @@ qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *op
   }
   qa_app_register_gtv_cvars(profile->source);
   if (qa_cvar_registry_dialect(profile->source) != dialect)
-    qa_range_error("Configuration source dialect differs from its selected product");
+    qa_raise("Error", 0, 0, "Configuration source dialect differs from its selected product");
   qa_cvar_registry_options movement_options = {0};
   movement_options.dialect = movement_dialect;
   movement_options.context = qa_cvar_registry_context(prepared_movement);
@@ -1647,7 +1736,7 @@ qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *op
     qa_seat_id seat_id = qa_session_seat_id(seat);
     qa_client_id client_id = qa_session_client_id(qa_session_seat_client(seat));
     if (!qa_same_seat(qa_seat_input_seat(input), seat_id))
-      qa_range_error("Configuration input belongs to another seat");
+      qa_raise("Error", 0, 0, "Configuration input belongs to another seat");
     qa_command_context context = {0};
     context.session = seat_id.session;
     context.origin.kind = QA_COMMAND_ORIGIN_LOCAL_SEAT;
@@ -1674,7 +1763,7 @@ qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *op
           || cvar_context.origin.kind != QA_COMMAND_ORIGIN_LOCAL_SEAT
           || !qa_same_seat(cvar_context.origin.seat, seat_id)
           || !qa_same_client(cvar_context.origin.client, client_id))
-        qa_range_error("Client configuration requires its actual primary seat cvar owner");
+        qa_raise("Error", 0, 0, "Client configuration requires its actual primary seat cvar owner");
     }
     if (client == NULL) {
       qa_app_register_player_userinfo(cvars, (double)seat_id.index,
@@ -1701,14 +1790,13 @@ qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *op
     qa_mouse_settings mouse = {NULL};
     qa_mouse_settings_init(&mouse, mouse_cvars);
     qa_app_register_run_cvar(mouse_cvars, movement_dialect);
-    char *profile_name = qa_app_configuration_seat_profile_name((size_t)seat_id.index);
-    profile->has_profile[index] = qa_config_store_load_seat(args->settings, profile_name, &profile->profiles[index]);
-    free(profile_name);
+    profile->has_profile[index] = qa_app_load_seat_profile(profile->input_store, options.user_content_root,
+        (double)seat_id.index, &profile->profiles[index]);
     if (has_client_store)
       archives[index] = qa_app_configuration_load_client_archive(&client_store,
           profile->selection.engine_behavior.content, profile->selection.engine_behavior.provider,
           (size_t)seat_id.index, dialect, &archive_counts[index]);
-    mouse_archives[index] = qa_app_configuration_load_input_archive(args->settings,
+    mouse_archives[index] = qa_app_configuration_load_input_archive(profile->input_store,
         (size_t)seat_id.index, dialect, &mouse_counts[index]);
     profile->seats[index].context = context;
     profile->seats[index].id = seat_id;
@@ -1724,9 +1812,9 @@ qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *op
   if (has_client_store) qa_config_store_destroy(&client_store);
   /* The archive arrays ride the seat rows; keep the index arrays for
    * destroy by stashing them behind the profile (freed there). */
-  profile->movement_archive = qa_app_configuration_load_movement_archive(args->settings,
+  profile->movement_archive = qa_app_configuration_load_movement_archive(profile->input_store,
       movement_dialect, &profile->movement_archive_count);
-  profile->fallback_archive = qa_app_configuration_load_fallback_archive(args->settings,
+  profile->fallback_archive = qa_app_configuration_load_fallback_archive(profile->input_store,
       dialect, &profile->fallback_archive_count);
   {
     size_t shared_count = 0, device_count = 0;
@@ -1762,6 +1850,20 @@ qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *op
   if (profile->routing == NULL) qa_range_error("Out of memory");
   qa_app_configuration_script_reader(args->catalog, &profile->selection, &options,
       args->scripts, &profile->read, &profile->read_ctx);
+  /* A mixed combination has no native file: it starts from the high level, and its component-keyed store wins
+   * over that. */
+  if (qa_app_console_script_files_native(args->scripts) == NULL && qa_app_console_script_files_layers(args->scripts) != NULL) {
+    qa_layer_snapshot empty;
+    qa_layer_snapshot_init(&empty);
+    const qa_effective_set *resolved = qa_game_layers_resolve(qa_app_console_script_files_layers(args->scripts), &empty);
+    qa_layer_snapshot_destroy(&empty);
+    /* TS keeps the resolved object; the layers reuse theirs on the next resolve or absorb, so keep a copy. */
+    qa_effective_set_init(&profile->mixed_high_storage);
+    qa_layer_map_copy(&profile->mixed_high_storage.binds, &resolved->binds);
+    qa_layer_map_copy(&profile->mixed_high_storage.unbound, &resolved->unbound);
+    qa_layer_map_copy(&profile->mixed_high_storage.cvars, &resolved->cvars);
+    profile->mixed_high = &profile->mixed_high_storage;
+  }
   /* Binding choices + retained configurations (TS closure state). */
   profile->choices = profile_xcalloc(profile->seat_count + 1, sizeof *profile->choices);
   profile->retained = profile_xcalloc(profile->seat_count + 1, sizeof *profile->retained);
@@ -1836,6 +1938,8 @@ qa_app_prepared_profile *qa_app_prepare_profile_configuration(qa_app_options *op
   program_options.allow_command_ctx = profile;
   program_options.forward_to_server = profile_forward_to_server;
   program_options.forward_to_server_ctx = profile;
+  program_options.local_form = qa_app_note_local_form_fn;
+  program_options.local_form_ctx = qa_app_console_script_files_layers(args->scripts);
   qa_app_prepared_seat *program_inputs = profile_xcalloc(profile->seat_count + 1, sizeof *program_inputs);
   for (size_t i = 0; i < profile->seat_count; i++) {
     program_inputs[i].context = profile->seats[i].context;
@@ -1962,8 +2066,8 @@ size_t qa_app_prepared_profile_binding_choices(qa_app_prepared_profile *profile,
 }
 void qa_app_prepared_profile_publish_continuation(qa_app_prepared_profile *profile,
     qa_app_prepared_startup *owner) {
-  if (owner != profile->args->prepared) qa_range_error("Configuration continuation belongs to another client");
-  if (profile->published != NULL) qa_range_error("Configuration continuation already published");
+  if (owner != profile->args->prepared) qa_raise("Error", 0, 0, "Configuration continuation belongs to another client");
+  if (profile->published != NULL) qa_raise("Error", 0, 0, "Configuration continuation already published");
   profile->published = owner;
   if (!profile->complete) {
     qa_app_prepared_configuration_continuation continuation = {0};
@@ -1981,6 +2085,9 @@ void qa_app_prepared_profile_forward_commands(qa_app_prepared_profile *profile,
     qa_app_profile_forward_fn forward, void *forward_ctx) {
   profile->forward = forward;
   profile->forward_ctx = forward_ctx;
+}
+qa_app_prepared_startup *qa_app_prepared_profile_published(const qa_app_prepared_profile *profile) {
+  return profile->published;
 }
 void qa_app_prepared_profile_destroy(qa_app_prepared_profile *profile) {
   if (profile == NULL) return;
@@ -2020,6 +2127,8 @@ void qa_app_prepared_profile_destroy(qa_app_prepared_profile *profile) {
   if (profile->has_phases) qa_app_startup_phases_free(&profile->phases);
   qa_app_cvar_archive_entries_free(profile->movement_archive, profile->movement_archive_count);
   qa_app_cvar_archive_entries_free(profile->fallback_archive, profile->fallback_archive_count);
+  if (profile->mixed_high != NULL) qa_effective_set_destroy(&profile->mixed_high_storage);
+  if (profile->owns_input_store) qa_config_store_destroy(&profile->input_store_storage);
   for (size_t i = 0; i < profile->shared_archive_count; i++) {
     free(profile->shared_archive[i].name);
     free(profile->shared_archive[i].value);
@@ -2050,5 +2159,6 @@ void qa_app_prepared_profile_destroy(qa_app_prepared_profile *profile) {
   free(profile->default_lists);
   if (profile->seat_defaults_owned) profile_bindings_dispose(profile->seat_defaults, profile->seat_default_count);
   qa_app_configuration_script_reader_free(profile->read_ctx);
+  free(profile->seats_copy);
   free(profile);
 }

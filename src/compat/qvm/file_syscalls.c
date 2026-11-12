@@ -95,7 +95,7 @@ void qa_qvm_files_destroy(qa_qvm_files *files) {
 qa_qvm_file_services qa_qvm_files_get_services(const qa_qvm_files *files) { return files->services; }
 
 void qa_qvm_files_assert_current(qa_qvm_files *files) {
-  if (files->closed) qa_range_error("QVM files have been closed");
+  if (files->closed) qa_raise("Error", 0, 0, "QVM files have been closed");
   files->services.assert_current(files->services.ctx);
 }
 
@@ -264,19 +264,21 @@ static bool read_files_checkpoint(const qa_save_value *value, qa_qvm_files_check
   return true;
 }
 
-void qa_qvm_files_restore_checkpoint(qa_qvm_files *files, const qa_save_value *value) {
-  qa_qvm_files_assert_current(files);
-  for (int i = 1; i < 64; i++)
-    if (files->handles[i].occupied) qa_range_error("QVM file restore requires an empty owner");
-  qa_qvm_files_checkpoint checkpoint;
-  if (!read_files_checkpoint(value, &checkpoint)) qa_range_error("out of memory");
-  for (size_t i = 0; i < checkpoint.handle_count; i++) {
-    qa_qvm_file_handle_checkpoint *entry = &checkpoint.handles[i];
-    file_handle *handle = &files->handles[(size_t)entry->slot];
-    handle->occupied = true;
-    handle->is_write = entry->is_write;
-    handle->order = files->next_order++;
+typedef struct restore_job {
+  qa_qvm_files *files;
+  qa_qvm_files_checkpoint *checkpoint;
+  file_handle *staged; /* 64 slots, TS `staged` */
+  uint64_t next_order;
+} restore_job;
+
+static void restore_stage(void *ctx) {
+  restore_job *job = ctx;
+  qa_qvm_files *files = job->files;
+  for (size_t i = 0; i < job->checkpoint->handle_count; i++) {
+    qa_qvm_file_handle_checkpoint *entry = &job->checkpoint->handles[i];
+    file_handle *handle = &job->staged[(size_t)entry->slot];
     if (!entry->is_write) {
+      handle->is_write = false;
       handle->bytes = entry->bytes;
       entry->bytes = NULL;
       handle->byte_length = entry->byte_length;
@@ -285,27 +287,77 @@ void qa_qvm_files_restore_checkpoint(qa_qvm_files *files, const qa_save_value *v
       handle->is_pk3_archive = reference_is_pk3(&entry->reference);
     } else {
       if (files->services.writable == NULL)
-        qa_range_error("QVM filesystem has no writable owner");
+        qa_raise("Error", 0, 0, "QVM filesystem has no writable owner");
       if (!qa_user_file_store_resume(files->services.writable, &entry->file, writable_print,
                                      files, &handle->file))
-        qa_range_error("QVM filesystem has no writable owner");
+        /* The C store reports a refused directory or an allocation failure as false;
+         * TS resume throws the platform's own error there. */
+        qa_raise("Error", 0, 0, "QVM writable file could not be resumed");
+      handle->is_write = true;
     }
+    handle->order = job->next_order++;
+    handle->occupied = true;
   }
   qa_qvm_files_assert_current(files);
+}
+
+static void close_file_body(void *ctx) { qa_writable_binary_file_close(ctx); }
+
+/* TS stages every handle and publishes them together: a failed restore closes
+ * the files it resumed and leaves the owner empty. */
+void qa_qvm_files_restore_checkpoint(qa_qvm_files *files, const qa_save_value *value) {
+  qa_qvm_files_assert_current(files);
+  for (int i = 1; i < 64; i++)
+    if (files->handles[i].occupied) qa_raise("Error", 0, 0, "QVM file restore requires an empty owner");
+  qa_qvm_files_checkpoint checkpoint;
+  if (!read_files_checkpoint(value, &checkpoint)) qa_range_error("out of memory");
+  file_handle *staged = calloc(64, sizeof *staged);
+  qa_caught_error *caught = malloc(sizeof *caught);
+  if (staged == NULL || caught == NULL) {
+    free(staged);
+    free(caught);
+    qa_qvm_files_checkpoint_destroy(&checkpoint);
+    qa_range_error("out of memory");
+  }
+  restore_job job = {files, &checkpoint, staged, files->next_order};
+  bool ok = qa_try(restore_stage, &job, caught);
   qa_qvm_files_checkpoint_destroy(&checkpoint);
+  if (!ok) {
+    qa_caught_error failure = *caught;
+    size_t close_failures = 0;
+    for (int slot = 1; slot < 64; slot++) {
+      if (!staged[slot].occupied) { free(staged[slot].bytes); continue; }
+      if (staged[slot].is_write && !qa_try(close_file_body, &staged[slot].file, caught)) close_failures++;
+      free(staged[slot].bytes);
+    }
+    free(staged);
+    free(caught);
+    if (close_failures != 0) qa_raise("AggregateError", 0, 0, "QVM file restore cleanup failed");
+    qa_rethrow(&failure);
+  }
+  for (int slot = 1; slot < 64; slot++)
+    if (staged[slot].occupied) files->handles[slot] = staged[slot];
+  files->next_order = job.next_order;
+  free(staged);
+  free(caught);
 }
 
 void qa_qvm_files_close_all(qa_qvm_files *files) {
   /* Cleanup paths close files that construction never created (TS `files?.closeAll()` / an absent owner). */
   if (files == NULL) return;
   files->closed = true;
+  /* Every file is closed even when one close fails; TS then reports them together. */
+  size_t failures = 0;
+  qa_caught_error caught;
   for (int i = 1; i < 64; i++) {
-    if (files->handles[i].occupied && files->handles[i].is_write)
-      qa_writable_binary_file_close(&files->handles[i].file);
+    if (files->handles[i].occupied && files->handles[i].is_write &&
+        !qa_try(close_file_body, &files->handles[i].file, &caught))
+      failures++;
     free(files->handles[i].bytes);
     files->handles[i].bytes = NULL;
     files->handles[i].occupied = false;
   }
+  if (failures != 0) qa_raise("AggregateError", 0, 0, "Failed to close QVM writable files");
 }
 
 /* TS IMMUTABLE_NAME: /(?:\.(?:pk3|qvm|dll|so|dylib)|(?:^|\/)(?:q3key|q3config\.cfg|autoexec\.cfg))$/i
@@ -326,6 +378,17 @@ static bool immutable_name(const char *path) {
   return false;
 }
 
+static void assert_current_body(void *ctx) { qa_qvm_files_assert_current(ctx); }
+
+typedef struct publish_job {
+  qa_qvm_file_publish publish;
+  int slot;
+} publish_job;
+static void publish_body(void *ctx) {
+  publish_job *job = ctx;
+  job->publish.call(job->publish.ctx, job->slot);
+}
+
 static int free_slot(qa_qvm_files *files) {
   int slot = 1;
   while (slot < 64 && files->handles[slot].occupied) slot++;
@@ -336,7 +399,7 @@ static int free_slot(qa_qvm_files *files) {
 double qa_qvm_files_open_write(qa_qvm_files *files, const char *path, qa_writable_file_mode mode,
                                qa_qvm_file_publish publish) {
   qa_qvm_files_assert_current(files);
-  if (files->services.writable == NULL) qa_range_error("QVM filesystem has no writable owner");
+  if (files->services.writable == NULL) qa_raise("Error", 0, 0, "QVM filesystem has no writable owner");
   int slot = free_slot(files);
   char *normalized = malloc(strlen(path) + 1);
   if (normalized == NULL) qa_range_error("out of memory");
@@ -359,10 +422,18 @@ double qa_qvm_files_open_write(qa_qvm_files *files, const char *path, qa_writabl
     return -1;
   }
   qa_writable_binary_file file;
+  qa_cleanup normalized_cleanup;
+  qa_cleanup_push(&normalized_cleanup, free, normalized);
   bool opened = qa_user_file_store_open(files->services.writable, normalized, mode, writable_print,
                                         files, &file);
+  qa_cleanup_pop(&normalized_cleanup);
   free(normalized);
-  qa_qvm_files_assert_current(files);
+  qa_caught_error caught;
+  /* TS: try { assertCurrent() } catch { file?.close(); throw }. */
+  if (!qa_try(assert_current_body, files, &caught)) {
+    if (opened) (void)qa_try(close_file_body, &file, &(qa_caught_error){0});
+    qa_rethrow(&caught);
+  }
   if (!opened) {
     publish.call(publish.ctx, 0);
     return -1;
@@ -371,7 +442,13 @@ double qa_qvm_files_open_write(qa_qvm_files *files, const char *path, qa_writabl
   files->handles[slot].is_write = true;
   files->handles[slot].file = file;
   files->handles[slot].order = files->next_order++;
-  publish.call(publish.ctx, slot);
+  /* TS: try { publish(slot) } catch { handles.delete(slot); file.close(); throw }. */
+  publish_job job = {publish, slot};
+  if (!qa_try(publish_body, &job, &caught)) {
+    files->handles[slot].occupied = false;
+    qa_writable_binary_file_close(&file);
+    qa_rethrow(&caught);
+  }
   return 0;
 }
 
@@ -420,7 +497,11 @@ double qa_qvm_files_open(qa_qvm_files *files, const char *path,
     publish->call(publish->ctx, 0);
     return -1;
   }
+  /* The opened bytes are released when no slot is free (TS drops the resource). */
+  qa_cleanup bytes_cleanup;
+  qa_cleanup_push(&bytes_cleanup, free, resource.bytes);
   int slot = free_slot(files);
+  qa_cleanup_pop(&bytes_cleanup);
   file_handle *handle = &files->handles[slot];
   handle->occupied = true;
   handle->is_write = false;
@@ -430,7 +511,15 @@ double qa_qvm_files_open(qa_qvm_files *files, const char *path,
   handle->reference = *resource.reference;
   handle->is_pk3_archive = reference_is_pk3(resource.reference);
   handle->order = files->next_order++;
-  publish->call(publish->ctx, slot);
+  /* TS: try { publish(slot) } catch { handles.delete(slot); throw }. */
+  publish_job job = {*publish, slot};
+  qa_caught_error caught;
+  if (!qa_try(publish_body, &job, &caught)) {
+    handle->occupied = false;
+    free(handle->bytes);
+    handle->bytes = NULL;
+    qa_rethrow(&caught);
+  }
   return (double)resource.byte_length;
 }
 

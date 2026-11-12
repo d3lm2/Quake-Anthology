@@ -20,14 +20,17 @@ qa_captured_qw_wire_entity qa_capture_qw_wire_entity(const qa_qw_entity_state *s
   o.number = state->number; o.flags = state->flags; return o;
 }
 static void read_vector(const qa_save_reader *reader, const char *name, qa_wire_vector *out) {
+  /* reader.list(item => item.number()) reads every item before the length check. */
   qa_save_reader field, item;
   (void)qa_save_reader_field(reader, name, &field);
-  if (qa_save_reader_list_count(&field) != 3) qa_save_reader_fail(&field, "expected a three component vector");
-  for (size_t i = 0; i < 3; i++) {
+  size_t count = qa_save_reader_list_count(&field);
+  for (size_t i = 0; i < count; i++) {
     (void)qa_save_reader_item(&field, i, &item);
-    qa_wire_vector_set(out, i, qa_save_reader_number(&item));
+    double value = qa_save_reader_number(&item);
+    if (i < 3) qa_wire_vector_set(out, i, value);
     qa_save_reader_destroy(&item);
   }
+  if (count != 3) qa_save_reader_fail(&field, "expected a three component vector");
   qa_save_reader_destroy(&field);
 }
 static double read_int(const qa_save_reader *reader, const char *name, int has_min) {

@@ -13,8 +13,9 @@
 
 #define FR(value) ((double)(float)(value))
 
+/* Zeroed, so a caught BinaryError can release a partly parsed model. */
 static void *xmalloc(size_t size) {
-  void *p = malloc(size == 0 ? 1 : size);
+  void *p = calloc(size == 0 ? 1 : size, 1);
   if (p == NULL) qa_range_error("Out of memory");
   return p;
 }
@@ -114,6 +115,7 @@ static double parse_surface(qa_binary_reader *reader, double source_offset, doub
     check_range(reader, ofs_bone_references, num_bone_references * 4, 168, ofs_end,
                 (int64_t)source_offset + 160);
   qa_md4_triangle *triangles = xmalloc((size_t)num_triangles * sizeof *triangles);
+  out->triangles = triangles;
   if (num_triangles > 0) qa_binary_reader_seek(reader, (int64_t)(source_offset + ofs_triangles));
   for (size_t i = 0; i < (size_t)num_triangles; i++) {
     for (int j = 0; j < 3; j++) triangles[i].indices[j] = read_index(reader, num_verts, "triangle vertex");
@@ -121,12 +123,15 @@ static double parse_surface(qa_binary_reader *reader, double source_offset, doub
   out->triangles = triangles;
   out->triangle_count = (size_t)num_triangles;
   double *bone_references = xmalloc((size_t)num_bone_references * sizeof *bone_references);
+  out->bone_references.values = bone_references;
   if (num_bone_references > 0) qa_binary_reader_seek(reader, (int64_t)(source_offset + ofs_bone_references));
   for (size_t i = 0; i < (size_t)num_bone_references; i++)
     bone_references[i] = read_index(reader, num_bones, "bone reference");
   out->bone_references.values = bone_references;
   out->bone_references.count = (size_t)num_bone_references;
   qa_md4_vertex *vertices = xmalloc((size_t)num_verts * sizeof *vertices);
+  out->vertices = vertices;
+  out->vertex_count = (size_t)num_verts;
   if (num_verts > 0) qa_binary_reader_seek(reader, (int64_t)(source_offset + ofs_verts));
   for (size_t i = 0; i < (size_t)num_verts; i++) {
     check_range(reader, (double)reader->cursor, 24, source_offset + 168, end, (int64_t)reader->cursor);
@@ -137,6 +142,7 @@ static double parse_surface(qa_binary_reader *reader, double source_offset, doub
     check_range(reader, (double)reader->cursor, num_weights * 20, source_offset + 168, end,
                 (int64_t)reader->cursor - 4);
     qa_md4_weight *weights = xmalloc((size_t)num_weights * sizeof *weights);
+    vertices[i].weights = weights;
     for (size_t w = 0; w < (size_t)num_weights; w++) {
       weights[w].bone_index = read_index(reader, num_bones, "weight bone");
       weights[w].bone_weight = qa_binary_reader_finite_f32(reader);
@@ -150,11 +156,27 @@ static double parse_surface(qa_binary_reader *reader, double source_offset, doub
   return end;
 }
 
+/* A BinaryError from a malformed model (callers catch it) releases the reader
+ * and everything parsed so far: each array is attached to `out` when allocated. */
+typedef struct md4_parse_state {
+  qa_binary_reader reader;
+  qa_decoded_md4_model *out;
+} md4_parse_state;
+static void md4_parse_release(void *arg) {
+  md4_parse_state *state = (md4_parse_state *)arg;
+  qa_binary_reader_destroy(&state->reader);
+  qa_decoded_md4_model_destroy(state->out);
+}
+
 void qa_parse_md4(const uint8_t *bytes, size_t length, const char *source, qa_decoded_md4_model *out) {
   memset(out, 0, sizeof *out);
   const char *name = source != NULL ? source : "<md4>";
-  qa_binary_reader reader;
-  if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, name)) qa_range_error("Out of memory");
+  md4_parse_state state;
+  state.out = out;
+  if (!qa_binary_reader_init(&state.reader, (uint8_t *)bytes, length, name)) qa_range_error("Out of memory");
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, md4_parse_release, &state);
+#define reader state.reader
   check_range(&reader, 0, 100, 0, (double)reader.length, 0);
   if (qa_binary_reader_u32(&reader) != 0x34504449u) qa_binary_error(name, 0, "expected IDP4 model magic");
   double version = qa_binary_reader_i32(&reader);
@@ -179,12 +201,15 @@ void qa_parse_md4(const uint8_t *bytes, size_t length, const char *source, qa_de
   if (num_lods > 0) check_range(&reader, ofs_lods, num_lods * 12, 100, ofs_end, 92);
   qa_binary_reader_seek(&reader, (int64_t)ofs_frames);
   qa_md4_frame *frames = xmalloc((size_t)num_frames * sizeof *frames);
+  model->frames = frames;
+  model->frame_count = (size_t)num_frames;
   for (size_t i = 0; i < (size_t)num_frames; i++) {
     frames[i].bounds.min = read_vec3(&reader);
     frames[i].bounds.max = read_vec3(&reader);
     frames[i].local_origin = read_vec3(&reader);
     frames[i].radius = qa_binary_reader_finite_f32(&reader);
     qa_md4_bone *bones = xmalloc((size_t)num_bones * sizeof *bones);
+    frames[i].bones = bones;
     for (size_t b = 0; b < (size_t)num_bones; b++) {
       for (int r = 0; r < 3; r++) bones[b].matrix[r] = read_row(&reader);
     }
@@ -194,6 +219,8 @@ void qa_parse_md4(const uint8_t *bytes, size_t length, const char *source, qa_de
   model->frames = frames;
   model->frame_count = (size_t)num_frames;
   qa_md4_lod *lods = xmalloc((size_t)num_lods * sizeof *lods);
+  model->lods = lods;
+  model->lod_count = (size_t)num_lods;
   double lod_offset = ofs_lods;
   for (size_t lod = 0; lod < (size_t)num_lods; lod++) {
     check_range(&reader, lod_offset, 12, 100, ofs_end, (int64_t)lod_offset);
@@ -206,6 +233,8 @@ void qa_parse_md4(const uint8_t *bytes, size_t length, const char *source, qa_de
     if (num_surfaces > 0)
       check_range(&reader, ofs_surfaces, num_surfaces * 168, 12, lod_length, (int64_t)lod_offset + 4);
     qa_md4_surface *surfaces = xmalloc((size_t)num_surfaces * sizeof *surfaces);
+    lods[lod].surfaces = surfaces;
+    lods[lod].surface_count = (size_t)num_surfaces;
     double surface_offset = lod_offset + ofs_surfaces;
     for (size_t s = 0; s < (size_t)num_surfaces; s++) {
       surface_offset = parse_surface(&reader, surface_offset, lod_offset + lod_length, num_bones,
@@ -224,7 +253,9 @@ void qa_parse_md4(const uint8_t *bytes, size_t length, const char *source, qa_de
     for (size_t i = 0; i < out->bone_name_count; i++) out->bone_names[i] = c_string(&reader);
   }
   out->source = xstrdup(name);
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
+#undef reader
 }
 
 void qa_decoded_md4_model_destroy(qa_decoded_md4_model *model) {

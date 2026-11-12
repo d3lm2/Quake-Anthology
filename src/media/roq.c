@@ -171,6 +171,10 @@ static int vq_code(vq_reader *vq) {
   return code;
 }
 
+static void reader_release(void *raw) {
+  qa_binary_reader_destroy((qa_binary_reader *)raw);
+}
+
 static bool decoder_setup(qa_roq_decoder *decoder, const char *source,
                           const qa_roq_decoder_options *options) {
   qa_source_roq_audio_init(&decoder->audio);
@@ -199,6 +203,8 @@ static void decoder_read_header(qa_roq_decoder *decoder, const char *source) {
   if (!qa_binary_reader_init(&reader, stored, 8, source)) {
     media_error("out of memory");
   }
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, reader_release, &reader);
   if (qa_roq_stream_initialized_by_reset(decoder->stream)) {
     qa_binary_reader_skip(&reader, 6);
   } else {
@@ -210,6 +216,7 @@ static void decoder_read_header(qa_roq_decoder *decoder, const char *source) {
   }
   int64_t rate = qa_binary_reader_u16(&reader);
   decoder->rate = rate == 0 ? 30 : rate;
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
 }
 
@@ -418,7 +425,9 @@ static void motion_block(qa_roq_decoder *decoder, vq_reader *vq, int64_t x,
       size_t from = (size_t)(row * decoder->frame_width * 4 + pair);
       size_t target =
           (size_t)(((y + row) * decoder->frame_width + x) * 4 + pair);
-      memcpy(front + target, source + from, 8);
+      /* TypedArray.set from the same buffer copies as if through a clone: a
+         motion vector can point into the image being written. */
+      memmove(front + target, source + from, 8);
     }
   }
 }
@@ -512,6 +521,10 @@ bool qa_roq_decoder_next_chunk(
     return true;
   }
   qa_binary_reader *chunk = &streamed.reader;
+  /* A malformed chunk raises from the decode (or a hook raises); the reader's
+   * source copy goes with it. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, reader_release, chunk);
   int64_t id = streamed.header.id;
   int64_t flags = streamed.header.flags;
   bool ok = true;
@@ -570,12 +583,14 @@ bool qa_roq_decoder_next_chunk(
       break;
   }
   if (!ok) {
+    qa_cleanup_pop(&guard);
     qa_binary_reader_destroy(chunk);
     return false;
   }
   if (out->kind == QA_ROQ_EVENT_AUDIO && after_audio_decode != NULL) {
     after_audio_decode(audio_ctx, out);
   }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(chunk);
   qa_roq_stream_complete_chunk(decoder->stream,
                                out->kind == QA_ROQ_EVENT_END);

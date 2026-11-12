@@ -16,6 +16,6 @@ typedef struct qa_rerelease_path_info {
   qa_vec3 first, second; int64_t link_type;
 } qa_rerelease_path_info;
 void qa_rerelease_path_info_destroy(qa_rerelease_path_info *info);
-/* runtime NULL = TS null (code 8). Invalid predecessor chains abort (TS Error). */
+/* runtime NULL = TS null (code 8). Invalid predecessor chains raise the TS Error. */
 qa_rerelease_path_info qa_rerelease_path_to_goal(qa_navigation_runtime *runtime, qa_rerelease_path_request request);
 #endif

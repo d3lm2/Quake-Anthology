@@ -8,6 +8,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include "qa/guest/pe/format.h"
 #include "qa/guest/pe/image.h"
@@ -23,7 +24,22 @@ static void *xrealloc(void *p, size_t size) {
   if (next == NULL) qa_range_error("Guest runtime out of memory");
   return next;
 }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+/* Host buffers held across guest accesses or capability calls that can raise: freed by the raise. */
+typedef struct held { void *items[2]; qa_cleanup node; } held;
+static void held_release(void *arg) { held *h = arg; free(h->items[0]); free(h->items[1]); }
+static void hold(held *h, void *first, void *second) {
+  h->items[0] = first; h->items[1] = second;
+  qa_cleanup_push(&h->node, held_release, h);
+}
+static void release(held *h) { qa_cleanup_pop(&h->node); held_release(h); }
+/* TS `a + b <= c + d` over BigInts, with a + b possibly past 2^64. */
+static bool range_within(uint64_t start, uint64_t length, uint64_t region, uint64_t region_length) {
+  const uint64_t end = start + length, region_end = region + region_length;
+  if (end < start) return false;
+  if (region_end < region) return true;
+  return end <= region_end;
+}
 static qa_guest_core_address off(const qa_mapped_guest_memory *m, qa_guest_core_address a, int64_t d) {
   return qa_memory_offset(m, a, d);
 }
@@ -277,10 +293,8 @@ static uint16_t *input_units(kernel_ctx *k, qa_guest_core_address address, int64
   *out_len = (size_t)length;
   return out;
 }
-/* UTF-8 decode (WHATWG replacement semantics simplified to U+FFFD per
- * invalid sequence maximal subpart) into UTF-16 units. Malloc'd. */
-/* WHATWG UTF-8 decode as TextDecoder applies it: a leading BOM is dropped and
- * each maximal invalid subpart yields one U+FFFD. */
+/* WHATWG UTF-8 decode as TextDecoder applies it, into UTF-16 units (malloc'd): a
+ * leading BOM is dropped and each maximal invalid subpart yields one U+FFFD. */
 static uint16_t *utf8_decode(const uint8_t *bytes, size_t len, size_t *out_len) {
   uint16_t *out = xmalloc((len + 1) * 2 * sizeof *out);
   size_t count = 0, i = len >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf ? 3 : 0;
@@ -351,6 +365,89 @@ static bool js_space_u16(uint16_t c) {
   return (c >= 9 && c <= 13) || c == 0x20 || c == 0xa0 || c == 0x1680 ||
          (c >= 0x2000 && c <= 0x200a) || c == 0x2028 || c == 0x2029 || c == 0x202f ||
          c == 0x205f || c == 0x3000 || c == 0xfeff;
+}
+
+typedef struct virtual_map {
+  const qa_mapped_memory_ext *ext;
+  uint64_t base;
+  size_t bytes;
+  qa_guest_core_address address;
+} virtual_map;
+static void virtual_map_run(void *arg) {
+  virtual_map *map = arg;
+  map->address = qa_gmem_map(map->ext, map->base, map->bytes, QA_PERM_NONE, "Windows VirtualAlloc", NULL, 0);
+}
+/* WTF-8 of UTF-16 units: lone surrogates keep their 3-byte form, which the JS case mapping copies as
+ * invalid UTF-8; NUL units are left to the caller. */
+static char *units_to_wtf8(const uint16_t *units, size_t length) {
+  char *out = xmalloc(length * 3 + 1);
+  size_t at = 0;
+  for (size_t i = 0; i < length; i++) {
+    uint32_t cp = units[i];
+    if (cp >= 0xd800 && cp < 0xdc00 && i + 1 < length && units[i + 1] >= 0xdc00 && units[i + 1] < 0xe000) {
+      cp = 0x10000 + ((cp - 0xd800) << 10) + (units[i + 1] - 0xdc00u);
+      i++;
+    }
+    if (cp < 0x80) out[at++] = (char)cp;
+    else if (cp < 0x800) {
+      out[at++] = (char)(0xc0 | (cp >> 6)); out[at++] = (char)(0x80 | (cp & 0x3f));
+    } else if (cp < 0x10000) {
+      out[at++] = (char)(0xe0 | (cp >> 12)); out[at++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+      out[at++] = (char)(0x80 | (cp & 0x3f));
+    } else {
+      out[at++] = (char)(0xf0 | (cp >> 18)); out[at++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+      out[at++] = (char)(0x80 | ((cp >> 6) & 0x3f)); out[at++] = (char)(0x80 | (cp & 0x3f));
+    }
+  }
+  out[at] = '\0';
+  return out;
+}
+/* Appends the UTF-16 units of WTF-8 text (as produced by units_to_wtf8 and the case mapping). */
+static void wtf8_append_units(const char *text, uint16_t **units, size_t *length, size_t *capacity) {
+  const unsigned char *s = (const unsigned char *)text;
+  for (size_t i = 0; s[i] != 0;) {
+    uint32_t cp = s[i];
+    size_t need = cp >= 0xf0 ? 3 : cp >= 0xe0 ? 2 : cp >= 0xc0 ? 1 : 0;
+    cp = need == 3 ? cp & 0x07 : need == 2 ? cp & 0x0f : need == 1 ? cp & 0x1f : cp;
+    i++;
+    for (size_t k = 0; k < need && s[i] != 0; k++) cp = (cp << 6) | (s[i++] & 0x3fu);
+    if (*length + 2 > *capacity) {
+      *capacity = *capacity * 2 + 16;
+      *units = xrealloc(*units, *capacity * sizeof **units);
+    }
+    if (cp >= 0x10000) {
+      cp -= 0x10000;
+      (*units)[(*length)++] = (uint16_t)(0xd800 + (cp >> 10));
+      (*units)[(*length)++] = (uint16_t)(0xdc00 + (cp & 0x3ff));
+    } else (*units)[(*length)++] = (uint16_t)cp;
+  }
+}
+/* String.prototype.toLowerCase/toUpperCase of a UTF-16 unit string (NUL units map to themselves and
+ * separate words, as they do for Final_Sigma). Malloc'd. */
+static uint16_t *js_case_units(const uint16_t *source, size_t length, bool upper, size_t *out_length) {
+  size_t capacity = length + 16, count = 0;
+  uint16_t *out = xmalloc(capacity * sizeof *out);
+  held h;
+  hold(&h, NULL, NULL);
+  for (size_t start = 0; start <= length;) {
+    size_t end = start;
+    while (end < length && source[end] != 0) end++;
+    char *segment = units_to_wtf8(source + start, end - start);
+    h.items[0] = segment;
+    char *mapped = upper ? qa_js_to_upper_case(segment) : qa_js_to_lower_case(segment);
+    if (mapped == NULL) qa_range_error("Guest runtime out of memory");
+    h.items[1] = mapped;
+    wtf8_append_units(mapped, &out, &count, &capacity);
+    free(segment); free(mapped);
+    h.items[0] = h.items[1] = NULL;
+    if (end == length) break;
+    if (count + 1 > capacity) { capacity = capacity * 2 + 16; out = xrealloc(out, capacity * sizeof *out); }
+    out[count++] = 0;
+    start = end + 1;
+  }
+  qa_cleanup_pop(&h.node);
+  *out_length = count;
+  return out;
 }
 
 static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *context,
@@ -586,9 +683,11 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
       bool has = qa_windows_allocate(host, size, heap.byte_offset, &address);
       if (has) {
         uint8_t *bytes = xmalloc(previous);
+        held h;
+        hold(&h, bytes, NULL);
         qa_memory_copy(memory, old, bytes, previous);
         qa_memory_write(memory, address, bytes, previous);
-        free(bytes);
+        release(&h);
         (void)qa_windows_free(host, true, old, heap.byte_offset);
       }
       return qa_call_pointer(has, address);
@@ -628,10 +727,14 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
         } else {
           uint64_t base = address.byte_offset & ~65535ULL;
           bytes = (size_t)(((address.byte_offset - base) + size + 4095) / 4096 * 4096);
-          /* TS catches a failed map as ERROR_INVALID_ADDRESS; the C memory
-           * map aborts on failure, so that path is unobservable here. */
-          address = qa_gmem_map(host->memory_ext, base, bytes, QA_PERM_NONE,
-                                "Windows VirtualAlloc", NULL, 0);
+          /* TS catches any failed map as ERROR_INVALID_ADDRESS. */
+          virtual_map map = {host->memory_ext, base, bytes, {0}};
+          qa_caught_error ignored;
+          if (!qa_try(virtual_map_run, &map, &ignored)) {
+            qa_windows_last_error_set(host, 487);
+            return qa_call_pointer(false, none);
+          }
+          address = map.address;
         }
         grow((void **)&k->tables->reservations, &k->tables->reservation_cap, k->tables->reservation_count,
              sizeof(reservation));
@@ -646,8 +749,11 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
         if (has_address)
           for (size_t i = 0; i < k->tables->reservation_count; i++)
             if (base >= k->tables->reservations[i].address.byte_offset &&
-                base + bytes <= k->tables->reservations[i].address.byte_offset + k->tables->reservations[i].size)
+                range_within(base, bytes, k->tables->reservations[i].address.byte_offset,
+                             k->tables->reservations[i].size)) {
               inside = true;
+              break;
+            }
         if (!has_address || !inside) {
           qa_windows_last_error_set(host, 487);
           return qa_call_pointer(false, none);
@@ -676,15 +782,19 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
         bool inside = false;
         for (size_t i = 0; i < k->tables->reservation_count; i++)
           if (address.byte_offset >= k->tables->reservations[i].address.byte_offset &&
-              address.byte_offset + size <=
-                  k->tables->reservations[i].address.byte_offset + k->tables->reservations[i].size)
+              range_within(address.byte_offset, size, k->tables->reservations[i].address.byte_offset,
+                           k->tables->reservations[i].size)) {
             inside = true;
+            break;
+          }
         if (!inside) return bool_result(false);
         qa_gmem_protect(host->memory_ext, address, size, QA_PERM_READ_WRITE);
         uint8_t *zeros = xmalloc(size);
+        held h;
+        hold(&h, zeros, NULL);
         memset(zeros, 0, size);
         qa_memory_write(memory, address, zeros, size);
-        free(zeros);
+        release(&h);
         qa_gmem_protect(host->memory_ext, address, size, QA_PERM_NONE);
         return bool_result(true);
       }
@@ -931,11 +1041,12 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
     }
     case K_GET_TIME: {
       bool local = state->number != 0;
-      time_t t = (time_t)(now_milliseconds(host) / 1000.0);
+      /* TS `new Date(now())`: one clock read; seconds floor toward -inf as Date does. */
+      const double ms = trunc(now_milliseconds(host));
+      time_t t = (time_t)floor(ms / 1000.0);
       struct tm tm_value;
       if (local) (void)localtime_r(&t, &tm_value);
       else (void)gmtime_r(&t, &tm_value);
-      double ms = now_milliseconds(host);
       int millis = (int)(ms - floor(ms / 1000.0) * 1000.0);
       int fields[] = {tm_value.tm_year + 1900, tm_value.tm_mon + 1, tm_value.tm_wday,
                       tm_value.tm_mday, tm_value.tm_hour, tm_value.tm_min, tm_value.tm_sec,
@@ -950,10 +1061,12 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
       qa_guest_core_address address = qa_guest_required_pointer(args, count, 0);
       uint8_t zeros[172] = {0};
       qa_memory_write(memory, address, zeros, sizeof zeros);
-      time_t t = (time_t)(now_milliseconds(host) / 1000.0);
-      struct tm g;
+      time_t t = (time_t)floor(now_milliseconds(host) / 1000.0);
+      /* TS Date#getTimezoneOffset at that instant: UTC minus local time, daylight saving included. */
+      struct tm g, l;
+      (void)localtime_r(&t, &l);
       (void)gmtime_r(&t, &g);
-      g.tm_isdst = 0;
+      g.tm_isdst = l.tm_isdst;
       long offset_minutes = (long)((mktime(&g) - t) / 60);
       qa_write_unsigned(memory, address, 4, (uint64_t)(uint32_t)offset_minutes);
       return u32_result(0);
@@ -970,15 +1083,16 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
       size_t image_count = 0;
       const qa_pe_image *const *images = qa_windows_images(host, &image_count);
       const qa_pe_image *found = NULL;
-      for (size_t i = 0; i < image_count; i++)
+      /* TS find/findIndex: the first image and the first unwind record that contain pc. */
+      for (size_t i = 0; i < image_count && found == NULL; i++)
         if (pc >= images[i]->image.base.byte_offset &&
-            pc < images[i]->image.base.byte_offset + images[i]->image.byte_length)
+            pc - images[i]->image.base.byte_offset < images[i]->image.byte_length)
           found = images[i];
       if (found == NULL) return qa_call_pointer(false, none);
       int64_t index = -1;
-      for (size_t i = 0; i < found->unwind_record_count; i++)
-        if (pc >= found->image.base.byte_offset + found->unwind_records[i].begin_rva &&
-            pc < found->image.base.byte_offset + found->unwind_records[i].end_rva)
+      for (size_t i = 0; i < found->unwind_record_count && index < 0; i++)
+        if (pc - found->image.base.byte_offset >= found->unwind_records[i].begin_rva &&
+            pc - found->image.base.byte_offset < found->unwind_records[i].end_rva)
           index = (int64_t)i;
       if (index < 0) return qa_call_pointer(false, none);
       qa_write_unsigned(memory, qa_guest_required_pointer(args, count, 1), 8,
@@ -1063,12 +1177,14 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
                                       "overlapped I/O is not implemented");
       size_t length = qa_guest_count(args, count, 2);
       uint8_t *bytes = xmalloc(length);
+      held h;
+      hold(&h, bytes, NULL);
       size_t read_count;
       if (entry->stream_kind == 1) {
         read_count = host->capabilities.standard_input != NULL
             ? host->capabilities.standard_input(host->capabilities.ctx, length, bytes) : 0;
       } else if (entry->stream_kind != 0) {
-        free(bytes);
+        release(&h);
         qa_windows_last_error_set(host, 5);
         return bool_result(false);
       } else {
@@ -1076,7 +1192,7 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
       }
       if (read_count > length) plain_error("File capability exceeded requested read length");
       qa_memory_write(memory, qa_guest_required_pointer(args, count, 1), bytes, read_count);
-      free(bytes);
+      release(&h);
       entry->offset += read_count;
       qa_guest_core_address read_out = {0};
       if (qa_guest_pointer_argument(args, count, 3, &read_out))
@@ -1095,13 +1211,17 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
       if (qa_guest_pointer_argument(args, count, 4, &overlapped))
         qa_unsupported_windows_import("kernel32.dll", "WriteFile",
                                       "overlapped I/O is not implemented");
+      qa_guest_core_address source = qa_guest_required_pointer(args, count, 1);
       size_t length = qa_guest_count(args, count, 2);
+      qa_memory_check(memory, source, length, QA_ACCESS_READ);
       uint8_t *bytes = xmalloc(length);
-      qa_memory_copy(memory, qa_guest_required_pointer(args, count, 1), bytes, length);
+      held h;
+      hold(&h, bytes, NULL);
+      qa_memory_copy(memory, source, bytes, length);
       size_t written;
       if (entry->stream_kind == 2 || entry->stream_kind == 3) {
         if (host->capabilities.standard_output == NULL) {
-          free(bytes);
+          release(&h);
           qa_windows_last_error_set(host, 6);
           return bool_result(false);
         }
@@ -1110,13 +1230,13 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
             entry->stream_kind == 2 ? QA_WINDOWS_STDOUT : QA_WINDOWS_STDERR, bytes, length);
         written = length;
       } else if (entry->stream_kind == 1) {
-        free(bytes);
+        release(&h);
         qa_windows_last_error_set(host, 5);
         return bool_result(false);
       } else {
         written = (size_t)entry->file->write(entry->file->ctx, entry->offset, bytes, length);
       }
-      free(bytes);
+      release(&h);
       entry->offset += written;
       qa_guest_core_address out = {0};
       if (qa_guest_pointer_argument(args, count, 3, &out))
@@ -1217,9 +1337,11 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
           return qa_call_int32(0);
         }
         size_t bytes_len = 0;
-        uint8_t *bytes = qa_string_bytes_wide(text, text_len, true, &bytes_len);
-        qa_memory_write(memory, output, bytes, text_len * 2);
-        free(bytes);
+        held h;
+        hold(&h, text, qa_string_bytes_wide(text, text_len, true, &bytes_len));
+        qa_memory_write(memory, output, h.items[1], text_len * 2);
+        release(&h);
+        return qa_call_int32((int32_t)text_len);
       }
       free(text);
       return qa_call_int32((int32_t)text_len);
@@ -1251,6 +1373,8 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
         bytes_len = source_len;
       }
       free(source);
+      held h;
+      hold(&h, bytes, NULL);
       int64_t capacity = qa_guest_integer(args, count, 5);
       qa_guest_core_address output = {0}, used = {0};
       bool has_output = qa_guest_pointer_argument(args, count, 4, &output);
@@ -1258,13 +1382,13 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
         qa_write_unsigned(memory, used, 4, used_default ? 1 : 0);
       if (capacity != 0) {
         if (!has_output || capacity < (int64_t)bytes_len) {
-          free(bytes);
+          release(&h);
           qa_windows_last_error_set(host, 122);
           return qa_call_int32(0);
         }
         qa_memory_write(memory, output, bytes, bytes_len);
       }
-      free(bytes);
+      release(&h);
       return qa_call_int32((int32_t)bytes_len);
     }
     case K_GET_STRING_TYPE: {
@@ -1276,6 +1400,8 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
       uint16_t *source = input_units(
           k, qa_guest_required_pointer(args, count, (size_t)(shift + 1)),
           qa_guest_integer(args, count, (size_t)(shift + 2)), wide, &source_len);
+      held h;
+      hold(&h, source, NULL);
       qa_guest_core_address output = qa_guest_required_pointer(args, count, (size_t)(shift + 3));
       for (size_t i = 0; i < source_len; i++) {
         uint16_t c = source[i];
@@ -1290,7 +1416,7 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
                     (is_hex ? 128 : 0) | (is_upper || is_lower ? 256 : 0);
         qa_write_unsigned(memory, off(memory, output, (int64_t)i * 2), 2, (uint64_t)flags);
       }
-      free(source);
+      release(&h);
       return qa_call_int32(1);
     }
     case K_LCMAP: {
@@ -1303,42 +1429,27 @@ static qa_call_result kernel_impl(void *ctx, const qa_guest_core_call_context *c
       size_t source_len = 0;
       uint16_t *source = input_units(k, qa_guest_required_pointer(args, count, 2),
                                      qa_guest_integer(args, count, 3), wide, &source_len);
-      /* JS toLowerCase/toUpperCase reduced to ASCII + Latin-1 simple
-       * mappings (with ß -> SS); full Unicode casing is not modeled. */
-      uint16_t *mapped = xmalloc((source_len * 2 + 1) * sizeof *mapped);
+      /* source.toLowerCase() / toUpperCase(): full JS case mapping of the UTF-16 units. */
+      held h;
+      hold(&h, source, NULL);
       size_t mapped_len = 0;
-      for (size_t i = 0; i < source_len; i++) {
-        uint16_t c = source[i];
-        if (flags == 0x100) { /* lower */
-          if (c >= 'A' && c <= 'Z') c = (uint16_t)(c + 32);
-          else if (c >= 0xc0 && c <= 0xde && c != 0xd7) c = (uint16_t)(c + 32);
-          else if (c == 0x178) c = 0xff;
-          mapped[mapped_len++] = c;
-        } else {
-          if (c == 0xdf) { mapped[mapped_len++] = 'S'; mapped[mapped_len++] = 'S'; continue; }
-          if (c == 0xb5) c = 0x39c;
-          else if (c >= 'a' && c <= 'z') c = (uint16_t)(c - 32);
-          else if (c >= 0xe0 && c <= 0xfe && c != 0xf7) c = (uint16_t)(c - 32);
-          else if (c == 0xff) c = 0x178;
-          mapped[mapped_len++] = c;
-        }
-      }
-      free(source);
+      uint16_t *mapped = js_case_units(source, source_len, flags == 0x200, &mapped_len);
+      release(&h);
+      hold(&h, mapped, NULL);
       int64_t capacity = qa_guest_integer(args, count, 5);
       qa_guest_core_address output = {0};
       bool has_output = qa_guest_pointer_argument(args, count, 4, &output);
       if (capacity != 0) {
         if (!has_output || capacity < (int64_t)mapped_len) {
-          free(mapped);
+          release(&h);
           qa_windows_last_error_set(host, 122);
           return qa_call_int32(0);
         }
         size_t bytes_len = 0;
-        uint8_t *bytes = qa_string_bytes_wide(mapped, mapped_len, wide, &bytes_len);
-        qa_memory_write(memory, output, bytes, mapped_len * (wide ? 2 : 1));
-        free(bytes);
+        h.items[1] = qa_string_bytes_wide(mapped, mapped_len, wide, &bytes_len);
+        qa_memory_write(memory, output, h.items[1], mapped_len * (wide ? 2 : 1));
       }
-      free(mapped);
+      release(&h);
       return qa_call_int32((int32_t)mapped_len);
     }
     default: break;

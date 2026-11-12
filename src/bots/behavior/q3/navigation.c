@@ -134,11 +134,24 @@ void qa_source_bot_navigation_bots_a_init(nav_t *n, const qa_source_bot_navigati
   t->predict = th_predict;
   qa_source_bot_travel_init(&n->travel, &n->travel_host);
 }
+typedef struct with_client_restore {
+  nav_t *n;
+  qa_navigation_runtime *previous;
+} with_client_restore;
+static void restore_selected(void *arg) {
+  with_client_restore *restore = arg;
+  restore->n->selected = restore->previous;
+}
+/* TS try { return think(); } finally { this.selected = previous; }: a raise out of
+ * think restores the selection through the cleanup node. */
 void qa_source_bot_navigation_with_client(nav_t *n, int64_t client, void (*think)(void *ctx), void *ctx) {
-  qa_navigation_runtime *previous = n->selected;
+  with_client_restore restore = {n, n->selected};
   n->selected = n->host.for_client(n->host.ctx, client);
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, restore_selected, &restore);
   think(ctx);
-  n->selected = previous;
+  qa_cleanup_pop(&cleanup);
+  n->selected = restore.previous;
 }
 bool qa_source_bot_navigation_ready(nav_t *n) { return runtime(n)->graph->node_count > 0; }
 int64_t qa_source_bot_navigation_point_area(nav_t *n, qa_vec3 origin) {
@@ -376,7 +389,7 @@ static size_t neighbors(nav_t *n, int64_t area, int64_t **out) {
       int64_t face_index = index >= 0 && (size_t)index < asset->face_index_count ? asset->face_indexes[index] : -1;
       int64_t absolute = face_index < 0 ? -face_index : face_index;
       if (index < 0 || (size_t)index >= asset->face_index_count || (size_t)absolute >= asset->face_count)
-        qa_range_error("AAS alternative route references an absent face");
+        qa_raise("Error", 0, 0, "AAS alternative route references an absent face");
       const qa_aas_face_rec *face = &asset->faces[absolute];
       int64_t other = face->front_area == area ? face->back_area : face->front_area;
       if (other != 0)
@@ -520,7 +533,7 @@ qa_alternative_goal *qa_source_bot_navigation_alternative_route_goals(nav_t *n,
     bool has_origin = center_of(n, best_area, &origin);
     ptrdiff_t times = find_candidate(candidates, candidate_count, best_area);
     if (!has_origin || times < 0)
-      qa_range_error("Alternative route candidate vanished");
+      qa_raise("Error", 0, 0, "Alternative route candidate vanished");
     qa_alternative_goal *g = &goals[goal_count++];
     g->origin = origin;
     g->area = best_area;

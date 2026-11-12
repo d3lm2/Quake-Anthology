@@ -63,6 +63,7 @@ void qa_app_q2_read_playback_header(const uint8_t *bytes, size_t length,
 }
 void qa_app_q2_playback_header_free(qa_app_q2_playback_header *header) {
   if (header->is_mvd) qa_q2_mvd_header_free(&header->profile);
+  else qa_q2_demo_header_free(&header->dm2);
 }
 struct qa_app_q2_demo_playback {
   qa_app_q2_client_receiver *receiver;
@@ -131,7 +132,7 @@ static void wrap_frame(void *ctx, const void *frame, const void *const *records,
   qa_app_q2_demo_playback *p = ctx;
   if (p->mvd) { p->host.frame(p->host.ctx, frame, records, count, now); return; }
   if ((size_t)p->selected_seat >= p->recorded_player_count)
-    qa_range_error("Recorded viewpoint has no source player");
+    qa_raise("Error", 0, 0, "Recorded viewpoint has no source player");
   double selected = p->recorded_players[(size_t)p->selected_seat];
   const qa_q2_wire_frame *wire = frame;
   qa_q2_wire_frame adjusted;
@@ -139,7 +140,7 @@ static void wrap_frame(void *ctx, const void *frame, const void *const *records,
   if (p->selected_seat != 0) {
     size_t split_index = (size_t)p->selected_seat - 1;
     if (!wire->has_split || split_index >= wire->split_count)
-      qa_range_error("Recorded viewpoint has no player state");
+      qa_raise("Error", 0, 0, "Recorded viewpoint has no player state");
     adjusted = *wire;
     adjusted.player = wire->split_players[split_index].player;
     adjusted.area_bits = wire->split_players[split_index].area_bits;
@@ -185,8 +186,10 @@ qa_app_q2_demo_playback *qa_app_q2_demo_playback_create(
   p->select_recorded_view = select_recorded_view; p->select_ctx = select_ctx;
   p->mvd = is_mvd(bytes, length);
   if (p->mvd) {
-    if (!presentation)
-      qa_range_error("MVD playback requires source BSP visibility and viewer binding");
+    if (!presentation) {
+      free(p);
+      qa_raise("Error", 0, 0, "MVD playback requires source BSP visibility and viewer binding");
+    }
     p->presentation = *presentation; p->has_presentation = true;
     if (!qa_q2_mvd_playback_init(&p->decoder, presentation->visibility)) { free(p); return NULL; }
     p->decoder_live = true;
@@ -231,7 +234,7 @@ void qa_app_q2_demo_playback_select_player(qa_app_q2_demo_playback *playback, do
       playback->selected_seat = (double)i;
       return;
     }
-  qa_range_error("Player has no viewpoint in this recording");
+  qa_raise("Error", 0, 0, "Player has no viewpoint in this recording");
 }
 bool qa_app_q2_demo_playback_recorded_time(qa_app_q2_demo_playback *playback, double *out) {
   return qa_app_q2_client_receiver_recorded_time(playback->receiver, out);
@@ -256,7 +259,11 @@ static void demo_record(void *ctx, qa_q2_server_record *record) {
       p->presentation.select_view(p->presentation.ctx,
           qa_q2_mvd_playback_get_selected_player(&p->decoder));
     qa_app_q2_client_receiver_receive_records(p->receiver, record, 1, 0);
-    if (p->closed) sink->stopped = true;
+    /* TS `if (this.closed) return` leaves the for-of: the generator decodes no more. */
+    if (p->closed) {
+      sink->stopped = true;
+      qa_q2_mvd_playback_stop(&p->decoder);
+    }
   }
   qa_cleanup_pop(&node);
   record_release(record);

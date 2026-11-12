@@ -11,24 +11,34 @@
 #include "qa/content/q2/foundation/monsters/ai.h"
 
 
-/* TS WeakSet<OwnedActor> boundPowerArmor (identity: id + owner + token). */
+/* TS WeakSet<OwnedActor> boundPowerArmor (identity: id + owner + token). A TS
+ * OwnedActor object ends with its session; a session token's address is reused by
+ * the next session, so the records of a token are retired when its identity owner is
+ * destroyed (a retired record is reused, never freed: an authority may still hold it
+ * as its cell binding). The closures read the actor, never the entity, which is
+ * freed while the binding stays with the authority. */
 typedef struct cell_binding {
   qa_owned_actor actor;
-  qa_q2_entity *entity;
+  bool retired;
   qa_q2_game_services *game;
   struct cell_binding *next;
 } cell_binding;
 static cell_binding *bindings;
+static bool retire_registered;
+static void retire_session(const void *token) {
+  for (cell_binding *b = bindings; b; b = b->next)
+    if (b->actor.token == token) b->retired = true;
+}
 static double cell_read(void *ctx) {
   cell_binding *b = ctx;
-  return qa_shared_inventory_table_count(b->game->host->inventory, b->entity->actor.id, "q2:monster-power");
+  return qa_shared_inventory_table_count(b->game->host->inventory, b->actor.id, "q2:monster-power");
 }
 static void cell_write(void *ctx, double count) {
   cell_binding *b = ctx;
   qa_inventory_entry entry;
   memset(&entry, 0, sizeof entry);
   entry.item = "q2:monster-power"; entry.count = count; entry.capacity = 100;
-  qa_shared_inventory_table_configure(b->game->host->inventory, b->entity->actor, entry, NULL, NULL);
+  qa_shared_inventory_table_configure(b->game->host->inventory, b->actor, entry, NULL, NULL);
 }
 static bool same_owned(qa_owned_actor a, qa_owned_actor b) {
   return qa_same_actor(a.id, b.id) && a.token == b.token
@@ -38,11 +48,18 @@ static void bind_power_armor_fn(void *ctx, qa_q2m_context *c) {
   (void)ctx;
   qa_q2_entity *entity = c->entity;
   qa_q2_game_services *game = c->game;
-  for (cell_binding *b = bindings; b; b = b->next)
-    if (same_owned(b->actor, entity->actor)) return;
-  cell_binding *b = malloc(sizeof *b);
-  if (!b) qa_raise("Error", 0, 0, "Brain power armor binding allocation failed");
-  b->actor = entity->actor; b->entity = entity; b->game = game; b->next = bindings; bindings = b;
+  if (!retire_registered) { qa_identity_owner_on_destroy(retire_session); retire_registered = true; }
+  cell_binding *b = NULL;
+  for (cell_binding *seen = bindings; seen; seen = seen->next) {
+    if (seen->retired) { if (!b) b = seen; continue; }
+    if (same_owned(seen->actor, entity->actor)) return;
+  }
+  if (!b) {
+    b = malloc(sizeof *b);
+    if (!b) qa_raise("Error", 0, 0, "Brain power armor binding allocation failed");
+    b->next = bindings; bindings = b;
+  }
+  b->actor = entity->actor; b->retired = false; b->game = game;
   qa_power_armor_cell_binding cells = {b, cell_read, cell_write};
   qa_gameplay_authority_bind_power_armor_cells(game->host->combat, entity->actor, cells);
 }

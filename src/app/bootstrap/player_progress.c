@@ -7,7 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <stdnoreturn.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/support.h"
 #include "qa/persistence/value.h"
 /* Events are allocated one by one so the views list() and all() hand out stay
@@ -79,6 +83,7 @@ static void free_owned(owned_event *e) {
   free(e->kind); free(e->source); free(e->participant); free(e->event); free(e->award); free(e->map); free(e->rules);
   free(e);
 }
+static void free_owned_node(void *arg) { free_owned(arg); }
 static bool same_identity(const qa_app_player_progress_event *a, const qa_app_player_progress_event *b) {
   return strcmp(a->source, b->source) == 0 && strcmp(a->participant, b->participant) == 0
       && strcmp(a->event, b->event) == 0;
@@ -140,17 +145,58 @@ static void write_events(FILE *out, qa_app_player_progress_store *store, const o
   }
   fputs("]}\n", out);
 }
+/* The Node fs error text "<CODE>: <description>, <syscall> '<path>'". */
+static void node_errno_text(int error, const char **code, const char **description) {
+  switch (error) {
+    case EACCES: *code = "EACCES"; *description = "permission denied"; return;
+    case EPERM: *code = "EPERM"; *description = "operation not permitted"; return;
+    case ENOENT: *code = "ENOENT"; *description = "no such file or directory"; return;
+    case ENOTDIR: *code = "ENOTDIR"; *description = "not a directory"; return;
+    case EISDIR: *code = "EISDIR"; *description = "illegal operation on a directory"; return;
+    case EEXIST: *code = "EEXIST"; *description = "file already exists"; return;
+    case EROFS: *code = "EROFS"; *description = "read-only file system"; return;
+    case ENOSPC: *code = "ENOSPC"; *description = "no space left on device"; return;
+    case ENAMETOOLONG: *code = "ENAMETOOLONG"; *description = "name too long"; return;
+    case ELOOP: *code = "ELOOP"; *description = "too many symbolic links encountered"; return;
+    default: *code = "EIO"; *description = strerror(error); return;
+  }
+}
+static noreturn void raise_fs(int error, const char *syscall, const char *path) {
+  const char *code, *description;
+  node_errno_text(error, &code, &description);
+  qa_raise("Error", 0, 0, "%s: %s, %s '%s'", code, description, syscall, path);
+}
+/* mkdir(dirname(file), { recursive: true }) */
 static void mkdir_parent(const char *file) {
   const char *slash = strrchr(file, '/');
   if (slash == NULL || slash == file) return;
-  char *dir = malloc((size_t)(slash - file) + 1);
+  size_t length = (size_t)(slash - file);
+  char *dir = malloc(length + 1);
   if (dir == NULL) qa_range_error("Out of memory");
-  memcpy(dir, file, (size_t)(slash - file)); dir[slash - file] = '\0';
-  /* mkdir -p over each prefix. */
-  for (char *p = dir + 1; *p != '\0'; p++) {
-    if (*p == '/') { *p = '\0'; (void)mkdir(dir, 0777); *p = '/'; }
+  memcpy(dir, file, length);
+  dir[length] = '\0';
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, dir);
+  char *copy = malloc(length + 1);
+  if (copy == NULL) qa_range_error("Out of memory");
+  memcpy(copy, dir, length + 1);
+  qa_cleanup copy_guard;
+  qa_cleanup_push(&copy_guard, free, copy);
+  for (size_t i = 1; i <= length; i++) {
+    if (copy[i] != '/' && copy[i] != '\0') continue;
+    char saved = copy[i];
+    copy[i] = '\0';
+    struct stat info;
+    if (stat(copy, &info) != 0) {
+      if (mkdir(copy, 0777) != 0 && errno != EEXIST) raise_fs(errno, "mkdir", dir);
+    } else if (!S_ISDIR(info.st_mode)) {
+      raise_fs(saved == '\0' ? EEXIST : ENOTDIR, "mkdir", dir);
+    }
+    copy[i] = saved;
   }
-  (void)mkdir(dir, 0777);
+  qa_cleanup_pop(&copy_guard);
+  free(copy);
+  qa_cleanup_pop(&guard);
   free(dir);
 }
 /* The TS try block over a parsed document: false (store left empty) on any
@@ -187,16 +233,18 @@ qa_app_player_progress_store *qa_app_player_progress_store_open(const char *file
   qa_app_player_progress_store *store = calloc(1, sizeof *store);
   if (store == NULL) qa_range_error("Out of memory");
   store->file = dup_text(file);
-  FILE *in = fopen(file, "rb");
-  if (in == NULL) {
-    if (errno == ENOENT) return store;
+  /* readFile(file, "utf8"): ENOENT opens empty; any other failure (a directory reads EISDIR) rejects. */
+  int fd = open(file, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
     int code = errno;
+    if (code == ENOENT) return store;
     qa_app_player_progress_store_destroy(store);
-    qa_raise("Error", code, 0, "%s", strerror(code));
+    raise_fs(code, "open", file);
   }
   size_t capacity = 4096, length = 0;
   uint8_t *bytes = malloc(capacity);
   if (bytes == NULL) qa_range_error("Out of memory");
+  int read_error = 0;
   for (;;) {
     if (length == capacity) {
       capacity *= 2;
@@ -204,13 +252,34 @@ qa_app_player_progress_store *qa_app_player_progress_store_open(const char *file
       if (next == NULL) qa_range_error("Out of memory");
       bytes = next;
     }
-    size_t read = fread(bytes + length, 1, capacity - length, in);
-    length += read;
-    if (read == 0) break;
+    ssize_t got = read(fd, bytes + length, capacity - length);
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      read_error = errno;
+      break;
+    }
+    if (got == 0) break;
+    length += (size_t)got;
   }
-  fclose(in);
-  qa_save_value *value = qa_parse_json_value(bytes, length, true);
+  close(fd);
+  if (read_error != 0) {
+    free(bytes);
+    qa_app_player_progress_store_destroy(store);
+    if (read_error == EISDIR) qa_raise("Error", 0, 0, "EISDIR: illegal operation on a directory, read");
+    raise_fs(read_error, "read", file);
+  }
+  /* The "utf8" decoding keeps a byte-order mark as U+FEFF, which JSON.parse rejects (torn or
+   * foreign text opens as empty progress); invalid sequences become U+FFFD. */
+  if (length >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf) {
+    free(bytes);
+    return store;
+  }
+  size_t text_length = 0;
+  char *text = qa_text_decoder_decode(bytes, length, &text_length);
   free(bytes);
+  if (text == NULL) qa_range_error("Out of memory");
+  qa_save_value *value = qa_parse_json_value((const uint8_t *)text, text_length, true);
+  free(text);
   if (value == NULL) return store; /* torn or foreign text opens as empty progress */
   if (!load_events(store, value)) clear_events(store);
   qa_save_value_free(value);
@@ -253,27 +322,39 @@ bool qa_app_player_progress_store_record(qa_app_player_progress_store *store, qa
   for (size_t i = 0; i < store->count; i++)
     if (same_identity(&store->events[i]->view, &event)) return false;
   owned_event *owned = own_event(event);
+  qa_cleanup owned_guard;
+  qa_cleanup_push(&owned_guard, free_owned_node, owned);
   mkdir_parent(store->file);
   size_t tlen = strlen(store->file) + strlen(".pending") + 1;
   char *temporary = malloc(tlen);
   if (temporary == NULL) qa_range_error("Out of memory");
   snprintf(temporary, tlen, "%s.pending", store->file);
-  FILE *out = fopen(temporary, "wb");
+  qa_cleanup temporary_guard;
+  qa_cleanup_push(&temporary_guard, free, temporary);
+  /* writeFile(temporary, text, { mode: 0o600 }): the mode applies (under the umask) when the file is created. */
+  int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) raise_fs(errno, "open", temporary);
+  FILE *out = fdopen(fd, "wb");
   if (out == NULL) {
     int code = errno;
-    free(temporary); free_owned(owned);
-    qa_raise("Error", code, 0, "%s", strerror(code));
+    close(fd);
+    raise_fs(code, "write", temporary);
   }
-  (void)fchmod(fileno(out), 0600);
   write_events(out, store, owned);
-  int code = 0;
-  if (fclose(out) != 0) code = errno;
-  else if (rename(temporary, store->file) != 0) code = errno;
-  free(temporary);
-  if (code != 0) {
-    free_owned(owned);
-    qa_raise("Error", code, 0, "%s", strerror(code));
+  if (ferror(out)) {
+    int code = errno;
+    fclose(out);
+    raise_fs(code, "write", temporary);
   }
+  if (fclose(out) != 0) raise_fs(errno, "write", temporary);
+  if (rename(temporary, store->file) != 0) {
+    const char *code, *description;
+    node_errno_text(errno, &code, &description);
+    qa_raise("Error", 0, 0, "%s: %s, rename '%s' -> '%s'", code, description, temporary, store->file);
+  }
+  qa_cleanup_pop(&temporary_guard);
+  free(temporary);
+  qa_cleanup_pop(&owned_guard);
   push(store, owned);
   return true;
 }

@@ -5,12 +5,12 @@
 #include "qa/foundation/support.h"
 qa_q3_projectile_behavior_result qa_q3_projectile_behavior(double weapon){
   const qa_q3_weapon_item *item=qa_q3_get_weapon_item(weapon);
-  if(!item) qa_range_error("Unknown Q3 projectile weapon %s",QA_JS_NUMBER(weapon));
+  if(!item) qa_raise("Error", 0, 0, "Unknown Q3 projectile weapon %s",QA_JS_NUMBER(weapon));
   if(weapon==4||weapon==12) return (qa_q3_projectile_behavior_result){item->item,"grenade"};
   if(weapon==5) return (qa_q3_projectile_behavior_result){item->item,"rocket"};
   if(weapon==8) return (qa_q3_projectile_behavior_result){item->item,"plasma"};
   if(weapon==9) return (qa_q3_projectile_behavior_result){item->item,"energy"};
   if(weapon==10) return (qa_q3_projectile_behavior_result){item->item,"grapple"};
   if(weapon==11) return (qa_q3_projectile_behavior_result){item->item,"nail"};
-  qa_range_error("Q3 weapon %s does not launch a projectile",QA_JS_NUMBER(weapon));
+  qa_raise("Error",0,0,"Q3 weapon %s does not launch a projectile",QA_JS_NUMBER(weapon));
 }

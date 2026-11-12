@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/foundation/js.h"
+#include "qa/network/common/js_number.h"
 
 static char *dups(const char *s) { size_t n = strlen(s); char *p = malloc(n + 1); if (p) memcpy(p, s, n + 1); return p; }
 static const char *format_name(qa_decoded_world_kind k) {
@@ -130,14 +131,82 @@ static bool estimate_allowed(void *ctx, const qa_navigation_edge *edge, bool has
   return static_edge_allowed(rt, edge, has_flags ? &q : NULL);
 }
 
+/* TS #scopeKey(): everything static_edge_allowed reads that differs between runtimes of one graph,
+   so equal keys give equal estimates. */
+typedef struct { char *text; size_t length, cap; } scope_text;
+static void scope_put(scope_text *t, const char *part) {
+  size_t n = strlen(part);
+  if (t->length + n + 1 > t->cap) {
+    size_t cap = t->cap ? t->cap : 64;
+    while (t->length + n + 1 > cap) cap *= 2;
+    char *grown = realloc(t->text, cap);
+    if (!grown) { free(t->text); qa_range_error("Out of memory building the estimate scope"); }
+    t->text = grown; t->cap = cap;
+  }
+  memcpy(t->text + t->length, part, n + 1);
+  t->length += n;
+}
+static int compare_text(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
+static int compare_id(const void *a, const void *b) {
+  int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+  return x < y ? -1 : x > y;
+}
+static int compare_enabled(const void *a, const void *b) {
+  const qa_navigation_id_bool *x = a, *y = b;
+  return x->id < y->id ? -1 : x->id > y->id;
+}
+static const char *scope_key(void *ctx) {
+  qa_navigation_runtime *rt = ctx;
+  if (rt->estimate_scope) return rt->estimate_scope;
+  const qa_navigation_profile *profile = &rt->graph->profile;
+  scope_text t = {0};
+  const char *modes[QA_TM_COUNT];
+  size_t mode_count = 0;
+  for (int mode = 0; mode < QA_TM_COUNT; mode++)
+    if (profile->capabilities & (1u << mode)) modes[mode_count++] = qa_travel_mode_name((qa_travel_mode)mode);
+  qsort(modes, mode_count, sizeof *modes, compare_text);
+  for (size_t i = 0; i < mode_count; i++) { if (i) scope_put(&t, ","); scope_put(&t, modes[i]); }
+  scope_put(&t, "|");
+  scope_put(&t, profile->team == 0 ? "red" : profile->team == 1 ? "blue" : "-");
+  scope_put(&t, profile->monster ? "|1|" : "|0|");
+  char number[64];
+  qa_net_js_number(profile->maximum_drop, number, sizeof number);
+  scope_put(&t, number);
+  scope_put(&t, "|");
+  int64_t *blocked = malloc((rt->blocked_count ? rt->blocked_count : 1) * sizeof *blocked);
+  qa_navigation_id_bool *enabled = malloc((rt->enabled_count ? rt->enabled_count : 1) * sizeof *enabled);
+  if (!blocked || !enabled) { free(blocked); free(enabled); free(t.text); qa_range_error("Out of memory building the estimate scope"); }
+  for (size_t i = 0; i < rt->blocked_count; i++) blocked[i] = rt->blocked[i].id;
+  qsort(blocked, rt->blocked_count, sizeof *blocked, compare_id);
+  for (size_t i = 0; i < rt->blocked_count; i++) {
+    if (i) scope_put(&t, ",");
+    snprintf(number, sizeof number, "%lld", (long long)blocked[i]);
+    scope_put(&t, number);
+  }
+  scope_put(&t, "|");
+  if (rt->enabled_count) memcpy(enabled, rt->enabled, rt->enabled_count * sizeof *enabled);
+  /* Array.prototype.sort is stable; the ids are unique Map keys, so any order-preserving sort agrees. */
+  qsort(enabled, rt->enabled_count, sizeof *enabled, compare_enabled);
+  for (size_t i = 0; i < rt->enabled_count; i++) {
+    if (i) scope_put(&t, ",");
+    snprintf(number, sizeof number, "%lld%s", (long long)enabled[i].id, enabled[i].enabled ? "+" : "-");
+    scope_put(&t, number);
+  }
+  free(blocked); free(enabled);
+  rt->estimate_scope = t.text;
+  return rt->estimate_scope;
+}
+static void scope_reset(qa_navigation_runtime *rt) { free(rt->estimate_scope); rt->estimate_scope = NULL; }
+
 bool qa_navigation_runtime_init(qa_navigation_runtime *rt, const qa_navigation_graph *graph,
                                 const qa_navigation_world *world) {
   memset(rt, 0, sizeof *rt);
   rt->graph = graph; rt->world = world; rt->world_revision = world_revision(world);
-  for (size_t i = 0; i < graph->node_count; i++)
-    for (size_t j = i + 1; j < graph->node_count; j++)
+  /* TS throws at the first node whose id an earlier node already has. */
+  for (size_t j = 1; j < graph->node_count; j++)
+    for (size_t i = 0; i < j; i++)
       if (graph->nodes[i].id == graph->nodes[j].id)
-        qa_range_error("Duplicate navigation node %lld", (long long)graph->nodes[i].id);
+        qa_range_error("Duplicate navigation node %lld", (long long)graph->nodes[j].id);
   size_t n = graph->node_count ? graph->node_count : 1;
   rt->outgoing = calloc(n, sizeof *rt->outgoing);
   rt->outgoing_counts = calloc(n, sizeof *rt->outgoing_counts);
@@ -161,7 +230,7 @@ bool qa_navigation_runtime_init(qa_navigation_runtime *rt, const qa_navigation_g
     rt->outgoing[from][rt->outgoing_counts[from]++] = edge;
   }
   free(caps);
-  if (!qa_navigation_estimates_init(&rt->estimates, graph, rt, estimate_allowed)) {
+  if (!qa_navigation_estimates_init_scoped(&rt->estimates, graph, rt, estimate_allowed, scope_key)) {
     qa_navigation_runtime_destroy(rt);
     return false;
   }
@@ -170,6 +239,7 @@ bool qa_navigation_runtime_init(qa_navigation_runtime *rt, const qa_navigation_g
 void qa_navigation_runtime_destroy(qa_navigation_runtime *rt) {
   if (!rt) return;
   qa_navigation_estimates_destroy(&rt->estimates);
+  free(rt->estimate_scope);
   if (rt->outgoing && rt->graph) for (size_t i = 0; i < rt->graph->node_count; i++) free((void *)rt->outgoing[i]);
   free((void *)rt->outgoing); free(rt->outgoing_counts);
   free(rt->enabled);
@@ -314,6 +384,7 @@ void qa_navigation_runtime_restore_checkpoint(qa_navigation_runtime *rt, const q
   free(rt->blocked); rt->blocked = blocked; rt->blocked_count = bl_n; rt->blocked_cap = bl_cap;
   free(rt->admission_seconds); rt->admission_seconds = admissions; rt->admission_count = ad_n; rt->admission_cap = ad_cap;
   rt->world_revision = revision; rt->generation = generation;
+  scope_reset(rt);
   qa_navigation_estimates_invalidate(&rt->estimates);
 }
 int64_t qa_navigation_runtime_generation(qa_navigation_runtime *rt) { refresh(rt); return rt->generation; }
@@ -387,7 +458,7 @@ bool qa_navigation_runtime_enable_area(qa_navigation_runtime *rt, int64_t id, bo
   bool previous = en ? en->enabled : !(node->source.kind == QA_NS_AAS && (node->flags & 8) != 0);
   if (previous == enabled) return previous;
   if (!enabled_set(rt, id, enabled)) qa_range_error("Out of memory");
-  invalidate(rt); qa_navigation_estimates_invalidate(&rt->estimates);
+  invalidate(rt); scope_reset(rt); qa_navigation_estimates_invalidate(&rt->estimates);
   return previous;
 }
 void qa_navigation_runtime_block_edge(qa_navigation_runtime *rt, int64_t id, const char *reason) {
@@ -417,7 +488,7 @@ void qa_navigation_runtime_block_edge(qa_navigation_runtime *rt, int64_t id, con
     if (!copy) qa_range_error("Out of memory");
     rt->blocked[rt->blocked_count++] = (qa_navigation_id_reason){id, copy};
   }
-  invalidate(rt); qa_navigation_estimates_invalidate(&rt->estimates);
+  invalidate(rt); scope_reset(rt); qa_navigation_estimates_invalidate(&rt->estimates);
 }
 
 static bool evaluate_node_allowed(qa_navigation_runtime *rt, const qa_navigation_node *node,
@@ -489,12 +560,10 @@ const qa_navigation_node *qa_navigation_runtime_nearest(qa_navigation_runtime *r
     if (d > radius) continue;
     qa_navigation_profile profile;
     if (!qa_nav_node_profile(&rt->graph->profile, node, &profile)) continue;
-    bool crouched = !(profile.shape.bounds.min.x == rt->graph->profile.shape.bounds.min.x &&
-                      profile.shape.bounds.min.y == rt->graph->profile.shape.bounds.min.y &&
-                      profile.shape.bounds.min.z == rt->graph->profile.shape.bounds.min.z &&
-                      profile.shape.bounds.max.x == rt->graph->profile.shape.bounds.max.x &&
-                      profile.shape.bounds.max.y == rt->graph->profile.shape.bounds.max.y &&
-                      profile.shape.bounds.max.z == rt->graph->profile.shape.bounds.max.z);
+    /* TS keys the start-solid memo by the shape object: the profile's own or its crouched shape. */
+    bool crouched = node->source.kind == QA_NS_AAS ? ((node->presence & 2) == 0 && (node->presence & 4) != 0)
+                    : node->source.kind == QA_NS_NAV3 ? ((node->flags & 512) != 0)
+                    : (node->source.kind == QA_NS_CONSTRUCTED && node->presence == 4);
     if (cn == ccap) { ccap = ccap ? ccap * 2 : 16; cands = realloc(cands, ccap * sizeof *cands); if (!cands) return NULL; }
     cands[cn] = (Cand){node, d, profile, cn, crouched}; cn++;
   }
@@ -645,7 +714,7 @@ static const qa_navigation_edge **candidate(qa_navigation_runtime *rt, int64_t s
       size_t length = 0;
       for (int64_t node = goal; node != start;) {
         CostEntry *e = cost_find(costs, cn, node);
-        if (!e || !e->parent) qa_range_error("Navigation predecessor chain is incomplete");
+        if (!e || !e->parent) { free(queue.v); free(costs); qa_raise("Error", 0, 0, "Navigation predecessor chain is incomplete"); }
         length++; node = e->parent->from;
       }
       const qa_navigation_edge **path = malloc((length ? length : 1) * sizeof *path);

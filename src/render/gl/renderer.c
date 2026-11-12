@@ -41,6 +41,7 @@ typedef struct gimpl {
   double offset_factor, offset_units;
   bool closed;
   gprep *retired_preps;
+  gprep *live_preps; /* prepared draws not cleaned yet: destroy reclaims the ones a failed cleanup left */
   void *active_key; /* context in the activeContexts set */
 } gimpl;
 static gimpl *G(qa_gl_renderer *r) { return (gimpl *)r->impl; }
@@ -75,7 +76,7 @@ static bool finite32(double value) { return isfinite((float)value); }
 static bool is_int32(double v) { return v == floor(v) && v >= -2147483648.0 && v <= 2147483647.0; }
 static double get_integer(gimpl *p, uint32_t name) {
   int32_t value = 0; p->gl.glGetIntegerv(name, &value);
-  if (value < 0) qa_range_error("OpenGL returned an invalid capability");
+  if (value < 0) qa_raise("Error", 0, 0, "OpenGL returned an invalid capability");
   return value;
 }
 double qa_gl_renderer_width(qa_gl_renderer *r) { gimpl *p = G(r); double w = 0, h = 0; p->window.drawable_size(p->window.ctx, &w, &h); return w; }
@@ -88,9 +89,9 @@ static void invalidate_state(gimpl *p) {
 static void make_current_body(void *ctx) { gimpl *p = (gimpl *)ctx; p->window.make_current(p->window.ctx); }
 static void opened(qa_gl_renderer *r) {
   gimpl *p = G(r);
-  if (p == NULL || p->closed) qa_range_error("OpenGL renderer is closed");
-  char message[1024];
-  if (!qa_range_error_catch(make_current_body, p, message, sizeof message)) { invalidate_state(p); qa_range_error("%s", message); }
+  if (p == NULL || p->closed) qa_raise("Error", 0, 0, "OpenGL renderer is closed");
+  qa_caught_error caught; /* rethrown unchanged: TS finally/catch-and-throw keep the error and its class */
+  if (!qa_try(make_current_body, p, &caught)) { invalidate_state(p); qa_rethrow(&caught); }
 }
 static void select_texture(gimpl *p, int unit) {
   if (p->texture_unit == unit) return;
@@ -107,7 +108,7 @@ static void identity_matrices(gimpl *p) {
 }
 /* World-space batches are transformed by the GPU with the view's matrix. */
 static void world_matrices(gimpl *p) {
-  if (!p->has_vp) qa_range_error("OpenGL world-space batch requires a view projection");
+  if (!p->has_vp) qa_raise("Error", 0, 0, "OpenGL world-space batch requires a view projection");
   p->gl.glMatrixMode(0x1701); p->gl.glLoadMatrixf(p->view_projection);
   p->gl.glMatrixMode(0x1700); p->gl.glLoadIdentity();
   p->matrices_identity = false;
@@ -118,20 +119,28 @@ static void disable_arrays(gimpl *p) {
   for (int unit = 3; unit >= 0; unit--) { select_texture(p, unit); p->gl.glDisableClientState(0x8078); }
   p->active_arrays = NULL;
 }
+typedef struct gamma_bind_scope { qa_gl_output_gamma *pass; double buffer, width, height; bool changed; } gamma_bind_scope;
+static void gamma_bind_body(void *ctx) { gamma_bind_scope *s = (gamma_bind_scope *)ctx; s->changed = qa_gl_output_gamma_bind(s->pass, s->buffer, s->width, s->height); }
 static void draw_target(qa_gl_renderer *r, bool rendering) {
   gimpl *p = G(r);
   if (p->has_object_opacity && qa_gl_object_opacity_bind(&p->object_opacity)) return;
   if (p->has_output_gamma) {
     double width = qa_gl_renderer_width(r), height = qa_gl_renderer_height(r);
-    if (width > r->max_texture_size || height > r->max_texture_size) qa_range_error("OpenGL gamma target exceeds maximum texture size");
-    bool changed = qa_gl_output_gamma_bind(&p->output_gamma, p->draw_buffer, width, height);
-    if (rendering || changed) p->gamma_finished = false;
+    if (width > r->max_texture_size || height > r->max_texture_size) qa_raise("Error", 0, 0, "OpenGL gamma target exceeds maximum texture size");
+    gamma_bind_scope scope = {&p->output_gamma, p->draw_buffer, width, height, false};
+    qa_caught_error caught; /* rethrown unchanged: TS finally/catch-and-throw keep the error and its class */
+    if (!qa_try(gamma_bind_body, &scope, &caught)) { invalidate_state(p); qa_rethrow(&caught); }
+    if (rendering || scope.changed) p->gamma_finished = false;
   }
 }
 
-typedef struct init_scope { qa_gl_renderer *r; gimpl *p; qa_renderer_resource_owner owner; bool has_program; } init_scope;
+typedef struct init_scope { qa_gl_renderer *r; gimpl *p; qa_renderer_resource_owner owner; bool has_library, has_program, load_failed; } init_scope;
 static void init_body(void *ctx) {
   init_scope *s = (init_scope *)ctx; qa_gl_renderer *r = s->r; gimpl *p = s->p; qa_gl *gl = &p->gl;
+  p->window.set_rendering_enabled(p->window.ctx, true);
+  p->window.make_current(p->window.ctx);
+  if (!qa_load_gl(&p->window.gl_context, &p->gl)) { s->load_failed = true; return; }
+  s->has_library = true;
   r->driver.vendor = gl->glGetString(0x1f00); r->driver.renderer = gl->glGetString(0x1f01);
   r->driver.version = gl->glGetString(0x1f02); r->driver.shading_language = gl->glGetString(0x8b8c);
   r->stencil_bits = get_integer(p, 0xd57);
@@ -144,7 +153,7 @@ static void init_body(void *ctx) {
   r->texture_units = coords < units ? coords : units;
   r->stereo_enabled = get_integer(p, 0xc33) != 0;
   if (r->texture_units < 4 || r->max_texture_size < 1 || r->depth_bits < 1)
-    qa_range_error("OpenGL renderer requires four texture coordinate units and a depth framebuffer");
+    qa_raise("Error", 0, 0, "OpenGL renderer requires four texture coordinate units and a depth framebuffer");
   p->precision = (qa_gl_precision){red, green, blue, r->alpha_bits, r->depth_bits, r->stencil_bits, r->color_bits};
   if (!qa_gl_stage_program_init(&p->program, &p->window.gl_context)) qa_range_error("OpenGL stage program allocation failed");
   s->has_program = true;
@@ -163,29 +172,28 @@ static void init_body(void *ctx) {
   disable_arrays(p);
 }
 bool qa_gl_renderer_init(qa_gl_renderer *r, qa_gl_render_context window, qa_renderer_resource_owner owner) {
-  if (!active_add(window.ctx)) qa_range_error("SDL context already has an active OpenGL renderer");
+  if (!active_add(window.ctx)) qa_raise("Error", 0, 0, "SDL context already has an active OpenGL renderer");
   gimpl *p = (gimpl *)calloc(1, sizeof *p);
   if (p == NULL) { active_remove(window.ctx); return false; }
   r->impl = p; r->owner = owner; p->window = window; p->active_key = window.ctx;
   p->draw_buffer = 0x405; p->alpha_test = "none"; p->gamma = 1; p->texture_unit = -1; p->offset_enabled = -1;
-  init_scope scope = {r, p, owner, false};
-  char message[1024];
-  /* TS constructor catch: release what opened, forget the context, rethrow. */
-  window.set_rendering_enabled(window.ctx, true);
-  window.make_current(window.ctx);
-  if (!qa_load_gl(&p->window.gl_context, &p->gl)) { free(p); r->impl = NULL; active_remove(window.ctx); return false; }
-  if (!qa_range_error_catch(init_body, &scope, message, sizeof message)) {
+  init_scope scope = {r, p, owner, false, false, false};
+  qa_caught_error caught; /* rethrown unchanged: TS finally/catch-and-throw keep the error and its class */
+  /* TS constructor catch (it covers setRenderingEnabled and makeCurrent too): release what opened, forget the context, rethrow. */
+  if (!qa_try(init_body, &scope, &caught)) {
     if (scope.has_program) qa_gl_stage_program_close(&p->program);
-    qa_gl_close(&p->gl); free(p); r->impl = NULL; active_remove(window.ctx);
-    qa_range_error("%s", message);
+    if (scope.has_library) qa_gl_close(&p->gl);
+    free(p); r->impl = NULL; active_remove(window.ctx);
+    qa_rethrow(&caught);
   }
+  if (scope.load_failed) { free(p); r->impl = NULL; active_remove(window.ctx); return false; }
   return true;
 }
 void qa_gl_renderer_set_output_gamma(qa_gl_renderer *r, double gamma) {
   uint8_t table[256]; bool has_table = qa_output_gamma_table(gamma, table);
   opened(r); gimpl *p = G(r);
   if (gamma == p->gamma) return;
-  if (p->active_arrays != NULL) qa_range_error("OpenGL gamma cannot interrupt a prepared draw");
+  if (p->active_arrays != NULL) qa_raise("Error", 0, 0, "OpenGL gamma cannot interrupt a prepared draw");
   invalidate_state(p);
   if (!has_table) {
     if (p->has_output_gamma) {
@@ -196,11 +204,12 @@ void qa_gl_renderer_set_output_gamma(qa_gl_renderer *r, double gamma) {
   } else if (!p->has_output_gamma) {
     qa_gl_output_gamma pass;
     if (!qa_gl_output_gamma_init(&pass, &p->window.gl_context, &p->gl, p->precision, table)) qa_range_error("OpenGL gamma pass allocation failed");
-    qa_gl_output_gamma * gamma2 = &pass;
     double buffer = p->draw_buffer;
     double width = qa_gl_renderer_width(r);
     double height = qa_gl_renderer_height(r);
-    (void)qa_gl_output_gamma_bind(gamma2, buffer, width, height);
+    gamma_bind_scope scope = {&pass, buffer, width, height, false};
+    qa_caught_error caught; /* try { pass.bind(...) } catch (error) { pass.close(); throw error } */
+    if (!qa_try(gamma_bind_body, &scope, &caught)) { qa_gl_output_gamma_close(&pass); qa_rethrow(&caught); }
     p->output_gamma = pass; p->has_output_gamma = true;
   } else qa_gl_output_gamma_update(&p->output_gamma, table);
   p->gamma = gamma; p->gamma_finished = false;
@@ -257,7 +266,8 @@ static void apply_state(gimpl *p, const qa_render_state *state) {
   if (!strcmp(state->blend.source, "one") && !strcmp(state->blend.destination, "zero")) gl->glDisable(0xbe2);
   else { gl->glEnable(0xbe2); gl->glBlendFunc(blend_factor(state->blend.source), blend_factor(state->blend.destination)); }
   gl->glDisable(0xbc0);
-  p->alpha_test = state->alpha_test;
+  /* The renderer outlives the batch: keep the literal, not the batch's string. */
+  p->alpha_test = !strcmp(state->alpha_test, "gt0") ? "gt0" : !strcmp(state->alpha_test, "lt128") ? "lt128" : !strcmp(state->alpha_test, "ge128") ? "ge128" : !strcmp(state->alpha_test, "none") ? "none" : state->alpha_test;
   apply_cull(p, state->cull);
   apply_range(p, state->depth_range);
   apply_offset(p, state->polygon_offset);
@@ -271,14 +281,14 @@ void qa_gl_renderer_apply_image_resource(qa_gl_renderer *r, qa_image_resource_op
   bool is_release = op.kind == QA_IMAGE_OP_RELEASE;
   uint32_t released = is_release ? qa_gl_textures_registered(&p->textures, op.image).name : 0;
   image_scope scope = {p, op};
-  char message[1024];
-  bool ok = qa_range_error_catch(image_body, &scope, message, sizeof message);
+  qa_caught_error caught; /* rethrown unchanged: TS finally/catch-and-throw keep the error and its class */
+  bool ok = qa_try(image_body, &scope, &caught);
   p->gl.glBindTexture(0xde1, is_release && (uint32_t)previous == released ? 0 : (uint32_t)previous);
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) qa_rethrow(&caught);
 }
 void qa_gl_renderer_select_draw_buffer(qa_gl_renderer *r, const char *buffer, bool clear) {
   opened(r); gimpl *p = G(r);
-  if (!strcmp(buffer, "back-right") && !r->stereo_enabled) qa_range_error("OpenGL stereo draw buffer requires a stereo context");
+  if (!strcmp(buffer, "back-right") && !r->stereo_enabled) qa_raise("Error", 0, 0, "OpenGL stereo draw buffer requires a stereo context");
   p->draw_buffer = !strcmp(buffer, "front") ? 0x404 : !strcmp(buffer, "back-left") ? 0x402 : !strcmp(buffer, "back-right") ? 0x403 : 0x405;
   if (!p->has_output_gamma) p->gl.glDrawBuffer(p->draw_buffer); else draw_target(r, true);
   if (clear) { p->gl.glClearColor(1, 0, 0.5f, 1); p->gl.glClear(0x4000 | 0x100); }
@@ -329,6 +339,9 @@ struct gprep {
   int next_unit;
   gprep *next;
 };
+static void live_remove(gimpl *p, gprep *pr) {
+  for (gprep **link = &p->live_preps; *link != NULL; link = &(*link)->next) if (*link == pr) { *link = pr->next; break; }
+}
 static void resolver_apply(void *ctx, qa_image_resource_operation op) { qa_gl_renderer_apply_image_resource((qa_gl_renderer *)ctx, op); }
 static void buffer_free(qa_gl_geometry_buffer *buffer) { if (buffer != NULL) { qa_gl_geometry_buffer_destroy(buffer); free(buffer); } }
 /* TS lets the GC reclaim cleaned closures; C reclaims them at the next prepare. */
@@ -337,14 +350,14 @@ static void reap_preps(gimpl *p) {
 }
 static void gprep_begin(void *ctx) {
   gprep *pr = (gprep *)ctx; opened(pr->r); gimpl *p = G(pr->r); qa_gl *gl = &p->gl;
-  if (pr->phase != PHASE_PREPARED || p->active_arrays != NULL) qa_range_error("OpenGL prepared draw is already active");
+  if (pr->phase != PHASE_PREPARED || p->active_arrays != NULL) qa_raise("Error", 0, 0, "OpenGL prepared draw is already active");
   const qa_batch_lighting *lighting = &pr->batch.lighting;
   bool has_atlas = false; uint32_t atlas_name = 0;
   if (strcmp(lighting->kind, "vertex") != 0) {
     const qa_q2_shadow_atlas *atlas = !strcmp(lighting->kind, "q2-model-shadow") ? &lighting->atlas_value : lighting->atlas;
     if (atlas != NULL) {
       qa_gl_texture_info info = qa_gl_textures_registered(&p->textures, atlas->image);
-      if (info.content_kind != QA_RENDER_IMAGE_DEPTH32F) qa_range_error("Q2 shadow atlas requires a depth32f image");
+      if (info.content_kind != QA_RENDER_IMAGE_DEPTH32F) qa_raise("Error", 0, 0, "Q2 shadow atlas requires a depth32f image");
       has_atlas = true; atlas_name = info.name;
     }
   }
@@ -375,7 +388,7 @@ static void gprep_begin(void *ctx) {
 static void gprep_apply_texture(void *ctx, double unit, qa_texture_binding operation) {
   gprep *pr = (gprep *)ctx; opened(pr->r); gimpl *p = G(pr->r);
   if (pr->phase != PHASE_ACTIVE || unit != pr->next_unit || (unit != 0 && unit != 1) || (unit == 1 && !pr->paired))
-    qa_range_error("OpenGL prepared texture order is invalid");
+    qa_raise("Error", 0, 0, "OpenGL prepared texture order is invalid");
   qa_texture_binding binding = pr->has_resolver ? qa_texture_resolver_resolve(&pr->resolver, operation) : operation;
   select_texture(p, (int)unit);
   qa_gl_textures_bind(&p->textures, binding);
@@ -387,13 +400,14 @@ static void gprep_apply_texture(void *ctx, double unit, qa_texture_binding opera
 }
 static void gprep_draw(void *ctx) {
   gprep *pr = (gprep *)ctx; opened(pr->r); gimpl *p = G(pr->r);
-  if (pr->phase != PHASE_ACTIVE || pr->next_unit != (pr->paired ? 2 : 1)) qa_range_error("OpenGL prepared draw has unapplied texture slots");
+  if (pr->phase != PHASE_ACTIVE || pr->next_unit != (pr->paired ? 2 : 1)) qa_raise("Error", 0, 0, "OpenGL prepared draw has unapplied texture slots");
   if (pr->arrays.index_count > 0) p->gl.glDrawElements(pr->mode, (int32_t)pr->arrays.index_count, 0x1405, pr->arrays.indices);
   pr->phase = PHASE_DRAWN;
 }
 static void gprep_release(gprep *pr, gimpl *p) {
   if (pr->has_resolver) { qa_texture_resolver_destroy(&pr->resolver); pr->has_resolver = false; }
   pr->phase = PHASE_CLEANED;
+  live_remove(p, pr);
   pr->next = p->retired_preps; p->retired_preps = pr;
 }
 static void gprep_cleanup(void *ctx) {
@@ -427,12 +441,12 @@ qa_prepared_backend_draw qa_gl_renderer_prepare_geometry(qa_gl_renderer *r, qa_d
     if (pr->buffer == NULL || !qa_gl_geometry_buffer_init(pr->buffer)) qa_range_error("OpenGL geometry allocation failed");
   }
   pr->r = r; pr->batch = batch;
-  char message[1024];
-  if (!qa_range_error_catch(pack_body, pr, message, sizeof message)) {
+  qa_caught_error caught; /* rethrown unchanged: TS finally/catch-and-throw keep the error and its class */
+  if (!qa_try(pack_body, pr, &caught)) {
     p->idle_geometry = pr->buffer;
     if (pr->has_resolver) qa_texture_resolver_destroy(&pr->resolver);
     free(pr);
-    qa_range_error("%s", message);
+    qa_rethrow(&caught);
   }
   pr->state = batch.state; /* TS snapshots the state: mutating the batch later has no effect. */
   if (batch.state.polygon_offset != NULL) { pr->offset = *batch.state.polygon_offset; pr->state.polygon_offset = &pr->offset; }
@@ -440,6 +454,7 @@ qa_prepared_backend_draw qa_gl_renderer_prepare_geometry(qa_gl_renderer *r, qa_d
   pr->environment = pr->paired ? batch.second_texture.environment : NULL;
   pr->mode = batch.primitive_is_lines ? 1 : 4;
   pr->line_width = batch.primitive_is_lines ? (float)batch.line_width : 1.0f;
+  pr->next = p->live_preps; p->live_preps = pr;
   qa_prepared_backend_draw o; memset(&o, 0, sizeof o);
   o.ctx = pr; o.begin = gprep_begin; o.apply_texture = gprep_apply_texture; o.draw = gprep_draw; o.cleanup = gprep_cleanup;
   return o;
@@ -455,12 +470,12 @@ static void opacity_body(void *ctx) {
 void qa_gl_renderer_with_object_opacity(qa_gl_renderer *r, double opacity, qa_gl_draw_fn draw, void *ctx) {
   opened(r); gimpl *p = G(r);
   if (!isfinite(opacity) || opacity < 0 || opacity > 1) qa_range_error("Object opacity must be in 0..1");
-  if (p->opacity_active) qa_range_error("Nested OpenGL object opacity is unsupported");
+  if (p->opacity_active) qa_raise("Error", 0, 0, "Nested OpenGL object opacity is unsupported");
   if (opacity == 0) return;
   if (opacity == 1) { draw(ctx); return; }
-  if (p->active_arrays != NULL) qa_range_error("Object opacity cannot interrupt a prepared draw");
+  if (p->active_arrays != NULL) qa_raise("Error", 0, 0, "Object opacity cannot interrupt a prepared draw");
   double width = qa_gl_renderer_width(r), height = qa_gl_renderer_height(r);
-  if (width > r->max_texture_size || height > r->max_texture_size) qa_range_error("OpenGL opacity target exceeds maximum texture size");
+  if (width > r->max_texture_size || height > r->max_texture_size) qa_raise("Error", 0, 0, "OpenGL opacity target exceeds maximum texture size");
   draw_target(r, true);
   invalidate_state(p);
   if (!p->has_object_opacity) {
@@ -469,10 +484,10 @@ void qa_gl_renderer_with_object_opacity(qa_gl_renderer *r, double opacity, qa_gl
   }
   p->opacity_active = true;
   opacity_scope scope = {p, draw, ctx, opacity, width, height};
-  char message[1024];
-  bool ok = qa_range_error_catch(opacity_body, &scope, message, sizeof message);
+  qa_caught_error caught; /* rethrown unchanged: TS finally/catch-and-throw keep the error and its class */
+  bool ok = qa_try(opacity_body, &scope, &caught);
   p->opacity_active = false; invalidate_state(p); /* TS finally */
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) qa_rethrow(&caught);
 }
 
 /* --- immediate operations --- */
@@ -575,7 +590,7 @@ void qa_gl_renderer_draw_immediate(qa_gl_renderer *r, qa_render_operation op) {
   gimpl *p = G(r);
   switch (op.kind) {
   case QA_RENDER_OP_Q2_FOG:
-    if (p->active_arrays != NULL) qa_range_error("OpenGL fog cannot interrupt a prepared draw");
+    if (p->active_arrays != NULL) qa_raise("Error", 0, 0, "OpenGL fog cannot interrupt a prepared draw");
     invalidate_state(p);
     if (!p->has_fog) {
       if (!qa_q2_fog_pass_init(&p->fog, &p->window.gl_context, &p->gl)) qa_range_error("OpenGL fog pass allocation failed");
@@ -588,9 +603,9 @@ void qa_gl_renderer_draw_immediate(qa_gl_renderer *r, qa_render_operation op) {
     qa_q2_fog_pass_draw(pass2, operation2, target_width, target_height);
     return;
   case QA_RENDER_OP_DEPTH_ATLAS: {
-    if (p->active_arrays != NULL) qa_range_error("OpenGL depth atlas cannot interrupt a prepared draw");
+    if (p->active_arrays != NULL) qa_raise("Error", 0, 0, "OpenGL depth atlas cannot interrupt a prepared draw");
     qa_gl_texture_info texture = qa_gl_textures_registered(&p->textures, op.image);
-    if (texture.content_kind != QA_RENDER_IMAGE_DEPTH32F) qa_range_error("OpenGL depth atlas target requires a depth32f image");
+    if (texture.content_kind != QA_RENDER_IMAGE_DEPTH32F) qa_raise("Error", 0, 0, "OpenGL depth atlas target requires a depth32f image");
     invalidate_state(p);
     if (!p->has_depth_atlas) {
       if (!qa_depth_atlas_target_init(&p->depth_atlas, &p->window.gl_context, &p->gl, &p->program)) qa_range_error("OpenGL depth atlas allocation failed");
@@ -605,9 +620,8 @@ void qa_gl_renderer_draw_immediate(qa_gl_renderer *r, qa_render_operation op) {
   case QA_RENDER_OP_DISABLE_PORTAL_CLIP: p->gl.glDisable(0x3000); return;
   case QA_RENDER_OP_SKY_SIDE: draw_sky(p, &op); return;
   case QA_RENDER_OP_SHADOW_VOLUME: case QA_RENDER_OP_SHADOW_FINISH: draw_shadow(r, &op); return;
-  case QA_RENDER_OP_DRAW: case QA_RENDER_OP_OBJECT_OPACITY: break;
+  case QA_RENDER_OP_DRAW: case QA_RENDER_OP_OBJECT_OPACITY: break; /* the TS switch has no case for these and returns */
   }
-  qa_range_error("Invalid OpenGL immediate operation");
 }
 void qa_gl_renderer_clear_color_buffer(qa_gl_renderer *r) { opened(r); draw_target(r, true); G(r)->gl.glClear(0x4000); }
 void qa_gl_renderer_draw_show_image(qa_gl_renderer *r, qa_renderer_image image, qa_rect rect, bool proportional) {
@@ -636,7 +650,7 @@ void qa_gl_renderer_set_overdraw_measurement(qa_gl_renderer *r, bool enabled) {
   opened(r); draw_target(r, true);
   qa_gl *gl = &G(r)->gl;
   if (!enabled) { gl->glDisable(0xb90); return; }
-  if (r->stencil_bits == 0) qa_range_error("OpenGL overdraw measurement requires a stencil framebuffer");
+  if (r->stencil_bits == 0) qa_raise("Error", 0, 0, "OpenGL overdraw measurement requires a stencil framebuffer");
   gl->glEnable(0xb90);
   gl->glStencilMask(0xffffffffu);
   gl->glClearStencil(0);
@@ -665,7 +679,7 @@ double qa_gl_renderer_read_depth_pixel(qa_gl_renderer *r, double x, double y) {
 static void resolve_output(qa_gl_renderer *r) {
   gimpl *p = G(r);
   if (p->has_output_gamma) {
-    if (p->active_arrays != NULL) qa_range_error("OpenGL gamma cannot interrupt a prepared draw");
+    if (p->active_arrays != NULL) qa_raise("Error", 0, 0, "OpenGL gamma cannot interrupt a prepared draw");
     draw_target(r, false);
     if (!p->gamma_finished) {
       invalidate_state(p);
@@ -678,7 +692,8 @@ uint8_t *qa_gl_renderer_read_pixels(qa_gl_renderer *r, size_t *out_length) {
   opened(r);
   resolve_output(r);
   size_t width = (size_t)qa_gl_renderer_width(r), height = (size_t)qa_gl_renderer_height(r), stride = width * 4, n = stride * height;
-  uint8_t *pixels = (uint8_t *)malloc(n ? n : 1), *top_down = (uint8_t *)malloc(n ? n : 1);
+  /* new Uint8Array(n): zero-filled, so rows GL does not write read as zero. */
+  uint8_t *pixels = (uint8_t *)calloc(n ? n : 1, 1), *top_down = (uint8_t *)malloc(n ? n : 1);
   if (pixels == NULL || top_down == NULL) { free(pixels); free(top_down); if (out_length) *out_length = 0; return NULL; }
   read_scope scope = {&G(r)->gl, 0, 0, (int32_t)width, (int32_t)height, 0x1908, 0x1401, pixels};
   qa_gl_with_pixel_store(&G(r)->gl, "pack", read_body, &scope);
@@ -699,16 +714,16 @@ static void depth_image_body(void *ctx) {
 bool qa_gl_renderer_read_depth_image(qa_gl_renderer *r, qa_renderer_image image, qa_depth_image_level *out, float *storage, size_t storage_count) {
   opened(r); gimpl *p = G(r);
   qa_gl_texture_info texture = qa_gl_textures_registered(&p->textures, image);
-  if (texture.content_kind != QA_RENDER_IMAGE_DEPTH32F) qa_range_error("OpenGL depth readback requires a depth32f image");
+  if (texture.content_kind != QA_RENDER_IMAGE_DEPTH32F) qa_raise("Error", 0, 0, "OpenGL depth readback requires a depth32f image");
   select_texture(p, 2);
   double previous = get_integer(p, 0x8069);
   size_t need = (size_t)(image.width * image.height);
   if (storage_count < need) return false; /* TS allocates; C callers supply storage. */
   depth_image_scope scope = {p, texture.name, storage};
-  char message[1024];
-  bool ok = qa_range_error_catch(depth_image_body, &scope, message, sizeof message);
+  qa_caught_error caught; /* rethrown unchanged: TS finally/catch-and-throw keep the error and its class */
+  bool ok = qa_try(depth_image_body, &scope, &caught);
   p->gl.glBindTexture(0xde1, (uint32_t)previous); select_texture(p, 0); /* TS finally */
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) qa_rethrow(&caught);
   out->width = image.width; out->height = image.height; out->pixels = storage; out->pixel_count = need;
   return true;
 }
@@ -721,10 +736,10 @@ static void present_body(void *ctx) {
   p->window.swap(p->window.ctx);
 }
 void qa_gl_renderer_present(qa_gl_renderer *r) {
-  char message[1024];
-  bool ok = qa_range_error_catch(present_body, r, message, sizeof message);
+  qa_caught_error caught; /* rethrown unchanged: TS finally/catch-and-throw keep the error and its class */
+  bool ok = qa_try(present_body, r, &caught);
   if (G(r) != NULL) invalidate_state(G(r)); /* TS finally */
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) qa_rethrow(&caught);
 }
 void qa_gl_renderer_close(qa_gl_renderer *r) {
   gimpl *p = G(r);
@@ -750,6 +765,11 @@ void qa_gl_renderer_destroy(qa_gl_renderer *r) {
   gimpl *p = G(r);
   if (p == NULL) return;
   qa_gl_renderer_close(r);
+  while (p->live_preps != NULL) {
+    gprep *pr = p->live_preps; p->live_preps = pr->next;
+    buffer_free(pr->buffer); if (pr->has_resolver) qa_texture_resolver_destroy(&pr->resolver);
+    free(pr);
+  }
   reap_preps(p);
   free(p); r->impl = NULL;
 }

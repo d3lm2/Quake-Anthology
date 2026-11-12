@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "qa/foundation/js.h"
@@ -21,9 +22,11 @@ int qa_download_file_open(qa_download_file *f, const char *root, const char *nam
   if (parent < 0) return 0;
   int fd = openat(parent, leaf, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   free(leaf);
-  if (fd < 0) { close(parent); qa_range_error("Download source is not a regular bounded file"); }
+  /* openSync's failure is the system Error (ENOENT, ELOOP, ...), not the regular-file check. */
+  if (fd < 0) { int code = errno; close(parent); qa_raise("Error", code, 0, "%s, open", strerror(code)); }
   struct stat info;
-  if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) { close(fd); close(parent); qa_range_error("Download source is not a regular bounded file"); }
+  if (fstat(fd, &info) != 0) { int code = errno; close(fd); close(parent); qa_raise("Error", code, 0, "%s, fstat", strerror(code)); }
+  if (!S_ISREG(info.st_mode)) { close(fd); close(parent); qa_raise("Error", 0, 0, "Download source is not a regular bounded file"); }
   close(parent);
   f->fd = fd; f->byte_length = (double)info.st_size; f->ended = false;
   return 1;
@@ -56,6 +59,19 @@ qa_download_source qa_download_file_as_source(qa_download_file *f) {
   qa_download_source s; s.ctx = f; s.byte_length = f->byte_length; s.read = file_src_read; s.close = file_src_close; return s;
 }
 
+static void random_uuid_name(char *out, size_t capacity) {
+  uint8_t b[16];
+  size_t done = 0;
+  while (done < sizeof b) {
+    ssize_t n = getrandom(b + done, sizeof b - done, 0);
+    if (n < 0) { if (errno == EINTR) continue; qa_raise("Error", errno, 0, "%s, getrandom", strerror(errno)); }
+    done += (size_t)n;
+  }
+  b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);
+  b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
+  snprintf(out, capacity, ".download-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
 static double sink_limit(qa_download_expectation e) { return e.is_protocol ? e.maximum_bytes : e.byte_length; }
 static int sink_open(qa_download_sink *s, const char *root, const char *name, qa_download_expectation expected, bool ranged) {
   double limit = sink_limit(expected);
@@ -64,10 +80,9 @@ static int sink_open(qa_download_sink *s, const char *root, const char *name, qa
   char *leaf = NULL;
   int parent = qa_open_contained_parent(root, name, true, &leaf);
   if (parent < 0) return 0;
-  /* Temporary name: randomUUID -> pid+counter (uniqueness only). */
-  static unsigned counter = 0;
+  /* `.download-${randomUUID()}`: a pid and counter could meet a stale name from an earlier process. */
   char tmpname[96];
-  snprintf(tmpname, sizeof tmpname, ".download-%ld-%u", (long)getpid(), ++counter);
+  random_uuid_name(tmpname, sizeof tmpname);
   int fd = openat(parent, tmpname, (ranged ? O_RDWR : O_WRONLY) | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
   if (fd < 0) { int code = errno; close(parent); free(leaf); qa_raise("Error", code, 0, "%s, open", strerror(code)); }
   s->parent_fd = parent; s->fd = fd;
@@ -144,9 +159,15 @@ void qa_download_sink_append_range(qa_download_sink *s, double span_start, const
   for (size_t i = 0; i < s->span_count; i++) if (s->spans[i].start == span_start) span = &s->spans[i];
   if (!span) qa_range_error("Unknown download span");
   if ((double)length > span->end - span_start + 1 - span->written) qa_range_error("Download exceeds span size");
-  size_t progress = 0;
-  write_all_at(s->fd, bytes, length, true, (off_t)(span_start + span->written), &progress);
-  span->written += (double)progress; s->count += (double)progress;
+  /* span.written and count advance per write, so a failing write keeps the earlier progress. */
+  size_t written = 0;
+  while (written < length) {
+    ssize_t n = pwrite(s->fd, bytes + written, length - written, (off_t)(span_start + span->written));
+    if (n == 0) qa_raise("Error", 0, 0, "Download write made no progress");
+    if (n < 0) { int code = errno; if (code == EINTR) continue; qa_raise("Error", code, 0, "%s, write", strerror(code)); }
+    written += (size_t)n;
+    span->written += (double)n; s->count += (double)n;
+  }
 }
 static void require_complete_ranges(qa_download_sink *s) {
   if (!s->ranged) return;
@@ -199,7 +220,11 @@ char *qa_download_sink_finish(qa_download_sink *s) {
   struct finish_scope scope = { s, NULL };
   qa_caught_error caught;
   bool ok = qa_try(finish_body, &scope, &caught);
+  /* A close failure in the finally replaces the result (and any error), as in TS. */
+  qa_cleanup digest_guard;
+  qa_cleanup_push(&digest_guard, free, scope.digest);
   qa_download_sink_close(s);
+  qa_cleanup_pop(&digest_guard);
   if (!ok) { free(scope.digest); qa_rethrow(&caught); }
   return scope.digest;
 }
@@ -214,6 +239,7 @@ char *qa_download_sink_try_finish(qa_download_sink *s, const char **error) {
   *error = s->failure;
   return NULL;
 }
+static void close_sink_body(void *ctx) { qa_download_sink_close(ctx); }
 struct inspect_scope { qa_download_sink *s; qa_download_inspect_fn inspect; void *ctx; const char *path; };
 static void inspect_body(void *ctx) {
   struct inspect_scope *scope = ctx;
@@ -234,8 +260,10 @@ void qa_download_sink_inspect_staged(qa_download_sink *s, qa_download_inspect_fn
   struct inspect_scope scope = { s, inspect, ctx, rpath };
   qa_caught_error caught;
   bool ok = qa_try(inspect_body, &scope, &caught);
-  if (!ok) qa_download_sink_close(s);
+  qa_caught_error close_caught;
+  bool closed = ok || qa_try(close_sink_body, s, &close_caught);
   s->inspecting = false; close(retained);
+  if (!closed) qa_rethrow(&close_caught);
   if (!ok) qa_rethrow(&caught);
 }
 static void unlink_at_if_present(int parent, const char *name, int *failure) {
@@ -245,7 +273,8 @@ void qa_download_sink_close(qa_download_sink *s) {
   if (s->ended) return;
   s->ended = true;
   /* try { closeSync(descriptor) } finally { try { unlink staged } finally { closeSync(parent) } }:
-   * every step runs, then the first failure propagates. */
+   * every step runs and, as a throw in a finally replaces the one before it, the last failure
+   * propagates. Within the unlink step the first throw skips the rest of that block. */
   int failure = 0; const char *call = NULL;
   if (s->fd >= 0 && close(s->fd) != 0) { failure = errno; call = "close"; }
   if (!s->suspended && s->parent_fd >= 0 && s->temporary) {
@@ -253,15 +282,15 @@ void qa_download_sink_close(qa_download_sink *s) {
     if (s->resumable) {
       unlink_at_if_present(s->parent_fd, s->temporary, &unlinked);
       char record[1024]; snprintf(record, sizeof record, "%s.sha256", s->temporary);
-      unlink_at_if_present(s->parent_fd, record, &unlinked);
+      if (unlinked == 0) unlink_at_if_present(s->parent_fd, record, &unlinked);
     } else if (unlinkat(s->parent_fd, s->temporary, 0) != 0) {
       /* A one-shot staged name must still exist: a missing one means something else removed
        * it, which callers report as a cleanup failure. */
       unlinked = errno;
     }
-    if (unlinked != 0 && failure == 0) { failure = unlinked; call = "unlink"; }
+    if (unlinked != 0) { failure = unlinked; call = "unlink"; }
   }
-  if (s->parent_fd >= 0) close(s->parent_fd);
+  if (s->parent_fd >= 0 && close(s->parent_fd) != 0) { failure = errno; call = "close"; }
   s->fd = -1; s->parent_fd = -1;
   /* A closed sink rejects every later call before reading its names or spans, so close
    * releases them: callers that only close (as TS code only closes) leak nothing. */

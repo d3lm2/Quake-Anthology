@@ -111,17 +111,6 @@ typedef struct qa_q2_connectionless_host {
 char *qa_q2_info_text(qa_q2_host_info info, const qa_q2_protocol_identity *protocols,
                       size_t protocol_count, double version);
 
-/* TS Q2ConnectionlessServer. */
-typedef struct qa_q2_connectionless_server {
-  const qa_q2_connectionless_host *host;
-  qa_q2_challenge_table *challenges;
-} qa_q2_connectionless_server;
-
-bool qa_q2_connectionless_server_receive(qa_q2_connectionless_server *server,
-                                         const qa_net_address *from,
-                                         const uint8_t *bytes, size_t length,
-                                         double now);
-
 /* TS handleQ2Rcon (host is the rcon subset; same struct). */
 void qa_q2_handle_rcon(const qa_q2_connectionless_host *host,
                        const qa_net_address *from,

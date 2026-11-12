@@ -98,8 +98,10 @@ char **qa_app_shuffled_tracks(const char *const *tracks, size_t count, const cha
   for (size_t i = 0; i < count; i++)
     if (!contains(bag, n, tracks[i])) bag[n++] = xstrdup(tracks[i]);
   for (long long index = (long long)n - 1; index > 0; index--) {
-    long long selected = (long long)floor(random(random_ctx) * (double)(index + 1));
-    char *tmp = bag[index]; bag[index] = bag[selected]; bag[selected] = tmp;
+    double selected = floor(random(random_ctx) * (double)(index + 1));
+    /* TS swaps only when bag[selected] exists: a random() of 1, a negative or a NaN leaves the bag as is */
+    if (!(selected >= 0 && selected <= (double)index)) continue;
+    char *tmp = bag[index]; bag[index] = bag[(size_t)selected]; bag[(size_t)selected] = tmp;
   }
   if (n > 1) {
     char *cue = qa_app_music_file_cue(bag[0]);

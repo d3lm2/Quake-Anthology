@@ -16,14 +16,20 @@
  *  - FrameCapture is synchronous: the TS promise write chain
  *    degenerates to direct calls in call order, and async readRgba
  *    to the synchronous callback above. Capture functions return
- *    false only on I/O or allocation failure (the TS promise
- *    rejects); the TS "No free screenshot filename..." Error raises
- *    like this module's other plain Errors. qa_frame_capture_init
+ *    false only on allocation failure. A file-system failure raises
+ *    the Error the TS promise rejects with (writeAtomic's Node fs
+ *    Error through qa_settings_raise_write_failure, or the exclusive
+ *    open/write/close error of an unnumbered shot), and the TS
+ *    "No free screenshot filename..." Error raises like this module's
+ *    other plain Errors. qa_frame_capture_init
  *    copies root; release with qa_frame_capture_destroy. Screenshot
  *    options defaults (format "png", quality 90) have no C form;
  *    callers pass QA_SCREENSHOT_PNG / 90, and NULL name for the
- *    auto-numbered shotNNNN form. Levelshot gamma follows
+ *    auto-numbered form. Levelshot gamma follows
  *    qa_make_levelshot (NULL or 256 entries).
+ *  - The TS constructor's `naming = Q3_SCREENSHOTS` default is
+ *    qa_frame_capture_init; qa_frame_capture_init_naming takes the
+ *    naming and copies its strings.
  */
 #ifndef QA_CAPTURE_INDEX_H
 #define QA_CAPTURE_INDEX_H
@@ -40,6 +46,14 @@ typedef enum qa_screenshot_format {
   QA_SCREENSHOT_PNG,
   QA_SCREENSHOT_JPG
 } qa_screenshot_format;
+
+/* TS ScreenshotNaming: where an unnamed screenshot goes and what it is
+ * called: the original game's folder, prefix and digits. */
+typedef struct qa_screenshot_naming {
+  const char *directory;
+  const char *prefix;
+  int digits;
+} qa_screenshot_naming;
 
 /* TS FrameReadback: readRgba may be async in TS; the C callback is
  * synchronous and returns a level whose pixels stay owned by the
@@ -75,16 +89,22 @@ typedef struct qa_frame_capture {
   qa_frame_readback readback;
   /* TS nextShot: first unnamed screenshot index to try, per format. */
   double next_shot[3];
+  /* TS naming; the strings are owned copies. */
+  qa_screenshot_naming naming;
 } qa_frame_capture;
-/* False only on OOM. */
+/* False only on OOM. Uses the Quake III naming (screenshots/shotNNNN). */
 bool qa_frame_capture_init(qa_frame_capture *capture, const char *root,
                            qa_frame_readback readback);
+bool qa_frame_capture_init_naming(qa_frame_capture *capture, const char *root,
+                                  qa_frame_readback readback, qa_screenshot_naming naming);
 void qa_frame_capture_destroy(qa_frame_capture *capture);
 
 /* TS FrameCapture.screenshot: named writes go through writeAtomic;
- * unnamed writes take the first free shot0000..shot9999 exclusively.
+ * unnamed writes take the first free numbered name exclusively (the
+ * original Quake 3 stops at shot9999; the Quake and Quake II names only
+ * pad to two digits and keep counting).
  * On success *out owns its path (qa_capture_result_free); false only
- * on I/O or allocation failure. */
+ * on allocation failure; file-system failures raise (see above). */
 bool qa_frame_capture_screenshot(qa_frame_capture *capture,
                                  qa_screenshot_format format, const char *name,
                                  int64_t quality, qa_capture_result *out);

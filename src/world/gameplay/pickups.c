@@ -257,7 +257,52 @@ static void require_entries(qa_shared_pickup_admission *admission, qa_actor_id a
     if (!found) not_admitted(items[i]);
   }
 }
-static qa_pickup_ammo_grant *resolve_ammo(qa_shared_pickup_admission *admission,
+/* C ownership (TS GC): the scratch arrays one admission call allocates. A
+ * raise (an unadmitted destination, a missing mapping, a throwing inventory
+ * binding or grant callback) unwinds through the call's cleanup node, which
+ * frees them; a normal return frees them at the end of the call. */
+typedef struct owned_list {
+  void **items;
+  size_t count, capacity;
+  qa_cleanup node;
+} owned_list;
+static void owned_release(void *arg) {
+  owned_list *list = arg;
+  for (size_t i = 0; i < list->count; i++) free(list->items[i]);
+  free(list->items);
+  list->items = NULL;
+  list->count = list->capacity = 0;
+}
+static void owned_open(owned_list *list) {
+  list->items = NULL;
+  list->count = list->capacity = 0;
+  qa_cleanup_push(&list->node, owned_release, list);
+}
+static void owned_close(owned_list *list) {
+  qa_cleanup_pop(&list->node);
+  owned_release(list);
+}
+static void *owned_calloc(owned_list *list, size_t size) {
+  if (list->count == list->capacity) {
+    list->capacity = list->capacity != 0 ? list->capacity * 2 : 8;
+    list->items = xrealloc(list->items, list->capacity * sizeof *list->items);
+  }
+  void *value = xcalloc(size);
+  list->items[list->count++] = value;
+  return value;
+}
+static void *owned_realloc(owned_list *list, void *ptr, size_t size) {
+  if (ptr == NULL) return owned_calloc(list, size);
+  for (size_t i = 0; i < list->count; i++) {
+    if (list->items[i] == ptr) {
+      list->items[i] = xrealloc(ptr, size);
+      return list->items[i];
+    }
+  }
+  abort(); /* not an owned pointer */
+}
+
+static qa_pickup_ammo_grant *resolve_ammo(owned_list *owned, qa_shared_pickup_admission *admission,
                                           const qa_pickup_ammo_grant *offers, size_t offer_count,
                                           bool source_quantity, size_t *out_count) {
   size_t total = 0;
@@ -266,7 +311,7 @@ static qa_pickup_ammo_grant *resolve_ammo(qa_shared_pickup_admission *admission,
       qa_range_error("Pickup amount must be finite and nonnegative");
     total += destinations(admission, "ammo", offers[i].item)->destination_count;
   }
-  qa_pickup_ammo_grant *grants = xcalloc((total != 0 ? total : 1) * sizeof *grants);
+  qa_pickup_ammo_grant *grants = owned_calloc(owned, (total != 0 ? total : 1) * sizeof *grants);
   size_t at = 0;
   for (size_t i = 0; i < offer_count; i++) {
     const qa_pickup_supply_mapping *mapping = destinations(admission, "ammo", offers[i].item);
@@ -287,12 +332,13 @@ typedef struct quantities_result {
   bool has_accepted;
   bool accepted;
 } quantities_result;
-static quantities_result apply_quantities(qa_shared_pickup_admission *admission, qa_actor_id actor,
-                                          const qa_pickup_ammo_grant *grants, size_t count,
-                                          qa_pickup_quantity_fn resolve, void *resolve_ctx) {
+static quantities_result apply_quantities(owned_list *owned, qa_shared_pickup_admission *admission,
+                                          qa_actor_id actor, const qa_pickup_ammo_grant *grants,
+                                          size_t count, qa_pickup_quantity_fn resolve,
+                                          void *resolve_ctx) {
   quantities_result result;
-  result.ammo = xcalloc((count != 0 ? count : 1) * sizeof *result.ammo);
-  result.exact = xcalloc((count != 0 ? count : 1) * sizeof *result.exact);
+  result.ammo = owned_calloc(owned, (count != 0 ? count : 1) * sizeof *result.ammo);
+  result.exact = owned_calloc(owned, (count != 0 ? count : 1) * sizeof *result.exact);
   result.count = count;
   result.has_accepted = false;
   result.accepted = false;
@@ -320,10 +366,10 @@ static quantities_result apply_quantities(qa_shared_pickup_admission *admission,
   }
   return result;
 }
-static qa_pickup_ammo_receipt *give_ammo(qa_shared_pickup_admission *admission,
+static qa_pickup_ammo_receipt *give_ammo(owned_list *owned, qa_shared_pickup_admission *admission,
                                          qa_owned_actor actor, const qa_pickup_ammo_grant *grants,
                                          size_t count, const bool *exact) {
-  qa_pickup_ammo_receipt *receipts = xcalloc((count != 0 ? count : 1) * sizeof *receipts);
+  qa_pickup_ammo_receipt *receipts = owned_calloc(owned, (count != 0 ? count : 1) * sizeof *receipts);
   for (size_t i = 0; i < count; i++) {
     double before = qa_shared_inventory_table_count(admission->options.inventory, actor.id,
                                                     grants[i].item);
@@ -352,16 +398,16 @@ static qa_pickup_ammo_receipt *give_ammo(qa_shared_pickup_admission *admission,
   return receipts;
 }
 
-static bool grant_ammo_impl(qa_shared_pickup_admission *admission, qa_owned_actor actor,
-                            const qa_pickup_ammo_grant *ammo, size_t ammo_count, bool auto_switch,
-                            qa_pickup_quantity_fn quantity, void *quantity_ctx) {
-  quantities_result grants = apply_quantities(admission, actor.id, ammo, ammo_count, quantity,
-                                              quantity_ctx);
-  qa_item_id *items = xcalloc((grants.count != 0 ? grants.count : 1) * sizeof *items);
+static bool grant_ammo_impl(owned_list *owned, qa_shared_pickup_admission *admission,
+                            qa_owned_actor actor, const qa_pickup_ammo_grant *ammo,
+                            size_t ammo_count, bool auto_switch, qa_pickup_quantity_fn quantity,
+                            void *quantity_ctx) {
+  quantities_result grants = apply_quantities(owned, admission, actor.id, ammo, ammo_count,
+                                              quantity, quantity_ctx);
+  qa_item_id *items = owned_calloc(owned, (grants.count != 0 ? grants.count : 1) * sizeof *items);
   for (size_t i = 0; i < grants.count; i++) items[i] = grants.ammo[i].item;
   require_entries(admission, actor.id, items, grants.count);
-  free(items);
-  qa_pickup_ammo_receipt *receipt = give_ammo(admission, actor, grants.ammo, grants.count,
+  qa_pickup_ammo_receipt *receipt = give_ammo(owned, admission, actor, grants.ammo, grants.count,
                                               grants.exact);
   bool accepted = grants.has_accepted ? grants.accepted : false;
   if (!grants.has_accepted) {
@@ -369,26 +415,23 @@ static bool grant_ammo_impl(qa_shared_pickup_admission *admission, qa_owned_acto
       if (receipt[i].given > 0) accepted = true;
     }
   }
-  free(grants.ammo);
-  free(grants.exact);
-  if (!accepted) { free(receipt); return false; }
+  if (!accepted) return false;
   admission->options.ammo_granted(admission->options.ctx, actor, receipt, grants.count, auto_switch);
-  free(receipt);
   return true;
 }
-static bool grant_ammo_weapon_impl(qa_shared_pickup_admission *admission, qa_owned_actor actor,
-                                   const qa_item_id *weapons, size_t weapon_count,
-                                   const qa_pickup_ammo_grant *ammo, size_t ammo_count,
-                                   qa_ammo_weapon_selection selection,
+static bool grant_ammo_weapon_impl(owned_list *owned, qa_shared_pickup_admission *admission,
+                                   qa_owned_actor actor, const qa_item_id *weapons,
+                                   size_t weapon_count, const qa_pickup_ammo_grant *ammo,
+                                   size_t ammo_count, qa_ammo_weapon_selection selection,
                                    qa_pickup_quantity_fn quantity, void *quantity_ctx) {
-  quantities_result grants = apply_quantities(admission, actor.id, ammo, ammo_count, quantity,
-                                              quantity_ctx);
-  qa_item_id *items = xcalloc((weapon_count + grants.count != 0 ? weapon_count + grants.count : 1) * sizeof *items);
+  quantities_result grants = apply_quantities(owned, admission, actor.id, ammo, ammo_count,
+                                              quantity, quantity_ctx);
+  qa_item_id *items = owned_calloc(
+      owned, (weapon_count + grants.count != 0 ? weapon_count + grants.count : 1) * sizeof *items);
   if (weapon_count != 0) memcpy(items, weapons, weapon_count * sizeof *items);
   for (size_t i = 0; i < grants.count; i++) items[weapon_count + i] = grants.ammo[i].item;
   require_entries(admission, actor.id, items, weapon_count + grants.count);
-  free(items);
-  qa_pickup_ammo_receipt *receipt = give_ammo(admission, actor, grants.ammo, grants.count,
+  qa_pickup_ammo_receipt *receipt = give_ammo(owned, admission, actor, grants.ammo, grants.count,
                                               grants.exact);
   bool accepted = grants.has_accepted ? grants.accepted : false;
   if (!grants.has_accepted) {
@@ -396,12 +439,7 @@ static bool grant_ammo_weapon_impl(qa_shared_pickup_admission *admission, qa_own
       if (receipt[i].given > 0) accepted = true;
     }
   }
-  if (!accepted) {
-    free(receipt);
-    free(grants.ammo);
-    free(grants.exact);
-    return false;
-  }
+  if (!accepted) return false;
   for (size_t w = 0; w < weapon_count; w++) {
     bool in_ammo = false;
     for (size_t i = 0; i < grants.count; i++) {
@@ -418,39 +456,32 @@ static bool grant_ammo_weapon_impl(qa_shared_pickup_admission *admission, qa_own
   }
   admission->options.weapon_granted(admission->options.ctx, actor, weapons, weapon_count,
                                     select ? selection.mode : QA_PICKUP_SELECTION_NEVER);
-  free(receipt);
-  free(grants.ammo);
-  free(grants.exact);
   return true;
 }
-static bool give_resolved_cargo(qa_shared_pickup_admission *admission, qa_owned_actor actor,
-                                const qa_item_id *weapons, size_t weapon_count,
-                                const qa_pickup_ammo_grant *ammo, size_t ammo_count,
-                                qa_pickup_selection selection, qa_pickup_quantity_fn quantity,
-                                void *quantity_ctx) {
-  qa_item_id *items = xcalloc((weapon_count + ammo_count != 0 ? weapon_count + ammo_count : 1) * sizeof *items);
+static bool give_resolved_cargo(owned_list *owned, qa_shared_pickup_admission *admission,
+                                qa_owned_actor actor, const qa_item_id *weapons,
+                                size_t weapon_count, const qa_pickup_ammo_grant *ammo,
+                                size_t ammo_count, qa_pickup_selection selection,
+                                qa_pickup_quantity_fn quantity, void *quantity_ctx) {
+  qa_item_id *items = owned_calloc(
+      owned, (weapon_count + ammo_count != 0 ? weapon_count + ammo_count : 1) * sizeof *items);
   if (weapon_count != 0) memcpy(items, weapons, weapon_count * sizeof *items);
   for (size_t i = 0; i < ammo_count; i++) items[weapon_count + i] = ammo[i].item;
   require_entries(admission, actor.id, items, weapon_count + ammo_count);
-  free(items);
-  quantities_result grants = apply_quantities(admission, actor.id, ammo, ammo_count, quantity,
-                                              quantity_ctx);
+  quantities_result grants = apply_quantities(owned, admission, actor.id, ammo, ammo_count,
+                                              quantity, quantity_ctx);
   for (size_t w = 0; w < weapon_count; w++)
     (void)qa_shared_inventory_table_give(admission->options.inventory, actor, weapons[w], 1);
-  qa_pickup_ammo_receipt *receipt = give_ammo(admission, actor, grants.ammo, grants.count,
-                                              grants.exact);
-  free(receipt);
-  free(grants.ammo);
-  free(grants.exact);
+  (void)give_ammo(owned, admission, actor, grants.ammo, grants.count, grants.exact);
   if (weapon_count != 0)
     admission->options.weapon_granted(admission->options.ctx, actor, weapons, weapon_count,
                                       selection);
   return true;
 }
-static bool give_cargo_impl(qa_shared_pickup_admission *admission, qa_owned_actor actor,
-                            const qa_pickup_cargo_entry *cargo, size_t cargo_count,
-                            qa_pickup_selection selection, qa_pickup_quantity_fn quantity,
-                            void *quantity_ctx) {
+static bool give_cargo_impl(owned_list *owned, qa_shared_pickup_admission *admission,
+                            qa_owned_actor actor, const qa_pickup_cargo_entry *cargo,
+                            size_t cargo_count, qa_pickup_selection selection,
+                            qa_pickup_quantity_fn quantity, void *quantity_ctx) {
   bool invalid = false;
   for (size_t i = 0; i < cargo_count; i++) {
     if (!isfinite(cargo[i].count) || (str_eq(cargo[i].kind, "weapon") && cargo[i].count != 1))
@@ -462,7 +493,8 @@ static bool give_cargo_impl(qa_shared_pickup_admission *admission, qa_owned_acto
   if (invalid) qa_error("Invalid pickup cargo");
   qa_item_id *weapons = NULL;
   size_t weapon_count = 0, weapon_capacity = 0;
-  qa_pickup_ammo_grant *counters = xcalloc((cargo_count != 0 ? cargo_count : 1) * sizeof *counters);
+  qa_pickup_ammo_grant *counters =
+      owned_calloc(owned, (cargo_count != 0 ? cargo_count : 1) * sizeof *counters);
   size_t counter_count = 0;
   for (size_t i = 0; i < cargo_count; i++) {
     if (str_eq(cargo[i].kind, "weapon")) {
@@ -475,7 +507,7 @@ static bool give_cargo_impl(qa_shared_pickup_admission *admission, qa_owned_acto
         if (!seen) {
           if (weapon_count == weapon_capacity) {
             weapon_capacity = weapon_capacity != 0 ? weapon_capacity * 2 : 8;
-            weapons = xrealloc(weapons, weapon_capacity * sizeof *weapons);
+            weapons = owned_realloc(owned, weapons, weapon_capacity * sizeof *weapons);
           }
           weapons[weapon_count++] = mapping->destinations[d];
         }
@@ -487,14 +519,10 @@ static bool give_cargo_impl(qa_shared_pickup_admission *admission, qa_owned_acto
     }
   }
   size_t mapped_count = 0;
-  qa_pickup_ammo_grant *mapped = resolve_ammo(admission, counters, counter_count,
+  qa_pickup_ammo_grant *mapped = resolve_ammo(owned, admission, counters, counter_count,
                                               quantity != NULL, &mapped_count);
-  free(counters);
-  bool result = give_resolved_cargo(admission, actor, weapons, weapon_count, mapped, mapped_count,
-                                    selection, quantity, quantity_ctx);
-  free(weapons);
-  free(mapped);
-  return result;
+  return give_resolved_cargo(owned, admission, actor, weapons, weapon_count, mapped, mapped_count,
+                             selection, quantity, quantity_ctx);
 }
 
 qa_pickup_supply_preview qa_shared_pickup_admission_preview(
@@ -512,13 +540,16 @@ qa_pickup_supply_preview qa_shared_pickup_admission_preview(
     offers = single;
     offer_count = 1;
   }
+  owned_list owned;
+  owned_open(&owned);
   size_t ammo_count = 0;
-  qa_pickup_ammo_grant *ammo = resolve_ammo(admission, offers, offer_count, false, &ammo_count);
+  qa_pickup_ammo_grant *ammo = resolve_ammo(&owned, admission, offers, offer_count, false, &ammo_count);
   size_t entry_count = 0;
   const qa_inventory_entry *entries =
       qa_shared_inventory_table_entries(admission->options.inventory, actor, &entry_count);
   size_t weapon_count = weapon_mapping != NULL ? weapon_mapping->destination_count : 0;
-  qa_pickup_ammo_grant *weapon_grants = xcalloc((weapon_count != 0 ? weapon_count : 1) * sizeof *weapon_grants);
+  qa_pickup_ammo_grant *weapon_grants =
+      owned_calloc(&owned, (weapon_count != 0 ? weapon_count : 1) * sizeof *weapon_grants);
   for (size_t i = 0; i < weapon_count; i++) {
     weapon_grants[i].item = weapon_mapping->destinations[i];
     weapon_grants[i].amount = 1;
@@ -532,8 +563,7 @@ qa_pickup_supply_preview qa_shared_pickup_admission_preview(
   plan.ammo_count = ammo_count;
   plan.acceptance = "positive";
   qa_pickup_supply_preview preview = qa_preview_pickup_grants(entries, entry_count, plan);
-  free(weapon_grants);
-  free(ammo);
+  owned_close(&owned);
   return preview;
 }
 bool qa_shared_pickup_admission_owns(qa_shared_pickup_admission *admission, qa_actor_id actor,
@@ -549,10 +579,13 @@ bool qa_shared_pickup_admission_ammo(qa_shared_pickup_admission *admission,
                                      qa_owned_actor actor, qa_pickup_ammo_grant offer,
                                      bool auto_switch, qa_pickup_quantity_fn quantity,
                                      void *quantity_ctx) {
+  owned_list owned;
+  owned_open(&owned);
   size_t count = 0;
-  qa_pickup_ammo_grant *ammo = resolve_ammo(admission, &offer, 1, quantity != NULL, &count);
-  bool result = grant_ammo_impl(admission, actor, ammo, count, auto_switch, quantity, quantity_ctx);
-  free(ammo);
+  qa_pickup_ammo_grant *ammo = resolve_ammo(&owned, admission, &offer, 1, quantity != NULL, &count);
+  bool result =
+      grant_ammo_impl(&owned, admission, actor, ammo, count, auto_switch, quantity, quantity_ctx);
+  owned_close(&owned);
   return result;
 }
 bool qa_shared_pickup_admission_ammo_weapon(qa_shared_pickup_admission *admission,
@@ -561,19 +594,24 @@ bool qa_shared_pickup_admission_ammo_weapon(qa_shared_pickup_admission *admissio
                                             qa_ammo_weapon_selection selection,
                                             qa_pickup_quantity_fn quantity, void *quantity_ctx) {
   const qa_pickup_supply_mapping *mapping = destinations(admission, "weapons", offer.weapon);
+  owned_list owned;
+  owned_open(&owned);
   size_t count = 0;
-  qa_pickup_ammo_grant *ammo = resolve_ammo(admission, &offer.grant, 1, quantity != NULL, &count);
-  bool result = grant_ammo_weapon_impl(admission, actor, mapping->destinations,
+  qa_pickup_ammo_grant *ammo =
+      resolve_ammo(&owned, admission, &offer.grant, 1, quantity != NULL, &count);
+  bool result = grant_ammo_weapon_impl(&owned, admission, actor, mapping->destinations,
                                        mapping->destination_count, ammo, count, selection,
                                        quantity, quantity_ctx);
-  free(ammo);
+  owned_close(&owned);
   return result;
 }
 bool qa_shared_pickup_admission_weapon(qa_shared_pickup_admission *admission,
                                        qa_owned_actor actor, qa_pickup_weapon_offer offer,
                                        qa_pickup_selection selection,
                                        qa_pickup_quantity_fn quantity, void *quantity_ctx) {
-  qa_pickup_cargo_entry *cargo = xcalloc((offer.ammo_count + 1) * sizeof *cargo);
+  owned_list owned;
+  owned_open(&owned);
+  qa_pickup_cargo_entry *cargo = owned_calloc(&owned, (offer.ammo_count + 1) * sizeof *cargo);
   cargo[0].kind = "weapon";
   cargo[0].item = offer.item;
   cargo[0].count = 1;
@@ -582,9 +620,9 @@ bool qa_shared_pickup_admission_weapon(qa_shared_pickup_admission *admission,
     cargo[i + 1].item = offer.ammo[i].item;
     cargo[i + 1].count = offer.ammo[i].amount;
   }
-  bool result = give_cargo_impl(admission, actor, cargo, offer.ammo_count + 1, selection,
+  bool result = give_cargo_impl(&owned, admission, actor, cargo, offer.ammo_count + 1, selection,
                                 quantity, quantity_ctx);
-  free(cargo);
+  owned_close(&owned);
   return result;
 }
 void qa_shared_pickup_admission_select_weapon(qa_shared_pickup_admission *admission,
@@ -598,26 +636,36 @@ void qa_shared_pickup_admission_select_weapon(qa_shared_pickup_admission *admiss
 bool qa_shared_pickup_admission_cargo(qa_shared_pickup_admission *admission,
                                       qa_owned_actor actor, const qa_pickup_cargo_entry *cargo,
                                       size_t cargo_count, qa_pickup_selection selection) {
-  return give_cargo_impl(admission, actor, cargo, cargo_count, selection, NULL, NULL);
+  owned_list owned;
+  owned_open(&owned);
+  bool result = give_cargo_impl(&owned, admission, actor, cargo, cargo_count, selection, NULL, NULL);
+  owned_close(&owned);
+  return result;
 }
 bool qa_shared_pickup_admission_canonical(qa_shared_pickup_admission *admission,
                                           qa_owned_actor actor, qa_pickup_supply_offer offer,
                                           qa_pickup_selection selection,
                                           qa_pickup_quantity_fn quantity, void *quantity_ctx) {
-  if (offer.kind == QA_PICKUP_SUPPLY_AMMO)
-    return grant_ammo_impl(admission, actor, &offer.grant, 1, true, quantity, quantity_ctx);
-  if (offer.kind == QA_PICKUP_SUPPLY_AMMO_WEAPON) {
+  owned_list owned;
+  owned_open(&owned);
+  bool result;
+  if (offer.kind == QA_PICKUP_SUPPLY_AMMO) {
+    result = grant_ammo_impl(&owned, admission, actor, &offer.grant, 1, true, quantity, quantity_ctx);
+  } else if (offer.kind == QA_PICKUP_SUPPLY_AMMO_WEAPON) {
     qa_ammo_weapon_selection ammo_selection;
     ammo_selection.mode = selection;
     ammo_selection.when = "empty-ammo";
     qa_pickup_ammo_grant grant = offer.grant;
     qa_item_id weapons[1] = {offer.weapon};
-    return grant_ammo_weapon_impl(admission, actor, weapons, 1, &grant, 1, ammo_selection,
-                                  quantity, quantity_ctx);
+    result = grant_ammo_weapon_impl(&owned, admission, actor, weapons, 1, &grant, 1, ammo_selection,
+                                    quantity, quantity_ctx);
+  } else {
+    qa_item_id weapons[1] = {offer.item};
+    result = give_resolved_cargo(&owned, admission, actor, weapons, 1, offer.ammo, offer.ammo_count,
+                                 selection, quantity, quantity_ctx);
   }
-  qa_item_id weapons[1] = {offer.item};
-  return give_resolved_cargo(admission, actor, weapons, 1, offer.ammo, offer.ammo_count,
-                             selection, quantity, quantity_ctx);
+  owned_close(&owned);
+  return result;
 }
 
 static bool c_maps(void *ctx, const char *kind, qa_item_id item) {

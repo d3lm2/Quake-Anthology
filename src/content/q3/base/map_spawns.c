@@ -82,7 +82,7 @@ size_t qa_q3_base_create_spawn_handlers(qa_q3_base_spawn_handlers_host host,
   count = qa_q3_target_spawn_handlers(host.targets, scratch, 128);
   put_all(&table, scratch, count < 128 ? count : 128);
   const qa_q3_spawn_handler_entry *remove = find_entry(&table, "info_null");
-  if (remove == NULL) qa_range_error("Source info_null handler is unavailable");
+  if (remove == NULL) qa_raise("Error", 0, 0, "Source info_null handler is unavailable");
   qa_q3_spawn_handler_fn remove_fn = remove->fn;
   void *remove_ctx = remove->ctx;
   put(&table, "func_group", remove_fn, remove_ctx);

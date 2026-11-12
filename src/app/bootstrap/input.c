@@ -7,7 +7,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/formats/text_decoder.h"
 #include "qa/app/bootstrap/cvar_archives.h"
+#include "qa/app/bootstrap/native_settings.h"
+#include "qa/app/bootstrap/seat_profile.h"
 #include "qa/contracts/execution.h"
 #include "qa/contracts/time.h"
 #include "qa/foundation/support.h"
@@ -385,10 +388,10 @@ static const char *console_clipboard(void *ctx) {
   size_t length = 0;
   uint8_t *bytes = qa_read_sdl_clipboard(&length);
   if (bytes == NULL) return NULL;
-  char *text = malloc(length + 1);
-  if (text == NULL) qa_range_error("Out of memory");
-  memcpy(text, bytes, length); text[length] = '\0';
+  /* new TextDecoder().decode(bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD. */
+  char *text = qa_text_decoder_decode(bytes, length, NULL);
   free(bytes);
+  if (text == NULL) qa_range_error("Out of memory");
   free(console->input->clipboard_text);
   console->input->clipboard_text = text;
   return text;
@@ -400,12 +403,63 @@ static void console_focus(void *ctx, qa_seat_input_focus focus) {
   /* TS createSeatConsole: the seat's own haptics, captured at construction. */
   if (console->local->pub.haptics != NULL) qa_seat_haptics_set_active(console->local->pub.haptics, active);
 }
+/* The chat field's text (UTF-8, console/field.h) as the say argument. TS passes the field's string to the source's
+ * say unchanged, and every byte writer on the way keeps one byte per UTF-16 code unit: NetQuake/QuakeWorld and Q2
+ * MSG_WriteString (charCodeAt & 255), the classic Q2 game's argv (latin1Bytes: & 255), Q3 MSG_WriteString (a unit
+ * above 127 is '.'), and the TS games' say (args.join(" ").slice(0, 62 - prefix.length) counts units). So each code
+ * unit becomes its low byte here: U+00E9 stays 0xE9, U+20AC is 0xAC, a character above U+FFFF is its two surrogate
+ * units' low bytes. Console text cannot hold the character itself: where TS encodes the whole string as UTF-8 (the
+ * rerelease Q2 game's argv, the Q2 KEX client's command, the unified client's control) the low byte's character is
+ * sent instead. A unit whose low byte is 0 (U+0100, U+0200, ...) ends the text, as the 0 byte TS writes ends the wire
+ * string. */
+char *qa_app_chat_console_text(const char *utf8) {
+  size_t length = strlen(utf8), at = 0;
+  char *out = malloc(length * 2 + 1);
+  if (out == NULL) qa_range_error("Out of memory");
+  const unsigned char *bytes = (const unsigned char *)utf8;
+  for (size_t i = 0; i < length;) {
+    uint32_t point = bytes[i];
+    size_t width = 1;
+    if (point >= 0xc2 && point <= 0xdf && i + 1 < length && (bytes[i + 1] & 0xc0) == 0x80) {
+      point = ((point & 0x1f) << 6) | (bytes[i + 1] & 0x3f); width = 2;
+    } else if (point >= 0xe0 && point <= 0xef && i + 2 < length && (bytes[i + 1] & 0xc0) == 0x80 && (bytes[i + 2] & 0xc0) == 0x80) {
+      point = ((point & 0x0f) << 12) | ((uint32_t)(bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f); width = 3;
+    } else if (point >= 0xf0 && point <= 0xf4 && i + 3 < length && (bytes[i + 1] & 0xc0) == 0x80 && (bytes[i + 2] & 0xc0) == 0x80
+        && (bytes[i + 3] & 0xc0) == 0x80) {
+      point = ((point & 0x07) << 18) | ((uint32_t)(bytes[i + 1] & 0x3f) << 12) | ((uint32_t)(bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+      width = 4;
+    } else if (point >= 0x80) point = 0xfffd; /* the field holds well-formed UTF-8; a stray byte reads as TextDecoder does */
+    i += width;
+    uint32_t units[2] = {point, 0};
+    size_t unit_count = 1;
+    if (point > 0xffff) {
+      units[0] = 0xd800 + ((point - 0x10000) >> 10);
+      units[1] = 0xdc00 + ((point - 0x10000) & 0x3ff);
+      unit_count = 2;
+    }
+    for (size_t u = 0; u < unit_count; u++) {
+      unsigned char byte = (unsigned char)(units[u] & 0xff);
+      if (byte == 0) { out[at] = '\0'; return out; }
+      out[at++] = (char)byte;
+    }
+  }
+  out[at] = '\0';
+  return out;
+}
 static void console_chat(void *ctx, const char *text, bool team, bool has_target, double target) {
   console_ctx *console = ctx;
-  const char *args[2] = {text, NULL};
+  char *line = qa_app_chat_console_text(text);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, line);
+  const char *args[2] = {line, NULL};
   char *number = NULL;
   if (has_target) { number = qa_app_input_internal_dup(QA_JS_NUMBER(target)); args[1] = number; }
+  qa_cleanup number_guard;
+  qa_cleanup_push(&number_guard, free, number);
   qa_app_input_internal_execute(console->input, team ? "say_team" : "say", args, has_target ? 2 : 1, &console->seat, NULL);
+  qa_cleanup_pop(&number_guard);
+  qa_cleanup_pop(&guard);
+  free(line);
   free(number);
 }
 
@@ -565,6 +619,7 @@ static void loaded_free(loaded_settings *loaded) {
   qa_app_cvar_archive_entries_free(loaded->fallback, loaded->fallback_count);
   memset(loaded, 0, sizeof *loaded);
 }
+static void loaded_release(void *loaded) { loaded_free(loaded); }
 
 static bool previous_has_seat(const qa_app_application_input *previous, qa_seat_id seat) {
   return previous != NULL && qa_app_input_internal_find_local(previous, seat) != NULL;
@@ -580,35 +635,44 @@ static const qa_app_prepared_seat *prepared_seat(const qa_app_prepared_startup *
 
 static void read_settings(loaded_settings *out, qa_session_seat *const *seats, size_t seat_count,
     qa_command_dialect dialect, const qa_app_input_commands *actions, const qa_config_store *settings,
-    const qa_app_input_command_owner *owner, const qa_app_application_input *previous,
+    const char *user_content_root, const qa_app_input_command_owner *owner, const qa_app_application_input *previous,
     const qa_app_prepared_startup *prepared) {
   memset(out, 0, sizeof *out);
-  out->count = seat_count;
   out->saved = xcalloc(seat_count, sizeof *out->saved);
   out->has_saved = xcalloc(seat_count, sizeof *out->has_saved);
   out->input = xcalloc(seat_count, sizeof *out->input);
   out->input_counts = xcalloc(seat_count, sizeof *out->input_counts);
-  for (size_t i = 0; i < seat_count; i++) {
-    char name[64];
-    snprintf(name, sizeof name, "input/seat-%lld.json", (long long)(qa_session_seat_id(seats[i]).index + 1));
-    out->has_saved[i] = qa_config_store_load_seat(settings, name, &out->saved[i]);
-  }
+  out->count = seat_count; /* loaded_free walks the arrays only once all four exist */
+  for (size_t i = 0; i < seat_count; i++)
+    out->has_saved[i] = qa_app_load_seat_profile(settings, user_content_root, (double)qa_session_seat_id(seats[i]).index,
+                                                 &out->saved[i]);
   double keyboard = 0; bool has_keyboard = false;
   out->has_routing = qa_config_store_load_input_routing(settings, "input/routing.json", &keyboard, &has_keyboard);
   out->routing_has_seat = has_keyboard; out->routing_seat = keyboard;
   qa_command_dialect source = actions->console != NULL ? actions->console->dialect(actions->console->ctx)
       : owner != NULL ? qa_cvar_registry_dialect(owner->cvars)
       : previous != NULL ? qa_cvar_registry_dialect(previous->console_cvars) : dialect;
-  bool has_owners = owner != NULL || previous != NULL || prepared != NULL;
-  if (!has_owners) {
+  /* Carried registries keep their values only while the dialect stays; a travel into another dialect loads that
+   * dialect's stores. */
+  bool retains_movement = owner != NULL || prepared != NULL ||
+      (previous != NULL && qa_cvar_registry_dialect(previous->cvar_owner) == dialect);
+  bool retains_fallback = owner != NULL || prepared != NULL ||
+      (previous != NULL && qa_cvar_registry_dialect(previous->console_cvars) == source);
+  if (!retains_movement) {
     const char *movement[] = {"movement", qa_app_configuration_dialect_name(dialect)};
     out->movement = qa_app_load_cvar_archive(settings, movement, 2, dialect, &out->movement_count);
+  }
+  if (!retains_fallback) {
     const char *fallback[] = {"fallback", qa_app_configuration_dialect_name(source)};
     out->fallback = qa_app_load_cvar_archive(settings, fallback, 2, source, &out->fallback_count);
   }
   for (size_t i = 0; i < seat_count; i++) {
     qa_seat_id id = qa_session_seat_id(seats[i]);
-    if ((owner != NULL && owner->input_settings != NULL) || previous_has_seat(previous, id) || prepared_seat(prepared, id) != NULL)
+    /* previous?.inputCvars(player.seat.id)?.dialect === sourceDialect && previous.locals.some(...) */
+    qa_cvar_registry *previous_input = previous != NULL ? qa_app_application_input_input_cvars(previous, true, id) : NULL;
+    bool previous_keeps = previous_input != NULL && qa_cvar_registry_dialect(previous_input) == source &&
+        previous_has_seat(previous, id);
+    if ((owner != NULL && owner->input_settings != NULL) || previous_keeps || prepared_seat(prepared, id) != NULL)
       continue;
     char index[32];
     snprintf(index, sizeof index, "%s", QA_JS_NUMBER((double)id.index));
@@ -668,6 +732,12 @@ static void forward_with_note(void *ctx, qa_command_invocation *invocation) {
   qa_app_input_internal_forward_to_server(ctx, invocation);
 }
 
+/* TS localForm: form => noteLocalForm(this.scripts.layers, form). */
+static void buffer_local_form(void *ctx, const qa_local_form *form) {
+  qa_app_application_input *input = ctx;
+  qa_app_note_local_form(qa_app_console_script_files_layers(input->script_owner), form);
+}
+
 static qa_command_buffer *create_buffer(qa_app_application_input *input, qa_command_dialect source_dialect,
     qa_command_context context) {
   qa_command_buffer_options options;
@@ -677,6 +747,7 @@ static qa_command_buffer *create_buffer(qa_app_application_input *input, qa_comm
   if (input->console_routing != NULL) options.cvar_routing = qa_app_console_routing_view(input->console_routing);
   options.print = qa_app_input_internal_print_source; options.print_ctx = input;
   options.forward_to_server = forward_with_note; options.forward_to_server_ctx = input;
+  options.local_form = buffer_local_form; options.local_form_ctx = input;
   options.builtins = true; options.builtins_set = true;
   qa_command_buffer *buffer = qa_command_buffer_create(&options);
   if (buffer == NULL) qa_range_error("Out of memory");
@@ -750,6 +821,25 @@ static void configuration_forward(void *ctx, const qa_app_configuration_command_
 }
 
 /* ---- constructor ---- */
+typedef struct construct_platform {
+  qa_app_application_input *input, *previous;
+  qa_app_client_bootstrap *client;
+  bool has_staging;
+} construct_platform;
+static void construct_platform_run(void *ctx) {
+  construct_platform *platform = ctx;
+  qa_app_application_input *input = platform->input, *previous = platform->previous;
+  qa_app_client_bootstrap *client = platform->client;
+  if (previous == NULL && !platform->has_staging) qa_input_router_attach_window(input->router, input->window.input);
+  qa_input_router_restart(input->router);
+  qa_app_controller_settings *previous_settings = previous != NULL ? previous->controller_settings : NULL;
+  if (previous_settings == NULL && client != NULL) {
+    if (client->platform.kind == QA_APP_CLIENT_INPUT_MENU) previous_settings = client->platform.controller_settings;
+    else if (client->platform.kind == QA_APP_CLIENT_INPUT_WORLD) previous_settings = client->platform.input->controller_settings;
+  }
+  if (previous_settings == NULL) qa_app_controller_settings_update(input->controller_settings);
+  else qa_app_controller_settings_copy_settled_profiles_from(input->controller_settings, previous_settings);
+}
 static qa_app_application_input *construct(qa_cvar_registry *const *staging, size_t staging_count, bool has_staging,
     const qa_app_input_open_args *args, const loaded_settings *loaded, qa_app_application_input *previous,
     qa_app_prepared_startup *prepared, qa_app_client_bootstrap *client) {
@@ -1159,16 +1249,15 @@ static qa_app_application_input *construct(qa_cvar_registry *const *staging, siz
       settings_devices, input, args->settings, report_print, input);
   free(seat_ids);
   if (input->client_commands == NULL || input->controller_settings == NULL) qa_range_error("Out of memory");
-  /* TS try { attach; restart; profiles } catch { if (ownsControllers) controllers.close(); throw }. */
-  if (previous == NULL && !has_staging) qa_input_router_attach_window(input->router, input->window.input);
-  qa_input_router_restart(input->router);
-  qa_app_controller_settings *previous_settings = previous != NULL ? previous->controller_settings : NULL;
-  if (previous_settings == NULL && client != NULL) {
-    if (client->platform.kind == QA_APP_CLIENT_INPUT_MENU) previous_settings = client->platform.controller_settings;
-    else if (client->platform.kind == QA_APP_CLIENT_INPUT_WORLD) previous_settings = client->platform.input->controller_settings;
+  /* TS try { attach; restart; profiles } catch { if (ownsControllers) controllers.close(); throw }: the input is
+   * dropped, closing the controllers only it created. */
+  construct_platform platform = {input, previous, client, has_staging};
+  qa_caught_error caught;
+  if (!qa_try(construct_platform_run, &platform, &caught)) {
+    input->closed = true; /* nothing was activated; TS drops the object */
+    qa_app_application_input_destroy(input);
+    qa_rethrow(&caught);
   }
-  if (previous_settings == NULL) qa_app_controller_settings_update(input->controller_settings);
-  else qa_app_controller_settings_copy_settled_profiles_from(input->controller_settings, previous_settings);
   return input;
 }
 
@@ -1197,11 +1286,18 @@ static qa_app_application_input *create(qa_cvar_registry *const *staging, size_t
     qa_app_client_bootstrap *client) {
   qa_session_seat **seats = xcalloc(args->player_count, sizeof *seats);
   for (size_t i = 0; i < args->player_count; i++) seats[i] = args->players[i].seat;
+  /* A raise from a profile or archive load, or from the constructor, frees what was read. */
   loaded_settings loaded;
-  read_settings(&loaded, seats, args->player_count, args->dialect, &args->actions, args->settings, args->owner,
-                previous, prepared);
-  free(seats);
+  memset(&loaded, 0, sizeof loaded);
+  qa_cleanup seats_guard, loaded_guard;
+  qa_cleanup_push(&seats_guard, free, seats);
+  qa_cleanup_push(&loaded_guard, loaded_release, &loaded);
+  read_settings(&loaded, seats, args->player_count, args->dialect, &args->actions, args->settings,
+                args->options->user_content_root, args->owner, previous, prepared);
   qa_app_application_input *input = construct(staging, staging_count, has_staging, args, &loaded, previous, prepared, client);
+  qa_cleanup_pop(&loaded_guard);
+  qa_cleanup_pop(&seats_guard);
+  free(seats);
   loaded_free(&loaded);
   create_ctx ctx = {staging, staging_count, has_staging, args, previous, prepared, client, input};
   qa_caught_error caught;
@@ -1254,6 +1350,17 @@ qa_ui_binding_capabilities qa_app_application_input_binding_capabilities(qa_app_
 
 qa_cvar_registry *qa_app_application_input_shared_cvars(const qa_app_application_input *input) { return input->shared_owner; }
 qa_cvar_registry *qa_app_application_input_shared_settings(const qa_app_application_input *input) { return input->shared_owner; }
+static qa_cvar_registry *shared_settings_current(void *ctx) {
+  qa_app_application_input *input = ctx;
+  if (input->shared_owner == NULL) qa_raise("Error", 0, 0, "Shared settings lost their owner");
+  return input->shared_owner;
+}
+qa_ui_setting_cvars qa_app_application_input_shared_settings_view(qa_app_application_input *input) {
+  qa_ui_setting_cvars view = {NULL, NULL, NULL};
+  if (input->shared_owner == NULL) return view;
+  view.current = shared_settings_current; view.ctx = input;
+  return view;
+}
 
 /* TS guestCommands: candidateProgram?.commands ?? commands. */
 static qa_command_buffer *guest_buffer(qa_app_application_input *input) {
@@ -1499,6 +1606,26 @@ qa_cvar_registry *qa_app_application_input_input_cvars(const qa_app_application_
   return NULL;
 }
 
+/* ---- bindingScope ---- */
+static bool scope_available(void *ctx) { (void)ctx; return true; }
+static bool scope_local(void *ctx) { return ((qa_app_application_input *)ctx)->bindings_local; }
+static void scope_set_local(void *ctx, bool local) { ((qa_app_application_input *)ctx)->bindings_local = local; }
+static void scope_note_local(void *ctx, const qa_physical_input *physical) {
+  qa_app_application_input *input = ctx;
+  /* The scope exists only while the scripts have layers; they are read again here as the TS closure captured them. */
+  qa_game_layers *layers = qa_app_console_script_files_layers(input->script_owner);
+  if (layers == NULL) return;
+  char *name = qa_physical_input_name(physical);
+  if (name == NULL) qa_range_error("Out of memory");
+  qa_game_layers_note_local_bind(layers, name);
+  free(name);
+}
+bool qa_app_application_input_binding_scope(qa_app_application_input *input, qa_ui_binding_scope *out) {
+  if (qa_app_console_script_files_layers(input->script_owner) == NULL) return false;
+  *out = (qa_ui_binding_scope){input, scope_available, scope_local, scope_set_local, scope_note_local};
+  return true;
+}
+
 bool qa_app_application_input_can_reset_bindings(qa_app_application_input *input, qa_seat_id id) {
   if (input->startup == NULL) return false;
   bool all = false, has_selected = false;
@@ -1581,6 +1708,7 @@ struct qa_app_local_seat_preparation {
   loaded_settings loaded;
   preparation_phase phase;
 };
+static void preparation_release(void *preparation) { qa_app_local_seat_preparation_destroy(preparation); }
 
 qa_app_local_seat_preparation *qa_app_application_input_prepare_local_seats(qa_app_application_input *input,
     qa_session_seat *const *seats, size_t seat_count) {
@@ -1595,8 +1723,12 @@ qa_app_local_seat_preparation *qa_app_application_input_prepare_local_seats(qa_a
   preparation->before = xcalloc(input->local_count, sizeof *preparation->before);
   if (input->local_count != 0) memcpy(preparation->before, input->locals, input->local_count * sizeof *input->locals);
   preparation->before_count = input->local_count;
-  read_settings(&preparation->loaded, seats, seat_count, input->dialect, &input->actions, input->settings, NULL,
-                input, input->startup);
+  /* A profile or archive load that raises drops the preparation (its input hold and what was read). */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, preparation_release, preparation);
+  read_settings(&preparation->loaded, seats, seat_count, input->dialect, &input->actions, input->settings,
+                input->options->user_content_root, NULL, input, input->startup);
+  qa_cleanup_pop(&guard);
   preparation->phase = PHASE_PREPARED;
   return preparation;
 }

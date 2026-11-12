@@ -3,7 +3,7 @@
 
 For every TS file under ../quake-anthology-ts/src and tests, finds the time of its
 last commit, and compares it with the newest modification time of its C files
-(docs/manifest.tsv c_source and header; c_source may be a glob). A C port whose
+(docs/manifest.tsv c_source and header; c_source may be a glob or a space-separated list). A C port whose
 newest edit predates the TS file's last commit is "stale": the TS changed after the
 C was last touched, so it must be re-read against current TS. A C edit after the TS
 commit does not prove parity (it may have been for another reason); it only means
@@ -33,9 +33,10 @@ def c_mtime(r):
         v = r.get(key) or '-'
         if v in ('-', ''):
             continue
-        for f in (glob.glob(v) if any(ch in v for ch in '*?[') else [v]):
-            if os.path.exists(f):
-                times.append(os.path.getmtime(f))
+        for part in v.split():
+            for f in (glob.glob(part) if any(ch in part for ch in '*?[') else [part]):
+                if os.path.exists(f):
+                    times.append(os.path.getmtime(f))
     return max(times) if times else None
 out = []
 for d, _, fs in os.walk(os.path.join(ts, 'src')):

@@ -339,13 +339,19 @@ qa_deform_geometry qa_deform_geometry_apply(
     if ((eq(deform.kind, "move") || eq(deform.kind, "wave")) &&
         (eq(deform.wave.kind, "none") || eq(deform.wave.kind, "noise"))) {
       if (tess->material_name == NULL)
-        qa_range_error("Invalid deformation waveform requires its begun source material");
+        qa_raise("Error", 0, 0, "Invalid deformation waveform requires its begun source material");
       int func = eq(deform.wave.kind, "none") ? QA_MAT_WAVE_NONE
                                               : QA_MAT_WAVE_NOISE;
-      char message[512];
-      snprintf(message, sizeof message,
+      /* Sized to the name (TS has no cap); the raise formats it before it unwinds the node. */
+      int length = snprintf(NULL, 0, "TableForFunc called with invalid function '%d' in shader '%s'\n",
+                            func, tess->material_name);
+      char *message = malloc(length < 0 ? 1 : (size_t)length + 1);
+      if (message == NULL) qa_range_error("deform allocation failed");
+      snprintf(message, (size_t)length + 1,
                "TableForFunc called with invalid function '%d' in shader '%s'\n",
                func, tess->material_name);
+      qa_cleanup node;
+      qa_cleanup_push(&node, free, message);
       qa_common_error(QA_COMMON_ERROR_DROP, message);
     }
     qa_material_vertex *vertices = malloc(

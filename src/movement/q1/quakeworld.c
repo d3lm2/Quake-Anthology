@@ -82,7 +82,7 @@ static qa_movement_state wrap_state(const quakeworld_move *move) {
 
 static void set_state(quakeworld_move *move, qa_movement_state state) {
   if (state.kind != QA_MOVEMENT_STATE_QW)
-    qa_range_error("QuakeWorld callback changed the movement provider during a command");
+    qa_raise("Error", 0, 0, "QuakeWorld callback changed the movement provider during a command");
   move->state = state.as.qw;
   qa_mod_client_movement_mode mode;
   if (qa_client_movement_mode(move->input.environment.client_outputs, move->input.environment.health, &mode)) {
@@ -520,7 +520,7 @@ static void step_physics(quakeworld_move *move, qa_qw_user_command command) {
   stance_command.as.qw = command;
   const qa_user_command effective = qa_client_stance_command(
       stance_command, outputs != NULL && outputs->has_stance, outputs != NULL && outputs->stance);
-  if (effective.kind != QA_USER_COMMAND_QW) qa_range_error("Client stance changed movement dialect");
+  if (effective.kind != QA_USER_COMMAND_QW) qa_raise("Error", 0, 0, "Client stance changed movement dialect");
   command = effective.as.qw;
   move->command = command;
   /* CL_PredictUsercmd seeds pmove.angles before PlayerMove computes its axes. */
@@ -573,6 +573,27 @@ static void step_physics(quakeworld_move *move, qa_qw_user_command command) {
   }
 }
 
+typedef struct step_body { quakeworld_move *move; qa_qw_user_command command; } step_body;
+/* The `try` body of TS step(): begin the input slice and run the physics. */
+static void step_application_body(void *ctx) {
+  step_body *body = ctx;
+  quakeworld_move *move = body->move;
+  qa_q1_movement_context *c = &move->context;
+  const qa_movement_input_application *application = &c->services.input_application;
+  qa_user_command begin_command;
+  memset(&begin_command, 0, sizeof begin_command);
+  begin_command.kind = QA_USER_COMMAND_QW;
+  begin_command.as.qw = body->command;
+  const qa_movement_input_continuation before =
+      application->begin(application->ctx, begin_command, step_frame(move, body->command), wrap_state(move));
+  if (!before.is_continue) c->removed = true;
+  else {
+    if (before.command.kind != QA_USER_COMMAND_QW) qa_raise("Error", 0, 0, "Input output changed command dialect");
+    set_state(move, before.state);
+    step_physics(move, before.command.as.qw);
+  }
+}
+
 static void step(quakeworld_move *move, qa_qw_user_command command) {
   qa_q1_movement_context *c = &move->context;
   const bool use_application = str_eq(move->input.execution, "authoritative") && c->services.has_input_application;
@@ -581,18 +602,12 @@ static void step(quakeworld_move *move, qa_qw_user_command command) {
     return;
   }
   const qa_movement_input_application *application = &c->services.input_application;
-  /* TS catch: application end(state, true) then rethrow; C errors abort. */
-  qa_user_command begin_command;
-  memset(&begin_command, 0, sizeof begin_command);
-  begin_command.kind = QA_USER_COMMAND_QW;
-  begin_command.as.qw = command;
-  const qa_movement_input_continuation before =
-      application->begin(application->ctx, begin_command, step_frame(move, command), wrap_state(move));
-  if (!before.is_continue) c->removed = true;
-  else {
-    if (before.command.kind != QA_USER_COMMAND_QW) qa_range_error("Input output changed command dialect");
-    set_state(move, before.state);
-    step_physics(move, before.command.as.qw);
+  /* try { begin ... stepPhysics } catch (error) { application.end(this.state, true); throw error; } */
+  step_body body = {move, command};
+  qa_caught_error caught;
+  if (!qa_try(step_application_body, &body, &caught)) {
+    (void)application->end(application->ctx, wrap_state(move), true, true, NULL);
+    qa_rethrow(&caught);
   }
   const qa_movement_continuation after = application->end(application->ctx, wrap_state(move), false, false, NULL);
   if (!after.is_continue) c->removed = true;
@@ -602,7 +617,7 @@ static void step(quakeworld_move *move, qa_qw_user_command command) {
 static void run_command(quakeworld_move *move, qa_qw_user_command command) {
   if (move->context.removed) return;
   if (move->input.profile.clock.kind != QA_CLOCK_Q1_QUAKEWORLD)
-    qa_range_error("QuakeWorld movement needs a QuakeWorld command clock");
+    qa_raise("Error", 0, 0, "QuakeWorld movement needs a QuakeWorld command clock");
   size_t slice_count = 0;
   qa_qw_user_command *slices =
       qa_quakeworld_command_slices(command, move->input.profile.clock.maximum_command_milliseconds, &slice_count);
@@ -641,7 +656,7 @@ qa_movement_result qa_move_quakeworld(qa_qw_movement_input input, qa_movement_se
   } else {
     result = qa_q1_finish_movement(&move.context, wrap_state(&move), move.state.angles, move.state.ground,
                                    move.water_level, move.water_type);
-    if (!str_eq(result.kind, "q1-quakeworld")) qa_range_error("Weapon callback changed QuakeWorld movement family");
+    if (!str_eq(result.kind, "q1-quakeworld")) qa_raise("Error", 0, 0, "Weapon callback changed QuakeWorld movement family");
   }
   qa_q1_movement_context_destroy(&move.context);
   free(move.touched);

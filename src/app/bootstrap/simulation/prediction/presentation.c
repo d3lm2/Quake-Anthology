@@ -64,9 +64,16 @@ struct qa_app_presentation_prediction_adapter {
   qa_q2_rerelease_movement_context rerelease_movement;
   snapshot_entry snapshots[64]; size_t snapshot_count;
   command_entry commands[64]; size_t command_count;
-  state_entry states[16]; size_t state_count;
+  /* TS WeakMap<SourcePlayerState, ...>: one entry per player-state object, emptied by capture. */
+  state_entry *states; size_t state_count, state_capacity;
   qa_app_movement_prediction_snapshot latest;
 };
+/* TS reads options.movement.profile through its getter at every use. */
+static void refresh_profile(qa_app_presentation_prediction_adapter *adapter) {
+  qa_movement_profile profile;
+  if (adapter->options.current_profile != NULL && adapter->options.current_profile(adapter->options.profile_ctx, &profile))
+    adapter->options.movement.probe.profile = profile;
+}
 
 static const char *state_kind_name(qa_movement_state_kind kind) {
   switch (kind) {
@@ -83,7 +90,7 @@ static bool same_session(qa_session_id a, qa_session_id b) { return a.token == b
 qa_app_presentation_prediction_adapter *qa_app_presentation_prediction_adapter_create(
     qa_app_presentation_prediction_options options) {
   if (!same_session(options.movement.probe.actor.id.session, options.movement.seat.session))
-    qa_range_error("Prediction actor and seat belong to different sessions");
+    qa_raise("Error", 0, 0, "Prediction actor and seat belong to different sessions");
   qa_app_presentation_prediction_adapter *adapter = calloc(1, sizeof *adapter);
   if (!adapter) return NULL;
   adapter->options = options;
@@ -99,16 +106,20 @@ void qa_app_presentation_prediction_adapter_destroy(qa_app_presentation_predicti
   if (!adapter) return;
   for (size_t i = 0; i < adapter->snapshot_count; i++) qa_app_movement_prediction_snapshot_destroy(&adapter->snapshots[i].snapshot);
   for (size_t i = 0; i < adapter->state_count; i++) qa_app_movement_prediction_snapshot_destroy(&adapter->states[i].snapshot);
+  free(adapter->states);
   qa_app_movement_prediction_snapshot_destroy(&adapter->latest);
   free(adapter);
 }
 const char *qa_app_presentation_prediction_adapter_command_timing(const qa_app_presentation_prediction_adapter *adapter) {
-  return adapter->options.movement.probe.profile.kind && strcmp(adapter->options.movement.probe.profile.kind, "q3") == 0 ? "q3" : "provider";
+  qa_movement_profile profile = adapter->options.movement.probe.profile;
+  if (adapter->options.current_profile != NULL) (void)adapter->options.current_profile(adapter->options.profile_ctx, &profile);
+  return profile.kind && strcmp(profile.kind, "q3") == 0 ? "q3" : "provider";
 }
 void qa_app_presentation_prediction_adapter_capture(qa_app_presentation_prediction_adapter *adapter,
     qa_app_movement_prediction_snapshot snapshot) {
+  refresh_profile(adapter);
   if (strcmp(state_kind_name(snapshot.state.kind), adapter->options.movement.probe.profile.kind) != 0)
-    qa_range_error("Cgame prediction snapshot changed selected movement");
+    qa_raise("Error", 0, 0, "Cgame prediction snapshot changed selected movement");
   qa_app_movement_prediction_snapshot copy = qa_app_copy_prediction_snapshot(snapshot);
   /* latest aliases the stored snapshot in TS; keep one owned copy stored. */
   for (size_t i = 0; i < adapter->state_count; i++) qa_app_movement_prediction_snapshot_destroy(&adapter->states[i].snapshot);
@@ -144,15 +155,15 @@ static qa_q3_arsenal_controls resolve_controls(qa_app_presentation_prediction_ad
 qa_q3_base_user_command qa_app_presentation_prediction_adapter_submit(
     qa_app_presentation_prediction_adapter *adapter, qa_actor_command input, double milliseconds) {
   if (!qa_same_actor(input.actor, adapter->options.movement.probe.actor.id))
-    qa_range_error("Cgame prediction command belongs to another actor");
+    qa_raise("Error", 0, 0, "Cgame prediction command belongs to another actor");
   qa_app_movement_prediction_snapshot latest = adapter->latest;
   bool arsenal_q3 = latest.arsenal.state.kind && strcmp(latest.arsenal.state.kind, "q3") == 0;
   double weapon = arsenal_q3 && latest.has_q3_arsenal
       ? resolve_controls(adapter, latest.arsenal, input.arsenal, input.command, latest.q3_arsenal.product).requested_weapon : 0;
   if (input.arsenal) {
     if (!input.arsenal->provider || !latest.arsenal.provider || strcmp(input.arsenal->provider, latest.arsenal.provider) != 0)
-      qa_range_error("Arsenal command belongs to a different provider");
-    if (arsenal_q3 && !latest.has_q3_arsenal) qa_range_error("Cgame has no selected arsenal owner for this intent");
+      qa_raise("Error", 0, 0, "Arsenal command belongs to a different provider");
+    if (arsenal_q3 && !latest.has_q3_arsenal) qa_raise("Error", 0, 0, "Cgame has no selected arsenal owner for this intent");
   }
   qa_q3_base_user_command presented = qa_app_presentation_source_command(input, milliseconds, weapon);
   qa_q3_base_user_command source = presented;
@@ -195,7 +206,7 @@ static qa_app_movement_prediction_snapshot seed_snapshot(qa_app_presentation_pre
     for (size_t i = 0; i < adapter->snapshot_count; i++)
       if (adapter->snapshots[i].time == ps->command_time) { baseline = adapter->snapshots[i].snapshot; found = true; }
   }
-  if (!found) qa_range_error("No selected movement snapshot for source command time %s", QA_JS_NUMBER(ps->command_time));
+  if (!found) qa_raise("Error", 0, 0, "No selected movement snapshot for source command time %s", QA_JS_NUMBER(ps->command_time));
   return qa_app_read_prediction_source_state(baseline, ps, adapter->options.entities);
 }
 
@@ -254,13 +265,16 @@ static bool scene_visible(void *v, double from, double to, const char *kind) {
 
 qa_bounds qa_app_presentation_prediction_adapter_move_player(qa_app_presentation_prediction_adapter *adapter,
     qa_q3_base_player_state_record *ps, qa_q3_base_user_command command, qa_q3_pres_movement_options movement) {
+  refresh_profile(adapter);
   qa_app_movement_prediction_snapshot seed = seed_snapshot(adapter, ps);
+  qa_cleanup seed_cleanup; /* a refused command releases the seed copy */
+  qa_cleanup_push(&seed_cleanup, (void (*)(void *))qa_app_movement_prediction_snapshot_destroy, &seed);
   double key = movement.has_original_server_time ? movement.original_server_time : command.server_time;
   command_entry *original = NULL;
   for (size_t i = 0; i < adapter->command_count; i++) if (adapter->commands[i].time == key) original = &adapter->commands[i];
   qa_app_prediction_command entry; memset(&entry, 0, sizeof entry);
   if (strcmp(adapter->options.movement.probe.profile.kind, "q3") != 0) {
-    if (!original) qa_range_error("No original selected command for cgame time %s", QA_JS_NUMBER(command.server_time));
+    if (!original) qa_raise("Error", 0, 0, "No original selected command for cgame time %s", QA_JS_NUMBER(command.server_time));
     entry = original->command;
   } else {
     entry.sequence = original ? original->command.sequence : command.server_time;
@@ -290,6 +304,7 @@ qa_bounds qa_app_presentation_prediction_adapter_move_player(qa_app_presentation
   options.has_trace_mask = true; options.trace_mask = movement.trace_mask;
   options.first_command = !prior || prior->snapshot.command_time_milliseconds != ps->command_time;
   qa_app_prediction_step_result output = qa_app_predict_movement_command(&adapter->options.movement.probe, seed, entry, options, NULL);
+  qa_cleanup_pop(&seed_cleanup);
   qa_app_movement_prediction_snapshot_destroy(&seed);
   qa_app_write_prediction_source_state(ps, output.player, adapter->options.entities);
   for (size_t i = 0; i < output.result.effect_count; i++) {
@@ -303,10 +318,11 @@ qa_bounds qa_app_presentation_prediction_adapter_move_player(qa_app_presentation
   free((void *)output.result.effects); free((void *)output.result.contacts); /* the step's movement result owns them */
   state_entry *entry_state = find_state(adapter, ps);
   if (!entry_state) {
-    if (adapter->state_count >= 16) {
-      qa_app_movement_prediction_snapshot_destroy(&adapter->states[0].snapshot);
-      memmove(adapter->states, adapter->states + 1, 15 * sizeof *adapter->states);
-      adapter->state_count = 15;
+    if (adapter->state_count == adapter->state_capacity) {
+      size_t capacity = adapter->state_capacity ? adapter->state_capacity * 2 : 4;
+      state_entry *grown = realloc(adapter->states, capacity * sizeof *grown);
+      if (!grown) qa_range_error("Out of memory");
+      adapter->states = grown; adapter->state_capacity = capacity;
     }
     entry_state = &adapter->states[adapter->state_count++];
     entry_state->ps = ps;
@@ -318,6 +334,7 @@ qa_bounds qa_app_presentation_prediction_adapter_move_player(qa_app_presentation
 
 void qa_app_presentation_prediction_adapter_update_view_angles(qa_app_presentation_prediction_adapter *adapter,
     qa_q3_base_player_state_record *ps, qa_q3_base_user_command command) {
+  refresh_profile(adapter);
   qa_app_movement_prediction_snapshot seed = seed_snapshot(adapter, ps);
   if (seed.state.kind != QA_MOVEMENT_STATE_Q3) {
     command_entry *original = NULL;
@@ -384,11 +401,21 @@ static bool sim_is_brush(void *v, qa_trace_hit hit) {
   return hit.kind == QA_TRACE_HIT_WORLD
       || (hit.kind == QA_TRACE_HIT_ACTOR && host->source.actor_is_inline_model && host->source.actor_is_inline_model(host->source.ctx, hit.actor));
 }
+/* get profile(): the player's profile, with its current world gravity for the Q1 families. */
+static bool sim_profile(void *v, qa_movement_profile *out) {
+  qa_app_simulation_prediction_host *host = (qa_app_simulation_prediction_host *)v;
+  qa_app_simulation_movement_player_view player; memset(&player, 0, sizeof player);
+  if (!host->source.movement_player || !host->source.movement_player(host->source.ctx, host->actor, &player)) return false;
+  *out = player.profile;
+  if (player.profile.kind && (strcmp(player.profile.kind, "q1-netquake") == 0 || strcmp(player.profile.kind, "q1-quakeworld") == 0))
+    out->parameters.gravity = player.world_gravity;
+  return true;
+}
 static qa_app_movement_prediction_snapshot sim_capture(qa_app_simulation_prediction_host *host, const qa_q3_base_player_state_record *ps, bool has_ps) {
-  if (!has_ps || !ps) qa_range_error("Prediction snapshot has no matching source client");
+  if (!has_ps || !ps) qa_raise("Error", 0, 0, "Prediction snapshot has no matching source client");
   qa_app_simulation_movement_player_view player; memset(&player, 0, sizeof player);
   if (!host->source.movement_player || !host->source.movement_player(host->source.ctx, host->actor, &player))
-    qa_range_error("Cgame prediction requires an admitted source player");
+    qa_raise("Error", 0, 0, "Cgame prediction requires an admitted source player");
   qa_app_movement_prediction_snapshot base; memset(&base, 0, sizeof base);
   base.sequence = player.last_sequence; base.command_time_milliseconds = ps->command_time;
   base.state = player.state; base.arsenal = player.arsenal; base.animation = player.animation;
@@ -411,7 +438,7 @@ qa_app_simulation_prediction_host *qa_app_create_simulation_prediction_host(
   qa_app_simulation_movement_player_view player; memset(&player, 0, sizeof player);
   bool has_player = source.movement_player && source.movement_player(source.ctx, actor, &player);
   bool has_source = source.has_q3_source && source.has_q3_source(source.ctx);
-  if (!has_player || !has_source) qa_range_error("Cgame prediction requires an admitted source player");
+  if (!has_player || !has_source) qa_raise("Error", 0, 0, "Cgame prediction requires an admitted source player");
   qa_app_simulation_prediction_host *host = calloc(1, sizeof *host);
   if (!host) return NULL;
   host->source = source; host->actor = actor;
@@ -435,6 +462,7 @@ qa_app_simulation_prediction_host *qa_app_create_simulation_prediction_host(
   options.host_ctx = source.host_ctx;
   options.relative_source_command = source.relative_source_command;
   options.publish_event = source.publish_event;
+  options.profile_ctx = host; options.current_profile = sim_profile;
   host->adapter = qa_app_create_presentation_movement_host(options);
   if (!host->adapter) { qa_app_movement_prediction_snapshot_destroy(&initial); free(host); return NULL; }
   return host;

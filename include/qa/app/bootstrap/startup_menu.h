@@ -107,4 +107,9 @@ void qa_app_startup_menu_bind_input(qa_app_startup_menu *m, qa_seat_input *input
     const qa_ui_binding_action *source, size_t source_count,
     const qa_ui_binding_action *(*get_source)(void *ctx, size_t *out_count), void *source_ctx,
     const qa_ui_binding_reset *reset);
+/** TS bindInput(input, actions, reset, scope): scope NULL is the TS undefined. */
+void qa_app_startup_menu_bind_input_scoped(qa_app_startup_menu *m, qa_seat_input *input,
+    const qa_ui_binding_action *source, size_t source_count,
+    const qa_ui_binding_action *(*get_source)(void *ctx, size_t *out_count), void *source_ctx,
+    const qa_ui_binding_reset *reset, const qa_ui_binding_scope *scope);
 #endif

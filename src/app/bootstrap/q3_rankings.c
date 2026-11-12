@@ -11,6 +11,7 @@
 #include "qa/foundation/js.h"
 #include "qa/network/services/rank_codec.h"
 typedef struct weapon_track { bool present; double weapon, since; } weapon_track;
+typedef struct actions_ctx { struct qa_app_q3_rankings *rankings; double slot; } actions_ctx;
 struct qa_app_q3_rankings {
   qa_q3_entity_pool *pool;
   const qa_q3_game_level *level;
@@ -24,6 +25,8 @@ struct qa_app_q3_rankings {
   bool closed;
   char *game_key; /* TS gameKey, "" until begin */
   bool ended;
+  /* accountActions closures: this owner and the slot, one per source client slot. */
+  actions_ctx actions[QA_Q3_MAX_CLIENTS];
 };
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 static void status_changed(void *ctx, double slot, qa_ranking_player_state state) {
@@ -91,12 +94,14 @@ qa_app_q3_rankings *qa_app_q3_rankings_create(qa_q3_entity_pool *pool, const qa_
 }
 qa_ranking_lifecycle *qa_app_q3_rankings_lifecycle(qa_app_q3_rankings *rankings) { return rankings->lifecycle; }
 static void assert_open(qa_app_q3_rankings *rankings) {
-  if (rankings->closed) qa_range_error("Ranking match owner is closed");
+  if (rankings->closed) qa_raise("Error", 0, 0, "Ranking match owner is closed");
 }
 static void flush_reports(qa_app_q3_rankings *rankings) {
   size_t count = 0;
   qa_q3_ranking_report *reports = qa_event_ring_take(&rankings->reports, &rankings->cursor, &count);
   qa_event_ring_retire(&rankings->reports);
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, reports);
   for (size_t i = 0; i < count; i++) {
     if (!is(qa_ranking_lifecycle_get_state(rankings->lifecycle).kind, "active")) break;
     if (reports[i].kind == QA_Q3_RANK_INTEGER)
@@ -106,6 +111,7 @@ static void flush_reports(qa_app_q3_rankings *rankings) {
       qa_ranking_lifecycle_report_string(rankings->lifecycle, reports[i].self, reports[i].other,
           reports[i].key, reports[i].value_string);
   }
+  qa_cleanup_pop(&node);
   free(reports);
 }
 void qa_app_q3_rankings_begin(qa_app_q3_rankings *rankings, bool enabled, bool single_player, const char *game_key) {
@@ -122,14 +128,12 @@ static void assert_client(qa_app_q3_rankings *rankings, double slot) {
   bool ok = slot == trunc(slot) && slot >= 0 && slot < rankings->pool->max_clients
       && rankings->host.entity_inuse(rankings->host.ctx, slot)
       && rankings->pool->clients[(size_t)slot] != NULL;
-  if (!ok) qa_range_error("Ranking account requires a connected source client");
+  if (!ok) qa_raise("Error", 0, 0, "Ranking account requires a connected source client");
 }
 void qa_app_q3_rankings_account(qa_app_q3_rankings *rankings, double slot, const qa_ranking_account_request *request) {
   assert_client(rankings, slot);
   qa_ranking_lifecycle_account(rankings->lifecycle, slot, request);
 }
-typedef struct actions_ctx { qa_app_q3_rankings *rankings; double slot; } actions_ctx;
-static actions_ctx slot_actions[64];
 static qa_ranking_service_state actions_service(void *ctx) {
   return qa_ranking_lifecycle_get_state(((actions_ctx *)ctx)->rankings->lifecycle);
 }
@@ -154,7 +158,7 @@ static const char *actions_spectate(void *ctx) {
 }
 qa_ui_ranking_account_actions qa_app_q3_rankings_account_actions(qa_app_q3_rankings *rankings, double slot) {
   assert_client(rankings, slot);
-  actions_ctx *ctx = &slot_actions[(size_t)slot % 64];
+  actions_ctx *ctx = &rankings->actions[(size_t)slot];
   ctx->rankings = rankings; ctx->slot = slot;
   qa_ui_ranking_account_actions actions = {ctx, actions_service, actions_player,
       actions_submit, actions_reset, actions_spectate};
@@ -257,15 +261,19 @@ void qa_app_q3_rankings_game_over(qa_app_q3_rankings *rankings) {
     qa_ranking_lifecycle_report_int(rankings->lifecycle, -1, -1, integers[i].key, value, false);
   }
 }
+static void flush_run(void *rankings) { flush_reports(rankings); }
 void qa_app_q3_rankings_close(qa_app_q3_rankings *rankings) {
   if (rankings == NULL || rankings->closed) return;
   rankings->closed = true;
   qa_q3_ranking_reports_detach(&rankings->pool->rankings);
-  flush_reports(rankings);
+  /* try { await this.flush(); } finally { await this.lifecycle.end(); } */
+  qa_caught_error caught;
+  bool flushed = qa_try(flush_run, rankings, &caught);
   qa_ranking_lifecycle_end(rankings->lifecycle);
   rankings->host.destroy_lifecycle(rankings->host.ctx, rankings->lifecycle);
   qa_event_ring_close_cursor(&rankings->reports, &rankings->cursor);
   qa_event_ring_destroy(&rankings->reports);
   free(rankings->observed); free(rankings->observed_present); free(rankings->weapons); free(rankings->game_key);
   free(rankings);
+  if (!flushed) qa_rethrow(&caught);
 }

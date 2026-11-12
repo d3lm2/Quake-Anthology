@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "q2_codec_internal.h"
 
 /* ---- value builders (TS encodeCheckpointValue of the captured object) ---- */
@@ -14,25 +15,40 @@ static bool set_own(qa_save_value *object, const char *key, qa_save_value *child
 }
 /* TS decode*(bytes): readX(new SaveReader(decodeCheckpointValue(bytes), path)). */
 typedef bool (*read_fn)(const qa_save_reader *reader, void *out);
+static void free_value(void *arg) { qa_save_value_free(arg); }
 static bool decode_with(const uint8_t *bytes, size_t length, const char *path, read_fn read, void *out) {
   qa_save_value *root = qa_decode_checkpoint_value(bytes, length);
   if (root == NULL) return false;
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, root, path)) { qa_save_value_free(root); return false; }
+  qa_cleanup guard; /* a malformed record raises with the tree released */
+  qa_cleanup_push(&guard, free_value, root);
   bool ok = read(&reader, out);
+  qa_cleanup_pop(&guard);
   qa_save_reader_destroy(&reader);
   qa_save_value_free(root);
   return ok;
 }
 
 /* ---- Q2MissionPackItemsCheckpoint ---- */
+static void free_items(void *arg) { qa_q2mp_items_checkpoint_free(arg); }
+static void read_items_body(const qa_save_reader *reader, qa_q2mp_items_checkpoint *out, bool *ok);
+/* A malformed entry raises with the partial checkpoint released. */
 bool qa_read_q2_mission_pack_items_checkpoint(const qa_save_reader *reader, qa_q2mp_items_checkpoint *out) {
   memset(out, 0, sizeof *out);
+  bool ok = true;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_items, out);
+  read_items_body(reader, out, &ok);
+  qa_cleanup_pop(&guard);
+  return ok;
+}
+static void read_items_body(const qa_save_reader *reader, qa_q2mp_items_checkpoint *out, bool *ok) {
   qa_save_reader powers = q2c_field(reader, "powers");
   size_t count = qa_save_reader_list_count(&powers);
   if (count != 0) {
     out->powers = calloc(count, sizeof *out->powers);
-    if (out->powers == NULL) { qa_save_reader_destroy(&powers); return false; }
+    if (out->powers == NULL) { qa_save_reader_destroy(&powers); *ok = false; return; }
   }
   for (size_t i = 0; i < count; i++) {
     qa_save_reader value = q2c_item(&powers, i);
@@ -47,7 +63,6 @@ bool qa_read_q2_mission_pack_items_checkpoint(const qa_save_reader *reader, qa_q
     out->power_count = i + 1;
   }
   qa_save_reader_destroy(&powers);
-  return true;
 }
 /* TS Q2MissionPackItems.capture: { powers: [{ actor, state: { quadFireUntil, doubleUntil, irUntil } }] }. */
 static qa_save_value *items_value(const qa_q2mp_items_checkpoint *checkpoint) {
@@ -121,8 +136,18 @@ static bool read_monster_state(const qa_save_reader *state, qa_q2mpm_saved_state
   out->widow_invulnerable_until = q2c_number(state, "widowInvulnerableUntil");
   return true;
 }
+static void free_monsters(void *arg) { qa_q2mpm_monsters_checkpoint_free(arg); }
+static bool read_monsters_body(const qa_save_reader *reader, qa_q2mpm_monsters_checkpoint *out);
+/* A malformed actor raises with the partial checkpoint (actors, reinforcement lists, hints) released. */
 bool qa_read_q2_mission_pack_monsters_checkpoint(const qa_save_reader *reader, qa_q2mpm_monsters_checkpoint *out) {
   memset(out, 0, sizeof *out);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_monsters, out);
+  bool ok = read_monsters_body(reader, out);
+  qa_cleanup_pop(&guard);
+  return ok;
+}
+static bool read_monsters_body(const qa_save_reader *reader, qa_q2mpm_monsters_checkpoint *out) {
   qa_save_reader f = q2c_field(reader, "version");
   out->version = qa_save_reader_literal_number(&f, 1);
   qa_save_reader_destroy(&f);
@@ -132,8 +157,8 @@ bool qa_read_q2_mission_pack_monsters_checkpoint(const qa_save_reader *reader, q
   qa_save_reader_destroy(&f);
   f = q2c_field(reader, "hints");
   if (!qa_save_reader_is_null(&f)) {
-    if (!qa_q2mpm_decode_hints_checkpoint(&f, &out->hints)) { qa_save_reader_destroy(&f); return false; }
-    out->has_hints = true;
+    out->has_hints = true; /* a partial hints checkpoint is released with the rest */
+    if (!qa_q2mpm_decode_hints_checkpoint(&f, &out->hints)) { out->has_hints = false; qa_save_reader_destroy(&f); return false; }
   }
   qa_save_reader_destroy(&f);
   out->widow_shots_fired = q2c_number(reader, "widowShotsFired");

@@ -4,9 +4,10 @@
  * binding, checkpoint, owned actors, messages, presentation, spatial,
  * movement, pusher and aim builtins, combat, protection, pickups and
  * items. Engine members typed const void * in qa_session_mod_engine_
- * services are read through world/session/mod_engine.h. TS plain Error
- * throws abort via qa_range_error with the identical message, so the
- * TS AggregateError collection in close paths never runs. */
+ * services are read through world/session/mod_engine.h. TS throws are
+ * qa_raise with the TS class and message; TS try/finally sites restore
+ * through qa_try, and close paths collect every failure into one
+ * AggregateError as TS does. */
 #ifndef QA_COMPAT_QC_MOD_PROVIDER_H
 #define QA_COMPAT_QC_MOD_PROVIDER_H
 #include <stdbool.h>
@@ -38,7 +39,7 @@
 #include "qa/world/session/mod_objectives.h"
 #include "qa/world/session/mods.h"
 
-/* TS validateQcMod. Aborts with the TS Error message on failure. */
+/* TS validateQcMod. Raises the TS error class and message on failure. */
 void qa_compat_qc_validate_mod(qa_compat_qc_program *program,
                                qa_mod_callback_declaration declaration);
 
@@ -92,8 +93,11 @@ struct qa_compat_qc_mod_provider {
   qa_compat_qc_mod_client_bindings clients;
   bool has_clients;
   qa_mod_source_objectives *objectives;
+  /* TS projections (actor -> slot, insertion order) and actorsBySlot (slot -> actor) are two Maps that
+   * can disagree: a client slot taken while an older projection is deferred, or remember() moving an actor. */
   struct { qa_actor_id actor; int64_t slot; } *projections;
   size_t projection_count, projection_capacity;
+  struct { bool has; qa_actor_id actor; } *actors_by_slot; /* entities.capacity entries */
   /* TS freeSlots: released foreign slots, oldest first. A slot is reused only after others are released behind it,
    * so stale references see it freed for a while (FOREIGN_SLOT_QUARANTINE). */
   int64_t *free_slots;
@@ -119,7 +123,8 @@ struct qa_compat_qc_mod_provider {
   bool has_release_subscription;
   qa_source_match_unbind release_match;
   bool has_release_match;
-  struct qa_compat_qc_match_player_cell *match_cells;
+  /* Each cell is its own allocation: a returned match player keeps its ctx while more players resolve. */
+  struct qa_compat_qc_match_player_cell **match_cells;
   size_t match_cell_count, match_cell_capacity;
   qa_compat_qc_executor_host host_state;
   qa_guest_checkpoint checkpoint_storage;

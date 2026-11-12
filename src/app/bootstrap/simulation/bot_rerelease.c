@@ -1,5 +1,6 @@
 /* Port of src/app/bootstrap/simulation/bot-rerelease.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/simulation/bot_rerelease.h"
+#include "qa/foundation/caught_message.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -7,8 +8,10 @@
 #include <string.h>
 #include "qa/app/bootstrap/simulation/bot_commands.h"
 #include "qa/bots/behavior/rerelease/chat_text.h"
+#include "qa/app/bootstrap/input.h"
 #include "qa/bots/behavior/rerelease/checkpoint.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include "qa/persistence/save_image.h"
 
@@ -55,10 +58,7 @@ static void *grow(void *p, size_t *capacity, size_t count, size_t size) {
 }
 static char *xstrdup(const char *s) { char *p = strdup(s != NULL ? s : ""); if (p == NULL) qa_range_error("Out of memory"); return p; }
 static const qa_app_sim_bot_simulation *sim_of(bots_t *b) { return b->options.simulation; }
-static bool ascii_equal_ignore_case(const char *a, const char *b) {
-  for (; *a != '\0' && *b != '\0'; a++, b++) if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
-  return *a == *b;
-}
+
 static connection *connection_at(bots_t *b, int64_t slot) {
   for (size_t i = 0; i < b->connection_count; i++) if (b->connections[i]->slot == slot) return b->connections[i];
   return NULL;
@@ -137,19 +137,31 @@ static const qa_bot_sound *sounds_of(void *ctx, size_t *out_count) { bots_t *b =
 static double cb_time(void *ctx) { connection *c = ctx; return sim_of(c->owner)->time_seconds(sim_of(c->owner)->ctx); }
 static void cb_pre_think(void *ctx, const char *name, qa_rerelease_orders orders) { (void)ctx; (void)name; (void)orders; } /* TS () => {} */
 static void cb_post_think(void *ctx, const char *name, qa_bot_usercmd command) { (void)ctx; (void)name; (void)command; } /* TS () => {} */
-typedef struct lookup_ctx { bots_t *owner; char *last; } lookup_ctx;
+/* Every looked-up text stays valid until the chat finishes: q1BotChatText
+ * keeps each variant it looked up before choosing one. */
+typedef struct lookup_ctx { bots_t *owner; char **texts; size_t count, capacity; } lookup_ctx;
 static const char *localization_lookup(void *ctx, const char *key) {
   lookup_ctx *l = ctx;
-  free(l->last);
-  l->last = qa_localization_table_lookup((qa_localization_table *)&l->owner->assets->localization, key, NULL, 0);
-  return l->last;
+  char *text = qa_localization_table_lookup((qa_localization_table *)&l->owner->assets->localization, key, NULL, 0);
+  if (text == NULL) return NULL;
+  l->texts = grow(l->texts, &l->capacity, l->count, sizeof *l->texts);
+  l->texts[l->count++] = text;
+  return text;
+}
+static void lookup_release(void *arg) {
+  lookup_ctx *l = arg;
+  for (size_t i = 0; i < l->count; i++) free(l->texts[i]);
+  free(l->texts);
+  l->texts = NULL; l->count = l->capacity = 0;
 }
 static void cb_chat(void *ctx, qa_bot_chat_event event) {
   connection *self = ctx;
   bots_t *b = self->owner;
   connection *c = connection_at(b, self->slot);
   if (c == NULL) fail("Native bot chat lost its admitted client");
-  lookup_ctx lookup = {b, NULL};
+  lookup_ctx lookup = {b, NULL, 0, 0};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, lookup_release, &lookup);
   char *text;
   if (is(b->assets->source, "q1-rerelease")) {
     text = qa_q1_bot_chat_text(event.locstring, localization_lookup, &lookup, qa_xorshift32_as_random(&c->behavior.random));
@@ -158,10 +170,21 @@ static void cb_chat(void *ctx, qa_bot_chat_event event) {
     const char *found = localization_lookup(&lookup, event.locstring);
     text = xstrdup(found != NULL ? found : event.locstring);
   }
-  free(lookup.last);
-  const char *args[1] = {text};
-  sim_of(b)->player_command(sim_of(b)->ctx, self->actor.id, event.team_only ? "say_team" : "say", args, 1);
+  qa_cleanup_pop(&cleanup);
+  lookup_release(&lookup);
+  qa_cleanup text_cleanup;
+  qa_cleanup_push(&text_cleanup, free, text);
+  /* The localized text is decoded UTF-8; a player command carries console text
+   * (one byte per UTF-16 unit), which every say writer reads, as for typed chat. */
+  char *line = qa_app_chat_console_text(text);
+  qa_cleanup_pop(&text_cleanup);
   free(text);
+  qa_cleanup line_cleanup;
+  qa_cleanup_push(&line_cleanup, free, line);
+  const char *args[1] = {line};
+  sim_of(b)->player_command(sim_of(b)->ctx, self->actor.id, event.team_only ? "say_team" : "say", args, 1);
+  qa_cleanup_pop(&line_cleanup);
+  free(line);
 }
 static void cb_select_weapon(void *ctx, double number) { connection *c = ctx; c->selection.number = number; }
 static double cb_weapon_impulse(void *ctx, double number) { connection *c = ctx; c->selection.number = number; return 0; }
@@ -209,7 +232,7 @@ static connection *connect_client(bots_t *b, qa_session_client *client, qa_q3_se
   if (player == NULL) fail("Native bot admission lost selected movement");
   size_t character_count = 0;
   const qa_character_entry *all = characters(b, &character_count), *character = NULL;
-  for (size_t i = 0; i < character_count && character == NULL; i++) if (ascii_equal_ignore_case(all[i].name, name)) character = &all[i];
+  for (size_t i = 0; i < character_count && character == NULL; i++) if (qa_js_equals_ignore_case(all[i].name, name)) /* TS toLowerCase() === */ character = &all[i];
   const char *definition = b->assets->files.provenance != NULL ? b->assets->files.provenance(b->assets->files.files.ctx) : NULL;
   if (definition == NULL) fail("Native bot assets require saved provenance");
   connection *c = calloc(1, sizeof *c);
@@ -312,9 +335,7 @@ static void add(bots_t *b, const char *name, const char *skill) {
     connection *partial = connection_at(b, id.slot);
     if (partial != NULL) remove_connection(b, id.slot);
     bool close_failed = !qa_try(cleanup_close, &cleanup, &second);
-    if (disconnect_failed || close_failed)
-      qa_raise("AggregateError", 0, 0, "Native bot admission and cleanup failed: %s%s%s%s%s", error.message,
-          disconnect_failed ? "; " : "", disconnect_failed ? first.message : "", close_failed ? "; " : "", close_failed ? second.message : "");
+    if (disconnect_failed || close_failed) qa_raise("AggregateError", 0, 0, "Native bot admission and cleanup failed");
     qa_rethrow(&error);
   }
   b->options.print(b->options.ctx, "Unable to add bot: server is full\n");
@@ -322,12 +343,11 @@ static void add(bots_t *b, const char *name, const char *skill) {
 
 static void console_command(void *ctx, const char *const *argv, size_t argc) {
   bots_t *b = ctx;
-  char command[64] = "undefined";
-  if (argc > 0) {
-    size_t n = 0;
-    for (; argv[0][n] != '\0' && n + 1 < sizeof command; n++) command[n] = (char)tolower((unsigned char)argv[0][n]);
-    command[n] = '\0';
-  }
+  /* TS argv[0]?.toLowerCase() over console text (one byte per UTF-16 unit): the Latin-1 lower case. */
+  char *command = argc > 0 ? qa_js_latin1_to_lower_case(argv[0]) : NULL;
+  if (argc > 0 && command == NULL) qa_range_error("Out of memory");
+  qa_cleanup command_cleanup;
+  qa_cleanup_push(&command_cleanup, free, command);
   size_t character_count = 0;
   const qa_character_entry *names = characters(b, &character_count);
   if (argc > 0 && strcmp(command, "addbot") == 0) {
@@ -354,6 +374,8 @@ static void console_command(void *ctx, const char *const *argv, size_t argc) {
       free(line);
     }
   } else qa_raise("Error", 0, 0, "Unknown native bot command %s", argc > 0 ? command : "undefined");
+  qa_cleanup_pop(&command_cleanup);
+  free(command);
 }
 static qa_user_command command_of(bots_t *b, qa_bot_usercmd source, connection *c) {
   const qa_app_sim_bot_simulation *sim = sim_of(b);
@@ -789,6 +811,17 @@ static qa_save_value *checkpoint(void *ctx) {
 }
 
 typedef struct saved_client { double slot; char *name, *skill; double sequence, selection; qa_rerelease_behavior_checkpoint behavior; } saved_client;
+typedef struct saved_clients { saved_client *items; size_t count; } saved_clients;
+/* Frees the decoded saved clients (also when a malformed save raises). */
+static void saved_clients_free(void *arg) {
+  saved_clients *list = arg;
+  for (size_t i = 0; i < list->count; i++) {
+    free(list->items[i].name); free(list->items[i].skill);
+    qa_rerelease_behavior_checkpoint_destroy(&list->items[i].behavior);
+  }
+  free(list->items);
+  list->items = NULL; list->count = 0;
+}
 static void rf(const qa_save_reader *r, const char *name, qa_save_reader *out) { if (!qa_save_reader_field(r, name, out)) qa_range_error("Out of memory"); }
 static double read_number(const qa_save_reader *r, const char *name, double (*read)(const qa_save_reader *)) {
   qa_save_reader f; rf(r, name, &f); double v = read(&f); qa_save_reader_destroy(&f); return v;
@@ -847,8 +880,12 @@ static void restore(bots_t *b) {
   size_t client_count = qa_save_reader_list_count(&list);
   saved_client *saved = calloc(client_count != 0 ? client_count : 1, sizeof *saved);
   if (saved == NULL) qa_range_error("Out of memory");
+  saved_clients owned = {saved, 0};
+  qa_cleanup saved_cleanup;
+  qa_cleanup_push(&saved_cleanup, saved_clients_free, &owned);
   for (size_t i = 0; i < client_count; i++) {
     qa_save_reader entry, behavior;
+    owned.count = i + 1; /* calloc'd: a partly read entry frees as empty */
     if (!qa_save_reader_item(&list, i, &entry)) qa_range_error("Out of memory");
     saved[i].slot = read_integer0(&entry, "slot");
     saved[i].name = read_string(&entry, "name"); saved[i].skill = read_string(&entry, "skill");
@@ -878,11 +915,21 @@ static void restore(bots_t *b) {
     c->sequence = state->sequence; c->selection.number = state->selection;
     if (!qa_rerelease_bot_behavior_restore(&c->behavior, &state->behavior)) qa_range_error("Out of memory");
   }
-  for (size_t i = 0; i < client_count; i++) { free(saved[i].name); free(saved[i].skill); qa_rerelease_behavior_checkpoint_destroy(&saved[i].behavior); }
-  free(saved);
+  qa_cleanup_pop(&saved_cleanup);
+  saved_clients_free(&owned);
   b->elapsed_milliseconds = image->transport.elapsed_milliseconds;
 }
 
+static void create_failed(void *arg) {
+  bots_t *b = arg;
+  /* A reliable ring handed in with options.clients stays the caller's. */
+  for (size_t i = 0; i < b->connection_count; i++)
+    for (size_t j = 0; j < b->options.client_count; j++)
+      if (b->connections[i]->client.reliable == b->options.clients[j].reliable) b->connections[i]->client.reliable = NULL;
+  while (b->connection_count != 0) remove_connection(b, b->connections[0]->slot);
+  qa_app_sim_rerelease_bot_objectives_destroy(b->objectives);
+  free(b->connections); free(b->observations); free(b->heard); free(b->commands); free(b->arsenals); free(b->client_views); free(b);
+}
 qa_app_sim_rerelease_bots *qa_app_sim_rerelease_bots_create(const qa_app_sim_bots_options *options,
     const qa_app_sim_application_bot_assets *assets) {
   const qa_app_sim_bot_simulation *sim = options->simulation;
@@ -904,6 +951,9 @@ qa_app_sim_rerelease_bots *qa_app_sim_rerelease_bots_create(const qa_app_sim_bot
   b->service.close = close_transport; b->service.checkpoint = checkpoint; b->service.begin_round_restart = begin_round_restart;
   b->service.bind_restarted_round = bind_restarted_round; b->service.reconnect_restarted_client = reconnect_restarted_client;
   b->service.resume_round_bots = resume_round_bots;
+  /* A raising constructor leaves nothing behind (TS GC): free what is built. */
+  qa_cleanup create_cleanup;
+  qa_cleanup_push(&create_cleanup, create_failed, b);
   b->objectives = qa_app_sim_rerelease_bot_objectives_create(sim, assets->knowledge);
   qa_cvar_snapshot snapshot;
   qa_cvar_registry_register(configuration, "bot_minplayers", "0", 0, &snapshot);
@@ -918,6 +968,7 @@ qa_app_sim_rerelease_bots *qa_app_sim_rerelease_bots_create(const qa_app_sim_bot
     connect_client(b, saved->client, &reliable, saved->userinfo, name, default_skill(b), NULL);
     free(name);
   }
+  qa_cleanup_pop(&create_cleanup);
   qa_app_sim_bot_services_attach_transport(sim->bot_services, &b->service);
   b->release_subscription = qa_session_actor_registry_on_release(sim->actors, on_release, b);
   return b;

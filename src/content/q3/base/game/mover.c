@@ -18,7 +18,7 @@ static qa_q3_game_combat_context *combat_of(RT *r) { return r->host.combat(r->ho
 static qa_q3_entity_pool *pool_of(RT *r) { return combat_of(r)->entities; }
 static double now(RT *r) { return combat_of(r)->time; }
 static void link_entity(RT *r, qa_q3_game_entity *e) { r->host.world.link(r->host.world.ctx, e); }
-static void owned(RT *r, qa_q3_game_entity *e) { if (qa_q3_entity_pool_get(pool_of(r), e->slot) != e) qa_range_error("Mover entity does not belong to this pool"); }
+static void owned(RT *r, qa_q3_game_entity *e) { if (qa_q3_entity_pool_get(pool_of(r), e->slot) != e) qa_raise("Error", 0, 0, "Mover entity does not belong to this pool"); }
 static double f32(double v) { return (float)v; }
 static void base_origin(qa_q3_game_entity *e, qa_vec3 origin) { e->s.pos.base = origin; }
 static void base_angles(qa_q3_game_entity *e, qa_vec3 angles) { e->s.apos.base = angles; }
@@ -54,7 +54,7 @@ typedef struct pushed_t {
 } pushed_t;
 typedef struct pushed_stack { pushed_t *items; size_t count, capacity; } pushed_stack;
 static void push_saved(pushed_stack *s, pushed_t value) {
-  if (s->count >= QA_Q3_MAX_GENTITIES) qa_range_error("pushed stack exceeds MAX_GENTITIES");
+  if (s->count >= QA_Q3_MAX_GENTITIES) qa_raise("Error", 0, 0, "pushed stack exceeds MAX_GENTITIES");
   if (s->count == s->capacity) {
     size_t cap = s->capacity ? s->capacity * 2 : 16; void *grown = realloc(s->items, cap * sizeof *s->items);
     if (!grown) qa_range_error("out of memory");
@@ -62,6 +62,7 @@ static void push_saved(pushed_stack *s, pushed_t value) {
   }
   s->items[s->count++] = value;
 }
+static void free_pushed(void *arg) { pushed_stack *s = arg; free(s->items); s->items = NULL; s->count = s->capacity = 0; }
 static double delta_yaw(qa_q3_game_client *c) { return c->ps.delta_angles.y; }
 static bool try_pushing(RT *r, qa_q3_game_entity *check, qa_q3_game_entity *pusher, qa_vec3 move, qa_vec3 amove, pushed_stack *pushed) {
   if ((qa_js_to_int32(pusher->s.e_flags) & EF_MOVER_STOP) != 0 && !qa_q3_rides(check, pusher)) return false;
@@ -74,7 +75,8 @@ static bool try_pushing(RT *r, qa_q3_game_entity *check, qa_q3_game_entity *push
   if (check->client) {
     qa_q3_base_player_state *ps = &check->client->ps;
     qa_q3_base_player_state_record_set_origin(ps, qa_add3(qa_add3(qa_q3_base_player_state_record_origin(ps), move), rotation_move));
-    ps->delta_angles = qa_math_vec3(ps->delta_angles.x, qa_int32(ps->delta_angles.y + angle_short(amove.y)), ps->delta_angles.z);
+    /* TS spreads deltaAngles and replaces y: the int32 angle words are not rounded to binary32. */
+    ps->delta_angles.y = qa_int32(ps->delta_angles.y + angle_short(amove.y));
   }
   if (!qa_q3_rides(check, pusher)) qa_q3_lose_ground(check);
   if (!qa_q3_mover_test_entity_position(r, check, NULL)) {
@@ -146,8 +148,8 @@ static void restore_pushed(RT *r, pushed_stack *pushed) {
     qa_q3_game_entity *e = saved->entity;
     base_origin(e, saved->origin); base_angles(e, saved->angles);
     if (e->client) {
-      if (!saved->has_view) qa_range_error("pushed entity acquired a client during the transaction");
-      e->client->ps.delta_angles = qa_math_vec3(e->client->ps.delta_angles.x, qa_qvm_float_to_int(saved->yaw), e->client->ps.delta_angles.z);
+      if (!saved->has_view) qa_raise("Error", 0, 0, "pushed entity acquired a client during the transaction");
+      e->client->ps.delta_angles.y = qa_qvm_float_to_int(saved->yaw); /* x and z keep their int32 words */
       qa_q3_base_player_state_record_set_origin(&e->client->ps, saved->origin);
     }
     link_entity(r, e);
@@ -195,6 +197,8 @@ static bool push_part(RT *r, qa_q3_game_entity *pusher, qa_vec3 move, qa_vec3 am
   const qa_actor_id *borrowed = r->host.spatial->area_actors(r->host.spatial->ctx, total, QA_Q3_MAX_GENTITIES, &count);
   qa_actor_id *entities = malloc((count ? count : 1) * sizeof *entities); if (!entities) qa_range_error("out of memory");
   if (count) memcpy(entities, borrowed, count * sizeof *entities);
+  /* A raise from a crush or explosion unwinds past this frame. */
+  qa_cleanup entities_node; qa_cleanup_push(&entities_node, free, entities);
   qa_vec3 origin2 = qa_add3(qa_q3_base_entity_shared_current_origin(&pusher->r), move);
   qa_vec3 angles = qa_add3(qa_q3_base_entity_shared_current_angles(&pusher->r), amove);
   write_pose(r, pusher, origin2, angles);
@@ -237,6 +241,7 @@ static bool push_part(RT *r, qa_q3_game_entity *pusher, qa_vec3 move, qa_vec3 am
     if (sine_pusher(pusher)) { crush(r, qa_q3_participant_entity(check), pusher); continue; }
     restore_pushed(r, pushed); *obstacle = qa_q3_participant_entity(check); blocked = true;
   }
+  qa_cleanup_pop(&entities_node);
   free(entities);
   return blocked;
 }
@@ -246,6 +251,7 @@ static void call_think_family(qa_q3_entity_callback cb, qa_q3_game_entity *self)
 void qa_q3_mover_run_team(RT *r, qa_q3_game_entity *entity) {
   owned(r, entity);
   pushed_stack pushed = {NULL, 0, 0}; double time = now(r); bool blocked = false; qa_q3_damage_participant obstacle; memset(&obstacle, 0, sizeof obstacle);
+  qa_cleanup pushed_node; qa_cleanup_push(&pushed_node, free_pushed, &pushed);
   for (qa_q3_game_entity *part = entity; part; part = part->teamchain) {
     qa_vec3 a2 = qa_q3_base_evaluate_trajectory(part->s.pos, time);
     qa_vec3 b2 = qa_q3_base_entity_shared_current_origin(&part->r);
@@ -256,7 +262,8 @@ void qa_q3_mover_run_team(RT *r, qa_q3_game_entity *entity) {
     blocked = push_part(r, part, move, amove, &pushed, &obstacle);
     if (blocked) break;
   }
-  free(pushed.items);
+  qa_cleanup_pop(&pushed_node);
+  free_pushed(&pushed);
   if (blocked) {
     double elapsed = qa_int32(time - r->host.previous_time);
     for (qa_q3_game_entity *part = entity; part; part = part->teamchain) {
@@ -287,7 +294,7 @@ void qa_q3_mover_set_state(RT *r, qa_q3_game_entity *e, qa_q3_mover_state state,
       e->s.pos.delta = qa_scale3(qa_sub3(e->pos2, e->pos1), f32(1000 / f32(previous.duration))); break;
     case QA_Q3_MOVER_TWO_TO_ONE: e->s.pos.type = QA_Q3_BASE_TR_LINEAR_STOP; e->s.pos.time = time; e->s.pos.base = e->pos2;
       e->s.pos.delta = qa_scale3(qa_sub3(e->pos1, e->pos2), f32(1000 / f32(previous.duration))); break;
-    default: qa_range_error("Invalid mover state %d", (int)state);
+    default: qa_raise("Error", 0, 0, "Invalid mover state %d", (int)state);
   }
   qa_q3_base_entity_shared_set_current_origin(&e->r, qa_q3_base_evaluate_trajectory(e->s.pos, now(r)));
   link_entity(r, e);
@@ -316,12 +323,12 @@ void qa_q3_mover_reached_binary(RT *r, qa_q3_game_entity *e) {
     qa_q3_mover_set_state(r, e, QA_Q3_MOVER_POS1, time);
     if (e->sound_pos1 != 0) qa_q3_entity_pool_add_event(pool, e, QA_Q3_EV_GENERAL_SOUND, e->sound_pos1);
     if (!e->teammaster || e->teammaster == e) r->host.adjust_area_portal_state(r->host.ctx, e, false);
-  } else qa_range_error("Reached_BinaryMover: bad moverState");
+  } else qa_raise("Error", 0, 0, "Reached_BinaryMover: bad moverState");
 }
 void qa_q3_mover_use_binary(RT *r, qa_q3_game_entity *e, const qa_q3_use_participant *other, const qa_q3_use_participant *activator) {
   owned(r, e);
   if ((qa_js_to_int32(e->flags) & QA_Q3_GAME_FLAG_TEAMSLAVE) != 0) {
-    if (!e->teammaster) qa_range_error("Mover team slave has no team master");
+    if (!e->teammaster) qa_raise("Error", 0, 0, "Mover team slave has no team master");
     qa_q3_mover_use_binary(r, e->teammaster, other, activator); return;
   }
   double time = now(r); qa_q3_entity_pool *pool = pool_of(r);
@@ -383,7 +390,7 @@ void qa_q3_mover_blocked_door(RT *r, qa_q3_game_entity *e, qa_q3_damage_particip
   qa_q3_game_entity *o = other.entity; owned(r, o);
   if (!o->client) {
     if (o->s.e_type == ET_ITEM) {
-      if (!o->item) qa_range_error("Blocked item has no item definition");
+      if (!o->item) qa_raise("Error", 0, 0, "Blocked item has no item definition");
       if (o->item->type == QA_Q3_BASE_IT_TEAM) { r->host.return_dropped_flag(r->host.ctx, o); return; }
     }
     (void)qa_q3_entity_pool_temp_entity(pool, o->s.origin, QA_Q3_EV_ITEM_POP);
@@ -408,7 +415,7 @@ void qa_q3_mover_bind_save_callbacks(RT *r) {
 void qa_q3_mover_runtime_bind(RT *r) {
   if (r->bound) return;
   qa_q3_game_combat_context *c = combat_of(r);
-  if (c->entities->options.product != c->product) qa_range_error("Mover product does not match its entity pool");
+  if (c->entities->options.product != c->product) qa_raise("Error", 0, 0, "Mover product does not match its entity pool");
   qa_q3_mover_bind_save_callbacks(r); r->bound = true;
 }
 void qa_q3_mover_runtime_init(RT *r, qa_q3_mover_host host) {

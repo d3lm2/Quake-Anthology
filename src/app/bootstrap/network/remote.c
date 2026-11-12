@@ -162,6 +162,7 @@ struct qa_app_q2_remote {
   char **presentation_paths; size_t presentation_path_cap;
   qa_app_sim_presentation_event *drained; size_t drained_count;
   qa_weapon_hud_status weapon_status;
+  char *weapon_status_label; /* the weapon status label the last read returned, whole */
   qa_inventory_entry *ui_inventory; size_t ui_inventory_cap;
   qa_app_sim_player_ui_item *ui_items;
   qa_body_snapshot *sample_bodies;
@@ -276,9 +277,9 @@ static qa_vec3 sampled_player_origin(qa_app_q2_remote *remote, const qa_q2_wire_
   qa_vec3 origin = player_origin(remote, frame, false);
   if (!remote->has_previous) return origin;
   qa_vec3 before = player_origin(remote, &remote->previous_frame, true);
-  double dx = fabs(origin.x - before.x), dy = fabs(origin.y - before.y), dz = fabs(origin.z - before.z);
-  double max_delta = dx > dy ? dx : dy;
-  if (dz > max_delta) max_delta = dz;
+  /* Math.max(|dx|, |dy|, |dz|) > 256: a NaN delta makes the maximum NaN (not a teleport). */
+  double max_delta = qa_js_max(qa_js_max(fabs(origin.x - before.x), fabs(origin.y - before.y)),
+      fabs(origin.z - before.z));
   return max_delta > 256 ? origin : interpolate(before, origin, remote->fraction);
 }
 static void require_player(qa_app_q2_remote *remote, qa_actor_id actor) {
@@ -373,6 +374,7 @@ void qa_app_q2_remote_destroy(qa_app_q2_remote *remote) {
   free(remote->drained);
   free(remote->ui_inventory);
   free(remote->ui_items);
+  free(remote->weapon_status_label);
   free(remote->sample_bodies);
   free(remote);
 }
@@ -429,8 +431,9 @@ qa_q2_mvd_visibility qa_app_q2_remote_mvd_visibility(qa_app_q2_remote *remote) {
 void qa_app_q2_remote_select_recorded_view(qa_app_q2_remote *remote, double clientnum) {
   const char *maximum_text = config_get(remote, remote->layout.max_clients);
   double maximum = maximum_text ? qa_js_string_to_number(maximum_text) : NAN;
-  if (clientnum != trunc(clientnum) || clientnum < 0 || maximum != trunc(maximum)
-      || clientnum >= maximum)
+  /* Number.isInteger: NaN and the infinities are not integers. */
+  if (!isfinite(clientnum) || clientnum != trunc(clientnum) || clientnum < 0
+      || !isfinite(maximum) || maximum != trunc(maximum) || clientnum >= maximum)
     qa_raise("Error", 0, 0, "Recorded viewpoint is outside its admitted player range");
   if (!remote->has_player || remote->player.source_entity != clientnum + 1) {
     if (remote->has_current) {
@@ -811,10 +814,15 @@ qa_app_sim_player_ui qa_app_q2_remote_player_ui(qa_app_q2_remote *remote, qa_act
   }
   ui.armor.powered.kind = "none";
   count_ctx count = {frame};
-  char label[128] = "";
+  /* The status label is kept with the remote until the next read: the returned UI points at it. */
+  size_t label_size = qa_app_q2_weapon_label_size(weapon);
+  char *label = calloc(label_size, 1);
+  if (label == NULL) qa_range_error("Out of memory");
+  free(remote->weapon_status_label);
+  remote->weapon_status_label = label;
   qa_weapon_hud_status status = {0};
   qa_provider_reference source = recipe->weapons.values[0];
-  if (qa_app_q2_weapon_status(weapon, item_count, &count, source, label, sizeof label, &status)) {
+  if (qa_app_q2_weapon_status(weapon, item_count, &count, source, label, label_size, &status)) {
     remote->weapon_status = status;
     ui.weapon_status = &remote->weapon_status;
   }
@@ -1152,9 +1160,9 @@ static void link_solids(qa_app_q2_remote *remote, const qa_q2_wire_frame *frame,
         ? qa_shared_model_bounds(scene, model)
         : body->body.bounds;
     qa_vec3 origin = body->body.origin;
-    double rx = fabs(bounds.min.x) > fabs(bounds.max.x) ? fabs(bounds.min.x) : fabs(bounds.max.x);
-    double ry = fabs(bounds.min.y) > fabs(bounds.max.y) ? fabs(bounds.min.y) : fabs(bounds.max.y);
-    double rz = fabs(bounds.min.z) > fabs(bounds.max.z) ? fabs(bounds.min.z) : fabs(bounds.max.z);
+    double rx = qa_js_max(fabs(bounds.min.x), fabs(bounds.max.x));
+    double ry = qa_js_max(fabs(bounds.min.y), fabs(bounds.max.y));
+    double rz = qa_js_max(fabs(bounds.min.z), fabs(bounds.max.z));
     double radius = qa_js_hypot3(rx, ry, rz);
     bool rotated = has_model && (body->body.angles.x != 0 || body->body.angles.y != 0
         || body->body.angles.z != 0);
@@ -1235,8 +1243,8 @@ void qa_app_q2_remote_frame(qa_app_q2_remote *remote, qa_q2_wire_frame frame,
     remote->has_predicted = false;
   }
   remote->fraction = 1;
-  double candidate_time = (frame.server_frame - 1) * remote->frame_milliseconds;
-  if (candidate_time > remote->view_time) remote->view_time = candidate_time;
+  /* Math.max(viewTime, ...): NaN propagates. */
+  remote->view_time = qa_js_max(remote->view_time, (frame.server_frame - 1) * remote->frame_milliseconds);
   remote->received_at = remote->options.presentation_time
       ? remote->options.presentation_time(remote->options.ctx) : now_milliseconds;
   qa_app_sim_player_view view = qa_app_q2_remote_player_view(remote, remote->player.actor);
@@ -1280,9 +1288,10 @@ void qa_app_q2_remote_frame(qa_app_q2_remote *remote, qa_q2_wire_frame frame,
     const char *pattern = config_get(remote, remote->layout.lights + (double)style);
     if (!pattern) continue;
     size_t length = strlen(pattern);
-    /* pattern.charCodeAt(Math.floor(time / 100) % pattern.length): a negative or non-finite
-     * position reads NaN. */
+    /* pattern.charCodeAt(Math.floor(time / 100) % pattern.length): a negative position reads
+     * NaN; a NaN one (non-finite time) reads index 0, as ToIntegerOrInfinity(NaN) is 0. */
     double position = length == 0 ? 0 : fmod(floor(time / 100), (double)length);
+    if (isnan(position)) position = 0;
     double value = length == 0 ? 1
         : position >= 0 ? ((double)(unsigned char)pattern[(size_t)position] - 97) / 12 : NAN;
     qa_scene_light_style *entry = &remote->published_styles[style_count++];
@@ -1442,10 +1451,12 @@ static const qa_simulation_output *sample_frame(qa_app_q2_remote *remote, double
       qa_app_q2_remote_player native = native_player(remote, &remote->current, false);
       body->body.bounds = predicted ? predicted->bounds : qa_app_q2_remote_body_bounds(&native);
     } else {
+      /* TS presentations.find: the first match. */
       for (size_t j = 0; j < presentation_count; j++)
         if (qa_same_actor(presentations[j].actor, body->actor) && !presentations[j].view_weapon) {
           body->body.origin = presentations[j].origin;
           body->body.angles = presentations[j].angles;
+          break;
         }
     }
   }

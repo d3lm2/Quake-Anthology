@@ -57,6 +57,12 @@ static qa_damage_request build_request(qa_q3_game_combat_context *c, qa_actor_id
   request.delivery = (qa_js_to_int32(flags) & QA_Q3_DAMAGE_RADIUS) != 0 ? "radius" : "direct";
   return request;
 }
+/* TS provenance objects live as long as anything references them. The bridge hands back pointers into a
+ * small ring that later attacks reuse, so the request keeps its own copies for the whole apply call. */
+static void own_provenance(qa_damage_request *request, qa_actor_id *attacker, qa_actor_id *inflictor) {
+  if (request->attack.attacker) { *attacker = *request->attack.attacker; request->attack.attacker = attacker; }
+  if (request->attack.inflictor) { *inflictor = *request->attack.inflictor; request->attack.inflictor = inflictor; }
+}
 void qa_q3_combat_damage_from(qa_q3_game_combat_context *c, qa_q3_damage_participant target, const qa_q3_damage_participant *inflictor,
     const qa_q3_use_participant *attacker, qa_q3_damage_direction *direction, const qa_vec3 *point, double amount, double flags, double mod, const qa_actor_id *projectile) {
   if (c->intermission_queued != 0) return;
@@ -70,7 +76,12 @@ void qa_q3_combat_damage_from(qa_q3_game_combat_context *c, qa_q3_damage_partici
     qa_vec3 impulse = direction ? *direction : (qa_vec3){0, 0, 0};
     if (!direction) flags = qa_js_to_int32(flags) | QA_Q3_DAMAGE_NO_KNOCKBACK;
     else { qa_vec3 n = qa_normalize3(*direction); direction->x = n.x; direction->y = n.y; direction->z = n.z; }
-    if (c->authority) (void)apply_request(c, build_request(c, target.actor, src, own, amount, flags, mod, impulse, origin, projectile));
+    if (c->authority) {
+      qa_actor_id attacker_id, inflictor_id;
+      qa_damage_request request = build_request(c, target.actor, src, own, amount, flags, mod, impulse, origin, projectile);
+      own_provenance(&request, &attacker_id, &inflictor_id);
+      (void)apply_request(c, request);
+    }
     else if (c->apply_damage) c->apply_damage(c->ctx, target.actor, amount, amount, impulse, origin, (qa_js_to_int32(flags) & QA_Q3_DAMAGE_RADIUS) != 0);
     return;
   }
@@ -91,6 +102,8 @@ void qa_q3_combat_damage_from(qa_q3_game_combat_context *c, qa_q3_damage_partici
     return;
   }
   apply_op op = {c, build_request(c, qa_q3_game_entity_actor(e).id, src, own, amount, flags, mod, impulse, pt, projectile)};
+  qa_actor_id attacker_id, inflictor_id;
+  own_provenance(&op.request, &attacker_id, &inflictor_id);
   qa_q3_damage_call call = {e, src, own, direction, point, amount, flags, mod};
   if (c->dispatch) (void)c->dispatch(c->services_ctx, call, run_apply_op, &op);
   else (void)run_apply_op(&op);
@@ -154,7 +167,7 @@ void qa_q3_damage_feedback(qa_q3_game_combat_context *c, qa_q3_damage_call call,
       maximum = trunc(maximum / 2);
     incoming = trunc((double)imul32(qa_int32(incoming), qa_int32(maximum)) / 100);
   }
-  double knockback = (iflags & QA_Q3_DAMAGE_NO_KNOCKBACK) != 0 || (qa_js_to_int32(target->flags) & QA_Q3_GAME_FLAG_NO_KNOCKBACK) != 0 ? 0 : (incoming < 200 ? incoming : 200);
+  double knockback = (iflags & QA_Q3_DAMAGE_NO_KNOCKBACK) != 0 || (qa_js_to_int32(target->flags) & QA_Q3_GAME_FLAG_NO_KNOCKBACK) != 0 ? 0 : qa_js_min(incoming, 200);
   if (knockback != 0 && client && call.direction && client->ps.pm_time == 0) {
     int32_t doubled = imul32(qa_int32(knockback), 2);
     client->ps.pm_time = doubled < 50 ? 50 : doubled > 200 ? 200 : doubled; client->ps.pm_flags = qa_js_to_int32(client->ps.pm_flags) | PMF_TIME_KNOCKBACK;
@@ -235,9 +248,13 @@ static qa_attack_provenance bridge_attack(void *ctx, qa_q3_damage_participant in
   qa_actor_id none; memset(&none, 0, sizeof none);
   return qa_q3_base_combat_bridge_attack(ctx, inflictor, attacker, weapon, mod, flags, projectile != NULL, projectile ? *projectile : none);
 }
+static void bridge_end_call(void *ctx) { qa_q3_base_combat_bridge_end_call(ctx); }
 static qa_damage_outcome bridge_dispatch(void *ctx, qa_q3_damage_call call, qa_damage_outcome (*operation)(void *), void *op_ctx) {
   qa_q3_base_combat_bridge_begin_call(ctx, call);
+  /* TS try/finally: the call is popped also when the operation raises. */
+  qa_cleanup node; qa_cleanup_push(&node, bridge_end_call, ctx);
   qa_damage_outcome outcome = operation(op_ctx);
+  qa_cleanup_pop(&node);
   qa_q3_base_combat_bridge_end_call(ctx);
   return outcome;
 }

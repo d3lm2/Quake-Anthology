@@ -314,7 +314,8 @@ static void read_callback(const qa_save_reader *source, bool has_wanted,
     case QA_WEAPON_CALLBACK_NATIVE_ARTIFACT: {
       qa_save_reader field, abi_reader;
       if (!qa_save_reader_field(source, "imageOffset", &field)) abort();
-      if (qa_save_reader_bigint(&field) != wanted.image_offset)
+      uint64_t offset;
+      if (!qa_save_reader_bigint_u64(&field, &offset) || offset != wanted.image_offset)
         qa_save_reader_fail(source, "native weapon entry differs from the loaded artifact");
       qa_save_reader_destroy(&field);
       if (!qa_save_reader_field(source, "abi", &abi_reader)) abort();

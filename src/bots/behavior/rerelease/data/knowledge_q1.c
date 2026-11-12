@@ -8,7 +8,7 @@ bool qa_load_quake1_knowledge(qa_bot_knowledge *out, qa_bot_asset_files *files) 
   char *settings = qa_read_bot_source_text(files, "bots/settings_PC.txt");
   if (!settings) settings = qa_read_bot_source_text(files, "bots/settings_Consoles.txt");
   if (!settings) settings = qa_read_bot_source_text(files, "bots/settings_Nintendo.txt");
-  if (!settings) qa_range_error("Quake rerelease bot weapons were mounted without source skill settings");
+  if (!settings) { free(weapons); qa_raise("Error", 0, 0, "Quake rerelease bot weapons were mounted without source skill settings"); }
   const char *names[7] = {"bots/characters.txt","bots/items.txt","bots/monsters.txt","bots/interactables.txt","bots/game_rules.txt","bots/teams.txt","bots/chats.txt"};
   char *txt[7] = {0}; for (int i = 0; i < 7; i++) txt[i] = qa_read_bot_source_text(files, names[i]);
   qa_bot_data_files f = {txt[0] ? txt[0] : "", weapons, txt[1] ? txt[1] : "", txt[2] ? txt[2] : "", txt[3] ? txt[3] : "", txt[4] ? txt[4] : "", txt[5] ? txt[5] : "", txt[6] ? txt[6] : "", settings, NULL};

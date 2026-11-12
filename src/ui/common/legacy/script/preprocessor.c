@@ -217,9 +217,16 @@ static int64_t signed_expression_value(double value) {
 
 /* ---- engine types ---- */
 
+/* One catch frame of the read-false signal; it follows the rules of
+   qa_ui_script_catch (lexer.h): enter, setjmp, leave on every path out. */
+struct preprocessor_engine;
 typedef struct rf_catch {
   jmp_buf buf;
   struct rf_catch *prev;
+  struct preprocessor_engine *engine;
+  qa_unwind_mark mark;
+  qa_cleanup restore;
+  volatile bool entered;
 } rf_catch;
 
 typedef struct source_frame {
@@ -414,16 +421,53 @@ _Noreturn static void engine_fail(preprocessor_engine *engine,
   qa_ui_script_fail_throw(&engine->env, &diagnostic, identity);
 }
 
+static void rf_restore(void *raw) {
+  rf_catch *frame = raw;
+  frame->engine->rf_top = frame->prev;
+  frame->entered = false;
+}
+static void rf_enter(preprocessor_engine *engine, rf_catch *frame) {
+  frame->engine = engine;
+  frame->prev = engine->rf_top;
+  frame->mark = qa_unwind_mark_take();
+  frame->entered = true;
+  engine->rf_top = frame;
+  qa_cleanup_push(&frame->restore, rf_restore, frame);
+}
+static void rf_leave(rf_catch *frame) {
+  if (!frame->entered) return; /* the signal landed here: already unwound */
+  qa_cleanup_pop(&frame->restore);
+  rf_restore(frame);
+}
+
 _Noreturn static void throw_read_false(preprocessor_engine *engine) {
   if (engine->rf_top == NULL)
     qa_ui_script_plain_error("source read failed outside a token operation");
-  longjmp(engine->rf_top->buf, 1);
+  rf_catch *target = engine->rf_top;
+  qa_unwind_to(target->mark);
+  longjmp(target->buf, 1);
 }
 
 /* TS `try { body } catch (error) { cleanup(); throw error; }` over the two
    source-failure channels (ScriptLanguageError and the read-false signal):
    runs body(engine, ctx); on either failure runs cleanup(ctx) and rethrows
    the same failure. */
+typedef struct guarded_raise {
+  preprocessor_engine *engine;
+  void (*cleanup)(preprocessor_engine *engine, void *ctx);
+  void *ctx;
+} guarded_raise;
+static void guarded_raise_cleanup(void *raw) {
+  guarded_raise *raised = raw;
+  raised->cleanup(raised->engine, raised->ctx);
+}
+static void precomp_token_cleanup(void *raw) {
+  qa_ui_precomp_token_destroy((qa_ui_precomp_token *)raw);
+}
+static void release_token_cleanup(void *raw) {
+  qa_ui_script_token_release((qa_ui_script_token *)raw);
+}
+
 static void guarded(preprocessor_engine *engine,
                     void (*body)(preprocessor_engine *engine, void *ctx),
                     void (*cleanup)(preprocessor_engine *engine, void *ctx),
@@ -431,15 +475,20 @@ static void guarded(preprocessor_engine *engine,
   qa_ui_script_catch catch_block;
   rf_catch rf;
   volatile int failure = 0;
-  catch_block.prev = engine->env.top;
-  engine->env.top = &catch_block;
-  rf.prev = engine->rf_top;
-  engine->rf_top = &rf;
+  /* A general raise (a RangeError inside the body) runs the cleanup as well:
+     the TS catch sees every error class. The node sits under both frames, so
+     a source failure landing here leaves it for the code below. */
+  guarded_raise raised = {engine, cleanup, ctx};
+  qa_cleanup raise_node;
+  qa_cleanup_push(&raise_node, guarded_raise_cleanup, &raised);
+  qa_ui_script_catch_enter(&engine->env, &catch_block);
+  rf_enter(engine, &rf);
   if (setjmp(catch_block.buf) != 0) failure = 1;
   else if (setjmp(rf.buf) != 0) failure = 2;
   else body(engine, ctx);
-  engine->env.top = catch_block.prev;
-  engine->rf_top = rf.prev;
+  rf_leave(&rf);
+  qa_ui_script_catch_leave(&catch_block);
+  qa_cleanup_pop(&raise_node);
   if (failure == 0) return;
   cleanup(engine, ctx);
   if (failure == 2) throw_read_false(engine);
@@ -789,8 +838,7 @@ static bool read_source_token(preprocessor_engine *engine,
     qa_ui_script_token *volatile token = NULL;
     volatile bool failed = false;
     qa_ui_script_catch catch_block;
-    catch_block.prev = engine->env.top;
-    engine->env.top = &catch_block;
+    qa_ui_script_catch_enter(&engine->env, &catch_block);
     if (setjmp(catch_block.buf) == 0) {
       qa_ui_script_token_record record;
       if (qa_ui_script_lexer_next_into(
@@ -808,9 +856,8 @@ static bool read_source_token(preprocessor_engine *engine,
         if (!ok || !qa_ui_precomp_token_set_unsupported(output, NULL))
           oom_fail();
       }
-      engine->env.top = catch_block.prev;
+      qa_ui_script_catch_leave(&catch_block);
     } else {
-      engine->env.top = catch_block.prev;
       failed = true; /* pending stays for the rethrow below */
     }
     if (token != NULL) {
@@ -882,6 +929,7 @@ static bool cursor_next(preprocessor_engine *engine,
 /* TS readLineToken over the engine cursor. */
 static bool read_line_token(preprocessor_engine *engine,
                             qa_ui_script_token **out) {
+  *out = NULL; /* callers tell "no token" (TS undefined) from a wrong one */
   bool may_cross = false;
   for (;;) {
     qa_ui_script_token *token;
@@ -1412,7 +1460,6 @@ static void free_macro_arguments(preprocessor_engine *engine, void *ctx) {
   macro_arguments_read *read = ctx;
   for (int32_t i = 0; i < read->numparms; i++)
     qa_ui_precomp_memory_free_tokens(engine->heap, read->arguments[i]);
-  free(read->macro_name);
 }
 
 static void read_macro_arguments(preprocessor_engine *engine,
@@ -1420,11 +1467,13 @@ static void read_macro_arguments(preprocessor_engine *engine,
                                  int64_t *arguments) {
   char *macro_name = qa_ui_precomp_define_name(macro);
   if (macro_name == NULL) oom_fail();
+  /* The name goes with whatever ends the read: a failed source, a raise. */
+  qa_cleanup name_node;
+  qa_cleanup_push(&name_node, free, macro_name);
   char message[1200];
   qa_ui_script_token *opening;
   if (!cursor_next(engine, &opening)) {
     snprintf(message, sizeof message, "define %s missing parms", macro_name);
-    free(macro_name);
     engine_fail(engine, message);
   }
   int32_t numparms = qa_ui_precomp_define_numparms(macro);
@@ -1432,7 +1481,6 @@ static void read_macro_arguments(preprocessor_engine *engine,
     snprintf(message, sizeof message,
              "define with more than %d parameters", MAX_DEFINE_PARAMETERS);
     qa_ui_script_token_release(opening);
-    free(macro_name);
     engine_fail(engine, message);
   }
   for (int32_t i = 0; i < numparms; i++) arguments[i] = 0;
@@ -1440,12 +1488,12 @@ static void read_macro_arguments(preprocessor_engine *engine,
     unread_token(engine, opening);
     qa_ui_script_token_release(opening);
     snprintf(message, sizeof message, "define %s missing parms", macro_name);
-    free(macro_name);
     engine_fail(engine, message);
   }
   qa_ui_script_token_release(opening);
   macro_arguments_read read = {macro, arguments, macro_name, numparms};
   guarded(engine, read_macro_arguments_body, free_macro_arguments, &read);
+  qa_cleanup_pop(&name_node);
   free(macro_name);
 }
 
@@ -1573,6 +1621,7 @@ typedef struct expand_state {
   int64_t *arguments;
   int32_t numparms;
   token_chain expanded;
+  const qa_ui_script_token *invocation; /* TS `location`: the macro name's */
 } expand_state;
 static void expand_define_body(preprocessor_engine *engine, void *ctx);
 /* The catch of expandDefine: the argument chains and the partial expansion
@@ -1585,7 +1634,8 @@ static void free_expansion(preprocessor_engine *engine, void *ctx) {
 }
 
 static token_chain expand_define(preprocessor_engine *engine,
-                                 qa_ui_precomp_define *macro) {
+                                 qa_ui_precomp_define *macro,
+                                 const qa_ui_script_token *invocation) {
   int32_t numparms = qa_ui_precomp_define_numparms(macro);
   int64_t arguments[MAX_DEFINE_PARAMETERS];
   if (numparms != 0) read_macro_arguments(engine, macro, arguments);
@@ -1603,6 +1653,7 @@ static token_chain expand_define(preprocessor_engine *engine,
   state.arguments = arguments;
   state.numparms = numparms;
   state.expanded = (token_chain){0, 0, 0};
+  state.invocation = invocation;
   guarded(engine, expand_define_body, free_expansion, &state);
   return state.expanded;
 }
@@ -1696,14 +1747,13 @@ static void expand_define_body(preprocessor_engine *engine, void *ctx) {
         qa_cleanup_pop(&text_node);
       }
       free(collect.text);
-      const char *path;
-      int64_t line, column;
-      qa_ui_script_lexer_current_location(current_frame(engine)->lexer,
-                                          &path, &line, &column);
-      (void)line;
+      /* TS: { path: location.path, column: location.column }, the place of
+         the macro name that is being expanded. */
       qa_ui_source_token_context context;
       memset(&context, 0, sizeof context);
-      if (!qa_ui_source_token_context_set(&context, path, column, "", 0))
+      if (!qa_ui_source_token_context_set(
+              &context, state->invocation->location.path,
+              state->invocation->location.column, "", 0))
         oom_fail();
       bool ok = qa_ui_precomp_token_set_context(stringized, &context);
       qa_ui_source_token_context_destroy(&context);
@@ -1875,7 +1925,7 @@ static bool expand_macro_into_source(preprocessor_engine *engine,
   }
   token_chain expanded = qa_ui_precomp_define_builtin(macro) != 0
                              ? expand_builtin(engine, macro, invocation)
-                             : expand_define(engine, macro);
+                             : expand_define(engine, macro, invocation);
   if (expanded.first == 0 || expanded.last == 0) return false;
   qa_ui_source_token_set_next(
       qa_ui_precomp_token_memory(
@@ -2005,7 +2055,11 @@ static void evaluate_expression_body(preprocessor_engine *engine, void *ctx) {
           qa_ui_script_token_release(token);
           engine_fail(engine, message);
         }
-        if (!expand_macro_into_source(engine, token)) {
+        qa_cleanup token_node;
+        qa_cleanup_push(&token_node, release_token_cleanup, token);
+        bool expanded = expand_macro_into_source(engine, token);
+        qa_cleanup_pop(&token_node);
+        if (!expanded) {
           qa_ui_script_token_release(token);
           throw_read_false(engine);
         }
@@ -2156,6 +2210,7 @@ static void undefine_one(preprocessor_engine *engine,
     snprintf(message, sizeof message, "expected name, found %s",
              name->text);
     unread_token(engine, name);
+    qa_ui_script_token_release(name); /* the caller's reference: this does not return */
     engine_fail(engine, message);
   }
   qa_ui_precomp_define *macro =
@@ -2288,7 +2343,10 @@ static void define_directive(preprocessor_engine *engine) {
     qa_ui_precomp_token *check_output = qa_ui_precomp_token_local();
     if (check_output == NULL) oom_fail();
     qa_ui_script_token *checked;
+    qa_cleanup check_node; /* the read can fail the source */
+    qa_cleanup_push(&check_node, precomp_token_cleanup, check_output);
     bool has_checked = read_token(engine, check_output, &checked);
+    qa_cleanup_pop(&check_node);
     qa_ui_precomp_token_destroy(check_output);
     if (!has_checked || !token_text_is(checked, ")")) {
       if (has_checked) {
@@ -2354,8 +2412,9 @@ static void define_directive(preprocessor_engine *engine) {
                      && strcmp(copied_text, macro_name) == 0;
     free(macro_name);
     if (recursive) {
+      /* TS leaves the copy it made in the heap: unlinked and never freed, so
+         it stays among the live tokens (and in a save). */
       engine_error(engine, "recursive define (removed recursion)");
-      qa_ui_precomp_memory_free_token(engine->heap, copied);
     } else {
       qa_ui_precomp_token_clear_whitespace(copied);
       if (last == NULL)
@@ -2399,29 +2458,60 @@ static char *collapse_slashes(const char *text) {
   return result;
 }
 
+/* The temporaries of one #include, freed if a step raises (a source
+   failure, a resolver or validate callback, a report callback). A resolved
+   storage not yet taken by its frame is disposed when the async validate
+   raises (TS nextRecordAsync disposes it) and otherwise dropped. */
+typedef struct include_temps {
+  qa_ui_script_token *first;
+  char *include_path;
+  char *pieces;
+  char *requested;
+  char *included_path;
+  qa_ui_source_script_storage *storage;
+  bool dispose_storage;
+} include_temps;
+static void include_temps_free(void *raw) {
+  include_temps *temps = raw;
+  qa_ui_script_token_release(temps->first);
+  free(temps->include_path);
+  free(temps->pieces);
+  free(temps->requested);
+  free(temps->included_path);
+  if (temps->storage != NULL) {
+    if (temps->dispose_storage) qa_ui_source_script_destroy(temps->storage);
+    else qa_ui_source_script_discard(temps->storage);
+  }
+  memset(temps, 0, sizeof *temps);
+}
+
 static void include_directive(preprocessor_engine *engine,
                               const char *source_path) {
-  qa_ui_script_token *first;
-  if (!cursor_next(engine, &first) || first->lines_crossed > 0) {
-    if (first != NULL) qa_ui_script_token_release(first);
+  include_temps temps;
+  memset(&temps, 0, sizeof temps);
+  qa_cleanup temps_node;
+  qa_cleanup_push(&temps_node, include_temps_free, &temps);
+  qa_ui_script_token *first = NULL;
+  bool have_first = cursor_next(engine, &first);
+  temps.first = first;
+  if (!have_first || first->lines_crossed > 0)
     engine_fail(engine, "#include without file name");
-  }
   qa_ui_script_include_request request;
   memset(&request, 0, sizeof request);
   request.from_path = source_path;
-  char *requested = NULL;
-  char *include_path = qa_ui_source_record_include_path(engine->source);
-  if (include_path == NULL) oom_fail();
   if (first->kind == QA_UI_SCRIPT_KIND_STRING) {
+    temps.include_path = qa_ui_source_record_include_path(engine->source);
+    if (temps.include_path == NULL) oom_fail();
     request.kind = QA_UI_SCRIPT_INCLUDE_QUOTED;
-    requested = copy_cstring(first->value);
-    request.requested_path = requested;
-    request.include_path = include_path[0] != '\0' ? include_path : NULL;
+    temps.requested = copy_cstring(first->value);
+    if (temps.requested == NULL) oom_fail();
+    request.requested_path = temps.requested;
+    request.include_path =
+        temps.include_path[0] != '\0' ? temps.include_path : NULL;
   } else if (is_punctuation(first, QA_UI_SCRIPT_PUNCT_LESS)) {
-    collect_text pieces = {NULL, 0, 0};
-    pieces.text = copy_cstring("");
-    if (pieces.text == NULL) oom_fail();
-    pieces.cap = 1;
+    size_t length = 0, cap = 1;
+    temps.pieces = copy_cstring("");
+    if (temps.pieces == NULL) oom_fail();
     bool closed = false;
     for (;;) {
       qa_ui_script_token *token;
@@ -2436,40 +2526,40 @@ static void include_directive(preprocessor_engine *engine,
         qa_ui_script_token_release(token);
         break;
       }
-      size_t need = pieces.length + token->text_length + 1;
-      if (need > pieces.cap) {
-        char *grown = realloc(pieces.text, need * 2);
-        if (grown == NULL) oom_fail();
-        pieces.text = grown;
-        pieces.cap = need * 2;
+      size_t need = length + token->text_length + 1;
+      if (need > cap) {
+        char *grown = realloc(temps.pieces, need * 2);
+        if (grown == NULL) {
+          qa_ui_script_token_release(token);
+          oom_fail();
+        }
+        temps.pieces = grown;
+        cap = need * 2;
       }
-      memcpy(pieces.text + pieces.length, token->text, token->text_length);
-      pieces.length += token->text_length;
-      pieces.text[pieces.length] = '\0';
+      memcpy(temps.pieces + length, token->text, token->text_length);
+      length += token->text_length;
+      temps.pieces[length] = '\0';
       qa_ui_script_token_release(token);
     }
     if (!closed) engine_warn(engine, "#include missing trailing >");
-    requested = malloc(strlen(include_path) + pieces.length + 1);
-    if (requested == NULL) oom_fail();
-    strcpy(requested, include_path);
-    strcat(requested, pieces.text);
-    free(pieces.text);
-    if (requested[0] == '\0')
+    /* TS reads this.source.includePath after the pieces. */
+    temps.include_path = qa_ui_source_record_include_path(engine->source);
+    if (temps.include_path == NULL) oom_fail();
+    temps.requested = malloc(strlen(temps.include_path) + length + 1);
+    if (temps.requested == NULL) oom_fail();
+    strcpy(temps.requested, temps.include_path);
+    strcat(temps.requested, temps.pieces);
+    if (temps.requested[0] == '\0')
       engine_fail(engine, "#include without file name between < >");
     request.kind = QA_UI_SCRIPT_INCLUDE_SYSTEM;
-    request.requested_path = requested;
+    request.requested_path = temps.requested;
   } else {
-    qa_ui_script_token_release(first);
-    free(include_path);
     engine_fail(engine, "#include without file name");
   }
-  qa_ui_script_token_release(first);
   if ((int64_t)engine->live_frames >= engine->limit.include_depth) {
     char message[160];
     snprintf(message, sizeof message, "include depth exceeds %lld",
              (long long)engine->limit.include_depth);
-    free(requested);
-    free(include_path);
     engine_fail(engine, message);
   }
   qa_ui_script_source included;
@@ -2477,42 +2567,48 @@ static void include_directive(preprocessor_engine *engine,
   bool resolved = engine->resolve != NULL
                   && engine->resolve(engine->resolve_ctx, &request,
                                      &included);
+  if (resolved) {
+    temps.storage = included.storage;
+    temps.dispose_storage = true;
+  }
   if (engine->async_validate != NULL)
     engine->async_validate(engine->async_validate_ctx);
+  temps.dispose_storage = false;
   if (!resolved) {
-    char *converted = collapse_slashes(requested);
+    char *converted = collapse_slashes(temps.requested);
     if (converted == NULL) oom_fail();
     char *failed = NULL;
     if (request.kind == QA_UI_SCRIPT_INCLUDE_QUOTED) {
-      failed = malloc(strlen(include_path) + strlen(converted) + 1);
-      if (failed == NULL) oom_fail();
-      strcpy(failed, include_path);
-      strcat(failed, converted);
+      /* TS this.source.includePath, read again here. */
+      char *again = qa_ui_source_record_include_path(engine->source);
+      failed = again == NULL
+                   ? NULL
+                   : malloc(strlen(again) + strlen(converted) + 1);
+      if (failed != NULL) {
+        strcpy(failed, again);
+        strcat(failed, converted);
+      }
+      free(again);
     } else {
       failed = copy_cstring(converted);
-      if (failed == NULL) oom_fail();
     }
     free(converted);
+    if (failed == NULL) oom_fail();
     char message[1300];
     snprintf(message, sizeof message, "file %s not found", failed);
     free(failed);
-    free(requested);
-    free(include_path);
     engine_fail(engine, message);
   }
   /* out->path is borrowed only for the resolve call and may alias
    * `requested` (client resolvers pass request->requested_path back);
    * copy it before freeing that buffer. */
-  char *included_path = copy_cstring(included.path);
-  if (included_path == NULL) oom_fail();
-  included.path = included_path;
-  free(requested);
-  free(include_path);
-  if (included.path[0] == '\0') {
-    free(included_path);
+  temps.included_path = copy_cstring(included.path);
+  if (temps.included_path == NULL) oom_fail();
+  included.path = temps.included_path;
+  if (included.path[0] == '\0')
     engine_fail(engine, "include resolver returned an empty canonical path");
-  }
   source_frame *included_frame = create_frame(engine, &included);
+  temps.storage = NULL; /* the frame's lexer owns it now */
   int64_t remaining = (int64_t)engine->live_frames + 1;
   for (int64_t id = qa_ui_source_record_script(engine->source); id != 0;) {
     if (--remaining == 0)
@@ -2540,15 +2636,17 @@ static void include_directive(preprocessor_engine *engine,
       engine->live_frames--;
       qa_ui_script_lexer_destroy(included_frame->lexer);
       free(included_frame);
-      free(included_path);
+      qa_cleanup_pop(&temps_node);
+      include_temps_free(&temps);
       return;
     }
     id = next_frame_id(frame);
   }
-  free(included_path);
   set_next_frame(included_frame, qa_ui_source_record_script(engine->source));
   qa_ui_source_record_set_script(engine->source,
                                  (uint32_t)included_frame->id);
+  qa_cleanup_pop(&temps_node);
+  include_temps_free(&temps);
 }
 
 static void directive(preprocessor_engine *engine) {
@@ -2608,7 +2706,10 @@ static void directive(preprocessor_engine *engine) {
       (void)column;
       char *path_copy = copy_cstring(path);
       if (path_copy == NULL) oom_fail();
+      qa_cleanup path_node;
+      qa_cleanup_push(&path_node, free, path_copy);
       include_directive(engine, path_copy);
+      qa_cleanup_pop(&path_node);
       free(path_copy);
     }
     return;
@@ -2686,11 +2787,9 @@ static bool read_token(preprocessor_engine *engine,
       if (local == NULL) oom_fail();
       qa_ui_script_token *volatile next = NULL;
       rf_catch rf;
-      rf.prev = engine->rf_top;
-      engine->rf_top = &rf;
+      rf_enter(engine, &rf);
       qa_ui_script_catch catch_block;
-      catch_block.prev = engine->env.top;
-      engine->env.top = &catch_block;
+      qa_ui_script_catch_enter(&engine->env, &catch_block);
       volatile bool caught = false;
       if (setjmp(rf.buf) == 0) {
         if (setjmp(catch_block.buf) == 0) {
@@ -2702,8 +2801,8 @@ static bool read_token(preprocessor_engine *engine,
       } else {
         caught = true;
       }
-      engine->rf_top = rf.prev;
-      engine->env.top = catch_block.prev;
+      qa_ui_script_catch_leave(&catch_block);
+      rf_leave(&rf);
       if (caught) {
         qa_ui_script_fail_env_clear_pending(&engine->env);
         next = NULL;
@@ -2752,7 +2851,10 @@ static bool read_token(preprocessor_engine *engine,
     }
     if (token->kind == QA_UI_SCRIPT_KIND_NAME
         && macro_has(engine, token->value, token->value_length)) {
+      qa_cleanup token_node;
+      qa_cleanup_push(&token_node, release_token_cleanup, token);
       bool expanded = expand_macro_into_source(engine, token);
+      qa_cleanup_pop(&token_node);
       qa_ui_script_token_release(token);
       if (!expanded) return false;
       continue;
@@ -2828,6 +2930,8 @@ static preprocessor_engine *engine_alloc(
 }
 
 static void engine_destroy(preprocessor_engine *engine);
+static void engine_destroy_cleanup(void *raw) { engine_destroy(raw); }
+static void engine_discard_cleanup(void *raw);
 
 static preprocessor_engine *engine_create(
     const qa_ui_script_source *root, qa_ui_script_resolve_fn resolve,
@@ -2838,6 +2942,10 @@ static preprocessor_engine *engine_create(
   preprocessor_engine *engine =
       engine_alloc(resolve, resolve_ctx, options, lifetime, heap);
   if (engine == NULL) return NULL;
+  /* A throw while the source is being set up (an invalid initial define)
+     leaves the TS object to the collector. */
+  qa_cleanup engine_node;
+  qa_cleanup_push(&engine_node, engine_destroy_cleanup, engine);
   engine->memory = options != NULL ? options->memory : NULL;
   engine->has_memory = engine->memory != NULL;
   if (root->storage != NULL) {
@@ -2849,12 +2957,14 @@ static preprocessor_engine *engine_create(
         qa_ui_precomp_memory_create(engine->has_memory ? engine->memory
                                                        : NULL);
     if (engine->heap == NULL) {
+      qa_cleanup_pop(&engine_node);
       engine_destroy(engine);
       return NULL;
     }
     engine->owns_heap = true;
   }
   if (engine->cursor_token == NULL || engine->output == NULL) {
+    qa_cleanup_pop(&engine_node);
     engine_destroy(engine);
     return NULL;
   }
@@ -2866,6 +2976,7 @@ static preprocessor_engine *engine_create(
       lifetime == 1 ? QA_UI_SOURCE_LIFETIME_STACK
                     : QA_UI_SOURCE_LIFETIME_HEAP);
   if (engine->source == NULL) {
+    qa_cleanup_pop(&engine_node);
     engine_destroy(engine);
     return NULL;
   }
@@ -2884,6 +2995,7 @@ static preprocessor_engine *engine_create(
   if (options != NULL)
     install_initial_defines(engine, options->initial_defines,
                             options->initial_define_count);
+  qa_cleanup_pop(&engine_node);
   return engine;
 }
 
@@ -2938,6 +3050,16 @@ static void engine_destroy(preprocessor_engine *engine) {
   free(engine);
 }
 
+typedef struct output_adoption {
+  preprocessor_engine *engine;
+  qa_ui_precomp_token *output;
+} output_adoption;
+static void output_adoption_cleanup(void *raw) {
+  output_adoption *adoption = raw;
+  qa_ui_precomp_token_destroy(adoption->engine->output);
+  adoption->engine->output = adoption->output;
+}
+
 /* TS tokenOperation: one public token with output bookkeeping. */
 static bool token_operation(preprocessor_engine *engine,
                             qa_ui_script_token **out) {
@@ -2947,12 +3069,15 @@ static bool token_operation(preprocessor_engine *engine,
   qa_ui_precomp_token *volatile held_output = output;
   qa_ui_script_token *volatile token = NULL;
   volatile bool read_false = false;
+  /* TS sets this.output before reading, so the engine has it however the
+     read ends; a general raise (a RangeError) hands it over here. */
+  output_adoption adoption = {engine, output};
+  qa_cleanup adoption_node;
+  qa_cleanup_push(&adoption_node, output_adoption_cleanup, &adoption);
   rf_catch rf;
-  rf.prev = engine->rf_top;
-  engine->rf_top = &rf;
+  rf_enter(engine, &rf);
   qa_ui_script_catch catch_block;
-  catch_block.prev = engine->env.top;
-  engine->env.top = &catch_block;
+  qa_ui_script_catch_enter(&engine->env, &catch_block);
   volatile bool failed = false;
   if (setjmp(rf.buf) == 0) {
     if (setjmp(catch_block.buf) == 0) {
@@ -2964,8 +3089,9 @@ static bool token_operation(preprocessor_engine *engine,
   } else {
     read_false = true;
   }
-  engine->rf_top = rf.prev;
-  engine->env.top = catch_block.prev;
+  qa_ui_script_catch_leave(&catch_block);
+  rf_leave(&rf);
+  qa_cleanup_pop(&adoption_node);
   qa_ui_precomp_token_destroy(engine->output);
   engine->output = (qa_ui_precomp_token *)held_output;
   if (read_false) return false;
@@ -3028,14 +3154,12 @@ static bool read_expected(preprocessor_engine *engine,
                           qa_ui_script_token_record *out) {
   memset(out, 0, sizeof *out);
   qa_ui_script_catch catch_block;
-  catch_block.prev = engine->env.top;
-  engine->env.top = &catch_block;
+  qa_ui_script_catch_enter(&engine->env, &catch_block);
   volatile bool result = false;
   if (setjmp(catch_block.buf) == 0) {
     result = engine_next_record(engine, out);
-    engine->env.top = catch_block.prev;
+    qa_ui_script_catch_leave(&catch_block);
   } else {
-    engine->env.top = catch_block.prev;
     qa_ui_script_fail_env_clear_pending(&engine->env);
     result = false;
   }
@@ -3059,14 +3183,15 @@ static qa_ui_precomp_define *define_from_string(
   preprocessor_engine *engine =
       engine_create(&root, NULL, NULL, &options, 1, heap);
   if (engine == NULL) oom_fail();
+  /* Any other error class leaves TS's catch with the engine undisposed. */
+  qa_cleanup engine_node;
+  qa_cleanup_push(&engine_node, engine_discard_cleanup, engine);
   /* parseGlobal: defineDirective then macros.first(). */
   volatile bool caught = false;
   rf_catch rf;
-  rf.prev = engine->rf_top;
-  engine->rf_top = &rf;
+  rf_enter(engine, &rf);
   qa_ui_script_catch catch_block;
-  catch_block.prev = engine->env.top;
-  engine->env.top = &catch_block;
+  qa_ui_script_catch_enter(&engine->env, &catch_block);
   if (setjmp(rf.buf) == 0) {
     if (setjmp(catch_block.buf) == 0) {
       define_directive(engine);
@@ -3076,14 +3201,15 @@ static qa_ui_precomp_define *define_from_string(
   } else {
     caught = true;
   }
-  engine->rf_top = rf.prev;
-  engine->env.top = catch_block.prev;
+  qa_ui_script_catch_leave(&catch_block);
+  rf_leave(&rf);
   qa_ui_precomp_define *define = NULL;
   if (caught) {
     qa_ui_script_fail_env_clear_pending(&engine->env);
   } else {
     define = macro_first(engine);
   }
+  qa_cleanup_pop(&engine_node);
   engine_dispose(engine);
   engine_destroy(engine);
   return define;
@@ -3221,6 +3347,30 @@ static int64_t rfld_int_min(const qa_save_reader *reader, const char *name,
   return value;
 }
 
+/* An engine dropped by a failed restore: C handles are freed, allocations of
+   a memory owner stay with it (TS drops the objects; nothing is disposed). */
+static void engine_discard(preprocessor_engine *engine) {
+  if (engine == NULL) return;
+  for (size_t i = 0; i < engine->frame_count; i++) {
+    if (engine->frames[i] != NULL) {
+      qa_ui_script_lexer_discard(engine->frames[i]->lexer);
+      free(engine->frames[i]);
+    }
+  }
+  free(engine->frames);
+  qa_ui_source_record_discard(engine->source);
+  if (engine->owns_heap) qa_ui_precomp_memory_discard(engine->heap);
+  qa_ui_precomp_token_destroy(engine->cursor_token);
+  qa_ui_precomp_token_destroy(engine->output);
+  for (size_t i = 0; i < engine->reported_count; i++)
+    qa_ui_script_diagnostic_destroy(&engine->reported[i]);
+  free(engine->reported);
+  free(engine->macro_entries);
+  qa_ui_script_fail_env_destroy(&engine->env);
+  free(engine);
+}
+static void engine_discard_cleanup(void *raw) { engine_discard(raw); }
+
 static preprocessor_engine *engine_restore(
     const qa_save_value *value, qa_ui_script_resolve_fn resolve,
     void *resolve_ctx, const qa_ui_script_preprocessor_options *options,
@@ -3243,6 +3393,9 @@ static preprocessor_engine *engine_restore(
     qa_save_reader_destroy(&reader);
     return NULL;
   }
+  /* A malformed save raises anywhere below. */
+  qa_cleanup engine_node;
+  qa_cleanup_push(&engine_node, engine_discard_cleanup, engine);
   engine->memory = options != NULL ? options->memory : NULL;
   engine->has_memory = engine->memory != NULL;
   engine->heap =
@@ -3333,21 +3486,23 @@ static preprocessor_engine *engine_restore(
         goto oom_field;
       }
       source_frame *frame = calloc(1, sizeof *frame);
-      if (frame == NULL) {
-        qa_ui_script_lexer_destroy(lexer);
+      if (frame == NULL || !grow_frames(engine, (size_t)id)) {
+        free(frame);
+        qa_ui_script_lexer_discard(lexer);
         qa_save_reader_destroy(&cell);
         goto oom_field;
       }
       frame->id = id;
       frame->lexer = lexer;
-      frame->diagnostic_next = rfld_int_min(&cell, "diagnosticNext", 0);
-      frame->token_count = rfld_int_min(&cell, "tokenCount", 0);
-      qa_save_reader_destroy(&cell);
-      if (!grow_frames(engine, (size_t)id)) goto oom_field;
+      /* Registered first, so a malformed count below frees it with the
+         engine. */
       engine->frames[id - 1] = frame;
       if ((size_t)id > engine->frame_count)
         engine->frame_count = (size_t)id;
       engine->live_frames++;
+      frame->diagnostic_next = rfld_int_min(&cell, "diagnosticNext", 0);
+      frame->token_count = rfld_int_min(&cell, "tokenCount", 0);
+      qa_save_reader_destroy(&cell);
     }
   }
   qa_save_reader_destroy(&field);
@@ -3376,13 +3531,15 @@ static preprocessor_engine *engine_restore(
     }
   }
   qa_save_reader_destroy(&field);
+  qa_cleanup_pop(&engine_node);
   qa_save_reader_destroy(&reader);
   return engine;
 oom_field:
   qa_save_reader_destroy(&field);
 oom:
+  qa_cleanup_pop(&engine_node);
   qa_save_reader_destroy(&reader);
-  engine_destroy(engine);
+  engine_discard(engine);
   return NULL;
 }
 
@@ -3452,6 +3609,13 @@ bool qa_ui_script_source_reader_next(qa_ui_script_source_reader *reader,
   return engine_next_record(reader->engine, out);
 }
 
+static void async_read_finished(void *raw) {
+  preprocessor_engine *engine = raw;
+  engine->reading_async = false;
+  engine->async_validate = NULL;
+  engine->async_validate_ctx = NULL;
+}
+
 bool qa_ui_script_source_reader_next_async(
     qa_ui_script_source_reader *reader, qa_ui_script_validate_fn validate,
     void *validate_ctx, qa_ui_script_token_record *out) {
@@ -3464,10 +3628,12 @@ bool qa_ui_script_source_reader_next_async(
   engine->async_validate = validate;
   engine->async_validate_ctx = validate_ctx;
   qa_ui_script_token *token;
+  /* TS finally: the read is no longer pending however it ends. */
+  qa_cleanup async_node;
+  qa_cleanup_push(&async_node, async_read_finished, engine);
   bool found = token_operation(engine, &token);
-  engine->reading_async = false;
-  engine->async_validate = NULL;
-  engine->async_validate_ctx = NULL;
+  qa_cleanup_pop(&async_node);
+  async_read_finished(engine);
   if (!found) return false;
   qa_ui_script_token_release(token);
   engine_current_record(engine, out);
@@ -3570,22 +3736,27 @@ bool qa_ui_script_source_reader_expect_token_string(
     qa_ui_script_source_reader *reader, const char *text) {
   preprocessor_engine *engine = reader->engine;
   qa_ui_script_token_record record;
-  char message[1300];
+  /* The expected text is the caller's and has no length limit. */
+  size_t capacity = strlen(text) + QA_UI_SOURCE_TOKEN_STRING_BYTES + 64;
+  char *message = malloc(capacity);
+  if (message == NULL) oom_fail();
+  qa_cleanup message_node;
+  qa_cleanup_push(&message_node, free, message);
+  bool matches = false;
   if (!read_expected(engine, &record)) {
-    snprintf(message, sizeof message, "couldn't find expected %s", text);
+    snprintf(message, capacity, "couldn't find expected %s", text);
     engine_error(engine, message);
-    return false;
+  } else {
+    matches = token_text_is(record.token, text);
+    if (!matches)
+      snprintf(message, capacity, "expected %s, found %s", text,
+               record.token->text);
+    qa_ui_script_token_record_release(&record);
+    if (!matches) engine_error(engine, message);
   }
-  bool matches = token_text_is(record.token, text);
-  if (!matches)
-    snprintf(message, sizeof message, "expected %s, found %s", text,
-             record.token->text);
-  qa_ui_script_token_record_release(&record);
-  if (!matches) {
-    engine_error(engine, message);
-    return false;
-  }
-  return true;
+  qa_cleanup_pop(&message_node);
+  free(message);
+  return matches;
 }
 
 bool qa_ui_script_source_reader_expect_any_token(
@@ -3687,8 +3858,7 @@ bool qa_ui_script_source_reader_read_line_into(
   qa_ui_precomp_token *current = qa_ui_precomp_token_local();
   if (current == NULL) oom_fail();
   qa_ui_script_catch catch_block;
-  catch_block.prev = engine->env.top;
-  engine->env.top = &catch_block;
+  qa_ui_script_catch_enter(&engine->env, &catch_block);
   volatile bool failed = false;
   qa_ui_script_token *volatile result = NULL;
   if (setjmp(catch_block.buf) == 0) {
@@ -3710,9 +3880,8 @@ bool qa_ui_script_source_reader_read_line_into(
       result = token;
       break;
     }
-    engine->env.top = catch_block.prev;
+    qa_ui_script_catch_leave(&catch_block);
   } else {
-    engine->env.top = catch_block.prev;
     qa_ui_script_fail_env_clear_pending(&engine->env);
     failed = true;
   }
@@ -3738,14 +3907,12 @@ bool qa_ui_script_source_reader_catch(qa_ui_script_source_reader *reader,
                                       void *run_ctx) {
   preprocessor_engine *engine = reader->engine;
   qa_ui_script_catch catch_block;
-  catch_block.prev = engine->env.top;
-  engine->env.top = &catch_block;
+  qa_ui_script_catch_enter(&engine->env, &catch_block);
   if (setjmp(catch_block.buf) == 0) {
     run(run_ctx);
-    engine->env.top = catch_block.prev;
+    qa_ui_script_catch_leave(&catch_block);
     return true;
   }
-  engine->env.top = catch_block.prev;
   /* The longjmp skipped nextRecordAsync's finally. */
   engine->reading_async = false;
   engine->async_validate = NULL;
@@ -3973,6 +4140,17 @@ oom:
   return NULL;
 }
 
+typedef struct read_diagnostics {
+  qa_ui_script_diagnostic *list;
+  size_t count;
+} read_diagnostics;
+static void read_diagnostics_free(void *raw) {
+  read_diagnostics *read = raw;
+  for (size_t i = 0; i < read->count; i++)
+    qa_ui_script_diagnostic_destroy(&read->list[i]);
+  free(read->list);
+}
+
 void qa_ui_script_global_defines_restore_save_state(
     qa_ui_script_global_defines *globals, const qa_save_value *value,
     const qa_ui_script_memory_restore *restore) {
@@ -3983,30 +4161,32 @@ void qa_ui_script_global_defines_restore_save_state(
                                           restore);
   qa_save_reader_destroy(&field);
   globals->first = rfld_int_min(&reader, "first", 0);
-  for (size_t i = 0; i < globals->reported_count; i++)
-    qa_ui_script_diagnostic_destroy(&globals->reported[i]);
-  globals->reported_count = 0;
   if (!rfld(&reader, "reported", &field)) oom_fail();
+  /* TS splice(0, length, ...list(read)): every entry is read before the
+     list is replaced, so a malformed one leaves it as it was. */
   size_t count = qa_save_reader_list_count(&field);
+  read_diagnostics read = {calloc(count == 0 ? 1 : count, sizeof *read.list),
+                           0};
+  if (read.list == NULL) oom_fail();
+  qa_cleanup read_node;
+  qa_cleanup_push(&read_node, read_diagnostics_free, &read);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader cell;
     if (!qa_save_reader_item(&field, i, &cell)) oom_fail();
-    qa_ui_script_diagnostic diagnostic;
-    if (!qa_ui_script_read_diagnostic(&cell, &diagnostic)) oom_fail();
-    if (globals->reported_count == globals->reported_cap) {
-      size_t cap =
-          globals->reported_cap == 0 ? 8 : globals->reported_cap * 2;
-      qa_ui_script_diagnostic *grown =
-          realloc(globals->reported, cap * sizeof *grown);
-      if (grown == NULL) oom_fail();
-      globals->reported = grown;
-      globals->reported_cap = cap;
-    }
-    globals->reported[globals->reported_count++] = diagnostic;
+    if (!qa_ui_script_read_diagnostic(&cell, &read.list[read.count]))
+      oom_fail();
+    read.count++;
     qa_save_reader_destroy(&cell);
   }
+  qa_cleanup_pop(&read_node);
   qa_save_reader_destroy(&field);
   qa_save_reader_destroy(&reader);
+  for (size_t i = 0; i < globals->reported_count; i++)
+    qa_ui_script_diagnostic_destroy(&globals->reported[i]);
+  free(globals->reported);
+  globals->reported = read.list;
+  globals->reported_count = read.count;
+  globals->reported_cap = count == 0 ? 1 : count;
 }
 
 typedef struct owned_capture {
@@ -4020,8 +4200,11 @@ typedef struct owned_capture {
 static int64_t owned_reference(void *ctx,
                                qa_ui_script_allocation *allocation) {
   owned_capture *capture = ctx;
+  /* TS keys the allocation object; a C handle is a copy, so the block it
+     names is the identity. */
   for (size_t i = 0; i < capture->count; i++)
-    if (capture->allocations[i] == allocation) return (int64_t)i;
+    if (capture->allocations[i]->bytes == allocation->bytes)
+      return (int64_t)i;
   if (capture->count == capture->cap) {
     size_t cap = capture->cap == 0 ? 8 : capture->cap * 2;
     capture->allocations =
@@ -4088,6 +4271,17 @@ static qa_ui_script_allocation owned_allocation(void *ctx, int64_t id) {
   owned_restore *restore = ctx;
   if (id < 0 || id >= (int64_t)restore->count)
     qa_ui_script_plain_error("Invalid global define allocation");
+  if (restore->created[id] && restore->globals->memory == NULL) {
+    /* TS hands the same object to every reference of an id; here each
+       restored token frees its block, so a repeated id (only a crafted save
+       has one) gets its own copy instead of a block freed twice. */
+    qa_ui_script_allocation copy;
+    if (!qa_ui_script_memory_allocate(NULL, restore->lengths[id], false,
+                                      &copy))
+      oom_fail();
+    memcpy(copy.bytes, restore->bytes[id], restore->lengths[id]);
+    return copy;
+  }
   if (!restore->created[id]) {
     qa_ui_script_allocation allocation;
     if (!qa_ui_script_memory_allocate(restore->globals->memory,
@@ -4101,6 +4295,14 @@ static qa_ui_script_allocation owned_allocation(void *ctx, int64_t id) {
   return restore->allocations[id];
 }
 
+static void owned_restore_free(void *raw) {
+  owned_restore *restore = raw;
+  free(restore->bytes);
+  free(restore->lengths);
+  free(restore->allocations);
+  free(restore->created);
+}
+
 void qa_ui_script_global_defines_restore_owned_save_state(
     qa_ui_script_global_defines *globals, const qa_save_value *value) {
   if (globals->first != 0)
@@ -4112,6 +4314,8 @@ void qa_ui_script_global_defines_restore_owned_save_state(
   size_t count = qa_save_reader_list_count(&field);
   owned_restore restore;
   memset(&restore, 0, sizeof restore);
+  qa_cleanup restore_node; /* a malformed save raises below */
+  qa_cleanup_push(&restore_node, owned_restore_free, &restore);
   restore.globals = globals;
   restore.count = count;
   restore.bytes = calloc(count == 0 ? 1 : count, sizeof *restore.bytes);
@@ -4134,10 +4338,8 @@ void qa_ui_script_global_defines_restore_owned_save_state(
   qa_ui_script_global_defines_restore_save_state(globals, field.value, &api);
   qa_save_reader_destroy(&field);
   qa_save_reader_destroy(&reader);
-  free(restore.bytes);
-  free(restore.lengths);
-  free(restore.allocations);
-  free(restore.created);
+  qa_cleanup_pop(&restore_node);
+  owned_restore_free(&restore);
 }
 
 /* ---- ScriptPreprocessor (eager) ---- */
@@ -4152,6 +4354,16 @@ struct qa_ui_script_preprocessor {
   preprocessor_engine *engine;
 };
 
+typedef struct preprocessor_creation {
+  qa_ui_script_preprocessor *pre;
+  preprocessor_engine *engine;
+} preprocessor_creation;
+static void preprocessor_creation_cleanup(void *raw) {
+  preprocessor_creation *creation = raw;
+  qa_ui_script_preprocessor_destroy(creation->pre); /* its engine is not set yet */
+  engine_destroy(creation->engine);
+}
+
 qa_ui_script_preprocessor *qa_ui_script_preprocessor_create(
     const qa_ui_script_source *root, qa_ui_script_resolve_fn resolve,
     void *resolve_ctx, const qa_ui_script_preprocessor_options *options) {
@@ -4164,6 +4376,11 @@ qa_ui_script_preprocessor *qa_ui_script_preprocessor_create(
     engine_destroy(engine);
     return NULL;
   }
+  /* TS create throws what the first failing read throws; the tokens read so
+     far and the engine go to the collector. */
+  preprocessor_creation creation = {pre, engine};
+  qa_cleanup create_node;
+  qa_cleanup_push(&create_node, preprocessor_creation_cleanup, &creation);
   size_t cap = 0;
   for (;;) {
     qa_ui_script_token *token;
@@ -4174,6 +4391,7 @@ qa_ui_script_preprocessor *qa_ui_script_preprocessor_create(
           realloc(pre->tokens, cap * sizeof *grown);
       if (grown == NULL) {
         qa_ui_script_token_release(token);
+        qa_cleanup_pop(&create_node);
         qa_ui_script_preprocessor_destroy(pre);
         engine_destroy(engine);
         return NULL;
@@ -4187,18 +4405,21 @@ qa_ui_script_preprocessor *qa_ui_script_preprocessor_create(
     pre->reported =
         calloc(pre->reported_count, sizeof *pre->reported);
     if (pre->reported == NULL) {
-      qa_ui_script_preprocessor_destroy(pre);
+      qa_cleanup_pop(&create_node);
+        qa_ui_script_preprocessor_destroy(pre);
       engine_destroy(engine);
       return NULL;
     }
     for (size_t i = 0; i < pre->reported_count; i++) {
       if (!copy_diagnostic(&engine->reported[i], &pre->reported[i])) {
+        qa_cleanup_pop(&create_node);
         qa_ui_script_preprocessor_destroy(pre);
         engine_destroy(engine);
         return NULL;
       }
     }
   }
+  qa_cleanup_pop(&create_node);
   pre->engine = engine;
   return pre;
 }

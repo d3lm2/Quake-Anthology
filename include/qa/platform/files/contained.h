@@ -9,6 +9,7 @@
 #define QA_PLATFORM_FILES_CONTAINED_H
 
 #include <stdbool.h>
+#include <stdnoreturn.h>
 #include <stddef.h>
 
 /*
@@ -30,5 +31,11 @@ void qa_contained_file_parts_free(char **parts, size_t count);
  */
 int qa_open_contained_parent(const char *root, const char *name, bool create,
                              char **out_leaf);
+
+/* Raises the Node/Bun fs Error for errno `code`: "<CODE>: <description>, <syscall> '<path>'"
+ * (strerror text for an unlisted code). */
+noreturn void qa_node_fs_error(int code, const char *syscall, const char *path);
+/* The same with an optional path (NULL: none) and destination (rename's "'<path>' -> '<dest>'"). */
+noreturn void qa_node_fs_error_paths(int code, const char *syscall, const char *path, const char *dest);
 
 #endif

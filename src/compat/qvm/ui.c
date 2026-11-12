@@ -36,7 +36,7 @@ static int32_t menu_number(const char *menu) {
 static void finish_init(qa_qvm_ui *ui) {
   const qa_execution_profile *profile = qa_qvm_module_get_profile(ui->module);
   if (profile->api.as.q3.kind != QA_Q3_API_UI)
-    qa_range_error("QvmUi execution profile has the wrong role");
+    qa_raise("Error", 0, 0, "QvmUi execution profile has the wrong role");
   ui->api = profile->api.as.q3;
 }
 
@@ -46,7 +46,7 @@ void qa_qvm_ui_init(qa_qvm_ui *ui, qa_seat_id seat, const qa_qvm_module_options 
   ui->seat = seat;
   ui->assert_current_operation = assert_current;
   ui->assert_ctx = assert_ctx;
-  if (strcmp(options->artifact->role, "ui") != 0) qa_range_error("QvmUi requires a ui artifact");
+  if (strcmp(options->artifact->role, "ui") != 0) qa_raise("Error", 0, 0, "QvmUi requires a ui artifact");
   assert_current(assert_ctx);
   qa_qvm_module_init(&ui->owned_module, options);
   ui->module = &ui->owned_module;
@@ -69,7 +69,13 @@ void qa_qvm_ui_init_module(qa_qvm_ui *ui, qa_seat_id seat, qa_qvm_module *module
 static void assert_validate(void *ctx) {
   qa_qvm_ui *ui = ctx;
   ui->assert_current_operation(ui->assert_ctx);
-  if (ui->retired) qa_range_error("UI module has been retired");
+  if (ui->retired) qa_raise("Error", 0, 0, "UI module has been retired");
+}
+
+static void create_finish_body(void *ctx) {
+  qa_qvm_ui *ui = ctx;
+  ui->assert_current_operation(ui->assert_ctx);
+  finish_init(ui);
 }
 
 void qa_qvm_ui_create(qa_qvm_ui *ui, qa_seat_id seat, const qa_qvm_module_options *options,
@@ -80,12 +86,16 @@ void qa_qvm_ui_create(qa_qvm_ui *ui, qa_seat_id seat, const qa_qvm_module_option
   ui->assert_ctx = assert_ctx;
   ui->module = &ui->owned_module;
   ui->owns_module = true;
-  if (strcmp(options->artifact->role, "ui") != 0) qa_range_error("QvmUi requires a ui artifact");
+  if (strcmp(options->artifact->role, "ui") != 0) qa_raise("Error", 0, 0, "QvmUi requires a ui artifact");
   assert_current(assert_ctx);
-  /* TS retires the module when QvmUi construction fails; C failures
-   * abort, so only the success path remains. */
   qa_qvm_module_create(&ui->owned_module, options, assert_validate, ui);
-  finish_init(ui);
+  /* TS: try { return new QvmUi(seat, module, assert) } catch (error) { module.retire(); throw error }.
+   * The constructor asserts the current operation and checks the profile's role. */
+  qa_caught_error caught;
+  if (!qa_try(create_finish_body, ui, &caught)) {
+    qa_qvm_module_retire(&ui->owned_module);
+    qa_rethrow(&caught);
+  }
 }
 
 void qa_qvm_ui_destroy(qa_qvm_ui *ui) {
@@ -95,7 +105,7 @@ void qa_qvm_ui_destroy(qa_qvm_ui *ui) {
 
 static void current(qa_qvm_ui *ui) {
   ui->assert_current_operation(ui->assert_ctx);
-  if (ui->retired) qa_range_error("UI module has been retired");
+  if (ui->retired) qa_raise("Error", 0, 0, "UI module has been retired");
 }
 
 static int32_t call(qa_qvm_ui *ui, const int32_t *words, size_t count) {
@@ -143,7 +153,7 @@ bool qa_qvm_ui_is_fullscreen(qa_qvm_ui *ui) {
 void qa_qvm_ui_set_active_menu(qa_qvm_ui *ui, const char *menu) {
   if (strcmp(qa_qvm_module_get_abi_profile(ui->module), "q3-modern") != 0 &&
       menu_number(menu) > UIMENU_BAD_CD_KEY)
-    qa_range_error("Legacy UI does not implement menu %s", menu);
+    qa_raise("Error", 0, 0, "Legacy UI does not implement menu %s", menu);
   int32_t words[] = {UI_SET_ACTIVE_MENU, menu_number(menu)};
   (void)call(ui, words, 2);
 }
@@ -164,7 +174,7 @@ void qa_qvm_ui_draw_connect_screen(qa_qvm_ui *ui, bool overlay) {
 
 bool qa_qvm_ui_has_unique_cd_key(qa_qvm_ui *ui) {
   if (strcmp(qa_qvm_module_get_abi_profile(ui->module), "q3-modern") != 0)
-    qa_range_error("Legacy UI does not export UI_HASUNIQUECDKEY");
+    qa_raise("Error", 0, 0, "Legacy UI does not export UI_HASUNIQUECDKEY");
   int32_t words[] = {UI_HASUNIQUECDKEY};
   return call(ui, words, 1) != 0;
 }

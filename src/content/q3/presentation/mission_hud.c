@@ -41,14 +41,14 @@ static void check_at(double index, double length) {
     qa_range_error("Mission HUD source index %s outside %s", QA_JS_NUMBER(index), QA_JS_NUMBER(length));
 }
 static void opened(const qa_q3_pres_mission_hud *hud) {
-  if (hud->closed) qa_range_error("Mission HUD is disposed");
+  if (hud->closed) qa_raise("Error", 0, 0, "Mission HUD is disposed");
 }
 static void registration_current(const qa_q3_pres_mission_hud *hud, double generation) {
   opened(hud);
-  if (generation != hud->generation) qa_range_error("Mission HUD media registration belongs to a retired lifecycle");
+  if (generation != hud->generation) qa_raise("Error", 0, 0, "Mission HUD media registration belongs to a retired lifecycle");
 }
 static qa_q3_base_source_player_state *snapshot_of(const qa_q3_pres_mission_hud *hud) {
-  if (!hud->state->snap) qa_range_error("Mission HUD operation requires cg.snap");
+  if (!hud->state->snap) qa_raise("Error", 0, 0, "Mission HUD operation requires cg.snap");
   return &hud->state->snap->player_state;
 }
 static void source_text(const char *value, size_t maximum) {
@@ -185,7 +185,7 @@ bool qa_q3_pres_mission_hud_init(qa_q3_pres_mission_hud *hud, qa_q3_pres_client_
     qa_q3_pres_mission_hud_host host) {
   if (state->product != QA_Q3_BASE_PRODUCT_MISSIONPACK || static_state->product != state->product ||
       media->static_state != static_state || host.icons->state != state || host.icons->media.static_state != static_state)
-    qa_range_error("Mission HUD requires one Team Arena cgame state and media owner");
+    qa_raise("Error", 0, 0, "Mission HUD requires one Team Arena cgame state and media owner");
   memset(hud, 0, sizeof *hud);
   hud->state = state;
   hud->static_state = static_state;
@@ -297,7 +297,7 @@ bool qa_q3_pres_mission_hud_menu_state(qa_q3_pres_mission_hud *hud, qa_ui_runtim
 static bool cache_shader(qa_q3_pres_mission_hud *hud, double generation, const char *path, const qa_q3_pres_scene_shader **out) {
   if (!hud->media->resources.register_shader_no_mip(hud->media->resources.ctx, path, out)) return false;
   opened(hud);
-  if (generation != hud->generation) qa_range_error("Mission HUD asset registration belongs to a retired lifecycle");
+  if (generation != hud->generation) qa_raise("Error", 0, 0, "Mission HUD asset registration belongs to a retired lifecycle");
   return true;
 }
 static bool cache_picture(qa_q3_pres_mission_hud *hud, double generation, const char *path, qa_picture_asset *out) {
@@ -407,12 +407,12 @@ static void register_font(qa_q3_pres_mission_hud *hud, const char *path, double 
 }
 static const qa_q3_registered_font *font_for(qa_q3_pres_mission_hud *hud, const qa_ui_resource_reference *reference) {
   font_entry *entry = font_slot(hud, reference->path, reference->point_size);
-  if (!entry) qa_range_error("HUD font declaration has no completed registration");
+  if (!entry) qa_raise("Error", 0, 0, "HUD font declaration has no completed registration");
   return entry->font;
 }
 static void load_current(qa_q3_pres_mission_hud *hud) {
   opened(hud);
-  if (hud->load_generation != hud->generation) qa_range_error("Mission HUD menu load belongs to a retired lifecycle");
+  if (hud->load_generation != hud->generation) qa_raise("Error", 0, 0, "Mission HUD menu load belongs to a retired lifecycle");
 }
 static bool registration_sink(void *ctx, const qa_ui_menu_registration_event *event, double *out_handle) {
   qa_q3_pres_mission_hud *hud = ctx;
@@ -462,7 +462,7 @@ static void asset_sink(void *ctx, const qa_ui_menu_asset_publication *event) {
 static double res_picture_handle(void *ctx, const qa_picture_asset *picture) {
   opened(ctx);
   if (!picture) return 0;
-  if (picture->kind != QA_PICTURE_MATERIAL) qa_range_error("Source HUD picture handle requires a registered renderer material");
+  if (picture->kind != QA_PICTURE_MATERIAL) qa_raise("Error", 0, 0, "Source HUD picture handle requires a registered renderer material");
   return picture->material.order;
 }
 static bool res_picture_for_handle(void *ctx, double handle, qa_picture_asset *out) {
@@ -749,7 +749,7 @@ static qa_ui_runtime *create_runtime(qa_q3_pres_mission_hud *hud, const qa_ui_me
 }
 char *qa_q3_pres_mission_hud_get_menu_buffer(qa_q3_pres_mission_hud *hud, const char *filename) {
   opened(hud);
-  char message[512];
+  char message[1024 + 128]; /* the file name comes from a cvar: up to 1023 bytes */
   if (!hud->host.assets.base.has(hud->host.assets.base.ctx, filename)) {
     snprintf(message, sizeof message, "^1menu file not found: %s, using default\n", filename);
     print_text(hud, message);
@@ -795,23 +795,34 @@ bool qa_q3_pres_mission_hud_load_hud_menu(qa_q3_pres_mission_hud *hud) {
   }
   return qa_q3_pres_mission_hud_load_menus(hud, requested[0] == '\0' ? "ui/hud.txt" : requested);
 }
+/* TS try/finally in loadMenus: a throw out of the load (a retired lifecycle, an oversized or malformed menu file,
+ * a failed registration) still clears `loading`, so the next load is not refused as "already active". */
+static void load_menus_unwind(void *arg) {
+  qa_q3_pres_mission_hud *hud = arg;
+  release_buffers(hud);
+  hud->load_path = NULL;
+  hud->loading = false;
+}
 bool qa_q3_pres_mission_hud_load_menus(qa_q3_pres_mission_hud *hud, const char *path) {
   opened(hud);
-  if (hud->loading) qa_range_error("Mission HUD menu registration is already active");
+  if (hud->loading) qa_raise("Error", 0, 0, "Mission HUD menu registration is already active");
   double started = hud->host.milliseconds(hud->host.ctx);
   if (!hud->host.assets.base.has(hud->host.assets.base.ctx, path))
-    qa_range_error("^3menu file not found: %s, using default\n", path);
+    qa_raise("Error", 0, 0, "^3menu file not found: %s, using default\n", path);
   hud->load_generation = hud->generation;
   hud->loading = true;
+  qa_cleanup loading_node;
+  qa_cleanup_push(&loading_node, load_menus_unwind, hud);
   uint8_t *bytes = NULL;
   size_t length = 0;
   if (!read_asset(hud, path, &bytes, &length)) {
+    qa_cleanup_pop(&loading_node);
     hud->loading = false;
     return false;
   }
   keep_buffer(hud, bytes);
   load_current(hud);
-  if (length >= MENU_ROOT_LIMIT) qa_range_error("^1menu file too large: %s is %zu, max allowed is 4096", path, length);
+  if (length >= MENU_ROOT_LIMIT) qa_raise("Error", 0, 0, "^1menu file too large: %s is %zu, max allowed is 4096", path, length);
   char *owned_path = strdup(path);
   if (!owned_path) oom();
   keep_buffer(hud, owned_path);
@@ -869,6 +880,7 @@ bool qa_q3_pres_mission_hud_load_menus(qa_q3_pres_mission_hud *hud, const char *
   char message[64];
   snprintf(message, sizeof message, "UI menu load time = %d milli seconds\n", qa_int32(hud->host.milliseconds(hud->host.ctx) - started));
   print_text(hud, message);
+  qa_cleanup_pop(&loading_node);
   release_buffers(hud);
   hud->load_path = NULL;
   hud->loading = false;
@@ -898,7 +910,7 @@ void qa_q3_pres_mission_hud_check_order_pending(qa_q3_pres_mission_hud *hud) {
   double selected = selected_index(hud);
   char text[128];
   if (selected == hud->state->num_sorted_team_players) {
-    if (!order) qa_range_error("CG_CheckOrderPending: Everyone order has no source voice command");
+    if (!order) qa_raise("Error", 0, 0, "CG_CheckOrderPending: Everyone order has no source voice command");
     snprintf(text, sizeof text, "cmd vsay_team %s\n", order->team);
     append_command(hud, text);
   } else {
@@ -994,7 +1006,7 @@ void qa_q3_pres_mission_hud_feeder_item(qa_q3_pres_mission_hud *hud, double feed
     else if (powerups & (1 << QA_Q3_PW_BLUEFLAG)) powerup = QA_Q3_PW_BLUEFLAG;
     if (powerup != QA_Q3_PW_NONE) {
       const qa_q3_base_item_definition *item = qa_q3_base_find_item_for_powerup(hud->state->product, powerup);
-      if (!item) qa_range_error("Mission HUD flag has no source item");
+      if (!item) qa_raise("Error", 0, 0, "Mission HUD flag has no source item");
       size_t list_count = 0, visual_count = 0;
       const qa_q3_base_item_definition *list = qa_q3_base_item_list(hud->state->product, &list_count);
       const qa_q3_pres_packet_item_visual *visuals = qa_q3_pres_client_weapon_media_registry_items(hud->host.weapon_registry, &visual_count);
@@ -1077,9 +1089,9 @@ void qa_q3_pres_mission_hud_set_score_selection_menu(qa_q3_pres_mission_hud *hud
 void qa_q3_pres_mission_hud_clear_scoreboard(qa_q3_pres_mission_hud *hud) { hud->scoreboard = NULL; }
 qa_ui_captured_menu *qa_q3_pres_mission_hud_menu_scoreboard(qa_q3_pres_mission_hud *hud) { return hud->scoreboard; }
 void qa_q3_pres_mission_hud_scroll_feeder(qa_q3_pres_mission_hud *hud, qa_ui_captured_menu *menu, double feeder, bool down) {
-  if (menu != hud->scoreboard) qa_range_error("Score scrolling requires the current Mission HUD scoreboard");
+  if (menu != hud->scoreboard) qa_raise("Error", 0, 0, "Score scrolling requires the current Mission HUD scoreboard");
   opened(hud);
-  if (!hud->runtime) qa_range_error("Mission HUD menus are not loaded");
+  if (!hud->runtime) qa_raise("Error", 0, 0, "Mission HUD menus are not loaded");
   qa_ui_runtime_scroll_captured_feeder(hud->runtime, menu, feeder, down);
 }
 /* cgDC.realTime/frameTime are never assigned by the original cgame module. */

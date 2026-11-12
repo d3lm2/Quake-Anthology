@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/compat/q2/native_mod_host_api.h"
+#include "qa/compat/q2/native_throw.h"
 #include "qa/content/q2/base/player/index.h"
 #include "qa/world/session/mod_client_input.h"
 #include "qa/foundation/js.h"
@@ -36,15 +37,15 @@ static bool client_is_actor(const binding *s, qa_client_id client, qa_actor_id a
 static entry_t require_entry(const binding *s, qa_actor_id actor) {
   const entry_t *entry = find_entry(s, actor); qa_client_id client;
   if (entry == NULL || !SERVICES(s)->for_actor(SERVICES(s)->ctx, actor, &client) || !qa_same_client(entry->client, client) || !client_is_actor(s, client, actor))
-    qa_range_error("Native component client identity is no longer live");
+    qa_raise("Error", 0, 0, "Native component client identity is no longer live");
   return *entry;
 }
 bool qa_compat_q2_native_mod_clients_slot(binding *s, qa_actor_id actor, double *out) {
   if (find_entry(s, actor) != NULL) { *out = require_entry(s, actor).slot; return true; }
-  if (is_denied(s, actor)) qa_range_error("Rejected native client lost its reserved source row");
+  if (is_denied(s, actor)) qa_raise("Error", 0, 0, "Rejected native client lost its reserved source row");
   qa_client_id client;
   if (!SERVICES(s)->for_actor(SERVICES(s)->ctx, actor, &client)) return false;
-  if (!client_is_actor(s, client, actor)) qa_range_error("Native component client identity is no longer live");
+  if (!client_is_actor(s, client, actor)) qa_raise("Error", 0, 0, "Native component client identity is no longer live");
   double slot = 0;
   for (;;) {
     bool occupied = false;
@@ -52,7 +53,7 @@ bool qa_compat_q2_native_mod_clients_slot(binding *s, qa_actor_id actor, double 
     if (!occupied) break;
     slot++;
   }
-  if (slot >= OPS(s)->declaration->maximum) qa_range_error("Native component source client capacity exceeded");
+  if (slot >= OPS(s)->declaration->maximum) qa_raise("Error", 0, 0, "Native component source client capacity exceeded");
   entry_t *entry = qa_compat_q2_grow((void **)&s->entries, &s->entry_count, &s->entry_capacity, sizeof *entry);
   entry->actor = actor; entry->client = client; entry->slot = slot; entry->admitted = false; entry->identity = ++s->next_identity;
   *out = slot; return true;
@@ -71,34 +72,58 @@ static void run_calls(binding *s, const qa_native_mod_source_call *calls, size_t
     double result; if (!OPS(s)->invoke(OPS(s)->ctx, &calls[i], actor, &result)) break;
   }
 }
-static bool admit(binding *s, qa_actor_id actor) {
-  if (is_denied(s, actor)) return false;
-  double slot;
-  if (!qa_compat_q2_native_mod_clients_slot(s, actor, &slot)) qa_range_error("Native component admission requires a live client");
-  entry_t entry = require_entry(s, actor);
-  OPS(s)->project(OPS(s)->ctx, actor);
-  if (entry.admitted) return true;
+typedef struct admit_call { binding *s; qa_actor_id actor; bool result; } admit_call;
+/* The TS try block of admit(). */
+static void admit_body(void *value) {
+  admit_call *c = value; binding *s = c->s; qa_actor_id actor = c->actor;
   const qa_native_mod_clients *d = OPS(s)->declaration;
   for (size_t i = 0; i < d->admit_count; i++) {
     (void)require_entry(s, actor);
     double result;
-    if (!OPS(s)->invoke(OPS(s)->ctx, &d->admit[i].call, actor, &result)) return false;
+    if (!OPS(s)->invoke(OPS(s)->ctx, &d->admit[i].call, actor, &result)) { c->result = false; return; }
     if (!strcmp(d->admit[i].accepts, "nonzero") && result == 0) {
-      char scratch[1024]; const char *reason = qa_q2_userinfo_get(qa_compat_q2_native_mod_clients_userinfo(s, actor), "rejmsg", scratch, sizeof scratch);
-      if (reason == NULL || reason[0] == '\0') reason = "Connection refused";
-      SERVICES(s)->drop(SERVICES(s)->ctx, require_entry(s, actor).client, reason, OPS(s)->content);
+      /* q2Userinfo(userinfo).get("rejmsg") || "Connection refused", with no length limit on the reason. */
+      size_t length = 0; const char *found = qa_q2_userinfo_find(qa_compat_q2_native_mod_clients_userinfo(s, actor), "rejmsg", &length);
+      char *reason = NULL;
+      if (found != NULL && length != 0) { reason = malloc(length + 1); if (reason == NULL) qa_range_error("Out of memory"); memcpy(reason, found, length); reason[length] = '\0'; }
+      qa_cleanup node; qa_cleanup_push(&node, free, reason);
+      SERVICES(s)->drop(SERVICES(s)->ctx, require_entry(s, actor).client, reason != NULL ? reason : "Connection refused", OPS(s)->content);
+      qa_cleanup_pop(&node); free(reason);
       qa_actor_id *slot_denied = qa_compat_q2_grow((void **)&s->denied, &s->denied_count, &s->denied_capacity, sizeof *slot_denied);
-      *slot_denied = actor; return false;
+      *slot_denied = actor; c->result = false; return;
     }
   }
   (void)require_entry(s, actor);
   entry_t *now = find_entry(s, actor); now->admitted = true; now->identity = ++s->next_identity;
   if (OPS(s)->admitted != NULL) OPS(s)->admitted(OPS(s)->ctx, actor);
-  return true;
+  c->result = true;
+}
+static bool admit(binding *s, qa_actor_id actor) {
+  if (is_denied(s, actor)) return false;
+  double slot;
+  if (!qa_compat_q2_native_mod_clients_slot(s, actor, &slot)) qa_raise("Error", 0, 0, "Native component admission requires a live client");
+  entry_t entry = require_entry(s, actor);
+  OPS(s)->project(OPS(s)->ctx, actor);
+  if (entry.admitted) return true;
+  /* TS catch: an admission that throws releases the client's source row and forgets it. */
+  admit_call call = {s, actor, false}; qa_compat_q2_native_thrown thrown;
+  if (!qa_compat_q2_native_try(admit_body, &call, &thrown)) {
+    OPS(s)->release(OPS(s)->ctx, actor); delete_entry(s, actor);
+    qa_compat_q2_native_rethrow(&thrown);
+  }
+  return call.result;
+}
+typedef struct disconnect_call { binding *s; qa_actor_id actor; } disconnect_call;
+static void disconnect_body(void *value) {
+  disconnect_call *c = value; binding *s = c->s;
+  if (require_entry(s, c->actor).admitted) run_calls(s, OPS(s)->declaration->disconnect, OPS(s)->declaration->disconnect_count, c->actor);
 }
 static void disconnect(binding *s, qa_actor_id actor) {
-  if (require_entry(s, actor).admitted) run_calls(s, OPS(s)->declaration->disconnect, OPS(s)->declaration->disconnect_count, actor);
+  /* TS finally: the row is released and forgotten whatever the disconnect calls did. */
+  disconnect_call call = {s, actor}; qa_compat_q2_native_thrown thrown;
+  bool completed = qa_compat_q2_native_try(disconnect_body, &call, &thrown);
   OPS(s)->release(OPS(s)->ctx, actor); delete_entry(s, actor);
+  if (!completed) qa_compat_q2_native_rethrow(&thrown);
 }
 static void on_client_event(void *ctx, qa_mod_client_event event) {
   binding *s = ctx; qa_actor_id actor = event.identity.actor;
@@ -127,8 +152,9 @@ void qa_compat_q2_native_mod_clients_start(binding *s) {
   size_t count = 0; const qa_mod_client_identity *listed = SERVICES(s)->clients(SERVICES(s)->ctx, &count);
   qa_mod_client_identity *identities = calloc(count + 1, sizeof *identities); if (identities == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < count; i++) identities[i] = listed[i];
+  qa_cleanup node; qa_cleanup_push(&node, free, identities); /* an admission can raise */
   for (size_t i = 0; i < count; i++) (void)admit(s, identities[i].actor);
-  free(identities);
+  qa_cleanup_pop(&node); free(identities);
   qa_mod_client_input_operations operations; memset(&operations, 0, sizeof operations);
   operations.ctx = s; operations.open = input_open; operations.invoke = input_invoke; operations.output = input_output;
   s->unsubscribe_input = qa_subscribe_mod_client_input(SERVICES(s), OPS(s)->declaration->input, OPS(s)->declaration->input_count, operations); s->input_subscribed = true;
@@ -150,9 +176,10 @@ void qa_compat_q2_native_mod_clients_end_frame(binding *s) {
   size_t count = s->entry_count; entry_t *sorted = calloc(count + 1, sizeof *sorted); if (sorted == NULL) qa_range_error("Out of memory");
   if (count != 0) memcpy(sorted, s->entries, count * sizeof *sorted);
   qa_js_sort(sorted, count, sizeof *sorted, by_slot);
+  qa_cleanup node; qa_cleanup_push(&node, free, sorted); /* a source call can raise */
   for (size_t i = 0; i < count; i++) if (entry_live(s, sorted[i].actor) && qa_compat_q2_native_mod_clients_admitted(s, sorted[i].actor))
     run_calls(s, OPS(s)->declaration->end_frame, OPS(s)->declaration->end_frame_count, sorted[i].actor);
-  free(sorted);
+  qa_cleanup_pop(&node); free(sorted);
 }
 const char *qa_compat_q2_native_mod_clients_userinfo(binding *s, qa_actor_id actor) { return SERVICES(s)->userinfo(SERVICES(s)->ctx, require_entry(s, actor).client); }
 void qa_compat_q2_native_mod_clients_set_userinfo(binding *s, qa_actor_id actor, const char *value) { SERVICES(s)->set_userinfo(SERVICES(s)->ctx, require_entry(s, actor).client, value); }
@@ -164,7 +191,7 @@ bool qa_compat_q2_native_mod_clients_invoke_command(binding *s, qa_command_invoc
   while (origin->kind == QA_COMMAND_ORIGIN_SCRIPT) origin = origin->caller;
   if (origin->kind != QA_COMMAND_ORIGIN_LOCAL_SEAT && origin->kind != QA_COMMAND_ORIGIN_REMOTE_CLIENT) return false;
   qa_actor_id actor;
-  if (!SERVICES(s)->actor(SERVICES(s)->ctx, origin->client, &actor)) qa_range_error("Native component command client is no longer live");
+  if (!SERVICES(s)->actor(SERVICES(s)->ctx, origin->client, &actor)) qa_raise("Error", 0, 0, "Native component command client is no longer live");
   if (!admit(s, actor)) return true;
   command_call call = {s, actor};
   OPS(s)->with_command(OPS(s)->ctx, command, command_body, &call);
@@ -172,27 +199,38 @@ bool qa_compat_q2_native_mod_clients_invoke_command(binding *s, qa_command_invoc
 }
 qa_compat_q2_native_mod_client_slot *qa_compat_q2_native_mod_clients_checkpoint(binding *s, size_t *out_count) {
   for (size_t i = s->denied_count; i > 0; i--) { qa_client_id client; if (!SERVICES(s)->for_actor(SERVICES(s)->ctx, s->denied[i - 1], &client)) delete_denied(s, s->denied[i - 1]); }
-  if (s->denied_count != 0) qa_range_error("Cannot save a native component before its rejected client disconnects");
+  if (s->denied_count != 0) qa_raise("Error", 0, 0, "Cannot save a native component before its rejected client disconnects");
   qa_compat_q2_native_mod_client_slot *rows = calloc(s->entry_count + 1, sizeof *rows); if (rows == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < s->entry_count; i++) { rows[i].actor = s->entries[i].actor; rows[i].slot = s->entries[i].slot; rows[i].admitted = s->entries[i].admitted; }
   *out_count = s->entry_count; return rows;
 }
 void qa_compat_q2_native_mod_clients_validate_restore(binding *s, const qa_compat_q2_native_mod_client_slot *entries, size_t count) {
-  for (size_t i = 0; i < count; i++) if (!entry_live(s, entries[i].actor)) qa_range_error("Saved native component client is unavailable");
+  for (size_t i = 0; i < count; i++) if (!entry_live(s, entries[i].actor)) qa_raise("Error", 0, 0, "Saved native component client is unavailable");
 }
 void qa_compat_q2_native_mod_clients_restore(binding *s, const qa_compat_q2_native_mod_client_slot *entries, size_t count) {
   qa_compat_q2_native_mod_clients_validate_restore(s, entries, count); s->entry_count = 0; s->denied_count = 0;
   for (size_t i = 0; i < count; i++) {
-    qa_client_id client; if (!SERVICES(s)->for_actor(SERVICES(s)->ctx, entries[i].actor, &client)) qa_range_error("Saved native component client is unavailable");
+    qa_client_id client; if (!SERVICES(s)->for_actor(SERVICES(s)->ctx, entries[i].actor, &client)) qa_raise("Error", 0, 0, "Saved native component client is unavailable");
     entry_t *entry = find_entry(s, entries[i].actor);
     if (entry == NULL) entry = qa_compat_q2_grow((void **)&s->entries, &s->entry_count, &s->entry_capacity, sizeof *entry);
     entry->actor = entries[i].actor; entry->client = client; entry->slot = entries[i].slot; entry->admitted = entries[i].admitted; entry->identity = ++s->next_identity;
   }
 }
 void qa_compat_q2_native_mod_clients_forget(binding *s, qa_actor_id actor) { delete_entry(s, actor); }
+static void unsubscribe_input_body(void *value) { binding *s = value; s->unsubscribe_input.invoke(s->unsubscribe_input.ctx); }
+typedef struct release_call { binding *s; qa_actor_id actor; } release_call;
+static void release_body(void *value) { release_call *c = value; OPS(c->s)->release(OPS(c->s)->ctx, c->actor); }
+/* TS close(): the client subscription ends first (its throw leaves as it is); the input subscription and every
+ * client's release then run each in its own try, and their failures leave as one AggregateError. */
 void qa_compat_q2_native_mod_clients_close(binding *s) {
-  if (s->subscribed) { s->unsubscribe.invoke(s->unsubscribe.ctx); s->subscribed = false; }
-  if (s->input_subscribed) { s->unsubscribe_input.invoke(s->unsubscribe_input.ctx); s->input_subscribed = false; }
-  while (s->entry_count > 0) { size_t last = s->entry_count; qa_actor_id actor = s->entries[0].actor; OPS(s)->release(OPS(s)->ctx, actor); if (s->entry_count == last) delete_entry(s, actor); }
+  if (s->subscribed) { s->subscribed = false; s->unsubscribe.invoke(s->unsubscribe.ctx); }
+  size_t errors = 0; qa_caught_error caught;
+  if (s->input_subscribed) { s->input_subscribed = false; if (!qa_try(unsubscribe_input_body, s, &caught)) errors++; }
+  /* [...entries.keys()]: the actors as they stand before any release. */
+  size_t count = s->entry_count; qa_actor_id *actors = calloc(count + 1, sizeof *actors); if (actors == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < count; i++) actors[i] = s->entries[i].actor;
+  for (size_t i = 0; i < count; i++) { release_call call = {s, actors[i]}; if (!qa_try(release_body, &call, &caught)) errors++; }
+  free(actors);
   s->entry_count = 0; s->denied_count = 0;
+  if (errors != 0) qa_raise("AggregateError", 0, 0, "Native component client cleanup failed");
 }

@@ -27,3 +27,26 @@ void qa_persist_decoded_free(qa_persist_decoded *owner) {
   owner->blocks = NULL;
   owner->block_count = owner->block_capacity = 0;
 }
+
+static void rollback(void *arg) {
+  qa_persist_decoded_scope *scope = arg;
+  qa_persist_decoded *owner = scope->owner;
+  for (size_t i = scope->mark; i < owner->block_count; i++) free(owner->blocks[i]);
+  owner->block_count = scope->mark;
+  if (scope->mark == 0) {
+    free(owner->blocks);
+    owner->blocks = NULL;
+    owner->block_capacity = 0;
+  }
+  if (owner->root != scope->root) {
+    qa_save_value_free(owner->root);
+    owner->root = scope->root;
+  }
+}
+void qa_persist_decoded_enter(qa_persist_decoded_scope *scope, qa_persist_decoded *owner) {
+  scope->owner = owner;
+  scope->mark = owner->block_count;
+  scope->root = owner->root;
+  qa_cleanup_push(&scope->node, rollback, scope);
+}
+void qa_persist_decoded_leave(qa_persist_decoded_scope *scope) { qa_cleanup_pop(&scope->node); }

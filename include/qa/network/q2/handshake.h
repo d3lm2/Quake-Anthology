@@ -27,6 +27,9 @@ typedef struct qa_q2_connectionless_message {
   size_t argument_count;
   char *text;
   char *body;
+  /* Read with utf8: the strings are UTF-8 and TS lengths count UTF-16 units; otherwise each byte
+   * is one Latin-1 character. */
+  bool utf8;
 } qa_q2_connectionless_message;
 
 void qa_q2_connectionless_message_free(qa_q2_connectionless_message *message);

@@ -27,6 +27,7 @@ typedef struct qa_app_sim_saved_movement_player {
   bool flight;
   qa_saved_actor_id actor; double client_slot;
   qa_movement_state state; qa_arsenal_state arsenal; qa_actor_animation_state animation;
+  bool has_jump_pad; qa_actor_id jump_pad; /* a Q3 state's jumpPad: state.as.q3.jump_pad is NULL; the caller points it at its own copy */
   qa_vec3 view_angles, command_angles; double view_height; qa_bounds bounds; qa_trace_hit ground;
   double water_level, water_type; bool intermission;
   double gravity_multiplier, world_gravity, buttons, previous_buttons, last_sequence, last_weapon_seconds;

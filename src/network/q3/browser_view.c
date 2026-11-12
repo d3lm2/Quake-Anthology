@@ -4,7 +4,9 @@
 #include "qa/core/common_error.h"
 #include "qa/core/cvars/info.h"
 #include "qa/core/numeric.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
+#include "qa/network/common/js_number.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -337,8 +339,8 @@ char *qa_q3_browser_view_get_server_info(qa_q3_browser_view *v, int64_t source, 
   const qa_server_status *status = row_status(v, row);
   sc.values[0] = row_name(v, row);
   sc.values[1] = owned_slice31_source(status ? status->map : "");
-  sc.values[2] = owned_number(status ? (int64_t)status->players : 0);
-  sc.values[3] = owned_number(status ? (int64_t)status->max_players : 0);
+  sc.values[2] = xstrdup(QA_JS_NUMBER(status ? status->players : 0)); /* String(status?.players ?? 0) */
+  sc.values[3] = xstrdup(QA_JS_NUMBER(status ? status->max_players : 0));
   sc.values[4] = owned_number(row->ping);
   sc.values[5] = owned_number(qa_native_atoi(rule_get(status, "minping")));
   sc.values[6] = owned_number(qa_native_atoi(rule_get(status, "maxping")));
@@ -389,13 +391,13 @@ int64_t qa_q3_browser_view_compare_servers(qa_q3_browser_view *v, int64_t source
     if (!ma || !mb) { free(ma); free(mb); qa_range_error("browser map allocation failed"); }
     compared = compare_text(ma, mb); free(ma); free(mb);
   } else {
-    int64_t left = 0, right = 0;
+    double left = 0, right = 0; /* TS numbers: a NaN player count compares as neither */
     if (key == 2 || key == 3) {
       const qa_server_status *sa = row_status(v, a);
-      left = key == 2 ? (sa ? (int64_t)sa->players : 0) : qa_native_atoi(rule_get(sa, "gametype"));
+      left = key == 2 ? (sa ? sa->players : 0) : qa_native_atoi(rule_get(sa, "gametype"));
       const qa_server_status *sb = row_status(v, b);
-      right = key == 2 ? (sb ? (int64_t)sb->players : 0) : qa_native_atoi(rule_get(sb, "gametype"));
-    } else if (key == 4) { left = a->ping; right = b->ping; }
+      right = key == 2 ? (sb ? sb->players : 0) : qa_native_atoi(rule_get(sb, "gametype"));
+    } else if (key == 4) { left = (double)a->ping; right = (double)b->ping; }
     compared = left < right ? -1 : left > right ? 1 : 0;
   }
   return direction == 0 || compared == 0 ? compared : -compared;
@@ -409,9 +411,12 @@ int64_t qa_q3_browser_view_add_server(qa_q3_browser_view *v, int64_t source, qa_
   qa_cleanup_push(&guard, release_address, &resolved);
   bool ok = v->options.browser.resolve_q3(v->options.browser.ctx, address(address_ctx), &resolved);
   view_entry_at(v, generation);
-  if (!ok) qa_raise("Error", 0, 0, "LAN_AddServer: address resolution failed");
-  for (int64_t i = 0; i < list->count; i++)
-    if (rows_same(&list->rows[i], &resolved)) { qa_cleanup_pop(&guard); qa_q3_mirror_address_destroy(&resolved); return 0; }
+  /* An unresolvable address is a refusal for the UI, not a fault of the VM call. */
+  int64_t refused = !ok ? -1 : 2;
+  for (int64_t i = 0; refused == 2 && i < list->count; i++)
+    if (rows_same(&list->rows[i], &resolved)) refused = 0;
+  if (refused == 2 && (size_t)list->count >= list->capacity) refused = -1;
+  if (refused != 2) { qa_cleanup_pop(&guard); qa_q3_mirror_address_destroy(&resolved); return refused; }
   row_t *row = &list->rows[list->count];
   row_set_address(row, &resolved);
   char *text = qa_source_command_text(name(name_ctx));
@@ -435,9 +440,8 @@ void qa_q3_browser_view_remove_server(qa_q3_browser_view *v, int64_t source, qa_
   qa_cleanup_push(&guard, release_address, &resolved);
   bool ok = v->options.browser.resolve_q3(v->options.browser.ctx, address(address_ctx), &resolved);
   view_entry_at(v, generation);
-  if (!ok) qa_raise("Error", 0, 0, "LAN_RemoveServer: address resolution failed");
-  int64_t index = -1;
-  for (int64_t i = 0; i < list->count; i++) if (rows_same(&list->rows[i], &resolved)) { index = i; break; }
+  int64_t index = -1; /* an unresolvable address removes nothing */
+  for (int64_t i = 0; ok && i < list->count; i++) if (rows_same(&list->rows[i], &resolved)) { index = i; break; }
   if (index < 0) { qa_cleanup_pop(&guard); qa_q3_mirror_address_destroy(&resolved); return; }
   v->options.browser.remove_q3(v->options.browser.ctx, source, &resolved);
   for (int64_t next = index; next < list->count - 1; next++) row_copy(&list->rows[next], &list->rows[next + 1]);
@@ -471,8 +475,7 @@ void qa_q3_browser_view_clear_ping(qa_q3_browser_view *v, int64_t index) {
   qa_q3_mirror_address_destroy(&slot->address); slot->has_address = false; slot->handle = 0;
 }
 static ping_slot_t *ping_slot_at(qa_q3_browser_view *v, int64_t index) {
-  if (index < 0 || index >= 32) qa_range_error("Server browser source index %lld outside %d", (long long)index, 32);
-  return &v->pings[index];
+  return index < 0 || index >= 32 ? NULL : &v->pings[index];
 }
 typedef struct ping_info_scope { qa_q3_browser_view *v; const char *text; char *info; } ping_info_scope;
 static void ping_info_body(void *ctx) {
@@ -514,8 +517,8 @@ static int64_t ping_time(qa_q3_browser_view *v, ping_slot_t *slot) {
 }
 bool qa_q3_browser_view_get_ping(qa_q3_browser_view *v, int64_t index, int64_t size, qa_q3_browser_write_nullable_fn write, void *write_ctx, char **address_out, int64_t *time_out) {
   view_entry(v);
-  ping_slot_t *slot = ping_slot_at(v, index);
-  if (!slot->has_address) {
+  ping_slot_t *slot = ping_slot_at(v, index); /* NULL: TS this.pings[index] is undefined */
+  if (!slot || !slot->has_address) {
     if (write) write(write_ctx, NULL);
     *address_out = xstrdup(""); *time_out = 0;
     return *address_out != NULL;
@@ -533,10 +536,10 @@ bool qa_q3_browser_view_get_ping(qa_q3_browser_view *v, int64_t index, int64_t s
   qa_cleanup_push(&address_guard, release_string, &address);
   int64_t measured = ping_time(v, slot);
   int64_t elapsed = (int64_t)trunc(v->options.now(v->options.ctx) - slot->start);
-  /* TS Math.max(100, maxPing()): NaN stays NaN, so the comparison fails and the elapsed time is reported. */
-  double max_ping = v->options.max_ping(v->options.ctx);
-  double threshold = isnan(max_ping) ? max_ping : max_ping > 100 ? max_ping : 100;
-  *time_out = measured != 0 ? measured : (double)elapsed < threshold ? 0 : elapsed;
+  /* TS reads maxPing() only for an unmeasured slot; Math.max(100, NaN) is NaN, so the comparison
+   * fails and the elapsed time is reported. */
+  if (measured != 0) *time_out = measured;
+  else *time_out = (double)elapsed < qa_js_max(100, v->options.max_ping(v->options.ctx)) ? 0 : elapsed;
   publish_ping(v, &slot->address, measured);
   qa_cleanup_pop(&address_guard);
   *address_out = address;
@@ -545,7 +548,7 @@ bool qa_q3_browser_view_get_ping(qa_q3_browser_view *v, int64_t index, int64_t s
 char *qa_q3_browser_view_source_ping_info(qa_q3_browser_view *v, int64_t index, int64_t size, qa_q3_browser_write_fn write, void *write_ctx) {
   view_entry(v);
   ping_slot_t *slot = ping_slot_at(v, index);
-  if (!slot->has_address) return NULL;
+  if (!slot || !slot->has_address) return NULL;
   ping_time(v, slot);
   if (write) write(write_ctx, slot->info);
   return copy_string(slot->info, size);
@@ -688,8 +691,8 @@ static char *status_text(const qa_server_status *status) {
   status_append(&b, "\\", 1);
   for (size_t i = 0; i < status->player_count; i++) {
     const qa_player_detail *player = &status->player_details[i];
-    char head[64];
-    int n = snprintf(head, sizeof head, "\\%lld %lld \"", (long long)player->score, (long long)player->ping);
+    char head[96]; /* `\\${player.score} ${player.ping} "` */
+    int n = snprintf(head, sizeof head, "\\%s %s \"", QA_JS_NUMBER(player->score), QA_JS_NUMBER(player->ping));
     status_append(&b, head, (size_t)n);
     status_append(&b, player->name, strlen(player->name));
     status_append(&b, "\"", 1);
@@ -799,8 +802,8 @@ static void print_rule(qa_q3_browser_view *v, const char *key, const char *value
 }
 /* `${String(index).padEnd(2)}   ${String(score).padEnd(3)}    ${String(ping).padEnd(3)}   "${name}"\n` */
 static void print_player(qa_q3_browser_view *v, size_t index, const qa_player_detail *player) {
-  char head[96];
-  int hn = snprintf(head, sizeof head, "%-2zu   %-3lld    %-3lld   \"", index, (long long)player->score, (long long)player->ping);
+  char head[128];
+  int hn = snprintf(head, sizeof head, "%-2zu   %-3s    %-3s   \"", index, QA_JS_NUMBER(player->score), QA_JS_NUMBER(player->ping));
   size_t nn = strlen(player->name);
   char *line = malloc((size_t)hn + nn + 3);
   if (!line) qa_range_error("browser print allocation failed");

@@ -25,8 +25,12 @@ qa_app_q3_mapped_ammo_regeneration *qa_app_q3_mapped_ammo_regeneration_create(qa
     const qa_pickup_supply_owner *legacy_owners, size_t legacy_owner_count);
 void qa_app_q3_mapped_ammo_regeneration_destroy(qa_app_q3_mapped_ammo_regeneration *regen);
 const qa_pickup_supply_profile *qa_app_q3_mapped_ammo_regeneration_profile(const qa_app_q3_mapped_ammo_regeneration *regen);
-/* TS actors.onRelease cleanup. */
+/* TS actors.onRelease cleanup; safe while a caller holds the actor's views (they stay valid,
+ * current() false, until the next timers()/capture()/restore() call or destroy). Entries of
+ * actors no longer live are also dropped by those calls, as nothing routes the release yet. */
 void qa_app_q3_mapped_ammo_regeneration_release_actor(qa_app_q3_mapped_ammo_regeneration *regen, qa_owned_actor actor);
+/* The actor's timer views: valid until the next timers()/capture()/restore() call after the
+ * actor is released or the owner closed, or destroy. */
 const qa_q3_ta_mapped_ammo_timer *qa_app_q3_mapped_ammo_regeneration_timers(qa_app_q3_mapped_ammo_regeneration *regen,
     qa_owned_actor actor, size_t *out_count);
 void qa_app_q3_mapped_ammo_regeneration_stored(qa_app_q3_mapped_ammo_regeneration *regen, qa_actor_id actor, double weapon, double value);

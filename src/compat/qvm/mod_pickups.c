@@ -25,16 +25,16 @@ void qa_qvm_validate_mod_pickups(const qa_qvm_mod_callback_declaration *declarat
     for (size_t j = 0; j < r; j++)
       if (strcmp(declaration->pickups[j].rule.id, base->id) == 0) duplicate_id = true;
     if (declaration->clients == NULL || duplicate_id || base->id[0] == '\0' || base->offered_count == 0)
-      qa_range_error("QVM pickups require unique rules and source client admission");
+      qa_raise("Error", 0, 0, "QVM pickups require unique rules and source client admission");
     for (size_t i = 0; i < base->offered_count; i++) {
       for (size_t j = 0; j < r; j++) {
         for (size_t k = 0; k < declaration->pickups[j].rule.offered_count; k++)
           if (strcmp(declaration->pickups[j].rule.offered[k], base->offered[i]) == 0)
-            qa_range_error("Ambiguous QVM original pickup item");
+            qa_raise("Error", 0, 0, "Ambiguous QVM original pickup item");
       }
       for (size_t k = 0; k < i; k++)
         if (strcmp(base->offered[k], base->offered[i]) == 0)
-          qa_range_error("Ambiguous QVM original pickup item");
+          qa_raise("Error", 0, 0, "Ambiguous QVM original pickup item");
     }
     for (size_t w = 0; w < base->writes.count; w++) {
       const qa_pickup_write *resource = &base->writes.values[w];
@@ -45,7 +45,7 @@ void qa_qvm_validate_mod_pickups(const qa_qvm_mod_callback_declaration *declarat
           qa_protection_channel value = strcmp(channel, "regular") == 0 ? QA_PROTECTION_REGULAR : QA_PROTECTION_POWERED;
           if (value == resource->channel) found = true;
         }
-        if (!found) qa_range_error("QVM pickup has no protection owner");
+        if (!found) qa_raise("Error", 0, 0, "QVM pickup has no protection owner");
       } else {
         bool fields_count = strcmp(resource->fields, "count") == 0;
         bool projected = false;
@@ -73,7 +73,7 @@ void qa_qvm_validate_mod_pickups(const qa_qvm_mod_callback_declaration *declarat
           }
         }
         if (!projected && !owned)
-          qa_range_error("QVM pickup has no declared inventory storage for its requested count/capacity writes");
+          qa_raise("Error", 0, 0, "QVM pickup has no declared inventory storage for its requested count/capacity writes");
       }
     }
     const qa_original_pickup_operation *operation = &base->operation;
@@ -82,7 +82,7 @@ void qa_qvm_validate_mod_pickups(const qa_qvm_mod_callback_declaration *declarat
     if ((!operation->is_gate_then_grant && strcmp(grant->returns, "void") == 0) ||
         (operation->is_gate_then_grant && (strcmp(gate->returns, "void") == 0 ||
             (strcmp(operation->grant_accepts, "nonzero") == 0 && strcmp(grant->returns, "void") == 0))))
-      qa_range_error("QVM pickup requires its declared source decision");
+      qa_raise("Error", 0, 0, "QVM pickup requires its declared source decision");
     for (size_t c = 0; c < rule->context_count; c++) {
       const qa_qvm_mod_pickup_context *field = &rule->context[c];
       const qa_qvm_mod_actor_record *record = NULL;
@@ -106,7 +106,7 @@ void qa_qvm_validate_mod_pickups(const qa_qvm_mod_callback_declaration *declarat
           field->offset != trunc(field->offset) || field->offset > 9007199254740991.0 ||
           field->offset < 0 ||
           (int64_t)field->offset % 4 != 0 || field->offset + 4 > record->stride)
-        qa_range_error("Invalid QVM pickup source context");
+        qa_raise("Error", 0, 0, "Invalid QVM pickup source context");
       for (size_t f = 0; f < record->field_count; f++) {
         const qa_qvm_mod_actor_field *binding = &record->fields[f];
         double width;
@@ -118,7 +118,7 @@ void qa_qvm_validate_mod_pickups(const qa_qvm_mod_callback_declaration *declarat
         else width = 4;
         if (binding->offset < field->offset + 4 && field->offset < binding->offset + width &&
             strcmp(binding->binding, "private") != 0 && strcmp(binding->binding, "constant") != 0)
-          qa_range_error("QVM pickup context overlaps shared or linked storage");
+          qa_raise("Error", 0, 0, "QVM pickup context overlaps shared or linked storage");
       }
       const qa_qvm_mod_source_actors *source = declaration->source_actors;
       if (declaration->entity_record != NULL && strcmp(record->id, declaration->entity_record) == 0 &&
@@ -132,7 +132,7 @@ void qa_qvm_validate_mod_pickups(const qa_qvm_mod_callback_declaration *declarat
               (callbacks->has_die && field->offset == callbacks->die))
             overlaps = true;
         }
-        if (overlaps) qa_range_error("QVM pickup context overlaps source actor lifetime");
+        if (overlaps) qa_raise("Error", 0, 0, "QVM pickup context overlaps source actor lifetime");
       }
     }
   }
@@ -261,7 +261,7 @@ static qa_original_pickup_decision take_rule(void *ctx, qa_original_pickup_offer
     if (strcmp(definition->rule.offered[i], offer.item) == 0) offered = true;
   if (!qa_same_actor(offer.recipient, actor) || !offered ||
       !take_current(pickups, actor, &offer, &execution))
-    qa_range_error("QVM pickup rule is no longer current");
+    qa_raise("Error", 0, 0, "QVM pickup rule is no longer current");
   qa_actor_id self_id = actor;
   qa_actor_id other_id = offer.pickup;
   qa_qvm_pickup_input inputs[7];
@@ -339,7 +339,10 @@ void qa_qvm_mod_pickups_activate(qa_qvm_mod_pickups *pickups) {
     if (clients == NULL) qa_range_error("QVM memory allocation failed");
     count = client_actors(pickups->services, clients, count);
   }
+  qa_cleanup clients_cleanup;
+  qa_cleanup_push(&clients_cleanup, free, clients);
   for (size_t i = 0; i < count; i++) qa_qvm_mod_pickups_bind_actor(pickups, clients[i]);
+  qa_cleanup_pop(&clients_cleanup);
   free(clients);
 }
 
@@ -350,7 +353,7 @@ void qa_qvm_mod_pickups_bind_actor(qa_qvm_mod_pickups *pickups, qa_actor_id acto
     return;
   qa_owned_actor owned;
   if (!qa_session_actor_registry_resolve_owned(pickups->services->actors, actor, &owned))
-    qa_range_error("QVM pickup recipient is retired");
+    qa_raise("Error", 0, 0, "QVM pickup recipient is retired");
   entry *created = actor_entry(pickups, actor);
   qa_original_pickup_rule *flat = malloc(
       (pickups->definition_count == 0 ? 1 : pickups->definition_count) * sizeof *flat);
@@ -364,7 +367,13 @@ void qa_qvm_mod_pickups_bind_actor(qa_qvm_mod_pickups *pickups, qa_actor_id acto
   }
   if (count != 0) {
     qa_inventory_pickup_binding binding = {pickups->owner, flat, count};
-    created->delegate_id = qa_shared_inventory_table_bind_pickup(pickups->services->inventory, owned, binding);
+    qa_cleanup flat_cleanup;
+    qa_cleanup_push(&flat_cleanup, free, flat);
+    int64_t delegate_id =
+        qa_shared_inventory_table_bind_pickup(pickups->services->inventory, owned, binding);
+    qa_cleanup_pop(&flat_cleanup);
+    created = actor_entry(pickups, actor); /* the bind may have admitted another recipient */
+    created->delegate_id = delegate_id;
     created->owned = owned;
     created->has_binding = true;
     created->has_delegate = true;
@@ -378,8 +387,25 @@ void qa_qvm_mod_pickups_bind_actor(qa_qvm_mod_pickups *pickups, qa_actor_id acto
 
 void qa_qvm_mod_pickups_assert_idle(const qa_qvm_mod_pickups *pickups) {
   if (pickups->depth != 0)
-    qa_range_error("Cannot save or restore during QVM original pickup execution");
+    qa_raise("Error", 0, 0, "Cannot save or restore during QVM original pickup execution");
 }
+
+typedef struct unbind_job {
+  qa_qvm_mod_pickups *pickups;
+  qa_owned_actor owned;
+  int64_t delegate_id;
+} unbind_job;
+
+static void unbind_body(void *ctx) {
+  unbind_job *job = ctx;
+  qa_shared_inventory_table_unbind_pickup(job->pickups->services->inventory, job->owned,
+                                          job->delegate_id);
+}
+
+typedef struct release_job {
+  qa_qvm_mod_pickups *pickups;
+  qa_actor_id actor;
+} release_job;
 
 void qa_qvm_mod_pickups_release(qa_qvm_mod_pickups *pickups, qa_actor_id actor) {
   entry *entries = pickups->entries;
@@ -392,16 +418,31 @@ void qa_qvm_mod_pickups_release(qa_qvm_mod_pickups *pickups, qa_actor_id actor) 
     free(entries[i].rules);
     memmove(&entries[i], &entries[i + 1], (pickups->entry_count - i - 1) * sizeof *entries);
     pickups->entry_count--;
-    if (has_binding) qa_shared_inventory_table_unbind_pickup(pickups->services->inventory, owned, delegate_id);
+    if (has_binding) {
+      /* TS collects the delegate's failure into an AggregateError. */
+      unbind_job job = {pickups, owned, delegate_id};
+      qa_caught_error failure;
+      if (!qa_try(unbind_body, &job, &failure))
+        qa_raise("AggregateError", 0, 0, "QVM pickup delegate cleanup failed");
+    }
     return;
   }
 }
 
+static void release_body(void *ctx) {
+  release_job *job = ctx;
+  qa_qvm_mod_pickups_release(job->pickups, job->actor);
+}
+
 void qa_qvm_mod_pickups_close(qa_qvm_mod_pickups *pickups) {
   pickups->active = false;
+  /* TS releases every recipient, then reports the failures together. */
+  bool failed = false;
   while (pickups->entry_count != 0) {
     entry *entries = pickups->entries;
-    qa_actor_id actor = entries[0].actor;
-    qa_qvm_mod_pickups_release(pickups, actor);
+    release_job job = {pickups, entries[0].actor};
+    qa_caught_error failure;
+    if (!qa_try(release_body, &job, &failure)) failed = true;
   }
+  if (failed) qa_raise("AggregateError", 0, 0, "QVM pickup cleanup failed");
 }

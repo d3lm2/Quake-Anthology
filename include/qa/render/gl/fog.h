@@ -1,6 +1,6 @@
 /* Port of src/render/gl/fog.ts: Q2 rerelease gl_fog.ts depth snapshot and
- * ordered global/height/sky passes. TS throws become qa_range_error aborts
- * (docs/PORTING.md). GPL-2.0-or-later. */
+ * ordered global/height/sky passes. A raise inside draw restores the saved GL
+ * state first, as the TS finally does. GPL-2.0-or-later. */
 #ifndef QA_RENDER_GL_FOG_H
 #define QA_RENDER_GL_FOG_H
 #include <stdbool.h>

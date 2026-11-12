@@ -1,5 +1,5 @@
 /*
- * Mirrors of src/compat/qc types whose C owner has not landed, for
+ * Mirrors of src/compat/qc types (copies of the compat/qc records), for
  * the src/content/q1/quakec port. Collision-proof qa_q1qc_ names;
  * TS owners:
  *  - program/definition/statement/function/opcode/program_error:

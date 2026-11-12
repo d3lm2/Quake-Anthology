@@ -362,6 +362,11 @@ static bool ph_banned(void *ctx, const char *address) {
   runtime_t *r = ctx;
   return PH(r)->banned(PH(r)->ctx, address);
 }
+/* TS { ...configuration.playerHooks }: selectEmpty (g_select_empty) is carried over. */
+static bool ph_select_empty(void *ctx) {
+  runtime_t *r = ctx;
+  return PH(r)->select_empty(PH(r)->ctx);
+}
 static void ph_score(void *ctx, qa_q2_entity *victim, qa_q2_entity *attacker, qa_q2_game_services *game, double change,
                      double means, qa_q2_entity *recipient) {
   runtime_t *r = ctx;
@@ -445,6 +450,7 @@ static qa_q2_player_hooks player_hooks(runtime_t *r) {
   hooks.noise = c->noise != NULL ? ph_noise : NULL;
   hooks.weapon_input = ph_weapon_input;
   hooks.banned = c->banned != NULL ? ph_banned : NULL;
+  hooks.select_empty = c->select_empty != NULL ? ph_select_empty : NULL;
   hooks.score = ph_score;
   hooks.player_spawned = ph_player_spawned;
   hooks.persistent_inventory_initialized =
@@ -948,15 +954,22 @@ qa_q2_entity *qa_q2_product_runtime_admit(qa_q2_product_runtime *r, qa_owned_act
     effect.count = 1;
     effect.color = 0;
     game->host->emit(game->host->ctx, effect);
-    char text[64];
-    snprintf(text, sizeof text, "%s entered the game\n", joined->name);
+    /* `${joined.name} entered the game\n`: the whole name, whatever its length. */
+    size_t text_size = strlen(joined->name) + sizeof " entered the game\n";
+    char *text = malloc(text_size);
+    if (text == NULL) qa_range_error("out of memory");
+    snprintf(text, text_size, "%s entered the game\n", joined->name);
     qa_q2_player_event print;
     memset(&print, 0, sizeof print);
     print.kind = "print";
     print.level = "high";
     print.text = text;
     qa_q2_player_hooks *hooks = qa_q2_players_hooks(r->players);
+    qa_cleanup text_node;
+    qa_cleanup_push(&text_node, free, text);
     hooks->emit(hooks->ctx, print);
+    qa_cleanup_pop(&text_node);
+    free(text);
   }
   return entity;
 }

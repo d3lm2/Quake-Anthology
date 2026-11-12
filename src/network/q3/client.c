@@ -21,7 +21,7 @@ int64_t qa_q3_wire_command_history_append(qa_q3_wire_command_history *h, const q
 }
 bool qa_q3_wire_command_history_read(const qa_q3_wire_command_history *h, int64_t number, qa_q3_wire_user_command *out) {
   if (number > h->number) qa_common_error(QA_COMMON_ERROR_DROP, "CL_GetUserCmd: requested future command");
-  if (number <= (int32_t)(h->number - 64)) return false;
+  if (number <= (int32_t)((uint32_t)h->number - 64u)) return false; /* (number - 64) | 0 */
   *out = h->commands[((int32_t)number) & 63];
   return true;
 }
@@ -385,6 +385,7 @@ void qa_q3_client_packet_result_destroy(qa_q3_client_packet_result *r) {
   qa_q3_server_message_destroy(&r->message);
   free(r->plaintext); r->plaintext = NULL;
 }
+static void packet_result_cleanup(void *result) { qa_q3_client_packet_result_destroy(result); }
 bool qa_q3_client_connection_receive_datagram(qa_q3_client_connection *c, const uint8_t *packet, size_t len, double real_time, qa_q3_client_packet_result *out) {
   memset(out, 0, sizeof *out);
   c->bindings.assert_current(c->bindings.ctx);
@@ -401,7 +402,13 @@ bool qa_q3_client_connection_receive_datagram(qa_q3_client_connection *c, const 
   if (!qa_q3_xor_server_message(out->channel.payload, out->channel.payload_len, c->mode.challenge, out->channel.sequence,
         qa_q3_reliable_ring_lookup_masked(c->reliable, ack), &out->plaintext)) return false;
   out->plaintext_len = out->channel.payload_len;
-  return qa_q3_client_connection_receive_message(c, out->channel.sequence, out->plaintext, out->plaintext_len, real_time, &out->message);
+  /* A malformed server message raises out of receiveMessage; the result is the caller's only
+   * when this returns, so its payload and plaintext are released on that path. */
+  qa_cleanup result_guard;
+  qa_cleanup_push(&result_guard, packet_result_cleanup, out);
+  bool ok = qa_q3_client_connection_receive_message(c, out->channel.sequence, out->plaintext, out->plaintext_len, real_time, &out->message);
+  qa_cleanup_pop(&result_guard);
+  return ok;
 }
 typedef struct { qa_q3_client_connection *c; } demo_seq_t;
 static void demo_seq(void *ctx, int64_t sequence) { ((demo_seq_t *)ctx)->c->server_message_sequence = sequence; }
@@ -446,6 +453,12 @@ bool qa_q3_client_connection_get_server_command(qa_q3_client_connection *c, int6
   bindings.ctx = c;
   return qa_q3_server_command_executor_execute(c->executor, server_command_text(c, sequence), c->game_state, &bindings, argv_out, argc_out);
 }
+typedef struct { qa_q3_message_writer *writer; uint8_t *finished, *bytes; } transmit_scratch;
+static void transmit_scratch_release(void *arg) {
+  transmit_scratch *scratch = arg;
+  qa_q3_message_writer_destroy(scratch->writer); free(scratch->finished); free(scratch->bytes);
+  scratch->writer = NULL; scratch->finished = NULL; scratch->bytes = NULL;
+}
 void qa_q3_client_connection_transmit(qa_q3_client_connection *c, const qa_q3_client_send_options *options, const qa_q3_channel_delivery *delivery) {
   c->bindings.assert_current(c->bindings.ctx);
   if (!c->channel || c->mode.kind != QA_Q3_CLIENT_MODE_NETWORK) qa_raise("Error", 0, 0, "Demo connection cannot send packets");
@@ -471,8 +484,17 @@ void qa_q3_client_connection_transmit(qa_q3_client_connection *c, const qa_q3_cl
   if (!pending) qa_range_error("client transmit allocation failed");
   size_t pending_count = qa_q3_reliable_ring_pending(c->reliable, pending, pending_cap);
   qa_q3_message_writer *writer = NULL;
-  if (!qa_q3_begin_client_message(&header, pending, pending_count, &c->source_state, &writer)) { free(pending); qa_range_error("client transmit allocation failed"); }
+  /* beginClientMessage raises on a negative acknowledgement taken from a hostile gamestate. */
+  qa_cleanup pending_guard;
+  qa_cleanup_push(&pending_guard, free, pending);
+  bool begun = qa_q3_begin_client_message(&header, pending, pending_count, &c->source_state, &writer);
+  qa_cleanup_pop(&pending_guard);
   free(pending);
+  if (!begun) qa_range_error("client transmit allocation failed");
+  /* The key callback, MAX_MSGLEN and the owner's send raise from here on. */
+  transmit_scratch scratch = { writer, NULL, NULL };
+  qa_cleanup scratch_guard;
+  qa_cleanup_push(&scratch_guard, transmit_scratch_release, &scratch);
   if (count != 0) {
     qa_q3_wire_snapshot latest;
     bool has_latest = qa_q3_snapshot_history_latest(c->history, &latest);
@@ -488,14 +510,15 @@ void qa_q3_client_connection_transmit(qa_q3_client_connection *c, const qa_q3_cl
   slot->server_time = count ? movement.commands[count - 1].server_time : 0;
   slot->real_time = options->real_time;
   c->last_packet_sent_time = options->real_time;
-  uint8_t *finished = NULL; size_t finished_len = 0;
-  if (!qa_q3_finish_client_message(writer, &finished, &finished_len)) { qa_q3_message_writer_destroy(writer); qa_range_error("client transmit allocation failed"); }
-  qa_q3_message_writer_destroy(writer);
-  uint8_t *bytes = NULL;
-  if (!qa_q3_xor_client_message(finished, finished_len, c->mode.challenge, server_command_cb, c, &bytes)) { free(finished); qa_range_error("client transmit allocation failed"); }
-  free(finished);
-  qa_q3_netchannel_begin_transmit(c->channel, bytes, finished_len, delivery);
-  free(bytes);
+  size_t finished_len = 0;
+  if (!qa_q3_finish_client_message(writer, &scratch.finished, &finished_len)) qa_range_error("client transmit allocation failed");
+  qa_q3_message_writer_destroy(writer); scratch.writer = NULL;
+  if (!qa_q3_xor_client_message(scratch.finished, finished_len, c->mode.challenge, server_command_cb, c, &scratch.bytes))
+    qa_range_error("client transmit allocation failed");
+  free(scratch.finished); scratch.finished = NULL;
+  qa_q3_netchannel_begin_transmit(c->channel, scratch.bytes, finished_len, delivery);
+  qa_cleanup_pop(&scratch_guard);
+  transmit_scratch_release(&scratch);
   while (qa_q3_netchannel_has_unsent_fragments(c->channel)) qa_q3_netchannel_transmit_next_fragment(c->channel, delivery);
 }
 bool qa_q3_client_connection_ready_to_send(const qa_q3_client_connection *c, const qa_q3_client_send_readiness *options) {

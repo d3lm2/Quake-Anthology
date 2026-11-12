@@ -165,6 +165,8 @@ typedef struct step_frame {
   event_list before_frame;           /* TS beforeFrameEvents */
   bool pending_consumed;             /* TS pendingBeforeFrameEvents = [] after the first progress */
   event_list progressed_events, progressed_round_events;
+  /* C: the frame's own event lists live here so a raise releases them (step_frame_release). */
+  event_list frame_events, final_rounds, round_events;
   double displayed_milliseconds;
   size_t progressed_event_count;
   double frame_milliseconds;
@@ -317,7 +319,7 @@ static void bind_arsenal_selections(qa_application *app) {
       const qa_weapon_reference *weapons[2] = { slot.active, slot.pending };
       for (size_t w = 0; w < 2; w++)
         if (weapons[w] != NULL && strcmp(weapons[w]->provider, arsenal.provider) != 0) supplemental = true;
-      free((void *)slot.ui.items);
+      /* slot.ui.items belong to the simulation's projection ring (freed when the ring slot is reused). */
     }
     bool selected_source = has_arsenal && (qa_app_shared_sim_q3_guest(app->world_simulation) != NULL
         || strcmp(arsenal.provider, qa_app_shared_sim_recipe(app->world_simulation)->map.entities.provider) != 0);
@@ -451,14 +453,19 @@ static void step_body(void *ctx) {
   }
   qa_application_dispatch_client_inputs(app);
   bool q1 = qa_app_shared_sim_q1_source(app->world_simulation) != NULL || qa_app_shared_sim_quakec_source(app->world_simulation) != NULL;
-  event_list before_frame = { NULL, 0, 0 };
-  if (q1) before_frame = drain_events(app);
+  if (q1) f->before_frame = drain_events(app);
   {
-    const qa_app_sim_presentation_event **pointers = event_pointers(&before_frame);
-    qa_application_append_q1_commands(app, pointers, before_frame.count);
+    const qa_app_sim_presentation_event **pointers = event_pointers(&f->before_frame);
+    qa_cleanup cleanup;
+    qa_cleanup_push(&cleanup, free, (void *)pointers);
+    qa_application_append_q1_commands(app, pointers, f->before_frame.count);
+    qa_cleanup_pop(&cleanup);
     free(pointers);
   }
-  if (app->dedicated_commands != NULL && app->dedicated_console != NULL) (void)qa_dedicated_console_drain(app->dedicated_console, app->dedicated_commands);
+  if (app->dedicated_commands != NULL && app->dedicated_console != NULL) {
+    qa_dedicated_console_pump_stdin(app->dedicated_console); /* the process.stdin events since the last frame */
+    (void)qa_dedicated_console_drain(app->dedicated_console, app->dedicated_commands);
+  }
   if (app->source_commands != NULL)
     (void)qa_command_buffer_execute_async(app->source_commands, after_dispatch, app, source_commands_continue, app);
   if (app->dedicated_commands != NULL && app->dedicated_commands != app->source_commands)
@@ -624,7 +631,6 @@ static void step_body(void *ctx) {
       break;
     }
   }
-  f->before_frame = before_frame;
   f->pending_consumed = false;
   f->displayed_milliseconds = app->elapsed - frame_milliseconds;
   f->frame_milliseconds = frame_milliseconds;
@@ -650,17 +656,21 @@ static void step_body(void *ctx) {
   if (!paused) qa_application_publish_local_guest_snapshots(app);
   if (app->guest_browser != NULL) { qa_app_startup_server_browser_poll(app->guest_browser->host); qa_q3_browser_view_poll(app->guest_browser->view); }
   app->frames++;
-  event_list frame_events = drain_events(app);
+  f->frame_events = drain_events(app);
+  event_list *frame_events = &f->frame_events;
   if (q1) {
-    const qa_app_sim_presentation_event **pointers = event_pointers(&frame_events);
-    qa_application_append_q1_commands(app, pointers, frame_events.count);
+    const qa_app_sim_presentation_event **pointers = event_pointers(frame_events);
+    qa_cleanup cleanup;
+    qa_cleanup_push(&cleanup, free, (void *)pointers);
+    qa_application_append_q1_commands(app, pointers, frame_events->count);
+    qa_cleanup_pop(&cleanup);
     free(pointers);
   }
   {
     event_list source = { NULL, 0, 0 };
     event_list_append(&source, f->before_frame.items, f->before_frame.count);
     event_list_append(&source, f->progressed_events.items, f->progressed_events.count);
-    event_list_append(&source, frame_events.items, frame_events.count);
+    event_list_append(&source, frame_events->items, frame_events->count);
     set_source_events(app, &source);
   }
   if (!paused && app->bots != NULL) app->bots->receive(app->bots->ctx, app->source_events, app->source_event_count);
@@ -690,29 +700,36 @@ static void step_body(void *ctx) {
     qa_transition_decision decision = qa_shared_transition_coordinator_resolve(app->transitions, mode, intents, intent_count, &id);
     qa_shared_transition_coordinator_commit(app->transitions, id, decision);
   }
-  event_list final_rounds = take_round_events(app);
-  event_list round_events = { NULL, 0, 0 };
-  event_list_append(&round_events, f->progressed_round_events.items, f->progressed_round_events.count);
-  event_list_append(&round_events, final_rounds.items, final_rounds.count);
+  f->final_rounds = take_round_events(app);
+  event_list *final_rounds = &f->final_rounds, *round_events = &f->round_events;
+  event_list_append(round_events, f->progressed_round_events.items, f->progressed_round_events.count);
+  event_list_append(round_events, final_rounds->items, final_rounds->count);
   qa_simulation_output final_presentation = output;
   if (f->progressed_event_count != 0) {
     final_presentation.events = output.event_count > f->progressed_event_count ? output.events + f->progressed_event_count : NULL;
     final_presentation.event_count = output.event_count > f->progressed_event_count ? output.event_count - f->progressed_event_count : 0;
   }
   {
-    event_list incoming = { NULL, 0, 0 };
-    if (!f->pending_consumed) event_list_append(&incoming, f->before_frame.items, f->before_frame.count);
-    event_list_append(&incoming, frame_events.items, frame_events.count);
-    const qa_app_sim_presentation_event **incoming_pointers = event_pointers(&incoming);
-    const qa_app_sim_presentation_event **round_pointers = event_pointers(&final_rounds);
-    qa_application_present_frame present = { incoming_pointers, incoming.count, round_pointers, final_rounds.count,
+    /* incoming is a borrowed view: the frame lists own the events. */
+    size_t incoming_count = (f->pending_consumed ? 0 : f->before_frame.count) + frame_events->count;
+    const qa_app_sim_presentation_event **incoming_pointers = checked(calloc(incoming_count + 1, sizeof *incoming_pointers));
+    size_t at = 0;
+    for (size_t i = 0; !f->pending_consumed && i < f->before_frame.count; i++) incoming_pointers[at++] = &f->before_frame.items[i];
+    for (size_t i = 0; i < frame_events->count; i++) incoming_pointers[at++] = &frame_events->items[i];
+    qa_cleanup incoming_cleanup;
+    qa_cleanup_push(&incoming_cleanup, free, (void *)incoming_pointers);
+    const qa_app_sim_presentation_event **round_pointers = event_pointers(final_rounds);
+    qa_cleanup round_cleanup;
+    qa_cleanup_push(&round_cleanup, free, (void *)round_pointers);
+    qa_application_present_frame present = { incoming_pointers, incoming_count, round_pointers, final_rounds->count,
       local_commands, local_count, qa_js_max(0, app->elapsed - f->displayed_milliseconds), f->frame_started_at, app->elapsed };
     qa_application_present_output(app, final_presentation, &present);
+    qa_cleanup_pop(&round_cleanup);
+    qa_cleanup_pop(&incoming_cleanup);
     free(incoming_pointers); free(round_pointers);
-    event_list_free(&incoming);
   }
-  event_list_free(&final_rounds);
-  event_list_free(&frame_events);
+  event_list_free(final_rounds);
+  event_list_free(frame_events);
   if (app->capture != NULL) qa_app_capture_drain(app->capture);
   if (app->tools != NULL) qa_omni_timer_stamp(qa_app_application_tools_timer(app->tools), "frame end");
   if (capture_transition_pending) {
@@ -745,11 +762,11 @@ static void step_body(void *ctx) {
   }
   {
     event_list combined = { NULL, 0, 0 };
-    event_list_append(&combined, round_events.items, round_events.count);
+    event_list_append(&combined, round_events->items, round_events->count);
     event_list_append(&combined, app->source_events, app->source_event_count);
     set_source_events(app, &combined);
   }
-  event_list_free(&round_events);
+  event_list_free(round_events);
   qa_application_rank_local_match(app);
   if (completed_lobby_simulation != NULL && app->lobby_completion != completed_lobby_simulation && app->host.lobby != NULL) {
     app->host.lobby->complete(app->host.lobby->ctx);
@@ -763,6 +780,9 @@ static void step_body(void *ctx) {
 }
 
 static void step_frame_release(step_frame *f) {
+  event_list_free(&f->frame_events);
+  event_list_free(&f->final_rounds);
+  event_list_free(&f->round_events);
   event_list_free(&f->before_frame);
   event_list_free(&f->progressed_events);
   event_list_free(&f->progressed_round_events);

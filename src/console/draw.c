@@ -127,6 +127,9 @@ static cp_text decode_text(const char *text) {
   return out;
 }
 
+/* The edit field's text is UTF-8 (console/field.h): [...field.text]. */
+static cp_text field_characters(const char *text) { return decode_text(text); }
+
 typedef struct draw_state {
   const qa_console_draw_options *options;
   qa_rect clip;
@@ -207,9 +210,8 @@ void qa_draw_console(const qa_console_draw_options *options) {
   const qa_console_draw_target *draw = options->draw;
   const qa_console_text_presentation *text = options->text;
   double scale = options->scale;
-  qa_rect bounds = {0, 0, draw->width,
-                    options->height < draw->height ? options->height
-                                                     : draw->height};
+  /* Math.min keeps a NaN height (a NaN console fraction). */
+  qa_rect bounds = {0, 0, draw->width, qa_js_min(options->height, draw->height)};
   if (!qa_same_seat(draw->seat, text->seat)) {
     qa_error("Console text belongs to another viewport seat");
   }
@@ -245,26 +247,22 @@ void qa_draw_console(const qa_console_draw_options *options) {
     }
   }
 
-  double height_limit =
-      options->height < draw->height ? options->height : draw->height;
-  double bottom = height_limit - 2 * scale;
-  if (bottom < 0) bottom = 0;
-  int64_t total_rows = (int64_t)floor(bottom / state.line_height);
-  if (total_rows < 0) total_rows = 0;
-  if (total_rows < field_lines) {
+  /* JS numbers throughout: a NaN height leaves totalRows NaN, so no help line is kept
+     (slice(0, NaN)), every row is drawn (rows.slice(length - NaN) is the whole list) and y is
+     NaN; no C cast of NaN. */
+  double height_limit = qa_js_min(options->height, draw->height);
+  double bottom = qa_js_max(0, height_limit - 2 * scale);
+  double total_rows = qa_js_max(0, floor(bottom / state.line_height));
+  if (total_rows < (double)field_lines) {
     for (size_t i = 0; i < help_count; i++) free(help[i]);
     return;
   }
-  int64_t spare = total_rows - field_lines;
-  size_t help_lines = help_count;
-  if (help_lines > 3) help_lines = 3;
-  if (help_lines > (size_t)spare) help_lines = (size_t)spare;
-  int64_t room = spare - (int64_t)help_lines;
-  size_t row_count = options->row_count;
-  if (row_count > (size_t)room) row_count = (size_t)room;
-  double y = bottom - state.line_height *
-                          (double)(row_count + (size_t)field_lines +
-                                   help_lines);
+  double help_take = qa_js_min(3, qa_js_max(0, total_rows - (double)field_lines));
+  size_t help_lines = isnan(help_take) ? 0 : help_count < (size_t)help_take ? help_count : (size_t)help_take;
+  double row_take = qa_js_min((double)options->row_count,
+                              qa_js_max(0, total_rows - (double)field_lines - (double)help_lines));
+  size_t row_count = isnan(row_take) ? options->row_count : (size_t)row_take;
+  double y = bottom - state.line_height * (row_take + (double)field_lines + (double)help_lines);
   size_t first_row = options->row_count - row_count;
   for (size_t r = first_row; r < options->row_count; r++) {
     const qa_console_row *row = &options->rows[r];
@@ -298,7 +296,7 @@ void qa_draw_console(const qa_console_draw_options *options) {
 
   const qa_console_field_view *field = options->field;
   if (field != NULL) {
-    cp_text characters = decode_text(field->text != NULL ? field->text : "");
+    cp_text characters = field_characters(field->text != NULL ? field->text : "");
     double cursor_width = measure(&state, 1);
     int64_t scroll = field->scroll < field->cursor ? field->scroll
                                                     : field->cursor;

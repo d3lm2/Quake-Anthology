@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "qa/persistence/save_image.h"
 #include "qa/persistence/shared.h"
 
@@ -242,9 +243,11 @@ static const char *callback_name(const qa_save_reader *callbacks,
   return value;
 }
 
-static qa_persist_q1_saved_entity read_entity(const qa_save_reader *reader, bool legacy) {
-  qa_persist_q1_saved_entity entity;
-  memset(&entity, 0, sizeof entity);
+/* Fills a zeroed slot in place, so a raise leaves every array it allocated reachable from the
+ * checkpoint (released by the reader's guard). */
+static void read_entity(const qa_save_reader *reader, bool legacy, qa_persist_q1_saved_entity *slot) {
+  qa_persist_q1_saved_entity *const e = slot;
+#define entity (*e)
   /* TS entity() binds the callbacks reader before the literal, but
    * only reads through it in literal order below. */
   entity.actor = f_actor(reader, "actor");
@@ -337,13 +340,13 @@ static qa_persist_q1_saved_entity read_entity(const qa_save_reader *reader, bool
     entity.callbacks.path_end = callback_name(&callbacks, "pathEnd");
     qa_save_reader_destroy(&callbacks);
   }
-  return entity;
+#undef entity
 }
 
-static qa_persist_q1_saved_player read_player(const qa_save_reader *reader) {
+static void read_player(const qa_save_reader *reader, qa_persist_q1_saved_player *slot) {
   static const char *const auto_switches[] = {"always", "new", "never"};
-  qa_persist_q1_saved_player player;
-  memset(&player, 0, sizeof player);
+  qa_persist_q1_saved_player *const p = slot;
+#define player (*p)
   player.actor = f_actor(reader, "actor");
   player.actor_provider = f_namespaced(reader, "actorProvider");
   {
@@ -399,28 +402,39 @@ static qa_persist_q1_saved_player read_player(const qa_save_reader *reader) {
     }
     qa_save_reader_destroy(&powerups);
   }
-  return player;
+#undef player
 }
 
-static const char **read_string_list(const qa_save_reader *reader,
-                                     size_t *out_count) {
+static void read_string_list(const qa_save_reader *reader, const char ***out,
+                             size_t *out_count) {
   size_t count = qa_save_reader_list_count(reader);
   const char **values = alloc(reader, count, sizeof *values);
+  *out = values;
+  *out_count = count;
   for (size_t i = 0; i < count; i++) {
     qa_save_reader entry = item(reader, i);
     values[i] = qa_save_reader_string(&entry);
     qa_save_reader_destroy(&entry);
   }
-  *out_count = count;
-  return values;
 }
 
+static void free_partial(void *arg) { qa_q1_foundation_checkpoint_free(arg); }
+static void free_value(void *arg) { qa_save_value_free(arg); }
 qa_persist_q1_foundation_checkpoint qa_read_q1_foundation_checkpoint(
     const qa_save_reader *reader) {
   static const char *const phases[] = {"loading", "frozen"};
   static const char *const editions[] = {"classic", "rerelease"};
   qa_persist_q1_foundation_checkpoint checkpoint;
   memset(&checkpoint, 0, sizeof checkpoint);
+  /* A raise releases the arrays read so far. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_partial, &checkpoint);
+  /* TS reads `version` as integer(0) for the legacy test before the provider. */
+  {
+    qa_save_reader version = field(reader, "version");
+    (void)qa_save_reader_integer_min(&version, 0);
+    qa_save_reader_destroy(&version);
+  }
   checkpoint.provider = f_namespaced(reader, "provider");
   {
     qa_save_reader format = field(reader, "format");
@@ -435,12 +449,12 @@ qa_persist_q1_foundation_checkpoint qa_read_q1_foundation_checkpoint(
     qa_save_reader precaches = field(reader, "precaches");
     checkpoint.precaches.phase = f_choice(&precaches, "phase", phases, 2);
     qa_save_reader models = field(&precaches, "models");
-    checkpoint.precaches.models =
-        read_string_list(&models, &checkpoint.precaches.model_count);
+    read_string_list(&models, &checkpoint.precaches.models,
+                     &checkpoint.precaches.model_count);
     qa_save_reader_destroy(&models);
     qa_save_reader sounds = field(&precaches, "sounds");
-    checkpoint.precaches.sounds =
-        read_string_list(&sounds, &checkpoint.precaches.sound_count);
+    read_string_list(&sounds, &checkpoint.precaches.sounds,
+                     &checkpoint.precaches.sound_count);
     qa_save_reader_destroy(&sounds);
     qa_save_reader_destroy(&precaches);
   }
@@ -492,7 +506,7 @@ qa_persist_q1_foundation_checkpoint qa_read_q1_foundation_checkpoint(
     checkpoint.entity_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&entities, i);
-      checkpoint.entities[i] = read_entity(&entry, checkpoint.version == 5);
+      read_entity(&entry, checkpoint.version == 5, &checkpoint.entities[i]);
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&entities);
@@ -504,7 +518,7 @@ qa_persist_q1_foundation_checkpoint qa_read_q1_foundation_checkpoint(
     checkpoint.player_count = count;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&players, i);
-      checkpoint.players[i] = read_player(&entry);
+      read_player(&entry, &checkpoint.players[i]);
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&players);
@@ -528,6 +542,7 @@ qa_persist_q1_foundation_checkpoint qa_read_q1_foundation_checkpoint(
     }
     qa_save_reader_destroy(&extensions);
   }
+  qa_cleanup_pop(&guard);
   return checkpoint;
 }
 
@@ -1026,7 +1041,10 @@ bool qa_decode_q1_foundation_checkpoint(const uint8_t *bytes, size_t length,
     qa_save_value_free(root);
     return false;
   }
+  qa_cleanup guard; /* the tree is released when the read raises */
+  qa_cleanup_push(&guard, free_value, root);
   *out = qa_read_q1_foundation_checkpoint(&reader);
+  qa_cleanup_pop(&guard);
   qa_save_reader_destroy(&reader);
   out->root = root;
   return true;

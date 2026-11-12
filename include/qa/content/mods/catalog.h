@@ -1,16 +1,15 @@
 /*
  * Port of src/content/mods/catalog.ts: discoverGameplayMods.
  * The TS CatalogProduct (owner: src/content/catalog/index.ts) and
- * MountedContent (owner: src/content/mounts/index.ts) modules are
- * not ported yet; the two small structs below mirror only the
- * fields this file reads, with collision-proof names, until those
- * modules land. The async mounted.open becomes a synchronous
+ * MountedContent (owner: src/content/mounts/index.ts) reach this
+ * file as two small structs that mirror only the fields it reads,
+ * with collision-proof names. The async mounted.open becomes a synchronous
  * fn+ctx; a NULL content_filter mirrors calling open without the
- * mount predicate. Per-component TS try/catch becomes an
- * unavailable result for the explicit checks this function makes
- * (missing declaration file, digest mismatch); malformed
- * declaration JSON still aborts through the SaveReader, as in
- * other ports, instead of becoming an unavailable reason.
+ * mount predicate. The per-component TS try/catch is a qa_try:
+ * anything thrown inside it (a missing declaration file, a digest
+ * mismatch, a malformed declaration) settles that component as
+ * unavailable with the error's message. A malformed
+ * gameplay-mods.json or a duplicate component raises, as in TS.
  * Returns a malloc'd result array (NULL only on OOM, or when no
  * gameplay-mods.json exists, with *out_count 0). Description
  * source/provider strings and unavailable reasons are malloc'd.

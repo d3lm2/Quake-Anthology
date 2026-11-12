@@ -1,6 +1,8 @@
 /* Port of src/settings/config.ts. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "qa/settings/config.h"
+
+#include "qa/platform/files/contained.h"
 #include "qa/network/common/js_number.h"
 
 #include <ctype.h>
@@ -16,6 +18,7 @@
 #include <unistd.h>
 
 #include "qa/core/commands/index.h"
+#include "qa/core/commands/text.h"
 #include "qa/foundation/support.h"
 
 /* Plain TS Errors abort with the identical message (see
@@ -140,6 +143,14 @@ static const char *settings_string(const qa_save_value *value) {
     qa_error("Expected settings text");
   return value->text;
 }
+/* Console text (one byte per code unit: a bound command) crosses the JSON boundary as
+ * the UTF-8 TS writes and reads (core/commands/text.h). A stored string with a character above U+00FF stays as its
+ * UTF-8 bytes, as the cvar archives keep it. */
+static char *console_text_of(const char *utf8) {
+  char *bytes = NULL;
+  if (qa_command_text_from_utf8(utf8, &bytes)) return bytes;
+  return (char *)xalloc(dup_text(utf8));
+}
 
 static qa_stick_curve parse_curve(const qa_save_value *value) {
   const qa_save_value *input = settings_record(value);
@@ -150,6 +161,7 @@ static qa_stick_curve parse_curve(const qa_save_value *value) {
   memset(&curve, 0, sizeof curve);
   curve.deadzone = deadzone;
   curve.exponent = exponent;
+  curve.parsed_order = true;
   if (kind != NULL && kind->kind == QA_SAVE_STRING && kind->text != NULL &&
       strcmp(kind->text, "radial") == 0) {
     curve.kind = QA_STICK_CURVE_RADIAL;
@@ -193,6 +205,7 @@ static qa_gamepad_tuning parse_gamepad(const qa_save_value *value) {
   tuning.gyro.yaw_axis_z = yaw_axis_z;
   tuning.gyro.yaw_sensitivity = settings_number(field(gyro, "yawSensitivity"));
   tuning.gyro.pitch_sensitivity = settings_number(field(gyro, "pitchSensitivity"));
+  tuning.gyro.parsed_order = true;
   qa_validate_gamepad_tuning(&tuning);
   return tuning;
 }
@@ -214,6 +227,7 @@ static qa_mouse_tuning parse_mouse(const qa_save_value *value) {
       is_undefined(field(input, "lookStrafe")) ? false : settings_boolean(field(input, "lookStrafe"));
   mouse.free_look = settings_boolean(field(input, "freeLook"));
   mouse.invert_pitch = settings_boolean(field(input, "invertPitch"));
+  mouse.key_order = QA_MOUSE_KEYS_PARSED;
   return mouse;
 }
 
@@ -292,7 +306,7 @@ static qa_input_binding_target parse_target(const qa_save_value *value) {
   if (kind != NULL && kind->kind == QA_SAVE_STRING && kind->text != NULL &&
       strcmp(kind->text, "command") == 0) {
     target.is_action = false;
-    target.text = (const char *)xalloc(dup_text(settings_string(field(input, "text"))));
+    target.text = console_text_of(settings_string(field(input, "text")));
     return target;
   }
   qa_error("Unknown binding target");
@@ -430,8 +444,11 @@ void qa_parse_gyro_profile(const qa_save_value *value, qa_gyro_profile *out) {
   } else if (name != NULL && strcmp(name, "device") == 0) {
     const char *guid = settings_string(field(identity, "guid"));
     const char *serial = settings_string(field(identity, "serial"));
-    /* The TS length/NUL checks count UTF-16 units; byte length here. */
-    if (!is_hex_guid(guid, false) || serial[0] == '\0' || strlen(serial) > 256)
+    /* TS serial.length counts UTF-16 units: one per UTF-8 lead byte, two for a 4-byte sequence. */
+    size_t units = 0;
+    for (const unsigned char *p = (const unsigned char *)serial; *p != '\0'; p++)
+      if ((*p & 0xc0) != 0x80) units += *p >= 0xf0 ? 2 : 1;
+    if (!is_hex_guid(guid, false) || serial[0] == '\0' || units > 256)
       qa_error("Invalid gyro device identity");
     out->identity_is_device = true;
     memcpy(out->guid, guid, 33);
@@ -534,77 +551,173 @@ char *qa_settings_path(const char *root, const char *name) {
 }
 
 /* --- writeAtomic --- */
-static bool make_directories(const char *path) {
-  /* mkdir -p for every prefix of the directory path. */
-  char *copy = dup_text(path);
-  if (copy == NULL) return false;
-  bool ok = true;
-  for (size_t i = 1; copy[i] != '\0'; i++) {
-    if (copy[i] != '/') continue;
-    copy[i] = '\0';
-    if (mkdir(copy, 0777) != 0 && errno != EEXIST) ok = false;
-    copy[i] = '/';
-    if (!ok) break;
-  }
-  if (ok && mkdir(copy, 0777) != 0 && errno != EEXIST) ok = false;
-  free(copy);
-  return ok;
+/* The Node fs error a failed writeAtomic step rejects with, kept for qa_settings_raise_write_failure. */
+typedef struct write_failure {
+  bool set;
+  int code;
+  const char *syscall; /* static */
+  char *path, *dest;   /* owned; NULL when the TS error names none */
+} write_failure;
+static _Thread_local write_failure last_write_failure;
+static void write_failure_clear(void) {
+  free(last_write_failure.path);
+  free(last_write_failure.dest);
+  memset(&last_write_failure, 0, sizeof last_write_failure);
+}
+static void write_failure_note(int code, const char *syscall, const char *path, const char *dest) {
+  write_failure_clear();
+  last_write_failure.set = true;
+  last_write_failure.code = code;
+  last_write_failure.syscall = syscall;
+  last_write_failure.path = path != NULL ? dup_text(path) : NULL;
+  last_write_failure.dest = dest != NULL ? dup_text(dest) : NULL;
+}
+noreturn void qa_settings_raise_write_failure(void) {
+  if (!last_write_failure.set) qa_range_error("Out of memory");
+  write_failure failure = last_write_failure;
+  memset(&last_write_failure, 0, sizeof last_write_failure);
+  qa_cleanup path_guard, dest_guard;
+  qa_cleanup_push(&path_guard, free, failure.path);
+  qa_cleanup_push(&dest_guard, free, failure.dest);
+  qa_node_fs_error_paths(failure.code, failure.syscall, failure.path, failure.dest);
 }
 
-bool qa_write_atomic(const char *path, const void *contents, size_t length) {
-  const char *slash = strrchr(path, '/');
-  if (slash != NULL && slash != path) {
-    size_t dir_length = (size_t)(slash - path);
-    char *dir = (char *)malloc(dir_length + 1);
-    if (dir == NULL) return false;
-    memcpy(dir, path, dir_length);
-    dir[dir_length] = '\0';
-    bool made = make_directories(dir);
-    free(dir);
-    if (!made) return false;
-  }
-  size_t template_length = strlen(path) + 16;
-  char *temporary = (char *)malloc(template_length);
-  if (temporary == NULL) return false;
-  snprintf(temporary, template_length, "%s..tmpXXXXXX", path);
-  int fd = mkstemp(temporary); /* 0600, matching the TS open mode */
-  if (fd < 0) {
-    free(temporary);
+/* node:path dirname(path) for the absolute or relative paths settingsPath gives. Malloc'd; NULL on OOM. */
+static char *path_dirname(const char *path) {
+  size_t length = strlen(path);
+  while (length > 1 && path[length - 1] == '/') length--;
+  size_t end = length;
+  while (end > 0 && path[end - 1] != '/') end--;
+  if (end == 0) return dup_text(".");
+  while (end > 1 && path[end - 1] == '/') end--;
+  char *out = (char *)malloc(end + 1);
+  if (out == NULL) return NULL;
+  memcpy(out, path, end);
+  out[end] = '\0';
+  return out;
+}
+
+/* Bun mkdir(path, { recursive: true }): an existing directory is success; a missing parent is created first and its
+ * failure names the parent; any other failure names `path` itself. False with the failure noted. */
+static bool make_directories(const char *path) {
+  if (mkdir(path, 0777) == 0) return true;
+  int code = errno;
+  struct stat status;
+  if (code == EEXIST) {
+    if (stat(path, &status) == 0 && S_ISDIR(status.st_mode)) return true;
+    write_failure_note(EEXIST, "mkdir", path, NULL);
     return false;
   }
-  bool ok = true;
-  const uint8_t *bytes = (const uint8_t *)contents;
-  size_t written = 0;
-  while (written < length) {
-    ssize_t chunk = write(fd, bytes + written, length - written);
-    if (chunk <= 0) {
-      ok = false;
-      break;
+  if (code == ENOENT) {
+    char *parent = path_dirname(path);
+    if (parent == NULL) return false;
+    bool made = strcmp(parent, path) != 0 && make_directories(parent);
+    bool root = strcmp(parent, path) == 0;
+    free(parent);
+    if (root) {
+      write_failure_note(code, "mkdir", path, NULL);
+      return false;
     }
-    written += (size_t)chunk;
+    if (!made) return false;
+    if (mkdir(path, 0777) == 0) return true;
+    code = errno;
+    if (code == EEXIST && stat(path, &status) == 0 && S_ISDIR(status.st_mode)) return true;
   }
-  if (ok && fsync(fd) != 0) ok = false; /* TS file.sync() */
-  if (close(fd) != 0) ok = false;
-  if (ok && rename(temporary, path) != 0) ok = false;
+  write_failure_note(code, "mkdir", path, NULL);
+  return false;
+}
+
+/* crypto.randomUUID(): a version 4 UUID in lower-case hex. */
+static void random_uuid(char out[37]) {
+  unsigned char bytes[16];
+  size_t got = 0;
+  FILE *source = fopen("/dev/urandom", "rb");
+  if (source != NULL) {
+    got = fread(bytes, 1, sizeof bytes, source);
+    fclose(source);
+  }
+  for (size_t i = got; i < sizeof bytes; i++) bytes[i] = (unsigned char)rand();
+  bytes[6] = (unsigned char)((bytes[6] & 0x0f) | 0x40);
+  bytes[8] = (unsigned char)((bytes[8] & 0x3f) | 0x80);
+  static const char hex[] = "0123456789abcdef";
+  size_t at = 0;
+  for (size_t i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) out[at++] = '-';
+    out[at++] = hex[bytes[i] >> 4];
+    out[at++] = hex[bytes[i] & 15];
+  }
+  out[at] = '\0';
+}
+
+/* TS writeAtomic: mkdir -p dirname(path); open `${path}.${randomUUID()}.tmp` "wx" 0600; write, sync, close; rename over
+ * path; open and sync the directory; finally rm(temporary, { force: true }). False on any failure, which is noted for
+ * qa_settings_raise_write_failure (none for an allocation failure). */
+bool qa_write_atomic(const char *path, const void *contents, size_t length) {
+  write_failure_clear();
+  char *directory = path_dirname(path);
+  if (directory == NULL) return false;
+  if (!make_directories(directory)) {
+    free(directory);
+    return false;
+  }
+  size_t temporary_length = strlen(path) + 48;
+  char *temporary = (char *)malloc(temporary_length);
+  if (temporary == NULL) {
+    free(directory);
+    return false;
+  }
+  char uuid[37];
+  random_uuid(uuid);
+  snprintf(temporary, temporary_length, "%s.%s.tmp", path, uuid);
+  bool ok = true;
+  int fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    write_failure_note(errno, "open", temporary, NULL);
+    ok = false;
+  }
+  if (ok) {
+    const uint8_t *bytes = (const uint8_t *)contents;
+    size_t written = 0;
+    while (ok && written < length) {
+      ssize_t chunk = write(fd, bytes + written, length - written);
+      if (chunk < 0 && errno == EINTR) continue;
+      if (chunk <= 0) {
+        write_failure_note(chunk < 0 ? errno : EIO, "write", NULL, NULL);
+        ok = false;
+        break;
+      }
+      written += (size_t)chunk;
+    }
+    if (ok && fsync(fd) != 0) { /* TS file.sync() */
+      write_failure_note(errno, "fsync", NULL, NULL);
+      ok = false;
+    }
+    if (close(fd) != 0 && ok) {
+      write_failure_note(errno, "close", NULL, NULL);
+      ok = false;
+    }
+  }
+  if (ok && rename(temporary, path) != 0) {
+    write_failure_note(errno, "rename", temporary, path);
+    ok = false;
+  }
   if (ok) {
     /* TS: open(dirname(path), "r") and directory.sync(), so the rename is durable. */
-    char *directory = NULL;
-    if (slash == NULL) directory = dup_text(".");
-    else if (slash == path) directory = dup_text("/");
-    else {
-      directory = (char *)malloc((size_t)(slash - path) + 1);
-      if (directory != NULL) {
-        memcpy(directory, path, (size_t)(slash - path));
-        directory[slash - path] = '\0';
+    int directory_fd = open(directory, O_RDONLY | O_CLOEXEC);
+    if (directory_fd < 0) {
+      write_failure_note(errno, "open", directory, NULL);
+      ok = false;
+    } else {
+      if (fsync(directory_fd) != 0) {
+        write_failure_note(errno, "fsync", NULL, NULL);
+        ok = false;
       }
+      close(directory_fd);
     }
-    int directory_fd = directory != NULL ? open(directory, O_RDONLY) : -1;
-    if (directory_fd < 0 || fsync(directory_fd) != 0) ok = false;
-    if (directory_fd >= 0 && close(directory_fd) != 0) ok = false;
-    free(directory);
   }
   unlink(temporary); /* the TS rm(force) finally; ENOENT after rename */
   free(temporary);
+  free(directory);
   return ok;
 }
 
@@ -645,25 +758,38 @@ static bool add_curve(text_buffer *b, const qa_stick_curve *curve, bool pretty,
   if (!text_add_json_string(b, radial ? "radial" : "axial")) return false;
   if (!add_key(b, "deadzone", pretty, depth, false)) return false;
   if (!text_add_number(b, curve->deadzone)) return false;
+  /* defaultGamepadTuning's literal puts outerThreshold before exponent; the parser after. */
+  if (radial && !curve->parsed_order) {
+    if (!add_key(b, "outerThreshold", pretty, depth, false)) return false;
+    if (!text_add_number(b, curve->outer_threshold)) return false;
+  }
   if (!add_key(b, "exponent", pretty, depth, false)) return false;
   if (!text_add_number(b, curve->exponent)) return false;
-  if (radial) {
+  if (radial && curve->parsed_order) {
     if (!add_key(b, "outerThreshold", pretty, depth, false)) return false;
     if (!text_add_number(b, curve->outer_threshold)) return false;
   }
   return add_close(b, pretty, depth, "}");
 }
+/* `parsed`: the parser's order whatever the struct's provenance (a document saveGyro re-validates). */
 static bool add_gyro(text_buffer *b, const qa_gyro_tuning *gyro, bool pretty,
-                     int depth) {
+                     int depth, bool parsed) {
+  bool literal = !parsed && !gyro->parsed_order; /* defaultGamepadTuning.gyro: yawAxis last */
   if (!text_add(b, "{")) return false;
   if (!add_key(b, "enabled", pretty, depth, true)) return false;
   if (!add_bool(b, gyro->enabled)) return false;
-  if (!add_key(b, "yawAxis", pretty, depth, false)) return false;
-  if (!text_add_json_string(b, gyro->yaw_axis_z ? "z" : "y")) return false;
+  if (!literal) {
+    if (!add_key(b, "yawAxis", pretty, depth, false)) return false;
+    if (!text_add_json_string(b, gyro->yaw_axis_z ? "z" : "y")) return false;
+  }
   if (!add_key(b, "yawSensitivity", pretty, depth, false)) return false;
   if (!text_add_number(b, gyro->yaw_sensitivity)) return false;
   if (!add_key(b, "pitchSensitivity", pretty, depth, false)) return false;
   if (!text_add_number(b, gyro->pitch_sensitivity)) return false;
+  if (literal) {
+    if (!add_key(b, "yawAxis", pretty, depth, false)) return false;
+    if (!text_add_json_string(b, gyro->yaw_axis_z ? "z" : "y")) return false;
+  }
   return add_close(b, pretty, depth, "}");
 }
 static bool add_gamepad(text_buffer *b, const qa_gamepad_tuning *pad, bool pretty,
@@ -688,11 +814,12 @@ static bool add_gamepad(text_buffer *b, const qa_gamepad_tuning *pad, bool prett
   if (!add_key(b, "triggerThreshold", pretty, depth, false)) return false;
   if (!text_add_number(b, pad->trigger_threshold)) return false;
   if (!add_key(b, "gyro", pretty, depth, false)) return false;
-  if (!add_gyro(b, &pad->gyro, pretty, depth + 1)) return false;
+  if (!add_gyro(b, &pad->gyro, pretty, depth + 1, false)) return false;
   return add_close(b, pretty, depth, "}");
 }
+/* `order` is the object's key order (QA_MOUSE_KEYS_*). */
 static bool add_mouse(text_buffer *b, const qa_mouse_tuning *mouse, bool pretty,
-                      int depth) {
+                      int depth, uint8_t order) {
   if (!text_add(b, "{")) return false;
   if (!add_key(b, "sensitivity", pretty, depth, true)) return false;
   if (!text_add_number(b, mouse->sensitivity)) return false;
@@ -704,18 +831,30 @@ static bool add_mouse(text_buffer *b, const qa_mouse_tuning *mouse, bool pretty,
   if (!text_add_number(b, mouse->yaw)) return false;
   if (!add_key(b, "pitch", pretty, depth, false)) return false;
   if (!text_add_number(b, mouse->pitch)) return false;
+  if (order == QA_MOUSE_KEYS_CVARS) {
+    if (!add_key(b, "invertPitch", pretty, depth, false)) return false;
+    if (!add_bool(b, mouse->invert_pitch)) return false;
+  }
   if (!add_key(b, "side", pretty, depth, false)) return false;
   if (!text_add_number(b, mouse->side)) return false;
   if (!add_key(b, "forward", pretty, depth, false)) return false;
   if (!text_add_number(b, mouse->forward)) return false;
+  if (order != QA_MOUSE_KEYS_PARSED) {
+    if (!add_key(b, "freeLook", pretty, depth, false)) return false;
+    if (!add_bool(b, mouse->free_look)) return false;
+  }
   if (!add_key(b, "lookSpring", pretty, depth, false)) return false;
   if (!add_bool(b, mouse->look_spring)) return false;
   if (!add_key(b, "lookStrafe", pretty, depth, false)) return false;
   if (!add_bool(b, mouse->look_strafe)) return false;
-  if (!add_key(b, "freeLook", pretty, depth, false)) return false;
-  if (!add_bool(b, mouse->free_look)) return false;
-  if (!add_key(b, "invertPitch", pretty, depth, false)) return false;
-  if (!add_bool(b, mouse->invert_pitch)) return false;
+  if (order == QA_MOUSE_KEYS_PARSED) {
+    if (!add_key(b, "freeLook", pretty, depth, false)) return false;
+    if (!add_bool(b, mouse->free_look)) return false;
+  }
+  if (order != QA_MOUSE_KEYS_CVARS) {
+    if (!add_key(b, "invertPitch", pretty, depth, false)) return false;
+    if (!add_bool(b, mouse->invert_pitch)) return false;
+  }
   return add_close(b, pretty, depth, "}");
 }
 static bool add_physical(text_buffer *b, const qa_physical_input *input,
@@ -752,6 +891,12 @@ static bool add_physical(text_buffer *b, const qa_physical_input *input,
   }
   return add_close(b, pretty, depth, "}");
 }
+static bool text_add_console_json_string(text_buffer *buffer, const char *console) {
+  char *utf8 = qa_command_text_to_utf8(console);
+  bool ok = text_add_json_string(buffer, utf8);
+  free(utf8);
+  return ok;
+}
 static bool add_binding_target(text_buffer *b, const qa_input_binding_target *target,
                                bool pretty, int depth) {
   if (!text_add(b, "{")) return false;
@@ -763,7 +908,7 @@ static bool add_binding_target(text_buffer *b, const qa_input_binding_target *ta
   } else {
     if (!text_add_json_string(b, "command")) return false;
     if (!add_key(b, "text", pretty, depth, false)) return false;
-    if (!text_add_json_string(b, target->text != NULL ? target->text : "")) return false;
+    if (!text_add_console_json_string(b, target->text != NULL ? target->text : "")) return false;
   }
   return add_close(b, pretty, depth, "}");
 }
@@ -814,35 +959,75 @@ static bool add_bindings_json(text_buffer *b, const qa_input_binding *bindings, 
 }
 static bool add_seat_json_with(text_buffer *b, const qa_seat_settings *settings, bool pretty);
 static bool add_seat_json(text_buffer *b, const qa_seat_settings *settings) { return add_seat_json_with(b, settings, true); }
+/* The parser's key order (parseSeatSettings' object literal). */
+static const uint8_t parsed_seat_keys[QA_SEAT_KEY_COUNT] = {
+    QA_SEAT_KEY_VERSION, QA_SEAT_KEY_BINDINGS, QA_SEAT_KEY_ALWAYS_RUN, QA_SEAT_KEY_GAMEPAD, QA_SEAT_KEY_MOUSE,
+    QA_SEAT_KEY_HISTORY, QA_SEAT_KEY_RUMBLE, QA_SEAT_KEY_RUMBLE_STRENGTH, QA_SEAT_KEY_CONTROLLER};
+static bool seat_key_present(const qa_seat_settings *settings, uint8_t key) {
+  if (key == QA_SEAT_KEY_ALWAYS_RUN) return settings->has_always_run;
+  if (key == QA_SEAT_KEY_RUMBLE_STRENGTH) return !settings->rumble_strength_absent;
+  return key < QA_SEAT_KEY_COUNT;
+}
+void qa_seat_settings_note_key(qa_seat_settings *settings, qa_seat_settings_key key) {
+  if (settings->key_count == 0) {
+    for (size_t i = 0; i < QA_SEAT_KEY_COUNT; i++)
+      if (seat_key_present(settings, parsed_seat_keys[i])) settings->key_order[settings->key_count++] = parsed_seat_keys[i];
+  }
+  for (size_t i = 0; i < settings->key_count; i++)
+    if (settings->key_order[i] == key) return;
+  if (settings->key_count < QA_SEAT_KEY_COUNT) settings->key_order[settings->key_count++] = (uint8_t)key;
+}
 static bool add_seat_json_with(text_buffer *b, const qa_seat_settings *settings, bool pretty) {
   if (!text_add(b, "{")) return false;
-  if (!add_key(b, "version", pretty, 1, true)) return false;
-  if (!text_add_number(b, settings->version)) return false;
-  if (!add_key(b, "bindings", pretty, 1, false)) return false;
-  if (!add_bindings_json(b, settings->bindings, settings->binding_count, pretty, 2)) return false;
-  if (settings->has_always_run) {
-    if (!add_key(b, "alwaysRun", pretty, 1, false)) return false;
-    if (!add_bool(b, settings->always_run)) return false;
+  const uint8_t *order = settings->key_count == 0 ? parsed_seat_keys : settings->key_order;
+  size_t count = settings->key_count == 0 ? QA_SEAT_KEY_COUNT : settings->key_count;
+  bool first = true;
+  for (size_t k = 0; k < count; k++) {
+    uint8_t key = order[k];
+    if (!seat_key_present(settings, key)) continue;
+    switch (key) {
+      case QA_SEAT_KEY_VERSION:
+        if (!add_key(b, "version", pretty, 1, first) || !text_add_number(b, settings->version)) return false;
+        break;
+      case QA_SEAT_KEY_BINDINGS:
+        if (!add_key(b, "bindings", pretty, 1, first)) return false;
+        if (!add_bindings_json(b, settings->bindings, settings->binding_count, pretty, 2)) return false;
+        break;
+      case QA_SEAT_KEY_ALWAYS_RUN:
+        if (!add_key(b, "alwaysRun", pretty, 1, first) || !add_bool(b, settings->always_run)) return false;
+        break;
+      case QA_SEAT_KEY_GAMEPAD:
+        if (!add_key(b, "gamepad", pretty, 1, first) || !add_gamepad(b, &settings->gamepad, pretty, 2)) return false;
+        break;
+      case QA_SEAT_KEY_MOUSE:
+        if (!add_key(b, "mouse", pretty, 1, first) || !add_mouse(b, &settings->mouse, pretty, 2, settings->mouse.key_order)) return false;
+        break;
+      case QA_SEAT_KEY_HISTORY:
+        if (!add_key(b, "history", pretty, 1, first)) return false;
+        if (!text_add(b, "[")) return false;
+        for (size_t i = 0; i < settings->history_count; i++) {
+          if (i > 0 && !text_add(b, ",")) return false;
+          if (!add_indent(b, pretty, 2)) return false;
+          if (!text_add_json_string(b, settings->history[i])) return false;
+        }
+        if (settings->history_count > 0 && !add_close(b, pretty, 2, "]")) return false;
+        if (settings->history_count == 0 && !text_add(b, "]")) return false;
+        break;
+      case QA_SEAT_KEY_RUMBLE:
+        if (!add_key(b, "rumble", pretty, 1, first) || !add_bool(b, settings->rumble)) return false;
+        break;
+      case QA_SEAT_KEY_RUMBLE_STRENGTH:
+        if (!add_key(b, "rumbleStrength", pretty, 1, first) || !text_add_number(b, settings->rumble_strength)) return false;
+        break;
+      case QA_SEAT_KEY_CONTROLLER:
+        if (!add_key(b, "controller", pretty, 1, first) || !add_controller(b, &settings->controller, pretty, 2)) return false;
+        break;
+      default:
+        continue;
+    }
+    first = false;
   }
-  if (!add_key(b, "gamepad", pretty, 1, false)) return false;
-  if (!add_gamepad(b, &settings->gamepad, pretty, 2)) return false;
-  if (!add_key(b, "mouse", pretty, 1, false)) return false;
-  if (!add_mouse(b, &settings->mouse, pretty, 2)) return false;
-  if (!add_key(b, "history", pretty, 1, false)) return false;
-  if (!text_add(b, "[")) return false;
-  for (size_t i = 0; i < settings->history_count; i++) {
-    if (i > 0 && !text_add(b, ",")) return false;
-    if (!add_indent(b, pretty, 2)) return false;
-    if (!text_add_json_string(b, settings->history[i])) return false;
-  }
-  if (settings->history_count > 0 && !add_close(b, pretty, 2, "]")) return false;
-  if (settings->history_count == 0 && !text_add(b, "]")) return false;
-  if (!add_key(b, "rumble", pretty, 1, false)) return false;
-  if (!add_bool(b, settings->rumble)) return false;
-  if (!add_key(b, "rumbleStrength", pretty, 1, false)) return false;
-  if (!text_add_number(b, settings->rumble_strength)) return false;
-  if (!add_key(b, "controller", pretty, 1, false)) return false;
-  if (!add_controller(b, &settings->controller, pretty, 2)) return false;
+  if (first) return text_add(b, "}");
   return add_close(b, pretty, 1, "}");
 }
 /* Compact JSON.stringify texts (key order follows the parsers). */
@@ -867,7 +1052,7 @@ static bool add_global_json(text_buffer *b, const qa_global_input_tuning *tuning
   if (!add_key(b, "version", pretty, 1, true)) return false;
   if (!text_add_number(b, tuning->version)) return false;
   if (!add_key(b, "mouse", pretty, 1, false)) return false;
-  if (!add_mouse(b, &tuning->mouse, pretty, 2)) return false;
+  if (!add_mouse(b, &tuning->mouse, pretty, 2, QA_MOUSE_KEYS_PARSED)) return false; /* parseGlobalInputTuning re-validates */
   if (tuning->has_always_run) {
     if (!add_key(b, "alwaysRun", pretty, 1, false)) return false;
     if (!add_bool(b, tuning->always_run)) return false;
@@ -897,13 +1082,18 @@ static bool add_gyro_json(text_buffer *b, const qa_gyro_profile *profile) {
   }
   if (!add_close(b, false, 2, "}")) return false;
   if (!add_key(b, "tuning", false, 1, false)) return false;
-  if (!add_gyro(b, &profile->tuning, false, 2)) return false;
+  if (!add_gyro(b, &profile->tuning, false, 2, true)) return false; /* parseGyroProfile re-validates */
   return add_close(b, false, 1, "}");
 }
 
 /* --- ConfigStore --- */
 bool qa_config_store_init(qa_config_store *store, const char *root) {
+  return qa_config_store_init_legacy(store, root, NULL);
+}
+bool qa_config_store_init_legacy(qa_config_store *store, const char *root,
+                                 const qa_config_store *legacy) {
   store->root = dup_text(root);
+  store->legacy = legacy;
   return store->root != NULL;
 }
 void qa_config_store_destroy(qa_config_store *store) {
@@ -914,9 +1104,16 @@ void qa_config_store_destroy(qa_config_store *store) {
 /* Bun.file(path).text() when it exists, else the TS null. Bytes are
  * kept as-is (Bun decodes UTF-8 lossily; qa_parse_json_value is
  * equally lenient, and malformed bytes still fail JSON parsing). */
+/* TS (await Bun.file(path).exists()) ? file.text() : absent. exists() is false for a missing path and for a directory
+ * (NULL here); a file that exists but cannot be opened rejects with the Node error. */
 static char *read_file_bytes(const char *path, size_t *out_length) {
+  struct stat status;
+  if (stat(path, &status) != 0 || S_ISDIR(status.st_mode)) return NULL;
   FILE *file = fopen(path, "rb");
-  if (file == NULL) return NULL;
+  if (file == NULL) {
+    if (errno == ENOENT) return NULL;
+    qa_node_fs_error(errno, "open", path);
+  }
   size_t capacity = 4096;
   size_t length = 0;
   char *data = (char *)malloc(capacity);
@@ -941,6 +1138,12 @@ static char *read_file_bytes(const char *path, size_t *out_length) {
   }
   fclose(file);
   data[length] = '\0';
+  /* Bun's file.text() decodes as TextDecoder does: one leading byte-order mark is dropped. */
+  if (length >= 3 && (unsigned char)data[0] == 0xef && (unsigned char)data[1] == 0xbb &&
+      (unsigned char)data[2] == 0xbf) {
+    memmove(data, data + 3, length - 2);
+    length -= 3;
+  }
   if (out_length != NULL) *out_length = length;
   return data;
 }
@@ -949,13 +1152,19 @@ char *qa_config_store_load_text(const qa_config_store *store, const char *name,
                                 size_t *out_length) {
   char *path = qa_settings_path(store->root, name);
   if (path == NULL) return NULL;
+  qa_cleanup path_guard;
+  qa_cleanup_push(&path_guard, free, path);
   char *text = read_file_bytes(path, out_length);
+  qa_cleanup_pop(&path_guard);
   free(path);
+  /* TS: (await file.exists()) ? file.text() : (this.legacy?.loadText(name) ?? null). */
+  if (text == NULL && store->legacy != NULL) return qa_config_store_load_text(store->legacy, name, out_length);
   return text;
 }
 
 bool qa_config_store_dump(const qa_config_store *store, const char *name,
                           const char *contents) {
+  write_failure_clear();
   char *path = qa_settings_path(store->root, name);
   if (path == NULL) return false;
   bool ok = qa_write_atomic_text(path, contents);
@@ -1069,6 +1278,7 @@ bool qa_config_store_load_gyro(const qa_config_store *store, const char *name,
 
 bool qa_config_store_save_gyro(const qa_config_store *store, const char *name,
                                const qa_gyro_profile *profile) {
+  write_failure_clear();
   /* TS saveGyro re-validates via parseGyroProfile(profile). */
   if (profile->version != 1) qa_error("Unsupported gyro settings version");
   if (profile->identity_is_device) {
@@ -1095,6 +1305,7 @@ bool qa_config_store_save_gyro(const qa_config_store *store, const char *name,
 bool qa_config_store_save_input_routing(const qa_config_store *store,
                                         const char *name, double keyboard_seat,
                                         bool has_keyboard_seat) {
+  write_failure_clear();
   if (has_keyboard_seat &&
       (!(keyboard_seat == trunc(keyboard_seat) &&
          fabs(keyboard_seat) <= 9007199254740991.0) ||
@@ -1131,6 +1342,7 @@ bool qa_config_store_load_input_routing(const qa_config_store *store,
 
 bool qa_config_store_save_seat(const qa_config_store *store, const char *name,
                                const qa_seat_settings *settings) {
+  write_failure_clear();
   char *path = qa_settings_path(store->root, name);
   if (path == NULL) return false;
   text_buffer buffer = {NULL, 0, 0};
@@ -1144,8 +1356,18 @@ bool qa_config_store_save_seat(const qa_config_store *store, const char *name,
 bool qa_config_store_load_seat(const qa_config_store *store, const char *name,
                                qa_seat_settings *out) {
   size_t length = 0;
-  char *text = qa_config_store_load_text(store, name, &length);
-  if (text == NULL) return false;
+  /* TS loadSeat reads this root only; an absent document is the legacy
+   * store's loadSeat, which decodes (and quarantines) in its own root. */
+  char *path = qa_settings_path(store->root, name);
+  char *text = NULL;
+  if (path != NULL) {
+    qa_cleanup path_guard;
+    qa_cleanup_push(&path_guard, free, path);
+    text = read_file_bytes(path, &length);
+    qa_cleanup_pop(&path_guard);
+  }
+  free(path);
+  if (text == NULL) return store->legacy != NULL && qa_config_store_load_seat(store->legacy, name, out);
   return config_decoded(store, name, text, length, parse_seat_job, out,
                         sizeof *out, free_seat_job);
 }
@@ -1163,6 +1385,7 @@ bool qa_config_store_load_global_tuning(const qa_config_store *store,
 bool qa_config_store_save_global_tuning(const qa_config_store *store,
                                         const char *name,
                                         const qa_global_input_tuning *tuning) {
+  write_failure_clear();
   /* TS saveGlobalTuning re-validates via parseGlobalInputTuning. */
   if (tuning->version != 1) qa_error("Unsupported global input tuning document");
   const qa_mouse_tuning *mouse = &tuning->mouse;
@@ -1188,6 +1411,7 @@ bool qa_config_store_save_cvars(const qa_config_store *store, const char *name,
                                 qa_cvar_registry *cvars,
                                 const char *const *bindings,
                                 size_t binding_count) {
+  write_failure_clear();
   char *path = qa_settings_path(store->root, name);
   if (path == NULL) return false;
   size_t command_count = 0;
@@ -1220,10 +1444,32 @@ void qa_config_store_execute(const qa_config_store *store, const char *name,
                              qa_command_context context) {
   char *path = qa_settings_path(store->root, name);
   if (path == NULL) qa_error("Settings script path could not be allocated");
-  size_t length = 0;
-  char *text = read_file_bytes(path, &length);
+  /* TS readFile(path, "utf8"): the bytes as they are (a byte-order mark stays), and a missing or
+   * unreadable file rejects with the Node fs error. */
+  FILE *file = fopen(path, "rb");
+  if (file == NULL) {
+    int code = errno;
+    qa_cleanup path_node;
+    qa_cleanup_push(&path_node, free, path);
+    qa_node_fs_error(code, "open", path);
+  }
+  size_t length = 0, capacity = 4096;
+  char *text = (char *)malloc(capacity);
+  while (text != NULL) {
+    if (length + 1 >= capacity) {
+      char *grown = (char *)realloc(text, capacity * 2);
+      if (grown == NULL) { free(text); text = NULL; break; }
+      text = grown;
+      capacity *= 2;
+    }
+    size_t read = fread(text + length, 1, capacity - length - 1, file);
+    length += read;
+    if (read == 0) break;
+  }
+  fclose(file);
   free(path);
-  if (text == NULL) qa_error("Settings script could not be read: %s", name);
+  if (text == NULL) qa_error("Settings allocation failed");
+  text[length] = '\0';
   text_buffer buffer = {NULL, 0, 0};
   if (!text_add(&buffer, text) || !text_add(&buffer, "\n")) {
     free(text);

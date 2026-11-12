@@ -66,11 +66,39 @@ typedef struct qa_q2_classic_original_save {
   bool autosave;
   qa_q2_classic_original_server_state server;
   qa_byte_view game;
+  /* The current map's `MAP.sav`. level_absent is the TS null: the map was entered but never written, which is
+   * what the original's `current/` folder holds for the level an autosave was taken on entering. Loading such a
+   * save spawns the map fresh. */
   qa_byte_view level;
+  bool level_absent;
   qa_q2_classic_visited_level *visited_levels;
   size_t visited_level_count;
   qa_save_value *root; /* owned when decoded; NULL when captured/built */
 } qa_q2_classic_original_save;
+
+/* TS Q2ClassicOriginalImport: the original files of a save folder read back, before they are bound to a launched
+ * module. The recorded cvars are the latched pairs `server.ssv` holds, to be forced into the live registry; they
+ * are not a registry capture. Everything is owned (qa_q2_classic_original_import_free). */
+typedef struct qa_q2_classic_latched_cvar {
+  char *name;
+  char *value;
+} qa_q2_classic_latched_cvar;
+typedef struct qa_q2_classic_original_import {
+  char *map;
+  char *spawn_point;
+  bool autosave;
+  qa_q2_classic_level_state server; /* configstring values are owned */
+  qa_q2_classic_latched_cvar *latched;
+  size_t latched_count;
+  uint8_t *game;
+  size_t game_length;
+  uint8_t *level; /* NULL with level_absent for the TS null */
+  size_t level_length;
+  bool level_absent;
+  qa_q2_classic_visited_level *visited_levels; /* map, level bytes and configstring values are owned */
+  size_t visited_level_count;
+} qa_q2_classic_original_import;
+void qa_q2_classic_original_import_free(qa_q2_classic_original_import *import);
 
 /* Returns false only on OOM. out->bytes.bytes is malloc'd (caller
  * frees); out->provider borrows save->module.id and out->schema is a
@@ -103,6 +131,7 @@ typedef void (*qa_q2_classic_server_state_fn)(void *ctx,
                                               qa_q2_classic_original_server_state *out);
 typedef void (*qa_q2_classic_write_fn)(void *ctx, const char *game_path,
                                        const char *level_path, bool autosave);
+/* level_path is NULL when the save carries no current level (TS null). */
 typedef void (*qa_q2_classic_read_fn)(void *ctx, const char *game_path,
                                       const char *level_path);
 typedef void (*qa_q2_classic_level_write_fn)(void *ctx, const char *level_path);
@@ -126,13 +155,14 @@ bool qa_classic_original_save_files_capture(
     qa_q2_classic_server_state_fn server_state, void *server_ctx,
     qa_q2_classic_write_fn write, void *write_ctx, bool autosave,
     qa_q2_classic_original_save *out);
+/* Reads the save's game and level fields only (TS Pick<Q2ClassicOriginalSave, "game" | "level">). */
 void qa_classic_original_save_files_restore(
     qa_classic_original_save_files *files, const qa_q2_classic_original_save *save,
-    qa_q2_classic_original_identity expected, qa_q2_classic_read_fn read, void *read_ctx);
+    qa_q2_classic_read_fn read, void *read_ctx);
 /* TS async restoreLoading; synchronous in C. */
 void qa_classic_original_save_files_restore_loading(
     qa_classic_original_save_files *files, const qa_q2_classic_original_save *save,
-    qa_q2_classic_original_identity expected, qa_q2_classic_read_fn read, void *read_ctx);
+    qa_q2_classic_read_fn read, void *read_ctx);
 /* Malloc'd level bytes in *out_bytes; false only on OOM. */
 bool qa_classic_original_save_files_capture_travel_level(
     qa_classic_original_save_files *files, qa_q2_classic_level_write_fn write,

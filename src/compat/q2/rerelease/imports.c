@@ -16,6 +16,40 @@ static void fmt_number(char *out, size_t cap, double v) {
   qa_net_js_number(v, out, cap);
 }
 
+/* new TextDecoder().decode(bytes), kept as the UTF-8 of the decoded string: each maximal invalid subpart becomes
+ * U+FFFD (WHATWG) and one leading byte order mark is dropped. Text that is already valid comes back unchanged. */
+char *qa_compat_q2_decode_guest_text(char *raw, size_t length) {
+  bool plain = true;
+  for (size_t i = 0; i < length && plain; i++) plain = (uint8_t)raw[i] < 0x80;
+  if (plain) return raw;
+  const uint8_t *data = (const uint8_t *)raw;
+  char *out = malloc(length * 3 + 1);
+  if (!out) { free(raw); qa_range_error("Q2 rerelease imports out of memory"); }
+  size_t i = 0, n = 0;
+  if (length >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf) i = 3;
+  while (i < length) {
+    uint8_t lead = data[i];
+    if (lead < 0x80) { out[n++] = (char)lead; i++; continue; }
+    size_t need = lead >= 0xc2 && lead <= 0xdf ? 1 : lead >= 0xe0 && lead <= 0xef ? 2 : lead >= 0xf0 && lead <= 0xf4 ? 3 : 0, seen = 0;
+    while (seen < need && i + 1 + seen < length) {
+      uint8_t lower = 0x80, upper = 0xbf, byte = data[i + 1 + seen];
+      if (seen == 0) {
+        if (lead == 0xe0) lower = 0xa0;
+        else if (lead == 0xed) upper = 0x9f;
+        else if (lead == 0xf0) lower = 0x90;
+        else if (lead == 0xf4) upper = 0x8f;
+      }
+      if (byte < lower || byte > upper) break;
+      seen++;
+    }
+    if (need != 0 && seen == need) { memcpy(out + n, data + i, need + 1); n += need + 1; }
+    else { out[n++] = (char)0xef; out[n++] = (char)0xbf; out[n++] = (char)0xbd; }
+    i += 1 + seen;
+  }
+  out[n] = 0;
+  free(raw);
+  return out;
+}
 char *qa_compat_q2_read_guest_string(const qa_compat_q2_memory *memory, qa_guest_address address, double maximum) {
   double limit = maximum < 0 ? 1048576.0 : maximum;
   if (memory->managed && memory->find_zero) {
@@ -25,7 +59,7 @@ char *qa_compat_q2_read_guest_string(const qa_compat_q2_memory *memory, qa_guest
     if (memory->copy_into) memory->copy_into(memory->ctx, address, (uint8_t *)out, (size_t)length, (double)length);
     else memory->copy(memory->ctx, address, (uint8_t *)out, (double)length);
     out[length] = 0;
-    return out;
+    return qa_compat_q2_decode_guest_text(out, (size_t)length);
   }
   size_t max = limit > 0 ? (size_t)limit : 0;
   char *out = xmalloc(max + 1);
@@ -35,7 +69,7 @@ char *qa_compat_q2_read_guest_string(const qa_compat_q2_memory *memory, qa_guest
       if (memory->copy_into) memory->copy_into(memory->ctx, address, (uint8_t *)out, len, (double)len);
       else memory->copy(memory->ctx, address, (uint8_t *)out, (double)len);
       out[len] = 0;
-      return out;
+      return qa_compat_q2_decode_guest_text(out, len);
     }
   }
   free(out);
@@ -158,7 +192,7 @@ void qa_compat_q2_rerelease_core_imports_free(qa_compat_q2_rerelease_core_import
       return;
     }
   }
-  qa_range_error("Q2 TagFree received an unowned or already freed allocation");
+  qa_raise("Error", 0, 0, "Q2 TagFree received an unowned or already freed allocation");
 }
 static qa_guest_call_result result_void(void) { qa_guest_call_result r; memset(&r, 0, sizeof r); r.kind = QA_GUEST_VALUE_VOID; return r; }
 static qa_guest_call_result result_u32(double v) { qa_guest_call_result r; memset(&r, 0, sizeof r); r.kind = QA_GUEST_VALUE_UINT32; r.number_value = v; return r; }
@@ -182,7 +216,12 @@ qa_guest_call_result qa_compat_q2_rerelease_core_imports_invoke(qa_compat_q2_rer
   const char *name = call.name;
   qa_compat_q2_rerelease_core_services *s = &c->services;
   if (strcmp(name, "Com_Print") == 0) { char *t = arg_text(c, args, count, 0); s->print(s->ctx, t); free(t); return result_void(); }
-  if (strcmp(name, "Com_Error") == 0) { char *t = arg_text(c, args, count, 0); qa_range_error("Q2 %s: %s", call.api, t); }
+  if (strcmp(name, "Com_Error") == 0) {
+    /* throw new Error(`Q2 ${call.api}: ${text(0)}`): the raise formats the text before the cleanup frees it. */
+    char *t = arg_text(c, args, count, 0);
+    qa_cleanup node; qa_cleanup_push(&node, free, t);
+    qa_raise("Error", 0, 0, "Q2 %s: %s", call.api, t);
+  }
   if (strcmp(name, "get_configstring") == 0)
     return qa_compat_q2_rerelease_guest_pointer(true, qa_compat_q2_rerelease_core_imports_string(c, s->get_configstring(s->ctx, (double)qa_compat_q2_guest_integer(args, count, 0))));
   if (strcmp(name, "configstring") == 0) {
@@ -221,7 +260,20 @@ qa_guest_call_result qa_compat_q2_rerelease_core_imports_invoke(qa_compat_q2_rer
       int64_t index = qa_compat_q2_guest_integer(args, count, 0);
       value = index >= 0 && (size_t)index < n && argv[index] ? argv[index] : "";
     }
-    qa_guest_address address = qa_compat_q2_command_guest_strings_get(c->command_strings, key, at, value);
+    /* TS new TextEncoder().encode(text): command text holds one byte per UTF-16
+     * unit (console text), so each byte is its code point's UTF-8. */
+    size_t value_length = strlen(value);
+    char *encoded = malloc(value_length * 2 + 1);
+    if (!encoded) { free(key); qa_range_error("Q2 import allocation failed"); }
+    size_t written = 0;
+    for (size_t i = 0; i < value_length; i++) {
+      unsigned char unit = (unsigned char)value[i];
+      if (unit < 0x80) encoded[written++] = (char)unit;
+      else { encoded[written++] = (char)(0xc0 | (unit >> 6)); encoded[written++] = (char)(0x80 | (unit & 0x3f)); }
+    }
+    encoded[written] = '\0';
+    qa_guest_address address = qa_compat_q2_command_guest_strings_get(c->command_strings, key, at, encoded);
+    free(encoded);
     free(key);
     return qa_compat_q2_rerelease_guest_pointer(true, address);
   }
@@ -250,9 +302,11 @@ qa_guest_call_result qa_compat_q2_rerelease_core_imports_invoke(qa_compat_q2_rer
   if (strcmp(name, "Info_ValueForKey") == 0) {
     qa_guest_address input = qa_compat_q2_guest_required_pointer(args, count, 0);
     char *key = arg_text(c, args, count, 1);
+    qa_cleanup key_node; qa_cleanup_push(&key_node, free, key);
     int64_t maximum = qa_compat_q2_guest_integer(args, count, 3);
-    if (maximum < 0 || maximum > 9007199254740991LL) { free(key); qa_range_error("Invalid Q2 info output size"); }
+    if (maximum < 0 || maximum > 9007199254740991LL) qa_range_error("Invalid Q2 info output size");
     char *value = qa_compat_q2_read_guest_string(c->memory, input, 2048);
+    qa_cleanup value_node; qa_cleanup_push(&value_node, free, value);
     size_t length = strlen(value), cursor = value[0] == '\\' ? 1 : 0;
     const char *found = ""; size_t found_len = 0;
     while (cursor < length) {
@@ -271,6 +325,7 @@ qa_guest_call_result qa_compat_q2_rerelease_core_imports_invoke(qa_compat_q2_rer
       c->memory->write(c->memory->ctx, output, (const uint8_t *)found, n);
       qa_compat_q2_mem_write_u8(c->memory, qa_compat_q2_mem_offset(c->memory, output, (int64_t)n), 0);
     }
+    qa_cleanup_pop(&value_node); qa_cleanup_pop(&key_node);
     free(key); free(value);
     return result_u64((uint64_t)found_len);
   }
@@ -282,24 +337,35 @@ qa_guest_call_result qa_compat_q2_rerelease_core_imports_invoke(qa_compat_q2_rer
     return cvar_result(c, filled, &snap);
   }
   if (strcmp(name, "cvar_set") == 0 || strcmp(name, "cvar_forceset") == 0) {
-    char *n0 = arg_text(c, args, count, 0), *n1 = arg_text(c, args, count, 1);
+    char *n0 = arg_text(c, args, count, 0);
+    qa_cleanup name_node; qa_cleanup_push(&name_node, free, n0);
     qa_cvar_snapshot snap; memset(&snap, 0, sizeof snap);
     /* A guest may not overwrite the credentials it is not allowed to read. */
     bool filled = qa_cvar_registry_get(s->cvars, n0, &snap);
     if (!filled || (snap.flags & QA_Q2_CVAR_FLAG_PRIVATE) == 0) {
       if (filled) qa_cvar_read_free(&snap);
       memset(&snap, 0, sizeof snap);
+      /* The value is read only when the set runs: a refused private cvar never touches the guest's value pointer. */
+      char *n1 = arg_text(c, args, count, 1);
+      qa_cleanup value_node; qa_cleanup_push(&value_node, free, n1);
       filled = qa_cvar_registry_set(s->cvars, n0, n1, strcmp(name, "cvar_forceset") == 0, &snap);
+      qa_cleanup_pop(&value_node); free(n1);
     }
-    free(n0); free(n1);
+    qa_cleanup_pop(&name_node); free(n0);
     return cvar_result(c, filled, &snap);
   }
   if (strcmp(name, "TagMalloc") == 0) {
     int64_t raw = qa_compat_q2_guest_integer(args, count, 0);
-    if (raw < 0 || raw > 0x10000000LL) qa_range_error("Q2 TagMalloc size exceeds mapped-memory allocation limit");
+    /* Only the guest's own address space limits an allocation; a size past it faults when it is mapped. */
+    if (raw < 0 || raw > 9007199254740991LL) qa_range_error("Q2 TagMalloc size is outside the guest address space");
     double size = raw > 1 ? (double)raw : 1, tag = (double)qa_compat_q2_guest_integer(args, count, 1);
     char label[128], num[64]; fmt_number(num, sizeof num, tag); snprintf(label, sizeof label, "Q2 tag %s", num);
     qa_guest_address address = qa_compat_q2_allocate_native_memory(c->memory, size, label);
+    /* this.#allocations.set(address.byteOffset, ...): a key already present keeps its place and takes the new record. */
+    for (size_t i = 0; i < c->alloc_count; i++) if (c->allocs[i].key == address.byte_offset) {
+      c->allocs[i] = (allocation_t){address.byte_offset, address, size, tag};
+      return qa_compat_q2_rerelease_guest_pointer(true, address);
+    }
     if (c->alloc_count == c->alloc_cap) {
       c->alloc_cap = c->alloc_cap ? c->alloc_cap * 2 : 16;
       c->allocs = realloc(c->allocs, c->alloc_cap * sizeof *c->allocs);

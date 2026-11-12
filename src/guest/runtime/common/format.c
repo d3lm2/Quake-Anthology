@@ -10,7 +10,8 @@
 #include "qa/guest/runtime/common/memory.h"
 #include "qa/foundation/js.h"
 
-void qa_guest_format_fortify_failure(const char *message) { qa_range_error("%s", message); }
+/* TS `throw new GuestFormatFortifyFailure(message)` (error.name). */
+void qa_guest_format_fortify_failure(const char *message) { qa_raise("GuestFormatFortifyFailure", 0, 0, "%s", message); }
 
 static void *xmalloc(size_t size) {
   void *p = malloc(size == 0 ? 1 : size);
@@ -191,7 +192,8 @@ static void parse_format(parsed_format *parsed, const char *text, const qa_guest
     conversion conv; memset(&conv, 0, sizeof conv);
     size_t flag_len = 0;
     while (p.at < p.length && strchr("-+ #0'", p.text[p.at]) != NULL) {
-      if (flag_len < sizeof conv.flags - 1) conv.flags[flag_len++] = p.text[p.at];
+      conv.flags[flag_len] = '\0';
+      if (strchr(conv.flags, p.text[p.at]) == NULL) conv.flags[flag_len++] = p.text[p.at]; /* six distinct flags at most */
       p.at++;
     }
     conv.flags[flag_len] = '\0';
@@ -261,8 +263,8 @@ static const parsed_format *retained_format(const char *text, const qa_guest_for
                                             parsed_format *scratch, bool *scratch_used) {
   *scratch_used = false;
   if (strlen(text) > RETAINED_FORMAT_LIMIT) {
+    *scratch_used = true; /* before the parse: a conversion that fails part way is released with the run */
     parse_format(scratch, text, request);
-    *scratch_used = true;
     return scratch;
   }
   retained_format_table **slot =
@@ -275,8 +277,15 @@ static const parsed_format *retained_format(const char *text, const qa_guest_for
   uint32_t hash = format_text_hash(text);
   for (size_t i = 0; i < table->count; i++)
     if (table->hashes[i] == hash && strcmp(table->keys[i], text) == 0) return &table->values[i];
-  parsed_format parsed;
-  parse_format(&parsed, text, request);
+  *scratch_used = true; /* the parse is the run's until the table takes it */
+  parse_format(scratch, text, request);
+  const parsed_format parsed = *scratch;
+  size_t length = strlen(text);
+  char *key = (char *)malloc(length + 1);
+  if (key == NULL) qa_range_error("Out of memory");
+  memcpy(key, text, length + 1);
+  memset(scratch, 0, sizeof *scratch);
+  *scratch_used = false;
   size_t at;
   if (table->count == RETAINED_FORMAT_CAPACITY) {
     at = table->oldest;
@@ -286,10 +295,7 @@ static const parsed_format *retained_format(const char *text, const qa_guest_for
   } else {
     at = table->count++;
   }
-  size_t length = strlen(text);
-  table->keys[at] = (char *)malloc(length + 1);
-  if (table->keys[at] == NULL) qa_range_error("Out of memory");
-  memcpy(table->keys[at], text, length + 1);
+  table->keys[at] = key;
   table->hashes[at] = hash;
   table->values[at] = parsed;
   return &table->values[at];
@@ -307,8 +313,8 @@ static void output_check_total(output *out) {
 static void output_append(output *out, const char *text, size_t length) {
   if (length == 0) return;
   const qa_guest_format_request *r = out->request;
-  int64_t available = !r->has_buffer ? 0 : (r->capacity > out->used ? r->capacity - out->used : 0);
-  size_t copied = (size_t)available < length ? (size_t)available : length;
+  uint64_t available = !r->has_buffer ? 0 : (r->capacity > (uint64_t)out->used ? r->capacity - (uint64_t)out->used : 0);
+  size_t copied = available < length ? (size_t)available : length;
   if (r->has_buffer && copied > 0) {
     qa_memory_write(r->memory, qa_memory_offset(r->memory, r->buffer, out->used),
                     (const uint8_t *)text, copied);
@@ -325,9 +331,8 @@ static void output_repeat(output *out, char character, int64_t count) {
   char chunk[4096];
   memset(chunk, character, sizeof chunk);
   if (r->termination == QA_TERMINATION_C99 || r->continue_count || !r->has_buffer) {
-    int64_t available = !r->has_buffer ? 0 : r->capacity - out->used;
-    if (available < 0) available = 0;
-    int64_t copied = count < available ? count : available;
+    uint64_t available = !r->has_buffer || r->capacity <= (uint64_t)out->used ? 0 : r->capacity - (uint64_t)out->used;
+    int64_t copied = (uint64_t)count < available ? count : (int64_t)available;
     for (int64_t at = 0; at < copied; at += 4096) {
       int64_t piece = copied - at < 4096 ? copied - at : 4096;
       output_append(out, chunk, (size_t)piece);
@@ -350,19 +355,19 @@ static qa_guest_format_result output_finish(output *out, bool has_error, int err
     result.result = !has_error ? (int)out->total : -1;
     return result;
   }
-  int64_t capacity = r->capacity;
+  const uint64_t capacity = r->capacity, used = (uint64_t)out->used;
   if (r->termination == QA_TERMINATION_UCRT_LEGACY) {
-    if (out->used < capacity)
+    if (used < capacity)
       qa_memory_write_u8(r->memory, qa_memory_offset(r->memory, r->buffer, out->used), 0);
-    result.result = (has_error || full || out->total > capacity) ? -1 : (int)out->total;
+    result.result = (has_error || full || (uint64_t)out->total > capacity) ? -1 : (int)out->total;
     return result;
   }
   if (capacity > 0) {
     int64_t at = (has_error && r->dialect == QA_FORMAT_WINDOWS && r->termination == QA_TERMINATION_C99) ? 0
-        : out->used >= capacity ? capacity - 1 : out->used;
+        : used >= capacity ? (int64_t)(capacity - 1) : out->used;
     qa_memory_write_u8(r->memory, qa_memory_offset(r->memory, r->buffer, at), 0);
   }
-  if (r->termination == QA_TERMINATION_UCRT && (capacity == 0 || out->used == capacity)) {
+  if (r->termination == QA_TERMINATION_UCRT && (capacity == 0 || used == capacity)) {
     result.result = capacity == 0 ? -1 : -2;
     return result;
   }
@@ -463,6 +468,39 @@ static void uint_to_radix(bstr *out_text, uint64_t value, int radix, bool upper)
   for (size_t i = n; i-- > 0;) bstr_append(out_text, &reversed[i], 1);
 }
 
+/* Everything one run owns. It is released when the run ends, by the printf failure exits (a local longjmp)
+ * and by a raise (a guest fault while a string or the va_list is read). */
+typedef struct format_scope {
+  char *text;
+  parsed_format long_format;
+  bool long_format_used;
+  qa_format_argument *values;
+  size_t value_count;
+  qa_format_argument_type *types;
+  bool *seen;
+  bstr body, prefix, padded;
+  qa_format_argument value;
+  bool value_owned;
+  char *formatted;
+  format_throw *previous_throw;
+} format_scope;
+static void format_scope_release(void *arg) {
+  format_scope *scope = arg;
+  free(scope->text);
+  if (scope->long_format_used) parsed_format_free(&scope->long_format);
+  for (size_t i = 0; i < scope->value_count; i++) qa_format_argument_free(&scope->values[i]);
+  free(scope->values);
+  free(scope->types);
+  free(scope->seen);
+  bstr_free(&scope->body);
+  bstr_free(&scope->prefix);
+  bstr_free(&scope->padded);
+  if (scope->value_owned) qa_format_argument_free(&scope->value);
+  free(scope->formatted);
+  g_throw = scope->previous_throw;
+  memset(scope, 0, sizeof *scope);
+}
+
 typedef struct format_run {
   const qa_guest_format_request *request;
   qa_format_arguments *reader;
@@ -473,7 +511,7 @@ typedef struct format_run {
 
 static qa_format_argument get_argument(format_run *run, reference ref) {
   if (!run->positional) {
-    if (run->reader == NULL) qa_range_error("Missing printf argument reader");
+    if (run->reader == NULL) qa_raise("Error", 0, 0, "Missing printf argument reader");
     return qa_format_arguments_next(run->reader, ref.type);
   }
   if (ref.index < 0 || (size_t)ref.index >= run->value_count) format_failure(22);
@@ -490,11 +528,9 @@ static int64_t amount_value(format_run *run, amount value) {
   return result;
 }
 
-static qa_guest_format_result format_run_body(const qa_guest_format_request *request, output *out) {
-  char *text = qa_read_string(request->memory, request->memory_ext, request->format, 1048576);
-  parsed_format long_format;
-  bool long_format_used;
-  const parsed_format *retained = retained_format(text, request, &long_format, &long_format_used);
+static qa_guest_format_result format_run_body(const qa_guest_format_request *request, output *out, format_scope *scope) {
+  char *text = scope->text = qa_read_string(request->memory, request->memory_ext, request->format, 1048576);
+  const parsed_format *retained = retained_format(text, request, &scope->long_format, &scope->long_format_used);
   const parsed_format parsed = *retained;
   qa_format_arguments reader;
   bool has_reader = parsed.reference_count > 0;
@@ -510,8 +546,8 @@ static qa_guest_format_result format_run_body(const qa_guest_format_request *req
     size_t max_index = 0;
     for (size_t i = 0; i < parsed.reference_count; i++)
       if (parsed.references[i].index + 1 > (int)max_index) max_index = (size_t)parsed.references[i].index + 1;
-    qa_format_argument_type *types = xmalloc(max_index * sizeof *types);
-    bool *seen = xmalloc(max_index * sizeof *seen);
+    qa_format_argument_type *types = scope->types = xmalloc(max_index * sizeof *types);
+    bool *seen = scope->seen = xmalloc(max_index * sizeof *seen);
     memset(seen, 0, max_index * sizeof *seen);
     for (size_t i = 0; i < parsed.reference_count; i++) {
       reference ref = parsed.references[i];
@@ -521,12 +557,14 @@ static qa_guest_format_result format_run_body(const qa_guest_format_request *req
     }
     size_t type_count = 0;
     for (size_t i = 0; i < max_index; i++) if (seen[i]) type_count++;
-    run.values = xmalloc(type_count * sizeof *run.values);
+    run.values = scope->values = xmalloc(type_count * sizeof *run.values);
     run.value_count = type_count;
     for (size_t index = 0; index < type_count; index++) {
       if (index >= max_index || !seen[index] || !has_reader) format_failure(22);
       run.values[index] = qa_format_arguments_next(&reader, types[index]);
+      scope->value_count = index + 1;
     }
+    scope->types = NULL; scope->seen = NULL;
     free(types); free(seen);
   }
 
@@ -546,10 +584,13 @@ static qa_guest_format_result format_run_body(const qa_guest_format_request *req
     bool alternate = strchr(conv->flags, '#') != NULL;
     bool plus = strchr(conv->flags, '+') != NULL;
     bool blank = strchr(conv->flags, ' ') != NULL;
-    if (!conv->has_argument) qa_range_error("Missing printf conversion argument");
-    qa_format_argument value = get_argument(&run, conv->argument);
+    if (!conv->has_argument) qa_raise("Error", 0, 0, "Missing printf conversion argument");
+    scope->value = get_argument(&run, conv->argument);
+    scope->value_owned = !run.positional;
+#define value scope->value
+#define body scope->body
+#define prefix scope->prefix
     char code = conv->code;
-    bstr body, prefix;
     bstr_init(&body); bstr_init(&prefix);
     bool zero = strchr(conv->flags, '0') != NULL && !left;
     bool skip_output = false;
@@ -582,13 +623,14 @@ static qa_guest_format_result format_run_body(const qa_guest_format_request *req
       if (has_precision) zero = false;
     } else if (strchr("fFeEgGaA", code) != NULL) {
       if (!value.is_float) format_failure(22);
-      char *formatted = qa_format_float(&value.float_value, code, has_precision, (int)precision,
+      char *formatted = scope->formatted = qa_format_float(&value.float_value, code, has_precision, (int)precision,
                                         alternate, request->rounding,
                                         request->dialect == QA_FORMAT_WINDOWS,
                                         strcmp(conv->length, "L") == 0 && request->dialect == QA_FORMAT_SYSTEM_V,
                                         request->exponent_digits);
       if (formatted == NULL) qa_range_error("Guest runtime out of memory");
       bstr_append_str(&body, formatted);
+      scope->formatted = NULL;
       free(formatted);
       if (value.float_value.sign == 1) bstr_append_str(&prefix, "-");
       else if (plus) bstr_append_str(&prefix, "+");
@@ -650,12 +692,13 @@ static qa_guest_format_result format_run_body(const qa_guest_format_request *req
         qa_guest_format_fortify_failure("glibc %n in writable format storage");
       qa_guest_core_address address = {0};
       if (!qa_memory_pointer(request->memory, argument_integer(&value), &address))
-        qa_range_error("Null printf count pointer");
+        qa_raise("TypeError", 0, 0, "Null printf count pointer");
       qa_write_unsigned(request->memory, address, integer_bits(conv->length, request) / 8,
                         (uint64_t)out->total);
       skip_output = true;
     }
-    if (!run.positional) qa_format_argument_free(&value);
+    if (scope->value_owned) qa_format_argument_free(&value);
+    scope->value_owned = false;
     if (skip_output) { bstr_free(&body); bstr_free(&prefix); continue; }
     int64_t padding = width - (int64_t)prefix.len - (int64_t)body.len;
     if (padding < 0) padding = 0;
@@ -666,18 +709,17 @@ static qa_guest_format_result format_run_body(const qa_guest_format_request *req
     if (left) output_repeat(out, ' ', padding);
     bstr_free(&body);
     bstr_free(&prefix);
+#undef value
+#undef body
+#undef prefix
   }
   final = output_finish(out, false, 0, false);
-  for (size_t i = 0; i < run.value_count; i++) qa_format_argument_free(&run.values[i]);
-  free(run.values);
-  if (long_format_used) parsed_format_free(&long_format);
-  free(text);
   return final;
 }
 
 qa_guest_format_result qa_format_guest_buffer(const qa_guest_format_request *request) {
-  int64_t limit = request->memory->pointer_bytes == 4 ? 0xffffffffLL : INT64_MAX;
-  if (request->capacity < 0 || request->capacity > limit)
+  /* capacity is the guest's size_t: any 64-bit value on a 64-bit guest (sprintf passes SIZE_MAX). */
+  if (request->memory->pointer_bytes == 4 && request->capacity > 0xffffffffull)
     qa_range_error("Guest printf buffer count is not size_t");
   if (!request->has_format || (!request->has_buffer && request->capacity != 0)) {
     qa_guest_format_result result = {-1, true, 22};
@@ -686,14 +728,20 @@ qa_guest_format_result qa_format_guest_buffer(const qa_guest_format_request *req
   output out; memset(&out, 0, sizeof out);
   out.request = request;
   format_throw catcher; memset(&catcher, 0, sizeof catcher);
-  format_throw *previous = g_throw;
+  format_scope scope; memset(&scope, 0, sizeof scope);
+  scope.previous_throw = g_throw;
+  qa_cleanup scope_node;
+  qa_cleanup_push(&scope_node, format_scope_release, &scope);
   g_throw = &catcher;
   if (setjmp(catcher.buf) != 0) {
-    g_throw = previous;
+    /* FormatFailure / BufferFull: nothing was pushed between the setjmp and the jump. */
+    qa_cleanup_pop(&scope_node);
+    format_scope_release(&scope);
     if (catcher.kind == 2) return output_finish(&out, false, 0, true);
     return output_finish(&out, true, catcher.errno_value, false);
   }
-  qa_guest_format_result result = format_run_body(request, &out);
-  g_throw = previous;
+  qa_guest_format_result result = format_run_body(request, &out, &scope);
+  qa_cleanup_pop(&scope_node);
+  format_scope_release(&scope);
   return result;
 }

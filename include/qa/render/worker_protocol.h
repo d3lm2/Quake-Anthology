@@ -98,7 +98,7 @@ qa_image_resource_operation qa_wire_decoder_image_operation(qa_wire_decoder *dec
 qa_draw_batch qa_wire_decoder_batch(qa_wire_decoder *decoder, qa_wire_batch *batch);
 /* Draw and object-opacity results carry no batches: decode wire->batches when reached. */
 qa_execution_operation qa_wire_decoder_operation(qa_wire_decoder *decoder, const qa_wire_operation *operation);
-/* TS viewState drops viewProjection, so a worker view never has one. */
+/* viewport, clear, clipPlane and the optional viewProjection. */
 qa_render_view_state qa_wire_decoder_view_state(qa_wire_decoder *decoder, const qa_wire_view *view);
 /* Raises a command's deferred failure. For a view, only that check runs: execute the
  * leaves through wire->view. */

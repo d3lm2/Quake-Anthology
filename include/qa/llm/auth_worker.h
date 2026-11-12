@@ -6,8 +6,9 @@
  * through a callback, and the owner (auth.ts's login flow, ported in
  * auth.c) pumps qa_llm_auth_worker_serve_once while it waits. The pure
  * request/response mapping is qa_llm_auth_worker_handle_request.
- * Startup validation throws plain Error in TS, so it aborts here with
- * the identical message via qa_llm_plain_error.
+ * Startup validation throws plain Error inside the TS worker thread; the
+ * parent only sees the worker fail, so here it is a false/NULL return
+ * and never aborts.
  * GPL-2.0-or-later.
  */
 #ifndef QA_LLM_AUTH_WORKER_H
@@ -36,13 +37,15 @@ typedef void (*qa_llm_auth_worker_post_fn)(void *ctx, const qa_llm_auth_worker_m
 
 typedef struct qa_llm_auth_worker qa_llm_auth_worker;
 
-/* workerData validation (fields() + the port/state checks). Aborts with
- * "Invalid subscription callback worker data." on any violation. */
-void qa_llm_auth_worker_parse_data(const qa_llm_json *worker_data, int *out_port, char **out_state);
-void qa_llm_auth_worker_validate(int requested_port, const char *expected_state);
+/* workerData validation (fields() + the port/state checks): false where
+ * the TS worker throws "Invalid subscription callback worker data.". */
+bool qa_llm_auth_worker_parse_data(const qa_llm_json *worker_data, int *out_port, char **out_state);
+bool qa_llm_auth_worker_validate(int requested_port, const char *expected_state);
 
 /* Starts the listener and posts ready (or listen-error and returns
- * NULL, mirroring the worker posting then throwing). */
+ * NULL, mirroring the worker posting then throwing). Invalid workerData
+ * returns NULL without posting: the worker throws first, and the parent
+ * sees only its error/exit ("Sign-in failed."). */
 qa_llm_auth_worker *qa_llm_auth_worker_start(int requested_port, const char *expected_state,
                                              qa_llm_auth_worker_post_fn post, void *post_ctx);
 int qa_llm_auth_worker_port(const qa_llm_auth_worker *worker);

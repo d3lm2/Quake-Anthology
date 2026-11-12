@@ -64,7 +64,7 @@ qa_guest_address qa_compat_q2_allocate_pooled_native_memory(const qa_compat_q2_m
   return bytes == 4096 && m->allocate_pooled != NULL ? m->allocate_pooled(m->ctx, bytes, 4096, label) : m->allocate(m->ctx, bytes, true, 4096, label);
 }
 const qa_guest_call_value *qa_compat_q2_guest_argument(const qa_guest_call_value *args, size_t count, size_t index) {
-  if (index >= count) qa_range_error("Missing guest argument %zu", index);
+  if (index >= count) qa_raise("TypeError", 0, 0, "Missing guest argument %zu", index);
   return &args[index];
 }
 int64_t qa_compat_q2_guest_integer(const qa_guest_call_value *args, size_t count, size_t index) {
@@ -72,18 +72,18 @@ int64_t qa_compat_q2_guest_integer(const qa_guest_call_value *args, size_t count
   if (v->kind == QA_GUEST_VALUE_INT64) return v->int64_value;
   if (v->kind == QA_GUEST_VALUE_UINT64) return (int64_t)v->uint64_value;
   if (v->kind == QA_GUEST_VALUE_INT32 || v->kind == QA_GUEST_VALUE_UINT32) return (int64_t)v->number_value;
-  qa_range_error("Guest integer required");
+  qa_raise("TypeError", 0, 0, "Guest integer required");
 }
 bool qa_compat_q2_guest_pointer(const qa_guest_call_value *args, size_t count, size_t index, qa_guest_address *out) {
   const qa_guest_call_value *v = qa_compat_q2_guest_argument(args, count, index);
-  if (v->kind != QA_GUEST_VALUE_POINTER) qa_range_error("Guest pointer required");
+  if (v->kind != QA_GUEST_VALUE_POINTER) qa_raise("TypeError", 0, 0, "Guest pointer required");
   if (!v->pointer_value.has_value) return false;
   if (out) *out = v->pointer_value.value;
   return true;
 }
 qa_guest_address qa_compat_q2_guest_required_pointer(const qa_guest_call_value *args, size_t count, size_t index) {
   qa_guest_address a; memset(&a, 0, sizeof a);
-  if (!qa_compat_q2_guest_pointer(args, count, index, &a)) qa_range_error("Nonnull guest pointer required");
+  if (!qa_compat_q2_guest_pointer(args, count, index, &a)) qa_raise("TypeError", 0, 0, "Nonnull guest pointer required");
   return a;
 }
 qa_guest_call_value qa_compat_q2_call_pointer(bool has, qa_guest_address value) {

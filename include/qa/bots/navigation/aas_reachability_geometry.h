@@ -21,6 +21,9 @@ qa_aas_setting_rec *qa_aas_at_setting_mut(qa_aas_asset *world, int64_t index);
 const qa_aas_reach_rec *qa_aas_at_reach(const qa_aas_asset *world, int64_t index);
 qa_vec3 qa_aas_at_vertex(const qa_aas_asset *world, int64_t index);
 qa_aas_linked_reachability *qa_aas_at_head(qa_aas_reachability_context *context, int64_t index);
+/* crossings.some(c => (aasAt(settings, c.area).contents & mask) !== 0); takes and frees `crossings`
+ * (also before an out-of-range RangeError). */
+bool qa_aas_crossings_any_contents(const qa_aas_asset *world, qa_aas_area_crossing *crossings, size_t count, int64_t mask);
 
 double qa_aas_face_area(const qa_aas_asset *world, const qa_aas_face_rec *face);
 double qa_aas_area_volume(const qa_aas_asset *world, int64_t area_number);

@@ -100,7 +100,7 @@ void qa_shade_q2_fragment_into(qa_cpu_sample *out,const qa_cpu_lighting *lightin
     double g=is_model?vertex.y:!is_tex?texel->g:texel->g*vertex.y;
     double b=is_model?vertex.z:!is_tex?texel->b:texel->b*vertex.z;
     if(is_model&&p->has_shade_scale){
-      if(p->atlas==NULL||lighting->depth==NULL) qa_range_error("CPU model shadows require their depth atlas");
+      if(p->atlas==NULL||lighting->depth==NULL) qa_raise("Error", 0, 0, "CPU model shadows require their depth atlas");
       /* TS passes Q2FragmentLight[] here; fraction lives on that shape. */
       qa_vec3 shade; shade.x=vertex.x;shade.y=vertex.y;shade.z=vertex.z;
       double kr=1,kg=1,kb=1;
@@ -122,7 +122,7 @@ void qa_shade_q2_fragment_into(qa_cpu_sample *out,const qa_cpu_lighting *lightin
       if(contrib.x==0&&contrib.y==0&&contrib.z==0)continue;
       double vis=1;
       if(strcmp(l->shadow.kind,"none")){
-        if(p->atlas==NULL||lighting->depth==NULL) qa_range_error("CPU shadow light requires its depth atlas");
+        if(p->atlas==NULL||lighting->depth==NULL) qa_raise("Error", 0, 0, "CPU shadow light requires its depth atlas");
         vis=qa_cpu_shadow_visibility(position,l->origin,l->radius,l->shadow,*p->atlas,*lighting->depth,false);
       }
       r+=contrib.x*vis;g+=contrib.y*vis;b+=contrib.z*vis;
@@ -131,7 +131,7 @@ void qa_shade_q2_fragment_into(qa_cpu_sample *out,const qa_cpu_lighting *lightin
     if(p->pass&&!strcmp(p->pass,"material-lightmap")){r*=vertex.x;g*=vertex.y;b*=vertex.z;}
     out->r=r;out->g=g;out->b=b;out->a=(p->pass&&!strcmp(p->pass,"lightmap"))?1:texel->a*vertex.w; return;
   }
-  if(lighting->depth==NULL) qa_range_error("CPU model shadows require their depth atlas");
+  if(lighting->depth==NULL) qa_raise("Error", 0, 0, "CPU model shadows require their depth atlas");
   qa_vec3 shade=alias_shade(position,vertex,p->shade_scale,p->model_shadow_lights,p->model_shadow_light_count,p->atlas_value,*lighting->depth);
   out->r=texel->r*shade.x;out->g=texel->g*shade.y;out->b=texel->b*shade.z;out->a=texel->a*vertex.w;
 }

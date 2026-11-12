@@ -1,0 +1,36 @@
+# tools/depth_audit.py exceptions: thin or missing C ports whose token deficit is explained.
+# ts_source	reason
+src/guest/x86/fast.ts	perf-only predecoded fast path, not ported (manifest unported-perf); the ported interpreter computes the same result (TS differential tests)
+src/guest/floating-point/fast-arithmetic.ts	perf-only exact fast paths for SSE/x87 binary ops, not ported (manifest unported-perf); the ported soft-float path computes the same result (gate-guest2 differential run)
+src/app/bootstrap/simulation/source-strategy.ts	the 228 SourceStrategy members are qa_app_source_strategy table entries whose bodies are qa_ss_* functions in shared_simulation_{core,players,worlds,arsenal}.c (counted under runtime.ts); read member by member by gate-simA2..A4
+src/content/q2/foundation/monsters/muzzle.ts	offset tables as compact {x, y, z} initializers where TS spells Math.fround per component; both arrays and the 67 ids equal the bun dump (gate-q2c, tests/content/oracles/q2_monster_tables.txt)
+src/app/bootstrap/effects/q2-muzzle.ts	flash tables as compact initializers; compared value for value with bun over flashes 0..300 (gate-app9, test_app_gate_review9)
+src/content/q2/rerelease/monsters/tables/float.ts	move table as compact initializers; equal to a bun dump value for value (gate-q2r, tests/content/test_q2_gate_review_rerelease.c)
+src/content/q2/foundation/weapon-attachments.ts	table as compact initializers; 119 entries equal the bun dump (gate-q2a, tests/content/oracles/q2_weapon_attachments.txt)
+src/content/composition/q1/q3-pickups.ts	foreignQ3Pickup is qa_q1_foreign_q3_pickup in src/content/q1/foundation/pickups.c (counted under pickups.ts); read in full with it (gate-content2)
+src/formats/q12-model/normals.ts	162-entry table as compact FR() initializers where TS spells Math.fround per component; equal to the bun dump value for value (tests/formats/test_formats_audit_review.c)
+src/audio/reverb-presets.ts	preset table as positional initializers where TS names every field per preset; compared with bun (tests/audio/test_audio_gate_review2.c)
+src/platform/audio.ts	SDL2 backend only: TS also carries an SDL3 backend it prefers when present (not ported; C links SDL2); SDL2 path read in full (gate-misc, gate-misc2)
+src/platform/ipx-native.ts	Linux branch only; the Windows socket branch is not ported (no Windows build); Linux branch read in full (gate-misc2)
+src/contracts/render.ts	type-only contract: interfaces and unions become C structs and enums in the header; TS declarations are wordier
+src/contracts/movement.ts	type-only contract: interfaces and unions become C structs and enums in the header; TS declarations are wordier
+src/contracts/protocol.ts	type-only contract: interfaces and unions become C structs and enums in the header; TS declarations are wordier
+src/contracts/native-mod-callbacks.ts	type-only contract: callback interfaces become C function-pointer structs in the header
+src/contracts/mod-callbacks.ts	type-only contract: callback interfaces become C function-pointer structs in the header
+src/contracts/ui.ts	type-only contract: interfaces and unions become C structs and enums in the header; TS declarations are wordier
+src/contracts/qvm-mod-callbacks.ts	type-only contract: callback interfaces become C function-pointer structs in the header
+src/contracts/execution.ts	type-only contract: interfaces and unions become C structs and enums in the header; TS declarations are wordier
+src/contracts/gameplay.ts	type-only contract: interfaces and unions become C structs and enums in the header; TS declarations are wordier
+src/contracts/qvm-mod-presentation.ts	type-only contract: interfaces become C structs in the header
+src/contracts/time.ts	type-only contract: interfaces become C structs in the header
+src/content/q1/addons/monsters/bosses/sphere-points.ts	100-point table as compact initializers; compared entry for entry with the TS table (gate-q1c)
+src/network/q3/state/entity.ts	class of field initializers and per-field copies; C is a struct with memset init and struct assignment copies; read in full (gate-net3)
+src/network/q1/qw-constants.ts	constants as #define/enum where TS spells `export const NAME = value`; read in full (gate-net1)
+src/network/q1/constants.ts	constants as #define/enum where TS spells `export const NAME = value`; read in full (gate-net1)
+src/app/bootstrap/simulation/rerelease-guest-services-contract.ts	type-only contract (interfaces over the classic guest services); C structs in the header
+src/bots/behavior/q3/observations.ts	read in full (gate-bots2); TS type annotations on the observation records inflate its count
+src/content/q1/addons/index.ts	barrel and registration list; read in full (gate-q1b), registration order equal to TS
+src/compat/qc/index.ts	barrel (re-exports only); read in full (gate-cqc)
+src/bots/navigation/index.ts	barrel (re-exports only); read (gate-bots3)
+src/content/q2/missionpacks/index.ts	barrel and registration list; read in full (gate-q2mp)
+src/app/bootstrap/network/unified-types.ts	type-only file; read in full with the network type files (gate-appnet3)

@@ -1,6 +1,6 @@
 /* Port of src/compat/q2/rerelease/navigation.ts. GPL-2.0-or-later.
- * NavigationRuntime (bots/navigation) is not landed; the runtime
- * handle is opaque and path_to_goal is a fn+ctx mirror of
+ * The NavigationRuntime (bots/navigation) handle is opaque here and
+ * path_to_goal is a fn+ctx mirror of
  * rereleasePathToGoal (bots/navigation/rerelease-path.ts). */
 #ifndef QA_COMPAT_Q2_RERELEASE_NAVIGATION_H
 #define QA_COMPAT_Q2_RERELEASE_NAVIGATION_H

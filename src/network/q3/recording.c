@@ -9,6 +9,7 @@ static qa_q3_entity_state_record *recording_baseline(void *ctx, int64_t number) 
   size_t count;
   return &qa_q3_client_connection_baselines(client, &count)[number];
 }
+static void release_gamestate(void *state) { qa_q3_gamestate_destroy(state); }
 bool qa_q3_demo_gamestate(qa_q3_client_connection *client, int64_t *sequence_out, uint8_t **message_out, size_t *message_len_out) {
   int64_t sequence = (int32_t)(qa_q3_client_connection_server_message_sequence(client) - 1);
   qa_q3_gamestate state;
@@ -24,9 +25,13 @@ bool qa_q3_demo_gamestate(qa_q3_client_connection *client, int64_t *sequence_out
   ctx.parse_entities_number = 0;
   ctx.baseline = recording_baseline; ctx.baseline_ctx = client;
   ctx.history = NULL; ctx.history_ctx = NULL;
+  /* encodeServerMessage raises on a baseline that differs from its index or on MAX_MSGLEN. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_gamestate, &op.gamestate);
   bool ok = qa_q3_encode_server_message(qa_q3_reliable_ring_sequence(reliable), &op, 1, &ctx,
                                         qa_q3_client_connection_source_state(client), message_out, message_len_out);
-  qa_q3_gamestate_destroy(&state);
+  qa_cleanup_pop(&guard);
+  qa_q3_gamestate_destroy(&op.gamestate);
   *sequence_out = sequence;
   return ok;
 }
@@ -49,9 +54,18 @@ bool qa_q3_demo_recording_init(qa_q3_demo_recording **out, qa_q3_client_connecti
   r->client = client; r->file = *file;
   qa_q3_client_connection_set_demo_waiting(client, true);
   int64_t sequence = 0; uint8_t *message = NULL; size_t len = 0;
-  if (!qa_q3_demo_gamestate(client, &sequence, &message, &len)) { free(r); return false; }
-  recording_write(r, sequence, message, len);
-  free(message);
+  /* The seed encode and the sink's writes raise before the recording is the caller's. */
+  qa_cleanup recording_guard, message_guard;
+  qa_cleanup_push(&recording_guard, free, r);
+  bool ok = qa_q3_demo_gamestate(client, &sequence, &message, &len);
+  if (ok) {
+    qa_cleanup_push(&message_guard, free, message);
+    recording_write(r, sequence, message, len);
+    qa_cleanup_pop(&message_guard);
+    free(message);
+  }
+  qa_cleanup_pop(&recording_guard);
+  if (!ok) { free(r); return false; }
   *out = r; return true;
 }
 void qa_q3_demo_recording_destroy(qa_q3_demo_recording *r) { free(r); }

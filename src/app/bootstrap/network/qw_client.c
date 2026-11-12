@@ -40,6 +40,9 @@ struct qa_app_qw_client_network {
   qa_quakeworld_recording_state *recording_state;
   bool recording; qa_app_qw_recording_sink recording_sink; void *recording_token;
   bool recording_waiting;
+  /* TS recordingFailure: a command write that failed in submit, thrown by every later poll
+   * until a new attach (TS records it on the write chain and poll awaits the chain). */
+  bool has_recording_failure; qa_caught_error recording_failure;
   qa_qw_connect_client handshake; bool handshake_init;
   char *userinfo;
   bool skin_pass_pending, begun;
@@ -278,13 +281,16 @@ static bool records(qa_app_qw_client_network *n, qa_quakeworld_message *messages
         char **args = qa_quakeworld_command_arguments(cursor, &arg_count);
         if (!args) qa_range_error("out of memory");
         const char *name = arg_count ? args[0] : NULL;
+        /* TS: the whole test (cmd prespawn|spawn, numeric arguments, this server count) selects
+         * the forward; a line that fails it falls through to the other branches. */
+        bool numeric = true;
+        for (size_t j = 2; j < arg_count; j++)
+          if (!all_digits(args[j])) numeric = false;
         if (name && strcmp(name, "cmd") == 0 && arg_count > 1
-            && (strcmp(args[1], "prespawn") == 0 || strcmp(args[1], "spawn") == 0)) {
-          bool numeric = true;
-          for (size_t j = 2; j < arg_count; j++)
-            if (!all_digits(args[j])) numeric = false;
-          if (numeric && arg_count > 2 && n->has_data
-              && strtod(args[2], NULL) == n->data.server_count) {
+            && (strcmp(args[1], "prespawn") == 0 || strcmp(args[1], "spawn") == 0)
+            && numeric && arg_count > 2 && n->has_data
+            && strtod(args[2], NULL) == n->data.server_count) {
+          {
             size_t total = 1;
             for (size_t j = 1; j < arg_count; j++) total += strlen(args[j]) + 1;
             char *line = xmalloc(total);
@@ -397,6 +403,7 @@ static void datagram_scope_free(void *arg) {
 const void *const *qa_app_qw_client_network_poll(qa_app_qw_client_network *n,
     double now, size_t *out_count) {
   *out_count = 0;
+  if (n->has_recording_failure) qa_rethrow(&n->recording_failure);
   if (n->state == QA_APP_PHASE_CLOSED || n->state == QA_APP_PHASE_REJECTED) return NULL;
   if (!n->has_last_received) {
     n->last_received = now;
@@ -494,6 +501,13 @@ static const qa_qw_user_command *command_at(qa_app_qw_client_network *n, double 
     if (n->commands[i].sequence == sequence) return &n->commands[i].command;
   return NULL;
 }
+typedef struct recording_append_call {
+  qa_app_qw_client_network *n; const qa_quakeworld_demo_record *record;
+} recording_append_call;
+static void recording_append_body(void *ctx) {
+  recording_append_call *call = ctx;
+  call->n->recording_sink.append(call->n->recording_sink.ctx, call->record);
+}
 void qa_app_qw_client_network_submit(qa_app_qw_client_network *n,
     const void *const *commands, size_t count, double now) {
   if (n->state != QA_APP_PHASE_ACTIVE) return;
@@ -519,7 +533,12 @@ void qa_app_qw_client_network_submit(qa_app_qw_client_network *n,
       record.seconds = now / 1000;
       record.command = command;
       record.view_angles = command.angles;
-      n->recording_sink.append(n->recording_sink.ctx, &record);
+      recording_append_call call = {n, &record};
+      qa_caught_error caught;
+      if (!qa_try(recording_append_body, &call, &caught) && !n->has_recording_failure) {
+        n->recording_failure = caught;
+        n->has_recording_failure = true;
+      }
     }
     qa_size_buf buffer;
     if (!qa_size_buf_init(&buffer, 256, false)) qa_range_error("out of memory");
@@ -588,6 +607,7 @@ void *qa_app_qw_client_network_recording_attach(qa_app_qw_client_network *n,
     qa_raise("Error", 0, 0, "QuakeWorld recording cannot attach");
   n->recording_waiting = n->state == QA_APP_PHASE_ACTIVE;
   n->has_last_delta = false;
+  n->has_recording_failure = false;
   n->recording_sink = sink;
   n->recording = true;
   n->recording_token = xmalloc(1);

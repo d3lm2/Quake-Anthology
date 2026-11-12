@@ -8,6 +8,7 @@
 #include "qa/world/session/mod_commands.h"
 #include "qa/app/bootstrap/simulation/quakec_source.h"
 #include "qa/app/bootstrap/simulation/random.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 typedef struct prepared_ctx {
@@ -36,27 +37,27 @@ typedef struct runtime_ctx {
   /* The command binding borrows its names; readScript's last text stays until the next read. */
   const char **command_names;
   char *script;
+  bool provider_ready;
+  qa_guest_checkpoint saved; /* the last checkpoint's row, which the returned state borrows */
+  double random_words[31];   /* the last random checkpoint's words, which its state borrows (one per runtime) */
 } runtime_ctx;
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
-static double rnd_next_integer(void *ctx) { return qa_app_sim_source_random_next_integer(ctx); }
-static double rnd_next_unit(void *ctx) { return qa_app_sim_source_random_next_unit(ctx); }
+static double rnd_next_integer(void *ctx) { return qa_app_sim_source_random_next_integer(((runtime_ctx *)ctx)->random); }
+static double rnd_next_unit(void *ctx) { return qa_app_sim_source_random_next_unit(((runtime_ctx *)ctx)->random); }
 static qa_random_state rnd_checkpoint(void *ctx) {
-  qa_app_sim_source_random_state s = qa_app_sim_source_random_checkpoint(ctx);
+  runtime_ctx *r = ctx;
+  qa_app_sim_source_random_state s = qa_app_sim_source_random_checkpoint(r->random);
   qa_random_state out; memset(&out, 0, sizeof out);
   out.kind = QA_RANDOM_STATE_GLIBC_RANDOM;
-  static double words[31];
-  for (int i = 0; i < 31; i++) words[i] = s.words[i];
-  out.words = (qa_double_view){words, 31};
-  out.front = s.front; out.rear = s.rear; out.draws = s.draws;
+  for (int i = 0; i < 31; i++) r->random_words[i] = s.words[i];
+  out.words = (qa_double_view){r->random_words, 31};
+  out.front = s.front; out.rear = s.rear; out.draws = (double)s.draws;
   return out;
 }
 static void rnd_restore(void *ctx, qa_random_state state) {
-  if (state.kind != QA_RANDOM_STATE_GLIBC_RANDOM) qa_range_error("Invalid QuakeC mod random state");
-  qa_app_sim_source_random_state s; memset(&s, 0, sizeof s);
-  s.kind = "glibc-random";
-  for (size_t i = 0; i < state.words.count && i < 31; i++) s.words[i] = qa_js_to_int32(state.words.values[i]);
-  s.front = (int)state.front; s.rear = (int)state.rear; s.draws = (int64_t)state.draws;
-  qa_app_sim_source_random_restore(ctx, s);
+  if (state.kind != QA_RANDOM_STATE_GLIBC_RANDOM) qa_raise("Error", 0, 0, "Invalid QuakeC mod random state");
+  /* random.restore(state): a word list of another length is RangeError "Invalid source random state". */
+  qa_app_sim_source_random_restore(((runtime_ctx *)ctx)->random, qa_app_sim_source_random_state_of(&state));
 }
 static void validate_state(void *ctx, qa_mod_private_checkpoint state) {
   prepared_ctx *p = ctx;
@@ -68,17 +69,16 @@ static void validate_state(void *ctx, qa_mod_private_checkpoint state) {
       || guest->globals.length != p->program.initial_globals_length
       || guest->function_index != 0 || guest->call_stack_count != 0 || guest->locals.length != 0
       || !is(guest->host_state.format, "quakec:host-v1"))
-    qa_range_error("Incompatible QuakeC gameplay mod checkpoint");
+    qa_raise("Error", 0, 0, "Incompatible QuakeC gameplay mod checkpoint");
 }
-static void rt_close(void *ctx) {
-  runtime_ctx *r = ctx;
-  qa_compat_qc_mod_provider_close(&r->provider);
-  qa_compat_qc_mod_provider_destroy(&r->provider);
-  qa_app_sim_source_random_destroy(r->random);
-}
+/* runtime.close() and the scope's own(source) both close the source (close is idempotent); the source is destroyed
+ * only when the scope frees the runtime, after both. */
+static void rt_close(void *ctx) { qa_compat_qc_mod_provider_close(&((runtime_ctx *)ctx)->provider); }
 /* The scope frees the runtime after it closes the source (as qvm_mod.c's runtime_free). */
 static void runtime_free(void *ctx) {
   runtime_ctx *r = ctx;
+  if (r->provider_ready) qa_compat_qc_mod_provider_destroy(&r->provider);
+  if (r->random != NULL) qa_app_sim_source_random_destroy(r->random);
   free(r->command_names);
   free(r->script);
   free(r);
@@ -89,14 +89,22 @@ static qa_mod_private_checkpoint rt_checkpoint(void *ctx) {
   runtime_ctx *r = ctx;
   qa_mod_private_checkpoint out; memset(&out, 0, sizeof out);
   const qa_guest_checkpoint *guest = qa_compat_qc_mod_provider_checkpoint(&r->provider);
-  static qa_guest_checkpoint storage;
-  if (guest) { storage = *guest; out.guests = &storage; out.guest_count = 1; }
+  if (guest) { r->saved = *guest; out.guests = &r->saved; out.guest_count = 1; }
   return out;
+}
+/* presentations() { return source.presentations(); } */
+static const qa_app_simulation_presentation *rt_presentations(void *ctx, size_t *out_count) {
+  return qa_compat_qc_mod_provider_presentations(&((runtime_ctx *)ctx)->provider, out_count);
+}
+/* clientPresentation: () => source.clientPresentation() */
+static bool rt_client_presentation(void *ctx, qa_mod_client_presentation_source *out) {
+  *out = qa_compat_qc_mod_provider_client_presentation(&((runtime_ctx *)ctx)->provider);
+  return true;
 }
 static void rt_restore(void *ctx, qa_mod_private_checkpoint state) {
   runtime_ctx *r = ctx;
   if (state.guest_count == 0 || state.guests[0].kind != QA_GUEST_CHECKPOINT_QUAKEC)
-    qa_range_error("Missing QuakeC mod checkpoint");
+    qa_raise("Error", 0, 0, "Missing QuakeC mod checkpoint");
   qa_compat_qc_mod_provider_restore(&r->provider, &state.guests[0]);
 }
 /* register(registrations): registerModCallbacks(declaration.callbacks, registrations,
@@ -136,7 +144,7 @@ static const char *command_read_script(void *ctx, const char *name) {
 }
 static qa_mod_runtime initialize_mod(void *ctx, qa_mod_initialization *context) {
   prepared_ctx *p = ctx;
-  if (context->services == NULL) qa_range_error("QuakeC gameplay mods require destination world services");
+  if (context->services == NULL) qa_raise("Error", 0, 0, "QuakeC gameplay mods require destination world services");
   qa_mod_host_services *services = (qa_mod_host_services *)context->services;
   runtime_ctx *r = calloc(1, sizeof *r);
   if (!r) qa_range_error("Out of memory");
@@ -146,7 +154,7 @@ static qa_mod_runtime initialize_mod(void *ctx, qa_mod_initialization *context) 
   r->assert_current = context->assert_current;
   qa_resource_scope_defer(context->resources, runtime_free, r);
   r->random = qa_app_sim_source_random_create(services->seed, "classic");
-  r->mod_random.source.ctx = r->random;
+  r->mod_random.source.ctx = r;
   r->mod_random.source.next_integer = rnd_next_integer;
   r->mod_random.source.next_unit = rnd_next_unit;
   r->mod_random.source.checkpoint = rnd_checkpoint;
@@ -156,7 +164,10 @@ static qa_mod_runtime initialize_mod(void *ctx, qa_mod_initialization *context) 
   if (!qa_compat_qc_mod_provider_init(&r->provider, &p->program, p->module, p->options.declaration,
         services, &r->mod_random, &r->media, NULL, NULL, 0))
     qa_range_error("Out of memory");
-  /* context.resources.own(source): runtime close owns the provider. */
+  r->provider_ready = true;
+  /* context.resources.own(source): a later refusal (binding commands, initialize) closes the source with the scope. */
+  qa_session_resource owned = {r, rt_close};
+  (void)qa_resource_scope_own(context->resources, owned);
   if (services->commands != NULL) {
     const qa_mod_callback_declaration *declaration = &p->options.declaration;
     const char **names = calloc(declaration->command_count + 1, sizeof *names);
@@ -184,15 +195,28 @@ static qa_mod_runtime initialize_mod(void *ctx, qa_mod_initialization *context) 
   r->runtime.advance = rt_advance;
   r->runtime.checkpoint = rt_checkpoint;
   r->runtime.restore = rt_restore;
+  r->runtime.presentations = rt_presentations;
+  r->runtime.client_presentation = rt_client_presentation;
   return r->runtime;
+}
+/* A program loadQcProgram or validateQcMod refuses is released with the refusal. */
+typedef struct prepare_frame { prepared_ctx *p; bool loaded; } prepare_frame;
+static void prepare_release(void *arg) {
+  prepare_frame *frame = arg;
+  if (frame->loaded) qa_compat_qc_program_destroy(&frame->p->program);
+  free(frame->p);
 }
 qa_prepared_mod qa_app_sim_prepare_quakec_mod(qa_app_sim_prepare_quakec_mod_options options) {
   prepared_ctx *p = calloc(1, sizeof *p);
   if (!p) qa_range_error("Out of memory");
+  prepare_frame frame = {p, false};
+  qa_cleanup cleanup; qa_cleanup_push(&cleanup, prepare_release, &frame);
   p->options = options;
   if (!qa_compat_qc_load_program(options.program, options.program_length, NULL, NULL, &p->program))
     qa_range_error("Out of memory");
+  frame.loaded = true;
   qa_compat_qc_validate_mod(&p->program, options.declaration);
+  qa_cleanup_pop(&cleanup);
   p->instance_provider = qa_mod_instance_provider(options.description.selection);
   p->module = (qa_module_identity){p->instance_provider, options.declaration.program.path, p->program.digest, options.declaration_digest};
   p->modules[0] = p->module;
@@ -212,30 +236,14 @@ qa_prepared_mod qa_app_sim_prepare_quakec_mod(qa_app_sim_prepare_quakec_mod_opti
   out.initialize = initialize_mod;
   return out;
 }
-qa_prepared_mod qa_app_sim_prepare_mounted_quakec_mod(qa_app_sim_prepare_quakec_mod_options options, qa_app_sim_quakec_mod_mounts mounts) {
-  uint8_t *bytes = NULL; size_t length = 0; const char *digest = NULL;
-  bool opened = mounts.open(mounts.ctx, options.declaration.program.path, &bytes, &length, &digest);
-  if (!opened || !is(digest, options.declaration.program.digest)) {
-    free(bytes);
-    qa_range_error("Selected mod program differs from its resolved artifact");
-  }
-  qa_compat_qc_program program;
-  if (!qa_compat_qc_load_program(bytes, length, NULL, NULL, &program)) qa_range_error("Out of memory");
-  qa_compat_qc_mod_media media = mounts.prepare_resources(mounts.ctx, &program);
-  static qa_compat_qc_mod_media media_storage; media_storage = media;
-  options.program = bytes; options.program_length = length;
-  options.media = &media_storage;
-  return qa_app_sim_prepare_quakec_mod(options);
-}
 /* TS readScript: async name => (await mounts.open(name))?.bytes decoded, or undefined. */
 static char *mounted_read_script(void *ctx, const char *name) {
   qa_content_opened_resource script = {0};
   if (!qa_content_mounted_open(ctx, name, NULL, NULL, &script)) return NULL;
-  char *text = malloc(script.byte_length + 1);
-  if (!text) qa_range_error("Out of memory");
-  memcpy(text, script.bytes, script.byte_length);
-  text[script.byte_length] = '\0';
+  /* new TextDecoder().decode(bytes): a leading byte order mark dropped, invalid sequences U+FFFD */
+  char *text = qa_text_decoder_decode(script.bytes, script.byte_length, NULL);
   free(script.bytes);
+  if (!text) qa_range_error("Out of memory");
   return text;
 }
 qa_prepared_mod qa_app_sim_prepare_mounted_quakec_mod_content(qa_mod_description description,
@@ -251,10 +259,14 @@ qa_prepared_mod qa_app_sim_prepare_mounted_quakec_mod_content(qa_mod_description
   /* prepareQuakeCResources(loadQcProgram(artifact.bytes), mounts) */
   qa_compat_qc_program program;
   if (!qa_compat_qc_load_program(artifact.bytes, artifact.byte_length, NULL, NULL, &program)) qa_range_error("Out of memory");
+  qa_cleanup program_node; qa_cleanup_push(&program_node, (void (*)(void *))qa_compat_qc_program_destroy, &program);
   qa_app_sim_quakec_resources resources = qa_app_sim_prepare_quakec_resources(&program, mounts, NULL);
+  qa_cleanup_pop(&program_node);
   qa_compat_qc_program_destroy(&program);
+  qa_cleanup resources_node; qa_cleanup_push(&resources_node, (void (*)(void *))qa_app_sim_quakec_resources_destroy, &resources);
   qa_compat_qc_mod_media_resource *rows = calloc(resources.count + 1, sizeof *rows);
   if (!rows) qa_range_error("Out of memory");
+  qa_cleanup rows_node; qa_cleanup_push(&rows_node, free, rows);
   for (size_t i = 0; i < resources.count; i++) {
     rows[i].name = resources.items[i].name;
     rows[i].resource = resources.items[i].resource;
@@ -271,6 +283,8 @@ qa_prepared_mod qa_app_sim_prepare_mounted_quakec_mod_content(qa_mod_description
   options.read_script_ctx = mounts;
   options.read_script = mounted_read_script;
   qa_prepared_mod prepared = qa_app_sim_prepare_quakec_mod(options);
+  qa_cleanup_pop(&rows_node);
+  qa_cleanup_pop(&resources_node);
   qa_cleanup_pop(&program_cleanup);
   prepared_ctx *p = prepared.ctx;
   p->owned_program = artifact.bytes;

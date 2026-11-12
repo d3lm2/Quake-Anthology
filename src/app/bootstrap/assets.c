@@ -24,7 +24,10 @@
 #include "qa/formats/q3_model/md5.h"
 #include "qa/formats/q3_model/replacements.h"
 #include "qa/formats/q3_model/scene.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
+#include "qa/platform/files/contained.h"
 #include "qa/foundation/support.h"
 #include "qa/materials/compile.h"
 #include "qa/media/material.h"
@@ -388,9 +391,10 @@ static bool palette_for(qa_content_mounted *mounts, qa_game_family family, qa_pa
 }
 
 typedef struct shader_path_set { char **paths; size_t count, cap; } shader_path_set;
+/* String.prototype.toLowerCase (Unicode). */
 static char *lowered(const char *text) {
-  char *copy = xdup(text);
-  for (char *c = copy; *c; c++) *c = (char)tolower((unsigned char)*c);
+  char *copy = qa_js_to_lower_case(text);
+  if (copy == NULL) qa_range_error("Out of memory");
   return copy;
 }
 /* TS add: first name wins under a case-insensitive comparison. */
@@ -439,7 +443,7 @@ static int entry_ordinal_compare(const void *a, const void *b, void *ctx) {
 static int lowered_name_compare(const void *a, const void *b, void *ctx) {
   (void)ctx;
   char *left = lowered(*(char *const *)a), *right = lowered(*(char *const *)b);
-  int order = strcmp(left, right);
+  int order = qa_js_compare_code_units(left, right); /* a < b over UTF-16 code units */
   free(left); free(right);
   return order < 0 ? -1 : order > 0 ? 1 : 0;
 }
@@ -492,7 +496,15 @@ static void shader_paths(const qa_app_application_assets *assets, qa_content_mou
       int error = errno;
       free(directory);
       if (error == ENOENT) continue;
-      qa_raise("Error", error, 0, "%s: %s", strerror(error), root);
+      /* Bun's readdir error: "<CODE>: <description>, scandir '<directory>'" */
+      char *failed = malloc(length + 8);
+      if (failed == NULL) qa_range_error("Out of memory");
+      memcpy(failed, root, strlen(root) + 1);
+      if (strlen(root) == 0 || root[strlen(root) - 1] != '/') strcat(failed, "/");
+      strcat(failed, "scripts");
+      qa_cleanup failed_guard;
+      qa_cleanup_push(&failed_guard, free, failed);
+      qa_node_fs_error_paths(error, "scandir", failed, NULL);
     }
     name_list names = {NULL, 0, 0};
     struct dirent *entry;
@@ -555,11 +567,10 @@ static void load_scripts(void *ctx) {
   for (size_t i = 0; i < set.count; i++) {
     qa_content_opened_resource asset;
     if (!qa_content_mounted_open(entry->mounts, set.paths[i], NULL, NULL, &asset)) continue;
-    char *text = malloc(asset.byte_length + 1);
-    if (text == NULL) { free(asset.bytes); qa_range_error("Out of memory"); }
-    if (asset.byte_length != 0) memcpy(text, asset.bytes, asset.byte_length);
-    text[asset.byte_length] = '\0';
+    /* new TextDecoder().decode(asset.bytes) */
+    char *text = qa_text_decoder_decode(asset.bytes, asset.byte_length, NULL);
     free(asset.bytes);
+    if (text == NULL) qa_range_error("Out of memory");
     files.texts[files.count] = text;
     files.sources[files.count] = set.paths[i];
     files.count++;
@@ -712,6 +723,11 @@ static void dimension_body(void *ctx) {
   dimension_scope *scope = ctx;
   scope->decoded = qa_cinematic_dimensions(scope->source, &scope->width, &scope->height);
 }
+static void drop_movie_playback(void *arg) {
+  movie_entry *entry = arg;
+  free(entry->playback);
+  entry->playback = NULL;
+}
 /* The body of TS materialMovie's pending promise. */
 static void movie_load(qa_app_application_assets *assets, provider_entry *provider, movie_entry *entry) {
   qa_content_opened_resource asset;
@@ -755,7 +771,14 @@ static void movie_load(qa_app_application_assets *assets, provider_entry *provid
   options.on_audio_reset = ignore_reset;
   options.on_audio_pause = ignore_pause;
   options.on_complete = ignore_complete;
-  if (!qa_cinematic_playback_init(entry->playback, &source, &options, NULL)) {
+  /* A malformed movie raises out of the constructor (which releases what it built): the struct
+   * goes with it. False (OOM) leaves the copied source name to release. */
+  qa_cleanup playback_guard;
+  qa_cleanup_push(&playback_guard, drop_movie_playback, entry);
+  bool initialized = qa_cinematic_playback_init(entry->playback, &source, &options, NULL);
+  qa_cleanup_pop(&playback_guard);
+  if (!initialized) {
+    qa_cinematic_playback_destroy(entry->playback);
     free(entry->playback); entry->playback = NULL;
     qa_range_error("Out of memory");
   }
@@ -979,11 +1002,14 @@ typedef struct decoded_storage {
   qa_decoded_model model;
   bool md3; qa_decoded_md3_model md3_model; qa_decoded_scene_md3 scene;
   qa_q12_model q12;
+  /* What a partial decode built (a raise from toSceneMd3 frees the parsed MD3). */
+  bool has_md3_model, has_scene, has_q12;
 } decoded_storage;
 static void decoded_storage_free(void *arg) {
   decoded_storage *storage = arg;
-  if (storage->md3) { qa_decoded_scene_md3_destroy(&storage->scene); qa_decoded_md3_model_destroy(&storage->md3_model); }
-  else qa_q12_model_destroy(&storage->q12);
+  if (storage->has_scene) qa_decoded_scene_md3_destroy(&storage->scene);
+  if (storage->has_md3_model) qa_decoded_md3_model_destroy(&storage->md3_model);
+  if (storage->has_q12) qa_q12_model_destroy(&storage->q12);
   free(storage);
 }
 static bool ends_with_ci(const char *text, const char *suffix) {
@@ -1006,15 +1032,18 @@ static const qa_decoded_model *model_decode(void *ctx, const uint8_t *bytes, siz
   model_host *host = ctx;
   decoded_storage *storage = xcalloc(1, sizeof *storage);
   qa_cleanup guard;
-  qa_cleanup_push(&guard, free, storage);
+  qa_cleanup_push(&guard, decoded_storage_free, storage);
   if (ends_with_ci(path, ".md3")) {
     qa_parse_md3(bytes, length, path, &storage->md3_model);
+    storage->has_md3_model = true;
     qa_to_scene_md3(&storage->md3_model.model, &storage->scene);
+    storage->has_scene = true;
     storage->md3 = true;
     storage->model.kind = QA_DECODED_MODEL_Q3_MESH;
     storage->model.as.q3_mesh = &storage->scene.model;
   } else {
     qa_parse_q12_model(bytes, length, path, &storage->q12);
+    storage->has_q12 = true;
     switch (storage->q12.kind) {
       case QA_Q12_MODEL_MDL: storage->model.kind = QA_DECODED_MODEL_Q1_ALIAS; storage->model.as.q1_alias = &storage->q12.as.mdl; break;
       case QA_Q12_MODEL_MD2: storage->model.kind = QA_DECODED_MODEL_Q2_ALIAS; storage->model.as.q2_alias = &storage->q12.as.md2; break;
@@ -1048,11 +1077,10 @@ static void md5_storage_free(void *arg) {
   free(storage->mesh_text); free(storage->anim_text); free(storage->scale_text);
   free(storage);
 }
+/* new TextDecoder().decode(bytes): BOM dropped, invalid UTF-8 as U+FFFD. */
 static char *text_of(const uint8_t *bytes, size_t length) {
-  char *text = malloc(length + 1);
+  char *text = qa_text_decoder_decode(bytes, length, NULL);
   if (text == NULL) qa_range_error("Out of memory");
-  if (length != 0) memcpy(text, bytes, length);
-  text[length] = '\0';
   return text;
 }
 typedef struct md5_scope {
@@ -1080,10 +1108,13 @@ static void md5_body(void *ctx) {
   storage->diagnostics = xcalloc(storage->diagnostic_count + 1, sizeof *storage->diagnostics);
   for (size_t i = 0; i < storage->anim.diagnostics.count; i++) storage->diagnostics[i] = xdup(storage->anim.diagnostics.values[i]);
   if (storage->anim.frame_count < alias->frame_count) {
-    char text[4096];
-    snprintf(text, sizeof text, "%s has fewer frames than %s (%zu < %zu)", scope->anim_path, scope->resource_path,
+    /* Sized to the paths (TS template literal; a fixed buffer cut long loose paths). */
+    size_t size = strlen(scope->anim_path) + strlen(scope->resource_path) + 96;
+    char *text = malloc(size);
+    if (text == NULL) qa_range_error("Out of memory");
+    snprintf(text, size, "%s has fewer frames than %s (%zu < %zu)", scope->anim_path, scope->resource_path,
         storage->anim.frame_count, alias->frame_count);
-    storage->diagnostics[storage->diagnostic_count++] = xdup(text);
+    storage->diagnostics[storage->diagnostic_count++] = text;
   }
   qa_parse_md5_mesh(storage->mesh_text, scope->mesh_path, &storage->mesh); storage->has_mesh = true;
   qa_md2_replacement_skin_selection(alias->skins.values, alias->skins.count, (double)alias->frame_count,
@@ -1389,6 +1420,9 @@ static void prepared_free(qa_app_prepared_images *prepared) {
     free(row);
   }
   free(prepared->rows);
+  /* A refresh that was not committed (discarded, or a failed preparation) still owns its staged remaps; commit
+   * has released its own. */
+  if (prepared->has_remaps) qa_prepared_remap_refresh_destroy(&prepared->remaps);
   if (prepared->has_fonts) font_entry_close(&prepared->fonts);
   if (prepared->has_typography) typography_entry_close(&prepared->typography);
   qa_scene_image_policy_owned_destroy(&prepared->policy);

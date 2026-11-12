@@ -13,7 +13,7 @@ typedef struct qa_app_q2_playback_header {
   bool is_mvd;
   qa_q2_demo_header dm2;          /* when !is_mvd */
   qa_q2_protocol_identity protocol; /* mvd */
-  qa_q2_server_data_result data;    /* mvd (also in dm2) */
+  qa_q2_server_data_result data;    /* borrows dm2.data or profile.data (their strings) */
   qa_q2_mvd_header profile;         /* mvd; config strings owned */
 } qa_app_q2_playback_header;
 void qa_app_q2_read_playback_header(const uint8_t *bytes, size_t length,

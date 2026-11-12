@@ -34,36 +34,36 @@ void qa_row_worker_destroy(qa_row_worker *w){ if(!w->impl)return; wimpl *p=(wimp
   while(lo_<hi_){ size_t mid_=lo_+(hi_-lo_)/2; if((items)[mid_].id==(wanted)){(out)=&(items)[mid_];break;} if((items)[mid_].id<(wanted))lo_=mid_+1; else hi_=mid_; } } while(0)
 static qa_bound_texture w_tex(void *ctx,double id){ wimpl *p=(wimpl*)ctx; qa_bound_texture o; memset(&o,0,sizeof o); o.kind=QA_BOUND_TEXTURE_INCOMPLETE; if(id==-1)return o;
   const qa_row_texture_registration *found; FIND_BY_ID(p->tex,p->tex_count,id,found);
-  if(!found)qa_range_error("Row worker missing texture %.0f",id);
+  if(!found)qa_raise("Error", 0, 0, "Row worker missing texture %.0f",id);
   return found->texture; }
 static qa_batch_lighting w_lit(void *ctx,double id){ wimpl *p=(wimpl*)ctx;
   const qa_row_lighting_registration *found; FIND_BY_ID(p->lit,p->lit_count,id,found);
-  if(!found)qa_range_error("Row worker missing lighting %.0f",id);
+  if(!found)qa_raise("Error", 0, 0, "Row worker missing lighting %.0f",id);
   return found->parameters; }
 static const qa_depth_image_level *w_dep(void *ctx,double id){ wimpl *p=(wimpl*)ctx; if(id==-1)return NULL;
   const qa_row_depth_registration *found; FIND_BY_ID(p->dep,p->dep_count,id,found);
-  if(!found)qa_range_error("Row worker missing depth %.0f",id);
+  if(!found)qa_raise("Error", 0, 0, "Row worker missing depth %.0f",id);
   return &found->depth; }
 static void *worker_alloc(void *data,size_t count,size_t element){ void *grown=realloc(data,count*element); if(!grown)qa_range_error("row worker allocation failed"); return grown; }
 typedef struct job_ctx { wimpl *worker; qa_row_job_message message; } job_ctx;
 static void run_job_body(void *ctx){
   wimpl *p=((job_ctx*)ctx)->worker; qa_row_job_message msg=((job_ctx*)ctx)->message;
-  if(msg.kind==NULL||strcmp(msg.kind,"job")) qa_range_error("Invalid row worker job");
+  if(msg.kind==NULL||strcmp(msg.kind,"job")) qa_raise("Error", 0, 0, "Invalid row worker job");
   /* Registrations cover one job, except depth images, whose ids persist. */
   if(msg.texture_count>p->tex_cap){ p->tex=(qa_row_texture_registration*)worker_alloc(p->tex,msg.texture_count,sizeof *p->tex); p->tex_cap=msg.texture_count; }
   p->tex_count=0;
   for(size_t i=0;i<msg.texture_count;i++){ const qa_row_texture_registration *r=&msg.textures[i];
-    if(r->texture.kind==QA_BOUND_TEXTURE_IMAGE&&r->texture.level_count==0) qa_range_error("Row worker texture has no levels");
+    if(r->texture.kind==QA_BOUND_TEXTURE_IMAGE&&r->texture.level_count==0) qa_raise("Error", 0, 0, "Row worker texture has no levels");
     p->tex[p->tex_count++]=*r; }
   if(msg.lighting_count>p->lit_cap){ p->lit=(qa_row_lighting_registration*)worker_alloc(p->lit,msg.lighting_count,sizeof *p->lit); p->lit_cap=msg.lighting_count; }
   p->lit_count=0;
   for(size_t i=0;i<msg.lighting_count;i++){ const qa_row_lighting_registration *r=&msg.lightings[i];
-    if(strcmp(r->parameters.kind,"vertex")&&strcmp(r->parameters.kind,"q2-world")&&strcmp(r->parameters.kind,"q2-model-shadow")) qa_range_error("Invalid row worker lighting registration");
+    if(strcmp(r->parameters.kind,"vertex")&&strcmp(r->parameters.kind,"q2-world")&&strcmp(r->parameters.kind,"q2-model-shadow")) qa_raise("Error", 0, 0, "Invalid row worker lighting registration");
     p->lit[p->lit_count++]=*r; }
   if(p->dep_count+msg.depth_count>p->dep_cap){ size_t cap=p->dep_count+msg.depth_count; p->dep=(qa_row_depth_registration*)worker_alloc(p->dep,cap,sizeof *p->dep); p->dep_cap=cap; }
   for(size_t i=0;i<msg.depth_count;i++) p->dep[p->dep_count++]=msg.depths[i];
   if(msg.job_buffer!=NULL){ p->job=msg.job_buffer; p->job_count=msg.job_count; }
-  if(p->job==NULL) qa_range_error("Row worker has no job buffer");
+  if(p->job==NULL) qa_raise("Error", 0, 0, "Row worker has no job buffer");
   size_t n=(size_t)msg.count; double band_rows=qa_js_max(1,msg.band_rows);
   if(n>p->setup_cap){
     p->setups=(qa_triangle_setup*)worker_alloc(p->setups,n,sizeof *p->setups);
@@ -80,7 +80,7 @@ static void run_job_body(void *ctx){
   }
 }
 void qa_row_worker_run_job(qa_row_worker *w,qa_row_job_message msg){
-  wimpl *p=(wimpl*)w->impl; job_ctx ctx; ctx.worker=p; ctx.message=msg; char error[1024];
+  wimpl *p=(wimpl*)w->impl; job_ctx ctx; ctx.worker=p; ctx.message=msg; char error[1025]; /* text.slice(0, 1024) */
   bool ok=qa_range_error_catch(run_job_body,&ctx,error,sizeof error);
   pthread_mutex_lock(&p->control->lock);
   if(!ok){ p->control->failed=true; memcpy(p->control->error,error,sizeof error); }

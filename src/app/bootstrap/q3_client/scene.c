@@ -114,6 +114,7 @@ static qa_model_source_options presented_options(const qa_q3_pres_presented_mode
       skin[i] = (qa_model_custom_skin_entry){model->custom_skin[i].name, model->custom_skin[i].shader};
     qa_app_effect_storage_add(storage, free, skin);
     options.custom_skin = skin;
+    options.has_custom_skin = true; /* an empty skin is still a skin (calloc(0) may be NULL) */
     options.custom_skin_count = model->custom_skin_count;
   }
   options.has_non_normalized_axes = true;
@@ -266,7 +267,8 @@ static qa_sequence_phase phase_named(const char *name) {
 /* A SceneModelGroup is a SceneGroup in TS; the C group wraps its batches. */
 static void push_model_group(qa_app_q3_scene_operations *out, const qa_scene_model_group *group) {
   qa_scene_group *wrapped = xcalloc(1, sizeof *wrapped);
-  if (strcmp(group->kind, "compiled") == 0) *wrapped = qa_compiled_draw_group(group->material, group->batches, group->batch_count);
+  if (group->is_shadow_volume) *wrapped = qa_scene_model_shadow_volume_group(group); /* TS SceneShadowGroup (cg_shadows 2) */
+  else if (strcmp(group->kind, "compiled") == 0) *wrapped = qa_compiled_draw_group(group->material, group->batches, group->batch_count);
   else if (strcmp(group->kind, "source") == 0) {
     qa_source_surface_order order = {group->source_view, group->source_entity, group->surface, group->fog, group->dlight};
     *wrapped = qa_source_draw_group(group->source_material, order, group->batches, group->batch_count);

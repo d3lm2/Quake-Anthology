@@ -15,16 +15,25 @@
 #include "qa/foundation/support.h"
 #include "qa/network/q2/message.h"
 #include "qa/world/collision/body.h"
+#include "qa/core/math.h"
 
 #define CONFIGSTRINGS 12448
 static const double range_base[3] = {62, 8254, 10302}, range_count[3] = {8192, 2048, 512};
 static const char *const kinds[3] = {"model", "sound", "image"};
-static const qa_vec3 zero = {0, 0, 0};
 
 typedef struct link_metadata { qa_actor_id actor; bool clusters_null; double clusters[16]; size_t cluster_count; double first_cluster, headnode, areas[2]; } link_metadata;
 typedef struct motion_entry { qa_actor_id actor; qa_compat_q2_native_input_motion projection; bool has_body; qa_body_state body; qa_actor_id ground; } motion_entry;
 typedef struct binding { struct qa_app_sim_rerelease_guest_services *services; qa_compat_q2_rerelease_public_edict *view; qa_owned_actor actor; qa_actor_id ground; struct binding *next; } binding;
 typedef struct weapon_model { double index; char *name; } weapon_model;
+/* TS sourceInventory's binding: each access re-checks the owner and rebinds the slot's source client (current()). The
+ * client view is rebuilt only when the client pointer moved; for the same address it is the same view, and the
+ * validation it repeats is deterministic. */
+typedef struct inventory_binding {
+  struct qa_app_sim_rerelease_guest_services *services; double slot; qa_actor_id actor;
+  const qa_compat_q2_rerelease_client_profile *profile;
+  qa_compat_q2_rerelease_source_client *client; qa_guest_address address; qa_inventory_state_binding inner;
+  struct inventory_binding *next;
+} inventory_binding;
 
 struct qa_app_sim_rerelease_guest_services {
   qa_app_sim_rerelease_guest_services_options options;
@@ -44,8 +53,8 @@ struct qa_app_sim_rerelease_guest_services {
   qa_compat_q2_memory *memory;
   qa_compat_q2_rerelease_q2_guest_host *host;
   qa_compat_q2_rerelease_combat_bindings *combat;
-  const qa_compat_q2_rerelease_inventory_item *inventory_items; size_t inventory_item_count; bool has_inventory_items;
-  qa_compat_q2_rerelease_source_client *inventory_client;
+  qa_compat_q2_rerelease_inventory_item *inventory_items; size_t inventory_item_count; bool has_inventory_items; /* owned: TS #inventoryItems */
+  struct inventory_binding *inventory_bindings; /* every sourceInventory(slot) binding handed out, freed with the services */
   bool loading; double frame;
   bool has_velocity; qa_app_sim_player_velocity velocity;
   motion_entry *motions; size_t motion_count, motion_capacity;
@@ -154,7 +163,7 @@ static void enqueue(services_t *s, qa_app_sim_classic_guest_audience audience, b
   if (length != 0) memcpy(message.bytes, bytes, length);
   (void)qa_event_ring_admit(&s->messages, &message);
 }
-static qa_app_sim_classic_guest_audience multicast_all(void) { qa_app_sim_classic_guest_audience a = {false, 0, zero, "all"}; return a; }
+static qa_app_sim_classic_guest_audience multicast_all(void) { qa_app_sim_classic_guest_audience a = {false, 0, qa_zero_vec3, "all"}; return a; }
 static qa_q2_sizebuf *scratch_buffer(services_t *s) { qa_q2_sz_clear(&s->scratch); return &s->scratch; }
 const qa_app_sim_rerelease_guest_message *qa_app_sim_rerelease_guest_services_drain_messages(services_t *s, size_t *out_count) {
   free_drained(s); s->drained = qa_event_ring_take(&s->messages, &s->cursor, &s->drained_count); qa_event_ring_retire(&s->messages);
@@ -167,11 +176,11 @@ static bool accepts_client(services_t *s, double slot) {
 }
 static bool m_accepts(void *ctx, double slot) { return accepts_client(ctx, slot); }
 static void m_unicast(void *ctx, qa_compat_q2_rerelease_unicast value) {
-  qa_app_sim_classic_guest_audience audience = {true, value.client_slot, zero, NULL};
+  qa_app_sim_classic_guest_audience audience = {true, value.client_slot, qa_zero_vec3, NULL};
   enqueue(ctx, audience, value.reliable, value.bytes, value.byte_length, value.dupe_key);
 }
 static void m_multicast(void *ctx, qa_compat_q2_rerelease_multicast value) {
-  qa_app_sim_classic_guest_audience audience = {false, 0, value.has_origin ? value.origin : zero, value.destination};
+  qa_app_sim_classic_guest_audience audience = {false, 0, value.has_origin ? value.origin : qa_zero_vec3, value.destination};
   enqueue(ctx, audience, value.reliable, value.bytes, value.byte_length, 0);
 }
 
@@ -356,7 +365,7 @@ static void sound_event(void *ctx, qa_compat_q2_rerelease_sound_event event) {
   if (view == NULL && !event.has_origin) fail("API2023 sound has neither entity nor origin");
   qa_vec3 origin;
   if (event.has_origin) origin = event.origin;
-  else if (view == NULL) origin = zero;
+  else if (view == NULL) origin = qa_zero_vec3;
   else if (qa_compat_q2_rerelease_public_edict_byte(view, "solid") == 3) {
     origin.x = state.origin.x + (state.bounds.min.x + state.bounds.max.x) * 0.5; origin.y = state.origin.y + (state.bounds.min.y + state.bounds.max.y) * 0.5;
     origin.z = state.origin.z + (state.bounds.min.z + state.bounds.max.z) * 0.5;
@@ -380,7 +389,7 @@ static void print(services_t *s, bool has_slot, double slot, double level, const
   if (!broadcast && !has_slot) { s->options.base.print.print(s->options.base.print.ctx, text); return; }
   if (has_slot && !accepts_client(s, slot)) return;
   qa_q2_sizebuf *buffer = scratch_buffer(s); qa_q2_msg_write_byte(buffer, center ? 15 : 10); if (!center) qa_q2_msg_write_byte(buffer, level); qa_q2_msg_write_string(buffer, text);
-  qa_app_sim_classic_guest_audience audience = broadcast ? multicast_all() : (qa_app_sim_classic_guest_audience){true, has_slot ? slot : 0, zero, NULL};
+  qa_app_sim_classic_guest_audience audience = broadcast ? multicast_all() : (qa_app_sim_classic_guest_audience){true, has_slot ? slot : 0, qa_zero_vec3, NULL};
   enqueue(s, audience, true, buffer->data, (size_t)buffer->cursize, 0);
   if (broadcast) s->options.base.print.print(s->options.base.print.ctx, text);
 }
@@ -398,19 +407,31 @@ static const char *cs_tail(void *ctx) { services_t *s = ctx; const char *args = 
 static void cs_add(void *ctx, const char *text) { services_t *s = ctx; s->options.base.add_command.add_command(s->options.base.add_command.ctx, text); }
 static bool cs_extension(void *ctx, const char *name, const char *api, qa_guest_address *out) { (void)ctx; (void)name; (void)api; (void)out; return false; }
 static double number_arg(const qa_guest_call_value *args, size_t count, size_t index) { return (double)qa_compat_q2_guest_integer(args, count, index); }
-static char *text_arg(services_t *s, const qa_guest_call_value *args, size_t count, size_t index) { return qa_compat_q2_read_guest_string(s->memory, qa_compat_q2_guest_required_pointer(args, count, index), 65536); }
+/* readGuestString(memory, requiredPointer(args, index)) at its default limit of 1 MiB. */
+static char *text_arg(services_t *s, const qa_guest_call_value *args, size_t count, size_t index) { return qa_compat_q2_read_guest_string(s->memory, qa_compat_q2_guest_required_pointer(args, count, index), -1); }
 static bool slot_arg(services_t *s, const qa_guest_call_value *args, size_t count, size_t index, double *out) {
   qa_guest_address address; if (!qa_compat_q2_guest_pointer(args, count, index, &address)) return false;
   *out = from_pointer(s, address).slot; return true;
 }
 static bool nav_actor(void *ctx, qa_guest_address address, qa_actor_id *out) { services_t *s = ctx; return host_actor(s, from_pointer(s, address), out); }
 static qa_vec3 vector_at(services_t *s, qa_guest_address address) { return qa_compat_q2_mem_read_f32_vector(s->memory, address); }
+/* Text the import reads from the guest, released when a later read or write faults (a guest fault is recovered). */
+typedef struct owned_texts { char *texts[12]; size_t count; } owned_texts;
+static void owned_texts_free(void *arg) { owned_texts *o = arg; for (size_t i = 0; i < o->count; i++) free(o->texts[i]); o->count = 0; }
+static char *own_text(owned_texts *o, char *text) { o->texts[o->count++] = text; return text; }
+/* String.length of decoded guest text (valid UTF-8): UTF-16 units. */
+static size_t utf16_length(const char *text, size_t bytes) {
+  size_t units = 0;
+  for (size_t i = 0; i < bytes; i++) { uint8_t c = (uint8_t)text[i]; if ((c & 0xc0) != 0x80) units += c >= 0xf0 ? 2 : 1; }
+  return units;
+}
 static qa_guest_call_result info(services_t *s, qa_compat_q2_rerelease_import_call call) {
   const qa_guest_call_value *args = call.arguments; size_t count = call.argument_count;
+  owned_texts owned; owned.count = 0; qa_cleanup node; qa_cleanup_push(&node, owned_texts_free, &owned);
   qa_guest_address address = qa_compat_q2_guest_required_pointer(args, count, 0);
-  char *key = qa_compat_q2_read_guest_string(s->memory, qa_compat_q2_guest_required_pointer(args, count, 1), 2048);
-  char *input = qa_compat_q2_read_guest_string(s->memory, address, 2048);
-  size_t length = strlen(input), key_length = strlen(key); char *output = calloc(length + 2048 + 4, 1); size_t out_length = 0; bool found = false;
+  char *key = own_text(&owned, qa_compat_q2_read_guest_string(s->memory, qa_compat_q2_guest_required_pointer(args, count, 1), 2048));
+  char *input = own_text(&owned, qa_compat_q2_read_guest_string(s->memory, address, 2048));
+  size_t length = strlen(input), key_length = strlen(key); char *output = own_text(&owned, calloc(length + 2048 * 3 + 4, 1)); size_t out_length = 0; bool found = false;
   if (output == NULL) qa_range_error("Out of memory");
   size_t cursor = 0;
   while (cursor < length) {
@@ -425,19 +446,36 @@ static qa_guest_call_result info(services_t *s, qa_compat_q2_rerelease_import_ca
   output[out_length] = '\0';
   bool result = found;
   if (strcmp(call.name, "Info_SetValueForKey") == 0) {
-    char *value = qa_compat_q2_read_guest_string(s->memory, qa_compat_q2_guest_required_pointer(args, count, 2), 2048); size_t value_length = strlen(value);
-    if (key_length >= 64 || value_length >= 256 || strpbrk(key, "\\\";") != NULL || strpbrk(value, "\\\";") != NULL) { free(value); free(key); free(input); free(output); return qa_compat_q2_rerelease_guest_bool(false); }
-    result = value_length == 0 || out_length + key_length + value_length + 2 < 2048;
-    if (result && value_length != 0) {
-      char *pair = malloc(key_length + value_length + 3); if (pair == NULL) qa_range_error("Out of memory");
-      sprintf(pair, "\\%s\\%s", key, value);
-      for (size_t i = 0; pair[i] != '\0'; i++) { unsigned byte = (unsigned char)pair[i] & 127; if (byte >= 32 && byte < 127) output[out_length++] = (char)byte; }
-      output[out_length] = '\0'; free(pair);
+    char *value = own_text(&owned, qa_compat_q2_read_guest_string(s->memory, qa_compat_q2_guest_required_pointer(args, count, 2), 2048)); size_t value_length = strlen(value);
+    /* key.length, value.length and output.length count UTF-16 units */
+    size_t key_units = utf16_length(key, key_length), value_units = utf16_length(value, value_length);
+    if (key_units >= 64 || value_units >= 256 || strpbrk(key, "\\\";") != NULL || strpbrk(value, "\\\";") != NULL) {
+      qa_cleanup_pop(&node); owned_texts_free(&owned); return qa_compat_q2_rerelease_guest_bool(false);
     }
-    free(value);
+    result = value_length == 0 || utf16_length(output, out_length) + key_units + value_units + 2 < 2048;
+    if (result && value_length != 0) {
+      /* `\\${key}\\${value}`: each UTF-16 unit & 127, kept when printable */
+      const char *parts[4] = {"\\", key, "\\", value};
+      for (int part = 0; part < 4; part++) {
+        const uint8_t *p = (const uint8_t *)parts[part];
+        for (size_t i = 0; p[i] != 0;) {
+          uint32_t cp; size_t n;
+          if (p[i] < 0x80) { cp = p[i]; n = 1; }
+          else if (p[i] < 0xe0) { cp = p[i] & 0x1fu; n = 2; }
+          else if (p[i] < 0xf0) { cp = p[i] & 0x0fu; n = 3; }
+          else { cp = p[i] & 0x07u; n = 4; }
+          size_t k = 1; for (; k < n && p[i + k] != 0; k++) cp = cp << 6 | (p[i + k] & 0x3fu);
+          i += k;
+          uint32_t units[2]; size_t unit_count = 1; units[0] = cp;
+          if (cp >= 0x10000) { units[0] = 0xd800 + ((cp - 0x10000) >> 10); units[1] = 0xdc00 + ((cp - 0x10000) & 0x3ff); unit_count = 2; }
+          for (size_t u = 0; u < unit_count; u++) { unsigned byte = units[u] & 127; if (byte >= 32 && byte < 127) output[out_length++] = (char)byte; }
+        }
+      }
+      output[out_length] = '\0';
+    }
   }
   qa_compat_q2_memory *m = s->memory; m->write(m->ctx, address, (const uint8_t *)output, out_length); qa_compat_q2_mem_write_u8(m, qa_compat_q2_mem_offset(m, address, (int64_t)out_length), 0);
-  free(key); free(input); free(output);
+  qa_cleanup_pop(&node); owned_texts_free(&owned);
   return qa_compat_q2_rerelease_guest_bool(result);
 }
 static qa_guest_call_result clip(services_t *s, qa_compat_q2_rerelease_import_call call) {
@@ -472,26 +510,30 @@ static qa_guest_call_result clip(services_t *s, qa_compat_q2_rerelease_import_ca
 static bool cs_invoke(void *ctx, qa_compat_q2_rerelease_import_call call, qa_guest_call_result *out) {
   services_t *s = ctx; const qa_guest_call_value *args = call.arguments; size_t count = call.argument_count; const char *name = call.name; double slot = 0; bool has_slot;
   *out = qa_compat_q2_call_void();
-  if (strcmp(name, "Broadcast_Print") == 0) { char *text = text_arg(s, args, count, 1); print(s, false, 0, number_arg(args, count, 0), text, true, false); free(text); }
-  else if (strcmp(name, "Client_Print") == 0) { has_slot = slot_arg(s, args, count, 0, &slot); char *text = text_arg(s, args, count, 2); print(s, has_slot, slot, number_arg(args, count, 1), text, false, false); free(text); }
-  else if (strcmp(name, "Center_Print") == 0) { has_slot = slot_arg(s, args, count, 0, &slot); char *text = text_arg(s, args, count, 1); print(s, has_slot, slot, 5, text, false, true); free(text); }
+  owned_texts owned; owned.count = 0; qa_cleanup node; qa_cleanup_push(&node, owned_texts_free, &owned);
+  /* Operands in TS order: print(null, number(0), text(1)), print(slot(0), number(1), text(2)), ... */
+  if (strcmp(name, "Broadcast_Print") == 0) { double level = number_arg(args, count, 0); char *text = own_text(&owned, text_arg(s, args, count, 1)); print(s, false, 0, level, text, true, false); }
+  else if (strcmp(name, "Client_Print") == 0) {
+    has_slot = slot_arg(s, args, count, 0, &slot); double level = number_arg(args, count, 1); char *text = own_text(&owned, text_arg(s, args, count, 2));
+    print(s, has_slot, slot, level, text, false, false);
+  }
+  else if (strcmp(name, "Center_Print") == 0) { has_slot = slot_arg(s, args, count, 0, &slot); char *text = own_text(&owned, text_arg(s, args, count, 1)); print(s, has_slot, slot, 5, text, false, true); }
   else if (strcmp(name, "Loc_Print") == 0) {
     double n = number_arg(args, count, 4); if (n != floor(n) || n < 0 || n > 8) qa_range_error("API2023 localization argument count");
     char *values[8]; size_t value_count = 0;
     if (n > 0) { qa_guest_address base = qa_compat_q2_guest_required_pointer(args, count, 3);
-      for (size_t i = 0; i < (size_t)n; i++) { qa_guest_address at; values[value_count++] = qa_compat_q2_mem_read_pointer(s->memory, qa_compat_q2_mem_offset(s->memory, base, (int64_t)i * 8), &at) ? qa_compat_q2_read_guest_string(s->memory, at, 65536) : dup_text(""); } }
+      for (size_t i = 0; i < (size_t)n; i++) { qa_guest_address at; values[value_count++] = own_text(&owned, qa_compat_q2_mem_read_pointer(s->memory, qa_compat_q2_mem_offset(s->memory, base, (int64_t)i * 8), &at) ? qa_compat_q2_read_guest_string(s->memory, at, -1) : dup_text("")); } }
     double level = number_arg(args, count, 1); has_slot = slot_arg(s, args, count, 0, &slot);
-    char *key = text_arg(s, args, count, 2); char *text = s->options.localize.localize(s->options.localize.ctx, key, (const char *const *)values, value_count);
+    char *key = own_text(&owned, text_arg(s, args, count, 2)); char *text = own_text(&owned, s->options.localize.localize(s->options.localize.ctx, key, (const char *const *)values, value_count));
     int32_t bits = qa_js_to_int32(level);
     print(s, has_slot, slot, bits & ~8, text, (bits & 8) != 0, false);
-    free(text); free(key); for (size_t i = 0; i < value_count; i++) free(values[i]);
   }
   else if (strcmp(name, "DebugGraph") == 0) {
     const qa_guest_call_value *value = qa_compat_q2_guest_argument(args, count, 0);
     if (value->kind != QA_GUEST_VALUE_FLOAT32) qa_raise("TypeError", 0, 0, "API2023 graph requires a float");
     s->options.base.debug_graph.debug_graph(s->options.base.debug_graph.ctx, value->number_value, number_arg(args, count, 1));
   }
-  else if (strcmp(name, "SendToClipBoard") == 0) { if (s->options.clipboard.client) { char *text = text_arg(s, args, count, 0); s->options.clipboard.write(s->options.clipboard.ctx, text); free(text); } }
+  else if (strcmp(name, "SendToClipBoard") == 0) { if (s->options.clipboard.client) { char *text = own_text(&owned, text_arg(s, args, count, 0)); s->options.clipboard.write(s->options.clipboard.ctx, text); } }
   else if (strcmp(name, "ReportMatchDetails_Multicast") == 0) qa_q2_sz_clear(&s->buffer);
   else if (strcmp(name, "Bot_MoveToPoint") == 0 || strcmp(name, "Bot_FollowActor") == 0 || strcmp(name, "GetPathToGoal") == 0) {
     qa_compat_q2_rerelease_navigation_imports *navigation = qa_compat_q2_rerelease_navigation_imports_create(s->memory, s->options.navigation, s, nav_actor);
@@ -501,7 +543,8 @@ static bool cs_invoke(void *ctx, qa_compat_q2_rerelease_import_call call, qa_gue
   }
   else if (strcmp(name, "Info_RemoveKey") == 0 || strcmp(name, "Info_SetValueForKey") == 0) *out = info(s, call);
   else if (strcmp(name, "clip") == 0) *out = clip(s, call);
-  else return false;
+  else { qa_cleanup_pop(&node); return false; }
+  qa_cleanup_pop(&node); owned_texts_free(&owned);
   return true;
 }
 
@@ -559,7 +602,10 @@ void qa_app_sim_rerelease_guest_services_host_options(services_t *s, qa_compat_q
 void qa_app_sim_rerelease_guest_services_destroy(services_t *s) {
   if (s == NULL) return;
   if (s->combat != NULL) qa_compat_q2_rerelease_combat_bindings_destroy(s->combat);
-  if (s->inventory_client != NULL) qa_compat_q2_rerelease_source_client_destroy(s->inventory_client);
+  for (inventory_binding *b = s->inventory_bindings; b != NULL;) {
+    inventory_binding *next = b->next; if (b->client != NULL) qa_compat_q2_rerelease_source_client_destroy(b->client); free(b); b = next;
+  }
+  free(s->inventory_items);
   clear_strings(s); free(s->strings); free(s->positions); clear_weapons(s); free(s->weapons); free(s->weapon_list);
   for (int k = 0; k < 3; k++) qa_resource_name_index_destroy(&s->names[k]);
   qa_event_ring_for_each_live(&s->messages, free_message, NULL); free_drained(s);
@@ -625,18 +671,41 @@ void qa_app_sim_rerelease_guest_services_set_player_view_roll(services_t *s, dou
 }
 bool qa_app_sim_rerelease_guest_services_has_source_inventory(services_t *s) { return qa_compat_q2_rerelease_guest_module_get_world_profile(module_of(s)) != NULL; }
 static qa_guest_address core_string(void *ctx, const char *value) { services_t *s = ctx; return qa_compat_q2_rerelease_core_imports_string(qa_compat_q2_rerelease_q2_guest_host_get_core(s->host), value); }
+static void client_cleanup(void *client) { qa_compat_q2_rerelease_source_client_destroy(client); }
+static qa_inventory_state_binding *inventory_current(inventory_binding *b) {
+  services_t *s = b->services; qa_actor_id current;
+  if (!qa_session_actor_registry_is_live(s->options.base.engine->actors, b->actor) || !current_actor(at_slot(s, b->slot), &current) || !same_actor(current, b->actor))
+    fail("Native inventory owner was released");
+  qa_compat_q2_rerelease_public_edict *view = view_of(s, b->slot); qa_guest_address client; bool has = qa_compat_q2_rerelease_public_edict_pointer(view, "client", &client);
+  qa_compat_q2_rerelease_public_edict_destroy(view);
+  if (!has) fail("Native inventory requires a source client");
+  if (b->client == NULL || b->address.address_space != client.address_space || b->address.byte_offset != client.byte_offset) {
+    if (b->client != NULL) qa_compat_q2_rerelease_source_client_destroy(b->client);
+    b->client = NULL;
+    qa_compat_q2_rerelease_source_client *fresh = qa_compat_q2_rerelease_source_client_create(client, module_of(s), b->profile); if (fresh == NULL) qa_range_error("Out of memory");
+    /* A refused roster keeps no client: the next access validates again, as TS does on each one. */
+    qa_cleanup node; qa_cleanup_push(&node, client_cleanup, fresh);
+    qa_inventory_state_binding inner = qa_compat_q2_rerelease_source_client_inventory(fresh, s->inventory_items, s->inventory_item_count);
+    qa_cleanup_pop(&node);
+    b->client = fresh; b->address = client; b->inner = inner;
+  }
+  return &b->inner;
+}
+static const qa_inventory_entry *inventory_read(void *ctx, size_t *out_count) { qa_inventory_state_binding *inner = inventory_current(ctx); return inner->read(inner->ctx, out_count); }
+static void inventory_write(void *ctx, qa_inventory_entry entry) { qa_inventory_state_binding *inner = inventory_current(ctx); inner->write(inner->ctx, entry); }
+static bool inventory_mutable(void *ctx, qa_item_id item) {
+  qa_inventory_state_binding *inner = inventory_current(ctx); return inner->mutable_capacity != NULL && inner->mutable_capacity(inner->ctx, item);
+}
 bool qa_app_sim_rerelease_guest_services_source_inventory(services_t *s, double slot, qa_inventory_state_binding *out) {
   qa_compat_q2_rerelease_guest_module *module = module_of(s); const qa_compat_q2_rerelease_primary_world_profile *world = qa_compat_q2_rerelease_guest_module_get_world_profile(module);
   if (world == NULL) return false;
-  if (!s->has_inventory_items) { s->inventory_items = qa_compat_q2_rerelease_inventory_items(module, s, core_string, &s->inventory_item_count); s->has_inventory_items = true; }
+  if (!s->has_inventory_items) { s->inventory_items = qa_compat_q2_rerelease_inventory_items_owned(module, s, core_string, &s->inventory_item_count); s->has_inventory_items = true; }
   qa_actor_id actor; if (!current_actor(at_slot(s, slot), &actor)) fail("Native inventory requires a live source actor");
-  /* TS rebinds the client on each access; the C binding reads through the source client record for this slot. */
-  qa_compat_q2_rerelease_public_edict *view = view_of(s, slot); qa_guest_address client; bool has = qa_compat_q2_rerelease_public_edict_pointer(view, "client", &client);
-  qa_compat_q2_rerelease_public_edict_destroy(view);
-  if (!has) fail("Native inventory requires a source client");
-  if (s->inventory_client != NULL) qa_compat_q2_rerelease_source_client_destroy(s->inventory_client);
-  s->inventory_client = qa_compat_q2_rerelease_source_client_create(client, module, &world->client); if (s->inventory_client == NULL) qa_range_error("Out of memory");
-  *out = qa_compat_q2_rerelease_source_client_inventory(s->inventory_client, s->inventory_items, s->inventory_item_count);
+  inventory_binding *b = calloc(1, sizeof *b); if (b == NULL) qa_range_error("Out of memory");
+  b->services = s; b->slot = slot; b->actor = actor; b->profile = &world->client;
+  b->next = s->inventory_bindings; s->inventory_bindings = b;
+  memset(out, 0, sizeof *out);
+  out->ctx = b; out->read = inventory_read; out->write = inventory_write; out->mutable_capacity = inventory_mutable;
   return true;
 }
 void qa_app_sim_rerelease_guest_services_set_player_velocity_writer(services_t *s, qa_app_sim_player_velocity velocity) { s->has_velocity = true; s->velocity = velocity; }
@@ -680,6 +749,10 @@ static void write_number(services_t *s, qa_compat_q2_rerelease_public_edict *vie
 qa_q2_rerelease_entity_state qa_app_sim_rerelease_guest_services_entity_state(services_t *s, double slot) {
   qa_compat_q2_rerelease_public_edict *view = view_of(s, slot); write_number(s, view, slot);
   qa_q2_rerelease_entity_state state = qa_compat_q2_rerelease_public_edict_state(view); qa_compat_q2_rerelease_public_edict_destroy(view); return state;
+}
+qa_q2_rerelease_player_state qa_app_sim_rerelease_guest_services_player_state_into(services_t *s, double slot, double *stats) {
+  qa_compat_q2_rerelease_public_edict *view = view_of(s, slot); qa_q2_rerelease_player_state state = qa_compat_q2_rerelease_public_edict_player_state_into(view, stats);
+  qa_compat_q2_rerelease_public_edict_destroy(view); return state;
 }
 qa_q2_rerelease_player_state qa_app_sim_rerelease_guest_services_player_state(services_t *s, double slot) {
   qa_compat_q2_rerelease_public_edict *view = view_of(s, slot); qa_q2_rerelease_player_state state = qa_compat_q2_rerelease_public_edict_player_state(view);

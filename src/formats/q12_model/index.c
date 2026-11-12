@@ -7,6 +7,8 @@
 
 #include "qa/foundation/support.h"
 
+static void reader_release(void *reader) { qa_binary_reader_destroy((qa_binary_reader *)reader); }
+
 /* JSON.stringify of the magic for the error text. */
 static void json_quote(const char *text, char *out, size_t capacity) {
   size_t w = 0;
@@ -18,6 +20,10 @@ static void json_quote(const char *text, char *out, size_t capacity) {
       w += (size_t)snprintf(out + w, capacity - w, "%s", escape);
     } else if (*p < 0x20) {
       w += (size_t)snprintf(out + w, capacity - w, "\\u%04x", *p);
+    } else if (*p >= 0x80) {
+      /* The magic is a Latin-1 byte string: U+0080..U+00FF, two UTF-8 bytes. */
+      out[w++] = (char)(0xc0 | (*p >> 6));
+      out[w++] = (char)(0x80 | (*p & 0x3f));
     } else {
       out[w++] = (char)*p;
     }
@@ -30,7 +36,11 @@ void qa_parse_q12_model(const uint8_t *data, size_t data_length, const char *sou
   const char *name = source != NULL ? source : "<model>";
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)data, data_length, name)) qa_range_error("Out of memory");
+  /* A file shorter than its magic raises from the reader; a caught raise must not leak its name. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, reader_release, &reader);
   char *magic = qa_binary_reader_fixed_byte_string(&reader, 4);
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   memset(out, 0, sizeof *out);
   const char *text = magic != NULL ? magic : "";

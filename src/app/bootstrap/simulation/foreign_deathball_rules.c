@@ -58,11 +58,11 @@ bool qa_app_shared_sim_foreign_deathball(qa_app_shared_simulation *sim) {
 /* deathballOrigins(): the ball start (false = null) and the goals map. */
 bool qa_app_shared_sim_deathball_origins(qa_app_shared_simulation *sim, qa_vec3 *ball_out) {
   if (!sim->has_deathball_spots) {
-    bool has_ball = false; qa_vec3 ball = qa_ss_zero;
+    bool has_ball = false; qa_vec3 ball = qa_zero_vec3;
     size_t entity_count = 0;
     qa_q3_entity *entities = qa_q3_parse_entities(sim->world_entities, NULL, &entity_count);
     qa_vec3 *goals = qa_fm_alloc(entity_count, sizeof *goals); size_t goal_count = 0;
-    bool has_team1 = false; qa_vec3 team1 = qa_ss_zero;
+    bool has_team1 = false; qa_vec3 team1 = qa_zero_vec3;
     for (size_t i = 0; i < entity_count; i++) {
       const char *classname = qa_q3_entity_get(&entities[i], "classname");
       if (!classname) classname = "";
@@ -135,7 +135,7 @@ bool qa_app_shared_sim_deathball_origins(qa_app_shared_simulation *sim, qa_vec3 
 void qa_app_shared_sim_spawn_deathball(qa_app_shared_simulation *sim, qa_vec3 origin) {
   qa_owned_actor actor = qa_session_actor_registry_allocate(sim->actors, sim->recipe.match.provider, "q2:dm_dball_ball");
   qa_bounds bounds = {{-15, -15, -15}, {15, 15, 15}};
-  qa_body_state body = {{origin.x, origin.y, origin.z + 16}, qa_ss_zero, qa_ss_zero, bounds, NULL};
+  qa_body_state body = {{origin.x, origin.y, origin.z + 16}, qa_zero_vec3, qa_zero_vec3, bounds, NULL};
   qa_shared_body_table_create_body(qa_fm_bodies(sim), actor, body);
   qa_app_sim_shared_solid solid; memset(&solid, 0, sizeof solid);
   solid.solid = "box"; solid.family = qa_fm_family_name(sim->recipe.map.entities.provider);
@@ -167,7 +167,7 @@ void qa_app_shared_sim_tick_deathball(qa_app_shared_simulation *sim) {
     qa_vec3 home; bool has_home = qa_app_shared_sim_deathball_origins(sim, &home);
     qa_body_state body;
     if (sim->has_deathball && qa_app_shared_sim_body(sim, sim->deathball.id, &body) && has_home) {
-      body.origin = (qa_vec3){home.x, home.y, home.z + 16}; body.velocity = qa_ss_zero;
+      body.origin = (qa_vec3){home.x, home.y, home.z + 16}; body.velocity = qa_zero_vec3;
       qa_shared_body_table_write(qa_fm_bodies(sim), sim->deathball, body);
       qa_shared_body_table_link(qa_fm_bodies(sim), sim->deathball, NULL);
     }
@@ -198,4 +198,16 @@ void qa_app_shared_sim_tick_deathball(qa_app_shared_simulation *sim) {
     sim->has_deathball_reset_at = true; sim->deathball_reset_at = qa_fm_time(sim) + 2;
     return;
   }
+}
+bool qa_app_foreign_deathball_blocks_checkpoint(qa_app_shared_simulation *sim) { return qa_app_shared_sim_foreign_deathball(sim); }
+void qa_app_foreign_deathball_release(qa_app_shared_simulation *sim, qa_actor_id actor) { qa_ss_map_delete(&sim->deathball_teams, &actor); }
+static void wl_deathball_damage(void *ctx, const void *input, void *output) {
+  qa_app_shared_simulation *sim = ctx; const qa_damage_request *request = input; qa_damage_request *out = output;
+  *out = *request;
+  /* Native DeathBall: the ball takes 1 damage from every hit. */
+  if (sim->has_deathball && qa_same_actor(request->target, sim->deathball.id) && request->amount != 1) out->amount = 1;
+}
+void qa_app_foreign_deathball_register_combat(qa_app_shared_simulation *sim) {
+  if (!qa_app_shared_sim_foreign_deathball(sim)) return;
+  qa_fm_register_transform(sim, "q2:deathball", "q2:deathball/ball", wl_deathball_damage);
 }

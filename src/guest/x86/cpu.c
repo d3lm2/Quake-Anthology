@@ -831,6 +831,7 @@ typedef struct run_state {
   qa_x86_decoder decoder;
   bool has_decoder;
   bool checkpointed; /* TS checkpointed: registers saved after the host-call hook */
+  bool active;       /* an instruction is in progress (its TS try block) */
   qa_guest_core_address address;
   qa_guest_execution_stop stop;
   bool have_stop;
@@ -844,6 +845,20 @@ static qa_guest_execution_stop make_stop(qa_guest_execution_stop_kind kind, int6
   return stop;
 }
 
+/* TS run(): any other error leaves the instruction's try block with registers (once checkpointed), flags and IP
+ * restored, then is rethrown; the memory's fault target goes back to the caller's. */
+typedef struct x86_unwind { qa_i386_cpu *cpu; run_state *rs; qa_guest_throw *previous; } x86_unwind;
+static void x86_run_unwind(void *arg) {
+  x86_unwind *unwind = arg;
+  run_state *rs = unwind->rs;
+  qa_i386_cpu *cpu = unwind->cpu;
+  if (rs->active) {
+    if (rs->checkpointed) qa_integer_register_file_restore(&cpu->state->registers, rs->registers, sizeof rs->registers);
+    qa_processor_flags_set_value(&cpu->state->flags, rs->flags);
+    cpu->state->instruction_pointer = rs->original_ip;
+  }
+  cpu->memory->throw_ctx = unwind->previous;
+}
 qa_guest_execution_stop qa_i386_cpu_run(qa_i386_cpu *cpu, int64_t instruction_budget,
                                         bool has_return_address, qa_guest_core_address return_address) {
   if (instruction_budget < 0 || instruction_budget > QA_MAX_SAFE_INTEGER)
@@ -859,11 +874,15 @@ qa_guest_execution_stop qa_i386_cpu_run(qa_i386_cpu *cpu, int64_t instruction_bu
   qa_guest_throw_init(tc, &buf);
   qa_guest_throw *previous = cpu->memory->throw_ctx;
   cpu->memory->throw_ctx = tc;
+  x86_unwind unwind = {cpu, rs, previous};
+  qa_cleanup unwind_node;
+  qa_cleanup_push(&unwind_node, x86_run_unwind, &unwind);
   while (rs->instructions < instruction_budget) {
     rs->original_ip = cpu->state->instruction_pointer;
     rs->flags = qa_processor_flags_value(&cpu->state->flags);
     rs->has_decoder = false;
     rs->checkpointed = false;
+    rs->active = true;
     if (setjmp(buf) == 0) {
       rs->address = qa_x86_guest_address(cpu->memory,
           as_uint_n(32, cpu->state->segments[QA_SEG_CS].base + rs->original_ip), QA_ACCESS_EXECUTE, 1);
@@ -887,6 +906,7 @@ qa_guest_execution_stop qa_i386_cpu_run(qa_i386_cpu *cpu, int64_t instruction_bu
       bool halt = execute(cpu, &rs->decoder);
       cpu->state->instruction_pointer = rs->decoder.cursor;
       rs->instructions++;
+      rs->active = false;
       if (halt) {
         rs->stop = make_stop(QA_STOP_HALT, rs->instructions);
         rs->stop.address = rs->address;
@@ -894,6 +914,7 @@ qa_guest_execution_stop qa_i386_cpu_run(qa_i386_cpu *cpu, int64_t instruction_bu
         break;
       }
     } else {
+      rs->active = false;
       if (rs->checkpointed) qa_integer_register_file_restore(&cpu->state->registers, rs->registers, sizeof rs->registers);
       qa_processor_flags_set_value(&cpu->state->flags, rs->flags);
       cpu->state->instruction_pointer = rs->original_ip;
@@ -932,13 +953,13 @@ qa_guest_execution_stop qa_i386_cpu_run(qa_i386_cpu *cpu, int64_t instruction_bu
         (void)snprintf(cpu->stop_detail, sizeof cpu->stop_detail, "%s", tc->detail);
         rs->stop.detail = cpu->stop_detail;
       } else {
-        cpu->memory->throw_ctx = previous;
         qa_range_error("Guest throw channel is inconsistent");
       }
       rs->have_stop = true;
       break;
     }
   }
+  qa_cleanup_pop(&unwind_node);
   cpu->memory->throw_ctx = previous;
   if (rs->have_stop) return rs->stop;
   return make_stop(QA_STOP_BUDGET, rs->instructions);

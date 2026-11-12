@@ -26,8 +26,15 @@ qa_compat_qc_builtin qa_compat_qc_registry_get_named(const qa_compat_qc_builtin_
 void qa_compat_qc_registry_destroy(qa_compat_qc_builtin_registry *r) { if (r->state_destroy) { r->state_destroy(r->state); } free(r->numbered); free(r->named); memset(r, 0, sizeof *r); }
 void qa_compat_qc_machine_snapshot_destroy(qa_compat_qc_machine_snapshot *s) { free(s->globals); free(s->entities); free(s->strings); free(s->profiling); memset(s, 0, sizeof *s); }
 
+/* A TS error message has no length limit (a builtin's error text carries guest strings): the
+ * text is formatted whole and released as the raise unwinds. */
 noreturn void qa_compat_qc_machine_fail(qa_compat_qc_machine *m, const char *format, ...) {
-  char msg[QA_CAUGHT_MESSAGE_CAPACITY]; va_list ap; va_start(ap, format); vsnprintf(msg, sizeof msg, format, ap); va_end(ap);
+  va_list ap, measure; va_start(ap, format); va_copy(measure, ap);
+  int needed = vsnprintf(NULL, 0, format, measure); va_end(measure);
+  char *msg = malloc((size_t)(needed < 0 ? 0 : needed) + 1);
+  if (!msg) { va_end(ap); qa_range_error("QuakeC error text allocation failed"); }
+  vsnprintf(msg, (size_t)(needed < 0 ? 0 : needed) + 1, format, ap); va_end(ap);
+  qa_cleanup text; qa_cleanup_push(&text, free, msg);
   qa_raise("QcRuntimeError", 0, 0, "QuakeC %lld:%lld: %s", (long long)m->function_index, (long long)m->statement, msg);
 }
 static bool in_boundary(qa_compat_qc_machine *m, int64_t idx) { for (size_t i = 0; i < m->boundary_function_count; i++) { if (m->boundary_functions[i] == idx) return true; } return false; }
@@ -133,14 +140,19 @@ const char *qa_compat_qc_machine_arg_string(qa_compat_qc_machine *m, int64_t i) 
 void qa_compat_qc_machine_return_float(qa_compat_qc_machine *m, double v) { qa_compat_qc_words_set_float(&m->globals, 1, v); }
 void qa_compat_qc_machine_return_int(qa_compat_qc_machine *m, double v) { qa_compat_qc_words_set_int(&m->globals, 1, v); }
 void qa_compat_qc_machine_return_vector(qa_compat_qc_machine *m, qa_vec3 v) { qa_compat_qc_words_set_vector(&m->globals, 1, v); }
+/* The text built so far is released when a later argument is not a valid string. */
+typedef struct { char *text; } VarString;
+static void var_string_free(void *arg) { free(((VarString *)arg)->text); }
 char *qa_compat_qc_machine_var_string(qa_compat_qc_machine *m, int64_t first) {
-  size_t cap = 64, len = 0; char *r = malloc(cap); if (!r) return NULL; r[0] = 0;
+  size_t cap = 64, len = 0; VarString v = {malloc(cap)}; if (!v.text) return NULL; v.text[0] = 0;
+  qa_cleanup scope; qa_cleanup_push(&scope, var_string_free, &v);
   for (int64_t i = first; i < m->argument_count; i++) {
     const char *s = qa_compat_qc_machine_arg_string(m, i); size_t n = strlen(s);
-    if (len + n + 1 > cap) { cap = (len + n + 1) * 2; char *g = realloc(r, cap); if (!g) { free(r); return NULL; } r = g; }
-    memcpy(r + len, s, n); len += n; r[len] = 0;
+    if (len + n + 1 > cap) { cap = (len + n + 1) * 2; char *g = realloc(v.text, cap); if (!g) { qa_cleanup_pop(&scope); free(v.text); return NULL; } v.text = g; }
+    memcpy(v.text + len, s, n); len += n; v.text[len] = 0;
   }
-  return r;
+  qa_cleanup_pop(&scope);
+  return v.text;
 }
 qa_compat_qc_words *qa_compat_qc_machine_self(qa_compat_qc_machine *m) {
   return qa_compat_qc_entity_memory_from_reference(m->entities, qa_compat_qc_words_int(&m->globals, qa_compat_qc_machine_global_offset(m, "self")));
@@ -393,51 +405,80 @@ static void run_statements(qa_compat_qc_machine *m, int64_t exit_depth, int64_t 
     qa_compat_qc_words *g = &m->globals; const qa_numeric_operations *n = m->numeric; void *nc = n->ctx;
     int64_t a = st.a, b = st.b, c = st.c;
     switch (st.opcode) {
-      case QA_QC_OP_ADD_F: qa_compat_qc_words_set_float(g, c, n->add(nc, qa_compat_qc_words_float(g,a), qa_compat_qc_words_float(g,b))); break;
-      case QA_QC_OP_SUB_F: qa_compat_qc_words_set_float(g, c, n->subtract(nc, qa_compat_qc_words_float(g,a), qa_compat_qc_words_float(g,b))); break;
-      case QA_QC_OP_MUL_F: qa_compat_qc_words_set_float(g, c, n->multiply(nc, qa_compat_qc_words_float(g,a), qa_compat_qc_words_float(g,b))); break;
-      case QA_QC_OP_DIV_F: qa_compat_qc_words_set_float(g, c, n->divide(nc, qa_compat_qc_words_float(g,a), qa_compat_qc_words_float(g,b))); break;
-      case QA_QC_OP_ADD_V: for (int i=0;i<3;i++) qa_compat_qc_words_set_float(g,c+i,n->add(nc,qa_compat_qc_words_float(g,a+i),qa_compat_qc_words_float(g,b+i))); break;
-      case QA_QC_OP_SUB_V: for (int i=0;i<3;i++) qa_compat_qc_words_set_float(g,c+i,n->subtract(nc,qa_compat_qc_words_float(g,a+i),qa_compat_qc_words_float(g,b+i))); break;
-      case QA_QC_OP_MUL_V: qa_compat_qc_words_set_float(g,c,n->add(nc,n->add(nc,n->multiply(nc,qa_compat_qc_words_float(g,a),qa_compat_qc_words_float(g,b)),n->multiply(nc,qa_compat_qc_words_float(g,a+1),qa_compat_qc_words_float(g,b+1))),n->multiply(nc,qa_compat_qc_words_float(g,a+2),qa_compat_qc_words_float(g,b+2)))); break;
-      case QA_QC_OP_MUL_FV: for (int i=0;i<3;i++) qa_compat_qc_words_set_float(g,c+i,n->multiply(nc,qa_compat_qc_words_float(g,a),qa_compat_qc_words_float(g,b+i))); break;
-      case QA_QC_OP_MUL_VF: for (int i=0;i<3;i++) qa_compat_qc_words_set_float(g,c+i,n->multiply(nc,qa_compat_qc_words_float(g,b),qa_compat_qc_words_float(g,a+i))); break;
-      case QA_QC_OP_EQ_F: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)==qa_compat_qc_words_float(g,b)?1:0); break;
-      case QA_QC_OP_NE_F: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)!=qa_compat_qc_words_float(g,b)?1:0); break;
-      case QA_QC_OP_EQ_V: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)==qa_compat_qc_words_float(g,b)&&qa_compat_qc_words_float(g,a+1)==qa_compat_qc_words_float(g,b+1)&&qa_compat_qc_words_float(g,a+2)==qa_compat_qc_words_float(g,b+2)?1:0); break;
-      case QA_QC_OP_NE_V: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)!=qa_compat_qc_words_float(g,b)||qa_compat_qc_words_float(g,a+1)!=qa_compat_qc_words_float(g,b+1)||qa_compat_qc_words_float(g,a+2)!=qa_compat_qc_words_float(g,b+2)?1:0); break;
-      case QA_QC_OP_EQ_S: { const char *l=qa_compat_qc_strings_get(&m->strings,qa_compat_qc_words_int(g,a)); const char *r=qa_compat_qc_strings_get(&m->strings,qa_compat_qc_words_int(g,b)); qa_compat_qc_words_set_float(g,c,strcmp(l,r)==0?1:0); break; }
-      case QA_QC_OP_NE_S: { const char *l=qa_compat_qc_strings_get(&m->strings,qa_compat_qc_words_int(g,a)); const char *r=qa_compat_qc_strings_get(&m->strings,qa_compat_qc_words_int(g,b)); qa_compat_qc_words_set_float(g,c,byte_compare(l,r)); break; }
-      case QA_QC_OP_EQ_E: case QA_QC_OP_EQ_FN: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_int(g,a)==qa_compat_qc_words_int(g,b)?1:0); break;
-      case QA_QC_OP_NE_E: case QA_QC_OP_NE_FN: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_int(g,a)!=qa_compat_qc_words_int(g,b)?1:0); break;
-      case QA_QC_OP_LE: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)<=qa_compat_qc_words_float(g,b)?1:0); break;
-      case QA_QC_OP_GE: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)>=qa_compat_qc_words_float(g,b)?1:0); break;
-      case QA_QC_OP_LT: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)<qa_compat_qc_words_float(g,b)?1:0); break;
-      case QA_QC_OP_GT: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)>qa_compat_qc_words_float(g,b)?1:0); break;
-      case QA_QC_OP_NOT_F: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)==0?1:0); break;
-      case QA_QC_OP_NOT_V: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)==0&&qa_compat_qc_words_float(g,a+1)==0&&qa_compat_qc_words_float(g,a+2)==0?1:0); break;
-      case QA_QC_OP_NOT_S: { int32_t v=qa_compat_qc_words_int(g,a); qa_compat_qc_words_set_float(g,c,v==0||strcmp(qa_compat_qc_strings_get(&m->strings,v),"")==0?1:0); break; }
-      case QA_QC_OP_NOT_ENT: qa_compat_qc_words_set_float(g,c,qa_compat_qc_entity_memory_slot(m->entities,qa_compat_qc_words_int(g,a))==0?1:0); break;
-      case QA_QC_OP_NOT_FN: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_int(g,a)==0?1:0); break;
-      case QA_QC_OP_AND: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)!=0&&qa_compat_qc_words_float(g,b)!=0?1:0); break;
-      case QA_QC_OP_OR: qa_compat_qc_words_set_float(g,c,qa_compat_qc_words_float(g,a)!=0||qa_compat_qc_words_float(g,b)!=0?1:0); break;
-      case QA_QC_OP_BITAND: qa_compat_qc_words_set_float(g,c,(double)((int32_t)n->to_int32(nc,qa_compat_qc_words_float(g,a)) & (int32_t)n->to_int32(nc,qa_compat_qc_words_float(g,b)))); break;
-      case QA_QC_OP_BITOR: qa_compat_qc_words_set_float(g,c,(double)((int32_t)n->to_int32(nc,qa_compat_qc_words_float(g,a)) | (int32_t)n->to_int32(nc,qa_compat_qc_words_float(g,b)))); break;
+      /* Operand words are read into locals in TS order (left to right): each read can refuse a
+       * word outside the globals, and C leaves the order of call arguments and of the operands
+       * of == and & unspecified. */
+#define F(word) qa_compat_qc_words_float(g, (word))
+#define I(word) qa_compat_qc_words_int(g, (word))
+#define SETF(word, value) qa_compat_qc_words_set_float(g, (word), (value))
+      case QA_QC_OP_ADD_F: { double x = F(a); double y = F(b); SETF(c, n->add(nc, x, y)); break; }
+      case QA_QC_OP_SUB_F: { double x = F(a); double y = F(b); SETF(c, n->subtract(nc, x, y)); break; }
+      case QA_QC_OP_MUL_F: { double x = F(a); double y = F(b); SETF(c, n->multiply(nc, x, y)); break; }
+      case QA_QC_OP_DIV_F: { double x = F(a); double y = F(b); SETF(c, n->divide(nc, x, y)); break; }
+      case QA_QC_OP_ADD_V: for (int i = 0; i < 3; i++) { double x = F(a + i); double y = F(b + i); SETF(c + i, n->add(nc, x, y)); } break;
+      case QA_QC_OP_SUB_V: for (int i = 0; i < 3; i++) { double x = F(a + i); double y = F(b + i); SETF(c + i, n->subtract(nc, x, y)); } break;
+      case QA_QC_OP_MUL_V: {
+        double x0 = F(a); double y0 = F(b); double p0 = n->multiply(nc, x0, y0);
+        double x1 = F(a + 1); double y1 = F(b + 1); double p1 = n->multiply(nc, x1, y1);
+        double sum = n->add(nc, p0, p1);
+        double x2 = F(a + 2); double y2 = F(b + 2); double p2 = n->multiply(nc, x2, y2);
+        SETF(c, n->add(nc, sum, p2)); break; }
+      case QA_QC_OP_MUL_FV: for (int i = 0; i < 3; i++) { double x = F(a); double y = F(b + i); SETF(c + i, n->multiply(nc, x, y)); } break;
+      case QA_QC_OP_MUL_VF: for (int i = 0; i < 3; i++) { double x = F(b); double y = F(a + i); SETF(c + i, n->multiply(nc, x, y)); } break;
+      case QA_QC_OP_EQ_F: { double x = F(a); double y = F(b); SETF(c, x == y ? 1 : 0); break; }
+      case QA_QC_OP_NE_F: { double x = F(a); double y = F(b); SETF(c, x != y ? 1 : 0); break; }
+      case QA_QC_OP_EQ_V: {
+        /* && stops at the first unequal component: later words are not read. */
+        bool equal = true;
+        for (int i = 0; i < 3 && equal; i++) { double x = F(a + i); double y = F(b + i); equal = x == y; }
+        SETF(c, equal ? 1 : 0); break; }
+      case QA_QC_OP_NE_V: {
+        bool differs = false;
+        for (int i = 0; i < 3 && !differs; i++) { double x = F(a + i); double y = F(b + i); differs = x != y; }
+        SETF(c, differs ? 1 : 0); break; }
+      case QA_QC_OP_EQ_S: { const char *l=qa_compat_qc_strings_get(&m->strings,I(a)); const char *r=qa_compat_qc_strings_get(&m->strings,I(b)); SETF(c,strcmp(l,r)==0?1:0); break; }
+      case QA_QC_OP_NE_S: { const char *l=qa_compat_qc_strings_get(&m->strings,I(a)); const char *r=qa_compat_qc_strings_get(&m->strings,I(b)); SETF(c,byte_compare(l,r)); break; }
+      case QA_QC_OP_EQ_E: case QA_QC_OP_EQ_FN: { int32_t x = I(a); int32_t y = I(b); SETF(c, x == y ? 1 : 0); break; }
+      case QA_QC_OP_NE_E: case QA_QC_OP_NE_FN: { int32_t x = I(a); int32_t y = I(b); SETF(c, x != y ? 1 : 0); break; }
+      case QA_QC_OP_LE: { double x = F(a); double y = F(b); SETF(c, x <= y ? 1 : 0); break; }
+      case QA_QC_OP_GE: { double x = F(a); double y = F(b); SETF(c, x >= y ? 1 : 0); break; }
+      case QA_QC_OP_LT: { double x = F(a); double y = F(b); SETF(c, x < y ? 1 : 0); break; }
+      case QA_QC_OP_GT: { double x = F(a); double y = F(b); SETF(c, x > y ? 1 : 0); break; }
+      case QA_QC_OP_NOT_F: SETF(c, F(a) == 0 ? 1 : 0); break;
+      case QA_QC_OP_NOT_V: {
+        bool zero = true;
+        for (int i = 0; i < 3 && zero; i++) zero = F(a + i) == 0;
+        SETF(c, zero ? 1 : 0); break; }
+      case QA_QC_OP_NOT_S: { int32_t v=I(a); SETF(c,v==0||strcmp(qa_compat_qc_strings_get(&m->strings,v),"")==0?1:0); break; }
+      case QA_QC_OP_NOT_ENT: SETF(c,qa_compat_qc_entity_memory_slot(m->entities,I(a))==0?1:0); break;
+      case QA_QC_OP_NOT_FN: SETF(c,I(a)==0?1:0); break;
+      case QA_QC_OP_AND: {
+        /* a !== 0 && b !== 0: b is read only when a is nonzero. */
+        bool result = F(a) != 0;
+        if (result) result = F(b) != 0;
+        SETF(c, result ? 1 : 0); break; }
+      case QA_QC_OP_OR: {
+        bool result = F(a) != 0;
+        if (!result) result = F(b) != 0;
+        SETF(c, result ? 1 : 0); break; }
+      case QA_QC_OP_BITAND: { int32_t x = (int32_t)n->to_int32(nc, F(a)); int32_t y = (int32_t)n->to_int32(nc, F(b)); SETF(c, (double)(x & y)); break; }
+      case QA_QC_OP_BITOR: { int32_t x = (int32_t)n->to_int32(nc, F(a)); int32_t y = (int32_t)n->to_int32(nc, F(b)); SETF(c, (double)(x | y)); break; }
       case QA_QC_OP_STORE_F: case QA_QC_OP_STORE_S: case QA_QC_OP_STORE_ENT: case QA_QC_OP_STORE_FLD: case QA_QC_OP_STORE_FN: qa_compat_qc_words_copy_words(g,g,a,b,1); break;
       case QA_QC_OP_STORE_V: qa_compat_qc_words_copy_words(g,g,a,b,3); break;
-      case QA_QC_OP_LOAD_F: case QA_QC_OP_LOAD_S: case QA_QC_OP_LOAD_ENT: case QA_QC_OP_LOAD_FLD: case QA_QC_OP_LOAD_FN:
-        if (m->options.validate_entity_access) m->options.validate_entity_access(m->options.ctx,qa_compat_qc_words_int(g,a),qa_compat_qc_words_int(g,b),1,"read");
-        qa_compat_qc_words_copy_words(g,qa_compat_qc_entity_memory_from_reference(m->entities,qa_compat_qc_words_int(g,a)),qa_compat_qc_words_int(g,b),c,1); break;
-      case QA_QC_OP_LOAD_V:
-        if (m->options.validate_entity_access) m->options.validate_entity_access(m->options.ctx,qa_compat_qc_words_int(g,a),qa_compat_qc_words_int(g,b),3,"read");
-        qa_compat_qc_words_copy_words(g,qa_compat_qc_entity_memory_from_reference(m->entities,qa_compat_qc_words_int(g,a)),qa_compat_qc_words_int(g,b),c,3); break;
-      case QA_QC_OP_ADDRESS:
-        if (qa_compat_qc_entity_memory_slot(m->entities,qa_compat_qc_words_int(g,a))==0 && (!m->options.server_active || m->options.server_active(m->options.ctx))) qa_compat_qc_machine_fail(m,"assignment to world entity");
-        qa_compat_qc_words_set_int(g,c,(double)qa_compat_qc_entity_memory_pointer(m->entities,qa_compat_qc_words_int(g,a),qa_compat_qc_words_int(g,b))); break;
+      case QA_QC_OP_LOAD_F: case QA_QC_OP_LOAD_S: case QA_QC_OP_LOAD_ENT: case QA_QC_OP_LOAD_FLD: case QA_QC_OP_LOAD_FN: case QA_QC_OP_LOAD_V: {
+        int64_t words = st.opcode == QA_QC_OP_LOAD_V ? 3 : 1;
+        if (m->options.validate_entity_access) { int32_t reference = I(a); int32_t field = I(b); m->options.validate_entity_access(m->options.ctx, reference, field, words, "read"); }
+        qa_compat_qc_words *from = qa_compat_qc_entity_memory_from_reference(m->entities, I(a));
+        int32_t field = I(b);
+        qa_compat_qc_words_copy_words(g, from, field, c, words); break; }
+      case QA_QC_OP_ADDRESS: {
+        if (qa_compat_qc_entity_memory_slot(m->entities,I(a))==0 && (!m->options.server_active || m->options.server_active(m->options.ctx))) qa_compat_qc_machine_fail(m,"assignment to world entity");
+        int32_t reference = I(a); int32_t field = I(b);
+        qa_compat_qc_words_set_int(g,c,(double)qa_compat_qc_entity_memory_pointer(m->entities,reference,field)); break; }
       case QA_QC_OP_STOREP_F: case QA_QC_OP_STOREP_S: case QA_QC_OP_STOREP_ENT: case QA_QC_OP_STOREP_FLD: case QA_QC_OP_STOREP_FN: case QA_QC_OP_STOREP_V: {
         int64_t words = st.opcode==QA_QC_OP_STOREP_V?3:1;
-        qa_compat_qc_resolved_pointer dest = qa_compat_qc_entity_memory_resolve_pointer(m->entities,qa_compat_qc_words_int(g,b),words);
-        int64_t ref = qa_compat_qc_words_int(g,b) - m->entities->layout.variables_offset_bytes - dest.word*4;
+        qa_compat_qc_resolved_pointer dest = qa_compat_qc_entity_memory_resolve_pointer(m->entities,I(b),words);
+        int64_t ref = I(b) - m->entities->layout.variables_offset_bytes - dest.word*4;
         if (m->options.validate_entity_access) m->options.validate_entity_access(m->options.ctx,ref,dest.word,words,"write");
         uint8_t before[12]; bool obs=m->options.observe_entity_store!=NULL; if(obs) memcpy(before,dest.fields->bytes+dest.word*4,(size_t)words*4);
         qa_compat_qc_words_copy_words(dest.fields,g,a,dest.word,words);
@@ -460,8 +501,12 @@ static void run_statements(qa_compat_qc_machine *m, int64_t exit_depth, int64_t 
       case QA_QC_OP_STATE: {
         qa_compat_qc_words *self = qa_compat_qc_machine_self(m);
         if (m->options.validate_entity_access) {
-          int64_t reference = qa_compat_qc_words_int(g, qa_compat_qc_machine_global_offset(m, "self"));
-          struct { const char *name; double v; int is_int; } fs[3] = {{"nextthink", n->add(nc, qa_compat_qc_words_float(g, qa_compat_qc_machine_global_offset(m, "time")), 0.1), 0}, {"frame", qa_compat_qc_words_float(g, a), 0}, {"think", qa_compat_qc_words_int(g, b), 1}};
+          int64_t reference = I(qa_compat_qc_machine_global_offset(m, "self"));
+          /* The three values are read in TS array-literal order before any field is stored. */
+          double nextthink_value = n->add(nc, F(qa_compat_qc_machine_global_offset(m, "time")), 0.1);
+          double frame_value = F(a);
+          double think_value = I(b);
+          struct { const char *name; double v; int is_int; } fs[3] = {{"nextthink", nextthink_value, 0}, {"frame", frame_value, 0}, {"think", think_value, 1}};
           for (int i = 0; i < 3; i++) {
             int64_t word = qa_compat_qc_machine_field_offset(m, fs[i].name);
             m->options.validate_entity_access(m->options.ctx, reference, word, 1, "write");
@@ -471,15 +516,24 @@ static void run_statements(qa_compat_qc_machine *m, int64_t exit_depth, int64_t 
           }
           break;
         }
+        /* Each store evaluates its field offset, then its value. */
         int64_t nextthink = qa_compat_qc_machine_field_offset(m, "nextthink");
-        qa_compat_qc_words_set_float(self, nextthink, n->add(nc, qa_compat_qc_words_float(g, qa_compat_qc_machine_global_offset(m, "time")), 0.1));
-        qa_compat_qc_words_set_float(self, qa_compat_qc_machine_field_offset(m, "frame"), qa_compat_qc_words_float(g, a));
-        qa_compat_qc_words_set_int(self, qa_compat_qc_machine_field_offset(m, "think"), qa_compat_qc_words_int(g, b));
+        double nextthink_value = n->add(nc, F(qa_compat_qc_machine_global_offset(m, "time")), 0.1);
+        qa_compat_qc_words_set_float(self, nextthink, nextthink_value);
+        int64_t frame = qa_compat_qc_machine_field_offset(m, "frame");
+        double frame_value = F(a);
+        qa_compat_qc_words_set_float(self, frame, frame_value);
+        int64_t think = qa_compat_qc_machine_field_offset(m, "think");
+        int32_t think_value = I(b);
+        qa_compat_qc_words_set_int(self, think, think_value);
         break; }
       case QA_QC_OP_DONE: case QA_QC_OP_RETURN:
         if (stop_region && m->frame_count && (int64_t)m->frame_count-1==stop_frame) qa_compat_qc_machine_fail(m,"inline source region returned before its continuation");
         qa_compat_qc_words_copy_return_words(g,g,a,1,3); leave(m); break;
       default: qa_compat_qc_machine_fail(m,"unsupported opcode %d",(int)st.opcode);
+#undef F
+#undef I
+#undef SETF
     }
   }
 }

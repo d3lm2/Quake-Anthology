@@ -1,7 +1,6 @@
 /* Port of src/content/q2/multiplayer/ctf/grapple.ts. GPL-2.0-or-later.
- * Note: TS equipment.states clear/delete have no landed equipment API;
- * only the inactive map is cleared/deleted (equipment states are
- * overwritten in place on restore). */
+ * Note: the equipment has no Map.delete for one actor's state, so
+ * states.delete only reaches the inactive map. */
 #include "qa/content/q2/multiplayer/ctf/grapple.h"
 #include "../multiplayer_internal.h"
 #include "qa/content/q2/equipment/grapple_weapon.h"
@@ -107,7 +106,7 @@ qa_ctf_grapple_state *qa_q2_ctf_grapple_module_state_ref(qa_q2_ctf_grapple *g, q
 }
 
 bool qa_q2_ctf_grapple_module_state_has(qa_q2_ctf_grapple *g, qa_actor_id actor) {
-  if (g->equipment != NULL) return qa_q2_ctf_grapple_state(g->equipment, actor) != NULL;
+  if (g->equipment != NULL) return qa_q2_ctf_grapple_find_state(g->equipment, actor) != NULL; /* Map.has creates nothing */
   return inactive_ref(g, actor, false) != NULL;
 }
 
@@ -125,7 +124,10 @@ void qa_q2_ctf_grapple_module_state_delete(qa_q2_ctf_grapple *g, qa_actor_id act
   /* Equipment map delete is not exposed by the landed equipment. */
 }
 
-void qa_q2_ctf_grapple_module_states_clear(qa_q2_ctf_grapple *g) { g->inactive_count = 0; }
+void qa_q2_ctf_grapple_module_states_clear(qa_q2_ctf_grapple *g) {
+  if (g->equipment != NULL) qa_q2_ctf_grapple_clear_states(g->equipment); /* TS states is the equipment's map when there is one */
+  else g->inactive_count = 0;
+}
 
 qa_q2_callback_definitions qa_q2_ctf_grapple_module_callbacks(qa_q2_ctf_grapple *g) {
   if (g->equipment != NULL) return qa_q2_ctf_grapple_callbacks(g->equipment);

@@ -116,7 +116,7 @@ typedef struct quakec_host {
   double *board_order; size_t board_order_count; /* board Map insertion order */
   qa_wire_admission support;
   char *map_name;
-  qa_actor_command **inputs; size_t input_count;
+  qa_actor_command input; /* host input() scratch: the network copies each command */
 } quakec_host;
 
 static per_player *player_slot(quakec_host *h, double slot) {
@@ -360,8 +360,6 @@ static void host_observe(void *ctx, const void *output, const void *const *event
   quakec_host *h = ctx;
   const qa_app_sim_network_simulation *s = h->simulation;
   const qa_app_sim_presentation_event *const *events = (const qa_app_sim_presentation_event *const *)events_value;
-  for (size_t i = 0; i < h->input_count; i++) free(h->inputs[i]);
-  h->input_count = 0;
   routed_clear(&h->routed);
   h->routed = h->commands; /* routed = commandMessages.drainAll() */
   memset(&h->commands, 0, sizeof h->commands);
@@ -609,6 +607,9 @@ static qa_app_q1_frame host_frame(void *ctx, qa_app_q1_player player, const void
   routed_for(h, player, true, &entry->reliable);
   if (qa_app_sim_quakec_source_is_active_client(h->game, player.actor)) {
     double cluster = qa_shared_leaf_cluster(scene, qa_shared_point_leaf(scene, s->player_view(s->ctx, player.actor).origin));
+    /* messages = [clientData(player)], then consumeNetQuakeDamage (unshifted): a raising clientData
+     * leaves the damage unconsumed. */
+    qa_netquake_message data = client_data(h, player);
     qa_app_sim_quakec_netquake_damage damage;
     if (qa_app_sim_quakec_source_consume_netquake_damage(h->game, player.actor, &damage)) {
       qa_netquake_message message;
@@ -616,7 +617,7 @@ static qa_app_q1_frame host_frame(void *ctx, qa_app_q1_player player, const void
       message.kind = "damage"; message.armor = damage.armor; message.blood = damage.blood; message.source = damage.source;
       list_push(&entry->messages, message);
     }
-    list_push(&entry->messages, client_data(h, player));
+    list_push(&entry->messages, data);
     routed_for(h, player, false, &entry->datagram);
     size_t count = 0;
     qa_q1_extended_entity_state *states = entities(h, &count);
@@ -638,13 +639,12 @@ static qa_app_q1_frame host_frame(void *ctx, qa_app_q1_player player, const void
 }
 static const void *host_input(void *ctx, qa_app_q1_player player, const qa_q1_user_command *command, double sequence) {
   quakec_host *h = ctx;
-  qa_actor_command *out = xcalloc(1, sizeof *out);
+  qa_actor_command *out = &h->input;
+  memset(out, 0, sizeof *out);
   out->actor = player.actor;
   out->source.kind = QA_COMMAND_SOURCE_REMOTE_CLIENT; out->source.client = player.client;
   out->sequence = sequence;
   out->command.kind = QA_USER_COMMAND_Q1; out->command.as.q1 = *command;
-  h->inputs = xrealloc(h->inputs, (h->input_count + 1) * sizeof *h->inputs);
-  h->inputs[h->input_count++] = out;
   return out;
 }
 static char *slice_15(const char *text) {
@@ -758,8 +758,6 @@ static void host_destroy(void *ctx) {
   for (size_t i = 0; i < h->board_count; i++) free(h->board[i].name);
   free(h->board);
   routed_clear(&h->routed); routed_clear(&h->commands);
-  for (size_t i = 0; i < h->input_count; i++) free(h->inputs[i]);
-  free(h->inputs);
   free(h->models.keys); free(h->models.values); free(h->sounds.keys); free(h->sounds.values);
   qa_wire_admission_destroy(&h->support);
   free(h->map_name);

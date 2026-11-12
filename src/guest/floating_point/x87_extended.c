@@ -1,6 +1,8 @@
 /* Port of src/guest/floating-point/x87-extended.ts. GPL-2.0-or-later. */
 #include "qa/guest/floating_point/x87_extended.h"
 
+#include "qa/foundation/support.h"
+
 #include <string.h>
 
 #include "qa/guest/floating_point/trigonometric.h"
@@ -217,6 +219,12 @@ void qa_x87_remainder(qa_x87_remainder_result *out, const qa_binary_value *divid
   qa_bigint_free(&magnitude);
 }
 
+/* The series below can raise the BigInt size RangeError (an out-of-domain operand); its values are freed then. */
+typedef struct series_values { qa_bigint *values[7]; } series_values;
+static void series_release(void *arg) {
+  series_values *held = arg;
+  for (int i = 0; i < 7; i++) qa_bigint_free(held->values[i]);
+}
 void qa_x87_two_power_minus_one(qa_binary_result *out, const qa_binary_value *value, qa_fp_rounding mode) {
   memset(out, 0, sizeof *out);
   if (is_nan_operand(value)) {
@@ -258,6 +266,9 @@ void qa_x87_two_power_minus_one(qa_binary_result *out, const qa_binary_value *va
   qa_bigint_init(&sum);
   qa_bigint_init(&divisor);
   qa_bigint_init(&factor);
+  series_values held = {{&fixed, &y, &term, &sum, &divisor, &factor, &scale}};
+  qa_cleanup held_node;
+  qa_cleanup_push(&held_node, series_release, &held);
   if (shift >= 0) qa_bigint_shl(&fixed, &value->coefficient, shift);
   else qa_bigint_shr(&fixed, &value->coefficient, -shift);
   if (value->sign == 1) qa_bigint_neg(&fixed, &fixed);
@@ -272,6 +283,7 @@ void qa_x87_two_power_minus_one(qa_binary_result *out, const qa_binary_value *va
     big_div(&term, &term, &divisor);
     qa_bigint_add(&sum, &sum, &term);
   }
+  qa_cleanup_pop(&held_node);
   const bool negative = sum.sign < 0;
   if (negative) qa_bigint_neg(&sum, &sum);
   convert_finite(out, negative ? 1 : 0, &sum, -BITS, mode);

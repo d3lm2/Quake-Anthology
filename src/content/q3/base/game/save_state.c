@@ -10,13 +10,16 @@
 static char *dupstr(const char *v) { if (!v) return NULL; size_t n = strlen(v); char *d = malloc(n + 1); if (!d) qa_range_error("out of memory"); memcpy(d, v, n + 1); return d; }
 void qa_q3_graph_state_destroy(qa_q3_graph_state *s) {
   free(s->ownership);
-  for (size_t i = 0; i < s->entity_count; i++) { qa_q3_game_save_entity_state *e = &s->entities[i]; qa_q3_entity_values_destroy(&e->values);
+  for (size_t i = 0; s->entities && i < s->entity_count; i++) { qa_q3_game_save_entity_state *e = &s->entities[i]; qa_q3_entity_values_destroy(&e->values);
     free(e->classname); free(e->think); free(e->reached); free(e->blocked); free(e->touch); free(e->use); free(e->pain); free(e->die); }
   free(s->entities);
-  for (size_t i = 0; i < s->client_count; i++) { qa_q3_game_save_client_state *c = &s->clients[i]; qa_q3_persistant_values_destroy(&c->persistant);
-    free(c->events); free(c->event_parms); free(c->persistant_slots); free(c->powerups); free(c->ammo_times); free(c->areabits); }
+  for (size_t i = 0; s->clients && i < s->client_count; i++) { qa_q3_game_save_client_state *c = &s->clients[i]; qa_q3_persistant_values_destroy(&c->persistant);
+    free(c->events); free(c->event_parms); free(c->persistant_slots); free(c->powerups); free(c->ammo_times);
+    free(c->source_stats); free(c->special_ammo); free(c->areabits); }
   free(s->clients); memset(s, 0, sizeof *s);
 }
+static void destroy_graph(void *arg) { qa_q3_graph_state_destroy(arg); }
+static void free_block(void *arg) { free(arg); }
 /* TS Array.from(slots.copy()). */
 static double *copy_slots(const qa_q3_base_player_state_slots *slots, size_t *out) {
   int32_t *words = qa_q3_base_player_state_slots_copy(slots);
@@ -28,28 +31,33 @@ static double *copy_slots(const qa_q3_base_player_state_slots *slots, size_t *ou
   return d;
 }
 static void restore_slots(qa_q3_base_player_state_slots *target, const double *values, size_t count) {
-  if ((double)count != target->length) qa_range_error("Q3 saved player slot count mismatch");
+  if ((double)count != target->length) qa_raise("Error", 0, 0, "Q3 saved player slot count mismatch");
   for (size_t i = 0; i < count; i++) qa_q3_base_player_state_slots_set(target, (double)i, values[i]);
 }
 static void entity_slot(qa_q3_entity_pool *pool, qa_q3_game_entity *e, bool *has, double *out) {
   *has = e != NULL; if (!e) return;
-  if (qa_q3_entity_pool_get(pool, e->slot) != e) qa_range_error("Q3 graph contains a foreign entity record");
+  if (qa_q3_entity_pool_get(pool, e->slot) != e) qa_raise("Error", 0, 0, "Q3 graph contains a foreign entity record");
   *out = e->slot;
 }
+/* TS clientSlot of a non-null client: pool.clients.indexOf(client). */
 static double client_slot(qa_q3_entity_pool *pool, const qa_q3_game_client *c) {
   for (int i = 0; i < QA_Q3_MAX_CLIENTS; i++) if (pool->clients[i] == c) return i;
-  qa_range_error("Q3 graph contains a foreign client record");
+  qa_raise("Error", 0, 0, "Q3 graph contains a foreign client record");
 }
 static qa_q3_saved_actor_ref saved_ref(qa_actor_id actor) { qa_saved_actor_id id = qa_saved_actor_id_of(actor); qa_q3_saved_actor_ref r = {true, id.slot, id.generation}; return r; }
 static qa_saved_actor_id saved_id(qa_q3_saved_actor_ref r) { qa_saved_actor_id id = {r.slot, r.generation}; return id; }
 qa_q3_graph_state qa_q3_capture_q3_graph(qa_q3_graph_services g) {
   qa_q3_entity_pool *pool = g.pool; qa_q3_callback_catalog *cb = &pool->callbacks;
   qa_q3_graph_state s; memset(&s, 0, sizeof s);
-  s.complete = true; s.num_entities = pool->num_entities; s.max_clients = pool->max_clients;
-  s.entity_count = QA_Q3_MAX_GENTITIES; s.entities = calloc(s.entity_count, sizeof *s.entities);
-  s.ownership_count = QA_Q3_MAX_GENTITIES; s.ownership = calloc(s.ownership_count, sizeof *s.ownership);
-  s.client_count = QA_Q3_MAX_CLIENTS; s.clients = calloc(s.client_count, sizeof *s.clients);
-  if (!s.entities || !s.ownership || !s.clients) qa_range_error("out of memory");
+  /* A capture that throws (foreign record, unknown item, unregistered callback) drops the partly built state. */
+  qa_cleanup guard; qa_cleanup_push(&guard, destroy_graph, &s);
+  s.num_entities = pool->num_entities; s.max_clients = pool->max_clients;
+  s.entities = calloc(QA_Q3_MAX_GENTITIES, sizeof *s.entities); if (!s.entities) qa_range_error("out of memory");
+  s.entity_count = QA_Q3_MAX_GENTITIES;
+  s.ownership = calloc(QA_Q3_MAX_GENTITIES, sizeof *s.ownership); if (!s.ownership) qa_range_error("out of memory");
+  s.ownership_count = QA_Q3_MAX_GENTITIES;
+  s.clients = calloc(QA_Q3_MAX_CLIENTS, sizeof *s.clients); if (!s.clients) qa_range_error("out of memory");
+  s.client_count = QA_Q3_MAX_CLIENTS;
   qa_q3_base_ownership_state *owners = qa_q3_base_entity_records_capture_ownership(g.records);
   if (!owners) qa_range_error("out of memory");
   for (size_t i = 0; i < s.ownership_count; i++) {
@@ -57,35 +65,11 @@ qa_q3_graph_state qa_q3_capture_q3_graph(qa_q3_graph_services g) {
     if (owners[i].has_actor) s.ownership[i].actor = saved_ref(owners[i].actor.id);
   }
   free(owners);
+  size_t item_count = 0; const qa_q3_base_item_definition *items = qa_q3_base_item_list(qa_q3_base_entity_records_product(g.records), &item_count);
   for (size_t i = 0; i < s.entity_count; i++) {
+    /* Steps follow the TS callback so the first failure reported is the TS one. */
     qa_q3_game_entity *e = qa_q3_entity_pool_at(pool, (double)i); qa_q3_game_save_entity_state *st = &s.entities[i];
     qa_q3_game_classname_capture classname = qa_q3_game_entity_capture_classname(e);
-    if (classname.kind == 1) { st->classname_is_client = true; st->classname_client = client_slot(pool, classname.client); }
-    else st->classname = dupstr(classname.value);
-    if (e->has_activation) {
-      if (e->activation.entity) { bool has; entity_slot(pool, e->activation.entity, &has, &st->activation_slot); st->activation_kind = 1; }
-      else { st->activation_kind = 2; st->activation_actor = saved_ref(e->activation.actor); }
-    }
-    if (e->item) {
-      st->has_item = true; st->item = -1;
-      size_t item_count = 0; const qa_q3_base_item_definition *items = qa_q3_base_item_list(qa_q3_base_entity_records_product(g.records), &item_count);
-      for (size_t k = 0; k < item_count; k++) if (&items[k] == e->item) { st->item = (double)k; break; }
-      if (st->item < 0) qa_range_error("Q3 entity has an unknown item identity");
-    }
-    st->values = qa_q3_capture_entity_values(e); st->network = qa_q3_capture_network_values(&e->s);
-    st->pos = e->s.pos; st->apos = e->s.apos; st->sv_flags = e->r.sv_flags; st->single_client = e->r.single_client;
-    st->contents = e->r.contents; st->owner_num = e->r.owner_num; st->model_kind = e->r.model.kind; st->model_index = e->r.model.index;
-    st->has_client = e->client != NULL; if (e->client) st->client = client_slot(pool, e->client);
-    entity_slot(pool, e->parent, &st->has_parent, &st->parent); entity_slot(pool, e->next_train, &st->has_next_train, &st->next_train);
-    entity_slot(pool, e->prev_train, &st->has_prev_train, &st->prev_train); entity_slot(pool, e->target_ent, &st->has_target_ent, &st->target_ent);
-    entity_slot(pool, e->chain, &st->has_chain, &st->chain); entity_slot(pool, e->enemy, &st->has_enemy, &st->enemy);
-    entity_slot(pool, e->activator, &st->has_activator, &st->activator); entity_slot(pool, e->teamchain, &st->has_teamchain, &st->teamchain);
-    entity_slot(pool, e->teammaster, &st->has_teammaster, &st->teammaster);
-    st->nextthink = e->nextthink;
-    st->think = dupstr(qa_q3_callback_family_capture(&cb->think, e->think)); st->reached = dupstr(qa_q3_callback_family_capture(&cb->reached, e->reached));
-    st->blocked = dupstr(qa_q3_callback_family_capture(&cb->blocked, e->blocked)); st->touch = dupstr(qa_q3_callback_family_capture(&cb->touch, e->touch));
-    st->use = dupstr(qa_q3_callback_family_capture(&cb->use, e->use)); st->pain = dupstr(qa_q3_callback_family_capture(&cb->pain, e->pain));
-    st->die = dupstr(qa_q3_callback_family_capture(&cb->die, e->die));
     qa_q3_base_entity_shared_private_state priv = qa_q3_base_entity_shared_capture_private_state(&e->r);
     st->has_abs_min_override = priv.has_abs_min_override; st->abs_min_override = priv.abs_min_override;
     st->has_abs_max_override = priv.has_abs_max_override; st->abs_max_override = priv.abs_max_override;
@@ -97,6 +81,35 @@ qa_q3_graph_state qa_q3_capture_q3_graph(qa_q3_graph_services g) {
       st->previous_link_bounds = link->state.bounds;
       if (link->state.ground != NULL) st->previous_link_ground = saved_ref(*link->state.ground);
     }
+    if (e->has_activation && e->activation.entity) { bool has; double slot; entity_slot(pool, e->activation.entity, &has, &slot); }
+    if (e->item) {
+      st->item = -1;
+      for (size_t k = 0; k < item_count; k++) if (&items[k] == e->item) { st->item = (double)k; break; }
+      if (st->item < 0) qa_raise("Error", 0, 0, "Q3 entity has an unknown item identity");
+      st->has_item = true;
+    }
+    st->values = qa_q3_capture_entity_values(e); st->network = qa_q3_capture_network_values(&e->s);
+    st->pos = e->s.pos; st->apos = e->s.apos; st->sv_flags = e->r.sv_flags; st->single_client = e->r.single_client;
+    st->model_kind = e->r.model.kind; st->model_index = e->r.model.index; st->contents = e->r.contents; st->owner_num = e->r.owner_num;
+    if (e->client) { st->client = client_slot(pool, e->client); st->has_client = true; }
+    if (classname.kind == 1) {
+      if (!classname.client) qa_raise("Error", 0, 0, "Q3 bound classname has no client");
+      st->classname_client = client_slot(pool, classname.client); st->classname_is_client = true;
+    } else st->classname = dupstr(classname.value);
+    entity_slot(pool, e->parent, &st->has_parent, &st->parent); entity_slot(pool, e->next_train, &st->has_next_train, &st->next_train);
+    entity_slot(pool, e->prev_train, &st->has_prev_train, &st->prev_train); entity_slot(pool, e->target_ent, &st->has_target_ent, &st->target_ent);
+    entity_slot(pool, e->chain, &st->has_chain, &st->chain); entity_slot(pool, e->enemy, &st->has_enemy, &st->enemy);
+    entity_slot(pool, e->activator, &st->has_activator, &st->activator); entity_slot(pool, e->teamchain, &st->has_teamchain, &st->teamchain);
+    entity_slot(pool, e->teammaster, &st->has_teammaster, &st->teammaster);
+    if (e->has_activation) {
+      if (e->activation.entity) { st->activation_kind = 1; st->activation_slot = e->activation.entity->slot; }
+      else { st->activation_kind = 2; st->activation_actor = saved_ref(e->activation.actor); }
+    }
+    st->nextthink = e->nextthink;
+    st->think = dupstr(qa_q3_callback_family_capture(&cb->think, e->think)); st->reached = dupstr(qa_q3_callback_family_capture(&cb->reached, e->reached));
+    st->blocked = dupstr(qa_q3_callback_family_capture(&cb->blocked, e->blocked)); st->touch = dupstr(qa_q3_callback_family_capture(&cb->touch, e->touch));
+    st->use = dupstr(qa_q3_callback_family_capture(&cb->use, e->use)); st->pain = dupstr(qa_q3_callback_family_capture(&cb->pain, e->pain));
+    st->die = dupstr(qa_q3_callback_family_capture(&cb->die, e->die));
   }
   for (size_t i = 0; i < s.client_count; i++) {
     qa_q3_game_client *c = pool->clients[i]; qa_q3_game_save_client_state *st = &s.clients[i];
@@ -106,68 +119,56 @@ qa_q3_graph_state qa_q3_capture_q3_graph(qa_q3_graph_services g) {
     st->events = copy_slots(&c->ps.events, &st->event_count); st->event_parms = copy_slots(&c->ps.event_parms, &st->event_parm_count);
     st->persistant_slots = copy_slots(&c->ps.persistant, &st->persistant_count);
     st->powerups = copy_slots(&c->ps.powerups, &st->powerup_count); st->ammo_times = copy_slots(&c->ammo_times, &st->ammo_time_count);
+    st->source_stats = malloc(16 * sizeof *st->source_stats); st->special_ammo = malloc(16 * sizeof *st->special_ammo);
+    if (!st->source_stats || !st->special_ammo) qa_range_error("out of memory");
+    st->source_stat_count = st->special_ammo_count = 16;
     qa_q3_base_entity_records_capture_client_backing(g.records, (double)i, st->source_stats, st->special_ammo);
     entity_slot(pool, c->hook, &st->has_hook, &st->hook); entity_slot(pool, c->persistant_powerup, &st->has_persistant_powerup, &st->persistant_powerup);
     if (c->areabits) {
-      st->has_areabits = true; st->areabits_length = c->areabits_length; st->areabits = malloc(c->areabits_length ? c->areabits_length : 1);
+      st->areabits = malloc(c->areabits_length ? c->areabits_length : 1);
       if (!st->areabits) qa_range_error("out of memory");
-      memcpy(st->areabits, c->areabits, c->areabits_length);
+      if (c->areabits_length) memcpy(st->areabits, c->areabits, c->areabits_length);
+      st->areabits_length = c->areabits_length; st->has_areabits = true;
     }
   }
+  qa_cleanup_pop(&guard);
   return s;
 }
 void qa_q3_prepare_q3_graph(qa_q3_graph_services g, const qa_q3_graph_state *state) {
-  if (state->entity_count != QA_Q3_MAX_GENTITIES || state->client_count != QA_Q3_MAX_CLIENTS) qa_range_error("Q3 save must retain all entity and client slots");
+  if (state->entity_count != QA_Q3_MAX_GENTITIES || state->client_count != QA_Q3_MAX_CLIENTS) qa_raise("Error", 0, 0, "Q3 save must retain all entity and client slots");
   qa_q3_base_ownership_state *owners = calloc(state->ownership_count ? state->ownership_count : 1, sizeof *owners);
   if (!owners) qa_range_error("out of memory");
+  qa_cleanup guard; qa_cleanup_push(&guard, free_block, owners);
   for (size_t i = 0; i < state->ownership_count; i++) {
     const qa_q3_graph_ownership *entry = &state->ownership[i];
     owners[i].has_actor = entry->has_actor; owners[i].active = entry->active; owners[i].borrowed = entry->borrowed;
     if (entry->has_actor && !qa_session_actor_registry_resolve_saved(g.actors, saved_id(entry->actor), &owners[i].actor))
-      qa_range_error("Q3 saved ownership actor is not live");
+      qa_raise("Error", 0, 0, "Q3 saved ownership actor is not live");
   }
   qa_q3_base_entity_records_restore_ownership(g.records, owners, state->ownership_count);
+  qa_cleanup_pop(&guard);
   free(owners);
   for (size_t i = 0; i < state->client_count; i++)
-    qa_q3_base_entity_records_restore_client_backing(g.records, (double)i, state->clients[i].source_stats, 16, state->clients[i].special_ammo, 16);
+    qa_q3_base_entity_records_restore_client_backing(g.records, (double)i, state->clients[i].source_stats, state->clients[i].source_stat_count,
+        state->clients[i].special_ammo, state->clients[i].special_ammo_count);
 }
 static qa_q3_game_entity *slot_entity(qa_q3_entity_pool *pool, bool has, double slot) { return has ? qa_q3_entity_pool_at(pool, slot) : NULL; }
-static void restore_core(qa_q3_graph_services g, qa_q3_graph_state *state) {
+/* TS restoreQ3Graph's two loops and restoreCounts, in the TS statement order (a throw part way leaves the
+   same fields written). `full` is false only for the C-only qa_q3_restore_graph, which has no records or
+   actor registry and skips what needs them. */
+static void restore_core(qa_q3_graph_services g, qa_q3_graph_state *state, bool full) {
   qa_q3_entity_pool *pool = g.pool; qa_q3_callback_catalog *cb = &pool->callbacks;
   for (size_t i = 0; i < state->entity_count; i++) {
     qa_q3_game_entity *e = qa_q3_entity_pool_at(pool, (double)i); qa_q3_game_save_entity_state *st = &state->entities[i];
     qa_q3_restore_entity_values(e, &st->values); qa_q3_restore_network_values(&e->s, st->network);
     e->s.pos = st->pos; e->s.apos = st->apos; e->r.sv_flags = st->sv_flags; e->r.single_client = st->single_client;
     e->r.model.kind = st->model_kind; e->r.model.index = st->model_index; e->r.contents = st->contents; e->r.owner_num = st->owner_num;
-    e->client = st->has_client ? qa_q3_entity_pool_client_at(pool, st->client) : NULL;
-    e->parent = slot_entity(pool, st->has_parent, st->parent); e->next_train = slot_entity(pool, st->has_next_train, st->next_train);
-    e->prev_train = slot_entity(pool, st->has_prev_train, st->prev_train); e->target_ent = slot_entity(pool, st->has_target_ent, st->target_ent);
-    e->chain = slot_entity(pool, st->has_chain, st->chain); e->enemy = slot_entity(pool, st->has_enemy, st->enemy);
-    e->activator = slot_entity(pool, st->has_activator, st->activator); e->teamchain = slot_entity(pool, st->has_teamchain, st->teamchain);
-    e->teammaster = slot_entity(pool, st->has_teammaster, st->teammaster);
-    qa_q3_game_entity_restore_next_think(e, st->nextthink);
-    e->think = qa_q3_callback_family_resolve(&cb->think, st->think); e->reached = qa_q3_callback_family_resolve(&cb->reached, st->reached);
-    e->blocked = qa_q3_callback_family_resolve(&cb->blocked, st->blocked); e->touch = qa_q3_callback_family_resolve(&cb->touch, st->touch);
-    e->use = qa_q3_callback_family_resolve(&cb->use, st->use); e->pain = qa_q3_callback_family_resolve(&cb->pain, st->pain);
-    e->die = qa_q3_callback_family_resolve(&cb->die, st->die);
-    if (state->complete) {
-      if (st->classname_is_client) qa_q3_game_entity_bind_client_name(e, qa_q3_entity_pool_client_at(pool, st->classname_client));
-      else qa_q3_game_entity_set_classname(e, st->classname);
-      if (st->activation_kind == 1) { e->has_activation = true; e->activation = qa_q3_participant_entity(qa_q3_entity_pool_at(pool, st->activation_slot)); }
-      else if (st->activation_kind == 2 && g.records) {
-        e->has_activation = true;
-        e->activation = qa_q3_base_entity_records_damage_inflictor(g.records, true, qa_session_actor_registry_reference_saved(g.actors, saved_id(st->activation_actor), "checkpoint"));
-      } else e->has_activation = false;
-    }
-    if (st->has_item && g.records) {
-      e->item = qa_q3_base_item_at(qa_q3_base_entity_records_product(g.records), st->item);
-    } else if (!st->has_item) e->item = NULL;
-    if (state->complete) {
-      /* TS restorePrivateState; previous links need the actor registry. */
+    if (full) {
+      /* TS restorePrivateState. */
       qa_q3_base_entity_shared_private_state priv; memset(&priv, 0, sizeof priv); qa_actor_id ground;
       priv.has_abs_min_override = st->has_abs_min_override; priv.abs_min_override = st->abs_min_override;
       priv.has_abs_max_override = st->has_abs_max_override; priv.abs_max_override = st->abs_max_override;
-      if (st->has_previous_link && g.actors) {
+      if (st->has_previous_link) {
         qa_linked_body *link = &priv.previous_link; priv.has_previous_link = true;
         link->actor = qa_session_actor_registry_reference_saved(g.actors, saved_id(st->previous_link_actor), "checkpoint");
         link->link_count = st->previous_link_count; link->absolute_bounds = st->previous_link_absolute_bounds;
@@ -180,6 +181,29 @@ static void restore_core(qa_q3_graph_services g, qa_q3_graph_state *state) {
       }
       qa_q3_base_entity_shared_restore_private_state(&e->r, priv); /* copies ground into r */
     }
+    e->client = st->has_client ? qa_q3_entity_pool_client_at(pool, st->client) : NULL;
+    if (full) {
+      if (st->classname_is_client) qa_q3_game_entity_bind_client_name(e, qa_q3_entity_pool_client_at(pool, st->classname_client));
+      else qa_q3_game_entity_set_classname(e, st->classname);
+    }
+    e->parent = slot_entity(pool, st->has_parent, st->parent); e->next_train = slot_entity(pool, st->has_next_train, st->next_train);
+    e->prev_train = slot_entity(pool, st->has_prev_train, st->prev_train); e->target_ent = slot_entity(pool, st->has_target_ent, st->target_ent);
+    e->chain = slot_entity(pool, st->has_chain, st->chain); e->enemy = slot_entity(pool, st->has_enemy, st->enemy);
+    e->activator = slot_entity(pool, st->has_activator, st->activator); e->teamchain = slot_entity(pool, st->has_teamchain, st->teamchain);
+    e->teammaster = slot_entity(pool, st->has_teammaster, st->teammaster);
+    if (full) {
+      if (st->activation_kind == 1) { e->activation = qa_q3_participant_entity(qa_q3_entity_pool_at(pool, st->activation_slot)); e->has_activation = true; }
+      else if (st->activation_kind == 2) {
+        e->activation = qa_q3_base_entity_records_damage_inflictor(g.records, true, qa_session_actor_registry_reference_saved(g.actors, saved_id(st->activation_actor), "checkpoint"));
+        e->has_activation = true;
+      } else e->has_activation = false;
+      e->item = st->has_item ? qa_q3_base_item_at(qa_q3_base_entity_records_product(g.records), st->item) : NULL;
+    } else if (!st->has_item) e->item = NULL;
+    qa_q3_game_entity_restore_next_think(e, st->nextthink);
+    e->think = qa_q3_callback_family_resolve(&cb->think, st->think); e->reached = qa_q3_callback_family_resolve(&cb->reached, st->reached);
+    e->blocked = qa_q3_callback_family_resolve(&cb->blocked, st->blocked); e->touch = qa_q3_callback_family_resolve(&cb->touch, st->touch);
+    e->use = qa_q3_callback_family_resolve(&cb->use, st->use); e->pain = qa_q3_callback_family_resolve(&cb->pain, st->pain);
+    e->die = qa_q3_callback_family_resolve(&cb->die, st->die);
   }
   for (size_t i = 0; i < state->client_count; i++) {
     qa_q3_game_client *c = pool->clients[i]; qa_q3_game_save_client_state *st = &state->clients[i];
@@ -190,25 +214,26 @@ static void restore_core(qa_q3_graph_services g, qa_q3_graph_state *state) {
     restore_slots(&c->ps.persistant, st->persistant_slots, st->persistant_count); restore_slots(&c->ps.powerups, st->powerups, st->powerup_count);
     restore_slots(&c->ammo_times, st->ammo_times, st->ammo_time_count);
     c->hook = slot_entity(pool, st->has_hook, st->hook); c->persistant_powerup = slot_entity(pool, st->has_persistant_powerup, st->persistant_powerup);
-    if (state->complete) {
+    if (full) {
       free(c->areabits); c->areabits = NULL; c->areabits_length = 0;
       if (st->has_areabits) {
         c->areabits = malloc(st->areabits_length ? st->areabits_length : 1); if (!c->areabits) qa_range_error("out of memory");
-        memcpy(c->areabits, st->areabits, st->areabits_length); c->areabits_length = st->areabits_length;
+        if (st->areabits_length) memcpy(c->areabits, st->areabits, st->areabits_length);
+        c->areabits_length = st->areabits_length;
       }
     }
   }
   qa_q3_pool_counts counts = {state->num_entities, state->max_clients}; qa_q3_entity_pool_restore_counts(pool, counts);
 }
 void qa_q3_restore_q3_graph(qa_q3_graph_services g, qa_q3_graph_state *state) {
-  if (state->entity_count != QA_Q3_MAX_GENTITIES || state->client_count != QA_Q3_MAX_CLIENTS) qa_range_error("Q3 save must retain all entity and client slots");
-  restore_core(g, state);
+  if (state->entity_count != QA_Q3_MAX_GENTITIES || state->client_count != QA_Q3_MAX_CLIENTS) qa_raise("Error", 0, 0, "Q3 save must retain all entity and client slots");
+  restore_core(g, state, true);
   qa_q3_base_entity_records_restore_callbacks(g.records);
 }
 void qa_q3_restore_graph(qa_q3_entity_pool *pool, qa_q3_graph_state *state) {
-  if (state->entity_count != QA_Q3_MAX_GENTITIES || state->client_count != QA_Q3_MAX_CLIENTS) qa_range_error("Q3 save must retain all entity and client slots");
+  if (state->entity_count != QA_Q3_MAX_GENTITIES || state->client_count != QA_Q3_MAX_CLIENTS) qa_raise("Error", 0, 0, "Q3 save must retain all entity and client slots");
   qa_q3_graph_services g; memset(&g, 0, sizeof g); g.pool = pool;
-  restore_core(g, state);
+  restore_core(g, state, false);
 }
 /* Plain tree writer. */
 static qa_save_value *need(qa_save_value *v) { if (!v) qa_range_error("out of memory"); return v; }
@@ -322,7 +347,7 @@ static qa_save_value *client_value(const qa_q3_game_save_client_state *s) {
   put_num(se, "wins", s->session.wins); put_num(se, "losses", s->session.losses); put_num(se, "teamLeader", s->session.team_leader); put(o, "session", se);
   put(o, "events", numbers_value(s->events, s->event_count)); put(o, "eventParms", numbers_value(s->event_parms, s->event_parm_count)); put(o, "persistantSlots", numbers_value(s->persistant_slots, s->persistant_count));
   put(o, "powerups", numbers_value(s->powerups, s->powerup_count)); put(o, "ammoTimes", numbers_value(s->ammo_times, s->ammo_time_count));
-  put(b, "sourceStats", numbers_value(s->source_stats, 16)); put(b, "specialAmmo", numbers_value(s->special_ammo, 16)); put(o, "backing", b);
+  put(b, "sourceStats", numbers_value(s->source_stats, s->source_stat_count)); put(b, "specialAmmo", numbers_value(s->special_ammo, s->special_ammo_count)); put(o, "backing", b);
   put_slot(o, "hook", s->has_hook, s->hook); put_slot(o, "persistantPowerup", s->has_persistant_powerup, s->persistant_powerup);
   put(o, "areabits", s->has_areabits ? qa_save_value_bytes(s->areabits, s->areabits_length) : qa_save_value_null());
   return o;
@@ -339,80 +364,4 @@ qa_save_value *qa_q3_graph_state_to_value(const qa_q3_graph_state *s) {
   put(o, "ownership", own); put_num(o, "numEntities", s->num_entities); put_num(o, "maxClients", s->max_clients); put(o, "entities", ents); put(o, "clients", cl);
   return o;
 }
-/* Fields qa_q3_read_graph omits. */
-static qa_save_reader field_of(const qa_save_reader *r, const char *n) { qa_save_reader f; if (!qa_save_reader_field(r, n, &f)) qa_range_error("out of memory"); return f; }
-static qa_vec3 vec_field(const qa_save_reader *r, const char *n) { qa_save_reader f = field_of(r, n); qa_vec3 v = qa_q3_read_vector(&f); qa_save_reader_destroy(&f); return v; }
-static double slot_of(const qa_save_reader *r, double maximum) { double v = qa_save_reader_integer_min(r, 0); if (v >= maximum) qa_save_reader_fail(r, "Q3 source reference outside retained table"); return v; }
-static qa_q3_saved_actor_ref nullable_actor(const qa_save_reader *r, const char *n) {
-  qa_q3_saved_actor_ref out = {false, 0, 0}; qa_save_reader f = field_of(r, n);
-  if (!qa_save_reader_is_null(&f)) out = qa_q3_read_actor(&f);
-  qa_save_reader_destroy(&f); return out;
-}
-static double *numbers_field(const qa_save_reader *r, const char *n, size_t *count) {
-  qa_save_reader f = field_of(r, n); *count = qa_save_reader_list_count(&f);
-  double *d = malloc((*count ? *count : 1) * sizeof *d); if (!d) qa_range_error("out of memory");
-  for (size_t i = 0; i < *count; i++) { qa_save_reader it; qa_save_reader_item(&f, i, &it); d[i] = qa_save_reader_number(&it); qa_save_reader_destroy(&it); }
-  qa_save_reader_destroy(&f); return d;
-}
-static void read_entity_extras(const qa_save_reader *r, qa_q3_game_save_entity_state *s) {
-  static const char *const model_kinds[] = {"inline", "box", "capsule"}, *const name_kinds[] = {"value", "client-name"}, *const activation_kinds[] = {"entity", "actor"};
-  qa_save_reader shared = field_of(r, "shared"), model = field_of(&shared, "model"), kind = field_of(&model, "kind");
-  const char *k = qa_save_reader_choice_string(&kind, model_kinds, 3);
-  s->model_kind = strcmp(k, "inline") == 0 ? QA_Q3_BASE_MODEL_INLINE : strcmp(k, "capsule") == 0 ? QA_Q3_BASE_MODEL_CAPSULE : QA_Q3_BASE_MODEL_BOX;
-  if (s->model_kind == QA_Q3_BASE_MODEL_INLINE) { qa_save_reader i = field_of(&model, "index"); s->model_index = qa_save_reader_integer_min(&i, 0); qa_save_reader_destroy(&i); }
-  qa_save_reader_destroy(&kind); qa_save_reader_destroy(&model); qa_save_reader_destroy(&shared);
-  qa_save_reader name = field_of(r, "classname"), nk = field_of(&name, "kind");
-  if (strcmp(qa_save_reader_choice_string(&nk, name_kinds, 2), "value") == 0) {
-    qa_save_reader v = field_of(&name, "value"); s->classname = qa_save_reader_is_null(&v) ? NULL : dupstr(qa_save_reader_string(&v)); qa_save_reader_destroy(&v);
-  } else { qa_save_reader c = field_of(&name, "client"); s->classname_is_client = true; s->classname_client = slot_of(&c, QA_Q3_MAX_CLIENTS); qa_save_reader_destroy(&c); }
-  qa_save_reader_destroy(&nk); qa_save_reader_destroy(&name);
-  qa_save_reader activation = field_of(r, "activation");
-  if (!qa_save_reader_is_null(&activation)) {
-    qa_save_reader ak = field_of(&activation, "kind");
-    if (strcmp(qa_save_reader_choice_string(&ak, activation_kinds, 2), "entity") == 0) {
-      qa_save_reader sl = field_of(&activation, "slot"); s->activation_kind = 1; s->activation_slot = slot_of(&sl, QA_Q3_MAX_GENTITIES); qa_save_reader_destroy(&sl);
-    } else { qa_save_reader a = field_of(&activation, "actor"); s->activation_kind = 2; s->activation_actor = qa_q3_read_actor(&a); qa_save_reader_destroy(&a); }
-    qa_save_reader_destroy(&ak);
-  }
-  qa_save_reader_destroy(&activation);
-  /* TS sharedPrivate, read in the TS field order. */
-  qa_save_reader priv = field_of(r, "sharedPrivate"), f = field_of(&priv, "absMinOverride");
-  if (!qa_save_reader_is_null(&f)) { s->has_abs_min_override = true; s->abs_min_override = qa_q3_read_vector(&f); }
-  qa_save_reader_destroy(&f); f = field_of(&priv, "absMaxOverride");
-  if (!qa_save_reader_is_null(&f)) { s->has_abs_max_override = true; s->abs_max_override = qa_q3_read_vector(&f); }
-  qa_save_reader_destroy(&f); f = field_of(&priv, "previousLink");
-  if (!qa_save_reader_is_null(&f)) {
-    qa_save_reader state = field_of(&f, "state"), a = field_of(&f, "actor"), count = field_of(&f, "linkCount"), ab = field_of(&f, "absoluteBounds"), bb = field_of(&state, "bounds");
-    s->has_previous_link = true; s->previous_link_actor = qa_q3_read_actor(&a); s->previous_link_count = qa_save_reader_integer_min(&count, 0);
-    s->previous_link_absolute_bounds.min = vec_field(&ab, "min"); s->previous_link_absolute_bounds.max = vec_field(&ab, "max");
-    s->previous_link_origin = vec_field(&state, "origin"); s->previous_link_angles = vec_field(&state, "angles"); s->previous_link_velocity = vec_field(&state, "velocity");
-    s->previous_link_bounds.min = vec_field(&bb, "min"); s->previous_link_bounds.max = vec_field(&bb, "max");
-    s->previous_link_ground = nullable_actor(&state, "ground");
-    qa_save_reader_destroy(&bb); qa_save_reader_destroy(&ab); qa_save_reader_destroy(&count); qa_save_reader_destroy(&a); qa_save_reader_destroy(&state);
-  }
-  qa_save_reader_destroy(&f); qa_save_reader_destroy(&priv);
-}
-static void read_client_extras(const qa_save_reader *r, qa_q3_game_save_client_state *s) {
-  qa_save_reader b = field_of(r, "backing"); size_t n; double *values;
-  values = numbers_field(&b, "sourceStats", &n); if (n != 16) qa_save_reader_fail(&b, "Invalid Q3 private client backing"); memcpy(s->source_stats, values, sizeof s->source_stats); free(values);
-  values = numbers_field(&b, "specialAmmo", &n); if (n != 16) qa_save_reader_fail(&b, "Invalid Q3 private client backing"); memcpy(s->special_ammo, values, sizeof s->special_ammo); free(values);
-  qa_save_reader_destroy(&b);
-  qa_save_reader a = field_of(r, "areabits");
-  if (!qa_save_reader_is_null(&a)) {
-    size_t length = 0; const uint8_t *bytes = qa_save_reader_bytes(&a, &length);
-    s->has_areabits = true; s->areabits_length = length; s->areabits = malloc(length ? length : 1); if (!s->areabits) qa_range_error("out of memory");
-    memcpy(s->areabits, bytes, length);
-  }
-  qa_save_reader_destroy(&a);
-}
-qa_q3_graph_state qa_q3_read_complete_graph(const qa_save_value *value) {
-  qa_q3_graph_state s = qa_q3_read_graph(value);
-  qa_save_reader reader; qa_save_reader_init(&reader, value, "q3.graph");
-  qa_save_reader list = field_of(&reader, "entities");
-  for (size_t i = 0; i < s.entity_count; i++) { qa_save_reader it; qa_save_reader_item(&list, i, &it); read_entity_extras(&it, &s.entities[i]); qa_save_reader_destroy(&it); }
-  qa_save_reader_destroy(&list);
-  list = field_of(&reader, "clients");
-  for (size_t i = 0; i < s.client_count; i++) { qa_save_reader it; qa_save_reader_item(&list, i, &it); read_client_extras(&it, &s.clients[i]); qa_save_reader_destroy(&it); }
-  qa_save_reader_destroy(&list); qa_save_reader_destroy(&reader);
-  s.complete = true; return s;
-}
+qa_q3_graph_state qa_q3_read_complete_graph(const qa_save_value *value) { return qa_q3_read_graph(value); }

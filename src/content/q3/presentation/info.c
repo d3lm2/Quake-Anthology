@@ -1,6 +1,7 @@
 /* Port of src/content/q3/presentation/info.ts. GPL-2.0-or-later. */
 #include "qa/content/q3/presentation/info.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,7 +43,7 @@ static char *clean_text(const char *text) {
 void qa_q3_pres_client_loading_screen_init(screen_t *screen, qa_q3_pres_client_game_state *state,
     qa_q3_pres_client_media *media, qa_cvar_registry *cvars, qa_q3_pres_client_loading_imports imports) {
   if (state->product != media->product) {
-    qa_range_error("Loading screen product differs from cgame media");
+    qa_raise("Error", 0, 0, "Loading screen product differs from cgame media");
   }
   memset(screen, 0, sizeof *screen);
   screen->state = state;
@@ -75,7 +76,8 @@ bool qa_q3_pres_client_loading_screen_loading_item(screen_t *screen, double inde
 }
 
 bool qa_q3_pres_client_loading_screen_loading_client(screen_t *screen, double client_num) {
-  if (client_num != (double)(int64_t)client_num || client_num < 0 || client_num >= 64) {
+  /* !Number.isInteger: NaN and the infinities fail without an undefined integer cast. */
+  if (!isfinite(client_num) || floor(client_num) != client_num || client_num < 0 || client_num >= 64) {
     qa_range_error("CG_LoadingClient: bad client number");
   }
   const char *info = STR(screen->imports.config_string(screen->imports.ctx, 544 + client_num));
@@ -190,21 +192,30 @@ static void draw_text_line(screen_t *screen, qa_draw2d *draw, const qa_q3_legacy
 }
 
 bool qa_q3_pres_client_loading_screen_draw_information(screen_t *screen, qa_draw2d *draw) {
-  if (draw->space != QA_COORD_STRETCH_640) {
-    qa_range_error("Cgame drawing requires stretch-640 coordinates");
-  }
   const char *info = STR(screen->imports.config_string(screen->imports.ctx, 0));
   const char *system = STR(screen->imports.config_string(screen->imports.ctx, 1));
   qa_q3_pres_renderer_resources *resources = &screen->media->resources;
   char *map = qa_info_value_for_key(info, "mapname");
   if (map == NULL) return false;
-  char levelshot_path[256];
-  snprintf(levelshot_path, sizeof levelshot_path, "levelshots/%.200s.tga", map);
+  /* TS builds the path with no length limit (an info value can be 1023 bytes). */
+  size_t levelshot_size = strlen(map) + sizeof "levelshots/.tga";
+  char *levelshot_path = malloc(levelshot_size);
+  if (levelshot_path == NULL) {
+    free(map);
+    return false;
+  }
+  snprintf(levelshot_path, levelshot_size, "levelshots/%s.tga", map);
   free(map);
   const qa_q3_pres_scene_shader *levelshot = NULL;
-  if (!resources->register_shader_no_mip(resources->ctx, levelshot_path, &levelshot)) return false;
+  bool registered = resources->register_shader_no_mip(resources->ctx, levelshot_path, &levelshot);
+  free(levelshot_path);
+  if (!registered) return false;
   if (levelshot == NULL) {
     if (!resources->register_shader_no_mip(resources->ctx, "menu/art/unknownmap", &levelshot)) return false;
+  }
+  /* TS constructs ClientDrawTools here, after the levelshot registration. */
+  if (draw->space != QA_COORD_STRETCH_640) {
+    qa_raise("Error", 0, 0, "Cgame drawing requires stretch-640 coordinates");
   }
   qa_q3_legacy_fonts fonts;
   fonts.charset = picture_asset(screen, screen->media->graphics.charset_shader);

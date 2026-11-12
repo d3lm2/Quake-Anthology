@@ -1,6 +1,5 @@
 /* Port of src/app/bootstrap/startup.ts, the StartupApplication class (one C
- * type, qa_startup_application), built alongside the temporary concrete-host
- * shell in startup.h (main.c's path until the connection step).
+ * type, qa_startup_application). main.c opens it for a graphical run.
  *
  * Files: startup_application.c (constructor, StartupAction, print,
  * routeCommand, frontendCommand, connect, lobbyJoinOptions),

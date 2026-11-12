@@ -105,8 +105,8 @@ qa_bot_move_output qa_follow_path(qa_bot_path_state *state, qa_bot_follow_input 
   if (has_link && link_v.type == QA_NAV_LINK_WALK_OFF_LEDGE && input.on_ground && input.origin.z - target.z > 64) {
     qa_bot_vec3 prev = state->index > 0 ? path->points[state->index - 1] : input.origin;
     double ax = target.x - prev.x, ay = target.y - prev.y;
-    double al = hypot(ax, ay);
-    if (al < 1 && input.has_velocity) { ax = input.velocity.x; ay = input.velocity.y; al = hypot(ax, ay); }
+    double al = qa_js_hypot2(ax, ay);
+    if (al < 1 && input.has_velocity) { ax = input.velocity.x; ay = input.velocity.y; al = qa_js_hypot2(ax, ay); }
     if (al >= 1) target = (qa_bot_vec3){target.x + (ax / al) * QA_LEDGE_OVERSHOOT, target.y + (ay / al) * QA_LEDGE_OVERSHOOT, target.z};
   }
   qa_nav_graph_link lift_link; bool has_lift = false;
@@ -159,8 +159,7 @@ qa_bot_move_output qa_follow_path(qa_bot_path_state *state, qa_bot_follow_input 
     dir = len > 0 ? (qa_bot_vec3){dx / len, dy / len, dz / len} : qa_bvec(0, 0, 0);
     upmove = qa_bot_clamp(dir.z * speed, -speed, speed);
     if (input.has_air_seconds && input.air_seconds < QA_SWIM_AIR_RESERVE && input.has_air_above && input.air_above && dir.z > -0.5) {
-      double push = QA_SWIM_SURFACE_PUSH * speed;
-      if (push > upmove) upmove = push;
+      upmove = qa_js_max(upmove, QA_SWIM_SURFACE_PUSH * speed);
     }
   } else {
     dir = qa_steer_direction(input.origin, target);
@@ -171,12 +170,11 @@ qa_bot_move_output qa_follow_path(qa_bot_path_state *state, qa_bot_follow_input 
     if (qa_bvec_distance2d(input.origin, target) < QA_CORNER_SLOW_DISTANCE) {
       double ax = target.x - input.origin.x, ay = target.y - input.origin.y;
       double bx = next.x - target.x, by = next.y - target.y;
-      double la = hypot(ax, ay), lb = hypot(bx, by);
+      double la = qa_js_hypot2(ax, ay), lb = qa_js_hypot2(bx, by);
       if (la > 1 && lb > 1) {
         double cosv = (ax * bx + ay * by) / (la * lb);
         if (cosv < cos((QA_CORNER_TURN_DEGREES * acos(-1.0)) / 180)) {
-          double walk = input.has_walk_speed ? input.walk_speed : QA_BOT_WALK_SPEED;
-          if (walk < wish_speed) wish_speed = walk;
+          wish_speed = qa_js_min(wish_speed, input.has_walk_speed ? input.walk_speed : QA_BOT_WALK_SPEED);
         }
       }
     }
@@ -186,7 +184,7 @@ qa_bot_move_output qa_follow_path(qa_bot_path_state *state, qa_bot_follow_input 
     double along = input.velocity.x * dir.x + input.velocity.y * dir.y;
     wx -= input.velocity.x - along * dir.x;
     wy -= input.velocity.y - along * dir.y;
-    double wl = hypot(wx, wy);
+    double wl = qa_js_hypot2(wx, wy);
     if (wl > speed) { wx *= speed / wl; wy *= speed / wl; }
   }
   double forwardmove = qa_bot_clamp(wx * av.forward.x + wy * av.forward.y, -speed, speed);

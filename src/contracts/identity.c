@@ -31,7 +31,20 @@ bool qa_identity_owner_create(qa_identity_owner *owner, const char *name) {
   return true;
 }
 
+/* Token observers: one per module that keeps a table keyed by the token. */
+static void (**destroy_observers)(const void *token);
+static size_t destroy_observer_count;
+void qa_identity_owner_on_destroy(void (*fn)(const void *token)) {
+  for (size_t i = 0; i < destroy_observer_count; i++) if (destroy_observers[i] == fn) return;
+  void (**next)(const void *token) = realloc(destroy_observers, (destroy_observer_count + 1) * sizeof *next);
+  if (next == NULL) abort();
+  destroy_observers = next;
+  destroy_observers[destroy_observer_count++] = fn;
+}
+
 void qa_identity_owner_destroy(qa_identity_owner *owner) {
+  if (owner->token != NULL)
+    for (size_t i = 0; i < destroy_observer_count; i++) destroy_observers[i](owner->token);
   free((void *)owner->token);
   owner->token = NULL;
   owner->session.name = NULL;

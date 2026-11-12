@@ -19,7 +19,7 @@
 #include "qa/contracts/ui.h"
 #include "qa/materials/legacy_fog.h"
 
-typedef struct qa_app_sim_shared_simulation qa_app_sim_shared_simulation;
+typedef struct qa_app_shared_simulation qa_app_shared_simulation; /* TS SharedSimulation (shared_simulation.h) */
 typedef struct qa_app_sim_cvar_name_value { const char *name; const char *value; } qa_app_sim_cvar_name_value;
 
 typedef struct qa_app_sim_native_q2_guest_options {
@@ -89,12 +89,17 @@ typedef struct qa_app_sim_q3_guest_options {
   const struct qa_qvm_common_services *common;
 } qa_app_sim_q3_guest_options;
 
+/* TS SaveCaptureOptions: how a checkpoint is taken. An autosave is the snapshot the original writes on entering a
+ * level, not a player's save. Zero-initialized is the TS `{}`. */
+typedef struct qa_app_sim_save_capture_options { bool autosave; } qa_app_sim_save_capture_options;
+
+struct qa_app_sim_native_q2_import;
 typedef struct qa_app_simulation_options {
   const qa_app_prepared_qvm_grapple *prepared_qvm_grapple;
   const void *const *prepared_mods; size_t prepared_mod_count;
   const void *mod_commands; const void *mod_files;
   const void *enabled_mods; const void *mod_travel;
-  void *nav_ctx; const void *(*prepare_rerelease_navigation)(void *ctx, qa_app_sim_shared_simulation *sim);
+  void *nav_ctx; const void *(*prepare_rerelease_navigation)(void *ctx, qa_app_shared_simulation *sim);
   const qa_app_sim_real_time *weapon_behavior_real_time; const qa_windows_capabilities *weapon_behavior_clock;
   const void *const *weapon_behaviors; size_t weapon_behavior_count;
   bool dedicated;
@@ -103,6 +108,9 @@ typedef struct qa_app_simulation_options {
   bool has_q2_guest; qa_app_sim_native_q2_guest_options q2_guest;
   const qa_app_sim_native_q2_travel *native_q2_travel;
   bool original_save_candidate;
+  /* TS nativeImport: the files of an original Quake II save folder to start the native world from, instead of a
+   * fresh spawn (NULL = undefined). Borrowed; must outlive the simulation (native_q2_rerelease_save.h). */
+  const struct qa_app_sim_native_q2_import *native_import;
   const char *start_items;
   bool has_player_colors; double player_color_top, player_color_bottom;
   const char *initial_spawn_point; const char *q2_next_server;

@@ -13,6 +13,12 @@
 #include "qa/foundation/js.h"
 #include "qa/network/common/js_number.h"
 
+static size_t utf16_length(const char *text) {
+  size_t units = 0;
+  for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++)
+    if ((*p & 0xc0) != 0x80) units += *p >= 0xf0 ? 2 : 1;
+  return units;
+}
 static noreturn void qa_error(const char *format, ...) {
   char text[1536];
   va_list args;
@@ -46,9 +52,13 @@ static char *js_string(double value) {
   js_number_text(value, text, sizeof text);
   return dup_text(text);
 }
+/* TS `input.trim() === ""`: JS white space and line terminators (U+00A0, U+FEFF, ... too). */
 static bool trimmed_empty(const char *text) {
-  for (; *text != '\0'; text++)
-    if (!isspace((unsigned char)*text)) return false;
+  while (*text != '\0') {
+    size_t length = qa_js_white_space_length(text);
+    if (length == 0) return false;
+    text += length;
+  }
   return true;
 }
 static bool is_safe_integer(double value) {
@@ -104,8 +114,9 @@ static bool try_parse_server_setting(const qa_server_setting_definition *definit
       snprintf(message, message_size, "Unknown %s choice", definition->label);
       return false;
     case QA_SERVER_SETTING_TEXT_ENTRY:
-      /* Length is a UTF-16 unit count in TS, a byte count here. */
-      if ((double)strlen(input) > definition->maximum_length ||
+      /* TS input.length: UTF-16 units of the UTF-8 text (one per lead byte, two for a 4-byte
+       * sequence). */
+      if ((double)utf16_length(input) > definition->maximum_length ||
           strchr(input, '\r') != NULL || strchr(input, '\n') != NULL) {
         snprintf(message, message_size, "%s contains invalid text", definition->label);
         return false;
@@ -189,27 +200,34 @@ static const qa_server_setting_definition *find_definition(
   return NULL;
 }
 
+static void free_profile(void *arg) { qa_server_profile_free(arg); }
+static void free_tree(void *arg) { qa_save_value_free(arg); }
+/* A string node as the TS string: one holding a NUL (text_length beyond strlen) is still a
+ * string, but matches no definition id, and is invalid text-entry input. */
+static bool has_nul(const qa_save_value *value) { return value->text_length > strlen(value->text); }
 void qa_parse_server_profile(const qa_save_value *value,
                              const qa_server_setting_definition *const *definitions,
                              size_t definition_count, qa_server_profile *out) {
+  memset(out, 0, sizeof *out);
   if (!profile_record(value)) qa_error("Expected a server profile object");
   const qa_save_value *overrides = qa_save_value_get(value, "overrides");
   const qa_save_value *version = qa_save_value_get(value, "version");
   if (version == NULL || version->kind != QA_SAVE_NUMBER || version->number != 1 ||
       overrides == NULL || overrides->kind != QA_SAVE_ARRAY)
     qa_error("Unsupported server profile");
-  memset(out, 0, sizeof *out);
   out->version = 1;
-  out->override_count = overrides->item_count;
   out->overrides = (qa_server_profile_override *)xalloc(calloc(
-      out->override_count == 0 ? 1 : out->override_count, sizeof *out->overrides));
+      overrides->item_count == 0 ? 1 : overrides->item_count, sizeof *out->overrides));
+  out->override_count = overrides->item_count;
+  qa_cleanup guard; /* a refused entry raises with the entries read so far released */
+  qa_cleanup_push(&guard, free_profile, out);
   for (size_t i = 0; i < out->override_count; i++) {
     const qa_save_value *saved = overrides->items[i];
     if (!profile_record(saved)) qa_error("Expected a server profile object");
     const qa_save_value *id_value = qa_save_value_get(saved, "id");
     const qa_save_value *entry_value = qa_save_value_get(saved, "value");
     const qa_server_setting_definition *definition = NULL;
-    if (id_value != NULL && id_value->kind == QA_SAVE_STRING && id_value->text != NULL)
+    if (id_value != NULL && id_value->kind == QA_SAVE_STRING && id_value->text != NULL && !has_nul(id_value))
       definition = find_definition(definitions, definition_count, id_value->text);
     if (definition == NULL || entry_value == NULL ||
         entry_value->kind != QA_SAVE_STRING || entry_value->text == NULL)
@@ -218,9 +236,12 @@ void qa_parse_server_profile(const qa_save_value *value,
       if (strcmp(out->overrides[j].id, definition->id) == 0)
         qa_error("Duplicate server profile setting %s", definition->id);
     out->overrides[i].id = (char *)xalloc(dup_text(definition->id));
-    out->overrides[i].value =
-        (char *)xalloc(qa_parse_server_setting(definition, entry_value->text));
+    /* A value holding a NUL equals no toggle or choice spelling and is invalid text-entry text; a slider's
+     * Number() of it is NaN. Each refuses it as parseServerSetting does. */
+    out->overrides[i].value = (char *)xalloc(
+        qa_parse_server_setting(definition, has_nul(entry_value) ? "\x01\r" : entry_value->text));
   }
+  qa_cleanup_pop(&guard);
 }
 
 void qa_capture_server_profile(const qa_bound_server_setting *bindings,
@@ -387,7 +408,10 @@ bool qa_load_server_profile(const qa_config_store *store, const char *name,
   qa_save_value *value = qa_parse_json_value((const uint8_t *)text, length, true);
   free(text);
   if (value == NULL) return false;
+  qa_cleanup guard; /* a refused profile raises with its tree released */
+  qa_cleanup_push(&guard, free_tree, value);
   qa_parse_server_profile(value, definitions, definition_count, out);
+  qa_cleanup_pop(&guard);
   qa_save_value_free(value);
   return true;
 }

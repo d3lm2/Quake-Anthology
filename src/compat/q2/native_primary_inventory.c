@@ -10,6 +10,7 @@
 #include "qa/compat/q2/native_mod_entries.h"
 #include "qa/compat/q2/native_throw.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 
 typedef struct {
   bool has_actor; qa_actor_id actor; double flags; bool named;
@@ -29,7 +30,7 @@ struct qa_compat_q2_native_primary_inventory {
   qa_compat_q2_native_entry *next, *previous, *validate, *use, *named_use;
   bind_ctx binds[5];
   uint64_t lookup_region, use_regions[2];
-  scan_ctx scans[3]; size_t scan_count;
+  scan_ctx scans[3]; size_t scan_count, use_region_count; bool has_lookup_region; /* what the constructor bound so far */
   qa_compat_q2_native_inventory_readout_item *readout; size_t readout_capacity;
 };
 static const qa_guest_value_layout next_parameters[3] = {{.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "int32"}, {.is_aggregate = false, .storage = "uint8"}};
@@ -44,7 +45,7 @@ static bool current(const qa_compat_q2_native_primary_inventory *s, qa_actor_id 
 }
 static qa_guest_address client_of(const qa_compat_q2_native_primary_inventory *s, qa_actor_id actor) {
   qa_raw_entity_view record; qa_guest_address client;
-  if (!s->host.record_for(s->host.ctx, actor, &record) || !qa_compat_q2_mem_read_pointer(mem(s), qa_compat_q2_mem_offset(mem(s), record.address, (int64_t)s->profile->client), &client)) qa_range_error("Native inventory actor has no source client");
+  if (!s->host.record_for(s->host.ctx, actor, &record) || !qa_compat_q2_mem_read_pointer(mem(s), qa_compat_q2_mem_offset(mem(s), record.address, (int64_t)s->profile->client), &client)) qa_raise("Error", 0, 0, "Native inventory actor has no source client");
   return client;
 }
 static qa_guest_address cursor_address(const qa_compat_q2_native_primary_inventory *s, qa_actor_id actor) { const qa_compat_q2_memory * m = mem(s); qa_guest_address a = client_of(s, actor); return qa_compat_q2_mem_offset(m, a, (int64_t)s->profile->cursor); }
@@ -84,51 +85,64 @@ static const qa_compat_q2_native_inventory_row *cursor_row(qa_compat_q2_native_p
   for (size_t i = 0; i < count; i++) if (!rows[i].selected && rows[i].source_index == (double)index) return &rows[i];
   return NULL;
 }
-typedef struct { qa_compat_q2_native_primary_inventory *s; qa_guest_call_value values[3]; size_t value_count; bool forward; } evaluate_call;
+typedef struct {
+  qa_compat_q2_native_primary_inventory *s; qa_guest_call_value values[3]; size_t value_count; bool forward;
+  qa_guest_address inventory, cursor; const qa_compat_q2_native_inventory_row *row; size_t inventory_bytes; bool accepted;
+  uint8_t *saved_inventory, *zeroes, **saved_selection; size_t write_count;
+} evaluate_call;
+/* The TS try block of evaluate(). */
 static void evaluate_body(void *v) {
-  evaluate_call *c = v;
+  evaluate_call *c = v; qa_compat_q2_memory *memory = mem(c->s);
+  memory->write(memory->ctx, c->inventory, c->zeroes, c->inventory_bytes);
+  qa_compat_q2_mem_write_i32(memory, qa_compat_q2_mem_offset(memory, c->inventory, (int64_t)(c->row->source_index * 4)), qa_js_to_int32(source_count(c->row)));
+  qa_compat_q2_mem_write_i32(memory, c->cursor, 0);
   qa_compat_q2_native_entry_call_original(c->forward ? c->s->next : c->s->previous, c->values, c->value_count);
+  c->accepted = (double)qa_compat_q2_mem_read_i32(memory, c->cursor) == c->row->source_index;
+}
+static void release_evaluate(void *v) {
+  evaluate_call *c = v;
+  if (c->saved_selection != NULL) for (size_t i = 0; i < c->write_count; i++) free(c->saved_selection[i]);
+  free(c->saved_selection); free(c->saved_inventory); free(c->zeroes);
+  c->saved_selection = NULL; c->saved_inventory = c->zeroes = NULL;
 }
 static bool evaluate(qa_compat_q2_native_primary_inventory *s, qa_actor_id actor, const qa_compat_q2_native_inventory_row *row, int direction, double flags) {
   qa_compat_q2_memory *memory = mem(s);
   qa_guest_address client = client_of(s, actor);
   qa_raw_entity_view record;
   bool has_record = s->host.record_for(s->host.ctx, actor, &record);
-  if (!has_record || row->source_index != trunc(row->source_index) || row->source_index <= 0 || row->source_index >= s->profile->count) qa_range_error("Canonical inventory row has no valid original item slot");
-  qa_guest_address inventory = qa_compat_q2_mem_offset(memory, client, (int64_t)s->profile->inventory);
-  size_t inventory_bytes = (size_t)s->profile->count * 4;
-  uint8_t *saved_inventory = malloc(inventory_bytes), *zeroes = calloc(1, inventory_bytes);
-  size_t write_count = s->profile->selection_write_count;
-  uint8_t **saved_selection = calloc(write_count ? write_count : 1, sizeof *saved_selection);
-  if (saved_inventory == NULL || zeroes == NULL || saved_selection == NULL) qa_range_error("Native inventory out of memory");
-  memory->copy(memory->ctx, inventory, saved_inventory, (double)inventory_bytes);
-  for (size_t i = 0; i < write_count; i++) {
+  if (!has_record || row->source_index != trunc(row->source_index) || row->source_index <= 0 || row->source_index >= s->profile->count) qa_raise("Error", 0, 0, "Canonical inventory row has no valid original item slot");
+  evaluate_call call; memset(&call, 0, sizeof call);
+  call.s = s; call.row = row; call.forward = direction > 0;
+  call.inventory = qa_compat_q2_mem_offset(memory, client, (int64_t)s->profile->inventory);
+  call.cursor = qa_compat_q2_mem_offset(memory, client, (int64_t)s->profile->cursor);
+  call.inventory_bytes = (size_t)s->profile->count * 4; call.write_count = s->profile->selection_write_count;
+  qa_cleanup node; qa_cleanup_push(&node, release_evaluate, &call); /* guest memory access below can raise */
+  call.saved_inventory = malloc(call.inventory_bytes ? call.inventory_bytes : 1); call.zeroes = calloc(1, call.inventory_bytes ? call.inventory_bytes : 1);
+  call.saved_selection = calloc(call.write_count ? call.write_count : 1, sizeof *call.saved_selection);
+  if (call.saved_inventory == NULL || call.zeroes == NULL || call.saved_selection == NULL) qa_range_error("Native inventory out of memory");
+  memory->copy(memory->ctx, call.inventory, call.saved_inventory, (double)call.inventory_bytes);
+  for (size_t i = 0; i < call.write_count; i++) {
     const qa_compat_q2_selection_write *field = &s->profile->selection_writes[i];
-    saved_selection[i] = malloc((size_t)field->bytes);
-    if (saved_selection[i] == NULL) qa_range_error("Native inventory out of memory");
-    memory->copy(memory->ctx, qa_compat_q2_mem_offset(memory, client, (int64_t)field->offset), saved_selection[i], field->bytes);
+    call.saved_selection[i] = malloc((size_t)field->bytes ? (size_t)field->bytes : 1);
+    if (call.saved_selection[i] == NULL) qa_range_error("Native inventory out of memory");
+    memory->copy(memory->ctx, qa_compat_q2_mem_offset(memory, client, (int64_t)field->offset), call.saved_selection[i], field->bytes);
   }
-  bool accepted = false;
-  s->evaluating++;
-  memory->write(memory->ctx, inventory, zeroes, inventory_bytes);
-  qa_compat_q2_mem_write_i32(memory, qa_compat_q2_mem_offset(memory, inventory, (int64_t)(row->source_index * 4)), qa_js_to_int32(source_count(row)));
-  qa_guest_address cursor = qa_compat_q2_mem_offset(memory, client, (int64_t)s->profile->cursor);
-  qa_compat_q2_mem_write_i32(memory, cursor, 0);
-  evaluate_call call = {s, {qa_compat_q2_call_pointer(true, record.address), qa_compat_q2_call_int32(flags), {0}}, 2, direction > 0};
+  call.values[0] = qa_compat_q2_call_pointer(true, record.address); call.values[1] = qa_compat_q2_call_int32(flags); call.value_count = 2;
   if (direction > 0 && s->profile->next_menu_argument) { call.values[2] = qa_compat_q2_call_uint32(0); call.value_count = 3; }
+  s->evaluating++;
   qa_compat_q2_native_thrown thrown;
   bool completed = qa_compat_q2_native_try(evaluate_body, &call, &thrown);
-  if (completed) accepted = qa_compat_q2_mem_read_i32(memory, cursor) == (int32_t)row->source_index;
+  /* TS finally */
   s->evaluating--;
+  bool accepted = completed && call.accepted;
   if (current(s, actor)) {
-    memory->write(memory->ctx, inventory, saved_inventory, inventory_bytes);
-    if (!accepted) for (size_t i = 0; i < write_count; i++) {
+    memory->write(memory->ctx, call.inventory, call.saved_inventory, call.inventory_bytes);
+    if (!accepted) for (size_t i = 0; i < call.write_count; i++) {
       const qa_compat_q2_selection_write *field = &s->profile->selection_writes[i];
-      memory->write(memory->ctx, qa_compat_q2_mem_offset(memory, client, (int64_t)field->offset), saved_selection[i], (size_t)field->bytes);
+      memory->write(memory->ctx, qa_compat_q2_mem_offset(memory, client, (int64_t)field->offset), call.saved_selection[i], (size_t)field->bytes);
     }
   }
-  for (size_t i = 0; i < write_count; i++) free(saved_selection[i]);
-  free(saved_selection); free(saved_inventory); free(zeroes);
+  qa_cleanup_pop(&node); release_evaluate(&call);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
   return accepted;
 }
@@ -138,20 +152,21 @@ static void navigate(qa_compat_q2_native_primary_inventory *s, qa_actor_id actor
   int64_t start = chosen == NULL ? (direction > 0 ? -1 : 0) : (int64_t)(chosen - rows);
   refused_pair *refused = calloc(count ? count : 1, sizeof *refused); size_t refused_count = 0;
   if (refused == NULL) qa_range_error("Native inventory out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, free, refused); /* evaluate can raise */
   for (size_t step = 1; step <= count; step++) {
     int64_t n = (int64_t)count;
     /* JS % keeps the dividend's sign; an index past either end has no row. */
     int64_t position = (start + direction * (int64_t)step + n) % n;
-    if (position < 0 || position >= n) qa_range_error("Native inventory traversal lost its row");
+    if (position < 0 || position >= n) qa_raise("Error", 0, 0, "Native inventory traversal lost its row");
     const qa_compat_q2_native_inventory_row *row = &rows[position];
     double sourced = source_count(row);
     bool skip = row->count == 0;
     for (size_t i = 0; i < refused_count && !skip; i++) if (refused[i].index == row->source_index && refused[i].count == sourced) skip = true;
     if (skip) continue;
-    if (evaluate(s, actor, row, direction, flags)) { set_selected(s, actor, row->item, row->source_index); free(refused); return; }
+    if (evaluate(s, actor, row, direction, flags)) { set_selected(s, actor, row->item, row->source_index); qa_cleanup_pop(&node); free(refused); return; }
     refused[refused_count++] = (refused_pair){row->source_index, sourced};
   }
-  free(refused);
+  qa_cleanup_pop(&node); free(refused);
   const qa_compat_q2_memory * m = mem(s);
   qa_guest_address a = cursor_address(s, actor);
   qa_compat_q2_mem_write_i32(m, a, qa_js_to_int32(s->profile->empty));
@@ -202,12 +217,14 @@ static qa_guest_call_result bound_execute(void *v, const qa_guest_call_value *va
   bound_call call = {s, &frame, b->validate, values, count, binding, {0}};
   qa_compat_q2_native_thrown thrown;
   bool completed = qa_compat_q2_native_try(bound_body, &call, &thrown);
-  run_restore(s, &frame);
+  /* TS finally { frame.restore?.(); frames.pop() }. The frame lives on this stack, so it leaves the list first. */
   s->frame_count = depth - 1;
+  run_restore(s, &frame);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
   return call.result;
 }
-static char *ascii_lower(char *text) { for (char *c = text; *c != 0; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32); return text; }
+typedef struct { char *text; void *named, *matches; } lookup_scratch;
+static void release_lookup(void *v) { lookup_scratch *l = v; free(l->text); free(l->named); free(l->matches); }
 static void lookup_region(void *v, qa_compat_q2_inline_continuation *continuation) {
   qa_compat_q2_native_primary_inventory *s = v; inventory_frame *frame = top_frame(s);
   qa_compat_q2_memory *memory = mem(s); qa_compat_q2_runner *runner = s->host.runner;
@@ -221,8 +238,12 @@ static void lookup_region(void *v, qa_compat_q2_inline_continuation *continuatio
     qa_guest_address_result value = qa_compat_q2_mem_pointer(memory, (int64_t)runner->read_register(runner->ctx, "rcx", 64));
     has_name = value.has_value; name = value.value;
   }
-  if (!has_name) qa_range_error("Original item lookup has no name argument");
-  char *text = ascii_lower(qa_compat_q2_read_classic_string(memory, true, name, 65536));
+  if (!has_name) qa_raise("Error", 0, 0, "Original item lookup has no name argument");
+  /* readClassicString(...).toLowerCase() over API 3 text (latin1 capitals fold too). */
+  char *raw = qa_compat_q2_read_classic_string(memory, true, name, 65536);
+  char *text = qa_js_latin1_to_lower_case(raw); free(raw);
+  if (text == NULL) qa_range_error("Native inventory out of memory");
+  lookup_scratch scratch = {text, NULL, NULL}; qa_cleanup node; qa_cleanup_push(&node, release_lookup, &scratch); /* the guest and the hooks can raise */
   continuation->execute(continuation->ctx);
   uint64_t rax = runner->read_register(runner->ctx, "rax", width);
   qa_guest_address_result original = qa_compat_q2_mem_pointer(memory, (int64_t)rax);
@@ -230,6 +251,7 @@ static void lookup_region(void *v, qa_compat_q2_inline_continuation *continuatio
   if (!s->hooks.rows(s->hooks.ctx, frame->actor, &rows, &count)) { rows = NULL; count = 0; }
   qa_source_item_named_entry *named = calloc(count ? count : 1, sizeof *named);
   size_t *matches = calloc(count ? count : 1, sizeof *matches);
+  scratch.named = named; scratch.matches = matches;
   if (named == NULL || matches == NULL) qa_range_error("Native inventory out of memory");
   for (size_t i = 0; i < count; i++) { named[i].item = rows[i].item; named[i].label = rows[i].label; }
   qa_source_item_named_result choice = qa_source_item_named(named, count, text, original.has_value ? s->hooks.item_at(s->hooks.ctx, original.value) : NULL, matches, count);
@@ -242,18 +264,20 @@ static void lookup_region(void *v, qa_compat_q2_inline_continuation *continuatio
       size_t used = (size_t)snprintf(message, length, "Ambiguous item \"%s\"; use ", text);
       for (size_t i = 0; i < choice.match_count; i++) used += (size_t)snprintf(message + used, length - used, "%s%s", i == 0 ? "" : ", ", rows[matches[i]].item);
       snprintf(message + used, length - used, "\n");
+      qa_cleanup message_node; qa_cleanup_push(&message_node, free, message);
       s->hooks.print(s->hooks.ctx, frame->actor, message);
-      free(message);
+      qa_cleanup_pop(&message_node); free(message);
     }
   } else if (choice.kind == QA_SOURCE_ITEM_NAMED_MATCH && rows[choice.item_index].selected) {
     const qa_compat_q2_native_inventory_row *row = &rows[choice.item_index];
     qa_guest_address address = qa_compat_q2_mem_offset(memory, client_of(s, frame->actor), (int64_t)(s->profile->inventory + row->source_index * 4));
+    int32_t previous = qa_compat_q2_mem_read_i32(memory, address); /* read before the restore exists, as in TS */
     frame->has_row = true; frame->row = *row;
-    frame->has_restore = true; frame->restore_actor = frame->actor; frame->restore_address = address; frame->restore_count = qa_compat_q2_mem_read_i32(memory, address);
+    frame->has_restore = true; frame->restore_actor = frame->actor; frame->restore_address = address; frame->restore_count = previous;
     qa_compat_q2_mem_write_i32(memory, address, qa_js_to_int32(source_count(row)));
     runner->write_register(runner->ctx, "rax", width, (uint64_t)s->hooks.descriptor(s->hooks.ctx, row->source_index).byte_offset);
   }
-  free(named); free(matches); free(text);
+  qa_cleanup_pop(&node); release_lookup(&scratch);
 }
 static bool scan_accepts(void *v) {
   scan_ctx *scan = v; qa_compat_q2_native_primary_inventory *s = scan->s; inventory_frame *frame = top_frame(s);
@@ -262,9 +286,9 @@ static bool scan_accepts(void *v) {
 }
 static void scan_region(void *v, qa_compat_q2_inline_continuation *continuation) {
   scan_ctx *scan = v; qa_compat_q2_native_primary_inventory *s = scan->s; inventory_frame *frame = top_frame(s);
-  if (frame == NULL || !frame->has_actor || !current(s, frame->actor)) qa_range_error("Admitted inventory scan lost its actor");
+  if (frame == NULL || !frame->has_actor || !current(s, frame->actor)) qa_raise("Error", 0, 0, "Admitted inventory scan lost its actor");
   const qa_compat_q2_native_inventory_row *rows; size_t count;
-  if (!s->hooks.rows(s->hooks.ctx, frame->actor, &rows, &count)) qa_range_error("Admitted inventory scan lost its rows");
+  if (!s->hooks.rows(s->hooks.ctx, frame->actor, &rows, &count)) qa_raise("Error", 0, 0, "Admitted inventory scan lost its rows");
   navigate(s, frame->actor, rows, count, scan->direction, frame->flags);
   continuation->skip(continuation->ctx);
 }
@@ -281,33 +305,50 @@ static void use_region(void *v, qa_compat_q2_inline_continuation *continuation) 
   s->hooks.use(s->hooks.ctx, frame->actor, item);
   continuation->skip(continuation->ctx);
 }
+static void create_body(void *v);
 static qa_compat_q2_native_entry *bind(qa_compat_q2_native_primary_inventory *s, size_t slot, double entry, const char *name, size_t parameter_count, bool validate, bool named) {
-  char id[320];
-  snprintf(id, sizeof id, "%s:primary-inventory-%s", mem(s)->module.id, name);
+  /* `${host.memory.module.id}:primary-inventory-${name}` with no length limit; the entry binding copies the id. */
+  const char *module = mem(s)->module.id != NULL ? mem(s)->module.id : "";
+  size_t need = strlen(module) + strlen(name) + 20;
+  char *id = malloc(need); if (id == NULL) qa_range_error("Native inventory out of memory");
+  snprintf(id, need, "%s:primary-inventory-%s", module, name);
+  qa_cleanup node; qa_cleanup_push(&node, free, id);
   s->binds[slot] = (bind_ctx){s, validate, named};
   qa_compat_q2_guest_call_signature signature = {s->profile->abi, next_parameters, parameter_count, true, {0}, false};
-  return qa_compat_q2_native_entry_bind(mem(s), s->host.runner, s->host.ctx, s->host.invoke, at(s, entry), id, signature, &s->binds[slot], bound_execute, NULL, NULL);
+  qa_compat_q2_native_entry *entry_binding = qa_compat_q2_native_entry_bind(mem(s), s->host.runner, s->host.ctx, s->host.invoke, at(s, entry), id, signature, &s->binds[slot], bound_execute, NULL, NULL);
+  qa_cleanup_pop(&node); free(id);
+  return entry_binding;
 }
 qa_compat_q2_native_primary_inventory *qa_compat_q2_native_primary_inventory_create(qa_compat_q2_native_primary_weapon_host host, const qa_compat_q2_native_primary_inventory_profile *profile, qa_compat_q2_native_primary_inventory_hooks hooks) {
-  if (strcmp(host.memory->module.digest, profile->digest) != 0) qa_range_error("Native inventory profile belongs to another artifact");
+  if (strcmp(host.memory->module.digest, profile->digest) != 0) qa_raise("Error", 0, 0, "Native inventory profile belongs to another artifact");
   qa_compat_q2_native_primary_inventory *s = calloc(1, sizeof *s);
   if (s == NULL) qa_range_error("Native inventory out of memory");
   s->host = host; s->profile = profile; s->hooks = hooks;
-  qa_compat_q2_runner *runner = host.runner;
+  /* TS catch: a bind that throws closes the ones made before it. */
+  qa_caught_error caught;
+  if (!qa_try(create_body, s, &caught)) { qa_compat_q2_native_primary_inventory_destroy(s); qa_rethrow(&caught); }
+  return s;
+}
+static void create_body(void *v) {
+  qa_compat_q2_native_primary_inventory *s = v; const qa_compat_q2_native_primary_inventory_profile *profile = s->profile;
+  qa_compat_q2_runner *runner = s->host.runner;
   s->next = bind(s, 0, profile->next_entry, "next", profile->next_menu_argument ? 3 : 2, false, false);
   s->previous = bind(s, 1, profile->prev_entry, "previous", 2, false, false);
   s->validate = bind(s, 2, profile->validate_entry, "validate", 1, true, false);
   s->use = bind(s, 3, profile->use_entry, "use", 1, false, false);
   s->named_use = bind(s, 4, profile->named_entry, "named-use", 1, false, true);
   s->lookup_region = runner->bind_inline_region(runner->ctx, at(s, profile->named_lookup_call), at(s, profile->named_lookup_return), profile->abi, s, lookup_region);
-  s->scans[s->scan_count++] = (scan_ctx){s, profile->next_scan, profile->next_join, 1, 0};
-  s->scans[s->scan_count++] = (scan_ctx){s, profile->prev_scan, profile->prev_join, -1, 0};
-  if (profile->has_validate_scan) s->scans[s->scan_count++] = (scan_ctx){s, profile->validate_scan_entry, profile->validate_scan_join, 1, 0};
-  for (size_t i = 0; i < s->scan_count; i++)
+  s->has_lookup_region = true;
+  size_t scan_count = 0;
+  s->scans[scan_count++] = (scan_ctx){s, profile->next_scan, profile->next_join, 1, 0};
+  s->scans[scan_count++] = (scan_ctx){s, profile->prev_scan, profile->prev_join, -1, 0};
+  if (profile->has_validate_scan) s->scans[scan_count++] = (scan_ctx){s, profile->validate_scan_entry, profile->validate_scan_join, 1, 0};
+  for (size_t i = 0; i < scan_count; i++) {
     s->scans[i].handle = runner->bind_inline_region_accepts(runner->ctx, at(s, s->scans[i].entry), at(s, s->scans[i].join), profile->abi, &s->scans[i], scan_region, &s->scans[i], scan_accepts);
-  s->use_regions[0] = runner->bind_inline_region(runner->ctx, at(s, profile->use_call), at(s, profile->use_join), profile->abi, s, use_region);
-  s->use_regions[1] = runner->bind_inline_region(runner->ctx, at(s, profile->named_call), at(s, profile->named_join), profile->abi, s, use_region);
-  return s;
+    s->scan_count = i + 1; /* bound so far */
+  }
+  s->use_regions[0] = runner->bind_inline_region(runner->ctx, at(s, profile->use_call), at(s, profile->use_join), profile->abi, s, use_region); s->use_region_count = 1;
+  s->use_regions[1] = runner->bind_inline_region(runner->ctx, at(s, profile->named_call), at(s, profile->named_join), profile->abi, s, use_region); s->use_region_count = 2;
 }
 bool qa_compat_q2_native_primary_inventory_read(qa_compat_q2_native_primary_inventory *s, qa_actor_id actor, qa_compat_q2_native_inventory_readout *out) {
   if (!current(s, actor)) return false;
@@ -341,7 +382,7 @@ void qa_compat_q2_native_primary_inventory_restore(qa_compat_q2_native_primary_i
   const qa_compat_q2_native_inventory_row *rows = NULL, *row = NULL; size_t count = 0;
   if (s->hooks.rows(s->hooks.ctx, actor, &rows, &count))
     for (size_t i = 0; i < count && row == NULL; i++) if (strcmp(rows[i].item, item) == 0) row = &rows[i];
-  if (row == NULL) qa_range_error("Saved native inventory cursor is absent from its canonical rows");
+  if (row == NULL) qa_raise("Error", 0, 0, "Saved native inventory cursor is absent from its canonical rows");
   const qa_compat_q2_memory * m = mem(s);
   qa_guest_address a = cursor_address(s, actor);
   qa_compat_q2_mem_write_i32(m, a, qa_js_to_int32(row->source_index));
@@ -351,16 +392,15 @@ void qa_compat_q2_native_primary_inventory_release(qa_compat_q2_native_primary_i
 void qa_compat_q2_native_primary_inventory_close(qa_compat_q2_native_primary_inventory *s) {
   if (s->closed) return;
   s->closed = true;
+  /* removals.runReverse(): the stack is emptied, then whatever was bound is removed, newest first. */
   qa_compat_q2_runner *runner = s->host.runner;
-  runner->remove_inline_region(runner->ctx, s->use_regions[1]);
-  runner->remove_inline_region(runner->ctx, s->use_regions[0]);
-  for (size_t i = s->scan_count; i-- > 0;) runner->remove_inline_region(runner->ctx, s->scans[i].handle);
-  runner->remove_inline_region(runner->ctx, s->lookup_region);
-  qa_compat_q2_native_entry_close(s->named_use);
-  qa_compat_q2_native_entry_close(s->use);
-  qa_compat_q2_native_entry_close(s->validate);
-  qa_compat_q2_native_entry_close(s->previous);
-  qa_compat_q2_native_entry_close(s->next);
+  size_t uses = s->use_region_count, scans = s->scan_count; bool lookup = s->has_lookup_region;
+  qa_compat_q2_native_entry *entries[5] = {s->next, s->previous, s->validate, s->use, s->named_use};
+  s->use_region_count = 0; s->scan_count = 0; s->has_lookup_region = false;
+  for (size_t i = uses; i-- > 0;) runner->remove_inline_region(runner->ctx, s->use_regions[i]);
+  for (size_t i = scans; i-- > 0;) runner->remove_inline_region(runner->ctx, s->scans[i].handle);
+  if (lookup) runner->remove_inline_region(runner->ctx, s->lookup_region);
+  for (size_t i = 5; i-- > 0;) if (entries[i] != NULL) qa_compat_q2_native_entry_close(entries[i]);
   s->selected_count = 0;
 }
 void qa_compat_q2_native_primary_inventory_destroy(qa_compat_q2_native_primary_inventory *s) {

@@ -28,7 +28,7 @@ bool qa_compat_q2_rerelease_message_imports_invoke(qa_compat_q2_rerelease_messag
   else if (strcmp(name, "WriteLong") == 0) qa_q2_msg_write_long(buffer, (double)qa_compat_q2_guest_integer(args, count, 0));
   else if (strcmp(name, "WriteFloat") == 0 || strcmp(name, "WriteAngle") == 0) {
     const qa_guest_call_value *v = qa_compat_q2_guest_argument(args, count, 0);
-    if (v->kind != QA_GUEST_VALUE_FLOAT32) qa_range_error("Q2 message writer requires a source float");
+    if (v->kind != QA_GUEST_VALUE_FLOAT32) qa_raise("TypeError", 0, 0, "Q2 message writer requires a source float");
     if (strcmp(name, "WriteFloat") == 0) qa_q2_msg_write_float(buffer, v->number_value);
     else qa_q2_msg_write_byte(buffer, (double)(qa_js_to_int32(trunc((float)((float)(v->number_value * 256) / 360))) & 255)); /* guest NaN/huge: ToInt32 */
   }
@@ -49,10 +49,11 @@ bool qa_compat_q2_rerelease_message_imports_invoke(qa_compat_q2_rerelease_messag
       while (qa_compat_q2_mem_read_u8(m->memory, qa_compat_q2_mem_offset(m->memory, address, length)) != 0) {
         if (++length >= buffer->maxsize) qa_range_error("Q2 message string exceeds message capacity");
       }
-      uint8_t *bytes = malloc((size_t)length + 1);
+      uint8_t *bytes = malloc((size_t)length + 1); if (!bytes) qa_range_error("Out of memory");
+      qa_cleanup bytes_owned; qa_cleanup_push(&bytes_owned, free, bytes); /* released when the buffer overflows too */
       m->memory->copy(m->memory->ctx, address, bytes, (double)length + 1);
       qa_q2_sz_write(buffer, bytes, (size_t)length + 1, (int64_t)length + 1);
-      free(bytes);
+      qa_cleanup_pop(&bytes_owned); free(bytes);
     }
   }
   else if (strcmp(name, "WriteEntity") == 0) qa_q2_msg_write_short(buffer, m->source_slot(m->slot_ctx, qa_compat_q2_guest_required_pointer(args, count, 0)));
@@ -60,7 +61,7 @@ bool qa_compat_q2_rerelease_message_imports_invoke(qa_compat_q2_rerelease_messag
     qa_guest_address address; bool has = qa_compat_q2_guest_pointer(args, count, 0, &address);
     if (!has) qa_q2_sz_clear(buffer);
     else {
-      if (buffer->overflowed) qa_range_error("Q2 unicast message buffer overflowed");
+      if (buffer->overflowed) qa_raise("Error", 0, 0, "Q2 unicast message buffer overflowed");
       double slot = m->source_slot(m->slot_ctx, address);
       if (m->services.accepts_client(m->services.ctx, slot) && buffer->cursize != 0)
         m->services.unicast(m->services.ctx, (qa_compat_q2_rerelease_unicast){slot, qa_compat_q2_guest_integer(args, count, 1) != 0,
@@ -69,11 +70,11 @@ bool qa_compat_q2_rerelease_message_imports_invoke(qa_compat_q2_rerelease_messag
     }
   }
   else if (strcmp(name, "multicast") == 0) {
-    if (buffer->overflowed) qa_range_error("Q2 multicast message buffer overflowed");
+    if (buffer->overflowed) qa_raise("Error", 0, 0, "Q2 multicast message buffer overflowed");
     int64_t target = qa_compat_q2_guest_integer(args, count, 1);
     qa_guest_address address; bool has = qa_compat_q2_guest_pointer(args, count, 0, &address);
     if (target != 0 && target != 1 && target != 2) qa_range_error("Unknown Q2 multicast destination");
-    if (target != 0 && !has) qa_range_error("Q2 spatial multicast requires an origin");
+    if (target != 0 && !has) qa_raise("TypeError", 0, 0, "Q2 spatial multicast requires an origin");
     if (buffer->cursize != 0) {
       qa_compat_q2_rerelease_multicast msg; memset(&msg, 0, sizeof msg);
       msg.has_origin = has; if (has) msg.origin = qa_compat_q2_mem_read_f32_vector(m->memory, address);

@@ -101,6 +101,8 @@ typedef struct qa_system_v_service_host {
   void (*finalize_destructors)(void *ctx, const qa_guest_core_call_context *context,
                                bool has_dso, qa_guest_core_address dso);
   qa_guest_core_address (*tls_address)(void *ctx, uint64_t module_id, int64_t offset);
+  /* C ownership (no TS counterpart): service states released with the runtime, newest first. */
+  void (*own)(void *ctx, void *resource, void (*release)(void *resource));
 } qa_system_v_service_host;
 
 /* Convenience wrappers mirroring host.method(...) call sites. */
@@ -126,6 +128,9 @@ qa_call_result qa_system_v_invoke(qa_system_v_service_host *host, const qa_guest
                                   qa_guest_core_address target, const qa_abi_storage *parameters,
                                   size_t parameter_count, bool result_is_void, qa_abi_storage result,
                                   const qa_call_value *arguments, size_t argument_count);
+
+/* Hands a service state to the runtime, which releases it at destroy. */
+void qa_system_v_own(qa_system_v_service_host *host, void *resource, void (*release)(void *resource));
 
 /* TS throw new UnsupportedSystemVService(...). */
 void qa_unsupported_system_v_service(const char *library, const char *symbol,

@@ -92,11 +92,12 @@ struct qa_q3_pres_client_server_command_runtime {
   head_voice head_voices[64];
   buffered_voice voices[32];
   char *config_scratch; /* owned copy of the last config() result */
+  qa_caught_error *failure; /* owned; the error the TS `pending` promise stays rejected with */
 };
 typedef qa_q3_pres_client_server_command_runtime runtime_t;
 
 static void open_check(runtime_t *runtime) {
-  if (runtime->closed) qa_range_error("Cgame command runtime is closed");
+  if (runtime->closed) qa_raise("Error", 0, 0, "Cgame command runtime is closed");
 }
 static void at_check(double index, double length) {
   if (index != trunc(index) || index < 0 || index >= length) {
@@ -110,11 +111,11 @@ static void at_check(double index, double length) {
 bool qa_q3_pres_client_server_command_runtime_create(runtime_t **out,
     qa_q3_pres_client_server_command_host host) {
   if (host.state->product != host.static_state->product) {
-    qa_range_error("Cgame state products differ");
+    qa_raise("Error", 0, 0, "Cgame state products differ");
   }
   for (int i = 0; i < 64; i++) {
     if (host.client_info(host.clients_ctx, i) != &host.static_state->client_info[i]) {
-      qa_range_error("ClientInfoStore must use canonical cgs slots");
+      qa_raise("Error", 0, 0, "ClientInfoStore must use canonical cgs slots");
     }
   }
   runtime_t *runtime = calloc(1, sizeof *runtime);
@@ -136,6 +137,7 @@ void qa_q3_pres_client_server_command_runtime_destroy(runtime_t *runtime) {
   }
   free(runtime->voice_lists);
   free(runtime->config_scratch);
+  free(runtime->failure);
   free(runtime);
 }
 bool qa_q3_pres_client_server_command_runtime_dispose(runtime_t *runtime) {
@@ -484,8 +486,9 @@ bool qa_q3_pres_client_server_command_runtime_build_spectator_string(runtime_t *
   for (int i = 0; i < 64; i++) {
     qa_q3_pres_client_info *info = runtime->host.client_info(runtime->host.clients_ctx, i);
     if (info->info_valid && info->team == QA_Q3_BASE_TEAM_SPECTATOR) {
-      char next[1024];
-      snprintf(next, sizeof next, "%.900s%.100s     ", list, STR(info->name));
+      /* TS `${list}${name}     `.slice(0, 1023): the whole list is kept, then the cut. */
+      char next[1024 + 1024 + 8];
+      snprintf(next, sizeof next, "%s%.1023s     ", list, STR(info->name));
       slice_copy(list, sizeof list, next, 1023);
     }
   }
@@ -692,10 +695,17 @@ static bool map_restart(runtime_t *runtime) {
         return false;
       }
       if (demo_flag.integer_value != 0 && STR(demo_name.value)[0] != '\0') {
-        char command[512];
-        snprintf(command, sizeof command, "set g_synchronousclients 1 ; record %.400s \n",
-            STR(demo_name.value));
+        const char *demo = STR(demo_name.value);
+        size_t command_size = strlen(demo) + sizeof "set g_synchronousclients 1 ; record  \n";
+        char *command = malloc(command_size);
+        if (command == NULL) {
+          qa_cvar_read_free(&demo_flag);
+          qa_cvar_read_free(&demo_name);
+          return false;
+        }
+        snprintf(command, command_size, "set g_synchronousclients 1 ; record %s \n", demo);
         runtime->host.send_console_command(runtime->host.ctx, command);
+        free(command);
       }
       qa_cvar_read_free(&demo_flag);
       qa_cvar_read_free(&demo_name);
@@ -815,44 +825,91 @@ static bool dispatch(runtime_t *runtime, const char *const *command, size_t coun
     }
   }
   char line[1100];
-  snprintf(line, sizeof line, "Unknown client game command: %.1000s\n", remaining);
+  snprintf(line, sizeof line, "Unknown client game command: %s\n", remaining); /* remaining holds at most 1023 bytes */
   runtime->host.print(runtime->host.ctx, line);
   return true;
 }
 
-bool qa_q3_pres_client_server_command_runtime_execute_new_server_commands(runtime_t *runtime,
-    double latest_sequence) {
-  if (latest_sequence != trunc(latest_sequence) || latest_sequence < 0 || latest_sequence > 2147483647.0) {
-    qa_range_error("Invalid reliable command sequence");
-  }
+/* TS queue(): every command runs as a link of `pending`, and
+ * `.catch(error => { if (!this.closed) this.dispose(); throw error; })` leaves `pending` rejected. So a throw out of
+ * the command stream disposes the runtime, and every later link rejects with that same first error without running. */
+typedef struct owned_tokens { char **tokens; size_t count; } owned_tokens;
+static void free_owned_tokens(void *arg) {
+  owned_tokens *owned = arg;
+  free_tokens(owned->tokens, owned->count);
+}
+typedef struct queued_work {
+  runtime_t *runtime;
+  double latest_sequence;        /* executeNewServerCommands */
+  const char *const *command;    /* executeCommand: the owned copy */
+  size_t command_count;
+  bool result;
+} queued_work;
+static void new_commands_body(void *ctx) {
+  queued_work *work = ctx;
+  runtime_t *runtime = work->runtime;
+  work->result = false;
   open_check(runtime);
-  while (runtime->host.static_state->server_command_sequence < latest_sequence) {
+  while (runtime->host.static_state->server_command_sequence < work->latest_sequence) {
     double sequence = runtime->host.static_state->server_command_sequence + 1;
     runtime->host.static_state->server_command_sequence = sequence;
     char **tokens = NULL;
     size_t token_count = 0;
     bool found = runtime->host.get_server_command(runtime->host.ctx, sequence, &tokens, &token_count);
+    owned_tokens source = {tokens, token_count};
+    qa_cleanup source_node;
+    qa_cleanup_push(&source_node, free_owned_tokens, &source);
     open_check(runtime);
-    if (found) {
-      char **owned = NULL;
-      bool copied = command_copy((const char *const *)tokens, token_count, &owned);
-      free_tokens(tokens, token_count);
-      if (!copied) return false;
-      bool ok = dispatch(runtime, (const char *const *)owned, token_count);
-      free_tokens(owned, token_count);
-      if (!ok) return false;
-    }
+    char **owned = NULL;
+    bool copied = !found || command_copy((const char *const *)tokens, token_count, &owned);
+    qa_cleanup_pop(&source_node);
+    free_tokens(tokens, token_count);
+    if (!found) continue;
+    if (!copied) return;
+    owned_tokens copy = {owned, token_count};
+    qa_cleanup copy_node;
+    qa_cleanup_push(&copy_node, free_owned_tokens, &copy);
+    bool ok = dispatch(runtime, (const char *const *)owned, token_count);
+    qa_cleanup_pop(&copy_node);
+    free_tokens(owned, token_count);
+    if (!ok) return;
   }
-  return true;
+  work->result = true;
+}
+static void command_body(void *ctx) {
+  queued_work *work = ctx;
+  open_check(work->runtime);
+  work->result = dispatch(work->runtime, work->command, work->command_count);
+}
+static bool queue_run(runtime_t *runtime, void (*body)(void *ctx), queued_work *work, owned_tokens *owned) {
+  if (runtime->failure != NULL) {
+    if (owned != NULL) free_tokens(owned->tokens, owned->count);
+    qa_rethrow(runtime->failure);
+  }
+  qa_caught_error caught;
+  bool completed = qa_try(body, work, &caught);
+  if (owned != NULL) free_tokens(owned->tokens, owned->count);
+  if (completed) return work->result;
+  if (!runtime->closed) (void)qa_q3_pres_client_server_command_runtime_dispose(runtime);
+  runtime->failure = malloc(sizeof *runtime->failure);
+  if (runtime->failure != NULL) *runtime->failure = caught;
+  qa_rethrow(&caught);
+}
+bool qa_q3_pres_client_server_command_runtime_execute_new_server_commands(runtime_t *runtime,
+    double latest_sequence) {
+  if (latest_sequence != trunc(latest_sequence) || latest_sequence < 0 || latest_sequence > 2147483647.0) {
+    qa_range_error("Invalid reliable command sequence");
+  }
+  queued_work work = {runtime, latest_sequence, NULL, 0, false};
+  return queue_run(runtime, new_commands_body, &work, NULL);
 }
 bool qa_q3_pres_client_server_command_runtime_execute_command(runtime_t *runtime,
     const char *const *command, size_t command_count) {
   char **owned = NULL;
   if (!command_copy(command, command_count, &owned)) return false;
-  open_check(runtime);
-  bool ok = dispatch(runtime, (const char *const *)owned, command_count);
-  free_tokens(owned, command_count);
-  return ok;
+  owned_tokens copy = {owned, command_count};
+  queued_work work = {runtime, 0, (const char *const *)owned, command_count, false};
+  return queue_run(runtime, command_body, &work, &copy);
 }
 
 /* Voice file text: caller frees. *out NULL is the TS null return. */
@@ -941,8 +998,8 @@ bool qa_q3_pres_client_server_command_runtime_parse_voice_chats(runtime_t *runti
     slice_copy(chat->id, sizeof chat->id, token, 63);
     tokenizer_next(&tokenizer, true, token, sizeof token);
     if (strcmp(token, "{") != 0) {
-      char message[512];
-      snprintf(message, sizeof message, "^1expected { found %.200s in voice chat file: %.250s\n",
+      char message[1024 + 320]; /* a token holds at most 1023 bytes */
+      snprintf(message, sizeof message, "^1expected { found %s in voice chat file: %.250s\n",
           token, filename);
       runtime->host.print(runtime->host.ctx, message);
       result = false;
@@ -1045,8 +1102,8 @@ static voice_chat_list *voice_list_for_client(runtime_t *runtime, double client_
   for (int candidate_index = 0; candidate_index < 2; candidate_index++) {
     slice_copy(head, sizeof head, candidates[candidate_index], 63);
     for (int i = 0; i < 64; i++) {
-      if (runtime->head_voices[i].headmodel[0] != '\0' &&
-          fold_equal(runtime->head_voices[i].headmodel, head)) {
+      /* TS find(entry => fold(entry.headmodel) === fold(head)): an empty head matches the first unused entry. */
+      if (fold_equal(runtime->head_voices[i].headmodel, head)) {
         return voice_list_at(runtime, runtime->head_voices[i].voice_chat_num);
       }
     }
@@ -1099,7 +1156,7 @@ static bool play_voice_chat(runtime_t *runtime, buffered_voice *voice) {
   if (!cvar_integer(runtime, "cg_noVoiceChats", &no_voice_chats)) return false;
   if (no_voice_chats == 0) {
     runtime->host.start_local_sound(runtime->host.ctx, voice->snd, 3);
-    if (state->snap == NULL) qa_range_error("Voice playback requires the current snapshot");
+    if (state->snap == NULL) qa_raise("Error", 0, 0, "Voice playback requires the current snapshot");
     if (voice->client_num != state->snap->player_state.client_num) {
       double order = order_task(STR(voice->cmd));
       if (order > 0) {
@@ -1183,8 +1240,9 @@ static bool voice_chat_local_impl(runtime_t *runtime, double mode, bool voice_on
   else snprintf(name, sizeof name, "%.120s", STR(info->name));
   char full_message[256];
   char color_char = (char)(to_int32(color) & 255);
-  snprintf(full_message, sizeof full_message, "%.150s: ^%c%.80s", name,
-      color_char != '\0' ? color_char : ' ', message);
+  /* TS bytes() cuts at the first NUL, so colour byte 0 ends the message after the caret. */
+  if (color_char != '\0') snprintf(full_message, sizeof full_message, "%.150s: ^%c%.80s", name, color_char, message);
+  else snprintf(full_message, sizeof full_message, "%.150s: ^", name);
   buffered_voice voice;
   memset(&voice, 0, sizeof voice);
   voice.client_num = client_num;

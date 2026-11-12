@@ -60,7 +60,7 @@ double qa_bot_client_travel_time_to_goal_bots_a(qa_game_ai_context_bots_a *ctx, 
                                                 const qa_bot_goal *goal) {
   qa_vec3 origin;
   if (!qa_ai_client_origin_bots_a(ctx, client, &origin))
-    qa_range_error("BotClientTravelTimeToGoal would read an uninitialized player state for client %lld",
+    qa_raise("Error", 0, 0, "BotClientTravelTimeToGoal would read an uninitialized player state for client %lld",
                    (long long)client);
   int64_t area = qa_bot_point_area_num_bots_a(ctx, origin);
   if (area == 0)
@@ -80,7 +80,7 @@ int64_t qa_bot_sort_team_mates_by_base_travel_time_bots_a(qa_game_ai_context_bot
   const qa_bot_goal *goal = flags ? (red ? &dm->ctf_red_flag : &dm->ctf_blue_flag)
                                   : (red ? &dm->red_obelisk : &dm->blue_obelisk);
   if (state->product != QA_Q3_BASE_PRODUCT_MISSIONPACK && !flags)
-    qa_range_error("BotSortTeamMatesByBaseTravelTime has no source base goal in this base-game mode");
+    qa_raise("Error", 0, 0, "BotSortTeamMatesByBaseTravelTime has no source base goal in this base-game mode");
   if (ctx->team.sort_team_mates_max_clients == 0)
     ctx->team.sort_team_mates_max_clients = qa_ai_sv_maxclients_bots_a(ctx);
   int64_t candidates[QA_BOT_TEAMMATE_CAPACITY];

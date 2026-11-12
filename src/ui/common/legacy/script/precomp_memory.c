@@ -190,34 +190,27 @@ void qa_ui_precomp_token_restore_save_state(qa_ui_precomp_token *token,
   qa_save_reader_destroy(&field);
   if (!qa_save_reader_field(&reader, "context", &context))
     qa_range_error("precomp token restore allocation failed");
-  char *path = NULL, *ws = NULL;
+  /* The texts are borrowed from the save value, so a raise below (a bad
+     column) owns nothing. */
+  const char *path = NULL, *ws = NULL;
   int64_t column = 1;
-  if (qa_save_reader_field(&context, "path", &field)) {
-    const char *text = qa_save_reader_string(&field);
-    path = malloc(strlen(text) + 1);
-    if (path != NULL) strcpy(path, text);
-    qa_save_reader_destroy(&field);
-  }
-  if (qa_save_reader_field(&context, "column", &field)) {
-    column = (int64_t)qa_save_reader_integer_min(&field, 0);
-    qa_save_reader_destroy(&field);
-  }
-  if (qa_save_reader_field(&context, "leadingWhitespace", &field)) {
-    const char *text = qa_save_reader_string(&field);
-    ws = malloc(strlen(text) + 1);
-    if (ws != NULL) strcpy(ws, text);
-    qa_save_reader_destroy(&field);
-  }
-  qa_save_reader_destroy(&context);
-  if (path == NULL || ws == NULL
-      || !qa_ui_source_token_context_set(&token->context, path, column, ws,
-                                         strlen(ws))) {
-    free(path);
-    free(ws);
+  if (!qa_save_reader_field(&context, "path", &field))
     qa_range_error("precomp token restore allocation failed");
-  }
-  free(path);
-  free(ws);
+  path = qa_save_reader_string(&field);
+  qa_save_reader_destroy(&field);
+  if (!qa_save_reader_field(&context, "column", &field))
+    qa_range_error("precomp token restore allocation failed");
+  column = (int64_t)qa_save_reader_integer_min(&field, 0);
+  qa_save_reader_destroy(&field);
+  if (!qa_save_reader_field(&context, "leadingWhitespace", &field))
+    qa_range_error("precomp token restore allocation failed");
+  size_t ws_length = 0;
+  ws = qa_save_reader_string_length(&field, &ws_length);
+  qa_save_reader_destroy(&field);
+  qa_save_reader_destroy(&context);
+  if (!qa_ui_source_token_context_set(&token->context, path, column, ws,
+                                      ws_length))
+    qa_range_error("precomp token restore allocation failed");
   if (!qa_save_reader_field(&reader, "unsupported", &field))
     qa_range_error("precomp token restore allocation failed");
   if (qa_save_reader_is_null(&field)) {
@@ -412,11 +405,13 @@ static bool owner_allocate(qa_ui_precomp_memory *owner, size_t size,
 
 qa_ui_precomp_token *qa_ui_precomp_memory_copy_token(
     qa_ui_precomp_memory *memory, qa_ui_precomp_token *token) {
+  /* TS new PrecompToken(this.nextToken++, this.allocate(...)): the id is
+     taken before the allocation, so a failed allocation still uses it. */
+  int64_t id = memory->next_token++;
   qa_ui_script_allocation allocation;
   if (!owner_allocate(memory, QA_UI_SOURCE_TOKEN_BYTES, &allocation))
     qa_range_error("precomp token allocation failed");
-  qa_ui_precomp_token *copied =
-      qa_ui_precomp_token_create(memory->next_token++, allocation);
+  qa_ui_precomp_token *copied = qa_ui_precomp_token_create(id, allocation);
   if (copied == NULL) qa_range_error("precomp token allocation failed");
   qa_ui_precomp_token_copy_from(copied, token);
   qa_ui_source_token_set_next(copied->token, 0);
@@ -642,6 +637,40 @@ oom:
   return NULL;
 }
 
+/* A token dropped by a failed restore: an owner's allocation stays with the
+   owner; without one the bytes are freed. */
+static void discard_token_of(const qa_ui_script_memory *owner,
+                             qa_ui_precomp_token *token) {
+  if (owner == NULL) qa_ui_script_memory_free(NULL, &token->allocation);
+  token->owns_allocation_bytes = false;
+  qa_ui_precomp_token_destroy(token);
+}
+typedef struct token_discard {
+  qa_ui_precomp_memory *memory;
+  qa_ui_precomp_token *token;
+} token_discard;
+static void discard_token(void *raw) {
+  token_discard *discard = raw;
+  discard_token_of(discard->memory->memory, discard->token);
+}
+
+void qa_ui_precomp_memory_discard(qa_ui_precomp_memory *memory) {
+  if (memory == NULL) return;
+  for (size_t index = 0; index < memory->token_count; index++)
+    if (memory->tokens[index] != NULL)
+      discard_token_of(memory->memory, memory->tokens[index]);
+  for (size_t index = 0; index < memory->define_count; index++) {
+    qa_ui_precomp_define *define = memory->defines[index];
+    if (define == NULL) continue;
+    if (memory->memory == NULL)
+      qa_ui_script_memory_free(NULL, &define->allocation);
+    free(define);
+  }
+  free(memory->tokens);
+  free(memory->defines);
+  free(memory);
+}
+
 void qa_ui_precomp_memory_restore_save_state(
     qa_ui_precomp_memory *memory, const qa_save_value *value,
     const qa_ui_script_memory_restore *restore) {
@@ -660,13 +689,15 @@ void qa_ui_precomp_memory_restore_save_state(
    * the checkpoint image). C frees the stale handles. */
   for (size_t index = 0; index < memory->token_count; index++) {
     if (memory->tokens[index] != NULL) {
-      memory->tokens[index]->owns_allocation_bytes = false;
-      qa_ui_precomp_token_destroy(memory->tokens[index]);
+      discard_token_of(memory->memory, memory->tokens[index]);
       memory->tokens[index] = NULL;
     }
   }
   for (size_t index = 0; index < memory->define_count; index++) {
-    free(memory->defines[index]);
+    qa_ui_precomp_define *define = memory->defines[index];
+    if (define != NULL && memory->memory == NULL)
+      qa_ui_script_memory_free(NULL, &define->allocation);
+    free(define);
     memory->defines[index] = NULL;
   }
   memory->token_count = 0;
@@ -697,7 +728,13 @@ void qa_ui_precomp_memory_restore_save_state(
       qa_range_error("precomp memory restore allocation failed");
     if (!qa_save_reader_field(&entry, "state", &cell))
       qa_range_error("precomp memory restore allocation failed");
+    /* A malformed state drops the token (its allocation stays with the
+       restore owner). */
+    token_discard discard = {memory, token};
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, discard_token, &discard);
     qa_ui_precomp_token_restore_save_state(token, cell.value, true);
+    qa_cleanup_pop(&guard);
     qa_save_reader_destroy(&cell);
     if (!grow_tokens(memory, (size_t)id))
       qa_range_error("precomp memory restore allocation failed");

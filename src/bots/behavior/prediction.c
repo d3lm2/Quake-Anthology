@@ -1,14 +1,14 @@
 /* See header. GPL-2.0-or-later. */
 #include "qa/bots/behavior/prediction.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static noreturn void fail(const char *message) {
-  fprintf(stderr, "%s\n", message);
-  abort();
-}
+/* TS `throw new Error(message)`. */
+static noreturn void fail(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void free_slot(void *arg) { free(*(void **)arg); }
 /* The observed scene records the last collision query the provider executed. */
 typedef struct observed_scene {
   qa_scene_queries scene;
@@ -97,6 +97,8 @@ qa_bot_travel_prediction_result qa_project_bot_movement(qa_bot_movement_predicti
   qa_vec3 *trajectory = malloc(capacity * sizeof *trajectory);
   if (trajectory == NULL)
     qa_range_error("Out of memory projecting bot movement");
+  qa_cleanup trajectory_cleanup; /* a provider or projection that raises leaves it behind otherwise */
+  qa_cleanup_push(&trajectory_cleanup, free_slot, &trajectory);
   size_t count = 0;
   trajectory[count++] = end;
   qa_movement_result previous;
@@ -123,7 +125,7 @@ qa_bot_travel_prediction_result qa_project_bot_movement(qa_bot_movement_predicti
         projection.stop(projection.ctx, has_previous ? &previous : NULL, &result, frame);
     r.has_end_area = stop.has_area;
     r.end_area = (double)stop.area;
-    stop_event = stop.events & query.stop_events;
+    stop_event = (int64_t)qa_js_bit_and((double)stop.events, (double)query.stop_events); /* JS `&`: ToInt32 */
     if (stop_event != 0)
       end = stop.origin;
     seconds += elapsed;
@@ -134,6 +136,7 @@ qa_bot_travel_prediction_result qa_project_bot_movement(qa_bot_movement_predicti
     if (stop_event != 0)
       break;
   }
+  qa_cleanup_pop(&trajectory_cleanup);
   r.end = end;
   r.velocity = velocity;
   r.frames = (double)frames;

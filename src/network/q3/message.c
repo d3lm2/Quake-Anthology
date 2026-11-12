@@ -120,9 +120,10 @@ void qa_q3_message_writer_write_bits(qa_q3_message_writer *w, int64_t value, int
 }
 void qa_q3_message_writer_write_bits_double(qa_q3_message_writer *w, double value, int64_t bits) {
   if (!isfinite(value) || trunc(value) != value) {
-    /* TS checks after oldsize/reserve; reserve-side overflow returns first. */
+    /* TS checks after oldsize, the reserve and the width; reserve-side overflow returns first. */
     if (w->source_state) qa_q3_source_message_state_add_oldsize(w->source_state, bits);
     if (w->capacity - w->size < 4) { w->overflowed = true; return; }
+    width_of(bits, QA_Q3_MESSAGE_BITSTREAM);
     qa_range_error("Message integer must be integral");
   }
   qa_q3_message_writer_write_bits(w, (int64_t)value, bits);

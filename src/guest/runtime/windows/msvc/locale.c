@@ -10,7 +10,7 @@
 
 static const char *const library = "msvcp140.dll";
 
-static void plain_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
 static qa_guest_core_address at(const qa_mapped_guest_memory *m, qa_guest_core_address a, int64_t o) {
   return qa_memory_offset(m, a, o);
 }
@@ -90,6 +90,7 @@ void qa_msvc_locale_unlock(qa_msvc_locale *locale, qa_guest_core_address object)
   if (depth == 1) qa_memory_write_u32(memory, slot, 0);
 }
 
+static void free_detail(void *slot) { free(*(char **)slot); }
 typedef struct locale_state {
   qa_msvc_locale *locale;
   int kind;
@@ -160,10 +161,16 @@ static qa_call_result locale_impl(void *ctx, const qa_guest_core_call_context *c
         requested = qa_read_string(memory, host->memory_ext, supplied, 1048576);
       if (requested == NULL || (strcmp(requested, "C") != 0 && strcmp(requested, "") != 0)) {
         /* TS: requested is null only when supplied is null, and null !== "C"/"". */
-        if (requested != NULL)
-          qa_range_error(
-              "Unsupported Windows guest import msvcp140.dll!_Locinfo: locale %s is not "
-              "implemented", requested);
+        if (requested != NULL) {
+          const size_t length = strlen(requested) + 32;
+          char *detail = malloc(length);
+          if (detail == NULL) qa_range_error("Guest runtime out of memory");
+          (void)snprintf(detail, length, "locale %s is not implemented", requested);
+          free(requested);
+          qa_cleanup held;
+          qa_cleanup_push(&held, free_detail, &detail);
+          qa_unsupported_windows_import(library, "_Locinfo", detail);
+        }
         qa_unsupported_windows_import(library, "_Locinfo",
                                       "locale null is not implemented");
       }

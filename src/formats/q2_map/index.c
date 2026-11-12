@@ -1,7 +1,6 @@
 /* Port of src/formats/q2-map/index.ts. GPL-2.0-or-later. */
 #include "qa/formats/q2_map.h"
 
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +30,10 @@ static void list_push(qa_q2_string_list *list, char *value) {
 static bool valid_material(const char *material) {
   if (material[0] == '\0') return false;
   for (const char *p = material; *p != '\0'; p++) {
-    if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') return false;
+    /* TS /^[a-zA-Z0-9_-]+$/: ASCII only, whatever the C locale says. */
+    unsigned char c = (unsigned char)*p;
+    bool ascii_alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+    if (!ascii_alnum && c != '_' && c != '-') return false;
   }
   return true;
 }

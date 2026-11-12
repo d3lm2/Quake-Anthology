@@ -71,7 +71,7 @@ bool qa_q3_pres_client_command_history_read(qa_q3_pres_client_command_history *h
     char wanted[32], current[32];
     fmt_num(wanted, sizeof wanted, number);
     fmt_num(current, sizeof current, history->number);
-    qa_range_error("CL_GetUserCmd: %s >= %s", wanted, current);
+    qa_raise("Error", 0, 0, "CL_GetUserCmd: %s >= %s", wanted, current);
   }
   if (number <= (double)to_int32(history->number - 64)) return false;
   *out = history->commands[to_int32(number) & 63];
@@ -118,7 +118,7 @@ static qa_q3_base_player_inventory inventory_of(const qa_q3_base_source_player_s
   inventory.powerup = inventory_powerup;
   if (product != QA_Q3_BASE_PRODUCT_BASEQ3) {
     if (!schema->has_persistent_powerup) {
-      qa_range_error("Missionpack prediction requires its stat schema");
+      qa_raise("Error", 0, 0, "Missionpack prediction requires its stat schema");
     }
     inventory.has_persistent_powerup_index = true;
     inventory.persistent_powerup_index = slot_get(&ps->stats, schema->persistent_powerup);
@@ -143,7 +143,7 @@ static bool replace_predicted(qa_q3_pres_client_game_state *state, const qa_q3_b
 static qa_q3_base_user_command required_command(runtime_t *runtime, double number) {
   qa_q3_base_user_command command;
   if (!runtime->host.commands.read(runtime->host.commands.ctx, number, &command)) {
-    qa_range_error("Prediction command source violated its CMD_BACKUP window");
+    qa_raise("Error", 0, 0, "Prediction command source violated its CMD_BACKUP window");
   }
   return command;
 }
@@ -222,7 +222,7 @@ double qa_q3_pres_prediction_runtime_point_contents(runtime_t *runtime, qa_vec3 
 bool qa_q3_pres_prediction_runtime_interpolate_player_state(runtime_t *runtime, bool grab_angles) {
   qa_q3_pres_client_game_state *state = runtime->state;
   qa_q3_pres_retail_snapshot *previous = state->snap;
-  if (previous == NULL) qa_range_error("CG_InterpolatePlayerState requires cg.snap");
+  if (previous == NULL) qa_raise("Error", 0, 0, "CG_InterpolatePlayerState requires cg.snap");
   if (!replace_predicted(state, &previous->player_state)) return false;
   qa_q3_base_source_player_state *out = &state->predicted_player_state;
   if (grab_angles) {
@@ -356,11 +356,12 @@ static double movement_point_contents_thunk(void *ctx, qa_vec3 point, double pas
   return qa_q3_pres_prediction_runtime_point_contents(ctx, point, pass_entity);
 }
 
+static void destroy_player_state(void *arg) { qa_q3_base_player_state_record_destroy(arg); }
 bool qa_q3_pres_prediction_runtime_predict_player_state(runtime_t *runtime) {
   qa_q3_pres_client_game_state *state = runtime->state;
   qa_q3_pres_retail_snapshot *snapshot = state->snap;
   qa_q3_pres_prediction_settings settings = runtime->host.settings(runtime->host.ctx);
-  if (snapshot == NULL) qa_range_error("CG_PredictPlayerState requires cg.snap");
+  if (snapshot == NULL) qa_raise("Error", 0, 0, "CG_PredictPlayerState requires cg.snap");
   state->hyperspace = false;
   if (!state->valid_pps) {
     state->valid_pps = true;
@@ -379,10 +380,13 @@ bool qa_q3_pres_prediction_runtime_predict_player_state(runtime_t *runtime) {
   }
   qa_q3_base_source_player_state old;
   if (!qa_q3_base_player_state_record_copy(&old, &state->predicted_player_state)) return false;
+  qa_cleanup old_node; /* a raise out of the prediction (a command outside the window, a movement error) releases old */
+  qa_cleanup_push(&old_node, destroy_player_state, &old);
   double current = runtime->host.commands.current_number(runtime->host.commands.ctx);
   qa_q3_base_user_command oldest = required_command(runtime, (double)to_int32(current - 63));
   if (oldest.server_time > snapshot->player_state.command_time && oldest.server_time < state->time) {
     if (settings.show_miss != 0) warn(runtime, "exceeded PACKET_BACKUP on commands\n");
+    qa_cleanup_pop(&old_node);
     qa_q3_base_player_state_record_destroy(&old);
     return true;
   }
@@ -391,6 +395,7 @@ bool qa_q3_pres_prediction_runtime_predict_player_state(runtime_t *runtime) {
       state->next_snap != NULL && !state->next_frame_teleport && !state->this_frame_teleport
           ? state->next_snap : snapshot;
   if (!replace_predicted(state, &selected->player_state)) {
+    qa_cleanup_pop(&old_node);
     qa_q3_base_player_state_record_destroy(&old);
     return false;
   }
@@ -493,6 +498,7 @@ bool qa_q3_pres_prediction_runtime_predict_player_state(runtime_t *runtime) {
     /* A local authority can acknowledge every command before the next frame. */
     runtime->host.transition_player_state(runtime->host.ctx, ps, &old);
     if (settings.show_miss != 0) warn(runtime, "not moved\n");
+    qa_cleanup_pop(&old_node);
     qa_q3_base_player_state_record_destroy(&old);
     return true;
   }
@@ -506,6 +512,7 @@ bool qa_q3_pres_prediction_runtime_predict_player_state(runtime_t *runtime) {
     warn(runtime, "WARNING: double event\n");
     state->event_sequence = ps->event_sequence;
   }
+  qa_cleanup_pop(&old_node);
   qa_q3_base_player_state_record_destroy(&old);
   return true;
 }
@@ -516,7 +523,7 @@ bool qa_q3_pres_build_solid_list(qa_q3_pres_client_game_state *state) {
   qa_q3_pres_retail_snapshot *snapshot =
       state->next_snap != NULL && !state->next_frame_teleport && !state->this_frame_teleport
           ? state->next_snap : state->snap;
-  if (snapshot == NULL) qa_range_error("CG_BuildSolidList requires a snapshot");
+  if (snapshot == NULL) qa_raise("Error", 0, 0, "CG_BuildSolidList requires a snapshot");
   for (size_t index = 0; index < snapshot->entity_count; index++) {
     qa_q3_pres_client_entity *entity =
         qa_q3_pres_client_game_state_entity_at(state, snapshot->entities[index].number);

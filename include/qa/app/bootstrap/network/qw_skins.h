@@ -21,8 +21,13 @@ qa_app_qw_player_skins *qa_app_qw_player_skins_create(qa_app_qw_skin_options opt
 void qa_app_qw_player_skins_destroy(qa_app_qw_player_skins *skins);
 /* Malloc'd skin name; NULL only on OOM. */
 char *qa_app_qw_player_skins_name(qa_app_qw_player_skins *skins, const char *userinfo_skin);
-/* Borrowed cached skin or NULL (TS null). Owned by the cache. */
+/* Borrowed cached skin or NULL (TS null). Its name and pixels stay valid until
+ * qa_app_qw_player_skins_release_retired after the clear that drops it (TS callers keep the
+ * resolved object after the cache forgets it), or until destroy. */
 const qa_indexed_model_skin *qa_app_qw_player_skins_select(
     qa_app_qw_player_skins *skins, const char *userinfo_skin);
+/* TS cache.clear(): forgets every entry; the skins already handed out are retired, not freed. */
 void qa_app_qw_player_skins_clear(qa_app_qw_player_skins *skins);
+/* Frees the storage of skins dropped by earlier clears; call once no selection holds them. */
+void qa_app_qw_player_skins_release_retired(qa_app_qw_player_skins *skins);
 #endif

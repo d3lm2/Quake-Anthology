@@ -23,6 +23,9 @@ static const qa_guest_value_layout process_params[] = {P};
 typedef struct callback_entry { combat_t *owner; kind_t kind; qa_guest_address address; double offset; qa_compat_q2_native_entry *binding; } callback_entry;
 typedef struct damage_frame { qa_damage_request request; qa_source_damage_observer observer; bool has_result; qa_source_damage_result result; double applied; } damage_frame;
 typedef struct bound_actor { combat_t *owner; double slot; qa_owned_actor actor; struct bound_actor *next; } bound_actor;
+/* TS watched: Map<slot, closers[]>. Each field of a bound slot has its own write observer. */
+typedef struct watch_field { combat_t *owner; double slot, offset; uint64_t handle; } watch_field;
+typedef struct watched_slot { double slot; watch_field *fields; size_t count; } watched_slot;
 struct qa_compat_q2_native_mod_combat_state {
   const qa_native_mod_source_actors *definition; const qa_native_mod_declaration *declaration;
   const qa_compat_q2_native_mod_host *host; const qa_mod_host_services *services; qa_provider_id instance;
@@ -33,10 +36,18 @@ struct qa_compat_q2_native_mod_combat_state {
   bool has_deferred; qa_compat_q2_native_mod_deferred_damage_state deferred;
   qa_compat_q2_native_mod_armor_state armor;
   damage_frame **frames; size_t frame_count, frame_capacity;
-  bool watching; qa_guest_address watched_base; double watched_bytes; uint64_t watched;
-  bool suspended, closed;
+  watched_slot *watched; size_t watched_count, watched_capacity;
+  bool suspended, armor_ready;
   bound_actor *bound;
 };
+/* `${instance}${suffix}` with no length limit; the entry binding copies the id. */
+static char *make_id(const char *instance, const char *suffix) {
+  if (instance == NULL) instance = "";
+  size_t need = strlen(instance) + strlen(suffix) + 1;
+  char *id = malloc(need); if (id == NULL) qa_range_error("Out of memory");
+  (void)snprintf(id, need, "%s%s", instance, suffix);
+  return id;
+}
 static qa_guest_call_value pointer_value(bool has, qa_guest_address value) { return qa_compat_q2_call_pointer(has, value); }
 static qa_guest_call_value int_value(double value) { return qa_compat_q2_call_int32(trunc(value)); }
 static qa_compat_q2_guest_call_signature signature_of(const combat_t *s, const qa_guest_value_layout *parameters, size_t count) {
@@ -59,7 +70,7 @@ static qa_guest_address at(const combat_t *s, double slot, double offset) {
 static double slot_of(const combat_t *s, qa_guest_address address) { return qa_compat_q2_native_mod_table_slot(s->host, address, "Native callback actor is outside its source table"); }
 /* TS nullable(value): false is null. */
 static bool nullable_actor(const combat_t *s, const qa_guest_call_value *value, qa_actor_id *out) {
-  if (value == NULL || value->kind != QA_GUEST_VALUE_POINTER) qa_range_error("Native callback requires an actor pointer");
+  if (value == NULL || value->kind != QA_GUEST_VALUE_POINTER) qa_raise("Error", 0, 0, "Native callback requires an actor pointer");
   if (!value->pointer_value.has_value) return false;
   *out = s->calls.actor(s->calls.ctx, value->pointer_value.value); return true;
 }
@@ -90,6 +101,7 @@ static qa_compat_q2_guest_call_signature callback_signature(const combat_t *s, k
   }
 }
 static qa_guest_call_result callback_invoked(void *ctx, const qa_guest_call_value *values, size_t count, qa_compat_q2_native_entry *binding);
+static bool accepts_active(void *ctx) { return !((combat_t *)ctx)->suspended; }
 static callback_entry *ensure_entry(combat_t *s, kind_t kind, double slot) {
   double offset; if (!has_offset(s, kind, &offset)) return NULL;
   qa_guest_address address;
@@ -98,52 +110,76 @@ static callback_entry *ensure_entry(combat_t *s, kind_t kind, double slot) {
   for (size_t i = 0; i < s->entry_count; i++) if (s->entries[i]->address.byte_offset == address.byte_offset) return s->entries[i];
   callback_entry *entry = calloc(1, sizeof *entry); if (entry == NULL) qa_range_error("Out of memory");
   entry->owner = s; entry->kind = kind; entry->address = address; entry->offset = offset;
-  char id[320]; (void)snprintf(id, sizeof id, "%s:actor-%s-%lld", s->instance, kind_names[kind], (long long)address.byte_offset);
-  entry->binding = qa_compat_q2_native_mod_bind_entry(s->host, address, id, callback_signature(s, kind), entry, callback_invoked, s, NULL);
+  qa_cleanup entry_owned; qa_cleanup_push(&entry_owned, free, entry);
+  char suffix[64]; (void)snprintf(suffix, sizeof suffix, ":actor-%s-%lld", kind_names[kind], (long long)address.byte_offset);
+  char *id = make_id(s->instance, suffix);
+  qa_cleanup id_owned; qa_cleanup_push(&id_owned, free, id);
+  /* TS accepts: () => !this.suspended. */
+  entry->binding = qa_compat_q2_native_mod_bind_entry(s->host, address, id, callback_signature(s, kind), entry, callback_invoked, s, accepts_active);
+  qa_cleanup_pop(&id_owned); free(id); qa_cleanup_pop(&entry_owned);
   callback_entry **slot_entry = qa_compat_q2_grow((void **)&s->entries, &s->entry_count, &s->entry_capacity, sizeof *slot_entry); *slot_entry = entry;
   return entry;
 }
-static bool accepts_active(void *ctx) { return !((combat_t *)ctx)->suspended; }
+/* TS changed(slot, base, ranges): the ranges are relative to the observed field. */
 static void on_changed(void *ctx, const qa_compat_q2_written_range *ranges, size_t count) {
-  combat_t *s = ctx; if (s->suspended) return;
-  qa_compat_q2_native_mod_entities table = s->host->entities(s->host->ctx);
+  watch_field *field = ctx; combat_t *s = field->owner; qa_owned_actor owner;
+  if (s->suspended || !s->calls.owner(s->calls.ctx, field->slot, &owner)) return;
+  double pointer_bytes = (double)s->host->memory->pointer_bytes;
   for (size_t r = 0; r < count; r++) {
-    double first = floor(ranges[r].byte_offset / table.stride), last = floor((ranges[r].byte_offset + ranges[r].byte_length - 1) / table.stride);
-    for (double slot = first; slot <= last; slot++) {
-      qa_owned_actor owner; if (!s->calls.owner(s->calls.ctx, slot, &owner)) continue;
-      if (s->has_deferred) { qa_compat_q2_written_range local = {ranges[r].byte_offset - slot * table.stride, ranges[r].byte_length}; qa_compat_q2_native_mod_deferred_damage_state_changed(&s->deferred, slot, local); }
-      for (int kind = 0; kind < KIND_COUNT; kind++) {
-        double offset; if (!has_offset(s, (kind_t)kind, &offset)) continue;
-        double start = slot * table.stride + offset;
-        if (ranges[r].byte_offset < start + (double)s->host->memory->pointer_bytes && start < ranges[r].byte_offset + ranges[r].byte_length) (void)ensure_entry(s, (kind_t)kind, slot);
-      }
+    qa_compat_q2_written_range range = {field->offset + ranges[r].byte_offset, ranges[r].byte_length};
+    if (s->has_deferred) qa_compat_q2_native_mod_deferred_damage_state_changed(&s->deferred, field->slot, range);
+    for (int kind = 0; kind < KIND_COUNT; kind++) {
+      double offset; if (!has_offset(s, (kind_t)kind, &offset)) continue;
+      if (range.byte_offset < offset + pointer_bytes && offset < range.byte_offset + range.byte_length) (void)ensure_entry(s, (kind_t)kind, field->slot);
     }
   }
 }
-static void stop_watching(combat_t *s) { if (s->watching) { s->host->unobserve_writes(s->host->ctx, s->watched); s->watching = false; } }
-static void watch(combat_t *s) {
-  qa_compat_q2_native_mod_entities table = s->host->entities(s->host->ctx); double bytes = table.stride * table.capacity;
-  if (s->watching && s->watched_base.byte_offset == table.base.byte_offset && s->watched_bytes == bytes) return;
-  stop_watching(s);
-  s->watched_base = table.base; s->watched_bytes = bytes; s->watched = s->host->observe_writes(s->host->ctx, table.base, bytes, s, on_changed); s->watching = true;
+/* TS unwatch(). */
+static void stop_watching(combat_t *s) {
+  for (size_t i = 0; i < s->watched_count; i++) for (size_t j = 0; j < s->watched[i].count; j++) s->host->unobserve_writes(s->host->ctx, s->watched[i].fields[j].handle);
+  for (size_t i = 0; i < s->watched_count; i++) free(s->watched[i].fields);
+  s->watched_count = 0;
+}
+/* TS watch(slot): only the callback and deferred-damage fields of a bound slot are observed. A slot stays watched
+ * until unwatch(); an observer that fails to bind leaves the earlier ones of its slot observed, as TS does (their
+ * storage is kept for them). */
+static void watch(combat_t *s, double slot) {
+  for (size_t i = 0; i < s->watched_count; i++) if (s->watched[i].slot == slot) return;
+  double offsets[KIND_COUNT + 2], bytes[KIND_COUNT + 2]; size_t count = 0;
+  for (int kind = 0; kind < KIND_COUNT; kind++) { double offset; if (has_offset(s, (kind_t)kind, &offset)) { offsets[count] = offset; bytes[count++] = (double)s->host->memory->pointer_bytes; } }
+  if (s->has_deferred) {
+    /* deferred.watchedFields(): the receipt byte and the blood scalar. */
+    const qa_native_mod_deferred_damage *d = s->definition->combat->deferred;
+    offsets[count] = d->receipt; bytes[count++] = 1;
+    offsets[count] = d->blood.offset; bytes[count++] = qa_compat_q2_native_scalar_bytes(d->blood.encoding);
+  }
+  qa_guest_address entity = s->host->entity(s->host->ctx, slot).address;
+  watch_field *fields = calloc(count + 1, sizeof *fields); if (fields == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < count; i++) {
+    fields[i].owner = s; fields[i].slot = slot; fields[i].offset = offsets[i];
+    qa_guest_address address = qa_compat_q2_mem_offset(s->host->memory, entity, (int64_t)offsets[i]);
+    fields[i].handle = s->host->observe_writes(s->host->ctx, address, bytes[i], &fields[i], on_changed);
+  }
+  watched_slot *entry = qa_compat_q2_grow((void **)&s->watched, &s->watched_count, &s->watched_capacity, sizeof *entry);
+  entry->slot = slot; entry->fields = fields; entry->count = count;
 }
 
 /* --- Provenance and request decoding. --- */
 static qa_q2_native_cause native_cause_of(const combat_t *s, const qa_guest_call_value *value) {
   const qa_native_mod_combat *combat = s->definition->combat;
-  if (combat == NULL) qa_range_error("Native damage causes have not been declared");
+  if (combat == NULL) qa_raise("Error", 0, 0, "Native damage causes have not been declared");
   qa_q2_native_cause native; memset(&native, 0, sizeof native);
   if (!strcmp(combat->causes.edition, "classic")) {
-    if (value == NULL || value->kind != QA_GUEST_VALUE_INT32) qa_range_error("Classic damage requires integer MOD");
+    if (value == NULL || value->kind != QA_GUEST_VALUE_INT32) qa_raise("Error", 0, 0, "Classic damage requires integer MOD");
     native.edition = "classic"; native.game = combat->causes.game; native.value = value->number_value; return native;
   }
-  if (value == NULL || value->kind != QA_GUEST_VALUE_AGGREGATE || value->bytes.length != 3) qa_range_error("Rerelease damage requires its declared mod_t aggregate");
+  if (value == NULL || value->kind != QA_GUEST_VALUE_AGGREGATE || value->bytes.length != 3) qa_raise("Error", 0, 0, "Rerelease damage requires its declared mod_t aggregate");
   native.edition = "rerelease"; native.id = value->bytes.bytes[0]; native.friendly_fire = value->bytes.bytes[1] != 0; native.no_point_loss = value->bytes.bytes[2] != 0;
   return native;
 }
 static qa_attack_provenance provenance(const combat_t *s, const qa_actor_id *attacker, const qa_actor_id *inflictor, qa_q2_native_cause native) {
   double means_of_death = 0;
-  if (s->services->damage_context == NULL || !qa_q2mp_canonical_cause_from_native(native, &means_of_death)) qa_range_error("Native damage requires declared source cause and shared attack provenance");
+  if (s->services->damage_context == NULL || !qa_q2mp_canonical_cause_from_native(native, &means_of_death)) qa_raise("Error", 0, 0, "Native damage requires declared source cause and shared attack provenance");
   qa_attack_provenance attack; memset(&attack, 0, sizeof attack);
   s->services->damage_context(s->services->ctx, s->instance, &attack.sequence, &attack.weapon_provider, &attack.combat_provider, &attack.inventory_provider, &attack.movement_provider);
   attack.time = qa_compat_q2_services_time(s->services); attack.attacker = attacker; attack.inflictor = inflictor; attack.weapon = NULL;
@@ -218,7 +254,7 @@ static void apply_body(void *ctx) {
   qa_q2mp_native_cause_profile profile; memset(&profile, 0, sizeof profile);
   profile.rerelease = !strcmp(definition->causes.edition, "rerelease"); profile.game = definition->causes.game;
   qa_compat_q2_native_damage_arguments_result cause = qa_compat_q2_native_damage_arguments(c->request, profile);
-  if (cause.native.edition == NULL) qa_range_error("Shared attack has no declared native cause representation");
+  if (cause.native.edition == NULL) qa_raise("Error", 0, 0, "Shared attack has no declared native cause representation");
   c->args[3] = pointer_value(true, c->vectors);
   c->args[4] = pointer_value(true, qa_compat_q2_mem_offset(memory, c->vectors, 12));
   c->args[5] = pointer_value(true, qa_compat_q2_mem_offset(memory, c->vectors, 24));
@@ -256,7 +292,7 @@ static qa_source_damage_result run_source_damage(void *ctx, qa_source_damage_obs
   combat_t *s = ctx; qa_source_damage_result none = {0, "none"};
   if (!eligible(s, &request.target) || !eligible(s, request.attack.attacker) || !eligible(s, request.attack.inflictor)) return none;
   const qa_session_mod_engine_services *engine = s->services->engine;
-  if (engine == NULL) qa_range_error("Native damage requires its destination world actor");
+  if (engine == NULL) qa_raise("Error", 0, 0, "Native damage requires its destination world actor");
   qa_actor_id world; bool has_world = engine->world(engine->ctx, &world);
   apply_call call; memset(&call, 0, sizeof call); call.s = s; call.request = request; call.observer = observer;
   call.target = s->calls.address(s->calls.ctx, request.target);
@@ -267,7 +303,7 @@ static qa_source_damage_result run_source_damage(void *ctx, qa_source_damage_obs
   return call.result;
 }
 static qa_damage_outcome apply_damage(combat_t *s, qa_damage_request input) {
-  if (s->definition->combat == NULL || s->damage == NULL) qa_range_error("Native damage body has not been declared");
+  if (s->definition->combat == NULL || s->damage == NULL) qa_raise("Error", 0, 0, "Native damage body has not been declared");
   return qa_gameplay_authority_run_source_damage(s->services->combat, input, run_source_damage, s);
 }
 typedef struct foreign_apply { combat_t *s; qa_damage_request request; } foreign_apply;
@@ -296,44 +332,66 @@ static bool deferred_current(void *ctx, qa_damage_request *out) {
 }
 static bool deferred_owner(void *ctx, double slot, qa_owned_actor *out) { combat_t *s = ctx; return s->calls.owner(s->calls.ctx, slot, out); }
 static double deferred_scalar(void *ctx, qa_guest_address base, qa_native_mod_scalar_field field, bool has_value, double value) { combat_t *s = ctx; return s->calls.scalar(s->calls.ctx, base, field, has_value, value); }
+/* A constructor that throws before anything is bound leaves nothing behind. */
+static void create_abandon(void *value) { combat_t *s = value; if (s->armor_ready) qa_compat_q2_native_mod_armor_state_destroy(&s->armor); free(s); }
+typedef struct process_bind { combat_t *s; qa_guest_address address; const char *id; } process_bind;
+static void process_bind_body(void *value) {
+  process_bind *b = value; combat_t *s = b->s;
+  s->process = qa_compat_q2_native_mod_bind_entry(s->host, b->address, b->id, signature_of(s, process_params, 1), s, process_entry, s, accepts_active);
+}
 combat_t *qa_compat_q2_native_mod_combat_create(const qa_native_mod_source_actors *definition, const qa_native_mod_declaration *declaration,
     const qa_compat_q2_native_mod_host *host, const qa_mod_host_services *services, qa_provider_id instance, qa_compat_q2_native_mod_combat_calls calls) {
   combat_t *s = calloc(1, sizeof *s); if (s == NULL) qa_range_error("Out of memory");
+  qa_cleanup abandon; qa_cleanup_push(&abandon, create_abandon, s);
   s->definition = definition; s->declaration = declaration; s->host = host; s->services = services; s->instance = instance; s->calls = calls;
   const qa_native_mod_combat *combat = definition->combat;
   qa_native_mod_armor no_armor; memset(&no_armor, 0, sizeof no_armor); no_armor.kind = "none";
-  qa_compat_q2_native_mod_armor_state_init(&s->armor, combat != NULL ? combat->armor : no_armor, declaration, host, calls.scalar, calls.ctx);
-  if (combat == NULL) return s;
-  char id[320];
+  qa_compat_q2_native_mod_armor_state_init(&s->armor, combat != NULL ? combat->armor : no_armor, declaration, host, calls.scalar, calls.ctx); s->armor_ready = true;
+  if (combat == NULL) { qa_cleanup_pop(&abandon); return s; }
   for (int i = 0; i < 9; i++) s->damage_params[i] = i < 6 ? P : I;
   if (!strcmp(combat->damage.abi, "q2-classic")) s->damage_params[9] = I;
   else { memset(&s->damage_params[9], 0, sizeof s->damage_params[9]); s->damage_params[9].is_aggregate = true; s->damage_params[9].layout = qa_compat_q2_rerelease_mod_layout; }
-  (void)snprintf(id, sizeof id, "%s:damage", instance);
-  const qa_compat_q2_native_mod_host * host3 = host;
-  qa_guest_address address2 = qa_compat_q2_native_mod_entry_address(host, combat->damage.entry);
-  qa_compat_q2_guest_call_signature signature2 = signature_of(s, s->damage_params, 10);
-  s->damage = qa_compat_q2_native_mod_bind_entry(host3, address2, id, signature2, s, damage_entry, s, accepts_active);
+  qa_guest_address damage_address = qa_compat_q2_native_mod_entry_address(host, combat->damage.entry);
+  qa_compat_q2_guest_call_signature damage_signature = signature_of(s, s->damage_params, 10);
+  char *id = make_id(instance, ":damage");
+  qa_cleanup id_owned; qa_cleanup_push(&id_owned, free, id);
+  s->damage = qa_compat_q2_native_mod_bind_entry(host, damage_address, id, damage_signature, s, damage_entry, s, accepts_active);
+  qa_cleanup_pop(&id_owned); free(id);
+  /* From here the damage entry is bound to this object. TS has no catch around the deferred state or its address:
+   * a throw there leaves the entry bound and the object alive behind it, so it is not freed here either. */
+  qa_cleanup_pop(&abandon);
   if (combat->deferred != NULL) {
     qa_compat_q2_native_deferred_calls deferred_calls = {s, deferred_owner, deferred_scalar};
     qa_compat_q2_native_mod_deferred_damage_state_init(&s->deferred, combat->deferred, combat->health, host, services, deferred_calls, s, deferred_current); s->has_deferred = true;
-    (void)snprintf(id, sizeof id, "%s:deferred-damage", instance);
-    const qa_compat_q2_native_mod_host * host2 = host;
     qa_guest_address address = qa_compat_q2_native_mod_entry_address(host, combat->deferred->process);
-    qa_compat_q2_guest_call_signature signature = signature_of(s, process_params, 1);
-    s->process = qa_compat_q2_native_mod_bind_entry(host2, address, id, signature, s, process_entry, s, accepts_active);
+    /* TS try { this.process = bindNativeModEntry(...) } catch (error) { this.damage?.close(); throw error; } */
+    id = make_id(instance, ":deferred-damage");
+    process_bind bind = {s, address, id}; qa_caught_error caught;
+    bool bound = qa_try(process_bind_body, &bind, &caught);
+    free(id);
+    if (!bound) {
+      qa_compat_q2_native_entry_close(s->damage); s->damage = NULL;
+      qa_compat_q2_native_mod_deferred_damage_state_destroy(&s->deferred);
+      qa_compat_q2_native_mod_armor_state_destroy(&s->armor);
+      free(s);
+      qa_rethrow(&caught);
+    }
   }
   return s;
 }
 
 /* --- Guest argument scratch. --- */
 typedef void (*with_address_fn)(void *ctx, qa_guest_address address);
-typedef struct bytes_call { const combat_t *s; qa_guest_address address; size_t length; void *ctx; with_address_fn run; } bytes_call;
-static void bytes_body(void *ctx) { bytes_call *b = ctx; b->run(b->ctx, b->address); }
+typedef struct bytes_call { const combat_t *s; qa_guest_address address; const uint8_t *bytes; size_t length; void *ctx; with_address_fn run; } bytes_call;
+static void bytes_body(void *ctx) {
+  bytes_call *b = ctx; qa_compat_q2_memory *memory = b->s->host->memory;
+  memory->write(memory->ctx, b->address, b->bytes, b->length); /* inside the TS try: a refused write still unmaps */
+  b->run(b->ctx, b->address);
+}
 static void bytes_cleanup(void *ctx) { bytes_call *b = ctx; b->s->host->memory->unmap(b->s->host->memory->ctx, b->address, (double)b->length); }
 static void with_bytes(const combat_t *s, const uint8_t *bytes, size_t length, void *ctx, with_address_fn run) {
   qa_compat_q2_memory *memory = s->host->memory;
-  bytes_call b = {s, memory->allocate(memory->ctx, (double)length, true, 8, "Native mod callback value"), length, ctx, run};
-  memory->write(memory->ctx, b.address, bytes, length);
+  bytes_call b = {s, memory->allocate(memory->ctx, (double)length, true, 8, "Native mod callback value"), bytes, length, ctx, run};
   qa_compat_q2_native_mod_finally(bytes_body, &b, bytes_cleanup, &b);
 }
 typedef void (*values_run_fn)(void *ctx, const qa_guest_call_value *values, size_t count);
@@ -349,8 +407,8 @@ static void with_mod(const combat_t *s, const qa_attack_provenance *attack, qa_g
   if (is_q2 && attack->cause.has_native && attack->cause.native.edition != NULL && !strcmp(attack->cause.native.edition, "rerelease")) native = attack->cause.native;
   else {
     qa_q2mp_native_cause_profile profile; memset(&profile, 0, sizeof profile); profile.rerelease = true;
-    if (!qa_q2mp_native_cause_from_canonical(profile, is_q2 ? attack->cause.means_of_death : 0, &native)) qa_range_error("Reaction has no native mod_t representation");
-    if (native.edition == NULL || strcmp(native.edition, "rerelease") != 0) qa_range_error("Reaction has no native mod_t representation");
+    if (!qa_q2mp_native_cause_from_canonical(profile, is_q2 ? attack->cause.means_of_death : 0, &native)) qa_raise("Error", 0, 0, "Reaction has no native mod_t representation");
+    if (native.edition == NULL || strcmp(native.edition, "rerelease") != 0) qa_raise("Error", 0, 0, "Reaction has no native mod_t representation");
   }
   uint8_t bytes[3] = {qa_js_to_uint8(native.id), native.friendly_fire, native.no_point_loss};
   mod_call m = {args, count, ctx, run};
@@ -399,11 +457,12 @@ static void touch_plane_body(void *ctx, qa_guest_address plane) {
 static void with_touch(combat_t *s, const qa_touch_contact *contact, void *ctx, values_run_fn run) {
   if (!allows_touch(s, contact)) return;
   if (rerelease_callbacks(s)) {
-    if (contact->source_trace == NULL) qa_range_error("Native rerelease touch requires the shared source trace");
+    if (contact->source_trace == NULL) qa_raise("Error", 0, 0, "Native rerelease touch requires the shared source trace");
     size_t length = 0; uint8_t *encoded = s->host->encode_trace(s->host->ctx, &contact->source_trace->trace, &length);
     touch_trace_call t = {s, contact, ctx, run};
+    qa_cleanup encoded_owned; qa_cleanup_push(&encoded_owned, free, encoded);
     with_bytes(s, encoded, length, &t, touch_trace_body);
-    free(encoded); return;
+    qa_cleanup_pop(&encoded_owned); free(encoded); return;
   }
   uint8_t plane[20], surface[24]; memset(plane, 0, sizeof plane); memset(surface, 0, sizeof surface);
   if (contact->plane != NULL) {
@@ -447,7 +506,7 @@ typedef struct decoded_touch {
   surface_storage primary, secondary;
 } decoded_touch;
 static void decode_touch(const combat_t *s, qa_owned_actor self, const qa_guest_call_value *args, size_t count, decoded_touch *o) {
-  memset(o, 0, sizeof *o); qa_compat_q2_memory *memory = s->host->memory;
+  qa_compat_q2_memory *memory = s->host->memory;
   qa_actor_id other = s->calls.actor(s->calls.ctx, qa_compat_q2_guest_required_pointer(args, count, 1));
   o->contact.self = self; o->contact.other = other;
   if (rerelease_callbacks(s)) {
@@ -476,13 +535,14 @@ static void decode_touch(const combat_t *s, qa_owned_actor self, const qa_guest_
     return;
   }
   const qa_guest_call_value *plane = arg(args, count, 2), *surface = arg(args, count, 3);
-  if (plane == NULL || surface == NULL || plane->kind != QA_GUEST_VALUE_POINTER || surface->kind != QA_GUEST_VALUE_POINTER) qa_range_error("Classic touch requires plane and surface pointers");
+  if (plane == NULL || surface == NULL || plane->kind != QA_GUEST_VALUE_POINTER || surface->kind != QA_GUEST_VALUE_POINTER) qa_raise("Error", 0, 0, "Classic touch requires plane and surface pointers");
   if (read_surface(s, surface->pointer_value.has_value, surface->pointer_value.value, false, &o->primary)) {
     o->surface.name = o->primary.info.name; o->surface.native_flags = o->primary.info.flags; o->surface.native_value = o->primary.info.value; o->contact.surface = &o->surface;
   }
   if (plane->pointer_value.has_value) { o->plane = read_plane(s, plane->pointer_value.value).plane; o->contact.plane = &o->plane; }
 }
-static void decoded_touch_free(decoded_touch *o) { free(o->primary.name); free(o->primary.material); free(o->secondary.name); free(o->secondary.material); }
+static void decoded_touch_free(decoded_touch *o) { free(o->primary.name); free(o->primary.material); free(o->secondary.name); free(o->secondary.material); memset(&o->primary, 0, sizeof o->primary); memset(&o->secondary, 0, sizeof o->secondary); }
+static void decoded_touch_release(void *value) { decoded_touch_free(value); }
 static bool same_nullable_actor(const qa_actor_id *a, const qa_actor_id *b) { return (a == NULL && b == NULL) || (a != NULL && b != NULL && qa_same_actor(*a, *b)); }
 
 typedef struct source_call {
@@ -494,7 +554,7 @@ static void proceed(void *ctx, const qa_guest_call_value *values, size_t count) 
   source_call *c = ctx; c->s->calls.synchronize(c->s->calls.ctx);
   (void)qa_compat_q2_native_entry_call_original(c->binding, values, count);
 }
-static void check_self(const source_call *c, qa_owned_actor actor) { if (!qa_same_actor(actor.id, c->self.id)) qa_range_error("Native source callback target changes require replacement"); }
+static void check_self(const source_call *c, qa_owned_actor actor) { if (!qa_same_actor(actor.id, c->self.id)) qa_raise("Error", 0, 0, "Native source callback target changes require replacement"); }
 static void source_use_execute(void *ctx, qa_owned_actor actor, const qa_actor_id *other, const qa_actor_id *activator) {
   source_call *c = ctx; check_self(c, actor); combat_t *s = c->s;
   if (!eligible(s, &actor.id) || !eligible(s, other) || !eligible(s, activator)) return;
@@ -511,8 +571,11 @@ static void source_touch_execute(void *ctx, qa_touch_contact effective) {
   if (qa_same_actor(effective.other, contact->other) && effective.plane == contact->plane && effective.surface == contact->surface && effective.source_trace == contact->source_trace) { proceed(c, c->args, c->count); return; }
   with_touch(c->s, &effective, c, proceed);
 }
+/* TS `effective === reaction`: an object handed back unchanged. The reaction travels by value here, so identity is
+ * every member unchanged, a NaN kick or damage included. */
+static bool same_number(double a, double b) { return a != a ? b != b : a == b; }
 static bool same_pain(const qa_pain_reaction *a, const qa_pain_reaction *b) {
-  return qa_same_actor(a->self.id, b->self.id) && a->attack == b->attack && same_nullable_actor(a->attacker, b->attacker) && a->kick == b->kick && a->damage == b->damage;
+  return qa_same_actor(a->self.id, b->self.id) && a->attack == b->attack && same_nullable_actor(a->attacker, b->attacker) && same_number(a->kick, b->kick) && same_number(a->damage, b->damage);
 }
 static void source_pain_execute(void *ctx, qa_pain_reaction effective) {
   source_call *c = ctx; check_self(c, effective.self);
@@ -525,16 +588,20 @@ static void source_die_execute(void *ctx, qa_death_reaction effective) {
   if (!allows_die(c->s, &effective)) return;
   const qa_death_reaction *death = c->death;
   if (same_pain(&effective.pain, &death->pain) && same_nullable_actor(effective.inflictor, death->inflictor)
-      && effective.point.x == death->point.x && effective.point.y == death->point.y && effective.point.z == death->point.z) { proceed(c, c->args, c->count); return; }
+      && same_number(effective.point.x, death->point.x) && same_number(effective.point.y, death->point.y) && same_number(effective.point.z, death->point.z)) { proceed(c, c->args, c->count); return; }
   with_die(c->s, &effective, c, proceed);
 }
 static qa_actor_callback_table *callback_table(const combat_t *s) {
-  if (s->services->callbacks == NULL) qa_range_error("Native callbacks require shared actor operations");
+  if (s->services->callbacks == NULL) qa_raise("Error", 0, 0, "Native callbacks require shared actor operations");
   return s->services->callbacks;
 }
 static void source_touch(combat_t *s, source_call *c) {
-  decoded_touch touch; decode_touch(s, c->self, c->args, c->count, &touch); c->touch = &touch;
+  /* The surface names are owned text: released when a guest read or the callback raises too. */
+  decoded_touch touch; memset(&touch, 0, sizeof touch);
+  qa_cleanup touch_owned; qa_cleanup_push(&touch_owned, decoded_touch_release, &touch);
+  decode_touch(s, c->self, c->args, c->count, &touch); c->touch = &touch;
   (void)qa_actor_callback_table_source_touch(callback_table(s), touch.contact, source_touch_execute, c);
+  qa_cleanup_pop(&touch_owned);
   decoded_touch_free(&touch);
 }
 static void source_use(combat_t *s, source_call *c) {
@@ -625,6 +692,15 @@ static double bound_scalar(const bound_actor *b, qa_native_mod_scalar_field fiel
   const combat_t *s = b->owner;
   return s->calls.scalar(s->calls.ctx, s->host->entity(s->host->ctx, b->slot).address, field, has_value, value);
 }
+/* The two's complement bits of BigInt(value), 64 of them: enough for a guest field of any width and its mask.
+ * A number that is not an integer is JavaScriptCore's RangeError. */
+static uint64_t bigint_bits(double value) {
+  if (!isfinite(value) || value != trunc(value)) qa_range_error("Not an integer");
+  if (value >= 18446744073709551616.0) return UINT64_MAX;
+  if (value >= 9223372036854775808.0) return (uint64_t)value;
+  if (value < -9223372036854775808.0) return (uint64_t)INT64_MIN;
+  return (uint64_t)(int64_t)value;
+}
 static qa_damage_outcome binding_source_damage(void *ctx, qa_damage_request request) { return apply_damage(((bound_actor *)ctx)->owner, request); }
 static qa_combat_state binding_read(void *ctx) {
   bound_actor *b = ctx; combat_t *s = b->owner; const qa_native_mod_combat *combat = s->definition->combat;
@@ -632,10 +708,10 @@ static qa_combat_state binding_read(void *ctx) {
   state.health = bound_scalar(b, combat->health, false, 0); state.mass = bound_scalar(b, combat->mass, false, 0);
   state.armor = qa_compat_q2_native_mod_armor_read(&s->armor, b->slot);
   state.can_take_damage = bound_scalar(b, combat->takedamage, false, 0) != 0;
-  /* flags & mask on TS numbers: ToInt32 on both. */
-  int32_t flags = qa_js_to_int32(bound_scalar(b, combat->flags.field, false, 0));
-  state.invulnerable = (flags & qa_js_to_int32(combat->flags.invulnerable)) != 0;
-  state.has_no_knockback = true; state.no_knockback = (flags & qa_js_to_int32(combat->flags.no_knockback)) != 0;
+  /* (BigInt(scalar(flags)) & BigInt(mask)) !== 0n: the flags are read once per member, and every bit of a 64-bit
+   * field counts (ToInt32 dropped the rerelease flags above bit 31). */
+  state.invulnerable = (bigint_bits(bound_scalar(b, combat->flags.field, false, 0)) & bigint_bits(combat->flags.invulnerable)) != 0;
+  state.has_no_knockback = true; state.no_knockback = (bigint_bits(bound_scalar(b, combat->flags.field, false, 0)) & bigint_bits(combat->flags.no_knockback)) != 0;
   state.team = NULL;
   if (s->services->match != NULL) {
     qa_source_match_player_result player = s->services->match->player(s->services->match->ctx, b->actor.id);
@@ -647,7 +723,7 @@ static void binding_write_health(void *ctx, double value) { bound_actor *b = ctx
 static qa_armor_state binding_normalize(void *ctx, qa_armor_state armor) { bound_actor *b = ctx; return qa_compat_q2_native_mod_armor_normalize_legacy(&b->owner->armor, b->slot, armor); }
 static void binding_write_armor(void *ctx, qa_armor_state armor) { bound_actor *b = ctx; qa_compat_q2_native_mod_armor_write(&b->owner->armor, b->slot, armor); }
 qa_actor_callbacks qa_compat_q2_native_mod_combat_bind(combat_t *s, double slot, qa_owned_actor actor) {
-  qa_compat_q2_native_mod_combat_validate(s); watch(s);
+  qa_compat_q2_native_mod_combat_validate(s); watch(s, slot);
   for (int kind = 0; kind < KIND_COUNT; kind++) (void)ensure_entry(s, (kind_t)kind, slot);
   bound_actor *b = calloc(1, sizeof *b); if (b == NULL) qa_range_error("Out of memory");
   b->owner = s; b->slot = slot; b->actor = actor; b->next = s->bound; s->bound = b;
@@ -663,15 +739,15 @@ qa_actor_callbacks qa_compat_q2_native_mod_combat_bind(combat_t *s, double slot,
 }
 void qa_compat_q2_native_mod_combat_validate(combat_t *s) {
   double stride = s->host->entities(s->host->ctx).stride, pointer_bytes = (double)s->host->memory->pointer_bytes; const qa_native_mod_combat *combat = s->definition->combat;
-  for (int kind = 0; kind < KIND_COUNT; kind++) { double offset; if (has_offset(s, (kind_t)kind, &offset) && offset + pointer_bytes > stride) qa_range_error("Native callback field exceeds its source actor"); }
+  for (int kind = 0; kind < KIND_COUNT; kind++) { double offset; if (has_offset(s, (kind_t)kind, &offset) && offset + pointer_bytes > stride) qa_raise("Error", 0, 0, "Native callback field exceeds its source actor"); }
   if (combat == NULL) return;
   qa_native_mod_scalar_field fields[4] = {combat->health, combat->mass, combat->takedamage, combat->flags.field};
-  for (int i = 0; i < 4; i++) if (fields[i].offset + qa_compat_q2_native_scalar_bytes(fields[i].encoding) > stride) qa_range_error("Native combat field exceeds its source actor");
+  for (int i = 0; i < 4; i++) if (fields[i].offset + qa_compat_q2_native_scalar_bytes(fields[i].encoding) > stride) qa_raise("Error", 0, 0, "Native combat field exceeds its source actor");
   const qa_native_mod_deferred_damage *d = combat->deferred; if (d == NULL) return;
   double checks[7][2] = {{d->attacker, pointer_bytes}, {d->inflictor, pointer_bytes}, {d->blood.offset, qa_compat_q2_native_scalar_bytes(d->blood.encoding)}, {d->knockback.offset, qa_compat_q2_native_scalar_bytes(d->knockback.encoding)}, {d->point, 12}, {d->mod, 3}, {d->receipt, 1}};
   for (int i = 0; i < 7; i++) {
     double offset = checks[i][0];
-    if (!isfinite(offset) || offset != trunc(offset) || fabs(offset) > (double)QA_MAX_SAFE_INTEGER || offset < 0 || offset + checks[i][1] > stride) qa_range_error("Native deferred damage field exceeds its source actor");
+    if (!isfinite(offset) || offset != trunc(offset) || fabs(offset) > (double)QA_MAX_SAFE_INTEGER || offset < 0 || offset + checks[i][1] > stride) qa_raise("Error", 0, 0, "Native deferred damage field exceeds its source actor");
   }
 }
 void qa_compat_q2_native_mod_combat_release(combat_t *s, qa_actor_id actor) { if (s->has_deferred) qa_compat_q2_native_mod_deferred_damage_state_release(&s->deferred, actor); }
@@ -682,8 +758,6 @@ void qa_compat_q2_native_mod_combat_validate_saved(combat_t *s, const qa_compat_
 void qa_compat_q2_native_mod_combat_restore(combat_t *s, const qa_compat_q2_saved_native_deferred_damage *records, size_t count) { if (s->has_deferred) qa_compat_q2_native_mod_deferred_damage_state_restore(&s->deferred, records, count); }
 void qa_compat_q2_native_mod_combat_suspend(combat_t *s, bool value) { s->suspended = value; if (value) stop_watching(s); }
 void qa_compat_q2_native_mod_combat_close(combat_t *s) {
-  if (s->closed) return;
-  s->closed = true;
   stop_watching(s);
   for (size_t i = 0; i < s->entry_count; i++) { qa_compat_q2_native_entry_close(s->entries[i]->binding); free(s->entries[i]); }
   s->entry_count = 0;
@@ -697,5 +771,5 @@ void qa_compat_q2_native_mod_combat_destroy(combat_t *s) {
   if (s->has_deferred) qa_compat_q2_native_mod_deferred_damage_state_destroy(&s->deferred);
   qa_compat_q2_native_mod_armor_state_destroy(&s->armor);
   while (s->bound != NULL) { bound_actor *next = s->bound->next; free(s->bound); s->bound = next; }
-  free(s->entries); free(s->frames); free(s);
+  free(s->watched); free(s->entries); free(s->frames); free(s);
 }

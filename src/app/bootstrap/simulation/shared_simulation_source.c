@@ -44,13 +44,23 @@
 #include "qa/world/actors/body.h"
 
 static noreturn void ss_fail(const char *format, ...) {
-  char message[1024];
-  va_list args; va_start(args, format); vsnprintf(message, sizeof message, format, args); va_end(args);
-  qa_raise("Error", 0, 0, "%s", message);
+  va_list args; va_start(args, format); qa_ss_raise_error(format, args);
 }
 static qa_shared_body_table *ss_bodies(qa_app_shared_simulation *sim) { return qa_app_sim_shared_physics_bodies(sim->physics); }
 static double ss_time_seconds(const qa_app_shared_simulation *sim) { return qa_ss_seconds(sim->source_frame.time); }
 static const char *ss_cvar_flag(bool value) { return value ? "1" : "0"; }
+/* applyQ2LatchedCvars(cvars, options.nativeImport.server.latched): the latched pairs of the imported server.ssv. */
+static void ss_apply_import_latched(qa_cvar_registry *cvars, const qa_app_sim_native_q2_import *imported) {
+  size_t count = imported->rerelease ? imported->rerelease_import->latched_count : imported->classic->latched_count;
+  const char **names = calloc(count ? count : 1, sizeof *names), **values = calloc(count ? count : 1, sizeof *values);
+  if (!names || !values) qa_range_error("Out of memory");
+  for (size_t i = 0; i < count; i++) {
+    names[i] = imported->rerelease ? imported->rerelease_import->latched[i].name : imported->classic->latched[i].name;
+    values[i] = imported->rerelease ? imported->rerelease_import->latched[i].value : imported->classic->latched[i].value;
+  }
+  qa_apply_q2_latched_cvars(cvars, names, values, count);
+  free(names); free(values);
+}
 static void ss_cvar_set(qa_cvar_registry *cvars, const char *name, const char *value) {
   qa_cvar_snapshot snapshot;
   if (qa_cvar_registry_set(cvars, name, value, true, &snapshot)) qa_cvar_read_free(&snapshot);
@@ -328,10 +338,10 @@ typedef struct ss_q2_host {
   qa_original_pickup_admission original_pickups;
   qa_app_sim_q2_actor_host_env env;
 } ss_q2_host;
-typedef struct ss_q2_monster_read { ss_q2_host *host; qa_actor_id actor; } ss_q2_monster_read;
-static qa_q2m_state *ss_q2_read_monster(void *ctx) {
-  ss_q2_monster_read *read = ctx;
-  return read->host->read_monster ? read->host->read_monster(read->host->read_monster_ctx, read->actor) : NULL;
+/* readMonster: () => readMonster(entity.actor.id): the entry's own actor, so no record per registration. */
+static qa_q2m_state *ss_q2_read_monster(void *ctx, qa_actor_id actor) {
+  ss_q2_host *host = ctx;
+  return host->read_monster ? host->read_monster(host->read_monster_ctx, actor) : NULL;
 }
 static double ss_q2_gravity(void *ctx) { return qa_app_sim_shared_physics_gravity(((ss_q2_host *)ctx)->sim->physics); }
 static qa_q2_monster_target_result ss_q2_monster_target(void *ctx, qa_actor_id actor) {
@@ -343,12 +353,10 @@ static qa_q2_weapon_target_result ss_q2_weapon_target(void *ctx, qa_actor_id act
 }
 static void ss_q2_register_entity(void *ctx, qa_q2_entity *entity, qa_q2_entity_services *services) {
   ss_q2_host *host = ctx;
-  ss_q2_monster_read *read = qa_app_shared_sim_keep(host->sim, sizeof *read);
-  read->host = host; read->actor = entity->actor.id;
   qa_app_sim_actor_execution entry; memset(&entry, 0, sizeof entry);
   entry.kind = QA_APP_SIM_ACTOR_EXECUTION_Q2; entry.q2_entity = entity; entry.q2_services = services;
   entry.content = host->content; entry.actor = entity->actor;
-  entry.ctx = read; entry.read_monster = ss_q2_read_monster;
+  entry.ctx = host; entry.read_monster = ss_q2_read_monster;
   qa_app_shared_sim_register_actor_execution(host->sim, entry);
 }
 static double ss_q2_now(void *ctx) { ss_q2_host *host = ctx; return host->runtime.now(host->runtime.ctx); }
@@ -371,8 +379,8 @@ static qa_q2_player_view_result ss_q2_player_view_state(void *ctx, qa_actor_id a
   result.value.view_angles = qa_app_shared_sim_player_view(sim, actor).angles;
   if ((sim->strategy->as_q2(sim) != NULL)) {
     qa_q2_base_player_state *state = qa_q2_players_get_state(sim->source.product->players, actor);
-    result.value.old_velocity = state ? state->old_velocity : qa_ss_zero;
-  } else result.value.old_velocity = sim->grapple ? qa_app_sim_grapple_runtime_previous_velocity(sim->grapple, actor) : qa_ss_zero;
+    result.value.old_velocity = state ? state->old_velocity : qa_zero_vec3;
+  } else result.value.old_velocity = sim->grapple ? qa_app_sim_grapple_runtime_previous_velocity(sim->grapple, actor) : qa_zero_vec3;
   return result;
 }
 static void ss_q2_prepare_level_change(void *ctx, const char *map, const qa_q2_landmark_carry *landmark, double server_flags) {
@@ -430,7 +438,7 @@ static void ss_q2_set_area_portal(void *ctx, double portal, bool open) {
 static void ss_q2_emit(void *ctx, qa_q2_presentation_event event) {
   ss_q2_host *host = ctx; qa_app_shared_simulation *sim = host->sim;
   if (qa_ss_is(event.kind, "model")) {
-    qa_ss_map_set(&sim->source_models, &event.actor, &event);
+    qa_app_shared_sim_set_source_model(sim, &event);
     if (qa_ss_map_has(&sim->source_model_read_order, &event.actor)) qa_ss_map_delete(&sim->source_model_read_order, &event.actor);
   }
   qa_app_sim_source_event_input source; memset(&source, 0, sizeof source);
@@ -461,6 +469,7 @@ static void ss_q2_transition(void *ctx, qa_transition_intent intent) {
 }
 static void ss_q2_diagnostic(void *ctx, const char *message) { qa_app_shared_sim_print(((ss_q2_host *)ctx)->sim, message, NULL); }
 
+static void ss_q2_host_env_release(void *env) { qa_app_sim_q2_actor_host_env_release(env); }
 qa_q2_foundation_host qa_app_shared_sim_q2_actor_host(qa_app_shared_simulation *sim, qa_provider_reference source,
     qa_app_sim_actor_host_runtime runtime, qa_ss_q2_monster_fn monster, void *monster_ctx, const char *role) {
   ss_q2_host *host = qa_app_shared_sim_keep(sim, sizeof *host);
@@ -489,7 +498,9 @@ qa_q2_foundation_host qa_app_shared_sim_q2_actor_host(qa_app_shared_simulation *
   bindings.emit = ss_q2_emit; bindings.transition = ss_q2_transition; bindings.diagnostic = ss_q2_diagnostic;
   qa_app_sim_actor_host_world world = ss_host_world(sim, runtime.numeric);
   world.leaf_contents = source.content && strstr(source.content, ":rerelease:") ? "merged" : "stored";
-  return qa_app_sim_create_q2_actor_host(&host->env, bindings, world);
+  qa_q2_foundation_host out = qa_app_sim_create_q2_actor_host(&host->env, bindings, world);
+  qa_app_shared_sim_keep_owned(sim, &host->env, ss_q2_host_env_release);
+  return out;
 }
 
 /* ---- createSource: native Q2 (3307-3387) ---- */
@@ -611,22 +622,23 @@ static void ss_create_native(qa_app_shared_simulation *sim, bool loading, qa_pro
   const qa_app_sim_native_q2_travel *retained = sim->options.native_q2_travel;
   if (retained) {
     /* nativeModuleIdentity(native.prepared) over the edition's prepared guest. */
-    char revision[1024]; qa_module_identity expected;
+    char *revision = NULL; qa_module_identity expected;
     if (classic) {
       const qa_app_sim_prepared_classic_guest *prepared = guest->prepared;
-      expected = qa_app_sim_prepared_module_identity(&prepared->execution, prepared->has_primary, &prepared->primary, revision, sizeof revision);
+      expected = qa_app_sim_prepared_module_identity(&prepared->execution, prepared->has_primary, &prepared->primary, &revision);
     } else {
       const qa_app_sim_prepared_rerelease_guest *prepared = guest->prepared;
-      expected = qa_app_sim_prepared_module_identity(&prepared->execution, prepared->has_primary, &prepared->primary, revision, sizeof revision);
+      expected = qa_app_sim_prepared_module_identity(&prepared->execution, prepared->has_primary, &prepared->primary, &revision);
     }
     qa_module_identity world_module = retained->rerelease ? qa_app_sim_rerelease_guest_world_module(retained->rerelease_travel.world)
                                                           : qa_app_sim_classic_guest_world_module(retained->classic.world);
     double world_clients = retained->rerelease
         ? qa_app_sim_rerelease_guest_services_options_of(qa_app_sim_rerelease_guest_world_services(retained->rerelease_travel.world))->base.max_clients
         : qa_app_sim_classic_guest_services_options_of(qa_app_sim_classic_guest_world_services(retained->classic.world))->max_clients;
-    if (retained->rerelease == classic || sim->options.restore || !ss_module_identity_equal(world_module, expected)
-        || world_clients != sim->options.max_clients)
-      ss_fail("Native travel requires the same source module and client capacity");
+    bool refused = retained->rerelease == classic || sim->options.restore || !ss_module_identity_equal(world_module, expected)
+        || world_clients != sim->options.max_clients;
+    free(revision);
+    if (refused) ss_fail("Native travel requires the same source module and client capacity");
   }
   qa_cvar_registry *cvars = retained
       ? (retained->rerelease ? qa_app_sim_rerelease_guest_services_options_of(qa_app_sim_rerelease_guest_world_services(retained->rerelease_travel.world))->base.cvars
@@ -651,11 +663,19 @@ static void ss_create_native(qa_app_shared_simulation *sim, bool loading, qa_pro
   if (!sim->options.restore) ss_cvar_set(cvars, "nextserver", sim->options.q2_next_server ? sim->options.q2_next_server : "");
   sim->q2_server_registry = cvars;
   qa_app_shared_sim_initialize_server_settings(sim, cvars);
+  /* A map start is where a latched server setting takes effect, and the guest reads the live value when it initializes. */
+  if (!retained && !sim->options.restore) {
+    size_t applied = 0;
+    qa_cvar_snapshot *changed = qa_cvar_registry_apply_latched(cvars, NULL, &applied);
+    for (size_t i = 0; i < applied; i++) qa_cvar_read_free(&changed[i]);
+    free(changed);
+  }
   if (sim->options.restore) {
     qa_save_value *saved = qa_app_sim_saved_source_cvars(*sim->options.restore);
     qa_restore_q2_server_cvars(cvars, saved);
     qa_save_value_free(saved);
   }
+  if (sim->options.native_import) ss_apply_import_latched(cvars, sim->options.native_import);
   native->runtime = ss_make_runtime(sim, timing.numeric, sim->random, classic ? "q2-classic" : "native-rerelease", 25);
   native->engine = qa_app_shared_sim_q2_actor_host(sim, recipe->map.entities, native->runtime, NULL, NULL, "primary-world");
   native->pickups = qa_shared_original_pickup_admission_as_contract(sim->original_pickups);
@@ -844,13 +864,14 @@ static void ss_qc_admit(void *ctx, qa_owned_actor actor, int64_t slot, qa_app_si
 }
 static void ss_qc_change_level(void *ctx, const char *map) {
   qa_app_shared_simulation *sim = ((ss_quakec *)ctx)->sim;
-  char name[512]; snprintf(name, sizeof name, "q1:%s", map);
+  /* `q1:${map}`: the map name is whole. */
+  size_t name_size = strlen(map) + 4; char *name = qa_app_shared_sim_keep(sim, name_size); snprintf(name, name_size, "q1:%s", map);
   qa_transition_intent intent; memset(&intent, 0, sizeof intent);
   if (sim->recipe.campaign.is_campaign) {
     intent.kind = "campaign-level"; intent.campaign = sim->recipe.campaign.mission.provider;
-    intent.map = qa_app_shared_sim_intern(sim, name); intent.spawn_point = ""; intent.gate_count = 0; intent.cause = NULL;
+    intent.map = name; intent.spawn_point = ""; intent.gate_count = 0; intent.cause = NULL;
   } else {
-    intent.kind = "match-rotation"; intent.match = sim->recipe.match.provider; intent.map = qa_app_shared_sim_intern(sim, name);
+    intent.kind = "match-rotation"; intent.match = sim->recipe.match.provider; intent.map = name;
   }
   qa_event_ring_admit(&sim->transitions, &intent);
 }
@@ -889,13 +910,13 @@ static qa_damage_request ss_qc_damage_request(void *ctx, qa_q1_id1_damage_call c
                      target.origin.y - inflictor.origin.y - (inflictor.bounds.min.y + inflictor.bounds.max.y) * 0.5,
                      target.origin.z - inflictor.origin.z - (inflictor.bounds.min.z + inflictor.bounds.max.z) * 0.5};
     double length = qa_js_hypot3(delta.x, delta.y, delta.z);
-    qa_vec3 direction = length == 0 ? qa_ss_zero : (qa_vec3){delta.x / length, delta.y / length, delta.z / length};
+    qa_vec3 direction = length == 0 ? qa_zero_vec3 : (qa_vec3){delta.x / length, delta.y / length, delta.z / length};
     qa_compat_qc_world_host *world = qa_app_sim_quakec_source_world_host(qc->game);
     request.knockback = call.amount * qa_q1_id1_damage_multiplier(qa_app_sim_quakec_source_q1qc_machine(qc->game),
         qa_compat_qc_world_host_reference(world, call.attacker), qa_compat_qc_world_host_reference(world, call.inflictor));
     request.direction = direction;
     request.point = projectile.has_trace ? projectile.trace_point : target.origin;
-    request.normal = projectile.has_trace ? projectile.trace_normal : qa_ss_zero;
+    request.normal = projectile.has_trace ? projectile.trace_normal : qa_zero_vec3;
     request.attack = ss_qc_attack(sim, qc, call, (qa_source_time){QA_SOURCE_TIME_SECONDS, projectile.time});
     if (projectile.has_launch) { request.attack.has_originating_projectile = true; request.attack.originating_projectile = call.inflictor; }
     request.attack.weapon = projectile.weapon;
@@ -904,7 +925,7 @@ static qa_damage_request ss_qc_damage_request(void *ctx, qa_q1_id1_damage_call c
   if (!has_environment) {
     qa_body_state target;
     if (!qa_app_shared_sim_body(sim, call.target, &target)) ss_fail("Native QuakeC damage lost its target body");
-    request.knockback = 0; request.direction = qa_ss_zero; request.point = target.origin; request.normal = qa_ss_zero;
+    request.knockback = 0; request.direction = qa_zero_vec3; request.point = target.origin; request.normal = qa_zero_vec3;
     qa_compat_qc_machine *machine = qa_app_sim_quakec_source_machine(qc->game);
     double time = qa_compat_qc_words_float(&machine->globals, qa_compat_qc_machine_global_offset(machine, "time"));
     request.attack = ss_qc_attack(sim, qc, call, (qa_source_time){QA_SOURCE_TIME_SECONDS, time});
@@ -912,7 +933,7 @@ static qa_damage_request ss_qc_damage_request(void *ctx, qa_q1_id1_damage_call c
     return request;
   }
   request.knockback = environment.knockback; request.direction = environment.direction;
-  request.point = environment.point; request.normal = qa_ss_zero;
+  request.point = environment.point; request.normal = qa_zero_vec3;
   request.attack = ss_qc_attack(sim, qc, call, (qa_source_time){QA_SOURCE_TIME_SECONDS, environment.time});
   request.attack.weapon = NULL;
   request.attack.cause = environment.cause;
@@ -1088,7 +1109,7 @@ static void ss_q1_weapon_changed(void *ctx, qa_actor_id actor, qa_item_id acquir
   (void)acquired;
   qa_app_shared_simulation *sim = ((ss_q1 *)ctx)->sim;
   qa_app_sim_movement_player *player = qa_app_shared_sim_require_player(sim, actor);
-  player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+  qa_app_shared_sim_assign_player_arsenal(sim, player);
 }
 static bool ss_q1_prompt_supported(void *ctx, qa_actor_id actor) {
   qa_app_shared_simulation *sim = ((ss_q1 *)ctx)->sim;
@@ -1098,9 +1119,10 @@ static bool ss_q1_prompt_supported(void *ctx, qa_actor_id actor) {
 static void ss_q1_restart_session(void *ctx, const char *map, double flags) {
   ss_q1 *q1 = ctx; qa_app_shared_simulation *sim = q1->sim;
   sim->q1_restart = true; sim->q1_campaign.flags = flags;
-  char name[512]; snprintf(name, sizeof name, "q1:%s", map);
+  /* `q1:${map}`: the map name is whole. */
+  size_t name_size = strlen(map) + 4; char *name = qa_app_shared_sim_keep(sim, name_size); snprintf(name, name_size, "q1:%s", map);
   qa_transition_intent intent; memset(&intent, 0, sizeof intent);
-  intent.kind = "campaign-level"; intent.campaign = q1->campaign; intent.map = qa_app_shared_sim_intern(sim, name);
+  intent.kind = "campaign-level"; intent.campaign = q1->campaign; intent.map = name;
   intent.spawn_point = ""; intent.gate_count = 0; intent.cause = NULL;
   qa_event_ring_admit(&sim->transitions, &intent);
 }
@@ -1325,7 +1347,7 @@ static void ss_q2_player_spawned(void *ctx, qa_q2_entity *entity, qa_q2_game_ser
   if (q1) qa_q1_character_actor_respawn(*q1, NULL);
   if (sim->has_selected_arsenal && qa_app_shared_sim_selected_arsenal_has(sim, actor)) {
     qa_app_shared_sim_selected_arsenal_remove(sim, actor);
-    player->arsenal = qa_app_shared_sim_selected_arsenal_admit(sim, entity->actor, 100, false);
+    qa_app_shared_sim_store_player_arsenal(sim, player, qa_app_shared_sim_selected_arsenal_admit(sim, entity->actor, 100, false));
   }
   if (sim->selected_q3_source) qa_app_q3_selected_source_respawn(sim->selected_q3_source, actor);
   if (sim->hand_grenades) qa_app_sim_hand_grenade_runtime_respawn(sim->hand_grenades, actor);
@@ -1367,7 +1389,11 @@ static void ss_q2_dm_write(void *ctx, double flags) {
   uint32_t desired = ((uint32_t)qa_js_to_int32(latched) & ~changed) | ((uint32_t)qa_js_to_int32(flags) & changed);
   char text[32];
   ss_cvar_set(cvars, "dmflags", qa_ss_number_text(flags, text));
-  if ((double)desired != flags) { qa_cvar_snapshot snapshot; qa_cvar_registry_stage(cvars, "dmflags", qa_ss_number_text((double)desired, text), &snapshot); }
+  if ((double)desired != flags) {
+    qa_cvar_snapshot snapshot;
+    (void)qa_cvar_registry_stage(cvars, "dmflags", qa_ss_number_text((double)desired, text), &snapshot);
+    qa_cvar_read_free(&snapshot);
+  }
 }
 static double ss_q2_services_gravity(void *ctx) { return qa_app_sim_shared_physics_gravity(((ss_q2 *)ctx)->sim->physics); }
 static void ss_q2_services_emit(void *ctx, qa_q2_composition_event event) {
@@ -2167,16 +2193,20 @@ static qa_qvm_pickup_resolved_item ss_qvm_resolve_item(void *ctx, const qa_qvm_c
   ss_qvm *q = ctx; qa_app_shared_simulation *sim = q->sim;
   const qa_qvm_pickup_profile *profile = qa_app_prepared_q3_primary_pickups(q->guest->prepared);
   const qa_q3_guest_weapon *weapon = ss_qvm_weapon_with_tag(q, record->tag);
-  char fallback[256]; snprintf(fallback, sizeof fallback, "q3:%s", record->class_name);
+  /* `q3:${record.className}`: the guest class name is whole. */
+  size_t fallback_size = strlen(record->class_name) + 4; char *fallback = malloc(fallback_size);
+  if (fallback == NULL) qa_range_error("Out of memory");
+  snprintf(fallback, fallback_size, "q3:%s", record->class_name);
   qa_item_id item = record->type == profile->items.weapon_type ? (weapon ? weapon->item : NULL)
       : record->type == profile->items.ammo_type ? (weapon ? weapon->ammo : NULL) : NULL;
   if (item == NULL) item = qa_app_shared_sim_intern(sim, fallback);
+  free(fallback);
   qa_qvm_pickup_resolved_item resolved = {item, NULL};
-  qa_pickup_resource *resource = NULL;
+  qa_pickup_resource *resource = NULL; /* the offer reads it during this pickup call only (a per-call record) */
   if (record->type == QA_Q3_BASE_IT_ARMOR) {
-    resource = qa_app_shared_sim_keep(sim, sizeof *resource); resource->kind = QA_PICKUP_RESOURCE_PROTECTION; resource->channel = QA_PROTECTION_REGULAR;
+    resource = qa_app_shared_sim_scratch(sim, sizeof *resource); resource->kind = QA_PICKUP_RESOURCE_PROTECTION; resource->channel = QA_PROTECTION_REGULAR;
   } else if (record->type == profile->items.weapon_type || record->type == profile->items.ammo_type) {
-    resource = qa_app_shared_sim_keep(sim, sizeof *resource); resource->kind = QA_PICKUP_RESOURCE_INVENTORY; resource->item = item;
+    resource = qa_app_shared_sim_scratch(sim, sizeof *resource); resource->kind = QA_PICKUP_RESOURCE_INVENTORY; resource->item = item;
   }
   resolved.resource = resource;
   return resolved;
@@ -2285,7 +2315,8 @@ static bool ss_qvm_drop(void *ctx, qa_actor_id actor, qa_qvm_primary_weapon_drop
   if (source_weapon->ammo != NULL) {
     qa_qvm_inventory_words words;
     ss_qvm_project_inventory(q, actor, source_weapon->ammo, ui.has_ammo ? ui.ammo_count : 0, &words);
-    qa_qvm_inventory_word *kept = qa_app_shared_sim_keep(sim, (words.count ? words.count : 1) * sizeof *kept);
+    /* The death drop writes these words during this call only (a per-call record). */
+    qa_qvm_inventory_word *kept = qa_app_shared_sim_scratch(sim, (words.count ? words.count : 1) * sizeof *kept);
     memcpy(kept, words.entries, words.count * sizeof *kept);
     out->ammo_words = kept; out->ammo_word_count = words.count;
     qa_qvm_inventory_words_destroy(&words);

@@ -386,7 +386,7 @@ static const qa_app_q2_remote_mounts *q2_refresh_downloads(void *ctx, qa_app_q2_
 static const char *q2_userinfo(void *ctx) {
   /* TS userinfo: () => cvars.infoString(CvarFlag.UserInfo), over the constructor's configuration.source */
   qa_remote_application *app = ctx;
-  return keep_text(app, qa_cvar_registry_info_string(app->configuration->source, QA_CVAR_FLAG_USER_INFO, -1));
+  return keep_text(app, qa_cvar_registry_info_string(app->construct_source, QA_CVAR_FLAG_USER_INFO, -1));
 }
 
 static void fill_common(qa_remote_application *app, void **ctx, qa_app_remote_world_host *world_host,
@@ -750,6 +750,7 @@ static void construct_body(void *ctx) {
     qa_remote_application_set_source_handler(app, "allskins", false, NULL);
     qa_remote_application_set_source_handler(app, "color", true, NULL);
   }
+  app->construct_source = configuration->source;
   qa_remote_command_owner *owner = &app->client_command_owner_storage;
   memset(owner, 0, sizeof *owner);
   owner->cvars = configuration->source;
@@ -785,6 +786,33 @@ static void construct_release(qa_remote_application *app) {
   qa_remote_application_free_storage(app);
 }
 
+/* TS consoleLog / logConsole / gameFolder. */
+static void logged_host_print(void *ctx, const char *text) {
+  qa_remote_application *app = ctx;
+  if (app->console_log_attached) qa_app_console_log_write(&app->console_log, text);
+  app->unlogged_host.print(app->unlogged_host.ctx, text);
+}
+static double console_log_mode(void *ctx) {
+  qa_remote_application *app = ctx;
+  qa_remote_command_owner *commands = qa_remote_application_client_commands(app);
+  return qa_app_console_log_mode(commands != NULL ? commands->cvars : NULL, app->launch_options.console_debug);
+}
+static char *console_log_root(void *ctx) { return qa_remote_application_game_folder(ctx); }
+char *qa_remote_application_game_folder(qa_remote_application *app) {
+  const qa_content_catalog *catalog = app->remote_content != NULL ? app->remote_content->catalog
+      : qa_app_configuration_content_catalog(app->mounted_content);
+  const char *product = app->remote_content != NULL ? app->remote_content->product->id
+      : qa_content_catalog_product(catalog, app->launch_options.product)->id;
+  const char *components[1] = {product};
+  qa_app_stock_native *native = qa_app_stock_native_config(catalog, product, components, 1, app->launch_options.native_config_root,
+      false, NULL);
+  const char *folder = native != NULL ? native->layout.directory
+      : app->remote_content != NULL ? app->remote_content->write_root : app->configuration->settings->root;
+  char *copy = strdup(folder);
+  qa_app_stock_native_destroy(native);
+  if (copy == NULL) qa_range_error("Out of memory");
+  return copy;
+}
 qa_remote_application *qa_remote_application_construct(qa_app_options launch_options,
     qa_app_configuration_content *mounted_content, qa_engine_session *session, qa_app_native_renderer *renderer,
     const qa_remote_application_host *host, qa_app_image_settings *image_settings, const qa_remote_launch *launch,
@@ -798,6 +826,10 @@ qa_remote_application *qa_remote_application_construct(qa_app_options launch_opt
   app->session = session;
   app->renderer = renderer;
   app->host = *host;
+  /* hostWithConsoleLog(host, text => application?.logConsole(text)) */
+  app->unlogged_host = host->base;
+  if (host->base.print != NULL) { app->host.base.ctx = app; app->host.base.print = logged_host_print; }
+  qa_app_console_log_init(&app->console_log, console_log_mode, console_log_root, app);
   app->image_settings = image_settings;
   app->identity = identity;
   app->browser = browser;
@@ -1042,7 +1074,8 @@ static void open_body(void *ctx) {
     options->movement_product = movement;
   }
   options->movement = resolved.movement;
-  if (options->dedicated || options->seats != (double)(int64_t)options->seats || options->seats < 1 || options->seats > 4
+  /* !Number.isInteger(seats) || seats < 1 || seats > 4 (range first: the int64 cast of NaN or infinity is undefined) */
+  if (options->dedicated || !(options->seats >= 1 && options->seats <= 4) || options->seats != (double)(int64_t)options->seats
       || (!s->unified && (options->movement != s->family || options->character != s->family))) {
     const char *name = s->family == QA_GAME_FAMILY_Q1 ? "q1" : s->family == QA_GAME_FAMILY_Q3 ? "q3" : "q2";
     qa_raise("Error", 0, 0, "Native %s remote play requires one to four graphical seats with matching movement and character providers",
@@ -1187,6 +1220,7 @@ static void open_body(void *ctx) {
   qa_remote_application *application = qa_remote_application_construct(launch_options, s->content, s->session,
       s->renderer, host, s->image_settings, &launch, s->identity, s->browser, s->ownership, s->configuration, s->keys,
       s->key_profile);
+  application->console_log_attached = true; /* hostWithConsoleLog: `application` is assigned from here on */
   s->application = application;
   s->key_profile = NULL;
   /* the application owns what openSource opened from here (its closeOwned releases them) */

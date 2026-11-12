@@ -192,6 +192,7 @@ typedef struct unified_host {
   char **resource_strings; size_t resource_string_count;
   qa_app_unified_component_publication *publications; size_t publication_count;
   qa_app_unified_native_publication *native; size_t native_count;
+  char *admit_reason; /* the last refusal text, kept whole */
 } unified_host;
 
 static player_entry *entry_at(unified_host *h, double slot) {
@@ -332,8 +333,9 @@ static qa_app_unified_admission host_admit(void *ctx, const qa_net_address *addr
     free(text);
     if (!allowed.allowed) {
       qa_app_sim_info_clear(&values);
-      static _Thread_local char reason[256];
-      snprintf(reason, sizeof reason, "%s", allowed.reason);
+      char *reason = xstrdup(allowed.reason);
+      free(h->admit_reason);
+      h->admit_reason = reason;
       result.accepted = false; result.reason = reason;
       return result;
     }
@@ -368,8 +370,9 @@ static qa_app_unified_admission host_admit(void *ctx, const qa_net_address *addr
   entry->used = false; forget_info(entry);
   if (failures > 1) qa_raise("AggregateError", 0, 0, "Unified admission cleanup failed");
   if (is(error.name, "Q3ClientAdmissionDenied")) {
-    static _Thread_local char reason[QA_CAUGHT_MESSAGE_CAPACITY];
-    snprintf(reason, sizeof reason, "%s", error.message);
+    char *reason = xstrdup(error.message);
+    free(h->admit_reason);
+    h->admit_reason = reason;
     result.accepted = false; result.reason = reason;
     return result;
   }
@@ -412,6 +415,36 @@ static void host_userinfo(void *ctx, qa_app_unified_player player, const char *v
   qa_app_sim_info_clear(&values);
 }
 
+/* String.prototype.slice(0, units) over UTF-8 text: a four-byte sequence is two units; a cut inside one keeps its
+ * high surrogate (WTF-8), as the JS string does. */
+static char *slice_utf16(const char *text, size_t units) {
+  const unsigned char *bytes = (const unsigned char *)text;
+  size_t at = 0, used = 0;
+  char *out = xmalloc(strlen(text) + 4);
+  size_t length = 0;
+  while (bytes[at] != 0 && used < units) {
+    unsigned char lead = bytes[at];
+    size_t size = lead < 0x80 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 1;
+    for (size_t i = 1; i < size; i++) if (bytes[at + i] == 0) { size = i; break; }
+    if (size == 4) {
+      if (used + 2 > units) {
+        uint32_t code = ((uint32_t)(lead & 0x07) << 18) | ((uint32_t)(bytes[at + 1] & 0x3F) << 12)
+            | ((uint32_t)(bytes[at + 2] & 0x3F) << 6) | (uint32_t)(bytes[at + 3] & 0x3F);
+        uint32_t high = 0xD800 + ((code - 0x10000) >> 10);
+        out[length++] = (char)(0xE0 | (high >> 12));
+        out[length++] = (char)(0x80 | ((high >> 6) & 0x3F));
+        out[length++] = (char)(0x80 | (high & 0x3F));
+        used++;
+        break;
+      }
+      used += 2;
+    } else used++;
+    memcpy(out + length, bytes + at, size);
+    length += size; at += size;
+  }
+  out[length] = 0;
+  return out;
+}
 static void host_command(void *ctx, qa_app_unified_player player, const char *name, const char *const *args, size_t count) {
   unified_host *h = ctx;
   require_player(h, player);
@@ -421,10 +454,10 @@ static void host_command(void *ctx, qa_app_unified_player player, const char *na
     qa_app_sim_info values; memset(&values, 0, sizeof values);
     for (size_t i = 0; i < snapshot.userinfo_count; i++)
       qa_app_sim_info_set(&values, snapshot.userinfo[i].key, snapshot.userinfo[i].value);
-    /* (args[0] ?? 'unconnected').slice(0, 15): UTF-16 units equal bytes for ASCII names. */
-    char name_value[16];
-    snprintf(name_value, sizeof name_value, "%s", count > 0 && args[0] != NULL ? args[0] : "unconnected");
+    /* (args[0] ?? 'unconnected').slice(0, 15): 15 UTF-16 units of the UTF-8 argument. */
+    char *name_value = slice_utf16(count > 0 && args[0] != NULL ? args[0] : "unconnected", 15);
     qa_app_sim_info_set(&values, "name", name_value);
+    free(name_value);
     update(h, player, &values);
     qa_app_sim_info_clear(&values);
     return;
@@ -1009,5 +1042,6 @@ void qa_app_sim_unified_application_server_host_destroy(qa_app_unified_server_ho
   reset_resources(h);
   free(h->publications);
   free(h->native);
+  free(h->admit_reason);
   free(h);
 }

@@ -1,7 +1,10 @@
 /* Port of src/app/bootstrap/mod-presentations.ts. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
+#include "qa/foundation/caught_message.h"
 #include "qa/app/bootstrap/mod_presentations.h"
 #include <ctype.h>
+#include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qa/app/bootstrap/component_commands.h"
@@ -9,6 +12,7 @@
 #include "qa/app/bootstrap/simulation/q3/host.h"
 #include "qa/persistence/save_image.h"
 #include "qa/core/commands/text.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/support.h"
 #include "qa/input/client_commands.h"
 #include "qa/render/scene/world.h"
@@ -30,8 +34,7 @@ static void attempt(cleanup_failures *failures, void (*fn)(void *ctx), void *ctx
   if (failures->count++ == 0) failures->first = caught;
 }
 static void raise_failures(const cleanup_failures *failures, const char *message) {
-  qa_raise("AggregateError", 0, (long long)failures->count, "%s (%zu errors; first %s: %s)", message, failures->count,
-           failures->first.name, failures->first.message);
+  qa_raise("AggregateError", 0, (long long)failures->count, "%s", message);
 }
 
 /* ---- the shared scene effect frame ---- */
@@ -70,6 +73,8 @@ void qa_app_q3_scene_effect_frame(qa_app_application_q3_scene_renderer *renderer
   input.time.kind = QA_SOURCE_TIME_MILLISECONDS; input.time.value = time_milliseconds;
   input.target_is_seat = true; input.target_seat = seat;
   input.lights = out->lights; input.light_count = out->light_count; input.has_lights = true;
+  /* TS input.q3Lights: the scene's first 32 lights light its models (light-sampler dynamicLights). */
+  input.visibility.q3_lights = out->q3_lights; input.visibility.q3_light_count = out->q3_light_count;
   if (q1_fog != NULL) { input.has_q1_fog = true; input.q1_fog = *q1_fog; }
   qa_app_q3_scene_render_options options = {.no_world_model = false, .split_screen = split_screen};
   owned_operations *owned = xcalloc(1, sizeof *owned);
@@ -345,7 +350,25 @@ static qa_cvar_registry *producer_cvars(void *ctx, qa_command_context caller) {
     qa_raise("Error", 0, 0, "Component command producer differs from its original client module");
   return qa_app_application_mod_presentation_cvars(e->consumer);
 }
-typedef struct script_job { entry *e; const char *name; qa_command_context caller; qa_script_read_result result; } script_job;
+typedef struct script_job {
+  entry *e; const char *name; qa_command_context caller; qa_script_read_result result;
+  uint8_t *bytes; size_t byte_length;
+} script_job;
+/* new TextDecoder().decode(bytes) as console text (one byte per code unit). TS sourceCommandText keeps the text before
+ * a NUL (the decoder writes U+0000 as C0 80) and refuses a character above U+00FF with RangeError "Command text
+ * requires source bytes", which TS raises when the script executes; C raises it here (application_commands.c's
+ * source script read does the same). */
+static char *script_command_text(const uint8_t *bytes, size_t length) {
+  char *decoded = qa_text_decoder_decode(bytes, length, NULL);
+  if (decoded == NULL) qa_range_error("Out of memory");
+  char *nul = strstr(decoded, "\xc0\x80");
+  if (nul != NULL) *nul = '\0';
+  char *text = NULL;
+  bool converted = qa_command_text_from_utf8(decoded, &text);
+  free(decoded);
+  if (!converted) qa_raise("RangeError", 0, 0, "%s", "Command text requires source bytes");
+  return text;
+}
 static void read_script_run(void *ctx) {
   script_job *job = ctx;
   entry *e = job->e;
@@ -361,19 +384,28 @@ static void read_script_run(void *ctx) {
   job->result.kind = QA_SCRIPT_READ_READY;
   if (!found) return;
   job->result.has_text = true;
-  job->result.text = xcalloc(resource.byte_length + 1, 1);
-  memcpy(job->result.text, resource.bytes, resource.byte_length);
-  free(resource.bytes);
+  job->bytes = resource.bytes; job->byte_length = resource.byte_length;
 }
 static qa_script_read_result producer_read_script(void *ctx, const char *name, qa_command_context caller) {
   script_job job;
   memset(&job, 0, sizeof job);
   job.e = ctx; job.name = name; job.caller = caller;
   qa_caught_error error;
-  if (qa_try(read_script_run, &job, &error)) return job.result;
+  if (qa_try(read_script_run, &job, &error)) {
+    if (job.result.has_text) {
+      qa_cleanup node;
+      qa_cleanup_push(&node, free, job.bytes);
+      job.result.text = script_command_text(job.bytes, job.byte_length);
+      qa_cleanup_pop(&node);
+      free(job.bytes);
+    }
+    return job.result;
+  }
   qa_script_read_result failed;
   memset(&failed, 0, sizeof failed);
-  failed.kind = QA_SCRIPT_READ_FAILED; failed.error_message = xstrdup(error.message);
+  /* The completion rethrows what the read threw: keep its class and whole message. */
+  failed.kind = QA_SCRIPT_READ_FAILED; failed.error_message = xstrdup(qa_caught_message(&error));
+  failed.error_name = error.name;
   return failed;
 }
 static void producer_command(void *ctx, qa_command_invocation *command) {
@@ -475,8 +507,7 @@ static entry *create_entry(collection *c, const qa_app_viewing_seat *presentatio
     bool closed = qa_try(close_commands_run, e, &cleanup);
     entry_free(e);
     if (!closed)
-      qa_raise("AggregateError", 0, 2, "Component cgame initialization and command cleanup failed (first %s: %s; cleanup %s: %s)",
-               error.name, error.message, cleanup.name, cleanup.message);
+      qa_raise("AggregateError", 0, 2, "Component cgame initialization and command cleanup failed");
     qa_rethrow(&error);
   }
   if (!qa_try(after_create_run, &job, &error)) {
@@ -486,8 +517,7 @@ static entry *create_entry(collection *c, const qa_app_viewing_seat *presentatio
     attempt(&failures, consumer_destroy_run, e);
     entry_free(e);
     if (failures.count > 0)
-      qa_raise("AggregateError", 0, (long long)failures.count + 1, "Component presentation creation and cleanup failed (first %s: %s; cleanup %s: %s)",
-               error.name, error.message, failures.first.name, failures.first.message);
+      qa_raise("AggregateError", 0, (long long)failures.count + 1, "Component presentation creation and cleanup failed");
     qa_rethrow(&error);
   }
   return e;
@@ -629,7 +659,9 @@ static bool values_equal(const qa_save_value *a, const qa_save_value *b) {
   switch (a->kind) {
     case QA_SAVE_UNDEFINED: case QA_SAVE_NULL: return true;
     case QA_SAVE_BOOLEAN: return a->boolean == b->boolean;
-    case QA_SAVE_NUMBER: return a->number == b->number || (a->number != a->number && b->number != b->number);
+    /* isDeepStrictEqual compares numbers with Object.is: NaN equals NaN, 0 differs from -0. */
+    case QA_SAVE_NUMBER:
+      return (a->number == b->number && signbit(a->number) == signbit(b->number)) || (a->number != a->number && b->number != b->number);
     case QA_SAVE_BIGINT: case QA_SAVE_STRING: return strcmp(a->text, b->text) == 0;
     case QA_SAVE_BYTES: return a->byte_length == b->byte_length && (a->byte_length == 0 || memcmp(a->bytes, b->bytes, a->byte_length) == 0);
     case QA_SAVE_ARRAY:
@@ -768,8 +800,7 @@ void qa_app_application_mod_presentations_restore_checkpoint(collection *c, cons
     qa_caught_error cleanup;
     if (!qa_try(close_run, c, &cleanup)) {
       c->busy = false;
-      qa_raise("AggregateError", 0, 2, "Component client restore and cleanup failed (first %s: %s; cleanup %s: %s)",
-               error.name, error.message, cleanup.name, cleanup.message);
+      qa_raise("AggregateError", 0, 2, "Component client restore and cleanup failed");
     }
     c->busy = false;
     qa_rethrow(&error);
@@ -819,10 +850,9 @@ char *qa_app_application_mod_presentations_read_command_script(collection *c, co
   qa_cleanup node;
   qa_cleanup_push(&node, free, found ? resource.bytes : NULL);
   if (command_entry(c, source) != e) qa_raise("Error", 0, 0, "Component script owner changed while reading");
+  if (!found) { qa_cleanup_pop(&node); return NULL; }
+  char *text = script_command_text(resource.bytes, resource.byte_length); /* TextDecoder, as console text */
   qa_cleanup_pop(&node);
-  if (!found) return NULL;
-  char *text = xcalloc(resource.byte_length + 1, 1);
-  memcpy(text, resource.bytes, resource.byte_length);
   free(resource.bytes);
   return text;
 }
@@ -972,8 +1002,7 @@ static void prepare_run(void *ctx) {
       break;
     }
     if (!removed)
-      qa_raise("AggregateError", 0, 2, "Component presentation preparation and cleanup failed (first %s: %s; cleanup %s: %s)",
-               error.name, error.message, cleanup.name, cleanup.message);
+      qa_raise("AggregateError", 0, 2, "Component presentation preparation and cleanup failed");
     qa_rethrow(&error);
   }
 }

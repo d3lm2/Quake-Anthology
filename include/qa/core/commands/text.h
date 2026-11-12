@@ -21,6 +21,14 @@
 char *qa_source_command_text(const char *input);
 /* Malloc'd copy with ASCII A-Z folded to a-z. */
 char *qa_ascii_fold(const char *text);
+/* C-only boundary between settings text and command text. Settings text (JSON, the settings layers) is a TS
+ * string held as UTF-8; command text is one byte per UTF-16 code unit, which is what a TS script read as Latin-1
+ * holds. qa_command_text_from_utf8 answers the malloc'd byte text, or false with *out NULL when the text has a
+ * character above U+00FF or is not UTF-8 (TS sourceCommandText: RangeError "Command text requires source
+ * bytes"). qa_command_text_to_utf8 is the reverse: the UTF-8 TS writes for that string. Both raise RangeError
+ * "Out of memory" when allocation fails. */
+bool qa_command_text_from_utf8(const char *utf8, char **out);
+char *qa_command_text_to_utf8(const char *bytes);
 
 bool qa_command_dialect_is_q1(qa_command_dialect dialect);
 bool qa_command_dialect_is_q2(qa_command_dialect dialect);

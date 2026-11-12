@@ -9,45 +9,19 @@
 #include "qa/content/q1/missionpacks/world/finale_text.h"
 #include "qa/foundation/support.h"
 #include <math.h>
-/* content/q1/foundation/text.h is landed without its .c in this
- * tree; classicQ1Text is inlined here from the landed finale and
- * obituary helpers plus the TS classicQ1Messages table. Supersede
- * this with qa_q1_classic_text once text.c lands. */
-static const struct { const char *key, *value; } classic_messages[] = {
-  {"$qc_found_secret", "You found a secret area!"}, {"$qc_more_go", "There are more to go..."},
-  {"$qc_three_more", "Only 3 more to go..."}, {"$qc_two_more", "Only 2 more to go..."},
-  {"$qc_one_more", "Only 1 more to go..."}, {"$qc_sequence_completed", "Sequence completed!"},
-  {"$qc_need_gold_key", "You need the gold key"}, {"$qc_need_gold_runekey", "You need the gold runekey"},
-  {"$qc_need_gold_keycard", "You need the gold keycard"}, {"$qc_need_silver_key", "You need the silver key"},
-  {"$qc_need_silver_runekey", "You need the silver runekey"}, {"$qc_need_silver_keycard", "You need the silver keycard"},
-  {"$qc_already_have_rune", "You already have a rune\n"}, {"$qc_rune_resistance", "Earth Magic\n\nRESISTANCE"},
-  {"$qc_rune_strength", "Black Magic\n\nSTRENGTH"}, {"$qc_rune_haste", "Hell Magic\n\nHASTE"},
-  {"$qc_rune_regeneration", "Edler Magic\n\nRegeneration"},
-  {"$qc_color_games", "You were told you can't change teams.\nGo play color games somewhere else.\n"},
-  {"$qc_cannot_change_teams", "You cannot change teams.\n"}, {"$qc_ctf_disabled", "Capture the Flag is not enabled.\n"},
-  {"$qc_flag_missing", "The flag is missing!\n"}, {"$qc_flag_at_base", "The flag is at base!\n"},
-  {"$qc_flag_lying_about", "The flag is lying about!\n"}, {"$qc_you_have_flag", "You have the flag!\n"},
-  {"$qc_flag_screwed_up", "The flag is screwed up!\n"}, {"$qc_you_have_enemy_flag", "You have the enemy flag.\n"},
-  {"$qc_flag_returned", "The flag has been returned!\n"}, {"$qc_your_flag_returned_base", "Your flag has been returned to base!\n"},
-  {"$qc_enemy_flag_returned_base", "Enemy flag has been returned to base!\n"},
-  {"$qc_your_team_captured", "Your team captured the flag!\n"}, {"$qc_your_flag_captured", "Your flag was captured!\n"},
-  {"$qc_flag_taken", "The flag has been taken!\n"}, {"$qc_your_flag_taken", "Your flag has been taken!\n"},
-  {"$qc_enemy_killed_bonus", "Enemy flag carrier killed: {0} bonus frags\n"},
-  {"$qc_enemy_killed_no_bonus", "Enemy flag carrier killed, no bonus\n"},
-  {"$qc_has_token", "{0} has the tag token!\n"}, {"$qc_lost_token", "{0} lost the tag token!\n"},
-  {"$qc_got_token", "{0} got the tag token!\n"}, {"$qc_got_quad", "You got the Quad Damage\n"},
-};
-static const char *classic_message(const char *key) {
-  for (size_t i = 0; i < sizeof classic_messages / sizeof classic_messages[0]; i++)
-    if (strcmp(classic_messages[i].key, key) == 0) return classic_messages[i].value;
-  return NULL;
-}
+#include "qa/content/q1/foundation/text.h"
+#include "qa/foundation/caught_message.h"
+/* TS classicQ1Messages (content/q1/foundation/text.c holds the whole table). */
+static const char *classic_message(const char *key) { return qa_q1_classic_message(key); }
 #include "qa/text/localization.h"
 #include "qa/foundation/js.h"
 typedef struct catalog_entry {
   char *content;
   char *language;
   qa_localization_catalog catalog;
+  /* TS caches the catalog promise: a rejected load stays rejected for this content and language. */
+  bool failed;
+  qa_caught_error error;
 } catalog_entry;
 struct qa_app_q1_message_localization {
   qa_seat_id seat;
@@ -87,26 +61,45 @@ typedef struct tier_bytes {
   uint8_t *base; size_t base_length;
   uint8_t *mod; size_t mod_length;
 } tier_bytes;
-static tier_bytes load_tier(qa_content_mounted *mounts, const char *name) {
-  tier_bytes tier = {0};
-  char path[256];
+/* Fills `tier` as each open returns, so a raise leaves what was opened for the caller to free. */
+static void load_tier(qa_content_mounted *mounts, const char *name, tier_bytes *tier) {
+  size_t size = strlen(name) + 32;
+  char *path = malloc(size);
+  if (path == NULL) qa_range_error("Out of memory");
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, path);
   qa_content_opened_resource resource;
-  snprintf(path, sizeof path, "localization/loc_%s.txt", name);
+  snprintf(path, size, "localization/loc_%s.txt", name);
   if (qa_content_mounted_open(mounts, path, NULL, NULL, &resource)) {
-    tier.base = resource.bytes; tier.base_length = resource.byte_length;
+    tier->base = resource.bytes; tier->base_length = resource.byte_length;
   }
-  snprintf(path, sizeof path, "localization/loc_%s_mod.txt", name);
+  snprintf(path, size, "localization/loc_%s_mod.txt", name);
   if (qa_content_mounted_open(mounts, path, NULL, NULL, &resource)) {
-    tier.mod = resource.bytes; tier.mod_length = resource.byte_length;
+    tier->mod = resource.bytes; tier->mod_length = resource.byte_length;
   }
-  return tier;
+  qa_cleanup_pop(&node);
+  free(path);
+}
+typedef struct catalog_load {
+  qa_app_q1_message_localization *localization;
+  qa_content_id content;
+  const char *language;
+  tier_bytes primary, fallback;
+} catalog_load;
+static void open_tiers(void *v) {
+  catalog_load *load = v;
+  qa_content_mounted *mounts = load->localization->assets.for_content(load->localization->assets.ctx, load->content);
+  load_tier(mounts, load->language, &load->primary);
+  if (strcmp(load->language, "english") != 0) load_tier(mounts, "english", &load->fallback);
 }
 static qa_localization_table *table_for(qa_app_q1_message_localization *localization,
     qa_content_id content, const char *language) {
   for (size_t i = 0; i < localization->count; i++)
     if (strcmp(localization->entries[i].content, content) == 0
-        && strcmp(localization->entries[i].language, language) == 0)
+        && strcmp(localization->entries[i].language, language) == 0) {
+      if (localization->entries[i].failed) qa_rethrow(&localization->entries[i].error);
       return &localization->entries[i].catalog.table;
+    }
   if (localization->count == localization->capacity) {
     size_t cap = localization->capacity == 0 ? 4 : localization->capacity * 2;
     catalog_entry *next = realloc(localization->entries, cap * sizeof *next);
@@ -118,11 +111,18 @@ static qa_localization_table *table_for(qa_app_q1_message_localization *localiza
   entry->content = dup_text(content);
   entry->language = dup_text(language);
   qa_localization_catalog_init(&entry->catalog, localization->seat, QA_LOC_Q1_RERELEASE);
-  localization->count++;
-  qa_content_mounted *mounts = localization->assets.for_content(localization->assets.ctx, content);
-  tier_bytes primary = load_tier(mounts, language);
-  tier_bytes fallback = {0};
-  if (strcmp(language, "english") != 0) fallback = load_tier(mounts, "english");
+  size_t index = localization->count++;
+  catalog_load load = {localization, content, language, {0}, {0}};
+  qa_caught_error caught;
+  if (!qa_try(open_tiers, &load, &caught)) {
+    free(load.primary.base); free(load.primary.mod); free(load.fallback.base); free(load.fallback.mod);
+    entry = &localization->entries[index];
+    entry->failed = true;
+    qa_caught_copy(&entry->error, &caught);
+    qa_rethrow(&entry->error);
+  }
+  entry = &localization->entries[index];
+  tier_bytes primary = load.primary, fallback = load.fallback;
   qa_loc_load_tier primary_tier = {primary.base != NULL, {primary.base, primary.base_length}, NULL, 0};
   qa_byte_view primary_mod = {primary.mod, primary.mod_length};
   if (primary.mod != NULL) { primary_tier.mods = &primary_mod; primary_tier.mod_count = 1; }
@@ -152,17 +152,19 @@ static char *classic_text(const char *value, const qa_q1_msg_arg *args, size_t a
     const char **texts = calloc(arg_count == 0 ? 1 : arg_count, sizeof *texts);
     char (*scratch)[64] = calloc(arg_count == 0 ? 1 : arg_count, sizeof *scratch);
     if (texts == NULL || scratch == NULL) qa_range_error("Out of memory");
-    size_t size = strlen(value) + arg_count * 128 + 256;
-    obituary = malloc(size);
-    if (obituary == NULL) qa_range_error("Out of memory");
+    size_t longest = 0;
     for (size_t i = 0; i < arg_count; i++) {
       if (args[i].is_number) {
-        if ((fabs(args[i].number) < 9.2e18 && args[i].number == trunc(args[i].number)))
-          snprintf(scratch[i], 64, "%s", QA_JS_NUMBER(args[i].number));
-        else snprintf(scratch[i], 64, "%s", QA_JS_NUMBER(args[i].number));
+        snprintf(scratch[i], 64, "%s", QA_JS_NUMBER(args[i].number));
         texts[i] = scratch[i];
       } else texts[i] = args[i].text;
+      size_t length = strlen(texts[i]);
+      if (length > longest) longest = length;
     }
+    /* Every {n} of the template (the obituary table's or the key itself) may take the longest argument whole. */
+    size_t size = (strlen(value) + 512) * (longest + 1) + 1;
+    obituary = malloc(size);
+    if (obituary == NULL) qa_range_error("Out of memory");
     qa_q1_classic_obituary_text(value, texts, arg_count, obituary, size);
     free(texts); free(scratch);
     format = qa_q1_finale_text("classic", qa_q1mp_mission_finale_text("classic", obituary));

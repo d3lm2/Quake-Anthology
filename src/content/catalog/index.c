@@ -8,16 +8,22 @@
 #include <strings.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "catalog_internal.h"
+#include "qa/content/archive/types.h"
 #include "qa/content/catalog/addons.h"
 #include "qa/content/mounts.h"
 #include "qa/content/roots.h"
 #include "qa/content/user_data.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/node_path.h"
+#include "qa/foundation/support.h"
+
+#include <openssl/sha.h>
 
 /* ------------------------------------------------------------------ */
 /* Path and filesystem helpers (Node path/fs mirrors).                 */
@@ -141,6 +147,12 @@ typedef struct dir_list {
   size_t count;
 } dir_list;
 
+/* Throw-time cleanups (qa_cleanup) for what discovery holds while a directory
+ * read can raise; the TypeScript drops the same objects to the collector. */
+static void dir_list_free(dir_list *list);
+static void dir_list_cleanup(void *list) { dir_list_free((dir_list *)list); }
+static void string_slot_cleanup(void *slot) { free(*(char **)slot); }
+
 static void dir_list_free(dir_list *list) {
   for (size_t i = 0; i < list->count; i++) free(list->values[i].name);
   free(list->values);
@@ -181,14 +193,26 @@ static bool read_directory(const char *path, dir_list *out, int *error_out) {
   return true;
 }
 
-static uint8_t *read_file_prefix(const char *path, size_t limit, size_t *out_length) {
-  FILE *file = fopen(path, "rb");
-  if (file == NULL) return NULL;
-  uint8_t *bytes = (uint8_t *)malloc(limit != 0 ? limit : 1);
-  if (bytes == NULL) { (void)fclose(file); return NULL; }
-  *out_length = fread(bytes, 1, limit, file);
-  (void)fclose(file);
-  return bytes;
+/* readdir(path, { withFileTypes: true }) with no catch: a failure is the fs
+ * Error Bun reports. */
+static void read_directory_or_raise(const char *path, dir_list *out) {
+  int error = 0;
+  if (read_directory(path, out, &error)) return;
+  if (error == 0) qa_range_error("Out of memory");
+  qa_content_fs_error(error, "scandir", path);
+}
+
+/* open(path, "r") then one read of up to `limit` bytes at offset 0, closed in
+ * a finally: a failed open or read is the fs Error Bun reports. */
+static size_t read_file_prefix(const char *path, uint8_t *bytes, size_t limit) {
+  int descriptor = open(path, O_RDONLY);
+  if (descriptor < 0) qa_content_fs_error(errno, "open", path);
+  ssize_t count;
+  do count = pread(descriptor, bytes, limit, 0); while (count < 0 && errno == EINTR);
+  int error = errno;
+  (void)close(descriptor);
+  if (count < 0) qa_content_fs_error(error, "read", NULL);
+  return (size_t)count;
 }
 
 /* findContentPath (TS owner: src/content/mounts/paths.ts) with the
@@ -344,6 +368,10 @@ void qa_catalog_discovered_product_free(qa_catalog_discovered_product *product) 
     free(product->user_content->root); free(product->user_content->archives);
     free(product->user_content);
   }
+  if (product->redirected_content != NULL) {
+    free(product->redirected_content->root); free(product->redirected_content->archives);
+    free(product->redirected_content);
+  }
   if (product->addon_content != NULL) {
     free(product->addon_content->root); free(product->addon_content->archives);
     free(product->addon_content);
@@ -487,8 +515,9 @@ char *qa_remote_content_product(const qa_remote_content_selection *selection,
 /* Archive ordering.                                                   */
 
 static bool archive_format_for(const char *name, qa_archive_format *out) {
+  /* extname(name): a leading dot starts a name, not an extension. */
   const char *extension = strrchr(name, '.');
-  if (extension == NULL) return false;
+  if (extension == NULL || extension == name) return false;
   if (qa_catalog_ieq(extension, ".pak")) { *out = QA_ARCHIVE_FORMAT_PAK; return true; }
   if (qa_catalog_ieq(extension, ".pk3")) { *out = QA_ARCHIVE_FORMAT_PK3; return true; }
   if (qa_catalog_ieq(extension, ".kpf")) { *out = QA_ARCHIVE_FORMAT_KPF; return true; }
@@ -734,6 +763,9 @@ const qa_catalog_discovered_product *qa_content_catalog_require(
       free(text); text = next;
     }
     (void)joined;
+    /* The raise formats the message before it unwinds this node. */
+    qa_cleanup text_node;
+    if (text != NULL) qa_cleanup_push(&text_node, free, text);
     qa_catalog_error("Content %s requires: %s", id, text != NULL ? text : "");
   }
   if (product->availability.kind == QA_CATALOG_UNRESOLVED)
@@ -749,12 +781,13 @@ typedef struct directory_view {
   size_t archive_count;
 } directory_view;
 
-/* productDirectories: [user?, corpus, addon?] */
+/* productDirectories: [redirected?, user?, corpus, addon?] */
 static size_t product_directories(const qa_catalog_discovered_product *product,
-                                  directory_view views[3],
+                                  directory_view views[4],
                                   qa_catalog_archive **corpus_out) {
   size_t count = 0;
   const qa_catalog_directory_content *user = product->user_content;
+  const qa_catalog_directory_content *redirected = product->redirected_content;
   const qa_catalog_directory_content *addon = product->addon_content;
   size_t corpus_count = 0;
   for (size_t i = 0; i < product->archive_count; i++) {
@@ -763,10 +796,19 @@ static size_t product_directories(const qa_catalog_discovered_product *product,
     if (user != NULL)
       for (size_t j = 0; j < user->archive_count; j++)
         if (user->archives[j] == archive) excluded = true;
+    if (redirected != NULL)
+      for (size_t j = 0; j < redirected->archive_count; j++)
+        if (redirected->archives[j] == archive) excluded = true;
     if (addon != NULL)
       for (size_t j = 0; j < addon->archive_count; j++)
         if (addon->archives[j] == archive) excluded = true;
     if (!excluded) corpus_out[corpus_count++] = archive;
+  }
+  if (redirected != NULL) {
+    views[count].root = redirected->root;
+    views[count].archives = redirected->archives;
+    views[count].archive_count = redirected->archive_count;
+    count++;
   }
   if (user != NULL) {
     views[count].root = user->root;
@@ -820,7 +862,7 @@ static bool maps_visit(const qa_content_catalog *catalog,
     corpus = (qa_catalog_archive **)malloc(product->archive_count * sizeof *corpus);
     if (corpus == NULL) return false;
   }
-  directory_view views[3];
+  directory_view views[4];
   size_t view_count = product_directories(product, views, corpus);
   for (size_t v = 0; v < view_count; v++) {
     size_t ordered_count = 0;
@@ -972,7 +1014,7 @@ static bool mounts_visit(mounts_state *state, qa_content_id content) {
     corpus = (qa_catalog_archive **)malloc(product->archive_count * sizeof *corpus);
     if (corpus == NULL) return false;
   }
-  directory_view views[3];
+  directory_view views[4];
   size_t view_count = product_directories(product, views, corpus);
   for (size_t v = 0; v < view_count; v++) {
     size_t ordered_count = 0;
@@ -1179,7 +1221,7 @@ bool qa_content_catalog_create_mount_plan(
             if (strcmp(mount_physical_key(&unique.mounts[u]), key) != 0) continue;
             qa_mount_id id = mount_identity_id(&unique.mounts[u]);
             bool seen = false;
-            for (size_t s = 0; s < count; s++) if (order[s] == id) seen = true;
+            for (size_t s = 0; s < count; s++) if (strcmp(order[s], id) == 0) seen = true;
             if (!seen && order != NULL) order[count++] = id;
           }
         }
@@ -1467,7 +1509,7 @@ static bool inspect_mod_directory(const char *physical,
   memset(out, 0, sizeof *out);
   *found = false;
   dir_list members = {0};
-  if (!read_directory(physical, &members, NULL)) return true;
+  read_directory_or_raise(physical, &members); /* TS: no catch here */
   bool has_content = false;
   for (size_t i = 0; i < members.count; i++) {
     qa_archive_format format;
@@ -1690,12 +1732,18 @@ static bool discover_mods(const char *root,
     char *installed = anchored_path(roots, root, base->family, directory);
     if (installed == NULL) { free(directory); continue; }
     dir_list entries = {0};
-    if (!read_directory(installed, &entries, NULL)) {
-      free(directory); free(installed); continue;
-    }
+    /* TS `await readdir(installed)` and the member read of each folder have no
+     * catch: a failure ends discovery, and what this frame holds goes with it. */
+    qa_cleanup directory_node, installed_node, entries_node;
+    qa_cleanup_push(&directory_node, free, directory);
+    qa_cleanup_push(&installed_node, free, installed);
+    read_directory_or_raise(installed, &entries);
+    qa_cleanup_push(&entries_node, dir_list_cleanup, &entries);
     for (size_t e = 0; e < entries.count; e++) {
       const char *entry_name = entries.values[e].name;
       char *content_directory = qa_catalog_format("%s/%s", directory, entry_name);
+      qa_cleanup content_directory_node;
+      qa_cleanup_push(&content_directory_node, free, content_directory);
       bool skip = !entries.values[e].is_directory ||
                   qa_catalog_ieq(entry_name, "rerelease");
       const qa_catalog_product_expectation *known[64];
@@ -1716,8 +1764,11 @@ static bool discover_mods(const char *root,
         char *physical = resolve_path(installed, entry_name);
         inspected_mod inspected = {0};
         bool found = false;
+        qa_cleanup physical_node;
+        qa_cleanup_push(&physical_node, free, physical);
         bool ok = physical != NULL &&
                   inspect_mod_directory(physical, base, cache, &inspected, &found);
+        qa_cleanup_pop(&physical_node);
         free(physical);
         /* A folder name can't stop the game from starting; it just isn't a mod. */
         if (ok && found && valid_mod_name(entry_name, false)) {
@@ -1733,8 +1784,12 @@ static bool discover_mods(const char *root,
         qa_catalog_string_list_free(&inspected.archive_names);
         qa_catalog_string_list_free(&inspected.program_names);
       }
+      qa_cleanup_pop(&content_directory_node);
       free(content_directory);
     }
+    qa_cleanup_pop(&entries_node);
+    qa_cleanup_pop(&installed_node);
+    qa_cleanup_pop(&directory_node);
     dir_list_free(&entries);
     free(installed);
     free(directory);
@@ -1816,8 +1871,10 @@ bool qa_discover_addon_directories(
             qa_catalog_format("%s/%s", prefix, entries.values[e].name);
         directory.physical = qa_catalog_dup(physical);
         for (size_t t = 0; t < titles.count; t++)
-          if (qa_catalog_ieq(titles.values[t].game_directory, lower))
+          if (qa_catalog_ieq(titles.values[t].game_directory, lower)) {
+            free(directory.title); /* Map: a later row replaces an earlier one */
             directory.title = qa_catalog_dup(titles.values[t].title);
+          }
         if (!addon_directory_push(out, directory, &capacity)) {
           free(lower); free(physical);
           dir_list_free(&entries);
@@ -1881,6 +1938,19 @@ static bool discover_sibling_directories(
   return true;
 }
 
+typedef struct addon_inspection {
+  const char *physical;
+  const qa_catalog_product_expectation *base;
+  inspect_cache *cache;
+  inspected_mod inspected;
+  bool found;
+} addon_inspection;
+static void addon_inspect_run(void *raw) {
+  addon_inspection *inspection = (addon_inspection *)raw;
+  (void)inspect_mod_directory(inspection->physical, inspection->base, inspection->cache,
+                              &inspection->inspected, &inspection->found);
+}
+
 static bool discover_addon_mods(const qa_catalog_addon_directory_list *addons,
                                 const qa_catalog_product_expectation *products,
                                 size_t product_count, inspect_cache *cache,
@@ -1910,9 +1980,16 @@ static bool discover_addon_mods(const qa_catalog_addon_directory_list *addons,
         if (strcmp(known_values[i].edition, "quakeworld") == 0) quakeworld = true;
       if (addon->family != QA_GAME_FAMILY_Q1 || quakeworld) continue;
     }
-    inspected_mod inspected = {0};
-    bool found = false;
-    (void)inspect_mod_directory(addon->physical, base, cache, &inspected, &found);
+    /* TS inspectModDirectory(...).catch(() => null): any failure is "no mod". */
+    addon_inspection inspection = {addon->physical, base, cache, {{0}, {0}}, false};
+    qa_caught_error caught;
+    if (!qa_try(addon_inspect_run, &inspection, &caught)) {
+      qa_catalog_string_list_free(&inspection.inspected.archive_names);
+      qa_catalog_string_list_free(&inspection.inspected.program_names);
+      continue;
+    }
+    inspected_mod inspected = inspection.inspected;
+    bool found = inspection.found;
     if (found) {
       char *directory = qa_catalog_dirname(addon->content_directory);
       (void)mod_expectations(directory, addon->name, addon->content_directory,
@@ -1990,24 +2067,39 @@ static bool archive_maps(const qa_catalog_archive *archives, size_t count,
 
 static bool loose_walk(const char *root, const char *directory, map_list *out) {
   dir_list entries = {0};
-  if (!read_directory(directory, &entries, NULL)) return true;
+  read_directory_or_raise(directory, &entries); /* TS: no catch in the walk */
+  qa_cleanup entries_node;
+  qa_cleanup_push(&entries_node, dir_list_cleanup, &entries);
   for (size_t i = 0; i < entries.count; i++) {
     char *full = qa_catalog_join(directory, entries.values[i].name);
     char *path = full != NULL ? resolve_path(NULL, full) : NULL;
     free(full);
     if (path == NULL) continue;
     if (entries.values[i].is_directory) {
-      if (!loose_walk(root, path, out)) { free(path); dir_list_free(&entries); return false; }
+      qa_cleanup path_node;
+      qa_cleanup_push(&path_node, free, path);
+      bool walked = loose_walk(root, path, out);
+      qa_cleanup_pop(&path_node);
+      if (!walked) {
+        free(path);
+        qa_cleanup_pop(&entries_node);
+        dir_list_free(&entries);
+        return false;
+      }
       free(path);
     } else if (entries.values[i].is_file && is_bsp_path(entries.values[i].name)) {
       char *relative = relative_path(root, path);
       if (relative == NULL || !map_push_owned(out, relative, path, false, 0)) {
-        free(relative); free(path); dir_list_free(&entries); return false;
+        free(relative); free(path);
+        qa_cleanup_pop(&entries_node);
+        dir_list_free(&entries);
+        return false;
       }
     } else {
       free(path);
     }
   }
+  qa_cleanup_pop(&entries_node);
   dir_list_free(&entries);
   return true;
 }
@@ -2021,7 +2113,10 @@ static int compare_content_maps(const void *left, const void *right) {
 static bool loose_maps(const char *root, map_list *out) {
   char *maps_root = find_content_path(root, "maps");
   if (maps_root == NULL) return true;
+  qa_cleanup maps_root_node;
+  qa_cleanup_push(&maps_root_node, free, maps_root);
   bool ok = loose_walk(root, maps_root, out);
+  qa_cleanup_pop(&maps_root_node);
   free(maps_root);
   if (ok && out->count > 1)
     qa_js_sort(out->values, out->count, sizeof *out->values, compare_content_maps);
@@ -2046,11 +2141,18 @@ static bool archive_push(archive_list *list, qa_catalog_archive archive) {
   return true;
 }
 
+/* How a failed readdir is taken at each TS site: the loose root has no catch,
+ * scanArchives accepts only ENOENT, the add-on copy accepts anything. */
+typedef enum collect_mode { COLLECT_RAISE, COLLECT_MISSING_OK, COLLECT_ANY_OK } collect_mode;
 static void collect_archives(const char *directory, inspect_cache *cache,
-                             archive_list *out, qa_catalog_string_list *diagnostics) {
+                             archive_list *out, qa_catalog_string_list *diagnostics,
+                             collect_mode mode) {
   dir_list entries = {0};
   int error = 0;
-  if (!read_directory(directory, &entries, &error)) return;
+  if (!read_directory(directory, &entries, &error)) {
+    if (mode == COLLECT_ANY_OK || (mode == COLLECT_MISSING_OK && error == ENOENT) || error == 0) return;
+    qa_content_fs_error(error, "scandir", directory);
+  }
   for (size_t i = 0; i < entries.count; i++) {
     qa_archive_format format;
     if (!entries.values[i].is_file ||
@@ -2082,37 +2184,39 @@ static bool mod_description(const qa_catalog_product_expectation *product,
     char *path = anchored_path(&root_sets[i], roots[i], product->family, wanted);
     free(wanted);
     if (path == NULL) continue;
-    size_t length = 0;
-    uint8_t *bytes = read_file_prefix(path, 48, &length);
+    uint8_t bytes[48];
+    qa_cleanup path_node;
+    qa_cleanup_push(&path_node, free, path);
+    size_t length = read_file_prefix(path, bytes, sizeof bytes);
+    qa_cleanup_pop(&path_node);
     free(path);
-    if (bytes == NULL) continue; /* TS open would throw; first hit wins */
-    if (length == 0) { free(bytes); return true; }
+    if (length == 0) return true;
     size_t end = length;
     for (size_t j = 0; j < length; j++)
       if (bytes[j] == 0) { end = j; break; }
-    *title_out = qa_catalog_format("%.*s", (int)end, (const char *)bytes);
-    free(bytes);
-    return *title_out != NULL;
+    /* bytes.toString("latin1", 0, end): one character per byte, as UTF-8 text. */
+    char *title = (char *)malloc(end * 2 + 1);
+    if (title == NULL) return false;
+    size_t at = 0;
+    for (size_t j = 0; j < end; j++) {
+      if (bytes[j] < 0x80) title[at++] = (char)bytes[j];
+      else {
+        title[at++] = (char)(0xc0 | (bytes[j] >> 6));
+        title[at++] = (char)(0x80 | (bytes[j] & 0x3f));
+      }
+    }
+    title[at] = '\0';
+    *title_out = title;
+    return true;
   }
   return true;
 }
 
 /* ---- Required programs (TS missingPrograms) ---- */
 
-/* Node/Bun fs error text for the readdir and stat calls below. */
+/* Bun's fs error for the readdir and stat calls below. */
 static noreturn void catalog_fs_error(int code, const char *syscall, const char *path) {
-  static const struct { int code; const char *name, *text; } known[] = {
-      {ENOENT, "ENOENT", "no such file or directory"},
-      {ENOTDIR, "ENOTDIR", "not a directory"},
-      {EACCES, "EACCES", "permission denied"},
-      {EPERM, "EPERM", "operation not permitted"},
-      {ELOOP, "ELOOP", "too many symbolic links encountered"},
-      {ENAMETOOLONG, "ENAMETOOLONG", "name too long"},
-  };
-  for (size_t i = 0; i < sizeof known / sizeof known[0]; i++)
-    if (known[i].code == code)
-      qa_catalog_error("%s: %s, %s '%s'", known[i].name, known[i].text, syscall, path);
-  qa_catalog_error("%s", strerror(code));
+  qa_content_fs_error(code, syscall, path);
 }
 
 static const qa_catalog_discovered_product *catalog_product_by_id(
@@ -2153,6 +2257,10 @@ static bool loose_has(const char *root, const char *program) {
   char *directory = qa_catalog_dup(root);
   bool result = false;
   char *cursor = lower;
+  /* The listing and the stat raise on anything but a missing directory. */
+  qa_cleanup lower_node, directory_node;
+  qa_cleanup_push(&lower_node, free, lower);
+  qa_cleanup_push(&directory_node, string_slot_cleanup, &directory);
   for (;;) {
     char *slash = strchr(cursor, '/');
     if (slash != NULL) *slash = '\0';
@@ -2164,12 +2272,9 @@ static bool loose_has(const char *root, const char *program) {
       struct stat info;
       if (stat(path, &info) != 0) {
         int code = errno;
-        free(directory);
-        free(lower);
-        char text[4096];
-        snprintf(text, sizeof text, "%s", path);
-        free(path);
-        catalog_fs_error(code, "stat", text);
+        qa_cleanup path_node;
+        qa_cleanup_push(&path_node, free, path);
+        catalog_fs_error(code, "statx", path);
       }
       result = S_ISREG(info.st_mode);
       free(path);
@@ -2179,6 +2284,8 @@ static bool loose_has(const char *root, const char *program) {
     directory = path;
     cursor = slash + 1;
   }
+  qa_cleanup_pop(&directory_node);
+  qa_cleanup_pop(&lower_node);
   free(directory);
   free(lower);
   return result;
@@ -2201,6 +2308,18 @@ static bool has_program(const qa_catalog_discovered_product *product, const char
   return product->user_content != NULL && loose_has(product->user_content->root, program);
 }
 
+typedef struct missing_list {
+  char ***values;
+  size_t *count;
+} missing_list;
+static void missing_list_cleanup(void *raw) {
+  missing_list *list = (missing_list *)raw;
+  for (size_t i = 0; i < *list->count; i++) free((*list->values)[i]);
+  free(*list->values);
+  *list->values = NULL;
+  *list->count = 0;
+}
+
 /* TS missingPrograms: each required program is found in the product or
  * anywhere along its base chain. Malloc'd list (NULL when none missing). */
 static char **missing_programs(const qa_catalog_discovered_product *products, size_t count,
@@ -2220,6 +2339,10 @@ static char **missing_programs(const qa_catalog_discovered_product *products, si
                : catalog_product_by_id(products, count, link->expectation.base_product);
   }
   char **missing = NULL;
+  missing_list held = {&missing, out_count};
+  qa_cleanup chain_node, missing_node;
+  qa_cleanup_push(&chain_node, free, (void *)chain);
+  qa_cleanup_push(&missing_node, missing_list_cleanup, &held);
   for (size_t p = 0; p < product->expectation.required_program_count; p++) {
     const char *program = product->expectation.required_programs[p];
     bool found = false;
@@ -2230,42 +2353,198 @@ static char **missing_programs(const qa_catalog_discovered_product *products, si
     missing = grown;
     missing[(*out_count)++] = qa_catalog_dup(program);
   }
+  qa_cleanup_pop(&missing_node);
+  qa_cleanup_pop(&chain_node);
   free(chain);
   return missing;
+}
+
+char *qa_game_write_redirect(const char *explicit_root, const char *corpus_root) {
+  if (explicit_root != NULL && explicit_root[0] != '\0') return qa_node_path_resolve1(explicit_root);
+  const char *shared = getenv("QTS_TEST_GAME_WRITE_ROOT");
+  if (shared == NULL || shared[0] == '\0') return NULL;
+  /* createHash("sha256").update(resolve(corpusRoot)).digest("hex").slice(0, 16) */
+  char *corpus = qa_node_path_resolve1(corpus_root);
+  if (corpus == NULL) qa_raise("Error", 0, 0, "%s", "out of memory");
+  uint8_t digest[SHA256_DIGEST_LENGTH];
+  SHA256((const uint8_t *)corpus, strlen(corpus), digest);
+  free(corpus);
+  char name[17];
+  for (size_t i = 0; i < 8; i++) (void)snprintf(name + i * 2, 3, "%02x", (unsigned)digest[i]);
+  char *base = qa_node_path_resolve1(shared);
+  char *redirect = qa_node_path_join2(base, name);
+  free(base);
+  return redirect;
+}
+
+/* mkdir(path, { recursive: true }) */
+static bool make_directories(const char *path) {
+  char *copy = qa_catalog_dup(path);
+  if (copy == NULL) return false;
+  bool ok = true;
+  for (char *at = copy + 1; ok; at++) {
+    if (*at != '/' && *at != '\0') continue;
+    char saved = *at;
+    *at = '\0';
+    if (mkdir(copy, 0777) != 0 && errno != EEXIST) ok = false;
+    *at = saved;
+    if (saved == '\0') break;
+  }
+  int error = ok ? 0 : errno;
+  if (ok && !path_is_directory(copy)) { ok = false; error = ENOTDIR; }
+  free(copy);
+  errno = error;
+  return ok;
+}
+
+char *qa_game_download_directory(const char *corpus_root, qa_game_family family,
+                                 const char *content_directory, const char *redirect) {
+  const char *canonical = content_directory;
+  char *base = qa_game_write_redirect(redirect, corpus_root);
+  char *root = base != NULL ? qa_catalog_dup(base) : qa_node_path_resolve1(corpus_root);
+  if (root == NULL) qa_raise("Error", 0, 0, "%s", "out of memory");
+  char *game_root = NULL;
+  if (base == NULL) {
+    game_roots roots;
+    resolve_game_roots(root, &roots);
+    if (roots.roots[family] != NULL) game_root = qa_catalog_dup(roots.roots[family]);
+    qa_game_roots_free(&roots);
+  }
+  char *relative = game_root != NULL ? qa_game_relative_path(canonical, family) : NULL;
+  char *path = game_root == NULL ? find_content_path(root, canonical) : find_content_path(game_root, relative);
+  if (path == NULL) path = game_root == NULL ? qa_node_path_join2(root, canonical) : qa_node_path_join2(game_root, relative);
+  free(relative);
+  free(game_root);
+  free(root);
+  free(base);
+  if (!make_directories(path)) {
+    int error = errno;
+    qa_cleanup node;
+    qa_cleanup_push(&node, free, path);
+    qa_content_fs_error(error != 0 ? error : ENOTDIR, "mkdir", path);
+  }
+  return path;
+}
+
+/* What discoverInstalledContent holds while a directory read can still throw.
+ * The TypeScript leaves all of it to the collector; a raise here releases it. */
+typedef struct discovery_work {
+  char **strings[3];
+  expectation_list *expectations[6];
+  qa_catalog_string_list *lists[3];
+  qa_catalog_addon_directory_list *addons[3];
+  game_roots *roots[2];
+  inspect_cache *cache;
+  archive_list *root_archives;
+  qa_catalog_discovered_product **products;
+  size_t *product_count;
+} discovery_work;
+static void archive_list_release(archive_list *list) {
+  for (size_t i = 0; i < list->count; i++) qa_catalog_archive_free(&list->values[i]);
+  free(list->values);
+  memset(list, 0, sizeof *list);
+}
+static void discovery_work_cleanup(void *raw) {
+  discovery_work *work = (discovery_work *)raw;
+  for (size_t i = 0; i < 3; i++) { free(*work->strings[i]); *work->strings[i] = NULL; }
+  for (size_t i = 0; i < 6; i++) expectation_list_free(work->expectations[i]);
+  for (size_t i = 0; i < 3; i++) qa_catalog_string_list_free(work->lists[i]);
+  for (size_t i = 0; i < 3; i++) qa_catalog_addon_directory_list_free(work->addons[i]);
+  for (size_t i = 0; i < 2; i++) qa_game_roots_free(work->roots[i]);
+  inspect_cache_free(work->cache);
+  memset(work->cache, 0, sizeof *work->cache);
+  archive_list_release(work->root_archives);
+  for (size_t i = 0; i < *work->product_count; i++)
+    qa_catalog_discovered_product_free(&(*work->products)[i]);
+  free(*work->products);
+  *work->products = NULL;
+  *work->product_count = 0;
+}
+/* One product's working set, held until its last directory read. */
+typedef struct discovery_product_work {
+  char **strings[4];
+  archive_list *archives[4];
+  qa_catalog_string_list *lists[4];
+  map_list *maps[4];
+} discovery_product_work;
+static void discovery_product_work_cleanup(void *raw) {
+  discovery_product_work *work = (discovery_product_work *)raw;
+  for (size_t i = 0; i < 4; i++) {
+    free(*work->strings[i]);
+    archive_list_release(work->archives[i]);
+    qa_catalog_string_list_free(work->lists[i]);
+    map_list_free(work->maps[i]);
+  }
+}
+/* The checked requirement rows, held while the program lookups can throw. */
+typedef struct discovery_requirements {
+  char ***rows;
+  size_t *counts;
+  size_t count;
+} discovery_requirements;
+static void discovery_requirements_cleanup(void *raw) {
+  discovery_requirements *table = (discovery_requirements *)raw;
+  for (size_t i = 0; i < table->count; i++) {
+    for (size_t j = 0; j < table->counts[i]; j++) free(table->rows[i][j]);
+    free(table->rows[i]);
+  }
+  free(table->rows);
+  free(table->counts);
+}
+static void expectation_cleanup(void *raw) {
+  expectation_free((qa_catalog_product_expectation *)raw);
 }
 
 bool qa_discover_installed_content(const qa_discover_content_options *options,
                                    qa_content_catalog *out) {
   memset(out, 0, sizeof *out);
+  expectation_list expected = {0}, corpus_mods = {0}, user_mods = {0}, addon_mods = {0};
+  expectation_list combined = {0}, expectations = {0};
+  qa_catalog_string_list remote_overlays = {0}, user_mod_ids = {0}, addon_mod_ids = {0};
+  qa_catalog_addon_directory_list addon_directories = {0}, siblings = {0}, steam = {0};
+  inspect_cache cache = {0};
+  game_roots corpus_roots = {0}, user_roots = {0};
+  archive_list root_archives = {0};
+  qa_catalog_discovered_product *products = NULL;
+  size_t product_count = 0;
   char *corpus_root = resolve_path(NULL, options->corpus_root);
   char *user_root = options->user_content_root != NULL
                         ? resolve_path(NULL, options->user_content_root) : NULL;
   double generation_number = options->has_generation ? options->generation : 0;
+  char *game_writes = qa_game_write_redirect(options->game_write_root, corpus_root);
   if (!(generation_number >= 0 && generation_number <= 9007199254740991.0 &&
         generation_number == (double)(int64_t)generation_number)) {
-    free(corpus_root); free(user_root);
+    free(corpus_root); free(user_root); free(game_writes);
     qa_range_error("Catalog generation must be a nonnegative integer");
   }
+  discovery_work work = {
+      {&corpus_root, &user_root, &game_writes},
+      {&expected, &corpus_mods, &user_mods, &addon_mods, &combined, &expectations},
+      {&remote_overlays, &addon_mod_ids, &user_mod_ids},
+      {&siblings, &steam, &addon_directories},
+      {&corpus_roots, &user_roots},
+      &cache, &root_archives, &products, &product_count};
+  qa_cleanup work_node;
+  qa_cleanup_push(&work_node, discovery_work_cleanup, &work);
   int64_t generation = (int64_t)generation_number;
   const qa_catalog_product_expectation *stock = options->products;
   size_t stock_count = options->product_count;
   if (stock == NULL) { stock = qa_expected_products; stock_count = qa_expected_product_count; }
-  expectation_list expected = {0};
   for (size_t i = 0; i < stock_count; i++) {
     qa_catalog_product_expectation copy = {0};
     if (!expectation_dup(&stock[i], &copy) || !expectation_push(&expected, copy)) {
       expectation_free(&copy);
-      expectation_list_free(&expected);
-      free(corpus_root); free(user_root);
+      qa_cleanup_pop(&work_node);
+      discovery_work_cleanup(&work);
       return false;
     }
   }
-  qa_catalog_string_list remote_overlays = {0};
   bool has_remote = options->remote_content != NULL;
   if (has_remote) {
     qa_catalog_product_expectation remote = {0};
     if (!remote_expectation(options->remote_content, stock, stock_count, &remote)) {
-      expectation_list_free(&expected); free(corpus_root); free(user_root);
+      qa_cleanup_pop(&work_node);
+      discovery_work_cleanup(&work);
       return false;
     }
     if (strcmp(remote.id, options->remote_content->base) != 0)
@@ -2279,18 +2558,14 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
   if (has_remote && strcmp(options->remote_content->base, "q1-quakeworld") == 0)
     (void)qa_catalog_string_push(&remote_overlays,
                                  qa_catalog_dup(options->remote_content->base));
-  inspect_cache cache = {0};
   cache.inspector = options->inspector;
-  game_roots corpus_roots, user_roots;
   resolve_game_roots(corpus_root, &corpus_roots);
   if (user_root != NULL) resolve_game_roots(user_root, &user_roots);
   else { memset(&user_roots, 0, sizeof user_roots); for (int i = 0; i < 3; i++) user_roots.roots[i] = qa_catalog_dup(corpus_roots.roots[i] != NULL ? corpus_roots.roots[i] : ""); for (int i = 0; i < 3; i++) if (corpus_roots.roots[i] == NULL) { free(user_roots.roots[i]); user_roots.roots[i] = NULL; } }
-  expectation_list corpus_mods = {0}, user_mods = {0}, addon_mods = {0};
   if (options->discover_mods)
     (void)discover_mods(corpus_root, expected.values, expected.count, &cache,
                         &corpus_roots, &corpus_mods);
   if (options->discover_mods && user_root != NULL) {
-    expectation_list combined = {0};
     for (size_t i = 0; i < expected.count; i++) {
       qa_catalog_product_expectation copy = {0};
       if (expectation_dup(&expected.values[i], &copy)) (void)expectation_push(&combined, copy);
@@ -2303,7 +2578,6 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
                         &user_roots, &user_mods);
     expectation_list_free(&combined);
   }
-  qa_catalog_addon_directory_list siblings = {0}, steam = {0}, addon_directories = {0};
   {
     const game_roots *sets[2] = {&corpus_roots, &user_roots};
     size_t set_count = user_root == NULL ? 1 : 2;
@@ -2342,7 +2616,6 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
   qa_catalog_addon_directory_list_free(&siblings);
   qa_catalog_addon_directory_list_free(&steam);
   if (options->discover_mods) {
-    expectation_list combined = {0};
     const expectation_list *groups[3] = {&expected, &corpus_mods, &user_mods};
     for (size_t g = 0; g < 3; g++)
       for (size_t i = 0; i < groups[g]->count; i++) {
@@ -2354,14 +2627,12 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
                               &cache, &addon_mods);
     expectation_list_free(&combined);
   }
-  qa_catalog_string_list addon_mod_ids = {0}, user_mod_ids = {0};
   for (size_t i = 0; i < addon_mods.count; i++)
     (void)qa_catalog_string_push(&addon_mod_ids, qa_catalog_dup(addon_mods.values[i].id));
   for (size_t i = 0; i < user_mods.count; i++)
     (void)qa_catalog_string_push(&user_mod_ids, qa_catalog_dup(user_mods.values[i].id));
   for (size_t i = 0; i < remote_overlays.count; i++)
     (void)qa_catalog_string_push(&user_mod_ids, qa_catalog_dup(remote_overlays.values[i]));
-  expectation_list expectations = {0};
   {
     const expectation_list *groups[4] = {&expected, &corpus_mods, &user_mods, &addon_mods};
     const char *description_roots[2] = {corpus_root, user_root};
@@ -2383,8 +2654,11 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
           if (strcmp(stock[s].id, copy.id) == 0) is_stock = true;
         if (!is_stock) {
           char *title = NULL;
+          qa_cleanup copy_node;
+          qa_cleanup_push(&copy_node, expectation_cleanup, &copy);
           (void)mod_description(&copy, description_roots, description_sets,
                                 description_count, &title);
+          qa_cleanup_pop(&copy_node);
           if (title != NULL) {
             free((void *)copy.title);
             copy.title = title;
@@ -2399,14 +2673,23 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
   expectation_list_free(&corpus_mods);
   expectation_list_free(&user_mods);
   expectation_list_free(&addon_mods);
-  qa_catalog_discovered_product *products = NULL;
   if (expectations.count > 0)
     products = (qa_catalog_discovered_product *)calloc(expectations.count,
                                                        sizeof *products);
-  archive_list root_archives = {0};
-  size_t product_count = 0;
   for (size_t e = 0; e < expectations.count; e++) {
     qa_catalog_product_expectation *expectation = &expectations.values[e];
+    char *content_id = NULL, *loose_root = NULL, *user_product_root = NULL, *redirected_root = NULL;
+    archive_list found = {0}, user_archives = {0}, redirected_archives = {0}, addon_archives = {0};
+    qa_catalog_string_list diagnostics = {0}, user_diagnostics = {0};
+    qa_catalog_string_list redirected_diagnostics = {0}, addon_diagnostics = {0};
+    map_list corpus_maps = {0}, addon_maps = {0}, all_maps = {0}, corpus_maps_copy = {0};
+    discovery_product_work held = {
+        {&content_id, &loose_root, &user_product_root, &redirected_root},
+        {&found, &user_archives, &redirected_archives, &addon_archives},
+        {&diagnostics, &user_diagnostics, &redirected_diagnostics, &addon_diagnostics},
+        {&corpus_maps, &addon_maps, &all_maps, &corpus_maps_copy}};
+    qa_cleanup held_node;
+    qa_cleanup_push(&held_node, discovery_product_work_cleanup, &held);
     char *normalized = qa_catalog_normalize_resource_path(expectation->content_directory);
     free(normalized);
     qa_content_identity identity = {0};
@@ -2414,15 +2697,13 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
     identity.edition = expectation->edition;
     identity.package = expectation->campaign;
     identity.revision = "installed";
-    char *content_id = qa_create_content_id(identity);
+    content_id = qa_create_content_id(identity);
     char *root_path = anchored_path(&corpus_roots, corpus_root, expectation->family,
                                     expectation->content_directory);
-    char *loose_root = root_path != NULL && path_is_directory(root_path) ? root_path : NULL;
+    loose_root = root_path != NULL && path_is_directory(root_path) ? root_path : NULL;
     if (loose_root == NULL) free(root_path);
-    archive_list found = {0};
-    qa_catalog_string_list diagnostics = {0};
     if (loose_root != NULL) {
-      collect_archives(loose_root, &cache, &found, &diagnostics);
+      collect_archives(loose_root, &cache, &found, &diagnostics, COLLECT_RAISE);
       if (strcmp(expectation->edition, "rerelease") == 0) {
         const char *kpf = expectation->family == QA_GAME_FAMILY_Q1
                               ? "QuakeEX.kpf" : "Q2Game.kpf";
@@ -2448,7 +2729,6 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
         }
       }
     }
-    char *user_product_root = NULL;
     if (user_root != NULL && strcmp(user_root, corpus_root) != 0) {
       user_product_root = anchored_path(&user_roots, user_root, expectation->family,
                                         expectation->content_directory);
@@ -2456,30 +2736,31 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
         user_product_root = user_product_directory(user_root,
                                                    expectation->content_directory);
     }
-    archive_list user_archives = {0};
-    qa_catalog_string_list user_diagnostics = {0};
-    if (user_product_root != NULL && path_is_directory(user_product_root))
-      collect_archives(user_product_root, &cache, &user_archives, &user_diagnostics);
+    if (user_product_root != NULL)
+      collect_archives(user_product_root, &cache, &user_archives, &user_diagnostics, COLLECT_MISSING_OK);
+    redirected_root = game_writes == NULL ? NULL
+        : find_content_path(game_writes, expectation->content_directory);
+    if (redirected_root != NULL)
+      collect_archives(redirected_root, &cache, &redirected_archives, &redirected_diagnostics, COLLECT_MISSING_OK);
     const qa_catalog_addon_directory *addon = NULL;
     if (loose_root == NULL)
       addon = qa_catalog_addon_directory_find(&addon_directories,
                                               expectation->content_directory);
-    archive_list addon_archives = {0};
-    qa_catalog_string_list addon_diagnostics = {0};
     if (addon != NULL)
-      collect_archives(addon->physical, &cache, &addon_archives, &addon_diagnostics);
-    map_list corpus_maps = {0}, addon_maps = {0}, all_maps = {0};
+      collect_archives(addon->physical, &cache, &addon_archives, &addon_diagnostics, COLLECT_ANY_OK);
     (void)archive_maps(found.values, found.count, &corpus_maps);
     if (loose_root != NULL) (void)loose_maps(loose_root, &corpus_maps);
     (void)archive_maps(addon_archives.values, addon_archives.count, &addon_maps);
     if (addon != NULL) (void)loose_maps(addon->physical, &addon_maps);
+    (void)archive_maps(redirected_archives.values, redirected_archives.count, &all_maps);
+    if (redirected_root != NULL) (void)loose_maps(redirected_root, &all_maps);
     (void)archive_maps(user_archives.values, user_archives.count, &all_maps);
     if (user_product_root != NULL) (void)loose_maps(user_product_root, &all_maps);
     (void)map_list_extend(&all_maps, &corpus_maps);
-    map_list corpus_maps_copy = {0};
     (void)archive_maps(found.values, found.count, &corpus_maps_copy);
     if (loose_root != NULL) (void)loose_maps(loose_root, &corpus_maps_copy);
     (void)map_list_extend(&all_maps, &addon_maps);
+    qa_cleanup_pop(&held_node); /* nothing below reads a directory that can throw */
     bool is_user_mod = qa_catalog_string_contains(
         (const char *const *)user_mod_ids.values, user_mod_ids.count, expectation->id);
     bool is_addon_mod = qa_catalog_string_contains(
@@ -2490,10 +2771,14 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
     qa_catalog_string_list requirements = {0};
     for (size_t i = 0; i < diagnostics.count; i++)
       (void)qa_catalog_string_push(&requirements, qa_catalog_dup(diagnostics.values[i]));
-    if (is_user_mod)
+    if (is_user_mod) {
+      for (size_t i = 0; i < redirected_diagnostics.count; i++)
+        (void)qa_catalog_string_push(&requirements,
+                                     qa_catalog_dup(redirected_diagnostics.values[i]));
       for (size_t i = 0; i < user_diagnostics.count; i++)
         (void)qa_catalog_string_push(&requirements,
                                      qa_catalog_dup(user_diagnostics.values[i]));
+    }
     if (is_addon_mod)
       for (size_t i = 0; i < addon_diagnostics.count; i++)
         (void)qa_catalog_string_push(&requirements,
@@ -2565,11 +2850,13 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
       product->availability.kind = QA_CATALOG_INSTALLED;
     }
     qa_catalog_string_list_free(&requirements);
-    size_t total_archives = user_archives.count + found.count + addon_archives.count;
+    size_t total_archives = redirected_archives.count + user_archives.count + found.count + addon_archives.count;
     if (total_archives > 0) {
       product->archives = (qa_catalog_archive *)calloc(total_archives,
                                                        sizeof *product->archives);
       size_t slot = 0;
+      for (size_t i = 0; i < redirected_archives.count; i++)
+        product->archives[slot++] = redirected_archives.values[i];
       for (size_t i = 0; i < user_archives.count; i++)
         product->archives[slot++] = user_archives.values[i];
       for (size_t i = 0; i < found.count; i++)
@@ -2578,8 +2865,24 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
         product->archives[slot++] = addon_archives.values[i];
       product->archive_count = slot;
     }
-    free(user_archives.values); free(found.values); free(addon_archives.values);
+    free(redirected_archives.values); free(user_archives.values); free(found.values); free(addon_archives.values);
     product->loose_root = loose_root;
+    if (redirected_root != NULL) {
+      product->redirected_content =
+          (qa_catalog_directory_content *)calloc(1, sizeof *product->redirected_content);
+      if (product->redirected_content != NULL) {
+        product->redirected_content->root = redirected_root;
+        if (redirected_archives.count > 0) {
+          product->redirected_content->archives = (qa_catalog_archive **)malloc(
+              redirected_archives.count * sizeof *product->redirected_content->archives);
+          for (size_t i = 0; i < redirected_archives.count; i++)
+            product->redirected_content->archives[i] = &product->archives[i];
+          product->redirected_content->archive_count = redirected_archives.count;
+        }
+      } else {
+        free(redirected_root);
+      }
+    }
     if (user_product_root != NULL) {
       product->user_content =
           (qa_catalog_directory_content *)calloc(1, sizeof *product->user_content);
@@ -2589,7 +2892,7 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
           product->user_content->archives = (qa_catalog_archive **)malloc(
               user_archives.count * sizeof *product->user_content->archives);
           for (size_t i = 0; i < user_archives.count; i++)
-            product->user_content->archives[i] = &product->archives[i];
+            product->user_content->archives[i] = &product->archives[redirected_archives.count + i];
           product->user_content->archive_count = user_archives.count;
         }
       } else {
@@ -2602,7 +2905,7 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
       if (product->addon_content != NULL) {
         product->addon_content->root = qa_catalog_dup(addon->physical);
         if (addon_archives.count > 0) {
-          size_t offset = user_archives.count + found.count;
+          size_t offset = redirected_archives.count + user_archives.count + found.count;
           product->addon_content->archives = (qa_catalog_archive **)malloc(
               addon_archives.count * sizeof *product->addon_content->archives);
           for (size_t i = 0; i < addon_archives.count; i++)
@@ -2616,6 +2919,8 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
     qa_catalog_string_list all_diagnostics = {0};
     for (size_t i = 0; i < diagnostics.count; i++)
       (void)qa_catalog_string_push(&all_diagnostics, qa_catalog_dup(diagnostics.values[i]));
+    for (size_t i = 0; i < redirected_diagnostics.count; i++)
+      (void)qa_catalog_string_push(&all_diagnostics, qa_catalog_dup(redirected_diagnostics.values[i]));
     for (size_t i = 0; i < user_diagnostics.count; i++)
       (void)qa_catalog_string_push(&all_diagnostics, qa_catalog_dup(user_diagnostics.values[i]));
     for (size_t i = 0; i < addon_diagnostics.count; i++)
@@ -2624,8 +2929,11 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
     product->diagnostic_count = all_diagnostics.count;
     qa_catalog_string_list_free(&diagnostics);
     qa_catalog_string_list_free(&user_diagnostics);
+    qa_catalog_string_list_free(&redirected_diagnostics);
     qa_catalog_string_list_free(&addon_diagnostics);
   }
+  free(game_writes);
+  game_writes = NULL;
   expectation_list_free(&expectations);
   /* Checked base products and programs. TS reads each base's availability
    * from the unchecked products, so results are decided first, then applied. */
@@ -2634,6 +2942,9 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
     size_t *requirement_counts = product_count != 0 ? calloc(product_count, sizeof *requirement_counts) : NULL;
     if (product_count != 0 && (requirements == NULL || requirement_counts == NULL))
       qa_range_error("Out of memory");
+    discovery_requirements table = {requirements, requirement_counts, product_count};
+    qa_cleanup table_node;
+    qa_cleanup_push(&table_node, discovery_requirements_cleanup, &table);
     for (size_t i = 0; i < product_count; i++) {
       const qa_catalog_discovered_product *product = &products[i];
       if (product->availability.kind != QA_CATALOG_INSTALLED) continue;
@@ -2653,6 +2964,8 @@ bool qa_discover_installed_content(const qa_discover_content_options *options,
         continue;
       requirements[i] = missing_programs(products, product_count, product, &requirement_counts[i]);
     }
+    qa_cleanup_pop(&table_node);
+    qa_cleanup_pop(&work_node);
     for (size_t i = 0; i < product_count; i++) {
       if (requirement_counts[i] == 0) {
         free(requirements[i]);

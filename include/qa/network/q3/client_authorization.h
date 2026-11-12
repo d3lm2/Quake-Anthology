@@ -18,6 +18,10 @@ typedef struct qa_q3_client_authorization_options {
   qa_q3_auth_resolve_fn resolve; /* may be NULL */
   qa_q3_message_print_fn print; void *print_ctx;
   void *ctx;
+  /* Optional getters (TS `get cvars()` / a keys object reading a live owner): when set they are called with ctx at
+   * each TS access instead of reading `cvars` / `keys`, and may raise. */
+  qa_cvar_registry *(*cvars_of)(void *ctx);
+  const qa_q3_cd_key_state *(*keys_of)(void *ctx);
 } qa_q3_client_authorization_options;
 typedef void (*qa_q3_client_auth_assert_fn)(void *ctx);
 typedef void (*qa_q3_client_auth_send_fn)(void *ctx, const qa_q3_mirror_ipv4_address *address, const uint8_t *packet, size_t len);

@@ -4,6 +4,8 @@
 #define QA_Q2MP_INTERNAL_H
 #include "qa/foundation/js.h"
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qa/content/q2/foundation/monsters/types.h"
@@ -126,6 +128,22 @@ static inline bool q2mp_entity_present(qa_q2_game_services *g, const qa_q2_entit
   for (size_t i = 0; i < n; i++) if (entities[i] == e) return true;
   return false;
 }
+/* TS game.host.diagnostic(`...`): a template string has no length limit, so the text is sized, not cut. */
+static inline void q2mp_diagnosticf(qa_q2_game_services *g, const char *format, ...) {
+  va_list args, copy;
+  va_start(args, format);
+  va_copy(copy, args);
+  int need = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *text = need < 0 ? NULL : malloc((size_t)need + 1);
+  if (text == NULL) { va_end(args); qa_raise("Error", 0, 0, "Out of memory formatting a Q2 diagnostic"); }
+  (void)vsnprintf(text, (size_t)need + 1, format, args);
+  va_end(args);
+  g->host->diagnostic(g->host->ctx, text);
+  free(text);
+}
+/* JS truthiness of a number: 0, -0 and NaN are falsy (`x || fallback`, `x ||= fallback`). */
+static inline bool q2mp_truthy(double v) { return v != 0 && !isnan(v); }
 static inline bool q2mp_touch_eq(qa_q2_touch a, qa_q2_touch b) { return a.fn == b.fn && a.ctx == b.ctx; }
 static inline bool q2mp_use_eq(qa_q2_use a, qa_q2_use b) { return a.fn == b.fn && a.ctx == b.ctx; }
 static inline bool q2mp_die_eq(qa_q2_die a, qa_q2_die b) { return a.fn == b.fn && a.ctx == b.ctx; }

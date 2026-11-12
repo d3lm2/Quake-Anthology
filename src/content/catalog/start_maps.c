@@ -3,6 +3,8 @@
 #include "qa/content/catalog/start_maps.h"
 
 #include "catalog_internal.h"
+#include "qa/content/json_text.h"
+#include "qa/foundation/js.h"
 #include "qa/persistence/value.h"
 
 static bool is_record(const qa_save_value *value) {
@@ -52,11 +54,26 @@ void qa_authored_starts_free(qa_authored_starts *starts) {
   starts->episode = NULL; starts->starts = NULL; starts->start_count = 0;
 }
 
+/* A malformed database raises; what was built so far is released. */
+typedef struct starts_parse {
+  qa_save_value *value;
+  qa_authored_starts *out;
+} starts_parse;
+static void starts_parse_release(void *arg) {
+  starts_parse *parse = (starts_parse *)arg;
+  qa_save_value_free(parse->value);
+  qa_authored_starts_free(parse->out);
+}
+
 bool qa_parse_authored_starts(const uint8_t *bytes, size_t length,
                               const char *campaign, qa_authored_starts *out) {
   memset(out, 0, sizeof *out);
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  /* new TextDecoder().decode(bytes) drops a leading byte order mark. */
+  qa_save_value *value = qa_content_parse_json_lenient(bytes, length);
   if (value == NULL) return false;
+  starts_parse parse = {value, out};
+  qa_cleanup node;
+  qa_cleanup_push(&node, starts_parse_release, &parse);
   const qa_save_value *database = record(value);
   const char *episode_id = strcmp(campaign, "ctf") == 0 ? "baseq2" : campaign;
   size_t count = 0;
@@ -65,7 +82,8 @@ bool qa_parse_authored_starts(const uint8_t *bytes, size_t length,
     const qa_save_value *row = record(episodes->items[i]);
     if (strcmp(string_field(qa_save_value_get(row, "id")), episode_id) != 0) continue;
     qa_authored_episode *episode = (qa_authored_episode *)calloc(1, sizeof *episode);
-    if (episode == NULL) { qa_save_value_free(value); return false; }
+    if (episode == NULL) { qa_cleanup_pop(&node); qa_save_value_free(value); return false; }
+    out->episode = episode;
     episode->id = qa_catalog_dup(string_field(qa_save_value_get(row, "id")));
     episode->command = qa_catalog_dup(string_field(qa_save_value_get(row, "command")));
     episode->name = qa_catalog_dup(string_field(qa_save_value_get(row, "name")));
@@ -78,11 +96,12 @@ bool qa_parse_authored_starts(const uint8_t *bytes, size_t length,
   size_t capacity = 0;
   for (size_t i = 0; i < count; i++) {
     const qa_save_value *row = record(maps->items[i]);
+    /* TS order: the episode string first; the flag only for a matching row. */
+    if (strcmp(string_field(qa_save_value_get(row, "episode")), episode_id) != 0) continue;
     bool wanted = strcmp(campaign, "ctf") == 0
                       ? flag_field(qa_save_value_get(row, "ctf"))
                       : flag_field(qa_save_value_get(row, "sp"));
-    if (strcmp(string_field(qa_save_value_get(row, "episode")), episode_id) != 0 || !wanted)
-      continue;
+    if (!wanted) continue;
     const char *bsp = string_field(qa_save_value_get(row, "bsp"));
     const char *last = strrchr(bsp, '+');
     last = last != NULL ? last + 1 : bsp;
@@ -90,18 +109,21 @@ bool qa_parse_authored_starts(const uint8_t *bytes, size_t length,
     bool bad = name[0] == '\0';
     for (size_t j = 0; name[j] != '\0' && !bad; j++)
       if (name[j] == '+' || name[j] == '*' || name[j] == '$' || name[j] == ';' ||
-          isspace((unsigned char)name[j])) bad = true;
+          qa_js_white_space_length(name + j) != 0) bad = true; /* regex \s */
     if (bad) qa_catalog_error("Invalid mapdb.json start BSP: %s", bsp);
     char *path_input = qa_catalog_format("maps/%s.bsp", name);
-    if (path_input == NULL) { qa_save_value_free(value); qa_authored_starts_free(out); return false; }
+    if (path_input == NULL) { qa_cleanup_pop(&node); qa_save_value_free(value); qa_authored_starts_free(out); return false; }
+    qa_cleanup input_node;
+    qa_cleanup_push(&input_node, free, path_input);
     char *path = qa_catalog_normalize_resource_path(path_input);
+    qa_cleanup_pop(&input_node);
     free(path_input);
-    if (path == NULL) { qa_save_value_free(value); qa_authored_starts_free(out); return false; }
+    if (path == NULL) { qa_cleanup_pop(&node); qa_save_value_free(value); qa_authored_starts_free(out); return false; }
     if (out->start_count == capacity) {
       size_t next = capacity != 0 ? capacity * 2 : 8;
       qa_authored_start_map *grown =
           (qa_authored_start_map *)realloc(out->starts, next * sizeof *grown);
-      if (grown == NULL) { free(path); qa_save_value_free(value); qa_authored_starts_free(out); return false; }
+      if (grown == NULL) { free(path); qa_cleanup_pop(&node); qa_save_value_free(value); qa_authored_starts_free(out); return false; }
       out->starts = grown; capacity = next;
     }
     qa_authored_start_map *start = &out->starts[out->start_count++];
@@ -115,6 +137,7 @@ bool qa_parse_authored_starts(const uint8_t *bytes, size_t length,
     start->cooperative = flag_field(qa_save_value_get(row, "coop"));
     start->capture_the_flag = flag_field(qa_save_value_get(row, "ctf"));
   }
+  qa_cleanup_pop(&node);
   qa_save_value_free(value);
   return true;
 }

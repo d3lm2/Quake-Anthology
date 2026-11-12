@@ -22,6 +22,9 @@ static const qa_q2_item_definition *native_item(const qa_q2_foreign_item_service
   return strncmp(destination, "q2:", 3) == 0 ? s->item(s->ctx, destination + 3) : NULL;
 }
 
+/* JS `value || fallback` for numbers: 0 and NaN both take the fallback. */
+static double number_or(double value, double fallback) { return value != 0 && value == value ? value : fallback; }
+
 static bool ammo_pickup(void *ctx, qa_q2_entity *e, qa_q2_game_services *g, qa_owned_actor player) {
   const foreign_pickup *fc = ctx;
   const qa_q2_foreign_item_services *s = fc->services;
@@ -34,7 +37,7 @@ static bool ammo_pickup(void *ctx, qa_q2_entity *e, qa_q2_game_services *g, qa_o
   if (destination == NULL) return false;
   const qa_q2_item_definition *native = native_item(s, destination);
   s->ensure(s->ctx, player, g, destination, native != NULL && strcmp(native->kind, "ammo") == 0 ? native->capacity : 200);
-  return qa_shared_inventory_table_give(g->host->inventory, player, destination, e->count != 0 ? e->count : fc->row->quantity) != 0;
+  return qa_shared_inventory_table_give(g->host->inventory, player, destination, number_or(e->count, fc->row->quantity)) != 0;
 }
 
 static bool weapon_pickup(void *ctx, qa_q2_entity *e, qa_q2_game_services *g, qa_owned_actor player) {
@@ -59,7 +62,7 @@ static bool weapon_pickup(void *ctx, qa_q2_entity *e, qa_q2_game_services *g, qa
     const qa_q2_item_definition *ammo = native_item(s, grants[i].item);
     if (ammo == NULL || strcmp(ammo->kind, "ammo") != 0) continue;
     s->ensure(s->ctx, player, g, grants[i].item, ammo->capacity);
-    ammo_given += qa_shared_inventory_table_give(g->host->inventory, player, grants[i].item, e->count != 0 ? e->count : grants[i].amount);
+    ammo_given += qa_shared_inventory_table_give(g->host->inventory, player, grants[i].item, number_or(e->count, grants[i].amount));
   }
   if (previous == 0) s->weapon_picked(s->ctx, player.id, destination, true);
   return previous == 0 || ammo_given > 0;
@@ -125,7 +128,7 @@ static bool holdable_pickup(void *ctx, qa_q2_entity *e, qa_q2_game_services *g, 
     case 2: {
       qa_combat_state_result combat = qa_gameplay_authority_read(g->host->combat, player.id);
       double health = combat.has_value ? combat.value.health : 0;
-      double maximum = player_entity != NULL && player_entity->max_health != 0 ? player_entity->max_health : 100;
+      double maximum = player_entity != NULL ? number_or(player_entity->max_health, 100) : 100;
       if (health < 1 || health >= maximum) return false;
       qa_gameplay_authority_set_health(g->host->combat, player, maximum);
       return true;

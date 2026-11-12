@@ -284,13 +284,9 @@ double qa_seat_console_animate(qa_seat_console *console, bool open,
                                double target_fraction) {
   double target = open ? target_fraction : 0;
   double step = speed * elapsed_milliseconds / 1000;
-  if (console->fraction < target) {
-    double next = console->fraction + step;
-    console->fraction = next < target ? next : target;
-  } else {
-    double next = console->fraction - step;
-    console->fraction = next > target ? next : target;
-  }
+  /* Math.min/Math.max keep a NaN step or fraction (fmin-style selects dropped it). */
+  console->fraction = console->fraction < target ? qa_js_min(target, console->fraction + step)
+                                                 : qa_js_max(target, console->fraction - step);
   return console->fraction;
 }
 
@@ -300,6 +296,8 @@ void qa_seat_console_submit(qa_seat_console *console) {
     free(text);
     return;
   }
+  qa_cleanup text_guard;
+  qa_cleanup_push(&text_guard, free, text);
   size_t length = strlen(text);
   char *echo = (char *)malloc(length + 3);
   if (echo != NULL) {
@@ -307,13 +305,19 @@ void qa_seat_console_submit(qa_seat_console *console) {
     qa_seat_console_print(console, echo);
     free(echo);
   }
-  /* text.trimStart(): JS white space and line terminators. */
+  /* text.trimStart(): JS white space and line terminators (the field text is UTF-8). */
   const char *command_text = text;
   for (size_t skip = qa_js_white_space_length(command_text); skip != 0;
        skip = qa_js_white_space_length(command_text))
     command_text += skip;
   bool explicit = command_text[0] == '/' || command_text[0] == '\\';
-  const char *body = explicit ? command_text + 1 : command_text;
+  /* tokenizeCommand's sourceCommandText: the command becomes console text here, and a character above U+00FF
+   * refuses it (the echo is printed, the field and history keep their state). */
+  char *body = NULL;
+  if (!qa_command_text_from_utf8(explicit ? command_text + 1 : command_text, &body))
+    qa_raise("RangeError", 0, 0, "%s", "Command text requires source bytes");
+  qa_cleanup body_guard;
+  qa_cleanup_push(&body_guard, free, body);
   qa_command_tokens tokens;
   const char *first = "";
   bool have_tokens = qa_tokenize_command(body, console->options.dialect,
@@ -342,9 +346,12 @@ void qa_seat_console_submit(qa_seat_console *console) {
       free(line);
     }
   }
+  qa_cleanup_pop(&body_guard);
+  free(body);
   qa_console_history_add(&console->history, text);
   qa_console_field_clear(&console->field);
   qa_console_buffer_bottom(&console->buffer);
+  qa_cleanup_pop(&text_guard);
   free(text);
 }
 
@@ -372,6 +379,7 @@ bool qa_seat_console_input(qa_seat_console *console, const qa_seat_input_event *
   if (!is_chat && strcmp(focus_kind, "console") != 0) return false;
   qa_console_field *field = is_chat ? &console->chat_field : &console->field;
   if (strcmp(kind, "text") == 0) {
+    /* The platform's text is UTF-8, as the field holds it (field.h). */
     qa_console_field_insert(field, event->text == NULL ? "" : event->text);
     return true;
   }

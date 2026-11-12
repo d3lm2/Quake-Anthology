@@ -49,7 +49,8 @@ typedef struct qa_bot_id_origin { int64_t entity; qa_bot_vec3 origin; } qa_bot_i
 typedef struct qa_bot_awareness_entry { int64_t entity; qa_bot_awareness value; } qa_bot_awareness_entry;
 
 /* Property order of the TS memory object, which JSON save bytes keep:
- *  FRESH: newBrainMemory order (a brain never restored);
+ *  FRESH: newBrainMemory order with the four collections moved to the end, as
+ *  checkpoint() spreads the scalars first (a brain never restored);
  *  READ: the readRereleaseBehavior memory() order (a checkpoint as read);
  *  RESTORED: a brain restored from a READ checkpoint (its scalars in read order,
  *  then awareness, unreachableUntil, objectiveHome, saidThisLevel).
@@ -60,7 +61,8 @@ typedef struct qa_bot_brain_memory {
   qa_bot_aim_state aim;
   qa_bot_path_state path_state;
   qa_nav_path owned_path; bool has_owned_path; /* backing for path_state.path */
-  qa_bot_awareness *awareness; size_t awareness_count, awareness_cap; /* keyed by value.id */
+  qa_bot_awareness *awareness; int64_t *awareness_keys; /* TS Map key of awareness[i]; same count and cap */
+  size_t awareness_count, awareness_cap;
   double target_id;
   bool has_goal_point; qa_bot_vec3 goal_point;
   double goal_entity_id;
@@ -139,9 +141,11 @@ typedef struct qa_bot_brain {
   bool has_failed_plan_goal; qa_bot_vec3 failed_plan_goal;
   /* TS plannedGoal: the goal the current path was planned for. */
   bool has_planned_goal; qa_bot_vec3 planned_goal;
-  /* TS hazardNodes/hazardByNode: node hazard contents per navigation graph (keyed by the navigation
-     interface's ctx, which owns one graph's node list); derived, so not checkpointed. */
+  /* TS hazardNodes/hazardByNode: node hazard contents per navigation node list. TS keys by the
+     RuntimeNav's node views array; C by the interface identity (ctx when that is zero). Derived, so
+     not checkpointed. */
   const void *hazard_nav;
+  uint64_t hazard_identity;
   struct qa_bot_id_time *hazard_memo; size_t hazard_count, hazard_cap;
 } qa_bot_brain;
 /* Config is copied (game_mode string duplicated). False only on OOM;

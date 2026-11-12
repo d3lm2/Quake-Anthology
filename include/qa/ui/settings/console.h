@@ -5,5 +5,7 @@
 #include "qa/ui/settings/index.h"
 
 qa_ui_setting_bindings qa_ui_bind_console_settings(qa_cvar_registry *registry);
+/* Over a SettingCvars view (read at each call). */
+qa_ui_setting_bindings qa_ui_bind_console_settings_view(qa_ui_setting_cvars cvars);
 
 #endif

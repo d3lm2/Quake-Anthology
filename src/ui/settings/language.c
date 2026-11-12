@@ -52,7 +52,7 @@ char *qa_ui_read_seat_language(qa_cvar_registry *cvars, int64_t seat) {
 void qa_ui_write_seat_language(qa_cvar_registry *cvars, int64_t seat,
                                const char *language) {
   if (!lowercase_name(language))
-    qa_range_error("Expected a lowercase language name");
+    qa_raise("Error", 0, 0, "Expected a lowercase language name");
   char key[64];
   seat_name(seat, key, sizeof key);
   qa_cvar_snapshot out;

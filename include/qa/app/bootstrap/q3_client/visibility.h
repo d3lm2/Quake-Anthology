@@ -29,6 +29,14 @@ qa_app_q3_snapshot_selection *qa_app_select_application_q3_snapshot(
     qa_shared_scene_queries *queries,
     bool (*bounds)(void *ctx, double number, qa_bounds *out), void *bounds_ctx,
     double leaf_count, void (*print)(void *ctx, const char *text), void *print_ctx);
+/* The same with the eye height as a JS number (player->viewheight is ignored): the component
+ * scene's published view height can be fractional (TS passes the number). */
+qa_app_q3_snapshot_selection *qa_app_select_application_q3_snapshot_from(
+    const qa_q3_player_state_record *player, double viewheight,
+    const qa_app_q3_snapshot_source_entity *entities, size_t entity_row_count,
+    qa_shared_scene_queries *queries,
+    bool (*bounds)(void *ctx, double number, qa_bounds *out), void *bounds_ctx,
+    double leaf_count, void (*print)(void *ctx, const char *text), void *print_ctx);
 const qa_q3_visible_entities *qa_app_q3_snapshot_selection_visible(const qa_app_q3_snapshot_selection *selection);
 void qa_app_q3_snapshot_selection_destroy(qa_app_q3_snapshot_selection *selection);
 #endif

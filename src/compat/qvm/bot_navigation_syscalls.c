@@ -479,6 +479,16 @@ bool qa_qvm_bot_navigation_syscall(const qa_qvm_host_call *call, qa_qvm_bot_navi
       pointer_ctx move_storage;
       qa_qvm_bot_init_move_ref ref = qa_qvm_bot_init_move_reference(pointer_of(&move_storage, d, 2));
       int32_t handle = wint(d, 1);
+      /* TS hands initialize() a record of getters: a refused handle reads nothing
+       * (so a null or short record is not an error then), and the first field an
+       * admitted handle reads is orMoveFlags, which names the failing offset. */
+      if (handle <= 0 || handle > QA_MAX_MOVE_STATES || !states->allocated[handle]) {
+        qa_bot_init_move unread;
+        memset(&unread, 0, sizeof unread);
+        qa_bot_move_state_store_initialize(states, handle, unread);
+        return true;
+      }
+      (void)qa_qvm_bot_init_move_get_or_move_flags(&ref);
       qa_qvmx_bot_init_move read = qa_qvm_bot_init_move_read(&ref);
       qa_bot_init_move input;
       memset(&input, 0, sizeof input);

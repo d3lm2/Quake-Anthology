@@ -42,6 +42,10 @@ typedef struct qa_compat_q2_memory {
   void (*unobserve_writes)(void *ctx, uint64_t handle);
   /* TS allocate({ ..., pooled: true }): a 4096-byte page from the shared slab pool; NULL = unpooled allocate. */
   qa_guest_address (*allocate_pooled)(void *ctx, double byte_length, int64_t alignment, const char *label);
+  /* Optional (NULL = plain borrow). borrow() for a TS caller that catches GuestMemoryFault with reason "unmapped":
+   * false when the range includes unmapped bytes, true with *out set otherwise. Every other fault propagates as
+   * from borrow. */
+  bool (*borrow_mapped)(void *ctx, qa_guest_address address, double byte_length, uint8_t **out);
 } qa_compat_q2_memory;
 
 qa_guest_address qa_compat_q2_mem_offset(const qa_compat_q2_memory *m, qa_guest_address a, int64_t d);

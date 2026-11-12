@@ -20,32 +20,34 @@ void qa_compat_qc_validate_source_call(const qa_compat_qc_program *p, qa_mod_sou
     for (size_t i = 0; i < n; i++) {
       qa_mod_callback_value v = pass ? call.globals[i].value : call.arguments[i];
       if (strcmp(v.kind, "input") == 0) { bool has = false; for (size_t j = 0; j < avail_n; j++) if (strcmp(avail[j], v.name) == 0) has = true;
-        if (!has) qa_range_error("Mod %s cannot read %s", label, v.name); }
+        if (!has) qa_raise("Error", 0, 0, "Mod %s cannot read %s", label, v.name); }
     }
   }
   const qa_compat_qc_function *fn = qa_compat_qc_program_function_named(p, call.function);
   bool bad = fn->index == 0 || fn->first_statement <= 0 || fn->parameter_size_count != call.argument_count;
   if (!bad) for (size_t i = 0; i < fn->parameter_size_count; i++)
     if (fn->parameter_sizes[i] != (strcmp(qa_compat_qc_source_value_type(call.arguments[i]), "vector") == 0 ? 3 : 1)) bad = true;
-  if (bad) qa_range_error("Mod callback %s has an incompatible source signature", call.function);
+  if (bad) qa_raise("Error", 0, 0, "Mod callback %s has an incompatible source signature", call.function);
   for (size_t i = 0; i < call.global_count; i++) {
     bool dup = false; for (size_t j = 0; j < i; j++) if (strcmp(call.globals[j].name, call.globals[i].name) == 0) dup = true;
     const qa_compat_qc_definition *g = qa_compat_qc_program_global_named(p, call.globals[i].name);
     if (dup || !g || strcmp(g->type, qa_compat_qc_source_value_type(call.globals[i].value)) != 0)
-      qa_range_error("Mod callback global %s is duplicated or has an incompatible type", call.globals[i].name);
+      qa_raise("Error", 0, 0, "Mod callback global %s is duplicated or has an incompatible type", call.globals[i].name);
   }
 }
 void qa_compat_qc_write_source_value(qa_compat_qc_machine *m, qa_compat_qc_words *w, int64_t off, qa_mod_runtime_value v, qa_compat_qc_actor_reference ref) {
-  if (strcmp(v.kind,"float")==0) { if (!isfinite((double)qa_float32(v.number_value))) qa_range_error("Mod callback number exceeds binary32 range"); qa_compat_qc_words_set_float(w, off, v.number_value); }
+  if (strcmp(v.kind,"float")==0) { if (!isfinite((double)qa_float32(v.number_value))) qa_raise("Error", 0, 0, "Mod callback number exceeds binary32 range"); qa_compat_qc_words_set_float(w, off, v.number_value); }
   else if (strcmp(v.kind,"vector")==0) {
-    if (!isfinite((double)qa_float32(v.vector_value.x))||!isfinite((double)qa_float32(v.vector_value.y))||!isfinite((double)qa_float32(v.vector_value.z))) qa_range_error("Mod callback vector exceeds binary32 range");
+    if (!isfinite((double)qa_float32(v.vector_value.x))||!isfinite((double)qa_float32(v.vector_value.y))||!isfinite((double)qa_float32(v.vector_value.z))) qa_raise("Error", 0, 0, "Mod callback vector exceeds binary32 range");
     qa_compat_qc_words_set_vector(w, off, v.vector_value);
   }
   else if (strcmp(v.kind,"string")==0) {
     size_t vn = strlen(v.string_value); char *name = malloc(vn + 11); if (!name) qa_range_error("source value allocation failed");
     memcpy(name, "mod-value:", 10); memcpy(name + 10, v.string_value, vn + 1);
     int64_t cap = (int64_t)vn + 1; if (cap < 128) cap = 128;
+    qa_cleanup name_scope; qa_cleanup_push(&name_scope, free, name); /* released when the arena refuses the string */
     qa_compat_qc_words_set_int(w, off, (double)qa_compat_qc_strings_set_engine(&m->strings, name, v.string_value, cap));
+    qa_cleanup_pop(&name_scope);
     free(name);
   }
   else if (strcmp(v.kind,"actor")==0) qa_compat_qc_words_set_int(w, off, (double)ref.fn(ref.ctx, v.actor_value));
@@ -55,7 +57,7 @@ static qa_mod_runtime_value resolve(qa_mod_callback_value v, const qa_compat_qc_
     qa_mod_runtime_value r; memset(&r,0,sizeof r); r.kind=v.kind; r.number_value=v.number_value; r.string_value=v.string_value; r.vector_value=v.vector_value; return r;
   }
   for (size_t i=0;i<n;i++) if (strcmp(in[i].name, v.name)==0) return in[i].value;
-  qa_range_error("Gameplay callback %s has no %s input", fn, v.name);
+  qa_raise("Error", 0, 0, "Gameplay callback %s has no %s input", fn, v.name);
 }
 typedef struct { size_t off; uint8_t bytes[12]; size_t len; } SavedGlobal;
 typedef struct {
@@ -82,7 +84,7 @@ double qa_compat_qc_with_source_call(qa_compat_qc_machine *m, qa_mod_source_call
   for (size_t i=0;i<call.argument_count;i++) s.args[i]=resolve(call.arguments[i],inputs,n,call.function);
   for (size_t i=0;i<gc;i++){ s.gdefs[i]=qa_compat_qc_program_global_named(m->program,call.globals[i].name); s.gvals[i]=resolve(call.globals[i].value,inputs,n,call.function); }
   memcpy(s.staging, m->globals.bytes+4, 108);
-  for (size_t i=0;i<gc;i++){ if(!s.gdefs[i]) qa_range_error("Missing validated callback global");
+  for (size_t i=0;i<gc;i++){ if(!s.gdefs[i]) qa_raise("Error", 0, 0, "Missing validated callback global");
     s.saved[i].off=(size_t)s.gdefs[i]->offset*4; s.saved[i].len=(strcmp(s.gdefs[i]->type,"vector")==0?3:1)*4; memcpy(s.saved[i].bytes,m->globals.bytes+s.saved[i].off,s.saved[i].len); }
   s.staged = true; /* TS try begins here: earlier throws leave the staging untouched. */
   for (size_t i=0;i<call.argument_count;i++) qa_compat_qc_write_source_value(m,&m->globals,4+(int64_t)i*3,s.args[i],ref);

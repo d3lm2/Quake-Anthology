@@ -53,6 +53,12 @@ static void pmap_delete(pmap *m, const void *k) {
 }
 typedef struct bound { qa_registered_scene_material material; qa_scene_remap_source source; qa_scene_shader_binding binding; } bound;
 typedef struct effective { char *replacement; qa_scene_remap_source source; double time_offset; pmap *materials; } effective;
+static void effective_free(effective *e) {
+  if (!e) return;
+  free(e->replacement);
+  if (e->materials) { for (size_t k = 0; k < e->materials->count; k++) free(e->materials->vals[k]); free(e->materials->keys); free(e->materials->vals); free(e->materials); }
+  free(e);
+}
 typedef struct world_rec { qa_scene_world_service service; } world_rec;
 typedef struct owner_impl {
   smap *providers; pmap *worlds; pmap *admitted; pmap *bindings; smap *remaps; smap *requests;
@@ -61,6 +67,7 @@ typedef struct owner_impl {
   qa_shader_world_identity **owned_worlds; size_t nworlds, cworlds;
   qa_provider_shader_registrations **owned_providers; size_t nprov, cprov;
   qa_scene_material_handle **handles; size_t nh, ch;
+  uintptr_t next_request; /* TS remap token objects: a fresh identity per request */
 } owner_impl;
 static owner_impl *oi(qa_scene_material_registrations *r) { return (owner_impl *)r->_providers; }
 void qa_scene_material_registrations_init(qa_scene_material_registrations *r) {
@@ -81,7 +88,7 @@ void qa_scene_material_registrations_destroy(qa_scene_material_registrations *r)
   free(o->handles); free(o->scenes); free(o->snapshot);
   /* maps' value payloads (bound/effective) */
   if (o->bindings) for (size_t i = 0; i < o->bindings->count; i++) free(o->bindings->vals[i]);
-  if (o->remaps) for (size_t i = 0; i < o->remaps->count; i++) { effective *e = o->remaps->vals[i]; free(e->replacement); if (e->materials) { for (size_t k = 0; k < e->materials->count; k++) free(e->materials->vals[k]); free(e->materials->keys); free(e->materials->vals); free(e->materials); } free(e); }
+  if (o->remaps) for (size_t i = 0; i < o->remaps->count; i++) effective_free(o->remaps->vals[i]);
   smap *sm[3] = { o->providers, o->remaps, o->requests };
   for (int i = 0; i < 3; i++) if (sm[i]) { for (size_t k = 0; k < sm[i]->count; k++) free(sm[i]->keys[k]); free(sm[i]->keys); free(sm[i]->vals); free(sm[i]); }
   pmap *pm[3] = { o->worlds, o->admitted, o->bindings };
@@ -158,7 +165,9 @@ void qa_scene_material_registrations_bind_material(qa_scene_material_registratio
       && binding_eq(previous->binding, binding) && previous->source.ctx == source.ctx) return;
   bound *nb = xalloc(sizeof *nb); nb->material = material; nb->source = source; nb->binding = binding;
   pmap_set(o->bindings, material.registration, nb); r->binding_revision++;
+  if (present) free(previous);
   char *key = shader_name(qa_registered_scene_material_material(material)->name);
+  qa_cleanup key_guard; qa_cleanup_push(&key_guard, free, key); /* the preparation, commit and the throw below can raise */
   for (;;) {
     effective *selected = smap_get(o->remaps, key);
     if (!selected) break;
@@ -168,7 +177,7 @@ void qa_scene_material_registrations_bind_material(qa_scene_material_registratio
     selected->source.prepare_remap_materials(selected->source.ctx, selected->replacement, &binding, 1, &prepared);
     if (smap_get(o->remaps, key) != selected || !prepared.current(prepared.ctx)) { prepared.discard(prepared.ctx); continue; }
     if (!prepared.accepted) { prepared.discard(prepared.ctx); break; }
-    if (!prepared.material_count) { prepared.discard(prepared.ctx); qa_range_error("Shader remap lost its registered binding"); }
+    if (!prepared.material_count) { prepared.discard(prepared.ctx); qa_raise("Error", 0, 0, "Shader remap lost its registered binding"); }
     qa_registered_scene_material replacement = prepared.materials[0];
     prepared.commit(prepared.ctx);
     qa_scene_material_remap *v = xalloc(sizeof *v);
@@ -177,21 +186,24 @@ void qa_scene_material_registrations_bind_material(qa_scene_material_registratio
     pmap_set(selected->materials, material.registration, v);
     break;
   }
+  qa_cleanup_pop(&key_guard);
   free(key);
 }
 qa_shader_remap_result qa_scene_material_registrations_remap(qa_scene_material_registrations *r, qa_scene_remap_request request) {
   if (!request.source.registrations || request.source.registrations->owner != r)
-    qa_range_error("Shader remap source belongs to another scene");
+    qa_raise("Error", 0, 0, "Shader remap source belongs to another scene");
   if (!request.current(request.current_ctx)) return QA_REMAP_STALE;
   owner_impl *o = oi(r);
   char *key = shader_name(request.original);
-  void *token = xalloc(1);
+  void *token = (void *)++o->next_request;
   smap_set(o->requests, key, token);
+  /* if (!current()) return "stale": before either branch prepares anything. */
+  if (!(smap_get(o->requests, key) == token && request.current(request.current_ctx))) { free(key); return QA_REMAP_STALE; }
   char *replacement_key = shader_name(request.replacement);
   if (!strcmp(key, replacement_key)) {
     free(replacement_key);
-    if (!(smap_get(o->requests, key) == token && request.current(request.current_ctx))) { free(key); return QA_REMAP_STALE; }
-    smap_delete(o->remaps, key); r->remap_revision++;
+    effective *removed = smap_get(o->remaps, key);
+    smap_delete(o->remaps, key); effective_free(removed); r->remap_revision++;
     for (size_t i = 0; i < o->scene_count; i++) o->scenes[i].service.publish_raw_remap(o->scenes[i].service.ctx, key, NULL, 0, request.source.ctx, 0);
     free(key); return QA_REMAP_COMMITTED;
   }
@@ -224,14 +236,15 @@ qa_shader_remap_result qa_scene_material_registrations_remap(qa_scene_material_r
     if (revision != r->binding_revision) { prepared.discard(prepared.ctx); free(originals); continue; }
     pmap *materials = pmap_new();
     for (size_t i = 0; i < norig; i++) {
-      if (i >= prepared.material_count) { prepared.discard(prepared.ctx); qa_range_error("Shader remap lost a prepared binding"); }
+      if (i >= prepared.material_count) { prepared.discard(prepared.ctx); qa_raise("Error", 0, 0, "Shader remap lost a prepared binding"); }
       qa_scene_material_remap *v = xalloc(sizeof *v); v->material = prepared.materials[i]; v->time_offset = request.time_offset; v->source = request.source.ctx;
       pmap_set(materials, originals[i]->material.registration, v);
     }
     prepared.commit(prepared.ctx);
     for (size_t i = 0; i < materials->count; i++) { qa_scene_material_remap *v = materials->vals[i]; v->material = qa_scene_material_registrations_retained(r, v->material.registration); }
     effective *e = xalloc(sizeof *e); e->replacement = xdup(request.replacement); e->source = request.source; e->time_offset = request.time_offset; e->materials = materials;
-    smap_set(o->remaps, key, e); r->remap_revision++;
+    effective *replaced = smap_get(o->remaps, key);
+    smap_set(o->remaps, key, e); effective_free(replaced); r->remap_revision++;
     size_t offset = norig;
     /* re-fetch counts per world for publishing */
     for (size_t i = 0; i < o->scene_count; i++) {
@@ -252,45 +265,38 @@ void qa_scene_material_registrations_prepare_remap_refresh(qa_scene_material_reg
   impl->revision = r->remap_revision; impl->binding_revision = r->binding_revision;
   impl->replacements = smap_new();
   impl->sources = xalloc((count ? count : 1) * sizeof *impl->sources); memcpy(impl->sources, sources, count * sizeof *sources); impl->count = count;
-  /* all bindings of all replacement sources */
+  /* bindings = [...sources.values()].flatMap(source => source.materialBindings()), taken once. */
+  qa_scene_shader_binding *all_binds = NULL; qa_registered_scene_material *all_mats = NULL; size_t nall = 0, call = 0;
+  for (size_t si = 0; si < count; si++) {
+    const qa_scene_shader_binding *binds = NULL; size_t nbind = 0;
+    const qa_registered_scene_material *ms = sources[si].new_source.material_bindings_materials(sources[si].new_source.ctx, &binds, &nbind);
+    for (size_t k = 0; k < nbind; k++) {
+      if (nall == call) { call = call ? call * 2 : 16; all_binds = xg(all_binds, call * sizeof *all_binds); all_mats = xg(all_mats, call * sizeof *all_mats); }
+      all_binds[nall] = binds[k]; all_mats[nall] = ms[k]; nall++;
+    }
+  }
   for (size_t ri = 0; ri < o->remaps->count; ri++) {
     const char *name = o->remaps->keys[ri]; effective *selected = o->remaps->vals[ri];
     const qa_remap_refresh_source *pair = NULL;
     for (size_t i = 0; i < count; i++) if (sources[i].old_source.ctx == selected->source.ctx) pair = &sources[i];
-    if (!pair) qa_range_error("Remap image source was not prepared");
-    /* collect originals from all new sources' bindings */
-    qa_scene_shader_binding *bb = NULL; size_t nb = 0, cb = 0;
-    qa_registered_scene_material *mats = NULL; size_t nm = 0;
-    for (size_t si = 0; si < count; si++) {
-      const qa_scene_shader_binding *binds = NULL; size_t nbind = 0;
-      const qa_registered_scene_material *ms = sources[si].new_source.material_bindings_materials(sources[si].new_source.ctx, &binds, &nbind);
-      (void)ms;
-      /* material_bindings_materials returns parallel arrays via ctx service in shaders.c */
-      for (size_t k = 0; k < nbind; k++) {
-        (void)k;
-      }
-      (void)binds; (void)bb; (void)nb; (void)cb; (void)mats; (void)nm;
-    }
-    /* Bindings are fetched through the registrations' own binding map, which
-     * commit() rebuilds from the new sources (same observable set). */
+    if (!pair) qa_raise("Error", 0, 0, "Remap image source was not prepared");
     qa_scene_shader_binding *binds2 = NULL; size_t nb2 = 0, cb2 = 0;
     qa_registered_scene_material *origs = NULL;
-    for (size_t i = 0; i < o->bindings->count; i++) {
-      bound *b = o->bindings->vals[i];
-      char *k = shader_name(qa_registered_scene_material_material(b->material)->name);
+    for (size_t i = 0; i < nall; i++) {
+      char *k = shader_name(qa_registered_scene_material_material(all_mats[i])->name);
       if (!strcmp(k, name)) {
         if (nb2 == cb2) { cb2 = cb2 ? cb2 * 2 : 4; binds2 = xg(binds2, cb2 * sizeof *binds2); origs = xg(origs, cb2 * sizeof *origs); }
-        binds2[nb2] = b->binding; origs[nb2] = b->material; nb2++;
+        binds2[nb2] = all_binds[i]; origs[nb2] = all_mats[i]; nb2++;
       }
       free(k);
     }
     qa_prepared_scene_remap prepared; memset(&prepared, 0, sizeof prepared);
     pair->new_source.prepare_remap_materials(pair->new_source.ctx, selected->replacement, binds2, nb2, &prepared);
     free(binds2);
-    if (!prepared.accepted) { prepared.discard(prepared.ctx); qa_range_error("Current remap could not be rebuilt from its source images"); }
+    if (!prepared.accepted) { prepared.discard(prepared.ctx); qa_raise("Error", 0, 0, "Current remap could not be rebuilt from its source images"); }
     pmap *materials = pmap_new();
     for (size_t i = 0; i < nb2; i++) {
-      if (i >= prepared.material_count) { prepared.discard(prepared.ctx); qa_range_error("Refreshed remap lost a binding"); }
+      if (i >= prepared.material_count) { prepared.discard(prepared.ctx); qa_raise("Error", 0, 0, "Refreshed remap lost a binding"); }
       qa_scene_material_remap *v = xalloc(sizeof *v); v->material = prepared.materials[i]; v->source = selected->source.ctx; v->time_offset = selected->time_offset;
       pmap_set(materials, origs[i].registration, v);
     }
@@ -299,12 +305,24 @@ void qa_scene_material_registrations_prepare_remap_refresh(qa_scene_material_reg
     effective *e = xalloc(sizeof *e); e->replacement = xdup(selected->replacement); e->source = selected->source; e->time_offset = selected->time_offset; e->materials = materials;
     smap_set(impl->replacements, name, e);
   }
+  free(all_binds); free(all_mats);
   out->_impl = impl; out->owner = r;
+}
+static void refresh_impl_free(refresh_impl *impl) {
+  if (!impl) return;
+  for (size_t i = 0; i < impl->replacements->count; i++) { effective_free(impl->replacements->vals[i]); free(impl->replacements->keys[i]); }
+  free(impl->replacements->keys); free(impl->replacements->vals); free(impl->replacements);
+  free(impl->sources); free(impl);
+}
+void qa_prepared_remap_refresh_destroy(qa_prepared_remap_refresh *p) {
+  if (!p) return;
+  refresh_impl_free(p->_impl); p->_impl = NULL;
 }
 void qa_prepared_remap_refresh_validate(qa_prepared_remap_refresh *p) {
   refresh_impl *impl = p->_impl;
-  if (impl->revision != p->owner->remap_revision || impl->binding_revision != p->owner->binding_revision)
-    qa_range_error("Shader remap bindings changed during image preparation");
+  /* After commit() the revisions it captured have moved on, so validate throws. */
+  if (!impl || impl->revision != p->owner->remap_revision || impl->binding_revision != p->owner->binding_revision)
+    qa_raise("Error", 0, 0, "Shader remap bindings changed during image preparation");
 }
 void qa_prepared_remap_refresh_commit(qa_prepared_remap_refresh *p) {
   qa_prepared_remap_refresh_validate(p);
@@ -318,18 +336,22 @@ void qa_prepared_remap_refresh_commit(qa_prepared_remap_refresh *p) {
       bound *b = xalloc(sizeof *b);
       b->material = qa_scene_material_registrations_retained(r, ms[k].registration);
       b->source = impl->sources[si].old_source; b->binding = binds[k];
+      int had = 0; bound *replaced = pmap_get(o->bindings, b->material.registration, &had);
       pmap_set(o->bindings, b->material.registration, b);
+      if (had) free(replaced);
     }
   }
   r->binding_revision++;
-  for (size_t i = 0; i < o->remaps->count; i++) { effective *e = o->remaps->vals[i]; free(e->replacement); free(e); free(o->remaps->keys[i]); }
+  for (size_t i = 0; i < o->remaps->count; i++) { effective_free(o->remaps->vals[i]); free(o->remaps->keys[i]); }
   o->remaps->count = 0;
   for (size_t i = 0; i < impl->replacements->count; i++) {
     effective *e = impl->replacements->vals[i];
     for (size_t k = 0; k < e->materials->count; k++) { qa_scene_material_remap *v = e->materials->vals[k]; v->material = qa_scene_material_registrations_retained(r, v->material.registration); }
     smap_set(o->remaps, impl->replacements->keys[i], e);
+    impl->replacements->vals[i] = NULL; /* now owned by the registrations */
   }
   r->remap_revision++;
+  refresh_impl_free(impl); p->_impl = NULL;
 }
 qa_provider_shader_registrations *qa_scene_material_registrations_provider(qa_scene_material_registrations *r, qa_content_id content) {
   owner_impl *o = oi(r);
@@ -357,13 +379,13 @@ qa_shader_world_identity *qa_scene_material_registrations_world(qa_scene_materia
   return w;
 }
 void qa_scene_material_registrations_admit(qa_scene_material_registrations *r, qa_shader_registration *registration) {
-  if (registration->provider->owner != r) qa_range_error("Shader registration belongs to another scene");
+  if (registration->provider->owner != r) qa_raise("Error", 0, 0, "Shader registration belongs to another scene");
   owner_impl *o = oi(r);
   if (!pmap_has(o->admitted, registration)) pmap_set(o->admitted, registration, NULL);
 }
 qa_registered_scene_material qa_scene_material_registrations_publish(qa_scene_material_registrations *r, qa_shader_registration *registration, const qa_compiled_material *compiled) {
   owner_impl *o = oi(r);
-  if (!pmap_has(o->admitted, registration)) qa_range_error("Shader was not admitted to this scene");
+  if (!pmap_has(o->admitted, registration)) qa_raise("Error", 0, 0, "Shader was not admitted to this scene");
   int present = 0; qa_scene_material_handle *previous = pmap_get(o->admitted, registration, &present);
   if (previous) { previous->current = compiled; return (qa_registered_scene_material){ registration, previous, compiled }; }
   qa_scene_material_handle *h = xalloc(sizeof *h); h->registration = registration; h->current = compiled;
@@ -375,17 +397,17 @@ qa_registered_scene_material qa_scene_material_registrations_publish(qa_scene_ma
 qa_registered_scene_material qa_scene_material_registrations_retained(qa_scene_material_registrations *r, qa_shader_registration *registration) {
   owner_impl *o = oi(r); int present = 0;
   qa_scene_material_handle *h = pmap_get(o->admitted, registration, &present);
-  if (!present || !h) qa_range_error("Shader registration is not published");
+  if (!present || !h) qa_raise("Error", 0, 0, "Shader registration is not published");
   return (qa_registered_scene_material){ registration, h, h->current };
 }
 qa_registered_scene_material qa_scene_material_registrations_require_material(qa_scene_material_registrations *r, qa_registered_scene_material material) {
-  if (!material.handle || material.registration->provider->owner != r) qa_range_error("Material is not registered in this scene");
+  if (!material.handle || material.registration->provider->owner != r) qa_raise("Error", 0, 0, "Material is not registered in this scene");
   return material;
 }
 void qa_scene_material_registrations_cancel(qa_scene_material_registrations *r, qa_shader_registration *registration) {
   owner_impl *o = oi(r); int present = 0;
   void *v = pmap_get(o->admitted, registration, &present);
-  if (!present || v != NULL) qa_range_error("Only an unpublished shader admission can be cancelled");
+  if (!present || v != NULL) qa_raise("Error", 0, 0, "Only an unpublished shader admission can be cancelled");
   pmap_delete(o->admitted, registration);
 }
 static int cmp_sort(const void *a, const void *b) {
@@ -422,7 +444,7 @@ char *qa_provider_shader_registrations_key(qa_provider_shader_registrations *p, 
   if (key.kind == QA_BINDING_UNLIT) snprintf(buf, sizeof buf, "%s\x01unlit\x01%s", key.name, QA_JS_NUMBER(key.lightmap_index));
   else if (key.kind == QA_BINDING_SOURCE) snprintf(buf, sizeof buf, "%s\x01source\x01%s", key.name, QA_JS_NUMBER(key.request));
   else {
-    if (key.world->owner != p->owner) qa_range_error("Shader world belongs to another scene");
+    if (key.world->owner != p->owner) qa_raise("Error", 0, 0, "Shader world belongs to another scene");
     snprintf(buf, sizeof buf, "%s\x01world\x01%s\x01%s\x01%s", key.name, QA_JS_NUMBER(key.world->ordinal), QA_JS_NUMBER(key.lightmap_index), key.base_texture_name ? key.base_texture_name : "");
   }
   return xdup(buf);
@@ -443,12 +465,12 @@ qa_shader_registration *qa_provider_shader_registrations_reserve(qa_provider_sha
   free(k); return r;
 }
 qa_registered_scene_material qa_provider_shader_registrations_publish(qa_provider_shader_registrations *p, qa_shader_registration *registration, const qa_compiled_material *compiled) {
-  if (registration->provider != p) qa_range_error("Shader belongs to another provider");
+  if (registration->provider != p) qa_raise("Error", 0, 0, "Shader belongs to another provider");
   return qa_scene_material_registrations_publish(p->owner, registration, compiled);
 }
 void qa_provider_shader_registrations_cancel(qa_provider_shader_registrations *p, qa_shader_logical_key key, qa_shader_registration *registration) {
   char *k = qa_provider_shader_registrations_key(p, key);
-  if (smap_get(p->_registrations, k) != registration) { free(k); qa_range_error("Shader admission does not match its request"); }
+  if (smap_get(p->_registrations, k) != registration) { free(k); qa_raise("Error", 0, 0, "Shader admission does not match its request"); }
   qa_scene_material_registrations_cancel(p->owner, registration);
   smap_delete(p->_registrations, k); free(k);
   free_registration(registration);
@@ -456,8 +478,8 @@ void qa_provider_shader_registrations_cancel(qa_provider_shader_registrations *p
 qa_registered_scene_material qa_provider_shader_registrations_commit(qa_provider_shader_registrations *p, qa_shader_logical_key key, qa_shader_registration *registration, const qa_compiled_material *compiled) {
   char *k = qa_provider_shader_registrations_key(p, key);
   qa_shader_registration *previous = smap_get(p->_registrations, k);
-  if (previous && previous != registration) { free(k); qa_range_error("Shader registration changed during replacement"); }
-  if (registration->provider != p) { free(k); qa_range_error("Replacement shader belongs to another provider"); }
+  if (previous && previous != registration) { free(k); qa_raise("Error", 0, 0, "Shader registration changed during replacement"); }
+  if (registration->provider != p) { free(k); qa_raise("Error", 0, 0, "Replacement shader belongs to another provider"); }
   smap_set(p->_registrations, k, registration); free(k);
   qa_scene_material_registrations_admit(p->owner, registration);
   return qa_provider_shader_registrations_publish(p, registration, compiled);
@@ -484,7 +506,7 @@ void qa_shader_replacement_stage_destroy(qa_shader_replacement_stage *s) {
   free(impl->handles); free(impl); s->_entries = NULL;
 }
 static void stage_require(qa_shader_replacement_stage *s) {
-  if (s->state != 0) qa_range_error("Shader replacement is %s", s->state == 1 ? "committed" : "discarded");
+  if (s->state != 0) qa_raise("Error", 0, 0, "Shader replacement is %s", s->state == 1 ? "committed" : "discarded");
 }
 qa_shader_registration *qa_shader_replacement_stage_reserve(qa_shader_replacement_stage *s, qa_shader_logical_key key) {
   stage_require(s); stage_impl *impl = s->_entries;
@@ -510,7 +532,7 @@ qa_registered_scene_material qa_shader_replacement_stage_publish(qa_shader_repla
     } else impl->items[i].material->current = compiled;
     return (qa_registered_scene_material){ registration, impl->items[i].material, compiled };
   }
-  qa_range_error("Shader was not admitted to this replacement");
+  qa_raise("Error", 0, 0, "Shader was not admitted to this replacement");
 }
 void qa_shader_replacement_stage_cancel(qa_shader_replacement_stage *s, qa_shader_logical_key key, qa_shader_registration *registration) {
   stage_require(s); stage_impl *impl = s->_entries;
@@ -522,14 +544,14 @@ void qa_shader_replacement_stage_cancel(qa_shader_replacement_stage *s, qa_shade
     return;
   }
   free(k);
-  qa_range_error("Only an unpublished staged shader admission can be cancelled");
+  qa_raise("Error", 0, 0, "Only an unpublished staged shader admission can be cancelled");
 }
 void qa_shader_replacement_stage_validate(qa_shader_replacement_stage *s) {
   stage_require(s); stage_impl *impl = s->_entries;
   for (size_t i = 0; i < impl->count; i++) {
-    if (!impl->items[i].material) qa_range_error("Shader replacement has unfinished registrations");
+    if (!impl->items[i].material) qa_raise("Error", 0, 0, "Shader replacement has unfinished registrations");
     qa_shader_registration *previous = qa_provider_shader_registrations_find(s->provider, impl->items[i].key);
-    if (previous && previous != impl->items[i].registration) qa_range_error("Shader registration changed during replacement");
+    if (previous && previous != impl->items[i].registration) qa_raise("Error", 0, 0, "Shader registration changed during replacement");
   }
 }
 void qa_shader_replacement_stage_commit(qa_shader_replacement_stage *s) {
@@ -542,6 +564,14 @@ void qa_shader_replacement_stage_commit(qa_shader_replacement_stage *s) {
     impl->items[i].created = false; /* the provider's map owns it now */
     current->current = qa_registered_scene_material_compiled(retained);
   }
+  /* TS staged handles stay usable after the commit (they wrap the retained material): a picture or surface
+   * registered against the staging registry keeps its handle. The registrations own them from here on. */
+  owner_impl *o = oi(s->provider->owner);
+  for (size_t i = 0; i < impl->nh; i++) {
+    if (o->nh == o->ch) { o->ch = o->ch ? o->ch * 2 : 8; o->handles = xg(o->handles, o->ch * sizeof(void *)); }
+    o->handles[o->nh++] = impl->handles[i];
+  }
+  impl->nh = 0;
   s->state = 1;
 }
 void qa_shader_replacement_stage_discard(qa_shader_replacement_stage *s) {

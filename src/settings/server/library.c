@@ -1,5 +1,5 @@
 /* Port of src/settings/server/library.ts. GPL-2.0-or-later. */
-#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE 1
 #include "qa/settings/server/library.h"
 
 #include "qa/foundation/support.h"
@@ -15,15 +15,7 @@
 #include <sys/stat.h>
 #include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
-
-static noreturn void qa_error(const char *format, ...) {
-  char text[1536];
-  va_list args;
-  va_start(args, format);
-  vsnprintf(text, sizeof text, format, args);
-  va_end(args);
-  qa_raise("Error", 0, 0, "%s", text);
-}
+#include "qa/platform/files/contained.h"
 
 static char *dup_range(const char *text, size_t length) {
   char *out = (char *)malloc(length + 1);
@@ -73,8 +65,10 @@ qa_server_profile_entry *qa_list_server_profiles(const qa_config_store *store,
       free(directory);
       return (qa_server_profile_entry *)calloc(1, sizeof(qa_server_profile_entry));
     }
-    free(directory);
-    qa_error("Server profile directory could not be listed: %s", strerror(failure));
+    /* TS rethrows the readdir error: Node's "<CODE>: <description>, scandir '<path>'". */
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, directory);
+    qa_node_fs_error(failure, "scandir", directory);
   }
   qa_server_profile_entry *entries = NULL;
   size_t count = 0;
@@ -82,14 +76,17 @@ qa_server_profile_entry *qa_list_server_profiles(const qa_config_store *store,
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     if (!profile_file_name(entry->d_name)) continue;
-    /* entry.isFile() */
-    size_t path_length = strlen(directory) + 1 + strlen(entry->d_name) + 1;
-    char *full = (char *)malloc(path_length);
-    if (full == NULL) continue;
-    snprintf(full, path_length, "%s/%s", directory, entry->d_name);
-    struct stat info;
-    bool is_file = stat(full, &info) == 0 && S_ISREG(info.st_mode);
-    free(full);
+    /* entry.isFile(): the entry itself; a link to a file is not one. */
+    bool is_file = entry->d_type == DT_REG;
+    if (entry->d_type == DT_UNKNOWN) {
+      size_t path_length = strlen(directory) + 1 + strlen(entry->d_name) + 1;
+      char *full = (char *)malloc(path_length);
+      if (full == NULL) continue;
+      snprintf(full, path_length, "%s/%s", directory, entry->d_name);
+      struct stat info;
+      is_file = lstat(full, &info) == 0 && S_ISREG(info.st_mode);
+      free(full);
+    }
     if (!is_file) continue;
     if (count == capacity) {
       capacity = capacity == 0 ? 8 : capacity * 2;

@@ -136,11 +136,57 @@ char *qa_compress_common_text(const char *source, size_t length,
 void qa_common_parse_state_init(qa_common_parse_state *state) {
   memset(state, 0, sizeof *state);
 }
+/* The parser's strings are code-unit bytes; a save string is the TS string as
+ * UTF-8, so a byte above 0x7f is written as its two-byte UTF-8 form. */
+static char *code_units_to_utf8(const char *text) {
+  size_t length = strlen(text), extra = 0;
+  for (size_t i = 0; i < length; i++) extra += (unsigned char)text[i] >= 0x80;
+  char *out = (char *)malloc(length + extra + 1);
+  if (out == NULL) return NULL;
+  size_t w = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)text[i];
+    if (c < 0x80) out[w++] = (char)c;
+    else { out[w++] = (char)(0xc0 | (c >> 6)); out[w++] = (char)(0x80 | (c & 0x3f)); }
+  }
+  out[w] = '\0';
+  return out;
+}
+/* A save string (UTF-8) back to code-unit bytes. *units is TS string.length;
+ * false when a unit is above 0xff (no code-unit byte holds it). */
+static bool utf8_to_code_units(const char *text, char *out, size_t capacity, size_t *units) {
+  const unsigned char *b = (const unsigned char *)text;
+  size_t count = 0;
+  bool bytes = true;
+  for (size_t i = 0; b[i] != 0;) {
+    uint32_t cp = b[i];
+    size_t need = cp >= 0xf0 ? 3 : cp >= 0xe0 ? 2 : cp >= 0xc0 ? 1 : 0;
+    if (need == 1) cp &= 0x1f; else if (need == 2) cp &= 0x0f; else if (need == 3) cp &= 0x07;
+    size_t k = 1;
+    for (; k <= need && (b[i + k] & 0xc0) == 0x80; k++) cp = (cp << 6) | (b[i + k] & 0x3f);
+    i += k;
+    if (cp > 0xff) bytes = false;
+    if (bytes && count < capacity) out[count] = (char)cp;
+    count += cp >= 0x10000 ? 2 : 1;
+  }
+  if (count < capacity) out[count] = '\0';
+  *units = count;
+  return bytes;
+}
 qa_save_value *qa_common_parse_state_capture(const qa_common_parse_state *state) {
+  char *token_text = code_units_to_utf8(state->token);
+  char *name_text = code_units_to_utf8(state->name);
+  if (token_text == NULL || name_text == NULL) {
+    free(token_text);
+    free(name_text);
+    return NULL;
+  }
   qa_save_value *object = qa_save_value_object();
-  qa_save_value *token = qa_save_value_string(state->token);
+  qa_save_value *token = qa_save_value_string(token_text);
   qa_save_value *line = qa_save_value_number((double)state->line);
-  qa_save_value *name = qa_save_value_string(state->name);
+  qa_save_value *name = qa_save_value_string(name_text);
+  free(token_text);
+  free(name_text);
   if (object == NULL || token == NULL || line == NULL || name == NULL ||
       !qa_save_value_set(object, "token", token) ||
       !qa_save_value_set(object, "line", line) ||
@@ -165,17 +211,25 @@ void qa_common_parse_state_restore(qa_common_parse_state *state, const qa_save_v
       !qa_save_reader_field(&reader, "line", &line_reader) ||
       !qa_save_reader_field(&reader, "name", &name_reader))
     qa_range_error("out of memory");
-  const char *token = qa_save_reader_string(&token_reader);
+  const char *token_text = qa_save_reader_string(&token_reader);
   double line = qa_save_reader_integer_min(&line_reader, 0);
-  const char *name = qa_save_reader_string(&name_reader);
-  if (strlen(token) >= MAX_TOKEN_CHARS || strlen(name) >= MAX_TOKEN_CHARS)
+  const char *name_text = qa_save_reader_string(&name_reader);
+  char token[MAX_TOKEN_CHARS], name[MAX_TOKEN_CHARS];
+  size_t token_units = 0, name_units = 0;
+  bool token_bytes = utf8_to_code_units(token_text, token, sizeof token, &token_units);
+  bool name_bytes = utf8_to_code_units(name_text, name, sizeof name, &name_units);
+  if (token_units >= MAX_TOKEN_CHARS || name_units >= MAX_TOKEN_CHARS)
     qa_save_reader_fail(&reader, "parser string exceeds source storage");
-  strcpy(state->token, token);
-  state->token_length = strlen(token);
+  /* C-only: TS keeps a restored string with a unit above 0xff (only a crafted save holds one);
+     the C token and name are code-unit bytes and cannot. */
+  if (!token_bytes || !name_bytes)
+    qa_save_reader_fail(&reader, "parser string is not a source byte string");
+  memcpy(state->token, token, token_units + 1);
+  state->token_length = token_units;
   /* TS keeps the restored double; its first LF stores (line + 1) | 0. The C state is int32, so a restored
      line past int32 wraps here (ToInt32) instead of at that LF; only a diagnostic printed before it differs. */
   state->line = qa_js_to_int32(line);
-  strcpy(state->name, name);
+  memcpy(state->name, name, name_units + 1);
   qa_save_reader_destroy(&token_reader);
   qa_save_reader_destroy(&line_reader);
   qa_save_reader_destroy(&name_reader);
@@ -302,10 +356,12 @@ void qa_common_parse_state_match_token(qa_common_parse_state *state,
   if (strlen(token) != expected_length || memcmp(token, match, expected_length) != 0) {
     size_t total = strlen(token) + expected_length + 32;
     char *message = (char *)malloc(total);
-    if (message != NULL)
-      (void)snprintf(message, total, "MatchToken: %s != %.*s", token,
-                     (int)expected_length, match);
-    qa_common_error(QA_COMMON_ERROR_DROP, message != NULL ? message : "MatchToken");
+    if (message == NULL) qa_range_error("out of memory");
+    (void)snprintf(message, total, "MatchToken: %s != %.*s", token, (int)expected_length, match);
+    /* The raise formats the text before it unwinds this node. */
+    qa_cleanup node;
+    qa_cleanup_push(&node, free, message);
+    qa_common_error(QA_COMMON_ERROR_DROP, message);
   }
 }
 void qa_common_parse_state_skip_braced_section(qa_common_parse_state *state,
@@ -384,16 +440,25 @@ void qa_common_parse_state_skip_rest_of_line(qa_common_parse_state *state,
 /* --- Tokenizer --- */
 noreturn void qa_text_parse_error(const char *source_name, int64_t line, int64_t column,
                                   const char *format, ...) {
-  char text[1536];
+  /* TS messages have no length limit: the text is sized to its arguments. */
   va_list args;
   va_start(args, format);
-  vsnprintf(text, sizeof text, format, args);
+  va_list measure;
+  va_copy(measure, args);
+  int needed = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  char fallback[1];
+  char *text = needed >= 0 ? (char *)malloc((size_t)needed + 1) : NULL;
+  if (text != NULL) vsnprintf(text, (size_t)needed + 1, format, args);
   va_end(args);
-  qa_raise("TextParseError", 0, 0, "%s:%lld:%lld: %s", source_name, (long long)line, (long long)column, text);
+  qa_cleanup node;
+  if (text != NULL) qa_cleanup_push(&node, free, text);
+  else fallback[0] = '\0';
+  qa_raise("TextParseError", 0, 0, "%s:%lld:%lld: %s", source_name, (long long)line, (long long)column,
+           text != NULL ? text : fallback);
 }
-static bool is_whitespace(unsigned char c) { return c <= 32; }
-bool qa_tokenizer_init(qa_tokenizer *tokenizer, const char *source, size_t length,
-                       const char *name) {
+static bool tokenizer_init_mode(qa_tokenizer *tokenizer, const char *source, size_t length,
+                                const char *name, bool text) {
   tokenizer->source = dup_range(source, length);
   tokenizer->name = dup_range(name != NULL ? name : "<text>",
                               strlen(name != NULL ? name : "<text>"));
@@ -406,7 +471,16 @@ bool qa_tokenizer_init(qa_tokenizer *tokenizer, const char *source, size_t lengt
   tokenizer->offset = 0;
   tokenizer->line = 1;
   tokenizer->column = 1;
+  tokenizer->text = text;
   return true;
+}
+bool qa_tokenizer_init(qa_tokenizer *tokenizer, const char *source, size_t length,
+                       const char *name) {
+  return tokenizer_init_mode(tokenizer, source, length, name, false);
+}
+bool qa_tokenizer_init_text(qa_tokenizer *tokenizer, const char *source, size_t length,
+                            const char *name) {
+  return tokenizer_init_mode(tokenizer, source, length, name, true);
 }
 void qa_tokenizer_destroy(qa_tokenizer *tokenizer) {
   free(tokenizer->source);
@@ -414,11 +488,59 @@ void qa_tokenizer_destroy(qa_tokenizer *tokenizer) {
   tokenizer->source = NULL;
   tokenizer->name = NULL;
 }
+/* The TS character at byte `at`: the bytes it spans, the UTF-16 units it
+ * counts and its first unit's value. Byte mode: one byte per unit. Text mode:
+ * one UTF-8 sequence (a supplementary character is two units, its value the
+ * high surrogate), C0 80 is U+0000, and a byte that does not start a valid
+ * sequence is one unit of its own value. Callers stay below t->length. */
+typedef struct tokenizer_char { size_t bytes; int units; uint32_t value; } tokenizer_char;
+static tokenizer_char tokenizer_char_at(const qa_tokenizer *t, size_t at) {
+  const unsigned char *b = (const unsigned char *)t->source + at;
+  tokenizer_char out = {1, 1, b[0]};
+  if (!t->text || b[0] < 0x80) return out;
+  size_t available = t->length - at;
+  if (b[0] == 0xc0 && available >= 2 && b[1] == 0x80) {
+    out.bytes = 2;
+    out.value = 0;
+    return out;
+  }
+  size_t need = 0;
+  uint32_t cp = b[0];
+  unsigned char low = 0x80, high = 0xbf;
+  if (b[0] >= 0xc2 && b[0] <= 0xdf) { need = 1; cp = b[0] & 0x1f; }
+  else if (b[0] >= 0xe0 && b[0] <= 0xef) {
+    need = 2; cp = b[0] & 0x0f;
+    if (b[0] == 0xe0) low = 0xa0;
+    if (b[0] == 0xed) high = 0x9f;
+  } else if (b[0] >= 0xf0 && b[0] <= 0xf4) {
+    need = 3; cp = b[0] & 0x07;
+    if (b[0] == 0xf0) low = 0x90;
+    if (b[0] == 0xf4) high = 0x8f;
+  }
+  if (need == 0 || need >= available) return out;
+  for (size_t k = 1; k <= need; k++) {
+    unsigned char lower = k == 1 ? low : 0x80, upper = k == 1 ? high : 0xbf;
+    if (b[k] < lower || b[k] > upper) return out;
+    cp = (cp << 6) | (b[k] & 0x3f);
+  }
+  out.bytes = need + 1;
+  if (cp >= 0x10000) {
+    out.units = 2;
+    out.value = 0xd800 + ((cp - 0x10000) >> 10);
+  } else {
+    out.value = cp;
+  }
+  return out;
+}
+static bool tokenizer_space_at(const qa_tokenizer *t, size_t at) {
+  return tokenizer_char_at(t, at).value <= 32;
+}
 static bool tokenizer_starts(const qa_tokenizer *t, const char *prefix) {
   size_t length = strlen(prefix);
   return t->offset + length <= t->length &&
          memcmp(t->source + t->offset, prefix, length) == 0;
 }
+/* TS advance(): one character; CR LF is one line break. */
 static void tokenizer_advance(qa_tokenizer *t) {
   if (t->offset >= t->length) return;
   char character = t->source[t->offset];
@@ -429,19 +551,23 @@ static void tokenizer_advance(qa_tokenizer *t) {
     t->column = 1;
     return;
   }
-  t->offset++;
   if (character == '\n') {
+    t->offset++;
     t->line++;
     t->column = 1;
-  } else t->column++;
+    return;
+  }
+  tokenizer_char c = tokenizer_char_at(t, t->offset);
+  t->offset += c.bytes;
+  t->column += c.units;
 }
 bool qa_tokenizer_next(qa_tokenizer *t, bool allow_line_breaks, qa_text_token *out) {
   memset(out, 0, sizeof *out);
   bool crossed_line = false;
   for (;;) {
     while (t->offset < t->length) {
-      unsigned char character = (unsigned char)t->source[t->offset];
-      if (!is_whitespace(character)) break;
+      if (!tokenizer_space_at(t, t->offset)) break;
+      char character = t->source[t->offset];
       if (character == '\n' || character == '\r') crossed_line = true;
       tokenizer_advance(t);
     }
@@ -477,26 +603,30 @@ bool qa_tokenizer_next(qa_tokenizer *t, bool allow_line_breaks, qa_text_token *o
   int64_t column = t->column;
   bool quoted = t->source[t->offset] == '"';
   text_buffer value = {NULL, 0, 0};
+  size_t units = 0; /* TS value.length */
   bool oom = false;
   if (quoted) {
     tokenizer_advance(t);
     while (t->offset < t->length && !oom) {
-      char character = t->source[t->offset];
-      if (character == '"') break;
-      oom = !text_add_char(&value, character);
+      if (t->source[t->offset] == '"') break;
+      /* value += character: a CR is kept, and advance() then also skips its LF. */
+      tokenizer_char c = tokenizer_char_at(t, t->offset);
+      for (size_t k = 0; k < c.bytes && !oom; k++) oom = !text_add_char(&value, t->source[t->offset + k]);
+      units += (size_t)c.units;
       tokenizer_advance(t);
     }
     if (t->offset < t->length && t->source[t->offset] == '"') tokenizer_advance(t);
   } else {
     while (t->offset < t->length && !oom) {
-      unsigned char character = (unsigned char)t->source[t->offset];
-      if (is_whitespace(character)) break;
-      oom = !text_add_char(&value, (char)character);
+      tokenizer_char c = tokenizer_char_at(t, t->offset);
+      if (c.value <= 32) break;
+      for (size_t k = 0; k < c.bytes && !oom; k++) oom = !text_add_char(&value, t->source[t->offset + k]);
+      units += (size_t)c.units;
       tokenizer_advance(t);
     }
   }
   if (oom) { free(value.data); return false; }
-  if (value.length >= QA_TOKEN_MAX) {
+  if (units >= QA_TOKEN_MAX) {
     free(value.data);
     qa_text_parse_error(t->name, line, column,
                         "token is limited to %d characters", QA_TOKEN_MAX - 1);

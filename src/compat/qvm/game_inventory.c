@@ -48,7 +48,7 @@ static void validate_profile(const qa_qvm_inventory_options *options) {
       !same_text(identity->artifact_path, profile_module->artifact_path) ||
       !same_text(identity->revision, profile_module->revision) ||
       !same_text(module_abi, profile_abi) || !same_text(options->data->abi_profile, profile_abi))
-    qa_range_error("QVM inventory profile belongs to another source module");
+    qa_raise("Error", 0, 0, "QVM inventory profile belongs to another source module");
 }
 
 static void refresh(binding_ctx *ctx) {
@@ -63,14 +63,14 @@ static void refresh(binding_ctx *ctx) {
     const qa_qvm_inventory_weapon *definition = &definitions[i];
     if (!is_integer(definition->weapon) || definition->weapon < 1 || definition->weapon >= 16 ||
         slots[(size_t)definition->weapon])
-      qa_range_error("QVM inventory requires distinct public weapon slots");
+      qa_raise("Error", 0, 0, "QVM inventory requires distinct public weapon slots");
     slots[(size_t)definition->weapon] = true;
     for (int which = 0; which < 2; which++) {
       qa_item_id item = which == 0 ? definition->item : definition->ammo;
       if (which == 1 && item == NULL) continue;
       for (size_t f = 0; f < ctx->field_count; f++)
         if (strcmp(ctx->fields[f].item, item) == 0)
-          qa_range_error("QVM inventory item %s aliases another source field", item);
+          qa_raise("Error", 0, 0, "QVM inventory item %s aliases another source field", item);
       if (ctx->field_count == ctx->field_capacity) {
         size_t capacity = ctx->field_capacity == 0 ? 16 : ctx->field_capacity * 2;
         inventory_field *grown = realloc(ctx->fields, capacity * sizeof *grown);
@@ -95,7 +95,7 @@ static void public_view(binding_ctx *ctx, qa_qvm_writable_view *out) {
   qa_qvm_game_data_public_player_bytes(ctx->options.data, ctx->options.client(ctx->options.ctx), out);
   if ((int64_t)profile->weapons_offset + 4 > out->length ||
       (int64_t)profile->ammo_offset + 64 > out->length)
-    qa_range_error("QVM inventory fields exceed the public player record");
+    qa_raise("Error", 0, 0, "QVM inventory fields exceed the public player record");
 }
 
 static double field_capacity(binding_ctx *ctx, const inventory_field *field) {
@@ -108,7 +108,7 @@ static double field_capacity(binding_ctx *ctx, const inventory_field *field) {
                                      (double)entity_view.start, ctx->options.client(ctx->options.ctx)};
   double value = profile->capacity(profile->ctx, ctx->options.module->memory, field->weapon, context);
   if (!is_integer(value) || value < 0 || value > 2147483647.0)
-    qa_range_error("QVM source ammo capacity is not a nonnegative int32");
+    qa_raise("Error", 0, 0, "QVM source ammo capacity is not a nonnegative int32");
   return value;
 }
 
@@ -155,14 +155,14 @@ static void public_write(void *ctx, qa_inventory_entry entry) {
   inventory_field *field = NULL;
   for (size_t i = 0; i < binding->field_count; i++)
     if (strcmp(binding->fields[i].item, entry.item) == 0) field = &binding->fields[i];
-  if (field == NULL) qa_range_error("QVM inventory did not admit %s", entry.item);
+  if (field == NULL) qa_raise("Error", 0, 0, "QVM inventory did not admit %s", entry.item);
   if (entry.capacity != field_capacity(binding, field))
-    qa_range_error("QVM inventory cannot change source capacity");
+    qa_raise("Error", 0, 0, "QVM inventory cannot change source capacity");
   const qa_qvm_public_inventory_profile *profile = binding->options.profile.public_profile;
   if (field->is_weapon) {
     if ((entry.count != 0 && entry.count != 1) ||
         (entry.has_count_policy && strcmp(entry.count_policy.kind, "stack") != 0))
-      qa_range_error("QVM weapon ownership requires a zero or one stack");
+      qa_raise("Error", 0, 0, "QVM weapon ownership requires a zero or one stack");
     int32_t before = qa_qvm_writable_view_get_int32(&source, (int64_t)profile->weapons_offset, true);
     int32_t bit = 1 << (int)field->weapon;
     qa_qvm_writable_view_set_int32(&source, (int64_t)profile->weapons_offset,
@@ -171,7 +171,7 @@ static void public_write(void *ctx, qa_inventory_entry entry) {
     if (!is_integer(entry.count) || entry.count < -2147483648.0 || entry.count > 2147483647.0 ||
         !entry.has_count_policy || strcmp(entry.count_policy.kind, "source-counter") != 0 ||
         strcmp(entry.count_policy.arithmetic, "int32") != 0)
-      qa_range_error("QVM ammo requires its signed int32 source counter");
+      qa_raise("Error", 0, 0, "QVM ammo requires its signed int32 source counter");
     qa_qvm_writable_view_set_int32(
         &source, (int64_t)profile->ammo_offset + (int64_t)field->weapon * 4, qa_int32(entry.count),
         true);
@@ -190,7 +190,7 @@ static int64_t field_address(binding_ctx *binding, qa_qvm_item_field field, cons
   if (stride_message != NULL &&
       (qa_qvm_game_data_get_entity_stride_bytes(binding->options.data) != profile->entity_stride ||
        qa_qvm_game_data_get_client_stride_bytes(binding->options.data) != profile->client_stride))
-    qa_range_error("%s", stride_message);
+    qa_raise("Error", 0, 0, "%s", stride_message);
   qa_qvm_writable_view record;
   bool has_record = true;
   if (strcmp(field.record, "client") == 0)
@@ -200,10 +200,10 @@ static int64_t field_address(binding_ctx *binding, qa_qvm_item_field field, cons
   else
     has_record = false;
   if (!has_record || field.offset < 0 ||
-      (stride_message != NULL && (int64_t)field.offset % 4 != 0) ||
+      (stride_message != NULL && fmod(field.offset, 4) != 0) ||
       field.offset + 4 > (double)record.length)
-    qa_range_error(stride_message != NULL ? "Private QVM inventory field exceeds its source record"
-                                          : "Projected QVM item field exceeds its original record");
+    qa_raise("Error", 0, 0, "%s", stride_message != NULL ? "Private QVM inventory field exceeds its source record"
+                                                        : "Projected QVM item field exceeds its original record");
   return record.start + (int64_t)field.offset;
 }
 
@@ -313,10 +313,17 @@ static bool private_mutable_capacity(void *ctx, qa_item_id item) {
 static void private_write(void *ctx, qa_inventory_entry entry) {
   binding_ctx *binding = ctx;
   const qa_qvm_item_storage *storage = private_storage_for(binding, entry.item);
-  if (storage == NULL) qa_range_error("QVM inventory did not admit %s", entry.item);
+  if (storage == NULL) qa_raise("Error", 0, 0, "QVM inventory did not admit %s", entry.item);
   access_ctx access_storage;
   qa_qvm_write_item_storage(binding->options.profile.private_profile->image, *storage, entry,
                             private_access(&access_storage, binding));
+}
+
+static void free_binding_ctx(void *arg) {
+  binding_ctx *ctx = arg;
+  free(ctx->fields);
+  free(ctx->entries);
+  free(ctx);
 }
 
 qa_inventory_state_binding qa_qvm_inventory_binding(qa_qvm_inventory_options options) {
@@ -335,14 +342,24 @@ qa_inventory_state_binding qa_qvm_inventory_binding(qa_qvm_inventory_options opt
     return result;
   }
   const qa_qvm_public_inventory_profile *profile = options.profile.public_profile;
-  if (options.weapons.get == NULL) refresh(binding);
+  if (options.weapons.get == NULL) {
+    /* A refused weapon list leaves no half-built binding behind. */
+    qa_cleanup refused;
+    qa_cleanup_push(&refused, free_binding_ctx, binding);
+    refresh(binding);
+    qa_cleanup_pop(&refused);
+  }
   double offsets[] = {profile->weapons_offset, profile->ammo_offset};
   for (size_t i = 0; i < 2; i++)
-    if (!is_integer(offsets[i]) || offsets[i] < 0 || (int64_t)offsets[i] % 4 != 0)
-      qa_range_error("QVM inventory fields require aligned source offsets");
+    if (!is_integer(offsets[i]) || offsets[i] < 0 || fmod(offsets[i], 4) != 0) {
+      qa_qvm_inventory_binding_destroy(&result);
+      qa_raise("Error", 0, 0, "QVM inventory fields require aligned source offsets");
+    }
   if (profile->weapons_offset >= profile->ammo_offset &&
-      profile->weapons_offset < profile->ammo_offset + 64)
-    qa_range_error("QVM inventory weapon bits overlap ammo counters");
+      profile->weapons_offset < profile->ammo_offset + 64) {
+    qa_qvm_inventory_binding_destroy(&result);
+    qa_raise("Error", 0, 0, "QVM inventory weapon bits overlap ammo counters");
+  }
   result.read = public_read;
   result.write = public_write;
   return result;
@@ -394,11 +411,18 @@ static void projected_write(void *ctx, qa_qvm_item_field field, double value) {
   access->words.count++;
 }
 
+static void free_projected_words(void *arg) {
+  projected_access *access = arg;
+  free(access->words.entries);
+  access->words.entries = NULL;
+  access->words.count = 0;
+}
+
 bool qa_qvm_inventory_projection(qa_qvm_inventory_options options, qa_item_id item, double count,
                                  qa_qvm_inventory_words *out) {
   validate_profile(&options);
   if (!is_integer(count) || count < -2147483648.0 || count > 2147483647.0)
-    qa_range_error("QVM inventory projection requires an int32 counter");
+    qa_raise("Error", 0, 0, "QVM inventory projection requires an int32 counter");
   out->entries = NULL;
   out->count = 0;
   if (options.profile.private_profile != NULL) {
@@ -423,7 +447,7 @@ bool qa_qvm_inventory_projection(qa_qvm_inventory_options options, qa_item_id it
     }
     if (!has_entry || storage == NULL) {
       qa_qvm_inventory_binding_destroy(&binding);
-      qa_range_error("Projected QVM item has no original inventory storage");
+      qa_raise("Error", 0, 0, "Projected QVM item has no original inventory storage");
     }
     projected_access access;
     memset(&access, 0, sizeof access);
@@ -431,8 +455,11 @@ bool qa_qvm_inventory_projection(qa_qvm_inventory_options options, qa_item_id it
     entry.count = count;
     qa_qvm_item_storage_access storage_access = {&access, projected_read, projected_global,
                                                  projected_write};
+    /* A refused projection leaves neither the binding nor the words behind. */
+    qa_cleanup binding_cleanup, words_cleanup;
+    qa_cleanup_push(&binding_cleanup, free_binding_ctx, binding.ctx);
+    qa_cleanup_push(&words_cleanup, free_projected_words, &access);
     qa_qvm_write_item_storage(profile->image, *storage, entry, storage_access);
-    qa_qvm_inventory_binding_destroy(&binding);
     size_t kept = 0;
     for (size_t i = 0; i < access.words.count; i++) {
       qa_qvm_writable_view view;
@@ -441,6 +468,9 @@ bool qa_qvm_inventory_projection(qa_qvm_inventory_options options, qa_item_id it
         access.words.entries[kept++] = access.words.entries[i];
     }
     access.words.count = kept;
+    qa_cleanup_pop(&words_cleanup);
+    qa_cleanup_pop(&binding_cleanup);
+    qa_qvm_inventory_binding_destroy(&binding);
     *out = access.words;
     return true;
   }
@@ -456,15 +486,17 @@ bool qa_qvm_inventory_projection(qa_qvm_inventory_options options, qa_item_id it
       break;
     }
   if (weapon == NULL || weapon->weapon < 1 || weapon->weapon > 15)
-    qa_range_error("Projected QVM item has no public inventory slot");
+    qa_raise("Error", 0, 0, "Projected QVM item has no public inventory slot");
   const qa_qvm_public_inventory_profile *profile = options.profile.public_profile;
   qa_qvm_writable_view source;
   qa_qvm_game_data_public_player_bytes(options.data, options.client(options.ctx), &source);
+  bool owns = strcmp(weapon->item, item) == 0;
+  if (owns && count != 0 && count != 1)
+    qa_raise("Error", 0, 0, "Projected QVM ownership requires zero or one");
   out->entries = malloc(sizeof *out->entries);
   if (out->entries == NULL) return false;
   out->count = 1;
-  if (strcmp(weapon->item, item) == 0) {
-    if (count != 0 && count != 1) qa_range_error("Projected QVM ownership requires zero or one");
+  if (owns) {
     int32_t before = qa_qvm_writable_view_get_int32(&source, (int64_t)profile->weapons_offset, true);
     int32_t mask = 1 << (int)weapon->weapon;
     out->entries[0].address = (double)(source.start + (int64_t)profile->weapons_offset);

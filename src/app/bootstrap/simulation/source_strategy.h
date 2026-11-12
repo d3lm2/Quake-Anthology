@@ -18,6 +18,7 @@
 #include "qa/contracts/movement.h"
 #include "qa/contracts/session.h"
 #include "qa/contracts/time.h"
+#include "qa/app/bootstrap/simulation/native_q2_rerelease_save.h"
 #include "qa/app/bootstrap/simulation/rerelease_guest_world.h"
 #include "qa/app/bootstrap/simulation/shared_simulation.h"
 #include "qa/compat/qvm/game_combat_binding.h"
@@ -523,13 +524,19 @@ typedef struct qa_app_source_strategy {
   /* Refuses an original save the source cannot represent. */
   void (*assert_savable)(qa_app_shared_simulation *sim);
   /* The source's own save taken a frame at a time; false when it has none (TS undefined). The caller frees its parts. */
-  bool (*capture_guest_save)(qa_app_shared_simulation *sim, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx,
+  bool (*capture_guest_save)(qa_app_shared_simulation *sim, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx, bool autosave,
       qa_app_sim_rerelease_guest_save *out);
-  /* The source's own original save as a checkpoint provider whose bytes `owner` keeps; false when it keeps none (TS null). */
-  bool (*original_save)(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *guest_save, qa_persist_decoded *owner,
-      qa_provider_checkpoint *out);
+  /* The source's own original save as a checkpoint provider whose bytes `owner` keeps; false when it keeps none (TS null).
+   * An autosave is what the original writes on entering a level: it carries no file for a level the unit has not left before. */
+  bool (*original_save)(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *guest_save, bool autosave,
+      qa_persist_decoded *owner, qa_provider_checkpoint *out);
   /* Restores the source's own original save a frame at a time. */
   void (*restore_loading)(qa_app_shared_simulation *sim, const qa_save_image *save, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx);
+  /* Starts the world from the files of an original save folder, a frame at a time. */
+  void (*import_loading)(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported,
+      qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx);
+  /* Starts the world from the files of an original save folder. */
+  void (*import_original)(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported);
   /* Restores the source's own original save and reconnects its saved clients. */
   void (*restore_guest)(qa_app_shared_simulation *sim, const qa_save_image *save, bool native_restored);
   /* The guest stand-in entities shared monsters need to be addressed by guest slot; false when the guest needs none (TS null). */

@@ -110,6 +110,14 @@ double qa_q2_source_deathmatch_flags(qa_cvar_registry *cvars) {
   return (double)flags;
 }
 
+static void destroy_registry(void *registry) { qa_cvar_registry_destroy(registry); }
+static void free_value(void *value) { qa_save_value_free(value); }
+typedef struct snapshot_list { qa_cvar_snapshot *items; size_t count; } snapshot_list;
+static void free_snapshots(void *arg) {
+  snapshot_list *list = arg;
+  for (size_t i = 0; i < list->count; i++) qa_cvar_read_free(&list->items[i]);
+  free(list->items);
+}
 static qa_cvar_registry *validated_registry(qa_cvar_registry *cvars,
                                             const qa_save_value *value) {
   qa_cvar_registry_options options;
@@ -118,7 +126,10 @@ static qa_cvar_registry *validated_registry(qa_cvar_registry *cvars,
   options.context = qa_cvar_registry_context(cvars);
   qa_cvar_registry *validated =
       (qa_cvar_registry *)xalloc(qa_cvar_registry_create(&options));
+  qa_cleanup validated_node; /* a refused save drops the scratch registry (TS: garbage) */
+  qa_cleanup_push(&validated_node, destroy_registry, validated);
   qa_cvar_registry_restore_save_state(validated, value);
+  qa_cleanup_pop(&validated_node);
   return validated;
 }
 
@@ -178,6 +189,13 @@ static void object_replace(qa_save_value *object, const char *key,
   }
   if (!qa_save_value_set(object, key, child)) qa_error("Settings allocation failed");
 }
+/* A registry text (one byte per character) as the cvar checkpoint tree holds it: the UTF-8 of the TS string. */
+static qa_save_value *tree_string(const char *bytes) {
+  char *utf8 = qa_command_text_to_utf8(bytes);
+  qa_save_value *value = qa_save_value_string(utf8);
+  free(utf8);
+  return value;
+}
 static void entry_set(qa_save_value *object, const char *key, qa_save_value *child) {
   if (child == NULL || !qa_save_value_set(object, key, child))
     qa_error("Settings allocation failed");
@@ -186,37 +204,48 @@ static void entry_set(qa_save_value *object, const char *key, qa_save_value *chi
 void qa_restore_q2_server_cvars(qa_cvar_registry *cvars,
                                 const qa_save_value *value) {
   qa_cvar_registry *validated = validated_registry(cvars, value);
-  qa_save_value *saved =
-      (qa_save_value *)xalloc(qa_cvar_registry_capture_save_state(validated));
+  qa_save_value *saved = qa_cvar_registry_capture_save_state(validated);
   qa_cvar_registry_destroy(validated);
+  xalloc(saved);
+  /* Every scratch value below is released when a step raises (TS: garbage). */
+  qa_cleanup saved_node, merged_node, snapshots_node, order_node;
+  qa_cleanup_push(&saved_node, free_value, saved);
   qa_save_value *merged = clone_value(saved);
+  qa_cleanup_push(&merged_node, free_value, merged);
   qa_save_value *variables = object_child(merged, "variables");
   qa_save_value *order = object_child(merged, "order");
   if (variables == NULL || order == NULL) qa_error("Settings allocation failed");
   size_t snapshot_count = 0;
   qa_cvar_snapshot *snapshots =
       qa_cvar_registry_snapshots(cvars, 0, &snapshot_count);
+  snapshot_list snapshot_scope = {snapshots, snapshot_count};
+  qa_cleanup_push(&snapshots_node, free_snapshots, &snapshot_scope);
   qa_save_value *new_order = (qa_save_value *)xalloc(qa_save_value_array());
+  qa_cleanup_push(&order_node, free_value, new_order);
   for (size_t i = 0; i < snapshot_count; i++) {
     bool present = false;
+    char *name = qa_command_text_to_utf8(snapshots[i].name); /* the tree's spelling of the name */
     for (size_t j = 0; j < order->item_count; j++) {
       const qa_save_value *entry = order->items[j];
       if (entry != NULL && entry->kind == QA_SAVE_STRING && entry->text != NULL &&
-          strcmp(entry->text, snapshots[i].name) == 0)
+          strcmp(entry->text, name) == 0)
         present = true;
     }
+    free(name);
     if (present) continue;
     /* {...snapshot, latchedValue: snapshot.latchedValue ?? null} in
      * the registry's saved-variable shape. */
     qa_save_value *entry = (qa_save_value *)xalloc(qa_save_value_object());
-    entry_set(entry, "name", qa_save_value_string(snapshots[i].name));
-    entry_set(entry, "value", qa_save_value_string(snapshots[i].value));
-    entry_set(entry, "resetValue", qa_save_value_string(snapshots[i].reset_value));
+    qa_cleanup entry_node;
+    qa_cleanup_push(&entry_node, free_value, entry);
+    entry_set(entry, "name", tree_string(snapshots[i].name));
+    entry_set(entry, "value", tree_string(snapshots[i].value));
+    entry_set(entry, "resetValue", tree_string(snapshots[i].reset_value));
     entry_set(entry, "latchedValue",
               snapshots[i].latched_value != NULL
-                  ? qa_save_value_string(snapshots[i].latched_value)
+                  ? tree_string(snapshots[i].latched_value)
                   : qa_save_value_null());
-    entry_set(entry, "flags", qa_save_value_number((double)snapshots[i].flags));
+    entry_set(entry, "flags", qa_save_value_number(snapshots[i].flags_value)); /* TS: the number as held */
     entry_set(entry, "modified", qa_save_value_boolean(snapshots[i].modified));
     entry_set(entry, "modificationCount",
               qa_save_value_number(snapshots[i].modification_count));
@@ -224,17 +253,21 @@ void qa_restore_q2_server_cvars(qa_cvar_registry *cvars,
               qa_save_value_number(snapshots[i].numeric_value));
     entry_set(entry, "integerValue",
               qa_save_value_number(snapshots[i].integer_value));
-    if (!qa_save_value_push(variables, entry)) qa_error("Settings allocation failed");
-    if (!qa_save_value_push(new_order, qa_save_value_string(snapshots[i].name)))
+    qa_cleanup_pop(&entry_node);
+    if (!qa_save_value_push(variables, entry)) { qa_save_value_free(entry); qa_error("Settings allocation failed"); }
+    if (!qa_save_value_push(new_order, tree_string(snapshots[i].name)))
       qa_error("Settings allocation failed");
   }
   for (size_t j = 0; j < order->item_count; j++)
     if (!qa_save_value_push(new_order, clone_value(order->items[j])))
       qa_error("Settings allocation failed");
-  object_replace(merged, "order", new_order);
-  for (size_t i = 0; i < snapshot_count; i++) qa_cvar_read_free(&snapshots[i]);
-  free(snapshots);
+  qa_cleanup_pop(&order_node);
+  object_replace(merged, "order", new_order); /* merged owns it from here */
+  qa_cleanup_pop(&snapshots_node);
+  free_snapshots(&snapshot_scope);
   qa_cvar_registry_restore_save_state(cvars, merged);
+  qa_cleanup_pop(&merged_node);
+  qa_cleanup_pop(&saved_node);
   qa_save_value_free(merged);
   qa_save_value_free(saved);
 }
@@ -367,6 +400,18 @@ static void set_forced(qa_cvar_registry *cvars, const char *name, const char *va
   qa_cvar_snapshot snapshot;
   if (qa_cvar_registry_set(cvars, name, value, true, &snapshot)) qa_cvar_read_free(&snapshot);
 }
+void qa_apply_q2_latched_cvars(qa_cvar_registry *cvars, const char *const *names, const char *const *values,
+                               size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    qa_cvar_read found;
+    if (!qa_cvar_registry_find(cvars, names[i], &found)) {
+      registry_register(cvars, names[i], values[i], 0);
+    } else {
+      qa_cvar_read_free(&found);
+      set_forced(cvars, names[i], values[i]);
+    }
+  }
+}
 static void set_number(qa_cvar_registry *cvars, const char *name, double value, bool force) {
   char text[40];
   number_string(value, text, sizeof text);
@@ -409,10 +454,11 @@ static void free_strings(qa_q2_cvar_binding *binding) {
   free(binding->map_list); binding->map_list = NULL; binding->map_list_count = 0;
 }
 
-/* TS mapList getter: split on /[\s,]+/ (classic) or /\s+/ (rerelease), drop empties. */
+/* TS mapList getter: split on /[\s,]+/ (classic) or /\s+/ (rerelease), drop empties. The registry text holds one
+ * byte per character, so JS \s is these bytes and U+00A0 (byte 0xA0). */
 static void pull_map_list(qa_q2_cvar_binding *binding) {
   char *text = qa_cvar_registry_variable_string(binding->cvars, binding->rerelease == NULL ? "sv_maplist" : "g_map_list");
-  const char *separators = binding->rerelease == NULL ? " \t\n\v\f\r," : " \t\n\v\f\r";
+  const char *separators = binding->rerelease == NULL ? " \t\n\v\f\r\xa0," : " \t\n\v\f\r\xa0";
   size_t capacity = 0;
   for (const char *at = text != NULL ? text : ""; *at != '\0';) {
     size_t skip = strspn(at, separators);

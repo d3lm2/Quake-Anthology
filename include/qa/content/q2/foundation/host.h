@@ -359,6 +359,11 @@ qa_body_state qa_q2_game_body(qa_q2_game_services *g, qa_q2_entity *e);
 void qa_q2_game_move(qa_q2_game_services *g, qa_q2_entity *e, qa_q2_body_changes c, bool link);
 qa_q2_entity *qa_q2_game_entity_of(qa_q2_game_services *g, const qa_actor_id *a);
 void qa_q2_game_use_targets_entity(qa_q2_game_services *g, qa_q2_entity *e, const qa_actor_id *activator, bool ignore_delay);
+/* A malloc'd copy of host.nearby(origin, radius) (NULL when empty; free it).
+ * TS callers iterate the array nearby() returned; the C host reuses one result
+ * buffer, so a loop whose body can run another nearby() query (damage that sets
+ * off radius damage) iterates this copy. */
+qa_actor_id *qa_q2_game_nearby_copy(qa_q2_game_services *g, qa_vec3 origin, double radius, size_t *out_count);
 /* TS game.markDodgeable(entity). Test doubles that leave mark_dodgeable NULL skip it. */
 void qa_q2_game_mark_dodgeable(qa_q2_game_services *g, qa_q2_entity *e);
 /* TS game.entities is a live map: a loop that spawns or removes reads the

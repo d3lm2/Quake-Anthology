@@ -312,12 +312,9 @@ static const callback_slot CALLBACKS[] = {CALLBACK(think), CALLBACK(prethink), C
 
 static void read_entity(const qa_save_reader *reader, qa_q2_entity_checkpoint *out, qa_persist_decoded *owner) {
   memset(out, 0, sizeof *out);
-  out->actor = q2c_actor(reader, "actor");
-  out->has_source_slot = !q2c_is_null(reader, "sourceSlot");
-  if (out->has_source_slot) out->source_slot = q2c_integer(reader, "sourceSlot", 0);
+  /* TS entity() reads spawn.values (the healthtarget/itemtarget fallback) before the literal:
+   * actor, sourceSlot, then spawn's classname and ordinal. */
   qa_save_reader spawn = q2c_field(reader, "spawn");
-  out->spawn.classname = q2c_string(&spawn, "classname");
-  out->spawn.ordinal = q2c_integer(&spawn, "ordinal", -9007199254740991.0);
   qa_save_reader values = q2c_field(&spawn, "values");
   out->spawn.value_count = qa_save_reader_list_count(&values);
   out->spawn.value_capacity = out->spawn.value_count;
@@ -330,6 +327,11 @@ static void read_entity(const qa_save_reader *reader, qa_q2_entity_checkpoint *o
     qa_save_reader_destroy(&pair);
   }
   qa_save_reader_destroy(&values);
+  out->actor = q2c_actor(reader, "actor");
+  out->has_source_slot = !q2c_is_null(reader, "sourceSlot");
+  if (out->has_source_slot) out->source_slot = q2c_integer(reader, "sourceSlot", 0);
+  out->spawn.classname = q2c_string(&spawn, "classname");
+  out->spawn.ordinal = q2c_integer(&spawn, "ordinal", -9007199254740991.0);
   qa_save_reader_destroy(&spawn);
   qa_save_reader v = q2c_field(reader, "values");
   read_entity_values(&v, &out->spawn, &out->values);
@@ -389,6 +391,8 @@ static qa_save_value *entity_value(const qa_q2_entity_checkpoint *entity) {
 
 /* ---- TS readQ2FoundationCheckpoint ---- */
 qa_q2_foundation_checkpoint qa_read_q2_foundation_checkpoint(const qa_save_reader *reader, qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2_foundation_checkpoint out;
   memset(&out, 0, sizeof out);
   qa_save_reader version = q2c_field(reader, "version");
@@ -426,6 +430,7 @@ qa_q2_foundation_checkpoint qa_read_q2_foundation_checkpoint(const qa_save_reade
   }
   out.entities = records;
   qa_save_reader_destroy(&entities);
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 
@@ -467,9 +472,12 @@ uint8_t *qa_encode_q2_foundation_checkpoint(const qa_q2_foundation_checkpoint *c
 
 bool qa_decode_q2_foundation_checkpoint(const uint8_t *bytes, size_t length, qa_q2_foundation_checkpoint *out,
                                         qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_save_reader reader;
-  if (!q2c_open(bytes, length, "q2-foundation", owner, &reader)) return false;
+  if (!q2c_open(bytes, length, "q2-foundation", owner, &reader)) { qa_persist_decoded_leave(&owner_scope); return false; }
   *out = qa_read_q2_foundation_checkpoint(&reader, owner);
   qa_save_reader_destroy(&reader);
+  qa_persist_decoded_leave(&owner_scope);
   return true;
 }

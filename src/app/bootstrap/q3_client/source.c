@@ -164,9 +164,9 @@ qa_app_application_q3_source *qa_app_application_q3_source_create(
   s->level_shot_sequence = -1;
   for (size_t i = 0; i < 1024; i++) { s->strings[i] = xstrdup(""); s->applied_strings[i] = xstrdup(""); }
   const qa_app_q3_source_presentation_client *client = NULL;
-  for (size_t i = 0; i < initial->client_count; i++)
+  for (size_t i = 0; i < initial->client_count && client == NULL; i++) /* find: the first match */
     if (qa_same_actor(initial->clients[i].actor, current_actor)) client = &initial->clients[i];
-  if (client == NULL) qa_range_error("Q3 presentation seat has no source player");
+  if (client == NULL) qa_raise("Error", 0, 0, "Q3 presentation seat has no source player");
   s->client_number = client->slot;
   s->product = initial->product;
   for (size_t i = 0; i < initial->configstring_count; i++) {
@@ -195,13 +195,13 @@ double qa_app_application_q3_source_client_number(const qa_app_application_q3_so
 double qa_app_application_q3_source_time(const qa_app_application_q3_source *source) { return source->time; }
 qa_q3_pres_client_command_history *qa_app_application_q3_source_commands(qa_app_application_q3_source *source) { return &source->commands; }
 void qa_app_application_q3_source_assert_can_restart_round(qa_app_application_q3_source *source) {
-  if (source->has_pending_round_time) qa_range_error("Local Q3 round restart is already pending");
+  if (source->has_pending_round_time) qa_raise("Error", 0, 0, "Local Q3 round restart is already pending");
 }
 void qa_app_application_q3_source_begin_round_restart(qa_app_application_q3_source *source, double bit,
     const qa_app_q3_source_presentation_state *state) {
   qa_app_application_q3_source_assert_can_restart_round(source);
   if (bit == source->snapshot_server_bit || state->product != source->product || state->time < source->time)
-    qa_range_error("Invalid local Q3 restart epoch");
+    qa_raise("Error", 0, 0, "Invalid local Q3 restart epoch");
   apply_configstrings(source, state);
   const char *argv[1] = {"map_restart"};
   push_command(source, argv, 1);
@@ -219,7 +219,7 @@ void qa_app_application_q3_source_validate_round_actor(qa_app_application_q3_sou
       || actor.session.token != source->current_actor.session.token
       || qa_same_actor(actor, source->current_actor)
       || state->product != source->product || state->time < source->pending_round_time || !listed)
-    qa_range_error("Invalid local Q3 round actor binding");
+    qa_raise("Error", 0, 0, "Invalid local Q3 round actor binding");
 }
 void qa_app_application_q3_source_rebind_round(qa_app_application_q3_source *source, qa_actor_id actor,
     const qa_app_q3_source_presentation_state *state) {
@@ -256,7 +256,7 @@ bool qa_app_application_q3_source_get_server_command(qa_app_application_q3_sourc
     double index = command->argc > 1 ? qa_js_string_to_number(command->argv[1]) : NAN; /* Number(command[1]) */
     const char *value = command->argc > 2 ? command->argv[2] : NULL;
     if (index != trunc(index) || index < 0 || index >= 1024 || value == NULL)
-      qa_range_error("Invalid local source configstring command");
+      qa_raise("Error", 0, 0, "Invalid local source configstring command");
     set_string(&source->applied_strings[(size_t)index], value);
   }
   *argv_out = (const char *const *)command->argv;
@@ -264,17 +264,18 @@ bool qa_app_application_q3_source_get_server_command(qa_app_application_q3_sourc
   return true;
 }
 qa_actor_id qa_app_application_q3_source_actor_at(qa_app_application_q3_source *source, double number) {
-  if (source->has_pending_round_time) qa_range_error("Local Q3 actor binding is suspended for restart");
+  if (source->has_pending_round_time) qa_raise("Error", 0, 0, "Local Q3 actor binding is suspended for restart");
   qa_actor_id actor;
   if (actor_get(source, number, &actor)) return actor;
   if (source->callbacks.source_actor(source->callbacks.ctx, number, &actor)) return actor;
-  qa_range_error("Q3 sound entity %s has no source actor", QA_JS_NUMBER(number));
+  qa_raise("Error", 0, 0, "Q3 sound entity %s has no source actor", QA_JS_NUMBER(number));
 }
 bool qa_app_application_q3_source_sound_actor(qa_app_application_q3_source *source, double number, qa_actor_id *out) {
   if (source->has_pending_round_time) return false;
   if (actor_get(source, number, out)) return true;
   return source->callbacks.source_actor(source->callbacks.ctx, number, out);
 }
+static void release_tokens(void *tokens) { qa_command_tokens_destroy(tokens); }
 void qa_app_application_q3_source_receive_events(qa_app_application_q3_source *source,
     const qa_app_sim_presentation_event *events, size_t event_count) {
   for (size_t i = 0; i < event_count; i++) {
@@ -286,10 +287,13 @@ void qa_app_application_q3_source_receive_events(qa_app_application_q3_source *s
     if (command->kind == QA_APP_Q3_EVENT_SERVER_COMMAND
         && (command->client < 0 || command->client == source->client_number)) {
       qa_command_tokens tokens;
-      if (qa_tokenize_command(command->text, QA_COMMAND_DIALECT_Q3, QA_COMMAND_TEXT_SOURCE, &tokens)) {
-        push_command(source, (const char *const *)tokens.argv, tokens.argc);
-        qa_command_tokens_destroy(&tokens);
-      }
+      if (!qa_tokenize_command(command->text, QA_COMMAND_DIALECT_Q3, QA_COMMAND_TEXT_SOURCE, &tokens))
+        qa_range_error("Out of memory");
+      qa_cleanup guard;
+      qa_cleanup_push(&guard, release_tokens, &tokens);
+      push_command(source, (const char *const *)tokens.argv, tokens.argc);
+      qa_cleanup_pop(&guard);
+      qa_command_tokens_destroy(&tokens);
     }
   }
 }
@@ -298,13 +302,13 @@ void qa_app_application_q3_source_receive(qa_app_application_q3_source *source,
     const qa_app_sim_presentation_event *events, size_t event_count,
     const qa_actor_command *commands, size_t command_count) {
   if (source->has_pending_round_time)
-    qa_range_error("Local Q3 restart requires actor rebinding before publication");
-  if (state->time < source->time) qa_range_error("Q3 presentation world time rewound");
+    qa_raise("Error", 0, 0, "Local Q3 restart requires actor rebinding before publication");
+  if (state->time < source->time) qa_raise("Error", 0, 0, "Q3 presentation world time rewound");
   const qa_app_q3_source_presentation_client *player = NULL;
-  for (size_t i = 0; i < state->client_count; i++)
+  for (size_t i = 0; i < state->client_count && player == NULL; i++) /* find: the first match */
     if (qa_same_actor(state->clients[i].actor, source->current_actor)) player = &state->clients[i];
   if (player == NULL || player->slot != source->client_number)
-    qa_range_error("Q3 presentation seat changed source player");
+    qa_raise("Error", 0, 0, "Q3 presentation seat changed source player");
   for (size_t i = 0; i < state->entity_count; i++)
     actor_set(source, state->entities[i].state.number, state->entities[i].actor);
   for (size_t i = 0; i < state->client_count; i++)
@@ -325,7 +329,7 @@ void qa_app_application_q3_source_receive(qa_app_application_q3_source *source,
         command->buttons, command->weapon, command->forward_move, command->right_move, command->up_move};
       qa_q3_pres_client_command_history_append(&source->commands, appended);
     } else {
-      qa_range_error("Selected foreign movement requires its private cgame prediction command adapter");
+      qa_raise("Error", 0, 0, "Selected foreign movement requires its private cgame prediction command adapter");
     }
   }
   if (source->number > 0 && state->time == source->time) return;

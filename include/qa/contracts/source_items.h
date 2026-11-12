@@ -67,8 +67,8 @@ typedef struct qa_source_item_named_result {
   bool exact;        /* match only */
   size_t match_count; /* ambiguous only */
 } qa_source_item_named_result;
-/* original may be NULL (the TS default). Lowercasing is ASCII-only in
- * C; TS toLowerCase is Unicode (noted accommodation). */
+/* original may be NULL (the TS default). Both sides lowercase as TS
+ * toLowerCase does (qa_js_to_lower_case over UTF-8 text). */
 qa_source_item_named_result qa_source_item_named(
     const qa_source_item_named_entry *items, size_t count, const char *text,
     qa_item_id original, size_t *match_indices, size_t match_capacity);

@@ -22,7 +22,7 @@ int32_t qa_qvm_evaluate_unary(qa_qvm_opcode opcode, int32_t word) {
     case QA_QVMY_OP_NEGF: return as_word(-(double)as_float(word));
     case QA_QVMY_OP_CVIF: return as_word((double)word);
     case QA_QVMY_OP_CVFI: return qa_qvm_float_to_int((double)as_float(word));
-    default: qa_range_error("Unsupported QVM unary opcode %d", (int)opcode);
+    default: qa_raise("Error", 0, 0, "Unsupported QVM unary opcode %d", (int)opcode);
   }
 }
 
@@ -55,7 +55,7 @@ int32_t qa_qvm_evaluate_binary(qa_qvm_opcode opcode, int32_t left, int32_t right
     case QA_QVMY_OP_SUBF: return as_word((double)as_float(left) - (double)as_float(right));
     case QA_QVMY_OP_DIVF: return as_word((double)as_float(left) / (double)as_float(right));
     case QA_QVMY_OP_MULF: return as_word((double)as_float(left) * (double)as_float(right));
-    default: qa_range_error("Unsupported QVM binary opcode %d", (int)opcode);
+    default: qa_raise("Error", 0, 0, "Unsupported QVM binary opcode %d", (int)opcode);
   }
 }
 
@@ -77,6 +77,6 @@ bool qa_qvm_evaluate_branch(qa_qvm_opcode opcode, int32_t left, int32_t right) {
     case QA_QVMY_OP_LEF: return as_float(left) <= as_float(right);
     case QA_QVMY_OP_GTF: return as_float(left) > as_float(right);
     case QA_QVMY_OP_GEF: return as_float(left) >= as_float(right);
-    default: qa_range_error("Unsupported QVM branch opcode %d", (int)opcode);
+    default: qa_raise("Error", 0, 0, "Unsupported QVM branch opcode %d", (int)opcode);
   }
 }

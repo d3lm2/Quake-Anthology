@@ -17,6 +17,7 @@
 #include "qa/compat/q2/rerelease/player_state.h"
 #include "qa/contracts/native_mod_items.h"
 #include "qa/contracts/native_mod_region.h"
+#include "qa/content/json_text.h"
 #include "qa/core/commands/text.h"
 #include "qa/persistence/execution.h"
 #include "qa/persistence/q2_classic_guest.h"
@@ -81,13 +82,13 @@ static double number_result(const qa_guest_call_result *result) {
   double value;
   switch (result->kind) {
     case QA_GUEST_VALUE_VOID: return 0;
-    case QA_GUEST_VALUE_AGGREGATE: case QA_GUEST_VALUE_POINTER: qa_range_error("Native mod operation must return a scalar");
+    case QA_GUEST_VALUE_AGGREGATE: case QA_GUEST_VALUE_POINTER: qa_raise("Error", 0, 0, "Native mod operation must return a scalar");
     case QA_GUEST_VALUE_INT64: value = (double)result->int64_value; break;
     case QA_GUEST_VALUE_UINT64: value = (double)result->uint64_value; break;
     default: value = result->number_value; break;
   }
   bool big = result->kind == QA_GUEST_VALUE_INT64 || result->kind == QA_GUEST_VALUE_UINT64;
-  if (!isfinite(value) || (big && !safe_integer(value))) qa_range_error("Native callback result cannot be represented by the shared operation");
+  if (!isfinite(value) || (big && !safe_integer(value))) qa_raise("Error", 0, 0, "Native callback result cannot be represented by the shared operation");
   return value;
 }
 /* TS layout(value).storage. */
@@ -136,7 +137,7 @@ static void output_field(const declaration_t *d, const char *record_id, double o
     const qa_native_mod_armor_field *pose[2] = {&clients->pose->view_height, &clients->pose->crouched.field};
     for (int i = 0; i < 2 && ok; i++) if (eq(pose[i]->record, record_id) && pose[i]->field.offset < offset + length && offset < pose[i]->field.offset + scalar_size(pose[i]->field.encoding)) ok = false;
   }
-  if (!ok) qa_range_error("Native client output requires exclusive private client storage");
+  if (!ok) qa_raise("Error", 0, 0, "Native client output requires exclusive private client storage");
 }
 static void output_scalar_check(void *ctx, const void *field) { const qa_native_mod_armor_field *f = field; output_field(ctx, f->record, f->field.offset, scalar_size(f->field.encoding)); }
 static void output_vector_check(void *ctx, const void *field) { const qa_native_mod_record_offset *f = field; output_field(ctx, f->record, f->offset, 12); }
@@ -145,19 +146,19 @@ static bool available_has(available_t a, const char *name) { return in_names((na
 static void check_values(const declaration_t *d, const value_t *values, size_t count, available_t available) {
   for (size_t i = 0; i < count; i++) {
     const value_t *value = &values[i];
-    if (!strcmp(value->kind, "user-command")) { if (!available_has(available, "view-angles")) qa_range_error("Native user command requires an active input application"); continue; }
+    if (!strcmp(value->kind, "user-command")) { if (!available_has(available, "view-angles")) qa_raise("Error", 0, 0, "Native user command requires an active input application"); continue; }
     if (!strcmp(value->kind, "address")) continue;
-    if (!strcmp(value->kind, "client") || !strcmp(value->kind, "userinfo")) { if (d->clients == NULL || !available_has(available, value->input)) qa_range_error("Unavailable native client input"); continue; }
-    if (!strcmp(value->kind, "actor")) { if (!available_has(available, value->input) || find_record(d, value->record) == NULL) qa_range_error("Unavailable native actor input"); continue; }
-    if (!strcmp(value->kind, "time")) { if (!available_has(available, value->time_input)) qa_range_error("Unavailable native time input"); continue; }
+    if (!strcmp(value->kind, "client") || !strcmp(value->kind, "userinfo")) { if (d->clients == NULL || !available_has(available, value->input)) qa_raise("Error", 0, 0, "Unavailable native client input"); continue; }
+    if (!strcmp(value->kind, "actor")) { if (!available_has(available, value->input) || find_record(d, value->record) == NULL) qa_raise("Error", 0, 0, "Unavailable native actor input"); continue; }
+    if (!strcmp(value->kind, "time")) { if (!available_has(available, value->time_input)) qa_raise("Error", 0, 0, "Unavailable native time input"); continue; }
     const qa_mod_callback_value *input = &value->value; bool named = !strcmp(input->kind, "input");
-    if (named && !available_has(available, input->name)) qa_range_error("Unavailable native callback input %s", input->name);
+    if (named && !available_has(available, input->name)) qa_raise("Error", 0, 0, "Unavailable native callback input %s", input->name);
     const char *kind = !named ? input->kind
         : one_of(input->name, NAMES("point", "direction", "normal", "view-angles")) ? "vector"
         : !strcmp(input->name, "item") ? "string"
         : one_of(input->name, NAMES("self", "other", "activator", "attacker", "inflictor")) ? "actor" : "float";
     const char *expected = !strcmp(value->kind, "vector") || !strcmp(value->kind, "string") ? value->kind : "float";
-    if (strcmp(kind, expected) != 0) qa_range_error("Native callback input representation differs from its declaration");
+    if (strcmp(kind, expected) != 0) qa_raise("Error", 0, 0, "Native callback input representation differs from its declaration");
   }
 }
 static void check_call(const declaration_t *d, const call_t *call, available_t available) {
@@ -166,7 +167,7 @@ static void check_call(const declaration_t *d, const call_t *call, available_t a
   for (size_t i = 0; i < call->skip_count; i++) {
     const qa_native_mod_skip *region = &call->skips[i]; bool repeated = false;
     for (size_t j = 0; j < i; j++) if (region->entry == call->skips[j].entry) repeated = true;
-    if (!safe_integer(region->entry) || !safe_integer(region->join) || region->entry < 0 || region->join <= region->entry || repeated) qa_range_error("Invalid or repeated native source exclusion");
+    if (!safe_integer(region->entry) || !safe_integer(region->join) || region->entry < 0 || region->join <= region->entry || repeated) qa_raise("Error", 0, 0, "Invalid or repeated native source exclusion");
   }
 }
 #define AVAILABLE(...) ((available_t){(const char *const[]){__VA_ARGS__}, sizeof((const char *const[]){__VA_ARGS__}) / sizeof(const char *)})
@@ -174,33 +175,33 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
   qa_compat_q2_validate_native_mod_items(d);
   qa_compat_q2_validate_native_mod_pickups(d);
   const qa_native_mod_source_actors *owned = d->source_actors; int64_t pointer_bytes = d->target.abi.pointer_bytes;
-  if (owned != NULL && (!isfinite(owned->frame_seconds) || owned->frame_seconds <= 0 || owned->clock_count == 0)) qa_range_error("Native owned actors require a positive source frame period and clock");
+  if (owned != NULL && (!isfinite(owned->frame_seconds) || owned->frame_seconds <= 0 || owned->clock_count == 0)) qa_raise("Error", 0, 0, "Native owned actors require a positive source frame period and clock");
   const char *expected_abi = d->target.api.kind == QA_Q2_GAME_API_CLASSIC ? "q2-classic" : "q2-rerelease"; bool expected_classic = !strcmp(expected_abi, "q2-classic");
-  if (owned != NULL && owned->callbacks != NULL && strcmp(owned->callbacks->abi, expected_abi) != 0) qa_range_error("Native callback ABI differs from the selected module target");
+  if (owned != NULL && owned->callbacks != NULL && strcmp(owned->callbacks->abi, expected_abi) != 0) qa_raise("Error", 0, 0, "Native callback ABI differs from the selected module target");
   if (owned != NULL && owned->combat != NULL && (owned->callbacks == NULL || strcmp(owned->combat->damage.abi, expected_abi) != 0 || !strcmp(owned->combat->causes.edition, "classic") != expected_classic))
-    qa_range_error("Native combat requires its matching source callback and damage ABIs");
-  if (owned != NULL && owned->combat != NULL && owned->combat->deferred != NULL && expected_classic) qa_range_error("Native deferred damage requires its declared rerelease mod_t ABI");
+    qa_raise("Error", 0, 0, "Native combat requires its matching source callback and damage ABIs");
+  if (owned != NULL && owned->combat != NULL && owned->combat->deferred != NULL && expected_classic) qa_raise("Error", 0, 0, "Native deferred damage requires its declared rerelease mod_t ABI");
   /* TS authority Set across every record's shared fields. */
   for (size_t r = 0; r < d->actor_record_count; r++) {
     const record_t *record = &d->actor_records[r]; bool duplicate = false;
     for (size_t o = 0; o < r; o++) if (eq(d->actor_records[o].id, record->id)) duplicate = true;
-    if (record->id == NULL || record->id[0] == '\0' || duplicate || !safe_integer(record->stride) || record->stride < 4 || !safe_integer(record->capacity) || record->capacity < 1 || record->capacity > 65536 || !safe_integer(record->first_slot) || record->first_slot < 0) qa_range_error("Invalid native mod actor record");
+    if (record->id == NULL || record->id[0] == '\0' || duplicate || !safe_integer(record->stride) || record->stride < 4 || !safe_integer(record->capacity) || record->capacity < 1 || record->capacity > 65536 || !safe_integer(record->first_slot) || record->first_slot < 0) qa_raise("Error", 0, 0, "Invalid native mod actor record");
     for (size_t f = 0; f < record->field_count; f++) {
       const field_t *field = &record->fields[f];
       if (is_match(field)) { qa_source_match_field match = {!strcmp(field->binding, "score"), field->team_values, field->team_value_count}; qa_validate_source_match_field(match); }
       double length = size_of(field, pointer_bytes);
-      if (!safe_integer(field->offset) || field->offset < 0 || !safe_integer(length) || length < 1 || field->offset + length > record->stride) qa_range_error("Native mod field exceeds its source record");
+      if (!safe_integer(field->offset) || field->offset < 0 || !safe_integer(length) || length < 1 || field->offset + length > record->stride) qa_raise("Error", 0, 0, "Native mod field exceeds its source record");
       for (size_t g = 0; g < f; g++) {
         const field_t *prior = &record->fields[g];
-        if (field->offset < prior->offset + size_of(prior, pointer_bytes) && prior->offset < field->offset + length) qa_range_error("Overlapping native mod fields");
+        if (field->offset < prior->offset + size_of(prior, pointer_bytes) && prior->offset < field->offset + length) qa_raise("Error", 0, 0, "Overlapping native mod fields");
       }
       if (shared(field)) for (size_t pr = 0; pr <= r; pr++) {
         const record_t *other = &d->actor_records[pr];
         for (size_t pf = 0; pf < (pr == r ? f : other->field_count); pf++) {
           const field_t *prior = &other->fields[pf];
           if (shared(prior) && !strcmp(prior->binding, field->binding) && (!is_inventory(field) || eq(prior->item, field->item))) {
-            if (is_inventory(field)) qa_range_error("Multiple native stores for %s:%s", field->binding, field->item);
-            qa_range_error("Multiple native stores for %s", field->binding);
+            if (is_inventory(field)) qa_raise("Error", 0, 0, "Multiple native stores for %s:%s", field->binding, field->item);
+            qa_raise("Error", 0, 0, "Multiple native stores for %s", field->binding);
           }
         }
       }
@@ -208,7 +209,7 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
       if (!strcmp(field->binding, "constant-vector")) { qa_vec3 v = field->qvm_field.constant_vector; (void)scalar_value(v.x, "float32"); (void)scalar_value(v.y, "float32"); (void)scalar_value(v.z, "float32"); }
     }
   }
-  if (d->entity_record != NULL) { const record_t *entity = find_record(d, d->entity_record); if (entity == NULL || strcmp(entity->base.kind, "entities") != 0) qa_range_error("Native engine entity record must use the source public edict table"); }
+  if (d->entity_record != NULL) { const record_t *entity = find_record(d, d->entity_record); if (entity == NULL || strcmp(entity->base.kind, "entities") != 0) qa_raise("Error", 0, 0, "Native engine entity record must use the source public edict table"); }
   const qa_native_mod_clients *clients = d->clients;
   if (clients != NULL && clients->output_count != 0) qa_validate_mod_client_outputs(clients->outputs, clients->output_count, output_scalar_check, output_vector_check, (void *)d);
   if (clients != NULL) for (size_t i = 0; i < clients->output_count; i++) {
@@ -217,42 +218,42 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
     for (int k = 0; k < 2; k++) {
       const record_t *record = find_record(d, pairs[k]->record); bool found = false;
       if (record != NULL) for (size_t f = 0; f < record->field_count && !found; f++) found = !strcmp(record->fields[f].binding, bindings[k]) && record->fields[f].offset == pairs[k]->offset;
-      if (!found) qa_range_error("Client body shape must name its writable source mins/maxs");
+      if (!found) qa_raise("Error", 0, 0, "Client body shape must name its writable source mins/maxs");
     }
   }
-  if (d->client_presentation != NULL && (clients == NULL || owned == NULL || clients->end_frame_count == 0)) qa_range_error("Native client presentation requires declared original end-frame calls");
+  if (d->client_presentation != NULL && (clients == NULL || owned == NULL || clients->end_frame_count == 0)) qa_raise("Error", 0, 0, "Native client presentation requires declared original end-frame calls");
   for (size_t i = 0; i < d->protection_count; i++) {
     const qa_native_mod_protection_definition *protection = &d->protection[i];
-    for (size_t j = 0; j < i; j++) if (!strcmp(d->protection[j].channel, protection->channel)) qa_range_error("Duplicate native protection channel");
+    for (size_t j = 0; j < i; j++) if (!strcmp(d->protection[j].channel, protection->channel)) qa_raise("Error", 0, 0, "Duplicate native protection channel");
     bool regular = !strcmp(protection->channel, "regular"); size_t storage = regular ? protection->regular_storage_count : protection->power_storage_count;
     bool direct = !strcmp(protection->absorb_abi, "source-call") || !strcmp(protection->absorb_abi, "source-region");
-    if (clients == NULL || d->entity_record == NULL || protection->id == NULL || protection->id[0] == '\0' || storage == 0 || (!direct && !eq(protection->absorb_q2.flags, expected_abi))) qa_range_error("Native protection requires declared clients and its matching source ABI");
+    if (clients == NULL || d->entity_record == NULL || protection->id == NULL || protection->id[0] == '\0' || storage == 0 || (!direct && !eq(protection->absorb_q2.flags, expected_abi))) qa_raise("Error", 0, 0, "Native protection requires declared clients and its matching source ABI");
   }
   if (clients != NULL) {
     const record_t *entity = d->entity_record != NULL ? find_record(d, d->entity_record) : NULL; bool repeated = false;
     for (size_t i = 0; i < clients->records.count; i++) for (size_t j = 0; j < i; j++) if (eq(clients->records.values[i], clients->records.values[j])) repeated = true;
-    if (!safe_integer(clients->maximum) || clients->maximum < 1 || clients->maximum > 256 || clients->records.count == 0 || repeated || d->entity_record == NULL || entity == NULL || entity->first_slot != 1) qa_range_error("Invalid native component client layout");
+    if (!safe_integer(clients->maximum) || clients->maximum < 1 || clients->maximum > 256 || clients->records.count == 0 || repeated || d->entity_record == NULL || entity == NULL || entity->first_slot != 1) qa_raise("Error", 0, 0, "Invalid native component client layout");
     for (size_t i = 0; i < clients->records.count; i++) {
       const record_t *record = find_record(d, clients->records.values[i]);
-      if (record == NULL || !strcmp(record->base.kind, "entities") || record->capacity < clients->maximum) qa_range_error("Native component clients require declared private record arrays");
+      if (record == NULL || !strcmp(record->base.kind, "entities") || record->capacity < clients->maximum) qa_raise("Error", 0, 0, "Native component clients require declared private record arrays");
     }
     for (size_t i = 0; i < clients->admit_count; i++) {
       const qa_native_mod_admission_call *call = &clients->admit[i]; bool nonzero = eq(call->accepts, "nonzero");
-      if (nonzero && !strcmp(call->call.returns, "void")) qa_range_error("Native client admission requires its declared return value");
-      if (!strcmp(call->call.entry.kind, "game-export") && eq(call->call.entry.name, "ClientConnect") && !nonzero) qa_range_error("Original native ClientConnect rejection cannot be ignored");
+      if (nonzero && !strcmp(call->call.returns, "void")) qa_raise("Error", 0, 0, "Native client admission requires its declared return value");
+      if (!strcmp(call->call.entry.kind, "game-export") && eq(call->call.entry.name, "ClientConnect") && !nonzero) qa_raise("Error", 0, 0, "Original native ClientConnect rejection cannot be ignored");
     }
     for (size_t i = 0; i < clients->records.count; i++) {
       const record_t *record = find_record(d, clients->records.values[i]);
-      if (record != NULL && !strcmp(record->base.kind, "clients") && (record->first_slot != 0 || record->capacity != clients->maximum)) qa_range_error("Public native client rows must match the reserved source slots");
+      if (record != NULL && !strcmp(record->base.kind, "clients") && (record->first_slot != 0 || record->capacity != clients->maximum)) qa_raise("Error", 0, 0, "Public native client rows must match the reserved source slots");
     }
-    for (size_t r = 0; r < d->actor_record_count; r++) if (d->actor_records[r].capacity < clients->maximum) qa_range_error("Native actor array cannot hold its declared clients");
+    for (size_t r = 0; r < d->actor_record_count; r++) if (d->actor_records[r].capacity < clients->maximum) qa_raise("Error", 0, 0, "Native actor array cannot hold its declared clients");
   }
   for (size_t r = 0; r < d->actor_record_count; r++) for (size_t f = 0; f < d->actor_records[r].field_count; f++) {
     const field_t *field = &d->actor_records[r].fields[f];
-    if (!strcmp(field->binding, "record") && find_record(d, field->qvm_field.record) == NULL) qa_range_error("Unknown linked native actor record");
+    if (!strcmp(field->binding, "record") && find_record(d, field->qvm_field.record) == NULL) qa_raise("Error", 0, 0, "Unknown linked native actor record");
   }
-  for (size_t r = 0; r < d->actor_record_count; r++) if (!strcmp(d->actor_records[r].base.kind, "clients") && !client_record(d, d->actor_records[r].id)) qa_range_error("Native public client records require declared client ownership");
-  if (d->actor_record_count > 0 && (d->project_count == 0 || d->release_count == 0)) qa_range_error("Native actor projections require authored initialization and release callbacks");
+  for (size_t r = 0; r < d->actor_record_count; r++) if (!strcmp(d->actor_records[r].base.kind, "clients") && !client_record(d, d->actor_records[r].id)) qa_raise("Error", 0, 0, "Native public client records require declared client ownership");
+  if (d->actor_record_count > 0 && (d->project_count == 0 || d->release_count == 0)) qa_raise("Error", 0, 0, "Native actor projections require authored initialization and release callbacks");
   for (size_t i = 0; i < d->objective_count; i++) {
     const qa_source_objective_declaration *objective = &d->objectives[i];
     if (objective->is_owned && objective->change != NULL) check_call(d, objective->change, AVAILABLE("self", "other", "activator", "amount", "time"));
@@ -281,7 +282,7 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
         double prior_length = !strcmp(prior->value.kind, "vector") ? 12 : !strcmp(prior->value.kind, "address") ? (double)pointer_bytes : scalar_size(value_scalar_kind(&prior->value));
         if (eq(prior->record, field->record) && field->offset < prior->offset + prior_length && prior->offset < field->offset + length) ok = false;
       }
-      if (!ok) qa_range_error("Native pickup context requires separate declared source storage");
+      if (!ok) qa_raise("Error", 0, 0, "Native pickup context requires separate declared source storage");
       if (eq(field->record, d->entity_record) && owned != NULL) {
         double pointers[6]; size_t n = 0; pointers[n++] = owned->fields.ground; pointers[n++] = owned->fields.think;
         if (owned->fields.has_use) pointers[n++] = owned->fields.use;
@@ -289,7 +290,7 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
         bool overlaps = false;
         for (size_t k = 0; k < n; k++) if (field->offset < pointers[k] + (double)pointer_bytes && pointers[k] < field->offset + length) overlaps = true;
         double next_offset = owned->fields.nextthink.offset;
-        if (overlaps || (field->offset < next_offset + scalar_size(owned->fields.nextthink.encoding) && next_offset < field->offset + length)) qa_range_error("Native pickup context overlaps source actor lifetime");
+        if (overlaps || (field->offset < next_offset + scalar_size(owned->fields.nextthink.encoding) && next_offset < field->offset + length)) qa_raise("Error", 0, 0, "Native pickup context overlaps source actor lifetime");
       }
     }
   }
@@ -302,14 +303,15 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
       qa_compat_q2_validate_native_mod_region(r, pointer_bytes);
       for (size_t k = 0; k < r->input_count; k++) check_values(d, &r->inputs[k].value, 1, protection_inputs);
       const char **storages = calloc(r->call.argument_count + 1, sizeof *storages); if (storages == NULL) qa_range_error("Out of memory");
+      qa_cleanup storages_owned; qa_cleanup_push(&storages_owned, free, (void *)storages);
       for (size_t k = 0; k < r->call.argument_count; k++) storages[k] = value_storage(&r->call.arguments[k]);
       int64_t stack = qa_compat_q2_native_plan_stack_bytes(d->target.abi.kind, d->target.abi.image, pointer_bytes, d->target.abi.call, storages, r->call.argument_count, !strcmp(r->call.returns, "void") ? NULL : r->call.returns);
-      free(storages);
-      if (r->frame.argument_bytes != (double)(stack - pointer_bytes)) qa_range_error("Native donor argument area differs from its original call ABI");
-      for (size_t k = 0; k < r->input_count; k++) if (strcmp(value_storage(&r->inputs[k].value), r->inputs[k].target.storage) != 0) qa_range_error("Native donor input differs from its machine storage");
+      qa_cleanup_pop(&storages_owned); free((void *)storages);
+      if (r->frame.argument_bytes != (double)(stack - pointer_bytes)) qa_raise("Error", 0, 0, "Native donor argument area differs from its original call ABI");
+      for (size_t k = 0; k < r->input_count; k++) if (strcmp(value_storage(&r->inputs[k].value), r->inputs[k].target.storage) != 0) qa_raise("Error", 0, 0, "Native donor input differs from its machine storage");
       check_call(d, &r->call, protection_inputs);
     } else if (source_call) {
-      if (!strcmp(protection->absorb_call.returns, "void")) qa_range_error("Native protection requires a source return value");
+      if (!strcmp(protection->absorb_call.returns, "void")) qa_raise("Error", 0, 0, "Native protection requires a source return value");
       check_call(d, &protection->absorb_call, protection_inputs);
     } else for (size_t k = 0; k < protection->absorb_q2.global_count; k++) check_values(d, &protection->absorb_q2.globals[k].value, 1, protection_inputs);
   }
@@ -332,10 +334,10 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
     for (size_t i = 0; i < clients->command_count; i++) check_call(d, &clients->command[i], self_time);
     for (size_t i = 0; i < clients->frame_count; i++) check_call(d, &clients->frame[i], self_time);
     for (size_t i = 0; i < clients->end_frame_count; i++) check_call(d, &clients->end_frame[i], self_time);
-    if ((clients->frame_count != 0 || clients->end_frame_count != 0) && owned == NULL) qa_range_error("Native client frames require the original source actor clock");
+    if ((clients->frame_count != 0 || clients->end_frame_count != 0) && owned == NULL) qa_raise("Error", 0, 0, "Native client frames require the original source actor clock");
     available_t available = AVAILABLE("self", "time", "elapsed", "view-angles", "attack", "jump", "impulse", "forward-move", "side-move", "up-move");
     for (size_t i = 0; i < clients->input_count; i++) for (size_t c = 0; c < clients->input[i].call_count; c++) check_call(d, (const call_t *)clients->input[i].calls + c, available);
-    if (clients->input_field_count != 0 && clients->input_count == 0) qa_range_error("Native input fields require declared input callbacks");
+    if (clients->input_field_count != 0 && clients->input_count == 0) qa_raise("Error", 0, 0, "Native input fields require declared input callbacks");
     for (size_t i = 0; i < clients->input_field_count; i++) {
       const qa_native_mod_client_input_field *field = &clients->input_fields[i]; const record_t *record = find_record(d, field->record);
       double length = !strcmp(field->value.kind, "vector") ? 12 : scalar_size(value_scalar_kind(&field->value));
@@ -345,11 +347,11 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
         for (size_t f = 0; f < record->field_count && !declared; f++) { const field_t *c = &record->fields[f]; declared = !strcmp(c->binding, "private") && field->offset >= c->offset && field->offset + length <= c->offset + c->qvm_field.byte_length; }
         ok = declared;
       }
-      if (!ok) qa_range_error("Native input field requires declared private client storage");
+      if (!ok) qa_raise("Error", 0, 0, "Native input field requires declared private client storage");
       for (size_t p = 0; p < i; p++) {
         const qa_native_mod_client_input_field *prior = &clients->input_fields[p];
         double prior_length = !strcmp(prior->value.kind, "vector") ? 12 : scalar_size(value_scalar_kind(&prior->value));
-        if (eq(prior->record, field->record) && field->offset < prior->offset + prior_length && prior->offset < field->offset + length) qa_range_error("Overlapping native input fields");
+        if (eq(prior->record, field->record) && field->offset < prior->offset + prior_length && prior->offset < field->offset + length) qa_raise("Error", 0, 0, "Overlapping native input fields");
       }
       check_values(d, &field->value, 1, available);
     }
@@ -359,10 +361,10 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
         const record_t *record = find_record(d, pose[i]->record); double offset = pose[i]->field.offset, length = scalar_size(pose[i]->field.encoding);
         bool ok = record != NULL && (eq(pose[i]->record, d->entity_record) || client_record(d, pose[i]->record)) && safe_integer(offset) && offset >= 0 && offset + length <= record->stride;
         if (ok) for (size_t f = 0; f < record->field_count && ok; f++) { const field_t *value = &record->fields[f]; if (shared(value) && offset < value->offset + size_of(value, pointer_bytes) && value->offset < offset + length) ok = false; }
-        if (!ok) qa_range_error("Native client pose requires separate private source fields");
+        if (!ok) qa_raise("Error", 0, 0, "Native client pose requires separate private source fields");
       }
       double mask = clients->pose->crouched.mask;
-      if (!safe_integer(mask) || mask < 1 || mask > 2147483647.0) qa_range_error("Invalid native source crouch mask");
+      if (!safe_integer(mask) || mask < 1 || mask > 2147483647.0) qa_raise("Error", 0, 0, "Invalid native source crouch mask");
     }
     for (size_t i = 0; i < clients->input_count; i++) {
       const qa_mod_client_input_binding *binding = &clients->input[i]; if (!eq(binding->phase, "before")) continue;
@@ -372,7 +374,7 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
         if (!strcmp(output->kind, "handler")) {
           check_values(d, output->arguments, output->argument_count, available); size_t selves = 0;
           for (size_t a = 0; a < output->argument_count; a++) if (!strcmp(output->arguments[a].kind, "actor") && eq(output->arguments[a].input, "self")) selves++;
-          if (selves != 1) qa_range_error("Native output handler requires its exact client actor argument");
+          if (selves != 1) qa_raise("Error", 0, 0, "Native output handler requires its exact client actor argument");
         }
         if (!strcmp(output->kind, "field")) {
           bool found = false;
@@ -381,7 +383,7 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
             found = eq(field->record, output->record) && field->offset == output->offset && strcmp(field->value.kind, "time") != 0 && eq(field->value.value.kind, "input")
                 && one_of(field->value.value.name, NAMES("view-angles", "attack", "jump", "impulse", "forward-move", "side-move", "up-move"));
           }
-          if (!found) qa_range_error("Native input output requires its declared input field");
+          if (!found) qa_raise("Error", 0, 0, "Native input output requires its declared input field");
         }
       }
     }
@@ -389,7 +391,7 @@ void qa_compat_q2_validate_native_mod_declaration(const declaration_t *d) {
   for (size_t i = 0; i < d->callback_count; i++) {
     const qa_native_mod_callback *call = &d->callbacks[i]; bool observe = !strcmp(call->binding.stage, "observe"), duplicate = false;
     for (size_t j = 0; j < i; j++) if (eq(d->callbacks[j].binding.id, call->binding.id)) duplicate = true;
-    if (duplicate || (!observe && !strcmp(call->call.returns, "void"))) qa_range_error("Duplicate native callback or missing return value");
+    if (duplicate || (!observe && !strcmp(call->call.returns, "void"))) qa_raise("Error", 0, 0, "Duplicate native callback or missing return value");
     const char *names[16]; size_t n = 0; names[n++] = "self"; names[n++] = "time"; if (observe) names[n++] = "result";
     const char *operation = call->binding.operation;
     static const char *const extras_damage[] = {"attacker", "inflictor", "amount", "knockback", "direction", "point", "normal", NULL};
@@ -432,19 +434,21 @@ static void saved_mod_free(saved_mod *saved) {
   if (saved->has_items) qa_compat_q2_native_item_checkpoint_free(&saved->items);
   qa_save_value_free(saved->root);
 }
+static void saved_mod_release(void *value) { saved_mod_free(value); memset(value, 0, sizeof(saved_mod)); }
 static saved_mod read_checkpoint(const qa_provider_checkpoint *record, qa_module_identity module, const declaration_t *d) {
-  if (!eq(record->provider, module.id) || !eq(record->schema, "native:mod") || record->version != 1) qa_range_error("Invalid native mod checkpoint owner");
+  if (!eq(record->provider, module.id) || !eq(record->schema, "native:mod") || record->version != 1) qa_raise("Error", 0, 0, "Invalid native mod checkpoint owner");
   saved_mod out; memset(&out, 0, sizeof out);
+  qa_cleanup refused; qa_cleanup_push(&refused, saved_mod_release, &out); /* a refused save keeps nothing */
   out.root = qa_decode_checkpoint_value(record->bytes.bytes, record->bytes.length); if (out.root == NULL) qa_range_error("Out of memory");
   reader_t reader, f, state; if (!qa_save_reader_init(&reader, out.root, NULL)) qa_range_error("Out of memory");
   qa_module_identity saved_module = qa_read_module(rd(&reader, "module", &f)); qa_save_reader_destroy(&f);
-  if (!same_module(saved_module, module)) qa_range_error("Native mod checkpoint differs from the selected source");
+  if (!same_module(saved_module, module)) qa_raise("Error", 0, 0, "Native mod checkpoint differs from the selected source");
   rd(&reader, "source", &state);
   static const char *const editions[] = {"classic", "rerelease"};
   const char *edition = qa_save_reader_choice_string(rd(&state, "edition", &f), editions, 2); qa_save_reader_destroy(&f);
   out.map = qa_save_reader_string(rd(&reader, "map", &f)); qa_save_reader_destroy(&f);
   if (!strcmp(edition, "classic")) {
-    if (d->target.api.kind != QA_Q2_GAME_API_CLASSIC) qa_range_error("Native mod checkpoint API differs");
+    if (d->target.api.kind != QA_Q2_GAME_API_CLASSIC) qa_raise("Error", 0, 0, "Native mod checkpoint API differs");
     reader_t value; rd(&state, "original", &value);
     out.source.rerelease = false; out.source.original.provider = rd_namespaced(&value, "provider"); out.source.original.schema = rd_namespaced(&value, "schema");
     out.source.original.version = rd_int(&value, "version", 1); out.source.original.bytes = rd_bytes(&value, "bytes");
@@ -453,7 +457,7 @@ static saved_mod read_checkpoint(const qa_provider_checkpoint *record, qa_module
     if (!qa_decode_q2_classic_original_save(&out.source.original, identity, &decoded)) qa_range_error("Out of memory");
     qa_q2_classic_original_save_free(&decoded);
   } else {
-    if (d->target.api.kind != QA_Q2_GAME_API_RERELEASE) qa_range_error("Native mod checkpoint API differs");
+    if (d->target.api.kind != QA_Q2_GAME_API_RERELEASE) qa_raise("Error", 0, 0, "Native mod checkpoint API differs");
     out.source.rerelease = true; out.source.game = rd_bytes(&state, "game"); out.source.level = rd_bytes(&state, "level"); out.source.cvars = rd_bytes(&state, "cvars");
     reader_t list; rd(&state, "configstrings", &list); size_t count = qa_save_reader_list_count(&list);
     out.configstrings = calloc(count + 1, sizeof *out.configstrings); if (out.configstrings == NULL) qa_range_error("Out of memory");
@@ -462,7 +466,7 @@ static saved_mod read_checkpoint(const qa_provider_checkpoint *record, qa_module
       out.configstrings[i].index = rd_int(&entry, "index", 0); out.configstrings[i].value = qa_save_reader_string(rd(&entry, "value", &text)); qa_save_reader_destroy(&text); qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&list); out.source.configstrings = out.configstrings; out.source.configstring_count = count;
-    if (out.source.game.length == 0 || out.source.level.length == 0 || memchr(out.source.game.bytes, 0, out.source.game.length) != NULL || memchr(out.source.level.bytes, 0, out.source.level.length) != NULL) qa_range_error("Invalid native source JSON save");
+    if (out.source.game.length == 0 || out.source.level.length == 0 || memchr(out.source.game.bytes, 0, out.source.game.length) != NULL || memchr(out.source.level.bytes, 0, out.source.level.length) != NULL) qa_raise("Error", 0, 0, "Invalid native source JSON save");
     qa_save_value *cvars = qa_decode_checkpoint_value(out.source.cvars.bytes, out.source.cvars.length); if (cvars == NULL) qa_range_error("Out of memory"); qa_save_value_free(cvars);
   }
   qa_save_reader_destroy(&state);
@@ -480,7 +484,7 @@ static saved_mod read_checkpoint(const qa_provider_checkpoint *record, qa_module
     if (out.actors[i].slot >= capacity) invalid = true;
     for (size_t j = 0; j < i; j++) if (out.actors[i].slot == out.actors[j].slot || same_saved(out.actors[i].actor, out.actors[j].actor)) invalid = true;
   }
-  if (invalid) qa_range_error("Invalid native mod actor checkpoint");
+  if (invalid) qa_raise("Error", 0, 0, "Invalid native mod actor checkpoint");
   reader_t client_reader; rd(&reader, "clients", &client_reader);
   bool has_clients_field = !qa_save_reader_is_undefined(&client_reader);
   if (has_clients_field) {
@@ -505,7 +509,7 @@ static saved_mod read_checkpoint(const qa_provider_checkpoint *record, qa_module
     for (size_t i = 0; i < out.client_count && !matched; i++) matched = out.clients[i].slot == out.actors[a].slot;
     if (!matched) invalid = true;
   }
-  if (invalid) qa_range_error("Invalid native component client checkpoint");
+  if (invalid) qa_raise("Error", 0, 0, "Invalid native component client checkpoint");
   reader_t owned; rd(&reader, "owned", &owned);
   out.has_owned = !qa_save_reader_is_undefined(&owned) && !qa_save_reader_is_null(&owned);
   if (out.has_owned) {
@@ -529,7 +533,7 @@ static saved_mod read_checkpoint(const qa_provider_checkpoint *record, qa_module
   qa_save_reader_destroy(&owned);
   invalid = out.has_owned != (d->source_actors != NULL);
   if (out.has_owned) for (size_t i = 0; i < out.owned.actor_count; i++) for (size_t j = 0; j < i; j++) if (out.owned.actors[i].slot == out.owned.actors[j].slot || same_saved(out.owned.actors[i].actor, out.owned.actors[j].actor)) invalid = true;
-  if (invalid) qa_range_error("Invalid native owned actor checkpoint");
+  if (invalid) qa_raise("Error", 0, 0, "Invalid native owned actor checkpoint");
   if (out.has_owned) {
     invalid = out.owned.deferred_count > 0 && (d->source_actors->combat == NULL || d->source_actors->combat->deferred == NULL);
     for (size_t i = 0; i < out.owned.deferred_count; i++) {
@@ -538,17 +542,17 @@ static saved_mod read_checkpoint(const qa_provider_checkpoint *record, qa_module
       for (size_t a = 0; a < out.owned.actor_count && !matched; a++) matched = same_saved(out.owned.actors[a].actor, out.owned.deferred[i].target);
       if (!matched) invalid = true;
     }
-    if (invalid) qa_range_error("Invalid native deferred attack checkpoint");
+    if (invalid) qa_raise("Error", 0, 0, "Invalid native deferred attack checkpoint");
   }
   reader_t items; rd(&reader, "items", &items);
   bool items_present = !qa_save_reader_is_undefined(&items) && !qa_save_reader_is_null(&items);
-  if (items_present != (d->items != NULL)) qa_range_error("Native item checkpoint differs from source declaration");
+  if (items_present != (d->items != NULL)) qa_raise("Error", 0, 0, "Native item checkpoint differs from source declaration");
   if (d->items != NULL) {
     out.items = qa_compat_q2_read_native_item_checkpoint(&items, d->items); out.has_items = true;
     for (size_t i = 0; i < out.items.request_count; i++) {
       bool admitted = false;
       for (size_t c = 0; c < out.client_count && !admitted; c++) admitted = out.clients[c].admitted && same_saved(out.clients[c].actor, out.items.requests[i].actor);
-      if (!admitted) qa_range_error("Saved native item request has no admitted client");
+      if (!admitted) qa_raise("Error", 0, 0, "Saved native item request has no admitted client");
     }
   }
   qa_save_reader_destroy(&items);
@@ -559,6 +563,7 @@ static saved_mod read_checkpoint(const qa_provider_checkpoint *record, qa_module
     qa_app_sim_read_native_mod_presentation(&presentation, &checkpoint);
     qa_app_sim_native_mod_presentation_checkpoint_free(&checkpoint); qa_save_reader_destroy(&presentation); }
   qa_save_reader_destroy(&reader);
+  qa_cleanup_pop(&refused);
   return out;
 }
 void qa_compat_q2_validate_native_mod_checkpoint(const qa_provider_checkpoint *record, qa_module_identity module, const declaration_t *d) {
@@ -578,10 +583,11 @@ typedef struct invocation { observation *observations; size_t observation_count;
 typedef struct input_store { qa_guest_address address; uint8_t bytes[16], previous[16]; size_t length; } input_store;
 typedef struct input_scope {
   provider_t *owner; qa_mod_client_application *application; input_row rows[18]; size_t count; qa_actor_id self;
-  input_store *stores; size_t store_count; struct input_scope *outer;
+  input_store *stores; size_t store_count; struct input_scope *outer; qa_compat_q2_memory *memory;
 } input_scope;
 typedef struct pickup_scope { qa_actor_id actor; const qa_original_pickup_execution *execution; invocation *frame; provider_t *owner; } pickup_scope;
 typedef struct restore_link { double slot; qa_guest_address address; void *ctx; qa_compat_q2_native_import_fn invoke; qa_guest_call_value *values; size_t count; } restore_link;
+typedef struct projection_index_row { int64_t offset; qa_actor_id actor; } projection_index_row;
 typedef struct match_binding { provider_t *owner; qa_actor_id actor; qa_owned_actor owned; double slot; const field_t *team, *score; struct match_binding *next; } match_binding;
 struct qa_compat_q2_native_mod_provider {
   const declaration_t *declaration; const qa_mod_host_services *services; qa_provider_id instance; const char *map;
@@ -594,6 +600,9 @@ struct qa_compat_q2_native_mod_provider {
   qa_compat_q2_native_mod_protection *protection;
   qa_compat_q2_native_mod_pickups *pickups;
   projection_row *projections; size_t projection_count, projection_capacity;
+  /* TS ProjectionMap.version and projectionIndex: the address-to-actor lookup is rebuilt only after the projected set changes. */
+  uint64_t projection_version, projection_index_version; bool has_projection_index;
+  projection_index_row *projection_index; size_t projection_index_count, projection_index_capacity;
   invocation **frames; size_t frame_count, frame_capacity;
   pickup_scope **pickup_scopes; size_t pickup_scope_count, pickup_scope_capacity;
   int projection_writes;
@@ -611,10 +620,11 @@ struct qa_compat_q2_native_mod_provider {
   bool match_bound; qa_source_match_unbind release_match; match_binding *matches;
   restore_link *restore_links; size_t restore_link_count, restore_link_capacity;
   qa_app_simulation_presentation *scratch; size_t scratch_count, scratch_capacity;
+  qa_app_simulation_presentation *override_scratch; size_t override_count, override_capacity; /* appearanceOverrides() has its own array */
   char location[256];
 };
-static const qa_compat_q2_native_mod_host *host_of(const provider_t *s) { if (s->host_ == NULL) qa_range_error("Native mod has no source host"); return s->host_; }
-static void current(provider_t *s) { if (!s->closing) s->assert_current(s->assert_ctx); if (s->closed) qa_range_error("Native mod is closed"); }
+static const qa_compat_q2_native_mod_host *host_of(const provider_t *s) { if (s->host_ == NULL) qa_raise("Error", 0, 0, "Native mod has no source host"); return s->host_; }
+static void current(provider_t *s) { if (!s->closing) s->assert_current(s->assert_ctx); if (s->closed) qa_raise("Error", 0, 0, "Native mod is closed"); }
 static qa_compat_q2_memory *memory_of(const provider_t *s) { return host_of(s)->memory; }
 static const record_t *record_of(const provider_t *s, const char *id) { return find_record(s->declaration, id); }
 static bool world_actor(const provider_t *s, qa_actor_id *out) { const qa_session_mod_engine_services *e = s->services->engine; return e != NULL && e->world(e->ctx, out); }
@@ -624,7 +634,16 @@ static bool clients_admitted(provider_t *s, qa_actor_id actor) { return s->has_c
 static bool clients_rejects(const provider_t *s, qa_actor_id actor) { return s->has_clients && qa_compat_q2_native_mod_clients_rejects(&s->clients, actor); }
 static bool is_live(const provider_t *s, qa_actor_id actor) { return qa_session_actor_registry_is_live(s->services->actors, actor); }
 static projection_row *find_projection(const provider_t *s, qa_actor_id actor) { for (size_t i = 0; i < s->projection_count; i++) if (qa_same_actor(s->projections[i].actor, actor)) return &s->projections[i]; return NULL; }
+/* TS ProjectionMap.set / delete / clear: each counts a membership change. */
+static void set_projection(provider_t *s, qa_actor_id actor, double slot) {
+  s->projection_version++;
+  projection_row *row = find_projection(s, actor);
+  if (row == NULL) row = qa_compat_q2_grow((void **)&s->projections, &s->projection_count, &s->projection_capacity, sizeof *row);
+  row->actor = actor; row->slot = slot;
+}
+static void clear_projections(provider_t *s) { s->projection_version++; s->projection_count = 0; }
 static void delete_projection(provider_t *s, qa_actor_id actor) {
+  s->projection_version++;
   projection_row *row = find_projection(s, actor); if (row == NULL) return;
   size_t index = (size_t)(row - s->projections); memmove(row, row + 1, (s->projection_count - index - 1) * sizeof *row); s->projection_count--;
 }
@@ -661,7 +680,7 @@ static double scalar_read(provider_t *s, qa_guest_address address, const char *k
   qa_guest_call_result value = qa_compat_q2_native_decode_scalar(memory, kind, bytes);
   return number_result(&value);
 }
-static void objective_check(provider_t *s, bool objective) { if (objective) { current(s); if (s->closing || s->restoring) qa_range_error("Native objective source is unavailable"); } }
+static void objective_check(provider_t *s, bool objective) { if (objective) { current(s); if (s->closing || s->restoring) qa_raise("Error", 0, 0, "Native objective source is unavailable"); } }
 static qa_guest_address resolve(provider_t *s, qa_native_mod_address value, bool objective) {
   qa_compat_q2_memory *memory = memory_of(s);
   objective_check(s, objective);
@@ -669,7 +688,7 @@ static qa_guest_address resolve(provider_t *s, qa_native_mod_address value, bool
   for (size_t i = 0; i < value.indirections.count; i++) {
     objective_check(s, objective);
     qa_guest_address pointer;
-    if (!qa_compat_q2_mem_read_pointer(memory, address, &pointer)) qa_range_error("Native mod layout follows a null source pointer");
+    if (!qa_compat_q2_mem_read_pointer(memory, address, &pointer)) qa_raise("Error", 0, 0, "Native mod layout follows a null source pointer");
     address = qa_compat_q2_mem_offset(memory, pointer, (int64_t)value.indirections.values[i]);
   }
   objective_check(s, objective);
@@ -678,16 +697,16 @@ static qa_guest_address resolve(provider_t *s, qa_native_mod_address value, bool
 static qa_guest_address record_base(provider_t *s, const record_t *record) {
   const qa_compat_q2_native_mod_host *host = host_of(s); qa_compat_q2_memory *memory = host->memory;
   if (!strcmp(record->base.kind, "address")) return qa_compat_q2_mem_offset(memory, resolve(s, record->base.address, false), (int64_t)(record->first_slot * record->stride));
-  if (!strcmp(record->base.kind, "clients")) qa_range_error("Native private client rows are addressed through their source edicts");
+  if (!strcmp(record->base.kind, "clients")) qa_raise("Error", 0, 0, "Native private client rows are addressed through their source edicts");
   qa_compat_q2_native_mod_entities entities = host->entities(host->ctx);
-  if (entities.stride != record->stride || record->first_slot + record->capacity > entities.capacity) qa_range_error("Declared native actor layout differs from the source export table");
+  if (entities.stride != record->stride || record->first_slot + record->capacity > entities.capacity) qa_raise("Error", 0, 0, "Declared native actor layout differs from the source export table");
   return qa_compat_q2_mem_offset(memory, entities.base, (int64_t)(record->first_slot * record->stride));
 }
 static qa_guest_address record_address(provider_t *s, const record_t *record, double slot) {
   const qa_compat_q2_native_mod_host *host = host_of(s); qa_compat_q2_memory *memory = host->memory;
   if (!strcmp(record->base.kind, "clients")) {
     qa_guest_address address;
-    if (!host->client(host->ctx, record->first_slot + slot + 1, &address)) qa_range_error("Authored native initialization has not provided this client's private storage");
+    if (!host->client(host->ctx, record->first_slot + slot + 1, &address)) qa_raise("Error", 0, 0, "Authored native initialization has not provided this client's private storage");
     memory->check(memory->ctx, address, record->stride, "write"); return address;
   }
   return qa_compat_q2_mem_offset(memory, record_base(s, record), (int64_t)(slot * record->stride));
@@ -699,7 +718,7 @@ static void validate_inventory_capacity(provider_t *s, qa_actor_id actor, bool c
   for (size_t r = 0; r < d->actor_record_count; r++) {
     const record_t *record = &d->actor_records[r]; if (!actor_uses_record(s, client, record)) continue;
     for (size_t f = 0; f < record->field_count; f++) if (!strcmp(record->fields[f].binding, "inventory-capacity") && !qa_shared_inventory_table_mutable_capacity(s->services->inventory, actor, record->fields[f].item))
-      qa_range_error("Native mod requires mutable inventory capacity for %s", record->fields[f].item);
+      qa_raise("Error", 0, 0, "Native mod requires mutable inventory capacity for %s", record->fields[f].item);
   }
 }
 static bool execute(provider_t *s, const call_t *call, inputs_t inputs, bool transfer_flag, const qa_native_mod_protection_region *region, const qa_compat_q2_native_mod_region_authority *authority, double *out);
@@ -723,21 +742,39 @@ static void seed(provider_t *s, qa_actor_id actor, double slot, bool constants) 
     }
   }
 }
+typedef struct project_call { provider_t *s; qa_actor_id actor; double slot; bool has_client_slot; char *appearance; } project_call;
+static void project_body(void *value) {
+  project_call *c = value; provider_t *s = c->s; const qa_compat_q2_native_mod_host *host = host_of(s); const declaration_t *d = s->declaration;
+  double source_slot; bool has_source = qa_compat_q2_native_mod_provider_slot_of(s, c->actor, &source_slot);
+  if (has_source) { const char *text = host->presentation.signature(host->presentation.ctx, source_slot); size_t n = strlen(text) + 1; c->appearance = malloc(n); if (c->appearance == NULL) qa_range_error("Out of memory"); memcpy(c->appearance, text, n); }
+  seed(s, c->actor, c->slot, true);
+  if (!c->has_client_slot) for (size_t i = 0; i < d->project_count; i++) { input_buffer buffer; double result; (void)execute(s, &d->project[i], build_inputs(s, &c->actor, &buffer), false, NULL, NULL, &result); }
+  seed(s, c->actor, c->slot, true);
+  if (has_source && strcmp(c->appearance, host->presentation.signature(host->presentation.ctx, source_slot)) != 0) appearance_add(s, c->actor);
+}
+static void project_undo_body(void *value) {
+  project_call *c = value; provider_t *s = c->s; const declaration_t *d = s->declaration;
+  if (!c->has_client_slot) for (size_t i = 0; i < d->release_count; i++) { input_buffer buffer; double result; (void)execute(s, &d->release[i], build_inputs(s, &c->actor, &buffer), false, NULL, NULL, &result); }
+}
+static void project_undo_cleanup(void *value) {
+  project_call *c = value; provider_t *s = c->s; const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation;
+  p->release(p->ctx, c->actor); delete_projection(s, c->actor); actor_list_delete(s->appearance_actors, &s->appearance_count, c->actor);
+}
 /* TS pointer(actor, id). False is TS null. */
 static bool pointer_for(provider_t *s, const qa_actor_id *actor_ptr, const char *id, qa_guest_address *out) {
   if (actor_ptr == NULL) return false;
   qa_actor_id actor = *actor_ptr; double owned_slot; const qa_compat_q2_native_mod_host *host = host_of(s); const declaration_t *d = s->declaration;
   if (s->owned != NULL && qa_compat_q2_native_mod_actors_slot_of(s->owned, actor, &owned_slot)) {
-    if (!eq(id, d->entity_record)) qa_range_error("Owned native actor requires its original edict record");
+    if (!eq(id, d->entity_record)) qa_raise("Error", 0, 0, "Owned native actor requires its original edict record");
     *out = host->entity(host->ctx, owned_slot).address; return true;
   }
-  const record_t *record = record_of(s, id); if (record == NULL) qa_range_error("Unknown native actor record");
+  const record_t *record = record_of(s, id); if (record == NULL) qa_raise("Error", 0, 0, "Unknown native actor record");
   double client_slot = 0; bool has_client_slot = s->has_clients && qa_compat_q2_native_mod_clients_slot(&s->clients, actor, &client_slot);
   if (client_record(d, id) && !has_client_slot) return false;
   projection_row *row = find_projection(s, actor); double slot;
   if (row != NULL) slot = row->slot;
   else {
-    if (!is_live(s, actor)) qa_range_error("Native mod cannot borrow an expired actor");
+    if (!is_live(s, actor)) qa_raise("Error", 0, 0, "Native mod cannot borrow an expired actor");
     validate_inventory_capacity(s, actor, clients_has(s, actor));
     release_pending(s);
     double next = has_client_slot ? client_slot : d->clients != NULL ? d->clients->maximum : 0;
@@ -748,22 +785,25 @@ static bool pointer_for(provider_t *s, const qa_actor_id *actor_ptr, const char 
       if (!occupied || has_client_slot) break;
       next++;
     }
-    if (has_client_slot && occupied) qa_range_error("Native source client row is already projected");
+    if (has_client_slot && occupied) qa_raise("Error", 0, 0, "Native source client row is already projected");
     bool client = clients_has(s, actor);
-    for (size_t r = 0; r < d->actor_record_count; r++) if (actor_uses_record(s, client, &d->actor_records[r]) && next >= d->actor_records[r].capacity) qa_range_error("Native actor projection capacity exceeded");
+    for (size_t r = 0; r < d->actor_record_count; r++) if (actor_uses_record(s, client, &d->actor_records[r]) && next >= d->actor_records[r].capacity) qa_raise("Error", 0, 0, "Native actor projection capacity exceeded");
     for (size_t r = 0; r < d->actor_record_count; r++) {
       const record_t *candidate = &d->actor_records[r];
-      if (actor_uses_record(s, client, candidate) && !strcmp(candidate->base.kind, "entities") && candidate->first_slot + next >= host->entities(host->ctx).count) qa_range_error("Native actor projection requires a slot allocated by its authored initialization");
+      if (actor_uses_record(s, client, candidate) && !strcmp(candidate->base.kind, "entities") && candidate->first_slot + next >= host->entities(host->ctx).count) qa_raise("Error", 0, 0, "Native actor projection requires a slot allocated by its authored initialization");
     }
     slot = next;
-    projection_row *added = qa_compat_q2_grow((void **)&s->projections, &s->projection_count, &s->projection_capacity, sizeof *added); added->actor = actor; added->slot = slot;
-    double source_slot; bool has_source = qa_compat_q2_native_mod_provider_slot_of(s, actor, &source_slot); char *appearance = NULL;
-    if (has_source) { const char *text = host->presentation.signature(host->presentation.ctx, source_slot); size_t n = strlen(text) + 1; appearance = malloc(n); if (appearance == NULL) qa_range_error("Out of memory"); memcpy(appearance, text, n); }
-    seed(s, actor, slot, true);
-    if (!has_client_slot) for (size_t i = 0; i < d->project_count; i++) { input_buffer buffer; double result; (void)execute(s, &d->project[i], build_inputs(s, &actor, &buffer), false, NULL, NULL, &result); }
-    seed(s, actor, slot, true);
-    if (has_source && strcmp(appearance, host->presentation.signature(host->presentation.ctx, source_slot)) != 0) appearance_add(s, actor);
-    free(appearance);
+    set_projection(s, actor, slot);
+    /* TS try { seed, project, seed } catch (error) { try { release calls } finally { presentation.release,
+     * projections.delete, appearanceActors.delete } throw error; }: a projection that fails leaves no row behind. */
+    project_call call = {s, actor, slot, has_client_slot, NULL};
+    qa_compat_q2_native_thrown thrown;
+    bool projected = qa_compat_q2_native_try(project_body, &call, &thrown);
+    free(call.appearance);
+    if (!projected) {
+      qa_compat_q2_native_mod_finally(project_undo_body, &call, project_undo_cleanup, &call);
+      qa_compat_q2_native_rethrow(&thrown);
+    }
   }
   *out = record_address(s, record, slot); return true;
 }
@@ -795,19 +835,25 @@ static void scratch_append(provider_t *s, const qa_app_simulation_presentation *
   for (size_t i = 0; i < count; i++) { qa_app_simulation_presentation *row = qa_compat_q2_grow((void **)&s->scratch, &s->scratch_count, &s->scratch_capacity, sizeof *row); *row = rows[i]; }
 }
 const qa_app_simulation_presentation *qa_compat_q2_native_mod_provider_appearance_overrides(provider_t *s, size_t *out_count) {
-  s->scratch_count = 0; const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation;
+  /* A separate array from presentations(): TS returns a new array from each, so one result held across a call
+   * of the other must not change. */
+  s->override_count = 0; const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation;
   for (size_t i = 0; i < s->appearance_count; i++) {
     qa_actor_id actor = s->appearance_actors[i]; double slot;
-    if (qa_compat_q2_native_mod_provider_slot_of(s, actor, &slot) && is_live(s, actor)) { size_t n = 0; const qa_app_simulation_presentation *rows = p->appearance(p->ctx, actor, slot, &n); scratch_append(s, rows, n); }
+    if (qa_compat_q2_native_mod_provider_slot_of(s, actor, &slot) && is_live(s, actor)) {
+      size_t n = 0; const qa_app_simulation_presentation *rows = p->appearance(p->ctx, actor, slot, &n);
+      for (size_t k = 0; k < n; k++) { qa_app_simulation_presentation *row = qa_compat_q2_grow((void **)&s->override_scratch, &s->override_count, &s->override_capacity, sizeof *row); *row = rows[k]; }
+    }
   }
-  return scratch_finish(s, out_count);
+  *out_count = s->override_count; return s->override_scratch;
 }
 const qa_app_simulation_presentation *qa_compat_q2_native_mod_provider_presentations(provider_t *s, size_t *out_count) {
   s->scratch_count = 0;
   if (s->owned != NULL) {
     size_t count = 0; qa_compat_q2_native_mod_actor_slot *rows = qa_compat_q2_native_mod_actors_entries(s->owned, &count); const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation;
+    qa_cleanup rows_owned; qa_cleanup_push(&rows_owned, free, rows);
     for (size_t i = 0; i < count; i++) { size_t n = 0; const qa_app_simulation_presentation *items = p->appearance(p->ctx, rows[i].actor, rows[i].slot, &n); scratch_append(s, items, n); }
-    free(rows);
+    qa_cleanup_pop(&rows_owned); free(rows);
   }
   return scratch_finish(s, out_count);
 }
@@ -823,9 +869,9 @@ qa_guest_address qa_compat_q2_native_mod_provider_address(provider_t *s, qa_acto
   const qa_compat_q2_native_mod_host *host = host_of(s); double slot;
   if (is_world(s, actor)) return host->entities(host->ctx).base;
   if (s->owned != NULL && qa_compat_q2_native_mod_actors_slot_of(s->owned, actor, &slot)) return host->entity(host->ctx, slot).address;
-  if (s->declaration->entity_record == NULL) qa_range_error("Native mod requires a declared engine actor projection");
+  if (s->declaration->entity_record == NULL) qa_raise("Error", 0, 0, "Native mod requires a declared engine actor projection");
   qa_guest_address value;
-  if (!pointer_for(s, &actor, s->declaration->entity_record, &value)) qa_range_error("Native actor projection returned null");
+  if (!pointer_for(s, &actor, s->declaration->entity_record, &value)) qa_raise("Error", 0, 0, "Native actor projection returned null");
   return value;
 }
 /* --- Field projection. --- */
@@ -842,21 +888,30 @@ static bool body_output_field(provider_t *s, qa_actor_id actor, const char *reco
 }
 static observation *observe_all(provider_t *s, size_t *out_count) {
   observation *values = NULL; size_t count = 0, capacity = 0; qa_compat_q2_memory *memory = memory_of(s); const declaration_t *d = s->declaration;
+  qa_cleanup values_owned; qa_cleanup_push(&values_owned, free, values); /* re-pushed whenever the list moves */
   for (size_t p = 0; p < s->projection_count; p++) {
     qa_actor_id actor = s->projections[p].actor; double slot = s->projections[p].slot; bool client = clients_has(s, actor);
     for (size_t r = 0; r < d->actor_record_count; r++) {
       const record_t *record = &d->actor_records[r]; if (!actor_uses_record(s, client, record)) continue;
       for (size_t f = 0; f < record->field_count; f++) {
         const field_t *field = &record->fields[f]; if (!shared(field) || body_output_field(s, actor, record->id, field)) continue;
-        observation *o = qa_compat_q2_grow((void **)&values, &count, &capacity, sizeof *o);
-        o->actor = actor; o->address = qa_compat_q2_mem_offset(memory, record_address(s, record, slot), (int64_t)field->offset); o->field = field; o->length = (size_t)size_of(field, memory->pointer_bytes);
-        memory->copy(memory->ctx, o->address, o->bytes, (double)o->length);
+        observation row; memset(&row, 0, sizeof row);
+        row.actor = actor; row.address = qa_compat_q2_mem_offset(memory, record_address(s, record, slot), (int64_t)field->offset); row.field = field; row.length = (size_t)size_of(field, memory->pointer_bytes);
+        memory->copy(memory->ctx, row.address, row.bytes, (double)row.length);
+        qa_cleanup_pop(&values_owned);
+        observation *o = qa_compat_q2_grow((void **)&values, &count, &capacity, sizeof *o); *o = row;
+        qa_cleanup_push(&values_owned, free, values);
       }
     }
   }
+  qa_cleanup_pop(&values_owned);
   *out_count = count; return values;
 }
-static void frame_observe(provider_t *s, invocation *frame) { free(frame->observations); frame->observations = observe_all(s, &frame->observation_count); }
+static void frame_observe(provider_t *s, invocation *frame) {
+  /* The old list is given up before the new one is read: a read that raises must not leave it to be freed twice. */
+  free(frame->observations); frame->observations = NULL; frame->observation_count = 0;
+  frame->observations = observe_all(s, &frame->observation_count);
+}
 static qa_guest_address objective_address(provider_t *s, const qa_native_mod_address *value) { return resolve(s, *value, true); }
 static void projection_writes_done(void *ctx) { ((provider_t *)ctx)->projection_writes--; }
 static void refresh_body(void *ctx) {
@@ -864,7 +919,12 @@ static void refresh_body(void *ctx) {
   for (size_t p = 0; p < s->projection_count; p++) {
     qa_actor_id actor = s->projections[p].actor; double slot = s->projections[p].slot; bool client = clients_has(s, actor);
     validate_inventory_capacity(s, actor, client);
-    size_t inventory_count = 0; const qa_inventory_entry *inventory = qa_shared_inventory_table_entries(s->services->inventory, actor, &inventory_count);
+    /* TS holds its own array. The table hands out one scratch list that the next inventory read rewrites, and
+     * the match and combat reads below make such reads, so the entries are copied. */
+    size_t inventory_count = 0; const qa_inventory_entry *listed = qa_shared_inventory_table_entries(s->services->inventory, actor, &inventory_count);
+    qa_inventory_entry *inventory = calloc(inventory_count + 1, sizeof *inventory); if (inventory == NULL) qa_range_error("Out of memory");
+    if (inventory_count != 0) memcpy(inventory, listed, inventory_count * sizeof *inventory);
+    qa_cleanup inventory_owned; qa_cleanup_push(&inventory_owned, free, inventory);
     for (size_t r = 0; r < d->actor_record_count; r++) {
       const record_t *record = &d->actor_records[r]; if (!actor_uses_record(s, client, record)) continue;
       for (size_t f = 0; f < record->field_count; f++) {
@@ -883,21 +943,23 @@ static void refresh_body(void *ctx) {
         }
       }
     }
+    qa_cleanup_pop(&inventory_owned); free(inventory);
     const qa_native_mod_client_pose *pose = d->clients != NULL ? d->clients->pose : NULL;
     if (pose != NULL && clients_admitted(s, actor)) {
       const qa_mod_client_services *services = s->services->clients; qa_client_id client_id;
-      if (services == NULL || services->player_view == NULL || !services->for_actor(services->ctx, actor, &client_id)) qa_range_error("Native client pose requires the live destination movement view");
+      if (services == NULL || services->player_view == NULL || !services->for_actor(services->ctx, actor, &client_id)) qa_raise("Error", 0, 0, "Native client pose requires the live destination movement view");
       qa_mod_client_player_view view = services->player_view(services->ctx, client_id);
       const record_t *height_record = record_of(s, pose->view_height.record), *crouch_record = record_of(s, pose->crouched.field.record);
-      if (height_record == NULL || crouch_record == NULL) qa_range_error("Native pose record is unavailable");
+      if (height_record == NULL || crouch_record == NULL) qa_raise("Error", 0, 0, "Native pose record is unavailable");
+      /* TS order: the crouch address, its flags, then the height address. */
       qa_guest_address crouch_address = qa_compat_q2_mem_offset(memory, record_address(s, crouch_record, slot), (int64_t)pose->crouched.field.field.offset);
-      qa_guest_address height_address = qa_compat_q2_mem_offset(memory, record_address(s, height_record, slot), (int64_t)pose->view_height.field.offset);
       double flags = scalar_read(s, crouch_address, pose->crouched.field.field.encoding); const char *height_encoding = pose->view_height.field.encoding;
+      qa_guest_address height_address = qa_compat_q2_mem_offset(memory, record_address(s, height_record, slot), (int64_t)pose->view_height.field.offset);
       scalar_write(s, height_address, !strcmp(height_encoding, "float32") || !strcmp(height_encoding, "float64") ? view.view_offset.z : trunc(view.view_offset.z), height_encoding);
       int32_t mask = qa_js_to_int32(pose->crouched.mask), current_flags = qa_js_to_int32(flags); /* flags | mask: ToInt32 */
       scalar_write(s, crouch_address, (double)(view.crouched ? current_flags | mask : current_flags & ~mask), pose->crouched.field.field.encoding);
       double source_slot;
-      if (!qa_compat_q2_native_mod_provider_slot_of(s, actor, &source_slot)) qa_range_error("Native pose lost its source entity");
+      if (!qa_compat_q2_native_mod_provider_slot_of(s, actor, &source_slot)) qa_raise("Error", 0, 0, "Native pose lost its source entity");
       if (host->project_player_view != NULL) host->project_player_view(host->ctx, source_slot, view.view_offset.z);
     }
   }
@@ -917,12 +979,12 @@ static pickup_scope *pickup_scope_current(const provider_t *s) {
 static bool execution_current(const qa_original_pickup_execution *execution) { return execution->current(execution->current_ctx); }
 static void validate_pickup_writes(provider_t *s, const observation *const *changes, size_t count) {
   const pickup_scope *scope = pickup_scope_current(s); if (scope == NULL || count == 0 || s->projection_writes != 0) return;
-  if (!execution_current(scope->execution)) qa_range_error("Original pickup resource binding is no longer current");
+  if (!execution_current(scope->execution)) qa_raise("Error", 0, 0, "Original pickup resource binding is no longer current");
   qa_owned_actor owner;
-  if (!qa_session_actor_registry_resolve_owned(s->services->actors, scope->actor, &owner)) qa_range_error("Original pickup recipient was retired");
+  if (!qa_session_actor_registry_resolve_owned(s->services->actors, scope->actor, &owner)) qa_raise("Error", 0, 0, "Original pickup recipient was retired");
   for (size_t i = 0; i < count; i++) {
     const field_t *field = changes[i]->field;
-    if (!qa_same_actor(changes[i]->actor, scope->actor) || !is_inventory(field)) qa_range_error("Original pickup changed an undeclared resource");
+    if (!qa_same_actor(changes[i]->actor, scope->actor) || !is_inventory(field)) qa_raise("Error", 0, 0, "Original pickup changed an undeclared resource");
     bool permitted = false, count_field = !strcmp(field->binding, "inventory"); const qa_pickup_writes *writes = &scope->execution->writes;
     for (size_t w = 0; w < writes->count && !permitted; w++) {
       const qa_pickup_write *write = &writes->values[w];
@@ -932,7 +994,7 @@ static void validate_pickup_writes(provider_t *s, const observation *const *chan
         for (size_t k = 0; k < n && !permitted; k++) permitted = eq(items[k], field->item);
       }
     }
-    if (!permitted) qa_range_error("Original pickup changed undeclared %s %s", field->binding, field->item);
+    if (!permitted) qa_raise("Error", 0, 0, "Original pickup changed undeclared %s %s", field->binding, field->item);
   }
 }
 static void flush_frames(provider_t *s, const qa_compat_q2_native_protection_inventory_commit *inventory_commit);
@@ -940,9 +1002,10 @@ typedef struct configure_call { provider_t *owner; qa_actor_id actor; qa_item_id
 static void committed_writes(void *ctx) {
   configure_call *c = ctx; provider_t *s = c->owner;
   size_t count = 0; observation *all = observe_all(s, &count);
+  qa_cleanup all_owned; qa_cleanup_push(&all_owned, free, all);
   for (size_t i = 0; i < count; i++) if (qa_same_actor(all[i].actor, c->actor) && is_inventory(all[i].field) && eq(all[i].field->item, c->item))
     scalar_write(s, all[i].address, !strcmp(all[i].field->binding, "inventory") ? c->change.after.count : c->change.after.capacity, all[i].field->encoding);
-  free(all);
+  qa_cleanup_pop(&all_owned); free(all);
 }
 static void inventory_committed(void *ctx, qa_inventory_committed_change change) {
   configure_call *c = ctx; provider_t *s = c->owner; c->change = change;
@@ -957,7 +1020,7 @@ static void match_write_body(void *ctx) { match_write *m = ctx; scalar_write(m->
 static void run_commit(provider_t *s, const pending_commit *commit) {
   if (clients_rejects(s, commit->actor)) return;
   qa_owned_actor owner;
-  if (!qa_session_actor_registry_resolve_owned(s->services->actors, commit->actor, &owner)) qa_range_error("Native mod wrote an expired actor");
+  if (!qa_session_actor_registry_resolve_owned(s->services->actors, commit->actor, &owner)) qa_raise("Error", 0, 0, "Native mod wrote an expired actor");
   const field_t *field = commit->field;
   switch (commit->kind) {
     case COMMIT_MATCH:
@@ -972,24 +1035,24 @@ static void run_commit(provider_t *s, const pending_commit *commit) {
     case COMMIT_INVENTORY: {
       size_t count = 0; const qa_inventory_entry *entries = qa_shared_inventory_table_entries(s->services->inventory, commit->actor, &count); bool found = false; qa_inventory_entry entry; memset(&entry, 0, sizeof entry);
       for (size_t i = 0; i < count && !found; i++) if (!strcmp(entries[i].item, field->item)) { entry = entries[i]; found = true; }
-      if (!found) qa_range_error("Native mod wrote an undeclared destination item");
-      if (commit->has_capacity && !qa_shared_inventory_table_mutable_capacity(s->services->inventory, commit->actor, field->item)) qa_range_error("Native mod requires mutable inventory capacity for %s", field->item);
+      if (!found) qa_raise("Error", 0, 0, "Native mod wrote an undeclared destination item");
+      if (commit->has_capacity && !qa_shared_inventory_table_mutable_capacity(s->services->inventory, commit->actor, field->item)) qa_raise("Error", 0, 0, "Native mod requires mutable inventory capacity for %s", field->item);
       const pickup_scope *scope = pickup_scope_current(s);
-      if (scope != NULL && !execution_current(scope->execution)) qa_range_error("Original pickup resource binding is no longer current");
+      if (scope != NULL && !execution_current(scope->execution)) qa_raise("Error", 0, 0, "Original pickup resource binding is no longer current");
       if (commit->has_count) entry.count = commit->count;
       if (commit->has_capacity) entry.capacity = commit->capacity;
       configure_call c; memset(&c, 0, sizeof c); c.owner = s; c.actor = commit->actor; c.item = field->item; c.has_commit = commit->has_commit; c.commit = commit->commit;
       bool observed = scope != NULL || commit->has_commit;
       qa_shared_inventory_table_configure(s->services->inventory, owner, entry, observed ? inventory_committed : NULL, observed ? &c : NULL);
       if (scope != NULL) {
-        if (!execution_current(scope->execution)) qa_range_error("Original pickup resource binding is no longer current");
+        if (!execution_current(scope->execution)) qa_raise("Error", 0, 0, "Original pickup resource binding is no longer current");
         refresh(s);
       }
       break;
     }
     case COMMIT_BODY: {
       qa_body_state_result body = qa_shared_body_table_read(s->services->bodies, commit->actor);
-      if (!body.has_value) qa_range_error("Native mod wrote an actor without a body");
+      if (!body.has_value) qa_raise("Error", 0, 0, "Native mod wrote an actor without a body");
       qa_body_state next = body.value;
       if (!strcmp(field->binding, "bounds-min")) next.bounds.min = commit->vector;
       else if (!strcmp(field->binding, "bounds-max")) next.bounds.max = commit->vector;
@@ -1009,6 +1072,8 @@ static void flush_frames(provider_t *s, const qa_compat_q2_native_protection_inv
   size_t change_capacity = frame->observation_count + 1;
   observation *changed = calloc(change_capacity, sizeof *changed); const observation **pointers = calloc(change_capacity, sizeof *pointers);
   if (changed == NULL || pointers == NULL) qa_range_error("Out of memory");
+  /* Released when a guest read, the pickup check or an unrepresentable vector raises too. */
+  qa_cleanup changed_owned, pointers_owned; qa_cleanup_push(&changed_owned, free, changed); qa_cleanup_push(&pointers_owned, free, (void *)pointers);
   size_t change_count = 0;
   for (size_t i = 0; i < frame->observation_count; i++) {
     uint8_t now[16]; const observation *o = &frame->observations[i];
@@ -1017,7 +1082,7 @@ static void flush_frames(provider_t *s, const qa_compat_q2_native_protection_inv
   }
   validate_pickup_writes(s, pointers, change_count);
   for (size_t i = 0; i < s->frame_count; i++) frame_observe(s, s->frames[i]);
-  if (change_count == 0 && frame->cursor == frame->pending_count) { free(changed); free(pointers); return; }
+  if (change_count == 0 && frame->cursor == frame->pending_count) { qa_cleanup_pop(&pointers_owned); qa_cleanup_pop(&changed_owned); free(changed); free((void *)pointers); return; }
   for (size_t i = 0; i < change_count; i++) {
     const observation *o = &changed[i]; const field_t *field = o->field; bool queued = false;
     pending_commit commit; memset(&commit, 0, sizeof commit); commit.actor = o->actor; commit.address = o->address; commit.field = field;
@@ -1042,7 +1107,7 @@ static void flush_frames(provider_t *s, const qa_compat_q2_native_protection_inv
     }
     if (queued) { pending_commit *slot = qa_compat_q2_grow((void **)&frame->pending, &frame->pending_count, &frame->pending_capacity, sizeof *slot); *slot = commit; }
   }
-  free(changed); free(pointers);
+  qa_cleanup_pop(&pointers_owned); qa_cleanup_pop(&changed_owned); free(changed); free((void *)pointers);
   while (frame->cursor < frame->pending_count) { pending_commit * value2 = frame->pending; size_t value3 = frame->cursor++; pending_commit commit = value2[value3]; run_commit(s, &commit); }
   frame->pending_count = 0; frame->cursor = 0;
 }
@@ -1067,7 +1132,9 @@ static void publish(provider_t *s, bool events) {
   if (s->closing) return;
   publish_client_outputs(s);
   size_t count = 0; qa_compat_q2_native_mod_actor_slot *rows = entries_of(s, &count); const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation;
-  p->publish(p->ctx, rows, count, events); free(rows);
+  qa_cleanup rows_owned; qa_cleanup_push(&rows_owned, free, rows);
+  p->publish(p->ctx, rows, count, events);
+  qa_cleanup_pop(&rows_owned); free(rows);
 }
 /* --- Lowering source call values. --- */
 typedef struct allocation { qa_guest_address address; double bytes; } allocation;
@@ -1080,16 +1147,18 @@ static qa_guest_call_value lower(provider_t *s, const value_t *value, inputs_t i
   qa_compat_q2_memory *memory = memory_of(s); qa_guest_address none; memset(&none, 0, sizeof none);
   if (!strcmp(value->kind, "user-command")) {
     const input_scope *scope = s->input_context;
-    if (scope == NULL) qa_range_error("Native user command requires its active input application");
+    if (scope == NULL) qa_raise("Error", 0, 0, "Native user command requires its active input application");
     const qa_mod_client_application *application = scope->application; bool rerelease = !classic_target(s);
     qa_compat_q2_mod_command_inputs command; memset(&command, 0, sizeof command);
     inputs_t scoped = {scope->rows, scope->count};
     static const char *const names[6] = {"attack", "jump", "impulse", "forward-move", "side-move", "up-move"};
     double *fields[6] = {&command.attack, &command.jump, &command.impulse, &command.forward_move, &command.side_move, &command.up_move};
+    /* nativeModUserCommand reads each input where the command uses it (after the interval check, and no impulse
+     * for the rerelease command) and names the missing one there: an absent input is only marked here. */
     for (int i = 0; i < 6; i++) {
       const qa_mod_runtime_value *row = find_input(scoped, names[i]);
-      if (row == NULL || strcmp(row->kind, "float") != 0 || !isfinite(row->number_value)) qa_range_error("Missing native command input %s", names[i]);
-      *fields[i] = row->number_value; command.has[i] = true;
+      command.has[i] = row != NULL && strcmp(row->kind, "float") == 0 && isfinite(row->number_value);
+      *fields[i] = command.has[i] ? row->number_value : 0;
     }
     qa_source_time elapsed = application->frame.elapsed; double elapsed_ms = elapsed.value * (elapsed.kind == QA_SOURCE_TIME_SECONDS ? 1000 : 1);
     double frame = s->owned != NULL ? qa_compat_q2_native_mod_actors_source_frame(s->owned) : 0;
@@ -1101,15 +1170,15 @@ static qa_guest_call_value lower(provider_t *s, const value_t *value, inputs_t i
   if (!strcmp(value->kind, "address")) return value->address_value == NULL ? qa_compat_q2_call_pointer(false, none) : qa_compat_q2_call_pointer(true, resolve(s, *value->address_value, false));
   if (!strcmp(value->kind, "actor")) {
     const qa_mod_runtime_value *input = find_input(inputs, value->input);
-    if (input == NULL || strcmp(input->kind, "actor") != 0) qa_range_error("Missing native actor input");
+    if (input == NULL || strcmp(input->kind, "actor") != 0) qa_raise("Error", 0, 0, "Missing native actor input");
     qa_guest_address pointer; bool has = pointer_for(s, input->actor_value, value->record, &pointer);
     return qa_compat_q2_call_pointer(has, has ? pointer : none);
   }
   if (!strcmp(value->kind, "client") || !strcmp(value->kind, "userinfo")) {
     const qa_mod_runtime_value *input = find_input(inputs, value->input);
-    if (input == NULL || strcmp(input->kind, "actor") != 0 || input->actor_value == NULL || !s->has_clients) qa_range_error("Missing native client input");
+    if (input == NULL || strcmp(input->kind, "actor") != 0 || input->actor_value == NULL || !s->has_clients) qa_raise("Error", 0, 0, "Missing native client input");
     qa_actor_id actor = *input->actor_value; double slot;
-    if (!qa_compat_q2_native_mod_clients_slot(&s->clients, actor, &slot)) qa_range_error("Native client input does not identify a destination client");
+    if (!qa_compat_q2_native_mod_clients_slot(&s->clients, actor, &slot)) qa_raise("Error", 0, 0, "Native client input does not identify a destination client");
     if (!strcmp(value->kind, "client")) return qa_compat_q2_call_int32(slot);
     double capacity = classic_target(s) ? 512 : 2048, bytes = capacity + 4;
     qa_guest_address address = memory->allocate(memory->ctx, bytes, false, 0, "native mod mutable userinfo");
@@ -1117,7 +1186,7 @@ static qa_guest_call_value lower(provider_t *s, const value_t *value, inputs_t i
     const char *before = qa_compat_q2_native_mod_clients_userinfo(&s->clients, actor); size_t before_length = strlen(before);
     if (classic_target(s)) qa_compat_q2_write_classic_string(memory, address, before, capacity);
     else {
-      if ((double)before_length >= capacity) qa_range_error("Native userinfo exceeds its public API string limit");
+      if ((double)before_length >= capacity) qa_raise("Error", 0, 0, "Native userinfo exceeds its public API string limit");
       memory->write(memory->ctx, address, (const uint8_t *)before, before_length + 1);
     }
     correction *c = qa_compat_q2_grow((void **)&l->corrections, &l->correction_count, &l->correction_capacity, sizeof *c);
@@ -1126,7 +1195,7 @@ static qa_guest_call_value lower(provider_t *s, const value_t *value, inputs_t i
   }
   if (!strcmp(value->kind, "time")) {
     const qa_mod_runtime_value *input = find_input(inputs, value->time_input);
-    if (input == NULL || strcmp(input->kind, "float") != 0) qa_range_error("Missing native time input");
+    if (input == NULL || strcmp(input->kind, "float") != 0) qa_raise("Error", 0, 0, "Missing native time input");
     return scalar_value(input->number_value * (!strcmp(value->units, "milliseconds") ? 1000 : 1), value->encoding);
   }
   qa_mod_runtime_value constant; memset(&constant, 0, sizeof constant); const qa_mod_runtime_value *resolved;
@@ -1134,34 +1203,43 @@ static qa_guest_call_value lower(provider_t *s, const value_t *value, inputs_t i
   if (named) resolved = find_input(inputs, value->value.name);
   else { constant.kind = value->value.kind; constant.number_value = value->value.number_value; constant.string_value = value->value.string_value; constant.vector_value = value->value.vector_value; resolved = &constant; }
   if (!strcmp(value->kind, "vector")) {
-    if (resolved == NULL || strcmp(resolved->kind, "vector") != 0) qa_range_error("Missing native vector input");
+    if (resolved == NULL || strcmp(resolved->kind, "vector") != 0) qa_raise("Error", 0, 0, "Missing native vector input");
     qa_guest_address address = memory->allocate(memory->ctx, 12, false, 0, "native mod vector argument");
     add_allocation(l, address, 12); qa_compat_q2_write_classic_vector(memory, address, resolved->vector_value);
     return qa_compat_q2_call_pointer(true, address);
   }
   if (!strcmp(value->kind, "string")) {
-    if (resolved == NULL || strcmp(resolved->kind, "string") != 0) qa_range_error("Missing native string input");
+    if (resolved == NULL || strcmp(resolved->kind, "string") != 0) qa_raise("Error", 0, 0, "Missing native string input");
     qa_guest_address address = qa_compat_q2_allocate_classic_string(memory, resolved->string_value);
     add_allocation(l, address, qa_compat_q2_classic_string_allocation_bytes(resolved->string_value));
     return qa_compat_q2_call_pointer(true, address);
   }
-  if (resolved == NULL || strcmp(resolved->kind, "float") != 0) qa_range_error("Missing native scalar input");
+  if (resolved == NULL || strcmp(resolved->kind, "float") != 0) qa_raise("Error", 0, 0, "Missing native scalar input");
   if (named && !strcmp(value->value.name, "pickup-count") && strcmp(value->kind, "float32") != 0 && strcmp(value->kind, "float64") != 0 && (!isfinite(resolved->number_value) || resolved->number_value != trunc(resolved->number_value)))
-    qa_range_error("Native pickup count does not fit its declared integer ABI");
+    qa_raise("Error", 0, 0, "Native pickup count does not fit its declared integer ABI");
   return scalar_value(resolved->number_value, value->kind);
 }
 static void apply_corrections(provider_t *s, lower_state *l) {
   qa_compat_q2_memory *memory = memory_of(s);
   for (size_t i = 0; i < l->correction_count; i++) {
-    const correction *c = &l->corrections[i]; char *after;
-    if (classic_target(s)) after = qa_compat_q2_read_classic_string(memory, true, c->address, c->capacity);
+    const correction *c = &l->corrections[i]; char *after; const char *text;
+    if (classic_target(s)) { after = qa_compat_q2_read_classic_string(memory, true, c->address, c->capacity); text = after; }
     else {
-      size_t capacity = (size_t)c->capacity; after = malloc(capacity); if (after == NULL) qa_range_error("Out of memory");
+      size_t capacity = (size_t)c->capacity; after = malloc(capacity + 1); if (after == NULL) qa_range_error("Out of memory");
+      qa_cleanup read_owned; qa_cleanup_push(&read_owned, free, after);
       memory->copy(memory->ctx, c->address, (uint8_t *)after, c->capacity);
-      if (memchr(after, 0, capacity) == NULL) qa_range_error("Original native userinfo is unterminated");
+      const char *end = memchr(after, 0, capacity);
+      if (end == NULL) qa_raise("Error", 0, 0, "Original native userinfo is unterminated");
+      /* new TextDecoder("utf-8", { fatal: true }): the guest's bytes must be well-formed UTF-8 (a TypeError with
+       * Bun's text otherwise) and a leading byte order mark is not part of the text. */
+      size_t length = (size_t)(end - after); text = after;
+      if (length >= 3 && (uint8_t)text[0] == 0xef && (uint8_t)text[1] == 0xbb && (uint8_t)text[2] == 0xbf) { text += 3; length -= 3; }
+      if (!qa_content_utf8_valid((const uint8_t *)text, length)) qa_raise("TypeError", 0, 0, "%s", "Invalid byte sequence");
+      qa_cleanup_pop(&read_owned);
     }
-    if (strcmp(after, c->before) != 0) qa_compat_q2_native_mod_clients_set_userinfo(&s->clients, c->actor, after);
-    free(after);
+    qa_cleanup after_owned; qa_cleanup_push(&after_owned, free, after);
+    if (strcmp(text, c->before) != 0) qa_compat_q2_native_mod_clients_set_userinfo(&s->clients, c->actor, text);
+    qa_cleanup_pop(&after_owned); free(after);
   }
 }
 static void lower_state_release(provider_t *s, lower_state *l, bool unmap) {
@@ -1172,7 +1250,9 @@ static void lower_state_release(provider_t *s, lower_state *l, bool unmap) {
 /* --- transfer, execute. --- */
 static invocation *push_frame(provider_t *s, bool observed) {
   invocation *frame = calloc(1, sizeof *frame); if (frame == NULL) qa_range_error("Out of memory");
+  qa_cleanup frame_owned; qa_cleanup_push(&frame_owned, free, frame);
   if (observed) frame_observe(s, frame);
+  qa_cleanup_pop(&frame_owned);
   invocation **slot = qa_compat_q2_grow((void **)&s->frames, &s->frame_count, &s->frame_capacity, sizeof *slot); *slot = frame;
   return frame;
 }
@@ -1218,6 +1298,7 @@ typedef struct current_call {
   provider_t *s; const call_t *call; inputs_t inputs; bool transfer_flag; const qa_native_mod_protection_region *region; const qa_compat_q2_native_mod_region_authority *authority;
   lower_state lowered; stored_global *globals; size_t global_count; bool frame_pushed;
   qa_guest_call_value *arguments; qa_guest_value_layout *layouts;
+  qa_guest_call_value *region_values; struct appearance_row *appearances; size_t appearance_count;
   qa_compat_q2_native_mod_region_execution *regional; qa_guest_address target; qa_compat_q2_guest_call_signature signature; qa_guest_call_result result; double value;
 } current_call;
 static void current_invoke(void *ctx) {
@@ -1228,15 +1309,20 @@ static void region_bind(void *ctx) { current_call *c = ctx; qa_compat_q2_native_
 static void region_unbind(void *ctx) { current_call *c = ctx; qa_compat_q2_native_mod_region_execution_unbind(c->regional); }
 static qa_guest_address call_target(provider_t *s, const call_t *call);
 typedef struct appearance_row { qa_actor_id actor; char *signature; } appearance_row;
+static void free_appearances(appearance_row *rows, size_t count);
+typedef struct appearance_list { appearance_row *rows; size_t count; } appearance_list;
+static void appearance_list_release(void *value) { appearance_list *list = value; free_appearances(list->rows, list->count); }
 static appearance_row *capture_appearances(provider_t *s, size_t *out_count) {
-  appearance_row *rows = calloc(s->projection_count + 1, sizeof *rows); if (rows == NULL) qa_range_error("Out of memory");
-  const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation; size_t count = 0;
-  for (size_t i = 0; i < s->projection_count; i++) {
+  appearance_list list = {calloc(s->projection_count + 1, sizeof(appearance_row)), 0}; if (list.rows == NULL) qa_range_error("Out of memory");
+  qa_cleanup list_owned; qa_cleanup_push(&list_owned, appearance_list_release, &list); /* a signature read that raises keeps nothing */
+  const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation; size_t capacity = s->projection_count;
+  for (size_t i = 0; i < s->projection_count && list.count < capacity; i++) {
     double slot; if (!qa_compat_q2_native_mod_provider_slot_of(s, s->projections[i].actor, &slot)) continue;
     const char *text = p->signature(p->ctx, slot); size_t n = strlen(text) + 1; char *copy = malloc(n); if (copy == NULL) qa_range_error("Out of memory"); memcpy(copy, text, n);
-    rows[count].actor = s->projections[i].actor; rows[count].signature = copy; count++;
+    list.rows[list.count].actor = s->projections[i].actor; list.rows[list.count].signature = copy; list.count++;
   }
-  *out_count = count; return rows;
+  qa_cleanup_pop(&list_owned);
+  *out_count = list.count; return list.rows;
 }
 static void compare_appearances(provider_t *s, appearance_row *rows, size_t count) {
   const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation;
@@ -1249,10 +1335,9 @@ static void current_body(void *ctx) {
   if (c->arguments == NULL || c->layouts == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < call->argument_count; i++) c->arguments[i] = lower(s, &call->arguments[i], c->inputs, &c->lowered);
   if (c->region != NULL) {
-    qa_guest_call_value *values = calloc(c->region->input_count + 1, sizeof *values); if (values == NULL) qa_range_error("Out of memory");
-    for (size_t i = 0; i < c->region->input_count; i++) values[i] = lower(s, &c->region->inputs[i].value, c->inputs, &c->lowered);
-    c->regional = qa_compat_q2_native_mod_region_execution_create(host, c->region, values, c->region->input_count, c->authority);
-    free(values);
+    c->region_values = calloc(c->region->input_count + 1, sizeof *c->region_values); if (c->region_values == NULL) qa_range_error("Out of memory");
+    for (size_t i = 0; i < c->region->input_count; i++) c->region_values[i] = lower(s, &c->region->inputs[i].value, c->inputs, &c->lowered);
+    c->regional = qa_compat_q2_native_mod_region_execution_create(host, c->region, c->region_values, c->region->input_count, c->authority);
   }
   c->globals = calloc(call->global_count + 1, sizeof *c->globals); if (c->globals == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < call->global_count; i++) {
@@ -1263,17 +1348,16 @@ static void current_body(void *ctx) {
     stored_global *saved = &c->globals[c->global_count++]; saved->address = address; saved->length = length;
     memory->copy(memory->ctx, address, saved->bytes, (double)length);
     if (vector) {
-      if (lowered.kind != QA_GUEST_VALUE_POINTER || !lowered.pointer_value.has_value) qa_range_error("Missing native vector storage");
+      if (lowered.kind != QA_GUEST_VALUE_POINTER || !lowered.pointer_value.has_value) qa_raise("Error", 0, 0, "Missing native vector storage");
       uint8_t bytes[12]; memory->copy(memory->ctx, lowered.pointer_value.value, bytes, 12); memory->write(memory->ctx, address, bytes, 12);
     } else if (lowered.kind == QA_GUEST_VALUE_POINTER) qa_compat_q2_mem_write_pointer(memory, address, lowered.pointer_value.has_value, lowered.pointer_value.value);
-    else if (lowered.kind == QA_GUEST_VALUE_AGGREGATE) qa_range_error("Native mod aggregate global requires a declared layout");
+    else if (lowered.kind == QA_GUEST_VALUE_AGGREGATE) qa_raise("Error", 0, 0, "Native mod aggregate global requires a declared layout");
     else { uint8_t bytes[8]; int n = qa_compat_q2_native_encode_scalar(memory, storage, &lowered, bytes); memory->write(memory->ctx, address, bytes, (size_t)n); }
   }
-  appearance_row *appearances = NULL; size_t appearance_count = 0;
-  if (c->transfer_flag) { appearances = capture_appearances(s, &appearance_count); refresh(s); (void)push_frame(s, true); c->frame_pushed = true; }
+  if (c->transfer_flag) { c->appearances = capture_appearances(s, &c->appearance_count); refresh(s); (void)push_frame(s, true); c->frame_pushed = true; }
   c->target = call_target(s, call);
   memory->check(memory->ctx, c->target, 1, "execute");
-  if (!s->has_stages) qa_range_error("Native source stages are unavailable");
+  if (!s->has_stages) qa_raise("Error", 0, 0, "Native source stages are unavailable");
   memset(&c->signature, 0, sizeof c->signature);
   for (size_t i = 0; i < call->argument_count; i++) { c->layouts[i].is_aggregate = false; c->layouts[i].storage = value_storage(&call->arguments[i]); }
   c->signature.abi = s->declaration->target.abi; c->signature.parameters = c->layouts; c->signature.parameter_count = call->argument_count; c->signature.variadic = false;
@@ -1281,8 +1365,7 @@ static void current_body(void *ctx) {
   if (!c->signature.result_is_void) { c->signature.result.is_aggregate = false; c->signature.result.storage = call->returns; }
   qa_compat_q2_native_mod_stage_runner_run(&s->stages, call, c, current_invoke, c, c->regional != NULL ? region_bind : NULL, region_unbind);
   apply_corrections(s, &c->lowered);
-  if (c->transfer_flag) { flush_frames(s, NULL); compare_appearances(s, appearances, appearance_count); publish(s, true); }
-  free_appearances(appearances, appearance_count);
+  if (c->transfer_flag) { flush_frames(s, NULL); compare_appearances(s, c->appearances, c->appearance_count); publish(s, true); }
   if (c->regional != NULL) { qa_guest_call_value result = qa_compat_q2_native_mod_region_execution_result(c->regional); c->value = number_result(&result); }
   else c->value = number_result(&c->result);
 }
@@ -1296,8 +1379,8 @@ static void current_cleanup(current_call *c) {
   if (!s->closed && memory != NULL) for (size_t i = c->global_count; i > 0; i--) memory->write(memory->ctx, c->globals[i - 1].address, c->globals[i - 1].bytes, c->globals[i - 1].length);
   lower_state_release(s, &c->lowered, !s->closed);
   if (c->regional != NULL) qa_compat_q2_native_mod_region_execution_destroy(c->regional);
-  free(c->globals); free(c->arguments); free(c->layouts);
-  if (ownership_changed) qa_range_error("Native donor invocation ownership changed");
+  free(c->globals); free(c->arguments); free(c->layouts); free(c->region_values); free_appearances(c->appearances, c->appearance_count);
+  if (ownership_changed) qa_raise("Error", 0, 0, "Native donor invocation ownership changed");
 }
 /* TS executeCurrent: the cancellation catch restores the processor and returns 0. */
 static double execute_current(provider_t *s, const call_t *call, inputs_t inputs, bool transfer_flag, const qa_native_mod_protection_region *region, const qa_compat_q2_native_mod_region_authority *authority) {
@@ -1325,7 +1408,7 @@ static void execute_invoke(void *ctx) { execute_call *e = ctx; e->value = execut
 static void execute_inner(void *ctx) {
   execute_call *e = ctx;
   if (e->authority == NULL) { execute_invoke(e); return; }
-  if (!e->s->has_invocations) qa_range_error("Native donor invocation is unavailable");
+  if (!e->s->has_invocations) qa_raise("Error", 0, 0, "Native donor invocation is unavailable");
   qa_compat_q2_native_mod_invocations_guard(&e->s->invocations, e->authority, e, execute_invoke);
 }
 static void execute_body(void *ctx) {
@@ -1333,11 +1416,10 @@ static void execute_body(void *ctx) {
   const qa_actor_id *actor = self != NULL && !strcmp(self->kind, "actor") ? self->actor_value : NULL;
   e->has_value = source_execution(e->s, actor, execute_inner, e) != QA_Q2INV_RETIRED;
 }
-static void execute_cleanup(void *ctx) {
-  execute_call *e = ctx; provider_t *s = e->s;
-  if (!s->closed && e->transfer_flag && s->frame_count == 0) release_pending(s);
-  s->source_calls--; finish_host_close(s);
-}
+/* TS finally { try { releasePending } finally { sourceCalls--; finishHostClose } }. */
+static void execute_release_body(void *ctx) { execute_call *e = ctx; provider_t *s = e->s; if (!s->closed && e->transfer_flag && s->frame_count == 0) release_pending(s); }
+static void execute_release_cleanup(void *ctx) { execute_call *e = ctx; e->s->source_calls--; finish_host_close(e->s); }
+static void execute_cleanup(void *ctx) { qa_compat_q2_native_mod_finally(execute_release_body, ctx, execute_release_cleanup, ctx); }
 static bool execute(provider_t *s, const call_t *call, inputs_t inputs, bool transfer_flag, const qa_native_mod_protection_region *region, const qa_compat_q2_native_mod_region_authority *authority, double *out) {
   s->source_calls++;
   execute_call e = {s, call, inputs, transfer_flag, region, authority, 0, false};
@@ -1348,10 +1430,11 @@ static bool execute(provider_t *s, const call_t *call, inputs_t inputs, bool tra
 static qa_guest_address game_entry_of(provider_t *s, const call_t *call) {
   const qa_compat_q2_native_mod_host *host = host_of(s);
   qa_compat_q2_native_mod_game_entry entry = host->game_entry(host->ctx, call->entry.name); const qa_compat_q2_guest_call_signature *e = &entry.signature;
-  bool same = eq(e->abi.kind, s->declaration->target.abi.kind) && eq(e->abi.call, s->declaration->target.abi.call) && e->parameter_count == call->argument_count && e->result_is_void == !strcmp(call->returns, "void") && !e->variadic;
+  const qa_native_abi *abi = &s->declaration->target.abi;
+  bool same = eq(e->abi.kind, abi->kind) && eq(e->abi.image, abi->image) && e->abi.pointer_bytes == abi->pointer_bytes && eq(e->abi.call, abi->call) && e->parameter_count == call->argument_count && e->result_is_void == !strcmp(call->returns, "void") && !e->variadic;
   if (same && !e->result_is_void) same = !e->result.is_aggregate && eq(e->result.storage, call->returns);
   for (size_t i = 0; same && i < call->argument_count; i++) same = !e->parameters[i].is_aggregate && eq(e->parameters[i].storage, value_storage(&call->arguments[i]));
-  if (!same) qa_range_error("Native component callback differs from its public game ABI");
+  if (!same) qa_raise("Error", 0, 0, "Native component callback differs from its public game ABI");
   return entry.address;
 }
 static qa_guest_address call_target(provider_t *s, const call_t *call) {
@@ -1359,10 +1442,19 @@ static qa_guest_address call_target(provider_t *s, const call_t *call) {
   return qa_compat_q2_native_mod_entry_address(host_of(s), call->entry);
 }
 /* --- Releases. --- */
+static void release_pending_body(void *ctx);
+static void release_pending_cleanup(void *ctx);
 static void release_pending(provider_t *s) {
   if (s->frame_count != 0 || s->lifecycle || s->closed) return;
   if (s->owned != NULL) qa_compat_q2_native_mod_actors_drain_releases(s->owned);
-  s->lifecycle = true; const declaration_t *d = s->declaration; const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation;
+  s->lifecycle = true;
+  /* TS try { ... } finally { this.lifecycle = false; }: a release call that raises must not leave every later
+   * import treated as a lifecycle import. */
+  qa_compat_q2_native_mod_finally(release_pending_body, s, release_pending_cleanup, s);
+}
+static void release_pending_cleanup(void *ctx) { ((provider_t *)ctx)->lifecycle = false; }
+static void release_pending_body(void *ctx) {
+  provider_t *s = ctx; const declaration_t *d = s->declaration; const qa_compat_q2_native_mod_presentation *p = &host_of(s)->presentation;
   while (s->pending_release_count > 0) {
     qa_actor_id actor = s->pending_releases[0];
     if (!clients_has(s, actor)) for (size_t i = 0; i < d->release_count; i++) { input_buffer buffer; double result; (void)execute(s, &d->release[i], build_inputs(s, &actor, &buffer), false, NULL, NULL, &result); }
@@ -1370,7 +1462,6 @@ static void release_pending(provider_t *s) {
     actor_list_delete(s->pending_releases, &s->pending_release_count, actor);
     if (s->has_clients) qa_compat_q2_native_mod_clients_forget(&s->clients, actor);
   }
-  s->lifecycle = false;
 }
 static void on_actor_release(void *ctx, qa_owned_actor actor) {
   provider_t *s = ctx; qa_source_mod_client_outputs_release(s->client_outputs, actor.id);
@@ -1383,11 +1474,13 @@ static void on_actor_release(void *ctx, qa_owned_actor actor) {
 static bool objective_current(void *ctx) { provider_t *s = ctx; return !s->closed && !s->closing && !s->restoring; }
 static const char *objective_location(void *ctx, const qa_source_objective_declaration *declaration) {
   provider_t *s = ctx; const qa_native_mod_objective_scalar *storage = declaration->state_storage; const qa_native_mod_address *carrier = declaration->carrier, *target = declaration->target;
-  long long value = objective_address(s, &storage->address).byte_offset;
-  long long value2 = carrier != NULL ? objective_address(s, carrier).byte_offset : -1;
-  long long value3 = target != NULL ? objective_address(s, target).byte_offset : -1;
-  long long values[3] = {value, value2, value3};
-  (void)snprintf(s->location, sizeof s->location, "%lld|%lld|%lld", values[0], values[1], values[2]);
+  /* [storage, carrier, target].map(address => address === null ? "none" : byteOffset).join("|") */
+  const qa_native_mod_address *addresses[3] = {&storage->address, carrier, target}; size_t used = 0; s->location[0] = '\0';
+  for (int i = 0; i < 3; i++) {
+    int n = addresses[i] == NULL ? snprintf(s->location + used, sizeof s->location - used, "%snone", i == 0 ? "" : "|")
+        : snprintf(s->location + used, sizeof s->location - used, "%s%lld", i == 0 ? "" : "|", (long long)objective_address(s, addresses[i]).byte_offset);
+    if (n > 0) used += (size_t)n;
+  }
   return s->location;
 }
 static double objective_read_scalar(void *ctx, const void *storage) { provider_t *s = ctx; const qa_native_mod_objective_scalar *o = storage; return scalar_read(s, objective_address(s, &o->address), o->encoding); }
@@ -1398,7 +1491,7 @@ static bool objective_read_actor(void *ctx, const void *storage, qa_actor_id *ou
   qa_guest_address a = objective_address(s, storage);
   if (!qa_compat_q2_mem_read_pointer(m, a, &pointer)) return false;
   double slot = qa_compat_q2_native_mod_table_slot(host_of(s), pointer, "Native objective pointer is outside the source actor table");
-  if (!qa_compat_q2_native_mod_provider_actor_at(s, slot, out)) qa_range_error("Native objective references an absent actor");
+  if (!qa_compat_q2_native_mod_provider_actor_at(s, slot, out)) qa_raise("Error", 0, 0, "Native objective references an absent actor");
   return true;
 }
 static void objective_write_actor(void *ctx, const void *storage, const qa_actor_id *value) {
@@ -1411,13 +1504,15 @@ static void objective_write_actor(void *ctx, const void *storage, const qa_actor
 static void objective_invoke(void *ctx, const void *call, const qa_mod_objective_input_entry *inputs, size_t count) {
   provider_t *s = ctx; input_row *rows = calloc(count + 1, sizeof *rows); if (rows == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < count; i++) { rows[i].name = inputs[i].name; rows[i].value = inputs[i].value; }
-  inputs_t view = {rows, count}; double result; (void)execute(s, call, view, true, NULL, NULL, &result); free(rows);
+  qa_cleanup rows_owned; qa_cleanup_push(&rows_owned, free, rows);
+  inputs_t view = {rows, count}; double result; (void)execute(s, call, view, true, NULL, NULL, &result);
+  qa_cleanup_pop(&rows_owned); free(rows);
 }
 static double objective_seconds(void *ctx) { return qa_compat_q2_time_seconds(qa_compat_q2_services_time(((provider_t *)ctx)->services)); }
 /* --- Client outputs. --- */
 static qa_guest_address client_output_address(provider_t *s, qa_actor_id actor, const char *record_id, double offset) {
   const record_t *record = record_of(s, record_id); const projection_row *row = find_projection(s, actor);
-  if (record == NULL || row == NULL) qa_range_error("Native client output lost its source projection");
+  if (record == NULL || row == NULL) qa_raise("Error", 0, 0, "Native client output lost its source projection");
   const qa_compat_q2_memory * m = memory_of(s);
   qa_guest_address a = record_address(s, record, row->slot);
   return qa_compat_q2_mem_offset(m, a, (int64_t)offset);
@@ -1435,10 +1530,10 @@ static void context_body(void *value) {
     const qa_native_mod_pickup_context *field = &c->definition->context[i];
     current(s);
     qa_guest_address base;
-    if (!pointer_for(s, &c->offer->pickup, field->record, &base)) qa_range_error("Native pickup has no original source projection");
+    if (!pointer_for(s, &c->offer->pickup, field->record, &base)) qa_raise("Error", 0, 0, "Native pickup has no original source projection");
     if (eq(field->record, d->entity_record)) {
       double slot;
-      if (!qa_compat_q2_native_mod_provider_slot_of(s, c->offer->pickup, &slot) || field->offset < host->entity(host->ctx, slot).public_layout.byte_length) qa_range_error("Native pickup context overlaps the public entity record");
+      if (!qa_compat_q2_native_mod_provider_slot_of(s, c->offer->pickup, &slot) || field->offset < host->entity(host->ctx, slot).public_layout.byte_length) qa_raise("Error", 0, 0, "Native pickup context overlaps the public entity record");
     }
     qa_guest_address address = qa_compat_q2_mem_offset(memory, base, (int64_t)field->offset);
     qa_guest_call_value lowered = lower(s, &field->value, c->inputs, &c->lowered);
@@ -1447,20 +1542,21 @@ static void context_body(void *value) {
     context_store *saved = &c->stores[c->store_count++]; saved->address = address; saved->length = length;
     memory->copy(memory->ctx, address, saved->bytes, (double)length);
     if (vector) {
-      if (lowered.kind != QA_GUEST_VALUE_POINTER || !lowered.pointer_value.has_value) qa_range_error("Native pickup vector storage is unavailable");
+      if (lowered.kind != QA_GUEST_VALUE_POINTER || !lowered.pointer_value.has_value) qa_raise("Error", 0, 0, "Native pickup vector storage is unavailable");
       uint8_t bytes[12]; memory->copy(memory->ctx, lowered.pointer_value.value, bytes, 12); memory->write(memory->ctx, address, bytes, 12);
     } else if (lowered.kind == QA_GUEST_VALUE_POINTER) qa_compat_q2_mem_write_pointer(memory, address, lowered.pointer_value.has_value, lowered.pointer_value.value);
-    else if (lowered.kind == QA_GUEST_VALUE_AGGREGATE) qa_range_error("Native pickup requires a scalar context field");
+    else if (lowered.kind == QA_GUEST_VALUE_AGGREGATE) qa_raise("Error", 0, 0, "Native pickup requires a scalar context field");
     else { uint8_t bytes[8]; int n = qa_compat_q2_native_encode_scalar(memory, storage, &lowered, bytes); memory->write(memory->ctx, address, bytes, (size_t)n); }
   }
   c->execute(c->ctx);
 }
-static void context_cleanup(void *value) {
+static void context_restore(void *value) {
   context_call *c = value; provider_t *s = c->s;
   if (!s->closed) { qa_compat_q2_memory *memory = memory_of(s); for (size_t i = c->store_count; i > 0; i--) memory->write(memory->ctx, c->stores[i - 1].address, c->stores[i - 1].bytes, c->stores[i - 1].length); }
-  lower_state_release(s, &c->lowered, !s->closed);
-  free(c->stores);
 }
+static void context_unmap(void *value) { context_call *c = value; provider_t *s = c->s; lower_state_release(s, &c->lowered, !s->closed); free(c->stores); c->stores = NULL; }
+/* TS finally { if (!closed) try { restore the stores } finally { unmap the allocations } }. */
+static void context_cleanup(void *value) { qa_compat_q2_native_mod_finally(context_restore, value, context_unmap, value); }
 static void pickups_context(void *ctx, const qa_native_mod_pickup *definition, const qa_original_pickup_offer *offer, qa_compat_q2_native_pickup_inputs inputs, void *execute_ctx, void (*execute_fn)(void *)) {
   provider_t *s = ctx; current(s); qa_owned_actor pickup_owner; double owned_slot; qa_client_id client; qa_actor_id world;
   bool foreign = !qa_same_actor(offer->pickup, offer->recipient)
@@ -1468,7 +1564,7 @@ static void pickups_context(void *ctx, const qa_native_mod_pickup *definition, c
       && !(s->owned != NULL && qa_compat_q2_native_mod_actors_slot_of(s->owned, offer->pickup, &owned_slot))
       && !(s->services->clients != NULL && s->services->clients->for_actor(s->services->clients->ctx, offer->pickup, &client))
       && !(world_actor(s, &world) && qa_same_actor(world, offer->pickup));
-  if (!foreign) qa_range_error("Native pickup context requires a borrowed foreign pickup actor");
+  if (!foreign) qa_raise("Error", 0, 0, "Native pickup context requires a borrowed foreign pickup actor");
   context_call c; memset(&c, 0, sizeof c); c.s = s; c.ctx = execute_ctx; c.execute = execute_fn; c.definition = definition; c.offer = offer; c.inputs = inputs;
   c.stores = calloc(definition->context_count + 1, sizeof *c.stores); if (c.stores == NULL) qa_range_error("Out of memory");
   qa_compat_q2_native_mod_finally(context_body, &c, context_cleanup, &c);
@@ -1478,7 +1574,7 @@ static void pickup_written(void *ctx, const qa_compat_q2_written_range *ranges, 
   (void)ranges; (void)count; /* TS observer ignores its ranges. */
   pickup_scope *scope = ctx; provider_t *s = scope->owner;
   if (s->pickup_scope_count == 0 || s->pickup_scopes[s->pickup_scope_count - 1] != scope || s->frame_count == 0 || s->frames[s->frame_count - 1] != scope->frame || s->projection_writes != 0) return;
-  if (!execution_current(scope->execution)) qa_range_error("Original pickup resource binding is no longer current");
+  if (!execution_current(scope->execution)) qa_raise("Error", 0, 0, "Original pickup resource binding is no longer current");
   flush_frames(s, NULL);
 }
 static void observe_pickup_body(void *value) {
@@ -1500,7 +1596,7 @@ static void observe_pickup_cleanup(void *value) {
 }
 static void observe_pickup(void *value) {
   observe_pickup_call *c = value; provider_t *s = c->s;
-  if (s->frame_count == 0) qa_range_error("Pickup requires its native source frame");
+  if (s->frame_count == 0) qa_raise("Error", 0, 0, "Pickup requires its native source frame");
   c->scope.actor = c->actor; c->scope.execution = c->observer; c->scope.frame = s->frames[s->frame_count - 1]; c->scope.owner = s;
   pickup_scope **slot = qa_compat_q2_grow((void **)&s->pickup_scopes, &s->pickup_scope_count, &s->pickup_scope_capacity, sizeof *slot); *slot = &c->scope;
   qa_compat_q2_native_mod_finally(observe_pickup_body, c, observe_pickup_cleanup, c);
@@ -1523,8 +1619,19 @@ static double shared_scalar(void *ctx, qa_guest_address base, qa_native_mod_scal
 static void protection_transfer(void *ctx, void (*invoke)(void *), void *invoke_ctx) { transfer(ctx, invoke, invoke_ctx); }
 static void protection_flush(void *ctx, const qa_compat_q2_native_protection_inventory_commit *inventory) { flush_frames(ctx, inventory); }
 static bool protection_invoke(void *ctx, const call_t *call, qa_compat_q2_native_pickup_inputs inputs, const qa_native_mod_protection_region *region, const qa_compat_q2_native_mod_region_authority *authority, double *out) { return execute(ctx, call, inputs, false, region, authority, out); }
+static void create_abandon(void *value) {
+  provider_t *s = value;
+  if (s->protection != NULL) qa_compat_q2_native_mod_protection_destroy(s->protection);
+  if (s->pickups != NULL) qa_compat_q2_native_mod_pickups_destroy(s->pickups);
+  if (s->client_outputs != NULL) qa_source_mod_client_outputs_destroy(s->client_outputs);
+  if (s->objectives != NULL) qa_mod_source_objectives_destroy(s->objectives);
+  free(s);
+}
 provider_t *qa_compat_q2_native_mod_provider_create(const declaration_t *declaration, const qa_mod_host_services *services, qa_provider_id instance, const char *map, void *assert_ctx, void (*assert_current)(void *)) {
   provider_t *s = calloc(1, sizeof *s); if (s == NULL) qa_range_error("Out of memory");
+  /* Nothing is registered with the destination until the release subscription at the end: a declaration that is
+   * refused, or a member that fails to construct, leaves nothing behind. */
+  qa_cleanup abandon; qa_cleanup_push(&abandon, create_abandon, s);
   s->declaration = declaration; s->services = services; s->instance = instance; s->map = map; s->assert_ctx = assert_ctx; s->assert_current = assert_current;
   qa_mod_objective_storage storage; memset(&storage, 0, sizeof storage);
   storage.ctx = s; storage.current = objective_current; storage.location = objective_location; storage.read_scalar = objective_read_scalar; storage.write_scalar = objective_write_scalar;
@@ -1545,25 +1652,32 @@ provider_t *qa_compat_q2_native_mod_provider_create(const declaration_t *declara
     s->protection = qa_compat_q2_native_mod_protection_create(declaration->protection, declaration->protection_count, declaration, services, instance, operations);
   }
   s->subscription = qa_session_actor_registry_on_release(services->actors, on_actor_release, s); s->subscribed = true;
+  qa_cleanup_pop(&abandon);
   return s;
 }
 void qa_compat_q2_native_mod_provider_reserve_protection(provider_t *s) { current(s); if (s->protection != NULL) qa_compat_q2_native_mod_protection_reserve(s->protection); }
 /* --- Match. --- */
 static qa_guest_address match_address(match_binding *b, double offset) {
   provider_t *s = b->owner; current(s); qa_owned_actor owned; double slot;
-  if (!qa_session_actor_registry_resolve_owned(s->services->actors, b->actor, &owned) || !qa_same_owned_actor(owned, b->owned) || s->owned == NULL || !qa_compat_q2_native_mod_actors_slot_of(s->owned, b->actor, &slot) || slot != b->slot) qa_range_error("Native match actor was retired");
+  if (!qa_session_actor_registry_resolve_owned(s->services->actors, b->actor, &owned) || !qa_same_owned_actor(owned, b->owned) || s->owned == NULL || !qa_compat_q2_native_mod_actors_slot_of(s->owned, b->actor, &slot) || slot != b->slot) qa_raise("Error", 0, 0, "Native match actor was retired");
   const qa_compat_q2_native_mod_host *host = host_of(s); return qa_compat_q2_mem_offset(host->memory, host->entity(host->ctx, slot).address, (int64_t)offset);
 }
 static const char *match_team(void *ctx) { match_binding *b = ctx; if (b->team == NULL) return NULL; return qa_source_team(b->team->team_values, b->team->team_value_count, scalar_read(b->owner, match_address(b, b->team->offset), b->team->encoding)); }
-static double match_score(void *ctx) { match_binding *b = ctx; if (b->score == NULL) qa_range_error("Native match actor has no score field"); return scalar_read(b->owner, match_address(b, b->score->offset), b->score->encoding); }
-static void match_set_team(void *ctx, const char *value) { match_binding *b = ctx; if (b->team == NULL) qa_range_error("Native match actor has no team field"); provider_t * s = b->owner; qa_guest_address address = match_address(b, b->team->offset); double value2 = qa_original_team(b->team->team_values, b->team->team_value_count, value); scalar_write(s, address, value2, b->team->encoding); }
-static void match_set_score(void *ctx, double value) { match_binding *b = ctx; if (b->score == NULL) qa_range_error("Native match actor has no score field"); scalar_write(b->owner, match_address(b, b->score->offset), value, b->score->encoding); }
+static double match_score(void *ctx) { match_binding *b = ctx; if (b->score == NULL) qa_raise("Error", 0, 0, "Native match actor has no score field"); return scalar_read(b->owner, match_address(b, b->score->offset), b->score->encoding); }
+static void match_set_team(void *ctx, const char *value) { match_binding *b = ctx; if (b->team == NULL) qa_raise("Error", 0, 0, "Native match actor has no team field"); provider_t * s = b->owner; qa_guest_address address = match_address(b, b->team->offset); double value2 = qa_original_team(b->team->team_values, b->team->team_value_count, value); scalar_write(s, address, value2, b->team->encoding); }
+static void match_set_score(void *ctx, double value) { match_binding *b = ctx; if (b->score == NULL) qa_raise("Error", 0, 0, "Native match actor has no score field"); scalar_write(b->owner, match_address(b, b->score->offset), value, b->score->encoding); }
 static qa_source_match_player_result match_player(void *ctx, qa_actor_id actor) {
   provider_t *s = ctx; qa_source_match_player_result none; memset(&none, 0, sizeof none); qa_owned_actor owned; double slot;
   const record_t *record = s->declaration->entity_record != NULL ? record_of(s, s->declaration->entity_record) : NULL;
   if (s->closed || s->closing || !qa_session_actor_registry_resolve_owned(s->services->actors, actor, &owned) || !eq(owned.owner, s->instance) || s->owned == NULL || !qa_compat_q2_native_mod_actors_slot_of(s->owned, actor, &slot) || record == NULL) return none;
-  match_binding *b = calloc(1, sizeof *b); if (b == NULL) qa_range_error("Out of memory");
-  b->owner = s; b->actor = actor; b->owned = owned; b->slot = slot; b->next = s->matches; s->matches = b;
+  /* TS makes a new player object per call; each closes over nothing but (actor, owned, slot), so one context per
+   * such triple serves every call (a new one per call grew without bound: combat reads ask for the team). */
+  match_binding *b = NULL;
+  for (match_binding *known = s->matches; known != NULL && b == NULL; known = known->next) if (qa_same_actor(known->actor, actor) && qa_same_owned_actor(known->owned, owned) && known->slot == slot) b = known;
+  if (b == NULL) {
+    b = calloc(1, sizeof *b); if (b == NULL) qa_range_error("Out of memory");
+    b->owner = s; b->actor = actor; b->owned = owned; b->slot = slot; b->next = s->matches; s->matches = b;
+  }
   for (size_t f = 0; f < record->field_count; f++) { const field_t *field = &record->fields[f]; if (b->team == NULL && !strcmp(field->binding, "team")) b->team = field; if (b->score == NULL && !strcmp(field->binding, "score")) b->score = field; }
   qa_source_match_player_result result; memset(&result, 0, sizeof result); result.has_value = true;
   result.value.ctx = b; result.value.owner = s->instance; result.value.team = match_team; result.value.score = match_score; result.value.set_team = match_set_team; result.value.set_score = match_set_score;
@@ -1573,38 +1687,61 @@ void qa_compat_q2_native_mod_provider_activate_protection(provider_t *s) {
   current(s); qa_mod_source_objectives_activate(s->objectives); const declaration_t *d = s->declaration; bool has_match_field = false;
   for (size_t r = 0; r < d->actor_record_count; r++) for (size_t f = 0; f < d->actor_records[r].field_count; f++) if (is_match(&d->actor_records[r].fields[f])) has_match_field = true;
   if (!s->match_bound && has_match_field) {
-    if (s->services->match == NULL) qa_range_error("Declared match fields require destination match services");
+    if (s->services->match == NULL) qa_raise("Error", 0, 0, "Declared match fields require destination match services");
     s->release_match = s->services->match->bind_source(s->services->match->ctx, s->instance, match_player, s); s->match_bound = true;
   }
   if (s->protection != NULL) qa_compat_q2_native_mod_protection_activate(s->protection);
   qa_compat_q2_native_mod_pickups_activate(s->pickups);
 }
 /* --- Input scopes. --- */
+static bool input_scope_live(const input_scope *scope) {
+  const provider_t *s = scope->owner; qa_actor_id actor = scope->application->identity.actor, back; qa_client_id client = scope->application->identity.client, forward;
+  const qa_mod_client_services *clients = s->services->clients;
+  return !s->closed && is_live(s, actor) && clients != NULL && clients->actor(clients->ctx, client, &back) && qa_same_actor(back, actor) && clients->for_actor(clients->ctx, actor, &forward) && qa_same_client(forward, client);
+}
+typedef struct store_write { qa_compat_q2_memory *memory; const input_store *store; } store_write;
+static void store_restore_body(void *value) { store_write *w = value; w->memory->write(w->memory->ctx, w->store->address, w->store->previous, w->store->length); }
+/* TS close(failed): the fields go back to their earlier bytes when staging failed or an outer scope of the same
+ * client is still open. Each restore runs in its own try: one failure leaves as it is, several as one
+ * AggregateError. */
 static void input_scope_close(input_scope *scope, bool failed) {
   provider_t *s = scope->owner; size_t index = (size_t)-1;
   for (size_t i = 0; i < s->input_scope_count; i++) if (s->input_scopes[i] == scope) { index = i; break; }
   if (index == (size_t)-1) return;
   memmove(&s->input_scopes[index], &s->input_scopes[index + 1], (s->input_scope_count - index - 1) * sizeof *s->input_scopes); s->input_scope_count--;
-  bool outer_live = false;
+  bool outer_live = false; size_t errors = 0; qa_caught_error first, later;
   if (scope->outer != NULL) for (size_t i = 0; i < s->input_scope_count; i++) if (s->input_scopes[i] == scope->outer) outer_live = true;
   if (failed || outer_live) {
-    qa_actor_id actor = scope->application->identity.actor; const qa_mod_client_services *clients = s->services->clients; qa_compat_q2_memory *memory = memory_of(s);
     for (size_t i = 0; i < scope->store_count; i++) {
-      qa_actor_id back; qa_client_id forward; qa_client_id client = scope->application->identity.client;
-      if (s->closed || !is_live(s, actor) || clients == NULL || !clients->actor(clients->ctx, client, &back) || !qa_same_actor(back, actor) || !clients->for_actor(clients->ctx, actor, &forward) || !qa_same_client(forward, client)) break;
-      memory->write(memory->ctx, scope->stores[i].address, scope->stores[i].previous, scope->stores[i].length);
+      if (!input_scope_live(scope)) break;
+      store_write w = {scope->memory, &scope->stores[i]};
+      if (!qa_try(store_restore_body, &w, errors == 0 ? &first : &later)) errors++;
     }
   }
   if (s->input_context == scope) s->input_context = NULL;
   free(scope->stores); free(scope);
+  if (errors == 1) qa_rethrow(&first);
+  if (errors > 1) qa_raise("AggregateError", 0, 0, "Native input field restoration failed");
 }
 static void input_scope_cleanup(void *ctx) { input_scope_close(ctx, false); }
+static void input_scope_abandon(void *value) { input_scope *scope = value; free(scope->stores); free(scope); }
+static void input_stage_body(void *value) {
+  input_scope *scope = value; provider_t *s = scope->owner;
+  for (size_t i = 0; i < scope->store_count; i++) {
+    current(s);
+    if (!input_scope_live(scope)) break;
+    scope->memory->write(scope->memory->ctx, scope->stores[i].address, scope->stores[i].bytes, scope->stores[i].length);
+  }
+}
+static void input_rollback_body(void *value) { input_scope_close(value, true); }
 static void open_input(void *ctx, qa_mod_client_application *application, void (**cleanup)(void *), void **cleanup_ctx) {
   provider_t *s = ctx; current(s); qa_compat_q2_memory *memory = memory_of(s); qa_actor_id actor = application->identity.actor; const qa_native_mod_clients *clients = s->declaration->clients;
-  const projection_row *row = find_projection(s, actor); if (row == NULL) qa_range_error("Native input client has no source row");
+  const projection_row *row = find_projection(s, actor); if (row == NULL) qa_raise("Error", 0, 0, "Native input client has no source row");
   double slot = row->slot;
   input_scope *scope = calloc(1, sizeof *scope); if (scope == NULL) qa_range_error("Out of memory");
-  scope->owner = s; scope->application = application;
+  /* Until the scope joins the list nothing else knows it: a field that cannot be staged releases it. */
+  qa_cleanup scope_owned; qa_cleanup_push(&scope_owned, input_scope_abandon, scope);
+  scope->owner = s; scope->application = application; scope->memory = memory;
   qa_mod_client_input_values values = qa_mod_client_input_values_of(application);
   for (size_t i = 0; i < values.count; i++) { scope->rows[i].name = values.entries[i].name; scope->rows[i].value = values.entries[i].value; }
   scope->count = values.count; scope->self = actor;
@@ -1615,14 +1752,16 @@ static void open_input(void *ctx, qa_mod_client_application *application, void (
   scope->stores = calloc(field_count + 1, sizeof *scope->stores); if (scope->stores == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < field_count; i++) {
     const qa_native_mod_client_input_field *field = &clients->input_fields[i]; const record_t *record = record_of(s, field->record);
-    if (record == NULL) qa_range_error("Native input record is unavailable");
-    input_store *store = &scope->stores[scope->store_count++]; store->address = qa_compat_q2_mem_offset(memory, record_address(s, record, slot), (int64_t)field->offset);
+    if (record == NULL) qa_raise("Error", 0, 0, "Native input record is unavailable");
+    input_store *store = &scope->stores[scope->store_count]; store->address = qa_compat_q2_mem_offset(memory, record_address(s, record, slot), (int64_t)field->offset);
     if (!strcmp(field->value.kind, "vector")) {
       qa_vec3 vector;
-      if (!strcmp(field->value.value.kind, "input")) { const qa_mod_runtime_value *input = find_input(view, field->value.value.name); if (input == NULL || strcmp(input->kind, "vector") != 0) qa_range_error("Native input vector is unavailable"); vector = input->vector_value; }
-      else { if (strcmp(field->value.value.kind, "vector") != 0) qa_range_error("Native input vector is unavailable"); vector = field->value.value.vector_value; }
-      (void)scalar_value(vector.x, "float32"); (void)scalar_value(vector.y, "float32"); (void)scalar_value(vector.z, "float32");
-      qa_compat_q2_view_set_f32(store->bytes, 0, vector.x); qa_compat_q2_view_set_f32(store->bytes, 4, vector.y); qa_compat_q2_view_set_f32(store->bytes, 8, vector.z); store->length = 12;
+      if (!strcmp(field->value.value.kind, "input")) { const qa_mod_runtime_value *input = find_input(view, field->value.value.name); if (input == NULL || strcmp(input->kind, "vector") != 0) qa_raise("Error", 0, 0, "Native input vector is unavailable"); vector = input->vector_value; }
+      else { if (strcmp(field->value.value.kind, "vector") != 0) qa_raise("Error", 0, 0, "Native input vector is unavailable"); vector = field->value.value.vector_value; }
+      /* forEach: each component is checked, then written, in turn. */
+      (void)scalar_value(vector.x, "float32"); qa_compat_q2_view_set_f32(store->bytes, 0, vector.x);
+      (void)scalar_value(vector.y, "float32"); qa_compat_q2_view_set_f32(store->bytes, 4, vector.y);
+      (void)scalar_value(vector.z, "float32"); qa_compat_q2_view_set_f32(store->bytes, 8, vector.z); store->length = 12;
     } else {
       lower_state none; memset(&none, 0, sizeof none); qa_guest_call_value lowered = lower(s, &field->value, view, &none);
       store->length = (size_t)qa_compat_q2_native_encode_scalar(memory, value_scalar_kind(&field->value), &lowered, store->bytes);
@@ -1630,13 +1769,16 @@ static void open_input(void *ctx, qa_mod_client_application *application, void (
     }
     memory->check(memory->ctx, store->address, (double)store->length, "write");
     memory->copy(memory->ctx, store->address, store->previous, (double)store->length);
+    scope->store_count++;
   }
+  qa_cleanup_pop(&scope_owned);
   input_scope **slot_scope = qa_compat_q2_grow((void **)&s->input_scopes, &s->input_scope_count, &s->input_scope_capacity, sizeof *slot_scope); *slot_scope = scope;
-  const qa_mod_client_services *services = s->services->clients;
-  for (size_t i = 0; i < scope->store_count; i++) {
-    current(s); qa_actor_id back; qa_client_id forward; qa_client_id client = application->identity.client;
-    if (s->closed || !is_live(s, actor) || services == NULL || !services->actor(services->ctx, client, &back) || !qa_same_actor(back, actor) || !services->for_actor(services->ctx, actor, &forward) || !qa_same_client(forward, client)) break;
-    memory->write(memory->ctx, scope->stores[i].address, scope->stores[i].bytes, scope->stores[i].length);
+  /* TS try { stage every field } catch (error) { try { close(true) } catch (cleanup) { throw new AggregateError(
+   * [error, cleanup], "Native input staging and rollback failed") } throw error }. */
+  qa_caught_error caught, rollback;
+  if (!qa_try(input_stage_body, scope, &caught)) {
+    if (!qa_try(input_rollback_body, scope, &rollback)) qa_raise("AggregateError", 0, 0, "Native input staging and rollback failed");
+    qa_rethrow(&caught);
   }
   *cleanup = input_scope_cleanup; *cleanup_ctx = scope;
 }
@@ -1646,11 +1788,11 @@ static void input_invoke_cleanup(void *value) { input_invoke_call *c = value; c-
 static void invoke_input(void *ctx, const call_t *call, qa_mod_client_application *application) {
   provider_t *s = ctx; input_scope *scope = NULL;
   for (size_t i = 0; i < s->input_scope_count && scope == NULL; i++) if (s->input_scopes[i]->application == application) scope = s->input_scopes[i];
-  if (scope == NULL) qa_range_error("Native input callback has no active application");
+  if (scope == NULL) qa_raise("Error", 0, 0, "Native input callback has no active application");
   input_invoke_call c = {s, call, scope, s->input_context}; s->input_context = scope;
   qa_compat_q2_native_mod_finally(input_invoke_body, &c, input_invoke_cleanup, &c);
 }
-typedef struct handler_state { provider_t *s; qa_mod_client_application *application; const qa_native_mod_input_output *output; size_t index; bool has_expected; qa_guest_address expected; bool called; uint64_t observer; qa_guest_value_layout *layouts; } handler_state;
+typedef struct handler_state { provider_t *s; qa_mod_client_application *application; const qa_native_mod_input_output *output; size_t index; bool has_expected; qa_guest_address expected; bool called, observing; uint64_t observer; qa_guest_value_layout *layouts; } handler_state;
 typedef struct field_state { const qa_native_mod_input_output *output; const char *name; const char *kind; qa_guest_address address; size_t length; uint8_t before[16]; } field_state;
 static bool output_live(provider_t *s, qa_actor_id actor) { return !s->closed && is_live(s, actor) && clients_admitted(s, actor); }
 static void handler_observed(void *ctx) {
@@ -1659,63 +1801,83 @@ static void handler_observed(void *ctx) {
   qa_compat_q2_guest_call_signature signature; memset(&signature, 0, sizeof signature);
   signature.abi = s->declaration->target.abi; signature.parameters = h->layouts; signature.parameter_count = h->output->argument_count; signature.result_is_void = true; signature.variadic = false;
   qa_guest_call_value *actual = calloc(h->output->argument_count + 1, sizeof *actual); if (actual == NULL) qa_range_error("Out of memory");
+  qa_cleanup actual_owned; qa_cleanup_push(&actual_owned, free, actual);
   const qa_compat_q2_runner *runner = host_of(s)->runner;
   size_t count = runner->adapter_arguments(runner->ctx, signature, actual, h->output->argument_count);
+  qa_cleanup_pop(&actual_owned);
   if (h->index < count && actual[h->index].kind == QA_GUEST_VALUE_POINTER && actual[h->index].pointer_value.has_value && h->has_expected && actual[h->index].pointer_value.value.byte_offset == h->expected.byte_offset) h->called = true;
   free(actual);
 }
-static void input_output_fn(void *ctx, const qa_native_mod_input_output *outputs, size_t output_count, qa_mod_client_application *application, void (*run)(void *), void *run_ctx, qa_mod_client_input_output **out_outputs, size_t *out_count) {
-  provider_t *s = ctx; qa_compat_q2_memory *memory = memory_of(s); const qa_compat_q2_native_mod_host *host = host_of(s); qa_actor_id actor = application->identity.actor; const qa_native_mod_clients *clients = s->declaration->clients;
-  const projection_row *row = find_projection(s, actor); if (row == NULL) qa_range_error("Native output client has no source row");
-  double slot = row->slot;
-  handler_state *handlers = calloc(output_count + 1, sizeof *handlers); field_state *fields = calloc(output_count + 1, sizeof *fields);
-  if (handlers == NULL || fields == NULL) qa_range_error("Out of memory");
-  for (size_t i = 0; i < output_count; i++) {
-    const qa_native_mod_input_output *output = &outputs[i];
+typedef struct output_call {
+  provider_t *s; const qa_native_mod_input_output *outputs; size_t output_count; qa_mod_client_application *application; void (*run)(void *); void *run_ctx;
+  double slot; handler_state *handlers; field_state *fields; qa_mod_client_input_output *result; size_t count;
+} output_call;
+static void output_body(void *value) {
+  output_call *c = value; provider_t *s = c->s; qa_compat_q2_memory *memory = memory_of(s); const qa_compat_q2_native_mod_host *host = host_of(s);
+  qa_actor_id actor = c->application->identity.actor; const qa_native_mod_clients *clients = s->declaration->clients;
+  for (size_t i = 0; i < c->output_count; i++) {
+    const qa_native_mod_input_output *output = &c->outputs[i];
     if (!strcmp(output->kind, "handler")) {
-      handler_state *h = &handlers[i]; h->s = s; h->application = application; h->output = output;
+      handler_state *h = &c->handlers[i]; h->s = s; h->application = c->application; h->output = output;
       qa_guest_address address = qa_compat_q2_native_mod_entry_address(host, output->entry);
       const value_t *self_value = NULL;
       for (size_t a = 0; a < output->argument_count && self_value == NULL; a++) if (!strcmp(output->arguments[a].kind, "actor") && eq(output->arguments[a].input, "self")) { self_value = &output->arguments[a]; h->index = a; }
-      if (self_value == NULL) qa_range_error("Native output handler lacks its client actor argument");
+      if (self_value == NULL) qa_raise("Error", 0, 0, "Native output handler lacks its client actor argument");
       h->has_expected = pointer_for(s, &actor, self_value->record, &h->expected);
       h->layouts = calloc(output->argument_count + 1, sizeof *h->layouts); if (h->layouts == NULL) qa_range_error("Out of memory");
       for (size_t a = 0; a < output->argument_count; a++) { h->layouts[a].is_aggregate = false; h->layouts[a].storage = value_storage(&output->arguments[a]); }
-      h->observer = host->runner->observe_entry(host->runner->ctx, address, h, handler_observed);
+      h->observer = host->runner->observe_entry(host->runner->ctx, address, h, handler_observed); h->observing = true;
       continue;
     }
     const qa_native_mod_client_input_field *field = NULL; const record_t *record = record_of(s, output->record);
     if (clients != NULL) for (size_t f = 0; f < clients->input_field_count && field == NULL; f++) if (eq(clients->input_fields[f].record, output->record) && clients->input_fields[f].offset == output->offset) field = &clients->input_fields[f];
-    if (field == NULL || record == NULL || !strcmp(field->value.kind, "time") || !eq(field->value.value.kind, "input")) qa_range_error("Native output lacks its declared input field");
+    if (field == NULL || record == NULL || !strcmp(field->value.kind, "time") || !eq(field->value.value.kind, "input")) qa_raise("Error", 0, 0, "Native output lacks its declared input field");
     const char *name = field->value.value.name;
-    if (!one_of(name, NAMES("view-angles", "attack", "jump", "impulse", "forward-move", "side-move", "up-move"))) qa_range_error("Native output field is not a client input");
-    field_state *state = &fields[i]; state->output = output; state->name = name; state->kind = field->value.kind;
-    state->address = qa_compat_q2_mem_offset(memory, record_address(s, record, slot), (int64_t)field->offset);
+    if (!one_of(name, NAMES("view-angles", "attack", "jump", "impulse", "forward-move", "side-move", "up-move"))) qa_raise("Error", 0, 0, "Native output field is not a client input");
+    field_state *state = &c->fields[i]; state->output = output; state->name = name; state->kind = field->value.kind;
+    state->address = qa_compat_q2_mem_offset(memory, record_address(s, record, c->slot), (int64_t)field->offset);
     state->length = !strcmp(state->kind, "vector") ? 12 : (size_t)scalar_size(state->kind);
     memory->copy(memory->ctx, state->address, state->before, (double)state->length);
   }
-  run(run_ctx);
-  qa_mod_client_input_output *result = calloc(output_count + 1, sizeof *result); if (result == NULL) qa_range_error("Out of memory");
-  size_t count = 0;
-  if (output_live(s, actor)) for (size_t i = 0; i < output_count; i++) {
-    const qa_native_mod_input_output *output = &outputs[i];
+  c->run(c->run_ctx);
+  c->result = calloc(c->output_count + 1, sizeof *c->result); if (c->result == NULL) qa_range_error("Out of memory");
+  if (output_live(s, actor)) for (size_t i = 0; i < c->output_count; i++) {
+    const qa_native_mod_input_output *output = &c->outputs[i]; qa_mod_client_input_output *row = &c->result[c->count];
     if (!strcmp(output->kind, "handler")) {
-      if (handlers[i].called) { result[count].kind = QA_MOD_CLIENT_INPUT_OUTPUT_CONSUME; result[count].inputs = output->inputs; result[count].input_count = output->input_count; count++; }
+      if (c->handlers[i].called) { row->kind = QA_MOD_CLIENT_INPUT_OUTPUT_CONSUME; row->inputs = output->inputs; row->input_count = output->input_count; c->count++; }
       continue;
     }
-    field_state *state = &fields[i]; uint8_t now[16]; memory->copy(memory->ctx, state->address, now, (double)state->length);
+    field_state *state = &c->fields[i]; uint8_t now[16]; memory->copy(memory->ctx, state->address, now, (double)state->length);
     if (memcmp(now, state->before, state->length) == 0) continue;
     bool view_angles = !strcmp(state->name, "view-angles"), vector = !strcmp(state->kind, "vector");
-    result[count].kind = QA_MOD_CLIENT_INPUT_OUTPUT_SET; result[count].input = state->name;
-    if (view_angles && vector) result[count].vector_value = qa_compat_q2_read_classic_vector(memory, state->address);
-    else if (!view_angles && !vector) result[count].number_value = scalar_read(s, state->address, state->kind);
-    else qa_range_error("Native output representation differs from its input");
-    count++;
+    row->kind = QA_MOD_CLIENT_INPUT_OUTPUT_SET; row->input = state->name;
+    if (view_angles && vector) row->vector_value = qa_compat_q2_read_classic_vector(memory, state->address);
+    else if (!view_angles && !vector) row->number_value = scalar_read(s, state->address, state->kind);
+    else qa_raise("Error", 0, 0, "Native output representation differs from its input");
+    c->count++;
   }
-  for (size_t i = output_count; i > 0; i--) if (handlers[i - 1].observer != 0) host->runner->remove_entry(host->runner->ctx, handlers[i - 1].observer);
-  for (size_t i = 0; i < output_count; i++) free(handlers[i].layouts);
-  free(handlers); free(fields);
-  *out_outputs = result; *out_count = count;
+}
+/* TS finally { for (const close of remove.reverse()) close(); }: the entry observers leave whatever happened. */
+static void output_cleanup(void *value) {
+  output_call *c = value; const qa_compat_q2_native_mod_host *host = host_of(c->s);
+  for (size_t i = c->output_count; i > 0; i--) if (c->handlers[i - 1].observing) { c->handlers[i - 1].observing = false; host->runner->remove_entry(host->runner->ctx, c->handlers[i - 1].observer); }
+}
+static void output_release(void *value) {
+  output_call *c = value;
+  for (size_t i = 0; i < c->output_count; i++) free(c->handlers[i].layouts);
+  free(c->handlers); free(c->fields); free(c->result); c->handlers = NULL; c->fields = NULL; c->result = NULL;
+}
+static void input_output_fn(void *ctx, const qa_native_mod_input_output *outputs, size_t output_count, qa_mod_client_application *application, void (*run)(void *), void *run_ctx, qa_mod_client_input_output **out_outputs, size_t *out_count) {
+  provider_t *s = ctx; (void)memory_of(s); qa_actor_id actor = application->identity.actor;
+  const projection_row *row = find_projection(s, actor); if (row == NULL) qa_raise("Error", 0, 0, "Native output client has no source row");
+  output_call c; memset(&c, 0, sizeof c); c.s = s; c.outputs = outputs; c.output_count = output_count; c.application = application; c.run = run; c.run_ctx = run_ctx; c.slot = row->slot;
+  c.handlers = calloc(output_count + 1, sizeof *c.handlers); c.fields = calloc(output_count + 1, sizeof *c.fields);
+  if (c.handlers == NULL || c.fields == NULL) qa_range_error("Out of memory");
+  qa_cleanup owned; qa_cleanup_push(&owned, output_release, &c);
+  qa_compat_q2_native_mod_finally(output_body, &c, output_cleanup, &c);
+  qa_cleanup_pop(&owned);
+  *out_outputs = c.result; *out_count = c.count; c.result = NULL;
+  output_release(&c);
 }
 /* --- attach(). --- */
 static void client_project(void *ctx, qa_actor_id actor) {
@@ -1762,8 +1924,9 @@ static bool actors_client_frame(void *ctx, double slot) { provider_t *s = ctx; r
 static void actors_synchronize_frame(void *ctx, double seconds, double frame) { const qa_compat_q2_native_mod_host *host = host_of(ctx); host->synchronize_frame(host->ctx, seconds, frame); }
 static void actors_begin_frame(void *ctx) {
   provider_t *s = ctx; const qa_compat_q2_native_mod_host *host = host_of(s); size_t count = 0; qa_compat_q2_native_mod_actor_slot *rows = entries_of(s, &count);
+  qa_cleanup rows_owned; qa_cleanup_push(&rows_owned, free, rows);
   for (size_t i = 0; i < count; i++) host->clear_entity_event(host->ctx, rows[i].slot);
-  free(rows); host->presentation.begin_frame(host->presentation.ctx);
+  qa_cleanup_pop(&rows_owned); free(rows); host->presentation.begin_frame(host->presentation.ctx);
 }
 static void actors_end_frame(void *ctx) { provider_t *s = ctx; if (s->has_clients) qa_compat_q2_native_mod_clients_end_frame(&s->clients); if (!s->closed) publish(s, true); }
 static bool combat_eligible(void *ctx, qa_actor_id actor) { return !clients_rejects(ctx, actor); }
@@ -1774,7 +1937,7 @@ static void combat_synchronize(void *ctx) {
   if (s->frame_count != 0) frame_observe(s, s->frames[s->frame_count - 1]);
 }
 /* Items operations. */
-static qa_guest_address items_pointer(void *ctx, qa_actor_id actor, const char *record) { qa_guest_address address; if (!pointer_for(ctx, &actor, record, &address)) qa_range_error("Native source item lost its record"); return address; }
+static qa_guest_address items_pointer(void *ctx, qa_actor_id actor, const char *record) { qa_guest_address address; if (!pointer_for(ctx, &actor, record, &address)) qa_raise("Error", 0, 0, "Native source item lost its record"); return address; }
 static qa_guest_address items_resolve(void *ctx, qa_native_mod_address address) { return resolve(ctx, address, false); }
 static bool items_live(void *ctx, qa_actor_id actor) { provider_t *s = ctx; return !s->closed && !s->closing && !s->restoring && clients_admitted(s, actor) && is_live(s, actor); }
 static double items_read(void *ctx, qa_guest_address address, qa_native_mod_scalar encoding) { return scalar_read(ctx, address, encoding); }
@@ -1782,12 +1945,12 @@ static void items_write(void *ctx, qa_guest_address address, qa_native_mod_scala
 static void items_invoke(void *ctx, qa_actor_id actor, const call_t *call) { provider_t *s = ctx; input_buffer buffer; double result; (void)execute(s, call, build_inputs(s, &actor, &buffer), true, NULL, NULL, &result); }
 static const qa_source_weapon_presentation_model *items_model(void *ctx, qa_actor_id actor) {
   provider_t *s = ctx; double slot; const qa_compat_q2_native_mod_host *host = host_of(s);
-  if (!s->has_clients || !qa_compat_q2_native_mod_clients_slot(&s->clients, actor, &slot)) qa_range_error("Native viewmodel lost its client");
+  if (!s->has_clients || !qa_compat_q2_native_mod_clients_slot(&s->clients, actor, &slot)) qa_raise("Error", 0, 0, "Native viewmodel lost its client");
   return host->weapon_model(host->ctx, slot + 1);
 }
 static const qa_original_pickup_execution *items_pickup(void *ctx) { provider_t *s = ctx; return s->pickup_scope_count == 0 ? NULL : s->pickup_scopes[s->pickup_scope_count - 1]->execution; }
 void qa_compat_q2_native_mod_provider_attach(provider_t *s, const qa_compat_q2_native_mod_host *host) {
-  if (s->host_ != NULL) qa_range_error("Native mod already attached");
+  if (s->host_ != NULL) qa_raise("Error", 0, 0, "Native mod already attached");
   s->host_ = host; const declaration_t *d = s->declaration;
   qa_compat_q2_native_mod_stage_runner_init(&s->stages, host); s->has_stages = true;
   for (size_t i = 0; i < d->protection_count; i++) if (!strcmp(d->protection[i].absorb_abi, "source-region")) { qa_compat_q2_native_mod_invocations_init(&s->invocations, host); s->has_invocations = true; break; }
@@ -1801,7 +1964,7 @@ void qa_compat_q2_native_mod_provider_attach(provider_t *s, const qa_compat_q2_n
     s->items = qa_compat_q2_native_mod_items_create(d->items, d->target.abi, item_host, s->services, s->instance, host->content, operations);
   }
   if (d->clients != NULL) {
-    if (s->services->clients == NULL) qa_range_error("Native component clients require destination client services");
+    if (s->services->clients == NULL) qa_raise("Error", 0, 0, "Native component clients require destination client services");
     qa_compat_q2_native_mod_client_operations operations; memset(&operations, 0, sizeof operations);
     operations.services = s->services->clients; operations.declaration = d->clients; operations.content = host->content; operations.ctx = s;
     operations.project = client_project; operations.admitted = client_admitted; operations.release = client_release; operations.invoke = client_invoke; operations.open_input = open_input;
@@ -1828,9 +1991,11 @@ bool qa_compat_q2_native_mod_provider_client_presentation(provider_t *s, qa_mod_
 typedef struct command_call { provider_t *s; qa_command_invocation *command; bool result; } command_call;
 static void command_invoke(void *value) { command_call *c = value; const qa_compat_q2_native_mod_host *host = host_of(c->s); c->result = host->invoke_command(host->ctx, c->command); }
 static void command_transfer(void *value) {
-  command_call *c = value; provider_t *s = c->s; size_t count = 0; appearance_row *rows = capture_appearances(s, &count);
-  if (source_execution(s, NULL, command_invoke, c) == QA_Q2INV_RETIRED) { c->result = true; free_appearances(rows, count); return; }
-  compare_appearances(s, rows, count); free_appearances(rows, count);
+  command_call *c = value; provider_t *s = c->s; appearance_list list = {NULL, 0}; list.rows = capture_appearances(s, &list.count);
+  qa_cleanup list_owned; qa_cleanup_push(&list_owned, appearance_list_release, &list);
+  bool retired = source_execution(s, NULL, command_invoke, c) == QA_Q2INV_RETIRED;
+  if (retired) c->result = true; else compare_appearances(s, list.rows, list.count);
+  qa_cleanup_pop(&list_owned); free_appearances(list.rows, list.count);
 }
 bool qa_compat_q2_native_mod_provider_invoke_command(provider_t *s, qa_command_invocation *command) {
   char *fold = qa_ascii_fold(command->argc > 0 ? command->argv[0] : ""); if (fold == NULL) qa_range_error("Out of memory");
@@ -1851,6 +2016,23 @@ void qa_compat_q2_native_mod_provider_advance(provider_t *s, qa_frame_context fr
 typedef struct import_call { provider_t *s; const qa_guest_call_value *values; size_t count; void *ctx; qa_compat_q2_native_import_fn invoke; qa_guest_call_result result; } import_call;
 static void import_body(void *value) { import_call *c = value; c->result = c->invoke(c->ctx, c->values, c->count); }
 static void import_cleanup(void *value) { import_call *c = value; refresh(c->s); if (c->s->frame_count != 0) frame_observe(c->s, c->s->frames[c->s->frame_count - 1]); }
+/* TS projectedActorAt: the address-to-actor lookup for linkentity and setmodel, rebuilt only after the projected
+ * set changes. Map.set: two actors at one address leave the later one. */
+static bool projected_actor_at(provider_t *s, int64_t offset, qa_actor_id *out) {
+  if (!s->has_projection_index || s->projection_index_version != s->projection_version) {
+    s->has_projection_index = false; s->projection_index_count = 0;
+    for (size_t i = 0; i < s->projection_count; i++) {
+      qa_actor_id actor = s->projections[i].actor; int64_t address = qa_compat_q2_native_mod_provider_address(s, actor).byte_offset;
+      projection_index_row *row = NULL;
+      for (size_t k = 0; k < s->projection_index_count && row == NULL; k++) if (s->projection_index[k].offset == address) row = &s->projection_index[k];
+      if (row == NULL) row = qa_compat_q2_grow((void **)&s->projection_index, &s->projection_index_count, &s->projection_index_capacity, sizeof *row);
+      row->offset = address; row->actor = actor;
+    }
+    s->projection_index_version = s->projection_version; s->has_projection_index = true;
+  }
+  for (size_t k = 0; k < s->projection_index_count; k++) if (s->projection_index[k].offset == offset) { *out = s->projection_index[k].actor; return true; }
+  return false;
+}
 static qa_guest_call_result import_current(provider_t *s, const char *name, const qa_guest_call_value *values, size_t count, void *invoke_ctx, qa_compat_q2_native_import_fn invoke) {
   if (!s->ready) return invoke(invoke_ctx, values, count);
   bool entity_link = !strcmp(name, "linkentity") || !strcmp(name, "unlinkentity");
@@ -1868,21 +2050,21 @@ static qa_guest_call_result import_current(provider_t *s, const char *name, cons
     }
     return qa_compat_q2_call_void();
   }
+  /* Queries read no projected state: world geometry changes only at linkentity, and the next mutating import or
+   * frame end publishes pending guest stores. */
+  if (one_of(name, NAMES("trace", "pointcontents", "inPVS", "inPHS", "AreasConnected", "dprintf"))) return invoke(invoke_ctx, values, count);
   flush_frames(s, NULL);
   if (entity_link || !strcmp(name, "setmodel")) {
-    if (count == 0 || values[0].kind != QA_GUEST_VALUE_POINTER || !values[0].pointer_value.has_value) qa_range_error("Native entity import requires an actor");
+    if (count == 0 || values[0].kind != QA_GUEST_VALUE_POINTER || !values[0].pointer_value.has_value) qa_raise("Error", 0, 0, "Native entity import requires an actor");
     qa_guest_address value = values[0].pointer_value.value; const qa_compat_q2_native_mod_host *host = host_of(s);
-    int64_t world = host->entities(host->ctx).base.byte_offset; const qa_actor_id *actor = NULL; qa_actor_id actor_storage; bool owned = false;
-    for (size_t i = 0; i < s->projection_count && actor == NULL; i++) if (qa_compat_q2_native_mod_provider_address(s, s->projections[i].actor).byte_offset == value.byte_offset) { actor_storage = s->projections[i].actor; actor = &actor_storage; }
-    if (s->owned != NULL) {
-      size_t n = 0; qa_compat_q2_native_mod_actor_slot *rows = qa_compat_q2_native_mod_actors_entries(s->owned, &n);
-      for (size_t i = 0; i < n && !owned; i++) owned = host->entity(host->ctx, rows[i].slot).address.byte_offset == value.byte_offset;
-      free(rows);
-    }
-    if (value.byte_offset != world && actor == NULL && !owned) qa_range_error("Native source allocated an actor without a declared shared lifecycle");
+    qa_compat_q2_native_mod_entities table = host->entities(host->ctx); int64_t world = table.base.byte_offset;
+    qa_actor_id actor_storage; const qa_actor_id *actor = projected_actor_at(s, value.byte_offset, &actor_storage) ? &actor_storage : NULL;
+    /* difference >= 0n && difference % BigInt(stride) === 0n ? owned?.actorAt(row) : undefined */
+    double row; qa_owned_actor owned_actor; bool owned = qa_compat_q2_native_mod_table_index(table, value, &row) && s->owned != NULL && qa_compat_q2_native_mod_actors_actor_at(s->owned, row, &owned_actor);
+    if (value.byte_offset != world && actor == NULL && !owned) qa_raise("Error", 0, 0, "Native source allocated an actor without a declared shared lifecycle");
     if (actor != NULL && entity_link) {
       qa_owned_actor owner;
-      if (!qa_session_actor_registry_resolve_owned(s->services->actors, *actor, &owner)) qa_range_error("Native mod linked an expired actor");
+      if (!qa_session_actor_registry_resolve_owned(s->services->actors, *actor, &owner)) qa_raise("Error", 0, 0, "Native mod linked an expired actor");
       if (!strcmp(name, "linkentity")) qa_shared_body_table_link(s->services->bodies, owner, NULL); else qa_shared_body_table_unlink(s->services->bodies, owner);
       return qa_compat_q2_call_void();
     }
@@ -1899,23 +2081,30 @@ qa_guest_call_result qa_compat_q2_native_mod_provider_import_boundary(provider_t
   return result;
 }
 /* --- Lifecycle. --- */
-typedef struct record_range { int64_t address; double bytes; } record_range;
+typedef struct record_range { qa_guest_address address; double bytes; } record_range;
+typedef struct record_ranges { record_range *rows; size_t count, capacity; } record_ranges;
+static void record_ranges_release(void *value) { record_ranges *r = value; free(r->rows); r->rows = NULL; }
 static void validate_records(provider_t *s) {
   const declaration_t *d = s->declaration; qa_compat_q2_memory *memory = memory_of(s);
-  record_range *ranges = NULL; size_t count = 0, capacity = 0;
+  record_ranges ranges = {NULL, 0, 0}; qa_cleanup owned; qa_cleanup_push(&owned, record_ranges_release, &ranges);
+  /* TS builds every range first, then checks each, then compares them. */
   for (size_t r = 0; r < d->actor_record_count; r++) {
     const record_t *record = &d->actor_records[r];
     if (!strcmp(record->base.kind, "clients")) for (double slot = 0; slot < record->capacity; slot++) {
-      qa_guest_address address = record_address(s, record, slot); memory->check(memory->ctx, address, record->stride, "write");
-      record_range *range = qa_compat_q2_grow((void **)&ranges, &count, &capacity, sizeof *range); range->address = address.byte_offset; range->bytes = record->stride;
+      qa_guest_address address = record_address(s, record, slot);
+      record_range *range = qa_compat_q2_grow((void **)&ranges.rows, &ranges.count, &ranges.capacity, sizeof *range); range->address = address; range->bytes = record->stride;
     } else {
-      qa_guest_address address = record_base(s, record); memory->check(memory->ctx, address, record->stride * record->capacity, "write");
-      record_range *range = qa_compat_q2_grow((void **)&ranges, &count, &capacity, sizeof *range); range->address = address.byte_offset; range->bytes = record->stride * record->capacity;
+      qa_guest_address address = record_base(s, record);
+      record_range *range = qa_compat_q2_grow((void **)&ranges.rows, &ranges.count, &ranges.capacity, sizeof *range); range->address = address; range->bytes = record->stride * record->capacity;
     }
   }
-  for (size_t i = 0; i < count; i++) for (size_t j = 0; j < i; j++)
-    if ((double)ranges[i].address < (double)ranges[j].address + ranges[j].bytes && (double)ranges[j].address < (double)ranges[i].address + ranges[i].bytes) qa_range_error("Overlapping native actor arrays");
-  free(ranges);
+  for (size_t i = 0; i < ranges.count; i++) memory->check(memory->ctx, ranges.rows[i].address, ranges.rows[i].bytes, "write");
+  for (size_t i = 0; i < ranges.count; i++) for (size_t j = 0; j < i; j++) {
+    /* BigInt arithmetic in TS: the byte counts are safe integers, so the sums are exact in long double too. */
+    long double a = (long double)ranges.rows[i].address.byte_offset, b = (long double)ranges.rows[j].address.byte_offset;
+    if (a < b + (long double)ranges.rows[j].bytes && b < a + (long double)ranges.rows[i].bytes) qa_raise("Error", 0, 0, "Overlapping native actor arrays");
+  }
+  qa_cleanup_pop(&owned); free(ranges.rows);
 }
 static void check_call_entry(provider_t *s, const call_t *call) { qa_compat_q2_memory *memory = memory_of(s); memory->check(memory->ctx, call_target(s, call), 1, "execute"); }
 void qa_compat_q2_native_mod_provider_initialize(provider_t *s, bool restoring) {
@@ -1991,11 +2180,12 @@ static qa_save_value *items_value(const qa_compat_q2_native_item_checkpoint *ite
 qa_provider_checkpoint qa_compat_q2_native_mod_provider_checkpoint(provider_t *s) {
   qa_compat_q2_native_mod_pickups_assert_idle(s->pickups);
   current(s);
-  if (s->frame_count != 0 || s->input_scope_count != 0) qa_range_error("Cannot save an active native mod callback");
+  if (s->frame_count != 0 || s->input_scope_count != 0) qa_raise("Error", 0, 0, "Cannot save an active native mod callback");
   release_pending(s); flush_frames(s, NULL); refresh(s);
   size_t client_count = 0; qa_compat_q2_native_mod_client_slot *clients = s->has_clients ? qa_compat_q2_native_mod_clients_checkpoint(&s->clients, &client_count) : NULL;
+  qa_cleanup clients_owned; qa_cleanup_push(&clients_owned, free, clients);
   const qa_compat_q2_native_mod_host *host = host_of(s); qa_compat_q2_native_mod_source_save source = host->checkpoint(host->ctx); current(s);
-  if (s->pending_release_count != 0) qa_range_error("Actors changed during native mod capture");
+  if (s->pending_release_count != 0) qa_raise("Error", 0, 0, "Actors changed during native mod capture");
   qa_save_value *root = new_object(), *module = new_object();
   const qa_module_identity *identity = &host->memory->module;
   set_v(module, "id", qa_save_value_string(identity->id)); set_v(module, "artifactPath", qa_save_value_string(identity->artifact_path)); set_v(module, "digest", qa_save_value_string(identity->digest)); set_v(module, "revision", qa_save_value_string(identity->revision));
@@ -2013,7 +2203,7 @@ qa_provider_checkpoint qa_compat_q2_native_mod_provider_checkpoint(provider_t *s
   set_v(root, "presentation", host->presentation.checkpoint(host->presentation.ctx));
   qa_save_value *client_list = new_array();
   for (size_t i = 0; i < client_count; i++) { qa_save_value *row = new_object(); set_v(row, "actor", saved_id_value(qa_saved_actor_id_of(clients[i].actor))); set_v(row, "slot", qa_save_value_number(clients[i].slot)); set_v(row, "admitted", qa_save_value_boolean(clients[i].admitted)); push_v(client_list, row); }
-  set_v(root, "clients", client_list); free(clients);
+  set_v(root, "clients", client_list); qa_cleanup_pop(&clients_owned); free(clients);
   qa_save_value *actor_list = new_array();
   for (size_t i = 0; i < s->projection_count; i++) { qa_save_value *row = new_object(); set_v(row, "actor", saved_id_value(qa_saved_actor_id_of(s->projections[i].actor))); set_v(row, "slot", qa_save_value_number(s->projections[i].slot)); set_v(row, "appearance", qa_save_value_boolean(actor_list_has(s->appearance_actors, s->appearance_count, s->projections[i].actor))); push_v(actor_list, row); }
   set_v(root, "actors", actor_list);
@@ -2026,89 +2216,132 @@ qa_provider_checkpoint qa_compat_q2_native_mod_provider_checkpoint(provider_t *s
 static qa_actor_id reference_saved(const provider_t *s, qa_saved_actor_id actor) {
   return s->services->reference_saved != NULL ? s->services->reference_saved(s->services->ctx, actor) : qa_session_actor_registry_reference_saved(s->services->actors, actor, "current");
 }
-void qa_compat_q2_native_mod_provider_restore(provider_t *s, const qa_provider_checkpoint *record) {
-  qa_compat_q2_native_mod_pickups_assert_idle(s->pickups);
-  current(s);
-  if (s->frame_count != 0 || s->input_scope_count != 0) qa_range_error("Cannot restore an active native callback");
+typedef struct restore_call {
+  provider_t *s; saved_mod saved; qa_saved_actor_id *fog; qa_actor_id *actors; qa_compat_q2_native_mod_client_slot *clients;
+  qa_compat_q2_native_owned_saved *owned_actors; size_t owned_count;
+} restore_call;
+/* What the restore read and resolved is released however it ends. */
+static void restore_release(void *value) {
+  restore_call *c = value; free(c->fog); free(c->actors); free(c->clients); free(c->owned_actors); saved_mod_free(&c->saved);
+  memset(&c->saved, 0, sizeof c->saved); c->fog = NULL; c->actors = NULL; c->clients = NULL; c->owned_actors = NULL;
+}
+static void clear_restore_links(provider_t *s) { for (size_t i = 0; i < s->restore_link_count; i++) free(s->restore_links[i].values); s->restore_link_count = 0; }
+/* The TS try block of restore(). */
+static void restore_source_body(void *value) {
+  restore_call *c = value; provider_t *s = c->s; const saved_mod *saved = &c->saved;
   const qa_compat_q2_native_mod_host *host = host_of(s); const qa_compat_q2_native_mod_presentation *presentation = &host->presentation;
-  saved_mod saved = read_checkpoint(record, host->memory->module, s->declaration);
-  if (!eq(saved.map, s->map)) qa_range_error("Native mod source save belongs to another map");
-  reader_t presentation_reader; if (!qa_save_reader_init(&presentation_reader, saved.presentation, "presentation")) qa_range_error("Out of memory");
-  qa_app_sim_native_mod_presentation_checkpoint saved_presentation; qa_app_sim_read_native_mod_presentation(&presentation_reader, &saved_presentation);
-  qa_save_reader_destroy(&presentation_reader);
-  size_t fog_count = saved_presentation.fog_count; qa_saved_actor_id *fog = calloc(fog_count + 1, sizeof *fog); if (fog == NULL) qa_range_error("Out of memory");
-  for (size_t i = 0; i < fog_count; i++) fog[i] = saved_presentation.fog[i].actor;
-  qa_app_sim_native_mod_presentation_checkpoint_free(&saved_presentation);
-  qa_actor_id *actors = calloc(saved.actor_count + 1, sizeof *actors); if (actors == NULL) qa_range_error("Out of memory");
-  for (size_t i = 0; i < saved.actor_count; i++) { actors[i] = reference_saved(s, saved.actors[i].actor); if (!is_live(s, actors[i])) qa_range_error("Saved native projection actor is unavailable"); }
-  qa_compat_q2_native_mod_client_slot *clients = calloc(saved.client_count + 1, sizeof *clients); if (clients == NULL) qa_range_error("Out of memory");
-  for (size_t i = 0; i < saved.client_count; i++) { clients[i].actor = reference_saved(s, saved.clients[i].actor); clients[i].slot = saved.clients[i].slot; clients[i].admitted = saved.clients[i].admitted; }
-  if (s->has_clients) qa_compat_q2_native_mod_clients_validate_restore(&s->clients, clients, saved.client_count);
-  for (size_t i = 0; i < saved.actor_count; i++) {
-    bool client = false;
-    for (size_t c = 0; c < saved.client_count && !client; c++) client = qa_same_actor(clients[c].actor, actors[i]);
-    validate_inventory_capacity(s, actors[i], client);
-  }
-  for (size_t i = 0; i < fog_count; i++) if (!is_live(s, reference_saved(s, fog[i]))) qa_range_error("Saved native presentation player is unavailable");
-  free(fog);
-  size_t owned_count = 0; qa_compat_q2_native_owned_saved *owned_actors = saved.has_owned && s->owned != NULL ? qa_compat_q2_native_mod_actors_validate_saved(s->owned, &saved.owned, &owned_count) : NULL;
-  qa_source_mod_client_outputs_clear(s->client_outputs);
-  if (s->items != NULL) qa_compat_q2_native_mod_items_clear(s->items);
-  qa_compat_q2_native_mod_pickups_close(s->pickups);
-  if (s->protection != NULL) qa_compat_q2_native_mod_protection_prepare_restore(s->protection);
-  s->lifecycle = true; s->restoring = true; s->restore_link_count = 0;
-  if (s->owned != NULL) qa_compat_q2_native_mod_actors_suspend(s->owned, true);
-  if (s->has_clients) qa_compat_q2_native_mod_clients_restore(&s->clients, clients, saved.client_count);
+  if (s->has_clients) qa_compat_q2_native_mod_clients_restore(&s->clients, c->clients, saved->client_count);
   s->appearance_count = 0;
-  for (size_t i = 0; i < saved.actor_count; i++) if (saved.actors[i].appearance) appearance_add(s, actors[i]);
-  s->projection_count = 0;
-  for (size_t i = 0; i < saved.actor_count; i++) { projection_row *row = qa_compat_q2_grow((void **)&s->projections, &s->projection_count, &s->projection_capacity, sizeof *row); row->actor = actors[i]; row->slot = saved.actors[i].slot; }
+  for (size_t i = 0; i < saved->actor_count; i++) if (saved->actors[i].appearance) appearance_add(s, c->actors[i]);
+  clear_projections(s);
+  for (size_t i = 0; i < saved->actor_count; i++) set_projection(s, c->actors[i], saved->actors[i].slot);
   s->pending_release_count = 0;
-  host->restore(host->ctx, &saved.source);
+  host->restore(host->ctx, &saved->source);
   validate_records(s);
   if (s->protection != NULL) qa_compat_q2_native_mod_protection_validate_restored_inventory(s->protection);
   for (size_t i = 0; i < s->projection_count; i++) seed(s, s->projections[i].actor, s->projections[i].slot, false);
   refresh(s);
-  presentation->restore(presentation->ctx, saved.presentation);
-  if (saved.has_owned && s->owned != NULL) qa_compat_q2_native_mod_actors_restore(s->owned, &saved.owned, owned_actors, owned_count);
+  presentation->restore(presentation->ctx, saved->presentation);
+  if (saved->has_owned && s->owned != NULL) qa_compat_q2_native_mod_actors_restore(s->owned, &saved->owned, c->owned_actors, c->owned_count);
   for (size_t i = 0; i < s->restore_link_count; i++) {
     restore_link *link = &s->restore_links[i]; qa_owned_actor owned;
     if (s->owned == NULL || !qa_compat_q2_native_mod_actors_actor_at(s->owned, link->slot, &owned)) continue;
-    if (host->entity(host->ctx, link->slot).address.byte_offset != link->address.byte_offset) qa_range_error("Native restore retained a stale source link");
+    if (host->entity(host->ctx, link->slot).address.byte_offset != link->address.byte_offset) qa_raise("Error", 0, 0, "Native restore retained a stale source link");
     (void)link->invoke(link->ctx, link->values, link->count);
   }
   publish(s, false);
-  s->lifecycle = false; s->restoring = false;
-  for (size_t i = 0; i < s->restore_link_count; i++) free(s->restore_links[i].values);
-  s->restore_link_count = 0;
+}
+/* TS finally { lifecycle = false; restoring = false; restoreLinks.clear(); owned?.suspend(false); }: a source
+ * save the guest refuses must not leave the provider restoring for good. */
+static void restore_source_cleanup(void *value) {
+  restore_call *c = value; provider_t *s = c->s;
+  s->lifecycle = false; s->restoring = false; clear_restore_links(s);
   if (s->owned != NULL) qa_compat_q2_native_mod_actors_suspend(s->owned, false);
-  qa_mod_source_objectives_restored(s->objectives);
-  for (size_t i = 0; i < saved.client_count; i++) if (clients[i].admitted) { qa_source_mod_client_outputs_publish(s->client_outputs, clients[i].actor); if (s->items != NULL) qa_compat_q2_native_mod_items_admit(s->items, clients[i].actor); }
-  if (s->items != NULL && saved.has_items) qa_compat_q2_native_mod_items_restore(s->items, &saved.items);
-  if (s->has_clients) qa_compat_q2_native_mod_clients_start(&s->clients);
-  free(actors); free(clients); free(owned_actors); saved_mod_free(&saved);
 }
-void qa_compat_q2_native_mod_provider_close(provider_t *s) {
-  qa_mod_source_objectives_close(s->objectives);
-  if (s->match_bound) { s->release_match.invoke(s->release_match.ctx); s->match_bound = false; }
-  if (s->closed || s->closing) return;
-  s->closing = true;
-  qa_source_mod_client_outputs_close(s->client_outputs);
-  if (s->items != NULL) qa_compat_q2_native_mod_items_close(s->items);
+void qa_compat_q2_native_mod_provider_restore(provider_t *s, const qa_provider_checkpoint *record) {
+  qa_compat_q2_native_mod_pickups_assert_idle(s->pickups);
+  current(s);
+  if (s->frame_count != 0 || s->input_scope_count != 0) qa_raise("Error", 0, 0, "Cannot restore an active native callback");
+  const qa_compat_q2_native_mod_host *host = host_of(s);
+  restore_call c; memset(&c, 0, sizeof c); c.s = s;
+  qa_cleanup owned; qa_cleanup_push(&owned, restore_release, &c);
+  c.saved = read_checkpoint(record, host->memory->module, s->declaration);
+  const saved_mod *saved = &c.saved;
+  if (!eq(saved->map, s->map)) qa_raise("Error", 0, 0, "Native mod source save belongs to another map");
+  reader_t presentation_reader; if (!qa_save_reader_init(&presentation_reader, saved->presentation, "presentation")) qa_range_error("Out of memory");
+  qa_app_sim_native_mod_presentation_checkpoint saved_presentation; qa_app_sim_read_native_mod_presentation(&presentation_reader, &saved_presentation);
+  qa_save_reader_destroy(&presentation_reader);
+  size_t fog_count = saved_presentation.fog_count; c.fog = calloc(fog_count + 1, sizeof *c.fog);
+  if (c.fog != NULL) for (size_t i = 0; i < fog_count; i++) c.fog[i] = saved_presentation.fog[i].actor;
+  qa_app_sim_native_mod_presentation_checkpoint_free(&saved_presentation);
+  if (c.fog == NULL) qa_range_error("Out of memory");
+  /* TS maps every saved actor to its reference first, then checks each. */
+  c.actors = calloc(saved->actor_count + 1, sizeof *c.actors); if (c.actors == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < saved->actor_count; i++) c.actors[i] = reference_saved(s, saved->actors[i].actor);
+  for (size_t i = 0; i < saved->actor_count; i++) if (!is_live(s, c.actors[i])) qa_raise("Error", 0, 0, "Saved native projection actor is unavailable");
+  c.clients = calloc(saved->client_count + 1, sizeof *c.clients); if (c.clients == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < saved->client_count; i++) { c.clients[i].actor = reference_saved(s, saved->clients[i].actor); c.clients[i].slot = saved->clients[i].slot; c.clients[i].admitted = saved->clients[i].admitted; }
+  if (s->has_clients) qa_compat_q2_native_mod_clients_validate_restore(&s->clients, c.clients, saved->client_count);
+  for (size_t i = 0; i < saved->actor_count; i++) {
+    bool client = false;
+    for (size_t k = 0; k < saved->client_count && !client; k++) client = qa_same_actor(c.clients[k].actor, c.actors[i]);
+    validate_inventory_capacity(s, c.actors[i], client);
+  }
+  for (size_t i = 0; i < fog_count; i++) if (!is_live(s, reference_saved(s, c.fog[i]))) qa_raise("Error", 0, 0, "Saved native presentation player is unavailable");
+  if (saved->has_owned && s->owned != NULL) c.owned_actors = qa_compat_q2_native_mod_actors_validate_saved(s->owned, &saved->owned, &c.owned_count);
+  qa_source_mod_client_outputs_clear(s->client_outputs);
+  if (s->items != NULL) qa_compat_q2_native_mod_items_clear(s->items);
   qa_compat_q2_native_mod_pickups_close(s->pickups);
-  if (s->protection != NULL) qa_compat_q2_native_mod_protection_close(s->protection);
-  if (s->has_clients) qa_compat_q2_native_mod_clients_close(&s->clients);
-  if (s->owned != NULL) qa_compat_q2_native_mod_actors_close(s->owned);
-  s->closed = true;
-  if (s->subscribed) { qa_session_actor_registry_off_release(s->services->actors, s->subscription); s->subscribed = false; }
-  s->projection_count = 0; s->appearance_count = 0; s->pending_release_count = 0;
-  if (s->host_ != NULL) s->host_->presentation.close(s->host_->presentation.ctx);
-  s->pending_host_close = true;
-  finish_host_close(s);
+  if (s->protection != NULL) qa_compat_q2_native_mod_protection_prepare_restore(s->protection);
+  s->lifecycle = true; s->restoring = true; clear_restore_links(s);
+  if (s->owned != NULL) qa_compat_q2_native_mod_actors_suspend(s->owned, true);
+  qa_compat_q2_native_mod_finally(restore_source_body, &c, restore_source_cleanup, &c);
+  qa_mod_source_objectives_restored(s->objectives);
+  for (size_t i = 0; i < saved->client_count; i++) if (c.clients[i].admitted) { qa_source_mod_client_outputs_publish(s->client_outputs, c.clients[i].actor); if (s->items != NULL) qa_compat_q2_native_mod_items_admit(s->items, c.clients[i].actor); }
+  if (s->items != NULL && saved->has_items) qa_compat_q2_native_mod_items_restore(s->items, &saved->items);
+  if (s->has_clients) qa_compat_q2_native_mod_clients_start(&s->clients);
+  qa_cleanup_pop(&owned); restore_release(&c);
 }
+/* TS close(): every step runs in its own try and the failures leave as one AggregateError. */
+static void close_objectives(void *value) { qa_mod_source_objectives_close(((provider_t *)value)->objectives); }
+static void close_match(void *value) { provider_t *s = value; s->release_match.invoke(s->release_match.ctx); }
+static void close_client_outputs(void *value) { qa_source_mod_client_outputs_close(((provider_t *)value)->client_outputs); }
+static void close_items(void *value) { qa_compat_q2_native_mod_items_close(((provider_t *)value)->items); }
+static void close_pickups(void *value) { qa_compat_q2_native_mod_pickups_close(((provider_t *)value)->pickups); }
+static void close_protection(void *value) { qa_compat_q2_native_mod_protection_close(((provider_t *)value)->protection); }
+static void close_clients(void *value) { qa_compat_q2_native_mod_clients_close(&((provider_t *)value)->clients); }
+static void close_owned(void *value) { qa_compat_q2_native_mod_actors_close(((provider_t *)value)->owned); }
+static void close_presentation(void *value) { provider_t *s = value; s->host_->presentation.close(s->host_->presentation.ctx); }
+static void close_host(void *value) { finish_host_close(value); }
+void qa_compat_q2_native_mod_provider_close(provider_t *s) {
+  size_t errors = 0; qa_caught_error caught;
+  if (!qa_try(close_objectives, s, &caught)) errors++;
+  if (s->match_bound && !qa_try(close_match, s, &caught)) errors++;
+  s->match_bound = false;
+  if (s->closed || s->closing) {
+    if (errors != 0) qa_raise("AggregateError", 0, 0, "Native mod cleanup failed");
+    return;
+  }
+  s->closing = true;
+  if (!qa_try(close_client_outputs, s, &caught)) errors++;
+  if (s->items != NULL && !qa_try(close_items, s, &caught)) errors++;
+  if (!qa_try(close_pickups, s, &caught)) errors++;
+  if (s->protection != NULL && !qa_try(close_protection, s, &caught)) errors++;
+  if (s->has_clients && !qa_try(close_clients, s, &caught)) errors++;
+  if (s->owned != NULL && !qa_try(close_owned, s, &caught)) errors++;
+  s->closed = true;
+  if (s->subscribed) { s->subscribed = false; qa_session_actor_registry_off_release(s->services->actors, s->subscription); }
+  clear_projections(s); s->appearance_count = 0; s->pending_release_count = 0;
+  if (s->host_ != NULL && !qa_try(close_presentation, s, &caught)) errors++;
+  s->pending_host_close = true;
+  if (!qa_try(close_host, s, &caught)) errors++;
+  if (errors != 0) qa_raise("AggregateError", 0, 0, "Native mod cleanup failed");
+}
+static void destroy_close_body(void *value) { qa_compat_q2_native_mod_provider_close(value); }
 void qa_compat_q2_native_mod_provider_destroy(provider_t *s) {
   if (s == NULL) return;
-  qa_compat_q2_native_mod_provider_close(s);
+  /* C only: the owner has run TS close() and read its error; a failure here has no reader. */
+  qa_caught_error caught; (void)qa_try(destroy_close_body, s, &caught);
   if (s->owned != NULL) qa_compat_q2_native_mod_actors_destroy(s->owned);
   if (s->items != NULL) qa_compat_q2_native_mod_items_destroy(s->items);
   if (s->protection != NULL) qa_compat_q2_native_mod_protection_destroy(s->protection);
@@ -2118,5 +2351,5 @@ void qa_compat_q2_native_mod_provider_destroy(provider_t *s) {
   qa_source_mod_client_outputs_destroy(s->client_outputs); qa_mod_source_objectives_destroy(s->objectives);
   while (s->matches != NULL) { match_binding *next = s->matches->next; free(s->matches); s->matches = next; }
   while (s->frame_count > 0) pop_frame(s);
-  free(s->projections); free(s->frames); free(s->pickup_scopes); free(s->input_scopes); free(s->appearance_actors); free(s->pending_releases); free(s->region_authorities); free(s->restore_links); free(s->scratch); free(s);
+  free(s->projections); free(s->frames); free(s->pickup_scopes); free(s->input_scopes); free(s->appearance_actors); free(s->pending_releases); free(s->region_authorities); clear_restore_links(s); free(s->restore_links); free(s->scratch); free(s->override_scratch); free(s->projection_index); free(s);
 }

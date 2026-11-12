@@ -1,9 +1,13 @@
 /* Port of src/app/bootstrap/startup-config.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/startup_config.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include "qa/content/mounts/paths.h"
+#include "qa/foundation/caught_message.h"
+#include "qa/platform/files/contained.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 typedef struct script { const char *name; const char *scope; } script;
@@ -14,7 +18,9 @@ struct qa_app_startup_config {
   size_t index;
   bool has_active; script active;
   bool completed;
-  const char *failure;
+  /* TS failure: { error }: the first error executeFrame saw, thrown again by every later call. */
+  bool failed;
+  const char *failure_name; int failure_code; long long failure_detail; char *failure_message;
   bool dedicated_qw;
   bool defaults_applied, archive_applied;
 };
@@ -65,7 +71,11 @@ qa_app_startup_config *qa_app_startup_config_create(const qa_app_startup_config_
   c->caller_depth = script_depth(&options->context.origin);
   return c;
 }
-void qa_app_startup_config_destroy(qa_app_startup_config *c) { free(c); }
+void qa_app_startup_config_destroy(qa_app_startup_config *c) {
+  if (c == NULL) return;
+  free(c->failure_message);
+  free(c);
+}
 bool qa_app_startup_config_owns_source(const qa_app_startup_config *c, qa_command_context source) {
   if (!c->has_active || source.session.token != c->options.context.session.token) return false;
   const qa_command_origin *root = &source.origin;
@@ -110,7 +120,10 @@ void qa_app_startup_config_on_script_complete(qa_app_startup_config *c, const qa
   bool q1_child = strcmp(c->active.name, "quake.rc") == 0 && depth == c->caller_depth + 2
       && origin->kind == QA_COMMAND_ORIGIN_SCRIPT && origin->caller->kind == QA_COMMAND_ORIGIN_SCRIPT
       && strcmp(origin->caller->name, "quake.rc") == 0;
-  if (event->result == QA_SCRIPT_FAILED) qa_range_error("%s", event->error_message ? event->error_message : "Script failed");
+  /* TS `throw event.result.error`: the failed read carries the error's class and message (core/commands). */
+  if (event->result == QA_SCRIPT_FAILED)
+    qa_raise(event->error_name != NULL ? event->error_name : "Error", 0, 0, "%s",
+        event->error_message != NULL ? event->error_message : "");
   if (!direct && !q1_child) return;
   if (strcmp(event->name, "default.cfg") == 0 && !c->defaults_applied) {
     c->defaults_applied = true; c->options.apply_selected_defaults(c->options.apply_ctx);
@@ -125,12 +138,19 @@ void qa_app_startup_config_on_script_complete(qa_app_startup_config *c, const qa
   }
   if (direct) c->has_active = false;
 }
-bool qa_app_startup_config_execute_frame(qa_app_startup_config *c, qa_command_buffer *commands,
-                                         qa_app_startup_config_append append,
-                                         qa_after_dispatch_fn after_dispatch, void *after_ctx,
-                                         qa_should_continue_fn should_continue, void *continue_ctx) {
-  if (c->failure != NULL) qa_range_error("%s", c->failure);
-  if (c->completed) return true;
+typedef struct advance_call {
+  qa_app_startup_config *c;
+  qa_command_buffer *commands;
+  qa_app_startup_config_append append;
+  qa_after_dispatch_fn after_dispatch; void *after_ctx;
+  qa_should_continue_fn should_continue; void *continue_ctx;
+  bool result;
+} advance_call;
+/* TS advanceFrame. */
+static void advance_frame(void *ctx) {
+  advance_call *call = ctx;
+  qa_app_startup_config *c = call->c;
+  if (c->completed) { call->result = true; return; }
   if (c->dedicated_qw && !c->archive_applied) {
     c->defaults_applied = true; c->options.apply_selected_defaults(c->options.apply_ctx);
     c->archive_applied = true; c->options.apply_archive(c->options.apply_ctx);
@@ -138,13 +158,12 @@ bool qa_app_startup_config_execute_frame(qa_app_startup_config *c, qa_command_bu
   for (;;) {
     if (!c->has_active) {
       if (c->index >= c->script_count) {
-        if (!c->defaults_applied || !c->archive_applied) {
-          c->failure = "Startup script did not reach default and archived configuration stages";
-          qa_range_error("%s", c->failure);
-        }
+        if (!c->defaults_applied || !c->archive_applied)
+          qa_raise("Error", 0, 0, "Startup script did not reach default and archived configuration stages");
         c->completed = true;
         c->options.apply_launch_options(c->options.apply_ctx);
-        return true;
+        call->result = true;
+        return;
       }
       script s = c->scripts[c->index++];
       if (c->options.dialect == QA_COMMAND_DIALECT_Q3 && c->options.safe_mode && strcmp(s.name, "q3config.cfg") == 0) {
@@ -152,27 +171,79 @@ bool qa_app_startup_config_execute_frame(qa_app_startup_config *c, qa_command_bu
         continue;
       }
       c->active = s; c->has_active = true;
-      char text[512];
+      char text[32]; /* `exec ${script.name}\n` over the fixed script names */
       snprintf(text, sizeof text, "exec %s\n", s.name);
-      if (append.fn != NULL) append.fn(append.ctx, commands, text, &c->options.context);
-      else qa_command_buffer_append(commands, text, &c->options.context, -1);
+      if (call->append.fn != NULL) call->append.fn(call->append.ctx, call->commands, text, &c->options.context);
+      else qa_command_buffer_append(call->commands, text, &c->options.context, -1);
     }
-    qa_command_buffer_execute_scripts_async(commands, after_dispatch, after_ctx, should_continue, continue_ctx);
-    if (c->has_active || (should_continue != NULL && !should_continue(continue_ctx))) return false;
+    qa_command_buffer_execute_scripts_async(call->commands, call->after_dispatch, call->after_ctx, call->should_continue,
+                                            call->continue_ctx);
+    if (c->has_active || (call->should_continue != NULL && !call->should_continue(call->continue_ctx))) {
+      call->result = false;
+      return;
+    }
   }
 }
+bool qa_app_startup_config_execute_frame(qa_app_startup_config *c, qa_command_buffer *commands,
+                                         qa_app_startup_config_append append,
+                                         qa_after_dispatch_fn after_dispatch, void *after_ctx,
+                                         qa_should_continue_fn should_continue, void *continue_ctx) {
+  if (c->failed) qa_raise(c->failure_name, c->failure_code, c->failure_detail, "%s", c->failure_message);
+  advance_call call = {c, commands, append, after_dispatch, after_ctx, should_continue, continue_ctx, false};
+  qa_caught_error caught;
+  if (qa_try(advance_frame, &call, &caught)) return call.result;
+  const char *message = qa_caught_message(&caught);
+  size_t length = strlen(message);
+  char *kept = malloc(length + 1);
+  if (kept != NULL) {
+    memcpy(kept, message, length + 1);
+    c->failed = true;
+    c->failure_name = caught.name;
+    c->failure_code = caught.code;
+    c->failure_detail = caught.detail;
+    c->failure_message = kept;
+  }
+  qa_rethrow(&caught);
+}
+/* TS (await readFile(path)).toString("latin1"): the file's bytes, one per code unit (a NUL ends the C text). A read
+ * that fails raises the Node error, as readFile rejects. */
 static char *read_file_latin1(const char *path) {
   FILE *f = fopen(path, "rb");
-  if (!f) return NULL;
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  char *buf = malloc((size_t)size + 1);
+  if (!f) qa_node_fs_error(errno, "open", path);
+  struct stat status;
+  if (fstat(fileno(f), &status) != 0 || S_ISDIR(status.st_mode)) {
+    fclose(f);
+    qa_raise("Error", 0, 0, "EISDIR: illegal operation on a directory, read");
+  }
+  size_t capacity = 4096, length = 0;
+  char *buf = malloc(capacity);
   if (!buf) { fclose(f); qa_range_error("Out of memory"); }
-  size_t got = fread(buf, 1, (size_t)size, f);
+  for (;;) {
+    if (length + 1 >= capacity) {
+      char *grown = realloc(buf, capacity * 2);
+      if (grown == NULL) { free(buf); fclose(f); qa_range_error("Out of memory"); }
+      buf = grown;
+      capacity *= 2;
+    }
+    size_t got = fread(buf + length, 1, capacity - length - 1, f);
+    length += got;
+    if (got == 0) break;
+  }
+  bool failed = ferror(f) != 0;
   fclose(f);
-  buf[got] = '\0';
+  if (failed) { free(buf); qa_raise("Error", 0, 0, "EIO: i/o error, read"); }
+  buf[length] = '\0';
   return buf;
+}
+static void free_slot(void *raw) { free(*(char **)raw); }
+/* readFile(path).toString("latin1") of a path a lookup found; the path is freed either way. */
+static char *read_found(char *path) {
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &path);
+  char *text = read_file_latin1(path);
+  qa_cleanup_pop(&guard);
+  free(path);
+  return text;
 }
 static char *reader_read(void *ctx, const char *name, qa_command_context source, qa_app_startup_script_scope scope) {
   qa_app_startup_script_reader_options *options = ctx;
@@ -180,15 +251,20 @@ static char *reader_read(void *ctx, const char *name, qa_command_context source,
     const qa_command_origin *origin = &source.origin;
     while (origin->kind == QA_COMMAND_ORIGIN_SCRIPT) origin = origin->caller;
     if (origin->kind != QA_COMMAND_ORIGIN_LOCAL_SEAT || options->seat_root == NULL) return NULL;
-    char rel[1024];
     char *idx = qa_input_js_number((double)origin->seat.index);
-    snprintf(rel, sizeof rel, "settings/seat-%s/%s", idx ? idx : "0", name);
+    if (idx == NULL) qa_range_error("Out of memory");
+    size_t length = strlen(idx) + strlen(name) + 32;
+    char *rel = malloc(length);
+    if (rel == NULL) { free(idx); qa_range_error("Out of memory"); }
+    snprintf(rel, length, "settings/seat-%s/%s", idx, name);
     free(idx);
+    qa_cleanup rel_guard;
+    qa_cleanup_push(&rel_guard, free_slot, &rel);
     char *path = NULL;
-    if (!qa_find_content_path(options->seat_root, rel, QA_CONTENT_PATH_CASE_INSENSITIVE, &path)) return NULL;
-    char *r = read_file_latin1(path);
-    free(path);
-    return r;
+    bool found = qa_find_content_path(options->seat_root, rel, QA_CONTENT_PATH_CASE_INSENSITIVE, &path);
+    qa_cleanup_pop(&rel_guard);
+    free(rel);
+    return found ? read_found(path) : NULL;
   }
   if (strcmp(scope, "user") == 0) return options->user(options->ctx, name, source);
   if (strcmp(scope, "mounted") == 0) {
@@ -212,9 +288,7 @@ static char *reader_read(void *ctx, const char *name, qa_command_context source,
     for (size_t i = 0; i < count; i++) {
       char *path = NULL;
       if (!qa_find_content_path(roots[i], name, QA_CONTENT_PATH_CASE_INSENSITIVE, &path)) continue;
-      char *r = read_file_latin1(path);
-      free(path);
-      return r;
+      return read_found(path);
     }
   }
   return NULL;

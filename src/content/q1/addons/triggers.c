@@ -306,11 +306,22 @@ static void spawn_check_sacrifices(void *ctx, qa_q1_services *game, qa_q1_actor 
   entity->wait = 0;
   entity->touch = qa_q1_callback_registry_touch(game->named, entity, NAMED(context, "sacrifice_check"));
 }
+/* TS game.find(name): every entity with that targetname, as a snapshot array
+ * with no size limit. The caller frees it. */
+static qa_q1_actor **find_all(qa_q1_services *game, const char *name, size_t *count) {
+  size_t total = qa_q1_find(game, name, NULL, 0);
+  qa_q1_actor **found = malloc((total != 0 ? total : 1) * sizeof *found);
+  if (found == NULL) qa_range_error("out of memory");
+  *count = qa_q1_find(game, name, found, total);
+  return found;
+}
 static bool at_top(const qa_q1_actor *entity) { return same(entity->state, "top") || same(entity->state, "up"); }
 static void door_relay(void *ctx, qa_q1_services *game, qa_q1_actor *entity, const qa_actor_id *other, const qa_actor_id *activator) {
   (void)ctx; (void)other;
-  qa_q1_actor *found[256];
-  size_t count = qa_q1_find(game, entity->target, found, 256);
+  size_t count = 0;
+  qa_q1_actor **found = find_all(game, entity->target, &count);
+  qa_cleanup found_node; /* the callbacks below can raise */
+  qa_cleanup_push(&found_node, free, found);
   for (size_t i = 0; i < count; i++) {
     qa_q1_actor *target = found[i];
     bool top = at_top(target);
@@ -323,6 +334,8 @@ static void door_relay(void *ctx, qa_q1_services *game, qa_q1_actor *entity, con
       else qa_q1_call_use(game, target, qa_q1_callback_registry_use(game->named, target, "button_use"), NULL, activator);
     }
   }
+  qa_cleanup_pop(&found_node);
+  free(found);
 }
 static void door_group(void *ctx, qa_q1_services *game, qa_q1_actor *entity, const qa_actor_id *other, const qa_actor_id *activator) {
   (void)ctx; (void)other;
@@ -425,14 +438,18 @@ static void spawn_quad(void *ctx, qa_q1_services *game, qa_q1_actor *entity) {
 static void kill_monster(void *ctx, qa_q1_services *game, qa_q1_actor *entity, const qa_actor_id *other,
                          const qa_actor_id *activator) {
   (void)ctx; (void)other;
-  qa_q1_actor *found[256];
-  size_t count = qa_q1_find(game, entity->target, found, 256);
+  size_t count = 0;
+  qa_q1_actor **found = find_all(game, entity->target, &count);
+  qa_cleanup found_node; /* the callbacks below can raise */
+  qa_cleanup_push(&found_node, free, found);
   for (size_t i = 0; i < count; i++) {
     qa_q1_actor *target = found[i];
     if (target->monster == NULL || qa_q1_health(game, target->actor.id) <= 0) continue;
     (void)qa_q1_damage(game, target->actor.id, activator != NULL ? *activator : entity->actor.id, activator,
                        qa_q1_health(game, target->actor.id) * 2, NULL, NULL, NULL, NULL);
   }
+  qa_cleanup_pop(&found_node);
+  free(found);
 }
 static void init_kill_monster(qa_q1ad_context *context, qa_q1_actor *entity) {
   if (entity->target[0] == '\0' || entity->targetname[0] == '\0') qa_q1_remove(context->game, entity);

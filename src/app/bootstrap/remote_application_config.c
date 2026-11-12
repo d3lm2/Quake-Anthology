@@ -71,7 +71,21 @@ qa_config_store *qa_remote_product_settings(qa_remote_arena *arena, const qa_cat
 
 static void release_scripts(void *object) { qa_app_console_script_files_destroy(object); }
 static void release_prepared(void *object) { qa_app_prepared_startup_close(object); }
-void qa_remote_release_profile(void *object) { qa_app_prepared_profile_destroy(object); }
+/* A profile's configuration continuation may still be adopted by the prepared startup it was published to (the
+ * client's, which outlives a borrowed remote, or the remote's own, released after the profile): it is taken back
+ * before the profile is freed, as application_open.c does for the local case. */
+static void destroy_profile(qa_app_prepared_profile *profile) {
+  if (profile == NULL) return;
+  qa_app_prepared_startup *published = qa_app_prepared_profile_published(profile);
+  if (published != NULL) (void)qa_app_prepared_startup_retract_configuration_continuation(published, profile);
+  qa_app_prepared_profile_destroy(profile);
+}
+void qa_remote_release_profile(void *object) { destroy_profile(object); }
+void qa_remote_release_profile_slot(void *object) {
+  qa_app_prepared_profile **slot = object;
+  destroy_profile(*slot);
+  free(slot);
+}
 static void release_input(void *object) { qa_seat_input_destroy(object); }
 static void release_permission(void *object) { qa_app_client_download_permission_destroy(object); }
 static void release_socks(void *object) { qa_app_client_socks_settings_destroy(object); }
@@ -93,11 +107,13 @@ typedef struct profile_scripts_ctx {
   qa_content_mounted *mounts;
   const char **game_roots; char **owned_roots; size_t owned_count;
   char *console_root;
+  qa_app_configuration_layering layering;
 } profile_scripts_ctx;
 static void release_profile_scripts_ctx(void *object) {
   profile_scripts_ctx *ctx = object;
   for (size_t i = 0; i < ctx->owned_count; i++) free(ctx->owned_roots[i]);
   free(ctx->owned_roots); free(ctx->game_roots); free(ctx->console_root);
+  qa_app_configuration_layering_destroy(&ctx->layering);
   free(ctx);
 }
 static bool mounted_open(void *raw, const char *name, uint8_t **out_bytes, size_t *out_count) {
@@ -134,6 +150,11 @@ qa_app_console_script_files *qa_remote_profile_scripts(const qa_app_options *opt
   ctx->game_roots = xcalloc(capacity, sizeof *ctx->game_roots);
   ctx->owned_roots = xcalloc(capacity + 1, sizeof *ctx->owned_roots);
   ctx->owned_count = capacity + 1;
+  const char *components[QA_APP_SELECTION_COMPONENT_COUNT];
+  qa_app_selection_components(&selection, components);
+  ctx->layering = qa_app_configuration_layering_open(catalog, options, selection.engine_behavior.content, components,
+      QA_APP_SELECTION_COMPONENT_COUNT);
+  qa_app_configuration_layering_apply(&ctx->layering, &files);
   files.has_legacy_config = qa_app_legacy_configuration_options_for_catalog(catalog, options,
       selection.engine_behavior.content, &files.legacy_config, ctx->game_roots, capacity, ctx->owned_roots);
   files.console_root = ctx->console_root;
@@ -411,11 +432,17 @@ static void register_dialect_cvars(prepare_state *state, qa_cvar_registry *cvars
   if (dialect == QA_COMMAND_DIALECT_Q2_CLASSIC || dialect == QA_COMMAND_DIALECT_Q2_RERELEASE) {
     const int flags = QA_CVAR_FLAG_ARCHIVE | QA_CVAR_FLAG_USER_INFO;
     const char *model = options->character_model != NULL ? options->character_model : "";
-    char skin[256];
-    snprintf(skin, sizeof skin, "%s/%s", model,
-        strcmp(model, "female") == 0 ? "athena" : strcmp(model, "cyborg") == 0 ? "oni911" : "grunt");
+    /* `${characterModel}/${...}`: the model text is not length-capped */
+    const char *variant = strcmp(model, "female") == 0 ? "athena" : strcmp(model, "cyborg") == 0 ? "oni911" : "grunt";
+    size_t skin_length = strlen(model) + strlen(variant) + 2;
+    char *skin = xcalloc(skin_length, 1);
+    snprintf(skin, skin_length, "%s/%s", model, variant);
+    qa_cleanup skin_guard;
+    qa_cleanup_push(&skin_guard, free, skin);
     reg(cvars, "name", player, flags);
     reg(cvars, "skin", skin, flags);
+    qa_cleanup_pop(&skin_guard);
+    free(skin);
     reg(cvars, "rate", "15000", flags);
     reg(cvars, "msg", "1", flags);
     reg(cvars, "hand", "0", flags);
@@ -709,9 +736,12 @@ static void prepare_body(void *raw) {
   qa_app_profile_client_source *kept_client = xcalloc(1, sizeof *kept_client);
   qa_remote_arena_add(arena, release_memory, kept_client);
   *kept_client = client; *kept_args = args; kept_args->client_source = kept_client;
+  /* args.pending: a raise inside the preparation leaves the partial profile in the arena. */
+  qa_app_prepared_profile **profile_slot = xcalloc(1, sizeof *profile_slot);
+  qa_remote_arena_add(arena, qa_remote_release_profile_slot, profile_slot);
+  kept_args->pending = profile_slot;
   qa_app_prepared_profile *profile = qa_app_prepare_profile_configuration(profile_options, kept_args);
   if (profile == NULL) qa_range_error("Out of memory");
-  qa_remote_arena_add(arena, qa_remote_release_profile, profile);
   if (qa_remote_network_is(options, "unified-client") && current != NULL && qa_cvar_registry_dialect(current->source) != dialect) {
     for (size_t i = 0; i < selected_count; i++) {
       static const char *const names[] = { "name", "password" };
@@ -806,9 +836,11 @@ qa_remote_configuration *qa_remote_prepare_configuration(const qa_app_options *o
     if (state.has_images) {
       qa_caught_error cleanup;
       if (!qa_try(close_images, &state, &cleanup)) {
+        /* new AggregateError([error, cleanup], "Remote configuration preparation failed"): the message is the given text */
         primary.name = "AggregateError";
-        snprintf(primary.message, sizeof primary.message, "Remote configuration preparation failed: %.900s; %.900s",
-            caught.message, cleanup.message);
+        primary.code = 0;
+        primary.detail = 0;
+        snprintf(primary.message, sizeof primary.message, "Remote configuration preparation failed");
       }
     }
     /* outer catch: identities.discard(), seedScripts.close() */
@@ -817,7 +849,7 @@ qa_remote_configuration *qa_remote_prepare_configuration(const qa_app_options *o
     qa_caught_error seed_failure;
     if (!qa_try(close_seed, &state, &seed_failure) && !failed) { failure = seed_failure; failed = true; }
     if (failed)
-      qa_raise("AggregateError", 0, 0, "Remote configuration preparation cleanup failed: %s; %s", primary.message, failure.message);
+      qa_raise("AggregateError", 0, 0, "Remote configuration preparation cleanup failed");
     qa_rethrow(&primary);
   }
   /* finally { await seedScripts?.close(); } */

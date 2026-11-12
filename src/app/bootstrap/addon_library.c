@@ -16,6 +16,7 @@
 #include "qa/content/archive.h"
 #include "qa/content/catalog/addons.h"
 #include "qa/contracts/content.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/network/common/js_number.h"
 #include "qa/network/common/session.h"
@@ -410,7 +411,7 @@ static void run(qa_app_addon_library *library, operation_fn operation, void *ctx
   library->pending = true;
   operation_call call = {library, operation, ctx};
   qa_caught_error caught;
-  if (!qa_try(operation_body, &call, &caught) && !library->closed) set_message(library, caught.message);
+  if (!qa_try(operation_body, &call, &caught) && !library->closed) set_message(library, qa_caught_message(&caught));
   library->pending = false;
 }
 static void cancel_queue(qa_app_addon_library *library) {
@@ -599,6 +600,7 @@ static void install_cleanup(void *ctx) {
   state->cache = state->stage = state->directory = state->destination = NULL;
   state->packages = NULL;
 }
+static void download_result_cleanup(void *raw) { qa_http_download_result_destroy(raw); }
 static void cancelled_check(qa_app_addon_library *library) {
   if (library->closed || library->cancelled) qa_raise("Error", 0, 0, "Add-on installation cancelled");
 }
@@ -619,10 +621,10 @@ static void stage_package(install_state *state, const qa_addon_package *item, qa
     (void)qa_http_download_queue_result(state->queue, path, &result);
     const char *kind = result.kind ? result.kind : "failed";
     if (strcmp(kind, "failed") == 0 || strcmp(kind, "fallback") == 0) {
-      char reason[1024];
-      snprintf(reason, sizeof reason, "%s", result.reason ? result.reason : "Download failed");
-      qa_http_download_result_destroy(&result);
-      qa_raise("Error", 0, 0, "%s", reason);
+      /* The raise formats the whole message before it runs the cleanups. */
+      qa_cleanup guard;
+      qa_cleanup_push(&guard, download_result_cleanup, &result);
+      qa_raise("Error", 0, 0, "%s", result.reason ? result.reason : "Download failed");
     }
     bool cancelled = strcmp(kind, "cancelled") == 0;
     qa_http_download_result_destroy(&result);

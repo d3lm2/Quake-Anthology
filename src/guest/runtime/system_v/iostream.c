@@ -23,8 +23,8 @@ static bool name_ends_with(const char *name, const char *suffix) {
   size_t n = strlen(name), m = strlen(suffix);
   return n >= m && strcmp(name + n - m, suffix) == 0;
 }
-static void plain_error(const char *message) { qa_range_error("%s", message); }
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void plain_error(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
 static qa_guest_core_address slot(qa_system_v_iostreams *s, qa_guest_core_address a, int64_t o) {
   return qa_cxx_abi_slot(&s->abi, a, o);
 }
@@ -95,6 +95,7 @@ static qa_guest_core_address abi_function(qa_system_v_iostreams *streams, const 
                                      bool wide) {
   ios_state *state = xmalloc(sizeof *state);
   state->streams = streams; state->operation = operation; state->wide = wide;
+  qa_system_v_own(streams->host, state, free);
   qa_system_v_implementation impl = {state, ios_impl};
   return qa_cxx_abi_function(&streams->abi, name, parameters, parameter_count, result_is_void,
                              result, impl, NULL);
@@ -146,11 +147,11 @@ void qa_system_v_iostreams_init(qa_system_v_iostreams *streams, qa_system_v_serv
     (void)snprintf(clear_name, sizeof clear_name,
                    "_ZNSt9basic_iosI%cSt11char_traitsI%cEE5clearESt12_Ios_Iostate", c, c);
     qa_abi_storage clear_params[] = {ptr, i32};
-    (void)abi_function(streams, xstrdup(clear_name), clear_params, 2, true, i32, 2, wide);
+    (void)abi_function(streams, clear_name, clear_params, 2, true, i32, 2, wide);
     char flush_name[96];
     (void)snprintf(flush_name, sizeof flush_name, "_ZNS%s5flushEv",
                    wide ? "t13basic_ostreamIwSt11char_traitsIwEE" : "o");
-    (void)abi_function(streams, xstrdup(flush_name), &ptr, 1, false, ptr, 3, wide);
+    (void)abi_function(streams, flush_name, &ptr, 1, false, ptr, 3, wide);
   }
 }
 void qa_system_v_iostreams_destroy(qa_system_v_iostreams *streams) {
@@ -212,13 +213,13 @@ static void construct(qa_system_v_iostreams *streams, const qa_system_v_standard
   (void)snprintf(basic_ios_name, sizeof basic_ios_name, "St9basic_iosI%cSt11char_traitsI%cEE",
                  c, c);
   qa_cxx_rtti_base basic_base = {ios_base, 0, 2};
-  qa_guest_core_address basic_ios = qa_cxx_abi_type(abi, xstrdup(basic_ios_name), &basic_base, 1);
+  qa_guest_core_address basic_ios = qa_cxx_abi_type(abi, basic_ios_name, &basic_base, 1);
   char name_buffer[96];
   const char *name;
   if (stream->wide) {
     (void)snprintf(name_buffer, sizeof name_buffer, "St13basic_%sstreamIwSt11char_traitsIwEE",
                    stream->input ? "i" : "o");
-    name = xstrdup(name_buffer);
+    name = name_buffer;
   } else {
     name = stream->input ? "Si" : "So";
   }
@@ -241,12 +242,14 @@ static void construct(qa_system_v_iostreams *streams, const qa_system_v_standard
     qa_guest_core_address a5 = slot(streams, table, 3 * p);
     qa_guest_core_address v5 = qa_cxx_abi_unsupported(abi, unsupported_name);
     write_ptr(s6, a5, true, v5);
+    free(unsupported_name);
     char *deleting_name = xmalloc(strlen(name) + 40);
     (void)snprintf(deleting_name, strlen(name) + 40, "__guest_%s_deleting_destructor", name);
     qa_system_v_iostreams * s5 = streams;
     qa_guest_core_address a4 = slot(streams, table, 4 * p);
     qa_guest_core_address v4 = qa_cxx_abi_unsupported(abi, deleting_name);
     write_ptr(s5, a4, true, v4);
+    free(deleting_name);
     qa_write_unsigned(m, slot(streams, table, 5 * p), p, (uint64_t)(-(int64_t)prefix));
     qa_write_unsigned(m, slot(streams, table, 6 * p), p, (uint64_t)(-(int64_t)prefix));
     write_ptr(streams, slot(streams, table, 7 * p), true, type);
@@ -256,6 +259,7 @@ static void construct(qa_system_v_iostreams *streams, const qa_system_v_standard
     qa_guest_core_address a3 = slot(streams, table, 8 * p);
     qa_guest_core_address v3 = qa_cxx_abi_unsupported(abi, virtual_name);
     write_ptr(s4, a3, true, v3);
+    free(virtual_name);
     char *virtual_deleting = xmalloc(strlen(name) + 48);
     (void)snprintf(virtual_deleting, strlen(name) + 48,
                    "__guest_%s_virtual_deleting_destructor", name);
@@ -263,6 +267,7 @@ static void construct(qa_system_v_iostreams *streams, const qa_system_v_standard
     qa_guest_core_address a2 = slot(streams, table, 9 * p);
     qa_guest_core_address v2 = qa_cxx_abi_unsupported(abi, virtual_deleting);
     write_ptr(s3, a2, true, v2);
+    free(virtual_deleting);
   }
   free(table_name);
   write_ptr(streams, stream->address, true, slot(streams, table, 3 * p));
@@ -392,6 +397,7 @@ static qa_guest_core_address buf_function(qa_system_v_iostreams *streams, const 
                                      int operation) {
   buf_state *state = xmalloc(sizeof *state);
   state->streams = streams; state->wide = wide; state->operation = operation;
+  qa_system_v_own(streams->host, state, free);
   qa_system_v_implementation impl = {state, buf_impl};
   return qa_cxx_abi_function(&streams->abi, name, parameters, parameter_count, result_is_void,
                              result, impl, NULL);
@@ -410,7 +416,7 @@ static qa_guest_core_address make_buffer(qa_system_v_iostreams *streams, qa_gues
   qa_guest_core_address address = qa_system_v_allocate(streams->host, (size_t)(10 * p));
   char base_name[80];
   (void)snprintf(base_name, sizeof base_name, "St15basic_streambufI%cSt11char_traitsI%cEE", c, c);
-  qa_guest_core_address base_type = qa_cxx_abi_type(abi, xstrdup(base_name), NULL, 0);
+  qa_guest_core_address base_type = qa_cxx_abi_type(abi, base_name, NULL, 0);
   qa_cxx_rtti_base base = {base_type, 0, 2};
   qa_guest_core_address type = qa_cxx_abi_type(abi, name, &base, 1);
   char *table_name = xmalloc(strlen(name) + 8);
@@ -426,57 +432,72 @@ static qa_guest_core_address make_buffer(qa_system_v_iostreams *streams, qa_gues
     char *fn = xmalloc(strlen(name) + 40);
     (void)snprintf(fn, strlen(name) + 40, "__guest_%s_destructor", name);
     entries[0] = qa_cxx_abi_unsupported(abi, fn);
+    free(fn);
     fn = xmalloc(strlen(name) + 48);
     (void)snprintf(fn, strlen(name) + 48, "__guest_%s_deleting_destructor", name);
     entries[1] = qa_cxx_abi_unsupported(abi, fn);
     /* These two inherited basic_streambuf virtual methods intentionally
      * leave its state unchanged (TS comment). */
     qa_abi_storage two_ptrs[] = {ptr, ptr};
+    free(fn);
     fn = xmalloc(strlen(name) + 24);
     (void)snprintf(fn, strlen(name) + 24, "__guest_%s_imbue", name);
     entries[2] = buf_function(streams, fn, two_ptrs, 2, true, QA_STORAGE_INT32, wide, 0);
     qa_abi_storage setbuf_params[] = {ptr, ptr, signed_storage};
+    free(fn);
     fn = xmalloc(strlen(name) + 24);
     (void)snprintf(fn, strlen(name) + 24, "__guest_%s_setbuf", name);
     entries[3] = buf_function(streams, fn, setbuf_params, 3, false, ptr, wide, 1);
+    free(fn);
     fn = xmalloc(strlen(name) + 24);
     (void)snprintf(fn, strlen(name) + 24, "__guest_%s_seekoff", name);
     entries[4] = qa_cxx_abi_unsupported(abi, fn);
+    free(fn);
     fn = xmalloc(strlen(name) + 24);
     (void)snprintf(fn, strlen(name) + 24, "__guest_%s_seekpos", name);
     entries[5] = qa_cxx_abi_unsupported(abi, fn);
+    free(fn);
     fn = xmalloc(strlen(name) + 24);
     (void)snprintf(fn, strlen(name) + 24, "__guest_%s_sync", name);
     entries[6] = buf_function(streams, fn, &ptr, 1, false, QA_STORAGE_INT32, wide, 2);
+    free(fn);
     fn = xmalloc(strlen(name) + 32);
     (void)snprintf(fn, strlen(name) + 32, "__guest_%s_showmanyc", name);
     entries[7] = buf_function(streams, fn, &ptr, 1, false, signed_storage, wide, 3);
     qa_abi_storage transfer_params[] = {ptr, ptr, signed_storage};
+    free(fn);
     fn = xmalloc(strlen(name) + 24);
     (void)snprintf(fn, strlen(name) + 24, "__guest_%s_xsgetn", name);
     entries[8] = buf_function(streams, fn, transfer_params, 3, false, signed_storage, wide, 4);
+    free(fn);
     fn = xmalloc(strlen(name) + 32);
     (void)snprintf(fn, strlen(name) + 32, "__guest_%s_underflow", name);
     entries[9] = buf_function(streams, fn, &ptr, 1, false, character, wide, 5);
+    free(fn);
     fn = xmalloc(strlen(name) + 24);
     (void)snprintf(fn, strlen(name) + 24, "__guest_%s_uflow", name);
     entries[10] = buf_function(streams, fn, &ptr, 1, false, character, wide, 6);
     qa_abi_storage char_params[] = {ptr, character};
+    free(fn);
     fn = xmalloc(strlen(name) + 32);
     (void)snprintf(fn, strlen(name) + 32, "__guest_%s_pbackfail", name);
     entries[11] = buf_function(streams, fn, char_params, 2, false, character, wide, 7);
+    free(fn);
     fn = xmalloc(strlen(name) + 24);
     (void)snprintf(fn, strlen(name) + 24, "__guest_%s_xsputn", name);
     entries[12] = buf_function(streams, fn, transfer_params, 3, false, signed_storage, wide, 8);
+    free(fn);
     fn = xmalloc(strlen(name) + 32);
     (void)snprintf(fn, strlen(name) + 32, "__guest_%s_overflow", name);
     entries[13] = buf_function(streams, fn, char_params, 2, false, character, wide, 9);
+    free(fn);
     (void)qa_cxx_abi_vtable(abi, name, type, entries, 14);
     if (!qa_system_v_resolve_address(streams->host, "libstdc++.so.6", table_name,
                                      "GLIBCXX_3.4", &table))
       plain_error("Missing constructed streambuf vtable");
   }
   free(table_name);
+  free(name);
   write_ptr(streams, address, true, slot(streams, table, 2 * p));
   qa_system_v_iostreams * s2 = streams;
   qa_guest_core_address a = slot(streams, address, 7 * p);

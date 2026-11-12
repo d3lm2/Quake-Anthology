@@ -133,15 +133,15 @@ qa_vec3 *qa_q1_face_vertices(const qa_q1_world_geometry *map, double face_index,
   for (size_t i = 0; i < count; i++) {
     double at = face->edges.first + (double)i;
     if (at != trunc(at) || at < 0 || at >= (double)map->surface_edges.count)
-      qa_range_error("Missing Quake surface edge");
+      { free(vertices); qa_range_error("Missing Quake surface edge"); }
     double edge_index = map->surface_edges.values[(size_t)at];
     double edge_at = fabs(edge_index);
     if (edge_at != trunc(edge_at) || edge_at >= (double)map->edge_count)
-      qa_range_error("Missing Quake edge");
+      { free(vertices); qa_range_error("Missing Quake edge"); }
     const qa_bsp_edge *edge = &map->edges[(size_t)edge_at];
     double vertex_at = edge->vertices[edge_index >= 0 ? 0 : 1];
     if (vertex_at != trunc(vertex_at) || vertex_at < 0 || vertex_at >= (double)map->vertex_count)
-      qa_range_error("Missing Quake vertex");
+      { free(vertices); qa_range_error("Missing Quake vertex"); }
     vertices[i] = map->vertices[(size_t)vertex_at];
   }
   *out_count = count;

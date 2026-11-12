@@ -9,7 +9,7 @@ struct qa_app_remote_seat_pump {
   qa_app_remote_seat_pump_source source;
   qa_app_remote_seat_publication queue[CAPACITY];
   size_t head, count;
-  const char *failure;
+  bool failed; qa_caught_error failure; /* TS failure: { error } */
   bool pending_poll, pending_drain, closed, closing;
 };
 qa_app_remote_seat_pump *qa_app_remote_seat_pump_create(qa_app_remote_seat_pump_source source) {
@@ -20,16 +20,20 @@ qa_app_remote_seat_pump *qa_app_remote_seat_pump_create(qa_app_remote_seat_pump_
 }
 void qa_app_remote_seat_pump_destroy(qa_app_remote_seat_pump *p) { free(p); }
 void qa_app_remote_seat_pump_poll(qa_app_remote_seat_pump *p, double now_milliseconds) {
-  if (p->closed || p->pending_poll || p->failure != NULL) return;
+  if (p->closed || p->pending_poll || p->failed) return;
   p->pending_poll = true;
   if (!p->closed) {
-    const char *error = p->source.network_poll(p->source.ctx, now_milliseconds);
-    if (error != NULL && strcmp(error, qa_app_remote_seat_pump_retirement_error_text) != 0) p->failure = error;
+    const qa_caught_error *error = p->source.network_poll(p->source.ctx, now_milliseconds);
+    if (error != NULL && !(strcmp(error->name, "Error") == 0
+                           && strcmp(error->message, qa_app_remote_seat_pump_retirement_error_text) == 0)) {
+      p->failure = *error;
+      p->failed = true;
+    }
   }
   p->pending_poll = false;
 }
 void qa_app_remote_seat_pump_throw_failure(qa_app_remote_seat_pump *p) {
-  if (p->failure != NULL) qa_range_error("%s", p->failure);
+  if (p->failed) qa_rethrow(&p->failure);
 }
 bool qa_app_remote_seat_pump_enqueue(qa_app_remote_seat_pump *p, qa_app_remote_seat_publication publication) {
   if (p->closed) { publication.reject(publication.ctx, qa_app_remote_seat_pump_retirement_error_text); return false; }

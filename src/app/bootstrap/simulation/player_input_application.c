@@ -24,13 +24,13 @@ qa_vec3 qa_app_sim_movement_application_aim(qa_user_command command, qa_movement
   }
   if (command.kind == QA_USER_COMMAND_Q3 && state.kind == QA_MOVEMENT_STATE_Q3)
     return qa_q3_update_prediction_view(state.as.q3, health, command.as.q3).view_angles;
-  qa_range_error("Input application command does not match movement state");
+  qa_raise("Error", 0, 0, "Input application command does not match movement state");
 }
 qa_frame_context qa_app_sim_movement_application_frame(qa_user_command command, qa_movement_state state, qa_movement_profile profile, qa_frame_context frame) {
   if (command.kind == QA_USER_COMMAND_Q1) return frame;
   double milliseconds;
   if (command.kind == QA_USER_COMMAND_Q3) {
-    if (state.kind != QA_MOVEMENT_STATE_Q3) qa_range_error("Q3 input application has no command clock");
+    if (state.kind != QA_MOVEMENT_STATE_Q3) qa_raise("Error", 0, 0, "Q3 input application has no command clock");
     double delta = command.as.q3.server_time_milliseconds - state.as.q3.command_time_milliseconds;
     milliseconds = delta < 0 ? 0 : delta > 1000 ? 1000 : delta;
   } else if (command.kind == QA_USER_COMMAND_QW && profile.clock.kind == QA_CLOCK_Q1_QUAKEWORLD) {

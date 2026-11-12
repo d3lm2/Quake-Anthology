@@ -102,6 +102,14 @@ static qa_ui_source_script_storage *storage_new(
   return script;
 }
 
+/* Frees the C handle without freeing its allocations (TS drops the object;
+   the allocations stay with the restore map or memory owner). */
+static void storage_discard(void *script) {
+  qa_ui_source_script_storage *storage = script;
+  qa_ui_source_token_memory_destroy(storage->token);
+  free(storage);
+}
+
 qa_ui_source_script_storage *qa_ui_source_script_allocate(
     int64_t length, const char *path, const qa_ui_script_memory *memory) {
   if (length < 0 || length > 0x7fffffff - QA_UI_SOURCE_SCRIPT_BYTES - 1)
@@ -121,8 +129,13 @@ qa_ui_source_script_storage *qa_ui_source_script_allocate(
   for (size_t index = 0;; index++) {
     unsigned int character =
         index < path_length ? (uint8_t)path[index] : 0;
-    if (index >= FILENAME_BYTES)
+    if (index >= FILENAME_BYTES) {
+      /* TS leaves the block with its memory owner; without one it is
+         garbage. Only the C handle is freed here. */
+      if (memory == NULL) qa_ui_script_memory_free(memory, &script->allocation);
+      storage_discard(script);
       qa_range_error("LoadScript filename exceeds its 1024-byte source allocation");
+    }
     bytes[index] = (uint8_t)character;
     if (character == 0) break;
   }
@@ -194,6 +207,9 @@ qa_ui_source_script_storage *qa_ui_source_script_restore_save_state(
     qa_save_reader_destroy(&reader);
     return NULL;
   }
+  /* A malformed save raises below; the handle must not leak. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, storage_discard, script);
   if (!qa_save_reader_field(&reader, "punctuationTable", &field)) goto oom;
   if (!qa_save_reader_is_null(&field)) {
     script->punctuation_table = restore->allocation(
@@ -215,11 +231,13 @@ qa_ui_source_script_storage *qa_ui_source_script_restore_save_state(
     if (path == NULL) goto oom;
     free(path);
   }
+  qa_cleanup_pop(&guard);
   qa_save_reader_destroy(&reader);
   return script;
 oom:
+  qa_cleanup_pop(&guard);
   qa_save_reader_destroy(&reader);
-  qa_ui_source_script_destroy(script);
+  storage_discard(script);
   return NULL;
 }
 
@@ -480,6 +498,17 @@ void qa_ui_source_script_dispose(qa_ui_source_script_storage *script) {
   }
   qa_ui_script_memory_free(script->memory, &script->allocation);
   script->disposed = true;
+}
+
+void qa_ui_source_script_discard(qa_ui_source_script_storage *script) {
+  if (script == NULL) return;
+  /* Without a memory owner the bytes are the collector's to free. */
+  if (script->memory == NULL && !script->disposed) {
+    if (script->has_punctuation_table)
+      qa_ui_script_memory_free(NULL, &script->punctuation_table);
+    qa_ui_script_memory_free(NULL, &script->allocation);
+  }
+  storage_discard(script);
 }
 
 void qa_ui_source_script_destroy(qa_ui_source_script_storage *script) {

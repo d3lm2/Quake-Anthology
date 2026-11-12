@@ -14,7 +14,28 @@ struct qa_q3_huffman_tree {
   int symbols[258]; /* symbol -> node or -1 */
 };
 static void check_byte(int32_t s) { if (s < 0 || s > 255) qa_range_error("Huffman symbol must be a byte"); }
+/* TS allocates a Block per weight change and the collector drops the ones no node holds; the
+ * pool does the same here, renumbering the live blocks when it fills (message training alone
+ * would otherwise keep about 28 MB of dead blocks for the life of the process). Blocks are only
+ * ever shared or read through node->block, never compared, so renumbering is invisible. */
+static void compact_blocks(qa_q3_huffman_tree *t) {
+  int *map = malloc(t->nblocks * sizeof *map);
+  block_t *live = malloc((t->nnodes ? t->nnodes : 1) * sizeof *live);
+  if (!map || !live) { free(map); free(live); return; }
+  for (size_t i = 0; i < t->nblocks; i++) map[i] = -1;
+  size_t count = 0;
+  for (size_t i = 0; i < t->nnodes; i++) {
+    int b = t->nodes[i].block;
+    if (b < 0) continue;
+    if (map[b] < 0) { map[b] = (int)count; live[count++] = t->blocks[b]; }
+    t->nodes[i].block = map[b];
+  }
+  memcpy(t->blocks, live, count * sizeof *live);
+  t->nblocks = count;
+  free(map); free(live);
+}
 static int new_block(qa_q3_huffman_tree *t, int leader) {
+  if (t->nblocks == t->capblocks && t->nblocks > 4 * t->nnodes + 64) compact_blocks(t);
   if (t->nblocks == t->capblocks) {
     size_t nc = t->capblocks ? t->capblocks * 2 : 1024;
     block_t *nb = realloc(t->blocks, nc * sizeof *nb);
@@ -35,6 +56,7 @@ static int new_node(qa_q3_huffman_tree *t, int symbol, int64_t weight) {
   node_t *n = &t->nodes[id];
   n->left = n->right = n->parent = n->next = n->prev = -1;
   n->symbol = symbol; n->weight = weight;
+  n->block = -1; /* no block yet if new_block compacts the pool */
   n->block = new_block(t, id);
   return id;
 }

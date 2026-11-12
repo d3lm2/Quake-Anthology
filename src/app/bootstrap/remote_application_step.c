@@ -282,8 +282,11 @@ static void step_body(void *ctx) {
     qa_remote_seat_peer *successor = NULL;
     for (size_t i = 0; i < app->remote_seat_count && successor == NULL; i++) {
       qa_remote_seat_peer *peer = app->remote_seats[i];
+      /* peer.map === this.options.map: two absent maps are equal */
+      const char *map = app->launch_options.map;
+      bool same_map = (peer->map == NULL && map == NULL) || (peer->map != NULL && map != NULL && strcmp(peer->map, map) == 0);
       if (!peer->closed && peer != app->primary_peer && qa_app_remote_seat_channel_active(peer->channel) && peer->view != NULL
-          && peer->map != NULL && app->launch_options.map != NULL && strcmp(peer->map, app->launch_options.map) == 0)
+          && same_map)
         successor = peer;
     }
     if (successor == NULL) {

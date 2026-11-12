@@ -58,7 +58,7 @@ static bool in_rankings(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_a *sta
       continue;
     double other;
     if (!qa_ai_client_score_bots_a(ctx, client, &other))
-      qa_range_error("%s", error);
+      qa_raise("Error", 0, 0, "%s", error);
     if (first ? score < other : score > other)
       return false;
   }
@@ -85,7 +85,7 @@ static char *ranked_client(qa_game_ai_context_bots_a *ctx, bool first, char *out
       continue;
     double current;
     if (!qa_ai_client_score_bots_a(ctx, client, &current))
-      qa_range_error("BotClientInRankings: active player has no client state");
+      qa_raise("Error", 0, 0, "BotClientInRankings: active player has no client state");
     if (first ? current > score : current < score) {
       score = current;
       selected = client;
@@ -537,7 +537,7 @@ bool qa_bot_chat_hit_talking_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state
     return false;
   qa_bot_observed_entity_bots_a client = game_entity(ctx, state->src->client);
   if (!client.has_player)
-    qa_range_error("BotChat_HitTalking requires a client");
+    qa_raise("Error", 0, 0, "BotChat_HitTalking requires a client");
   int64_t attacker = client.last_hurt_client;
   if (attacker == 0 || attacker == state->src->client || attacker < 0 ||
       attacker >= QA_AI_MAX_CLIENTS)
@@ -558,7 +558,7 @@ bool qa_bot_chat_hit_talking_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state
 bool qa_bot_chat_hit_no_death_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_a *state) {
   qa_bot_observed_entity_bots_a client = game_entity(ctx, state->src->client);
   if (!client.has_player)
-    qa_range_error("BotChat_HitNoDeath requires a client");
+    qa_raise("Error", 0, 0, "BotChat_HitNoDeath requires a client");
   int64_t attacker = client.last_hurt_client, hurt_mod = client.last_hurt_mod;
   if (attacker == 0 || attacker == state->src->client || attacker < 0 ||
       attacker >= QA_AI_MAX_CLIENTS)
@@ -593,7 +593,7 @@ bool qa_bot_chat_hit_no_kill_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state
     return false;
   qa_bot_observed_entity_bots_a enemy = game_entity(ctx, state->src->enemy);
   if (!enemy.has_player)
-    qa_range_error("BotChat_HitNoKill requires an enemy client");
+    qa_raise("Error", 0, 0, "BotChat_HitNoKill requires an enemy client");
   int64_t hurt_mod = enemy.last_hurt_mod;
   char name[32];
   qa_client_name_bots_a(ctx, state->src->enemy, 32, name);
@@ -721,7 +721,7 @@ void qa_bot_chat_test_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_a
     emit(ctx, state, kills[i], TEST_FIXED, name, NULL);
   qa_bot_observed_entity_bots_a client = game_entity(ctx, state->src->client);
   if (!client.has_player)
-    qa_range_error("BotChatTest requires a client");
+    qa_raise("Error", 0, 0, "BotChatTest requires a client");
   int64_t hurt_client = client.last_hurt_client;
   char hurt_name[32];
   qa_client_name_bots_a(ctx, hurt_client, 32, hurt_name);

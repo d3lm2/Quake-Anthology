@@ -156,6 +156,7 @@ void qa_lmctf_match_restore(qa_lmctf_match *m, const qa_save_reader *reader) {
   if (!qa_save_reader_field(reader, "pendingMap", &pending)) qa_raise("Error", 0, 0, "Out of memory");
   free(m->pending.map);
   m->pending.map = NULL;
+  m->has_pending = false; /* a reader that raises below must not leave a pending change with no map */
   if (qa_save_reader_is_undefined(&pending) || qa_save_reader_is_null(&pending)) {
     m->has_pending = false;
   } else {

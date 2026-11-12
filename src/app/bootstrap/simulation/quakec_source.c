@@ -3,6 +3,7 @@
  * restores ride qa_cleanup nodes so a caught raise unwinds them. */
 #include "qa/text/localization_key.h"
 #include "qa/app/bootstrap/simulation/quakec_source.h"
+#include "qa/foundation/js_case.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -55,11 +56,23 @@
 typedef qa_app_sim_quakec_source S;
 
 /* ---------------- small helpers ---------------- */
+/* TS throw new Error(text): the whole text, however long (a guest name or path can be). The raise formats before
+ * it runs cleanups, so the cleanup frees the buffer after the message is taken. */
+static void fail_free(void *text) { free(text); }
 static noreturn void fail(const char *format, ...) {
-  char message[1024];
-  va_list args; va_start(args, format);
-  (void)vsnprintf(message, sizeof message, format, args);
+  char small[1024];
+  va_list args, whole; va_start(args, format); va_copy(whole, args);
+  int needed = vsnprintf(small, sizeof small, format, args);
   va_end(args);
+  char *message = small;
+  if (needed >= (int)sizeof small) {
+    message = malloc((size_t)needed + 1);
+    if (message == NULL) { va_end(whole); qa_range_error("Out of memory"); }
+    (void)vsnprintf(message, (size_t)needed + 1, format, whole);
+  }
+  va_end(whole);
+  qa_cleanup cleanup;
+  if (message != small) qa_cleanup_push(&cleanup, fail_free, message);
   qa_raise("Error", 0, 0, "%s", message);
 }
 static void *xalloc(size_t size) {
@@ -82,6 +95,18 @@ static char *xstrdup(const char *text) {
   char *p = xalloc(n);
   memcpy(p, text ? text : "", n);
   return p;
+}
+/* A template literal: the whole text, however long. */
+static char *xformat(const char *format, ...) {
+  va_list args, again; va_start(args, format); va_copy(again, args);
+  int needed = vsnprintf(NULL, 0, format, args);
+  va_end(args);
+  if (needed < 0) { va_end(again); qa_range_error("Out of memory"); }
+  char *text = malloc((size_t)needed + 1);
+  if (!text) { va_end(again); qa_range_error("Out of memory"); }
+  (void)vsnprintf(text, (size_t)needed + 1, format, again);
+  va_end(again);
+  return text;
 }
 static bool is(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 static bool starts(const char *a, const char *prefix) { return a != NULL && strncmp(a, prefix, strlen(prefix)) == 0; }
@@ -159,12 +184,17 @@ static void name_set_free(void *arg) {
   free(s->items);
   memset(s, 0, sizeof *s);
 }
-typedef struct prepare_cleanup { name_set names; qa_app_sim_quakec_resources resources; qa_entities entities; } prepare_cleanup;
+/* A malformed asset raises from its decoder: the asset bytes and decoded map are released with the rest. */
+typedef struct prepare_cleanup {
+  name_set names; qa_app_sim_quakec_resources resources; qa_entities entities; uint8_t *asset; qa_q1_map *map;
+} prepare_cleanup;
 static void prepare_cleanup_run(void *arg) {
   prepare_cleanup *c = arg;
   name_set_free(&c->names);
   qa_app_sim_quakec_resources_destroy(&c->resources);
   qa_entities_free(&c->entities);
+  free(c->asset); c->asset = NULL;
+  if (c->map) { qa_q1_map_destroy(c->map); free(c->map); c->map = NULL; }
 }
 qa_app_sim_quakec_resources qa_app_sim_prepare_quakec_resources(const qa_compat_qc_program *program,
     qa_content_mounted *mounts, const char *entity_text) {
@@ -198,6 +228,7 @@ qa_app_sim_quakec_resources qa_app_sim_prepare_quakec_resources(const qa_compat_
     bool found = qa_content_mounted_open(mounts, wav ? path : name, NULL, NULL, &asset);
     free(path);
     if (!found) continue; /* Conditional source precache fails if it actually requests this absent asset. */
+    c.asset = asset.bytes;
     qa_app_sim_quakec_resource entry; memset(&entry, 0, sizeof entry);
     if (ends(name, ".mdl") || ends(name, ".spr")) {
       qa_q12_model model; memset(&model, 0, sizeof model);
@@ -209,20 +240,20 @@ qa_app_sim_quakec_resources qa_app_sim_prepare_quakec_resources(const qa_compat_
       else entry.model_bounds = model.as.sp2.bounds;
       qa_q12_model_destroy(&model);
     } else if (ends(name, ".bsp")) {
-      qa_q1_map *map = xalloc(sizeof *map);
+      qa_q1_map *map = c.map = xalloc(sizeof *map);
       qa_q1_map_options map_options; memset(&map_options, 0, sizeof map_options);
       map_options.source = name;
       qa_q1_read_bsp(asset.bytes, asset.byte_length, &map_options, map);
-      if (map->world.model_count == 0) { qa_q1_map_destroy(map); free(map); free(asset.bytes); fail("No world model in %s", name); }
+      if (map->world.model_count == 0) fail("No world model in %s", name);
       entry.has_model_bounds = true;
       entry.model_bounds = map->world.models[0].bounds;
-      qa_q1_map_destroy(map); free(map);
+      qa_q1_map_destroy(map); free(map); c.map = NULL;
     } else {
       qa_decoded_wav decoded; memset(&decoded, 0, sizeof decoded);
       if (!qa_decode_quake_wav(asset.bytes, asset.byte_length, name, &decoded)) qa_range_error("Out of memory");
       qa_decoded_wav_dispose(&decoded);
     }
-    free(asset.bytes);
+    free(asset.bytes); c.asset = NULL;
     entry.name = xstrdup(name);
     entry.resource = *asset.reference;
     c.resources.items = xgrow(c.resources.items, &capacity, c.resources.count + 1, sizeof *c.resources.items);
@@ -256,8 +287,10 @@ void qa_app_sim_prepare_quakec_source_mounted(qa_execution_module execution, qa_
     fail("Shared QuakeC artifact API differs from the selected execution");
   qa_content_opened_resource compatibility; memset(&compatibility, 0, sizeof compatibility);
   bool has_compatibility = qa_content_mounted_open(mounts, "quakec-compatibility.json", NULL, NULL, &compatibility);
+  qa_cleanup compatibility_scope; qa_cleanup_push(&compatibility_scope, free, compatibility.bytes); /* a malformed file raises */
   bool read = qa_compat_qc_read_quakec_compatibility(has_compatibility ? compatibility.bytes : NULL,
       has_compatibility ? compatibility.byte_length : 0, out->program.digest, &out->compatibility);
+  qa_cleanup_pop(&compatibility_scope);
   free(compatibility.bytes);
   if (!read) qa_range_error("Out of memory");
   out->has_compatibility = true;
@@ -340,7 +373,7 @@ typedef struct actor_cell {
   S *source; qa_owned_actor actor; int64_t slot;
   qa_actor_id owner, enemy; bool live;
   qa_combat_state_binding combat;
-  char team[64]; /* read().team storage */
+  char *team; /* read().team storage: the whole team string (QW userinfo has no cap) */
 } actor_cell;
 typedef struct actor_set { qa_actor_id *items; size_t count, capacity; } actor_set;
 typedef struct slot_set { int64_t *items; size_t count, capacity; } slot_set;
@@ -380,6 +413,8 @@ struct qa_app_sim_quakec_source {
   precache_entry *precached; size_t precached_count, precached_capacity;
   double model_count, sound_count;
   int64_t release_id;
+  /* C: construction progress for a raising constructor or restore (TS leaves the half-built object to the GC). */
+  bool subscribed, constructed;
 
   /* compat/qc composition */
   qa_compat_qc_entity_memory entities;
@@ -435,9 +470,6 @@ struct qa_app_sim_quakec_source {
   struct inventory_cell **inventory_cells; size_t inventory_cell_count, inventory_cell_capacity;
   /* query scratch */
   char *classname_scratch, *team_scratch, *death_scratch, *info_scratch;
-  /* SimulationEvents retains message text by pointer until published;
-   * source-formatted texts live in this ring (TS strings are values). */
-  char *message_texts[1024]; size_t message_text_next;
   qa_app_sim_quakec_frag *drained_frags;
   qa_app_sim_quakec_routed *drained_routed; size_t drained_routed_count;
   nq_routed *drained_nq; size_t drained_nq_count; qa_app_sim_quakec_netquake_routed *drained_nq_view;
@@ -447,9 +479,6 @@ struct qa_app_sim_quakec_source {
   qa_app_sim_quakec_client_travel *travel_clients; size_t travel_client_count;
   double *travel_parameters;
   qa_actor_id solid_owner, flags_enemy;
-  /* Messages the local-message state retains borrow their text; this pool
-   * keeps every message handed to it alive for the source's lifetime. */
-  qa_netquake_message **retained; size_t *retained_counts; size_t retained_count, retained_capacity, retained_counts_capacity;
   /* checkpoint storage */
   qa_guest_checkpoint *checkpoint_storage; qa_compat_qc_machine_snapshot checkpoint_snapshot;
   uint8_t *checkpoint_host_bytes; bool has_checkpoint;
@@ -724,6 +753,18 @@ static void nq_routed_free(nq_routed *r) {
   nq_messages_free(r->messages, r->count);
   free(r->views);
 }
+typedef struct routed_batch { qa_app_sim_quakec_routed *records; size_t count; } routed_batch;
+static void routed_batch_free(void *arg) {
+  routed_batch *b = arg;
+  for (size_t i = 0; i < b->count; i++) routed_free(&b->records[i]);
+  free(b->records); b->records = NULL; b->count = 0;
+}
+typedef struct nq_batch { nq_routed *records; size_t count; } nq_batch;
+static void nq_batch_free(void *arg) {
+  nq_batch *b = arg;
+  for (size_t i = 0; i < b->count; i++) nq_routed_free(&b->records[i]);
+  free(b->records); b->records = NULL; b->count = 0;
+}
 static bool view_lookup(const view_entry *views, size_t count, int64_t index, view_entry *out) {
   for (size_t i = 0; i < count; i++) if (views[i].index == index) { if (out) *out = views[i]; return true; }
   return false;
@@ -827,12 +868,6 @@ static void emit_presentation(S *s, qa_app_sim_source_presentation_event source,
 static void message(S *s, qa_network_event event, const qa_actor_id *actor) {
   qa_app_sim_simulation_events_message(s->options.events, event, actor != NULL, actor ? *actor : no_actor(), false, 0);
 }
-static const char *retain_text(S *s, const char *text) {
-  size_t slot = s->message_text_next++ % (sizeof s->message_texts / sizeof s->message_texts[0]);
-  free(s->message_texts[slot]);
-  s->message_texts[slot] = xstrdup(text);
-  return s->message_texts[slot];
-}
 /* TS presentMessage: a localization-key print becomes the same message event native rules emit, so it localizes like theirs.
  * The emitted presentation event is copied by the presentation state, so the decoded strings are released after it. */
 static void present_message(S *s, qa_network_event event, const qa_actor_id *actor) {
@@ -854,7 +889,7 @@ static void present_message(S *s, qa_network_event event, const qa_actor_id *act
 }
 static void print_message(S *s, qa_actor_id actor, const char *text) {
   qa_network_event event; memset(&event, 0, sizeof event);
-  event.kind = QA_NETWORK_EVENT_PRINT; event.level = 2; event.text = retain_text(s, text);
+  event.kind = QA_NETWORK_EVENT_PRINT; event.level = 2; event.text = text; /* SimulationEvents copies message text */
   message(s, event, &actor);
 }
 
@@ -875,15 +910,16 @@ static bool map_model_index(S *s, const char *name, double *out) {
 static qa_compat_qc_precached_resource precache(S *s, const char *kind, const char *name) {
   char *key = key_of(kind, name);
   precache_entry *prior = precache_get(s, key);
-  if (prior) { free(key); return prior->value; }
+  free(key);
+  if (prior) return prior->value;
   double map_index = 0;
   qa_compat_qc_precached_resource value; memset(&value, 0, sizeof value);
   if (is(kind, "model") && map_model_index(s, name, &map_index)) {
     value.index = map_index; value.resource = s->options.recipe->map.geometry;
+    key = key_of(kind, name);
     precache_set(s, key, value); free(key);
     return value;
   }
-  free(key);
   const qa_app_sim_quakec_resource *resource = qa_app_sim_quakec_resources_get(&s->prepared->resources, name);
   if (!resource) fail("Unprepared actual QC %s resource %s", kind, name);
   double index = is(kind, "model") ? s->model_count++ : s->sound_count++;
@@ -1138,17 +1174,6 @@ static void lh_fog(void *ctx, qa_netquake_message value, const qa_actor_id *reci
   composition.kind = QA_COMP_Q1_EVENT_ADDON; composition.addon_event = &fog;
   emit_composition(((local_host_ctx *)ctx)->s, &composition, recipient);
 }
-static qa_netquake_message *retain_owned(S *s, qa_netquake_message *owned, size_t count) {
-  s->retained = xgrow(s->retained, &s->retained_capacity, s->retained_count + 1, sizeof *s->retained);
-  s->retained_counts = xgrow(s->retained_counts, &s->retained_counts_capacity, s->retained_count + 1, sizeof *s->retained_counts);
-  s->retained[s->retained_count] = owned; s->retained_counts[s->retained_count++] = count;
-  return owned;
-}
-static const qa_netquake_message *retain_messages(S *s, const qa_netquake_message *messages, size_t count) {
-  qa_netquake_message *copy = xalloc((count ? count : 1) * sizeof *copy);
-  for (size_t i = 0; i < count; i++) copy[i] = nq_copy(&messages[i]);
-  return retain_owned(s, copy, count);
-}
 static void receive_local_messages(S *s, const qa_netquake_message *messages, size_t count,
     qa_compat_qc_message_destination destination, const view_entry *views, size_t view_count, bool has_views) {
   if (destination.kind == QA_QC_DEST_MULTICAST) fail("NetQuake has no multicast destination");
@@ -1158,7 +1183,8 @@ static void receive_local_messages(S *s, const qa_netquake_message *messages, si
     const qa_netquake_message *m = &messages[index];
     view_entry view; bool has_view = has_views && view_lookup(views, view_count, (int64_t)index, &view);
     if (is(m->kind, "set-view") && !has_view) fail("QC camera message has no captured source actor");
-    m = retain_messages(s, m, 1);
+    /* The local-message state copies what it keeps and emitted events copy their text (TS strings are
+     * values), so the message need only live for this call. */
     qa_app_sim_quakec_local_messages_receive(s->local_messages, m, 1, target, has_view,
         has_view && view.has_actor ? &view.actor : NULL);
     local_host_ctx hctx = {s, target};
@@ -1264,7 +1290,7 @@ static qa_damage_outcome apply_source_damage(S *s, qa_damage_request request) {
     qa_compat_qc_machine_execute(&s->machine, s->binding->damage_index, 4);
   } else {
     qa_compat_qc_mod_input_entry inputs[16];
-    size_t input_count = qa_compat_qc_damage_inputs(request, s->current_time, inputs, 16);
+    size_t input_count = qa_compat_qc_damage_inputs(&request, s->current_time, inputs, 16);
     (void)qa_compat_qc_with_source_call(&s->machine, *call->declaration, inputs, input_count,
         (qa_compat_qc_actor_reference){s, source_call_reference}, (qa_compat_qc_source_execute){s, source_call_execute});
   }
@@ -1289,6 +1315,7 @@ static actor_cell *cell_for(S *s, qa_owned_actor actor, int64_t slot) {
     cell = xalloc(sizeof *cell);
     s->cells[s->cell_count++] = cell;
   }
+  free(cell->team);
   memset(cell, 0, sizeof *cell);
   cell->source = s; cell->actor = actor; cell->slot = slot; cell->live = true;
   return cell;
@@ -1307,7 +1334,7 @@ static qa_combat_state cell_read(void *ctx) {
   state.can_take_damage = fget(s, words, "takedamage") != 0;
   state.invulnerable = fget(s, words, "invincible_finished") >= s->current_time;
   const char *team = qa_app_sim_quakec_source_match_team(s, c->actor.id);
-  if (team) { (void)snprintf(c->team, sizeof c->team, "%s", team); state.team = c->team; }
+  if (team) { char *copy = xstrdup(team); free(c->team); c->team = copy; state.team = c->team; }
   return state;
 }
 static void cell_write_health(void *ctx, double health) {
@@ -1667,6 +1694,11 @@ static void b_aim(void *ctx, qa_compat_qc_machine *vm) {
   }
   s->aim_builtin.fn(s->aim_builtin.ctx, vm);
 }
+typedef struct infokey_scratch { char *owned, *key, *engine; } infokey_scratch;
+static void infokey_scratch_free(void *arg) {
+  infokey_scratch *k = arg;
+  free(k->owned); free(k->key); free(k->engine);
+}
 static void b_infokey(void *ctx, qa_compat_qc_machine *vm) {
   S *s = ctx;
   int64_t slot = qa_compat_qc_entity_memory_slot(&s->entities, qa_compat_qc_machine_arg_int(vm, 0));
@@ -1689,9 +1721,12 @@ static void b_infokey(void *ctx, qa_compat_qc_machine *vm) {
       } else value = "";
     }
   }
-  char engine[512]; (void)snprintf(engine, sizeof engine, "qw-infokey:%lld:%s", (long long)slot, key);
+  char *engine = xformat("qw-infokey:%lld:%s", (long long)slot, key); /* the whole key: a cut name would alias another key's slot */
+  infokey_scratch scratch = {owned, key, engine};
+  qa_cleanup scope; qa_cleanup_push(&scope, infokey_scratch_free, &scratch);
   qa_compat_qc_machine_return_int(vm, (double)qa_compat_qc_strings_set_engine(&vm->strings, engine, value, 1024));
-  free(owned); free(key);
+  qa_cleanup_pop(&scope);
+  infokey_scratch_free(&scratch);
 }
 static void b_logfrag(void *ctx, qa_compat_qc_machine *vm) {
   S *s = ctx;
@@ -1854,8 +1889,27 @@ static void register_default(S *s, const char *name, const char *value) {
 static void source_print(void *ctx, const char *text) { print(ctx, text); }
 
 /* ---------------- constructor ---------------- */
+/* A raising constructor or checkpoint restore: a fully built source is destroyed whole; before that, the release
+ * subscription is dropped (so the registry never calls into a dead source) and, while nothing else holds the source,
+ * it is freed. Between the subscription and the end of construction other owners (actor slots, hosts) may hold it,
+ * so what they reference is left allocated. */
+static void construct_failed(void *ctx) {
+  S *s = ctx;
+  if (s->constructed) { qa_app_sim_quakec_source_destroy(s); return; }
+  if (s->subscribed) { s->subscribed = false; qa_session_actor_registry_off_release(s->options.actors, s->release_id); return; }
+  qa_app_sim_quakec_local_messages_destroy(s->local_messages);
+  free(s->original_save_extension_text);
+  free(s);
+}
+static void construct(S *s, const qa_app_sim_prepared_quakec_source *prepared, qa_app_sim_quakec_source_options options);
 S *qa_app_sim_quakec_source_create(const qa_app_sim_prepared_quakec_source *prepared, qa_app_sim_quakec_source_options options) {
   S *s = xalloc(sizeof *s);
+  qa_cleanup failed; qa_cleanup_push(&failed, construct_failed, s);
+  construct(s, prepared, options);
+  qa_cleanup_pop(&failed);
+  return s;
+}
+static void construct(S *s, const qa_app_sim_prepared_quakec_source *prepared, qa_app_sim_quakec_source_options options) {
   s->prepared = prepared; s->options = options;
   s->program = (qa_compat_qc_program *)&prepared->program;
   s->qprogram = &prepared->view.program;
@@ -1881,6 +1935,7 @@ S *qa_app_sim_quakec_source_create(const qa_app_sim_prepared_quakec_source *prep
   s->reserved_client_slots = s->quakeworld ? 32 : (int64_t)options.max_clients;
   if (!(s->local_messages = qa_app_sim_quakec_local_messages_create())) qa_range_error("Out of memory");
   s->release_id = qa_session_actor_registry_on_release(options.actors, on_release, s);
+  s->subscribed = true;
   if (!qa_event_ring_init(&s->frag_records, 4096, sizeof(qa_app_sim_quakec_frag))
       || !qa_event_ring_init(&s->routed, 8192, sizeof(qa_app_sim_quakec_routed))
       || !qa_event_ring_init(&s->nq_routed, 8192, sizeof(nq_routed)))
@@ -2078,10 +2133,10 @@ S *qa_app_sim_quakec_source_create(const qa_app_sim_prepared_quakec_source *prep
   s->pusher_services = (qa_q1_pusher_services){s, s->pushers.numeric, ps_read, ps_candidates, ps_write, ps_link,
                                                ps_collision_enabled, ps_test_position, ps_push, ps_blocked,
                                                s->pushers.think ? ps_think : NULL};
+  s->constructed = true;
   if (!options.restore) {
     for (int64_t slot = 0; slot <= s->reserved_client_slots; slot++) (void)qa_compat_qc_world_host_actor(&s->world_host, slot);
   } else restore_constructed(s);
-  return s;
 }
 
 /* ---------------- getters ---------------- */
@@ -2305,9 +2360,11 @@ static void bind_client_inventory(S *s, qa_owned_actor actor, int64_t slot) {
 
 /* ---------------- host commands ---------------- */
 static void give_message(S *s, qa_actor_id actor, const char *text) { print_message(s, actor, text); }
-static char *ascii_lower(const char *text) {
+/* TS args[0].toLowerCase(): console arguments hold one byte per character (Latin-1), and JS folds
+ * A-Z and U+00C0-U+00DE except U+00D7. */
+static char *latin1_lower(const char *text) {
   char *out = xstrdup(text);
-  for (char *p = out; *p; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+  for (char *p = out; *p; p++) *p = (char)qa_js_latin1_lower((unsigned char)*p);
   return out;
 }
 typedef struct give_restore { S *s; qa_owned_actor item; } give_restore;
@@ -2385,8 +2442,10 @@ static void host_give_lowered(S *s, qa_actor_id actor, int64_t slot, const char 
   const char *classname = is(input, "quad") ? "item_artifact_super_damage" : is(input, "pent") ? "item_artifact_invulnerability"
       : is(input, "ring") ? "item_artifact_invisibility" : is(input, "suit") ? "item_artifact_envirosuit" : input;
   if (!starts(classname, "item_") && !starts(classname, "weapon_")) {
-    char text[512]; (void)snprintf(text, sizeof text, "Unknown item: %s\n", input);
+    char *text = xformat("Unknown item: %s\n", input);
+    qa_cleanup scope; qa_cleanup_push(&scope, free, text);
     give_message(s, actor, text);
+    qa_cleanup_pop(&scope); free(text);
     return;
   }
   uint8_t *template_bytes = NULL; size_t template_length = 0;
@@ -2401,8 +2460,10 @@ static void host_give_lowered(S *s, qa_actor_id actor, int64_t slot, const char 
     }
   }
   if (!template_bytes) {
-    char text[512]; (void)snprintf(text, sizeof text, "Cannot give %s: this map has no source item template\n", classname);
+    char *text = xformat("Cannot give %s: this map has no source item template\n", classname);
+    qa_cleanup scope; qa_cleanup_push(&scope, free, text);
     give_message(s, actor, text);
+    qa_cleanup_pop(&scope); free(text);
     return;
   }
   qa_cleanup bytes_scope; qa_cleanup_push(&bytes_scope, free, template_bytes);
@@ -2428,7 +2489,7 @@ static void host_give_lowered(S *s, qa_actor_id actor, int64_t slot, const char 
 }
 static void host_give(S *s, qa_actor_id actor, int64_t slot, const char *const *args, size_t arg_count) {
   if (arg_count == 0) { give_message(s, actor, "Usage: give <all|weapons|ammo|health|armor|keys|item> [amount]\n"); return; }
-  char *input = ascii_lower(args[0]);
+  char *input = latin1_lower(args[0]);
   qa_cleanup scope; qa_cleanup_push(&scope, free, input);
   host_give_lowered(s, actor, slot, args, arg_count, input);
   qa_cleanup_pop(&scope);
@@ -3027,26 +3088,32 @@ void qa_app_sim_quakec_source_spawn_map(S *s) {
   qa_app_sim_shared_physics_set_world_gravity(s->options.physics, qa_cvar_registry_variable_value(s->cvars, "sv_gravity"));
   qa_compat_qc_broadcast_messages_flush(&s->messages);
 }
+typedef struct route_views { qa_actor_id *targets; bool *has; } route_views;
+static void route_views_free(void *arg) { route_views *v = arg; free(v->targets); free(v->has); v->targets = NULL; v->has = NULL; }
 void qa_app_sim_quakec_source_begin_frame(S *s, qa_frame_context frame) {
   if (frame.time.kind != QA_SOURCE_TIME_SECONDS || frame.elapsed.kind != QA_SOURCE_TIME_SECONDS || !isfinite(frame.time.value))
     fail("QC frame requires source seconds");
   if (!s->netquake_wire_attached && !s->quakeworld) {
     if (s->nq_signon_count != 0) fail("QuakeC MSG_INIT requires a native NetQuake wire consumer");
-    size_t count = 0;
-    nq_routed *drained = qa_event_ring_drain_all(&s->nq_routed, &count);
-    for (size_t i = 0; i < count; i++) {
-      nq_routed *entry = &drained[i];
-      qa_actor_id *targets = xalloc((entry->count ? entry->count : 1) * sizeof *targets);
-      bool *has = xalloc((entry->count ? entry->count : 1) * sizeof *has);
+    /* The drained records are dropped whether or not re-routing raises (TS drainAll). */
+    nq_batch drained = {NULL, 0};
+    drained.records = qa_event_ring_drain_all(&s->nq_routed, &drained.count);
+    qa_cleanup drained_scope; qa_cleanup_push(&drained_scope, nq_batch_free, &drained);
+    for (size_t i = 0; i < drained.count; i++) {
+      nq_routed *entry = &drained.records[i];
+      route_views views = {xalloc((entry->count ? entry->count : 1) * sizeof *views.targets),
+                           xalloc((entry->count ? entry->count : 1) * sizeof *views.has)};
+      qa_cleanup views_scope; qa_cleanup_push(&views_scope, route_views_free, &views);
       for (size_t v = 0; v < entry->view_count; v++)
         if (entry->views[v].index >= 0 && (size_t)entry->views[v].index < entry->count) {
-          has[entry->views[v].index] = entry->views[v].has_actor; targets[entry->views[v].index] = entry->views[v].actor;
+          views.has[entry->views[v].index] = entry->views[v].has_actor; views.targets[entry->views[v].index] = entry->views[v].actor;
         }
-      nq_route(s, entry->messages, entry->count, entry->destination, targets, has, entry->count);
-      free(targets); free(has);
-      nq_routed_free(entry);
+      nq_route(s, entry->messages, entry->count, entry->destination, views.targets, views.has, entry->count);
+      qa_cleanup_pop(&views_scope);
+      route_views_free(&views);
     }
-    free(drained);
+    qa_cleanup_pop(&drained_scope);
+    nq_batch_free(&drained);
   }
   s->current_time = frame.time.value;
   gset(s, "frametime", frame.elapsed.value);
@@ -3321,7 +3388,8 @@ static bool sv_equal(const qa_save_value *a, const qa_save_value *b) {
   switch (a->kind) {
     case QA_SAVE_NULL: return true;
     case QA_SAVE_BOOLEAN: return a->boolean == b->boolean;
-    case QA_SAVE_NUMBER: return a->number == b->number || (isnan(a->number) && isnan(b->number));
+    case QA_SAVE_NUMBER: /* Object.is: NaN equals NaN, -0 differs from 0 */
+      return (a->number == b->number && signbit(a->number) == signbit(b->number)) || (isnan(a->number) && isnan(b->number));
     case QA_SAVE_BIGINT: case QA_SAVE_STRING: return strcmp(a->text, b->text) == 0;
     case QA_SAVE_BYTES: return a->byte_length == b->byte_length && (a->byte_length == 0 || memcmp(a->bytes, b->bytes, a->byte_length) == 0);
     case QA_SAVE_ARRAY:
@@ -3667,7 +3735,9 @@ static void check_declaration(S *s, const R *reader, const char *key, const char
   qa_save_value *current = is(key, "pickupCallers") ? pickup_callers_value(s) : declaration_value(s, key);
   const qa_save_value *saved = f.value;
   qa_save_value *fallback = NULL;
-  if (!saved || saved->kind == QA_SAVE_UNDEFINED) saved = fallback = (is(key, "teams") || is(key, "pickupCallers")) ? arr() : sv_check(qa_save_value_null());
+  /* TS `value ?? fallback`: a saved null takes the fallback too. */
+  if (!saved || saved->kind == QA_SAVE_UNDEFINED || saved->kind == QA_SAVE_NULL)
+    saved = fallback = (is(key, "teams") || is(key, "pickupCallers")) ? arr() : sv_check(qa_save_value_null());
   bool same = sv_equal(saved, current);
   qa_save_value_free(current); qa_save_value_free(fallback);
   if (!same) qa_save_reader_fail(&f, "%s", message);
@@ -3715,6 +3785,17 @@ static void clear_host_state(S *s) {
   s->nq_signon_count = 0; s->nq_signon_view_count = 0;
   nq_routed_reset(s);
 }
+typedef struct local_restore {
+  qa_netquake_message *baseline; size_t baseline_count;
+  qa_app_sim_quakec_captured_client *clients; size_t client_count;
+} local_restore;
+static void local_restore_free(void *arg) {
+  local_restore *l = arg;
+  nq_messages_free(l->baseline, l->baseline_count);
+  for (size_t i = 0; i < l->client_count; i++) nq_messages_free((qa_netquake_message *)l->clients[i].messages, l->clients[i].message_count);
+  free(l->clients);
+  memset(l, 0, sizeof *l);
+}
 static void restore_host(S *s, const qa_save_value *value) {
   R reader;
   if (!qa_save_reader_init(&reader, value, "quakec.source")) qa_range_error("Out of memory");
@@ -3745,11 +3826,16 @@ static void restore_host(S *s, const qa_save_value *value) {
     set_scratch(&s->original_save_extension_text, qa_save_reader_is_undefined(&f) ? "" : qa_save_reader_string(&f)); }
   clear_host_state(s);
   R list = fld(&reader, "activeClients");
-  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
-    R entry = itm(&list, i);
-    qa_actor_id actor = live_actor(s, &entry);
-    if (!qa_app_sim_quakec_source_is_reserved_client(s, actor) || active(s, actor)) qa_save_reader_fail(&reader, "invalid active QC client");
-    actor_set_add(&s->active_clients, actor);
+  { /* TS list(live) resolves every entry before the first membership check. */
+    size_t n = qa_save_reader_list_count(&list);
+    qa_actor_id *actors = xalloc((n ? n : 1) * sizeof *actors);
+    qa_cleanup scope; qa_cleanup_push(&scope, free, actors);
+    for (size_t i = 0; i < n; i++) { R entry = itm(&list, i); actors[i] = live_actor(s, &entry); }
+    for (size_t i = 0; i < n; i++) {
+      if (!qa_app_sim_quakec_source_is_reserved_client(s, actors[i]) || active(s, actors[i])) qa_save_reader_fail(&reader, "invalid active QC client");
+      actor_set_add(&s->active_clients, actors[i]);
+    }
+    qa_cleanup_pop(&scope); free(actors);
   }
   list = fld(&reader, "pendingWeapons");
   for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
@@ -3796,19 +3882,28 @@ static void restore_host(S *s, const qa_save_value *value) {
     identity_set(s, slot, *client);
   }
   R spectators = fld(&reader, "spectatorSlots");
-  if (!qa_save_reader_is_undefined(&spectators))
-    for (size_t i = 0, n = qa_save_reader_list_count(&spectators); i < n; i++) {
-      R entry = itm(&spectators, i);
-      int64_t slot = client_slot_of(s, &entry);
-      if (!s->quakeworld || !identity_get(s, slot) || slot_set_has(&s->spectator_slots, slot)) qa_save_reader_fail(&spectators, "invalid spectator slot");
-      slot_set_add(&s->spectator_slots, slot);
+  if (!qa_save_reader_is_undefined(&spectators)) { /* TS spectators.list(clientSlot), then the checks */
+    size_t n = qa_save_reader_list_count(&spectators);
+    int64_t *slots = xalloc((n ? n : 1) * sizeof *slots);
+    qa_cleanup scope; qa_cleanup_push(&scope, free, slots);
+    for (size_t i = 0; i < n; i++) { R entry = itm(&spectators, i); slots[i] = client_slot_of(s, &entry); }
+    for (size_t i = 0; i < n; i++) {
+      if (!s->quakeworld || !identity_get(s, slots[i]) || slot_set_has(&s->spectator_slots, slots[i])) qa_save_reader_fail(&spectators, "invalid spectator slot");
+      slot_set_add(&s->spectator_slots, slots[i]);
     }
+    qa_cleanup_pop(&scope); free(slots);
+  }
   list = fld(&reader, "preparedClients");
-  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
-    R entry = itm(&list, i);
-    int64_t slot = client_slot_of(s, &entry);
-    if (slot_set_has(&s->prepared_clients, slot) || !identity_get(s, slot)) qa_save_reader_fail(&reader, "invalid prepared client phase");
-    slot_set_add(&s->prepared_clients, slot);
+  { /* TS list(clientSlot), then the checks */
+    size_t n = qa_save_reader_list_count(&list);
+    int64_t *slots = xalloc((n ? n : 1) * sizeof *slots);
+    qa_cleanup scope; qa_cleanup_push(&scope, free, slots);
+    for (size_t i = 0; i < n; i++) { R entry = itm(&list, i); slots[i] = client_slot_of(s, &entry); }
+    for (size_t i = 0; i < n; i++) {
+      if (slot_set_has(&s->prepared_clients, slots[i]) || !identity_get(s, slots[i])) qa_save_reader_fail(&reader, "invalid prepared client phase");
+      slot_set_add(&s->prepared_clients, slots[i]);
+    }
+    qa_cleanup_pop(&scope); free(slots);
   }
   if (s->active_clients.count != s->identity_count) qa_save_reader_fail(&reader, "client phase identity mismatch");
   for (size_t i = 0; i < s->active_clients.count; i++) {
@@ -3817,19 +3912,34 @@ static void restore_host(S *s, const qa_save_value *value) {
       qa_save_reader_fail(&reader, "incomplete saved client phase");
   }
   list = fld(&reader, "fragRecords");
-  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
-    R entry = itm(&list, i), killer = fld(&entry, "killer"), victim = fld(&entry, "victim");
-    qa_app_sim_quakec_frag frag = {ref_actor(s, &killer), ref_actor(s, &victim)};
-    (void)qa_event_ring_admit(&s->frag_records, &frag);
+  { /* TS list(...) then admitAll: one all-or-nothing batch. */
+    size_t n = qa_save_reader_list_count(&list);
+    qa_app_sim_quakec_frag *frags = xalloc((n ? n : 1) * sizeof *frags);
+    qa_cleanup scope; qa_cleanup_push(&scope, free, frags);
+    for (size_t i = 0; i < n; i++) {
+      R entry = itm(&list, i), killer = fld(&entry, "killer"), victim = fld(&entry, "victim");
+      frags[i].killer = ref_actor(s, &killer);
+      frags[i].victim = ref_actor(s, &victim);
+    }
+    if (n != 0) (void)qa_event_ring_admit_all(&s->frag_records, frags, n);
+    qa_cleanup_pop(&scope); free(frags);
   }
   qa_compat_qc_actor_resolver resolve = {s, resolver};
   list = fld(&reader, "routed");
-  for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
-    R entry = itm(&list, i), entries = fld(&entry, "entries"), destination = fld(&entry, "destination");
-    size_t count = 0;
-    qa_compat_qc_routed_message *restored = qa_compat_qc_broadcast_restore_entries(&s->messages, entries.value, resolve, &count);
-    qa_app_sim_quakec_routed record = {restored, count, qa_compat_qc_read_destination(&destination, resolve)};
-    (void)qa_event_ring_admit(&s->routed, &record);
+  {
+    routed_batch batch = {xalloc((qa_save_reader_list_count(&list) ? qa_save_reader_list_count(&list) : 1) * sizeof *batch.records), 0};
+    qa_cleanup scope; qa_cleanup_push(&scope, routed_batch_free, &batch);
+    for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
+      R entry = itm(&list, i), entries = fld(&entry, "entries"), destination = fld(&entry, "destination");
+      qa_app_sim_quakec_routed *record = &batch.records[batch.count];
+      memset(record, 0, sizeof *record);
+      record->entries = qa_compat_qc_broadcast_restore_entries(&s->messages, entries.value, resolve, &record->entry_count);
+      batch.count++;
+      record->destination = qa_compat_qc_read_destination(&destination, resolve);
+    }
+    if (batch.count != 0) (void)qa_event_ring_admit_all(&s->routed, batch.records, batch.count);
+    qa_cleanup_pop(&scope);
+    free(batch.records); /* the ring owns the records now */
   }
   {
     R signon = fld(&reader, "signon");
@@ -3859,18 +3969,26 @@ static void restore_host(S *s, const qa_save_value *value) {
     free(entries);
   }
   R nq_routed_reader = fld(&reader, "netQuakeRouted");
-  if (!qa_save_reader_is_undefined(&nq_routed_reader))
-    for (size_t i = 0, n = qa_save_reader_list_count(&nq_routed_reader); i < n; i++) {
+  if (!qa_save_reader_is_undefined(&nq_routed_reader)) {
+    size_t n = qa_save_reader_list_count(&nq_routed_reader);
+    nq_batch batch = {xalloc((n ? n : 1) * sizeof *batch.records), 0};
+    qa_cleanup scope; qa_cleanup_push(&scope, nq_batch_free, &batch);
+    for (size_t i = 0; i < n; i++) {
       R entry = itm(&nq_routed_reader, i), bytes = fld(&entry, "bytes"), destination = fld(&entry, "destination"), views = fld(&entry, "views");
-      nq_routed record; memset(&record, 0, sizeof record);
-      record.messages = restore_nq(s, &bytes, &record.count);
+      nq_routed *record = &batch.records[batch.count];
+      memset(record, 0, sizeof *record);
+      record->messages = restore_nq(s, &bytes, &record->count);
+      batch.count++;
       size_t length = 0;
-      free(qa_compat_qc_broadcast_capture_netquake_messages(&s->messages, record.messages, record.count, &length));
-      record.size = length;
-      record.destination = qa_compat_qc_read_destination(&destination, resolve);
-      read_views(s, &views, record.messages, record.count, &record.views, &record.view_count);
-      (void)qa_event_ring_admit(&s->nq_routed, &record);
+      free(qa_compat_qc_broadcast_capture_netquake_messages(&s->messages, record->messages, record->count, &length));
+      record->size = length;
+      record->destination = qa_compat_qc_read_destination(&destination, resolve);
+      read_views(s, &views, record->messages, record->count, &record->views, &record->view_count);
     }
+    if (batch.count != 0) (void)qa_event_ring_admit_all(&s->nq_routed, batch.records, batch.count);
+    qa_cleanup_pop(&scope);
+    free(batch.records); /* the ring owns the records now */
+  }
   models_clear(s);
   list = fld(&reader, "models");
   for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
@@ -3883,8 +4001,9 @@ static void restore_host(S *s, const qa_save_value *value) {
     if (is_map && index != map_index) qa_save_reader_fail(&entry, "saved map model index differs from current world");
     R min = fld(&bounds, "min"), max = fld(&bounds, "max");
     R a = fld(&min, "x"), b = fld(&min, "y"), c = fld(&min, "z"), d = fld(&max, "x"), e = fld(&max, "y"), f = fld(&max, "z");
-    qa_bounds value = {{qa_save_reader_finite(&a), qa_save_reader_finite(&b), qa_save_reader_finite(&c)},
-                       {qa_save_reader_finite(&d), qa_save_reader_finite(&e), qa_save_reader_finite(&f)}};
+    qa_bounds value; /* read in TS order: initializer-list evaluation is unsequenced in C */
+    value.min.x = qa_save_reader_finite(&a); value.min.y = qa_save_reader_finite(&b); value.min.z = qa_save_reader_finite(&c);
+    value.max.x = qa_save_reader_finite(&d); value.max.y = qa_save_reader_finite(&e); value.max.z = qa_save_reader_finite(&f);
     model_set(s, name, index, value);
   }
   precached_clear(s);
@@ -3898,33 +4017,37 @@ static void restore_host(S *s, const qa_save_value *value) {
     const qa_resolved_resource_reference *resource = NULL;
     if (is_map) resource = &s->options.recipe->map.geometry;
     else { const qa_app_sim_quakec_resource *r = qa_app_sim_quakec_resources_get(&s->prepared->resources, name); if (r) resource = &r->resource; }
-    double index = fint(&entry, "index", 1);
-    if (is_map && index != map_index) qa_save_reader_fail(&entry, "saved inline model index differs from current map");
+    if (is_map && fint(&entry, "index", 1) != map_index) qa_save_reader_fail(&entry, "saved inline model index differs from current map");
     R id = fld(&entry, "id"), digest = fld(&entry, "digest");
     if (!colon || colon == key || !resource || !is(resource->id, qa_save_reader_string(&id)) || !is(resource->digest, qa_save_reader_string(&digest))
         || precache_get(s, key))
       qa_save_reader_fail(&entry, "saved precache resource differs from mounted content");
+    double index = fint(&entry, "index", 1);
     precache_set(s, key, (qa_compat_qc_precached_resource){index, *resource});
   }
   R local = fld(&reader, "localMessages");
   if (!qa_save_reader_is_undefined(&local)) {
     R started = fld(&local, "started"), baseline = fld(&local, "baseline"), clients = fld(&local, "clients");
     s->local_messages_started = qa_save_reader_boolean(&started);
-    size_t baseline_count = 0;
-    qa_netquake_message *baseline_messages = retain_owned(s, restore_nq(s, &baseline, &baseline_count), baseline_count);
+    local_restore decoded; memset(&decoded, 0, sizeof decoded);
+    qa_cleanup decoded_scope; qa_cleanup_push(&decoded_scope, local_restore_free, &decoded);
+    decoded.baseline = restore_nq(s, &baseline, &decoded.baseline_count);
     size_t client_count = qa_save_reader_list_count(&clients);
-    qa_app_sim_quakec_captured_client *captured = xalloc((client_count ? client_count : 1) * sizeof *captured);
+    decoded.clients = xalloc((client_count ? client_count : 1) * sizeof *decoded.clients);
     bool any_view = false;
-    for (size_t i = 0; i < baseline_count; i++) if (is(baseline_messages[i].kind, "set-view")) any_view = true;
+    for (size_t i = 0; i < decoded.baseline_count; i++) if (is(decoded.baseline[i].kind, "set-view")) any_view = true;
     for (size_t i = 0; i < client_count; i++) {
       R entry = itm(&clients, i), actor = fld(&entry, "actor"), bytes = fld(&entry, "bytes");
+      qa_actor_id resolved = ref_actor(s, &actor);
       size_t count = 0;
-      qa_netquake_message *messages = retain_owned(s, restore_nq(s, &bytes, &count), count);
-      captured[i] = (qa_app_sim_quakec_captured_client){ref_actor(s, &actor), messages, count};
+      qa_netquake_message *messages = restore_nq(s, &bytes, &count);
+      decoded.clients[i] = (qa_app_sim_quakec_captured_client){resolved, messages, count};
+      decoded.client_count = i + 1;
       for (size_t j = 0; j < count; j++) if (is(messages[j].kind, "set-view")) any_view = true;
     }
-    qa_app_sim_quakec_local_messages_restore(s->local_messages, baseline_messages, baseline_count, captured, client_count);
-    free(captured);
+    qa_app_sim_quakec_local_messages_restore(s->local_messages, decoded.baseline, decoded.baseline_count, decoded.clients, client_count);
+    qa_cleanup_pop(&decoded_scope);
+    local_restore_free(&decoded);
     R views = fld(&local, "views");
     if (!qa_save_reader_is_undefined(&views)) {
       R base = fld(&views, "baseline"), view_clients = fld(&views, "clients");
@@ -4199,18 +4322,15 @@ void qa_app_sim_quakec_source_destroy(S *s) {
   free(s->signon);
   nq_messages_free(s->nq_signon, s->nq_signon_count);
   free(s->nq_signon_views);
-  for (size_t i = 0; i < s->retained_count; i++) nq_messages_free(s->retained[i], s->retained_counts[i]);
-  free(s->retained); free(s->retained_counts);
   qa_app_sim_quakec_local_messages_destroy(s->local_messages);
   info_clear(s); free(s->user_info);
   free(s->spawn_parameters); free(s->identities); free(s->networks); free(s->pending); free(s->incoming);
   free(s->active_clients.items); free(s->spectator_slots.items); free(s->prepared_clients.items);
   models_clear(s); free(s->models); precached_clear(s); free(s->precached);
-  for (size_t i = 0; i < s->cell_count; i++) free(s->cells[i]);
+  for (size_t i = 0; i < s->cell_count; i++) { free(s->cells[i]->team); free(s->cells[i]); }
   free(s->cells);
   for (size_t i = 0; i < s->inventory_cell_count; i++) free(s->inventory_cells[i]);
   free(s->inventory_cells);
-  for (size_t i = 0; i < sizeof s->message_texts / sizeof s->message_texts[0]; i++) free(s->message_texts[i]);
   free(s->aim_targets); free(s->classname_scratch); free(s->team_scratch); free(s->death_scratch); free(s->info_scratch);
   free(s->client_scratch); free((void *)s->name_scratch);
   travel_free(s);

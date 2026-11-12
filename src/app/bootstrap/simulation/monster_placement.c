@@ -229,7 +229,26 @@ static qa_app_sim_nearby_placement placed(qa_vec3 origin, const qa_actor_id *gro
   return out;
 }
 
+/* The search's buffers, freed when a trace or blockedBy callback raises. */
+typedef struct placement_scratch { qa_app_sim_placement_offset *offsets; double *vertical; qa_vec3 *pending; key_set visited; } placement_scratch;
+static void placement_scratch_free(void *arg) {
+  placement_scratch *scratch = arg;
+  free(scratch->offsets); free(scratch->vertical); free(scratch->pending);
+  free(scratch->visited.keys); free(scratch->visited.slots);
+  memset(scratch, 0, sizeof *scratch);
+}
+static qa_app_sim_nearby_placement nearby_placement(const qa_app_sim_nearby_placement_input *input, placement_scratch *scratch);
 qa_app_sim_nearby_placement qa_app_sim_nearby_monster_placement(const qa_app_sim_nearby_placement_input *input) {
+  placement_scratch scratch;
+  memset(&scratch, 0, sizeof scratch);
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, placement_scratch_free, &scratch);
+  qa_app_sim_nearby_placement result = nearby_placement(input, &scratch);
+  qa_cleanup_pop(&cleanup);
+  placement_scratch_free(&scratch);
+  return result;
+}
+static qa_app_sim_nearby_placement nearby_placement(const qa_app_sim_nearby_placement_input *input, placement_scratch *scratch) {
   qa_app_sim_nearby_placement none;
   memset(&none, 0, sizeof none);
   const qa_body_state *body = &input->body;
@@ -248,10 +267,10 @@ qa_app_sim_nearby_placement qa_app_sim_nearby_monster_placement(const qa_app_sim
                       authored_bounds.max.x - authored_bounds.min.x, authored_bounds.max.y - authored_bounds.min.y};
   double radius = 2 * qa_js_max(qa_js_max(widths[0], widths[1]), qa_js_max(widths[2], widths[3]));
   size_t offset_count = 0;
-  qa_app_sim_placement_offset *offsets = qa_app_sim_placement_offsets_within(radius, &offset_count);
+  qa_app_sim_placement_offset *offsets = scratch->offsets = qa_app_sim_placement_offsets_within(radius, &offset_count);
   if (!same(input->locomotion, "walk")) {
     size_t vertical_count = 1, vertical_capacity = 16;
-    double *vertical = malloc(vertical_capacity * sizeof *vertical);
+    double *vertical = scratch->vertical = malloc(vertical_capacity * sizeof *vertical);
     if (vertical == NULL) qa_range_error("Out of memory");
     vertical[0] = 0;
     for (double z = 4; z <= body->bounds.max.z - body->bounds.min.z; z += 4) {
@@ -259,7 +278,7 @@ qa_app_sim_nearby_placement qa_app_sim_nearby_monster_placement(const qa_app_sim
         vertical_capacity *= 2;
         double *next = realloc(vertical, vertical_capacity * sizeof *vertical);
         if (next == NULL) qa_range_error("Out of memory");
-        vertical = next;
+        vertical = scratch->vertical = next;
       }
       vertical[vertical_count++] = -z;
       vertical[vertical_count++] = z;
@@ -271,9 +290,8 @@ qa_app_sim_nearby_placement qa_app_sim_nearby_monster_placement(const qa_app_sim
       if (fit.start_solid || fit.all_solid) continue;
       qa_vec3 source_fit = origin;
       source_fit.z = origin.z + body->bounds.min.z - authored_bounds.min.z;
-      if (reachable(input, source_origin, source_fit)) { free(vertical); free(offsets); return placed(origin, NULL); }
+      if (reachable(input, source_origin, source_fit)) return placed(origin, NULL);
     }
-    free(vertical);
   }
   if (same(input->locomotion, "walk")) {
     static const double lifts[2] = {1, 18};
@@ -289,19 +307,17 @@ qa_app_sim_nearby_placement qa_app_sim_nearby_monster_placement(const qa_app_sim
       qa_vec3 source_fit = floor.end;
       source_fit.z = floor.end.z + body->bounds.min.z - authored_bounds.min.z;
       if (!reachable(input, source_origin, source_fit)) continue;
-      free(offsets);
       return placed(floor.end, floor.hit.kind == QA_TRACE_HIT_ACTOR ? &floor.hit.actor : input->world_actor);
     }
   }
-  free(offsets);
   if (!supported || !authored_walks) return none;
   /* Tight authored pockets can open around a corner: follow walkable source-hull edges. */
   size_t pending_count = 1, pending_capacity = 64;
-  qa_vec3 *pending = malloc(pending_capacity * sizeof *pending);
+  qa_vec3 *pending = scratch->pending = malloc(pending_capacity * sizeof *pending);
   if (pending == NULL) qa_range_error("Out of memory");
   pending[0] = source_origin;
-  key_set visited;
-  memset(&visited, 0, sizeof visited);
+  key_set *visited_set = &scratch->visited;
+#define visited (*visited_set)
   key_add(&visited, 0, 0);
   double reach = qa_js_max(512, radius);
   static const double directions[4][2] = {{8, 0}, {-8, 0}, {0, 8}, {0, -8}};
@@ -327,7 +343,7 @@ qa_app_sim_nearby_placement qa_app_sim_nearby_monster_placement(const qa_app_sim
           pending_capacity *= 2;
           qa_vec3 *next = realloc(pending, pending_capacity * sizeof *pending);
           if (next == NULL) qa_range_error("Out of memory");
-          pending = next;
+          pending = scratch->pending = next;
         }
         pending[pending_count++] = floor.end;
         qa_vec3 origin = floor.end;
@@ -344,8 +360,6 @@ qa_app_sim_nearby_placement qa_app_sim_nearby_monster_placement(const qa_app_sim
       }
     }
   }
-  free(pending);
-  free(visited.keys);
-  free(visited.slots);
+#undef visited
   return result;
 }

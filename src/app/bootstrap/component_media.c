@@ -112,10 +112,10 @@ const char *qa_app_prepare_presentation_shaders(qa_app_component_media_host host
     for (size_t i = 0; i < pending_count; i++)
       if (local_shader_remap(pending_all[i])) { pending = pending_all[i]; break; }
     if (pending == NULL) return NULL;
-    if (!pending->local) qa_range_error("Shader delivery requires local media");
+    if (!pending->local) qa_raise("Error", 0, 0, "Shader delivery requires local media");
     const qa_app_retained_presentation *request = host.resolve_shader_replay(host.ctx, pending);
     if (request == NULL) continue;
-    if (request->local_media.event.kind != QA_MEDIA_REQUEST_SHADER_REMAP) qa_range_error("Shader delivery requires a material cue");
+    if (request->local_media.event.kind != QA_MEDIA_REQUEST_SHADER_REMAP) qa_raise("Error", 0, 0, "Shader delivery requires a material cue");
     local_current current = {&host, request};
     if (!local_media_current(&current)) { host.acknowledge_local_media(host.ctx, request, false); continue; }
     const qa_component_presentation_media_request *cue = &request->local_media.event;
@@ -130,7 +130,7 @@ const char *qa_app_prepare_presentation_shaders(qa_app_component_media_host host
     qa_shader_remap_result result = qa_world_scene_remap_shader(host.world(host.ctx), cue->original, cue->replacement,
                                                                 cue->time_offset, shaders, local_media_current, &current);
     if (result == QA_REMAP_STALE && local_media_current(&current))
-      qa_range_error("Shader destination changed before local media delivery");
+      qa_raise("Error", 0, 0, "Shader destination changed before local media delivery");
     /* Read before acknowledging: the acknowledgement may release request. */
     char *original = xstrdup(cue->original);
     double sequence = request->local_media.sequence;

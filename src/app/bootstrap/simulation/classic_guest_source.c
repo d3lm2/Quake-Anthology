@@ -11,6 +11,7 @@
 #include "qa/compat/q2/native_combat_call.h"
 #include "qa/compat/q2/native_primary_validation.h"
 #include "qa/compat/q2/rerelease/world_profile.h"
+#include "qa/content/json_text.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/guest/abi/adapter.h"
@@ -215,6 +216,31 @@ static void m_check(void *ctx, qa_guest_address a, double byte_length, const cha
   qa_sparse_check(&g->memory, to_core(a), byte_count(byte_length), kind);
 }
 static uint8_t *m_borrow(void *ctx, qa_guest_address a, double byte_length) { qa_app_sim_native_guest *g = ctx; return qa_sparse_borrow(&g->memory, to_core(a), byte_count(byte_length)); }
+/* borrow under a local fault target: an "unmapped" GuestMemoryFault is the false return, any other fault goes on to
+ * the fault target that was installed (a running CPU) or aborts as an uncaught throw does. */
+static bool m_borrow_mapped(void *ctx, qa_guest_address a, double byte_length, uint8_t **out) {
+  qa_app_sim_native_guest *g = ctx;
+  qa_sparse_guest_memory *memory = &g->memory;
+  qa_guest_throw *outer = memory->throw_ctx;
+  jmp_buf buf;
+  qa_guest_throw caught;
+  qa_guest_throw_init(&caught, &buf);
+  memory->throw_ctx = &caught;
+  if (setjmp(buf) == 0) {
+    *out = qa_sparse_borrow(memory, to_core(a), byte_count(byte_length));
+    memory->throw_ctx = outer;
+    return true;
+  }
+  memory->throw_ctx = outer;
+  if (caught.kind == QA_GUEST_THROW_MEMORY && caught.memory.reason == QA_FAULT_UNMAPPED) return false;
+  if (outer != NULL && outer->buf != NULL) {
+    jmp_buf *target = outer->buf;
+    *outer = caught;
+    outer->buf = target;
+    longjmp(*target, 1);
+  }
+  qa_range_error("%s", caught.kind == QA_GUEST_THROW_MEMORY ? caught.memory.message : caught.detail);
+}
 static void m_copy(void *ctx, qa_guest_address a, uint8_t *dest, double byte_length) { qa_app_sim_native_guest *g = ctx; qa_sparse_copy(&g->memory, to_core(a), dest, byte_count(byte_length)); }
 static void m_copy_into(void *ctx, qa_guest_address a, uint8_t *dest, size_t dest_length, double byte_length) {
   qa_app_sim_native_guest *g = ctx; qa_sparse_copy_into(&g->memory, to_core(a), dest, dest_length, 0, byte_count(byte_length));
@@ -409,12 +435,19 @@ static bool variadic_layouts(void *ctx, const qa_guest_host_callback *callback, 
   if (g->variadic_layouts == NULL) qa_range_error("Variadic host callback requires a layout resolver");
   qa_guest_call_value values_stack[16] = {{0}}; qa_guest_call_value *values = fixed_count <= 16 ? values_stack : xcalloc(fixed_count, sizeof *values);
   for (size_t i = 0; i < fixed_count; i++) values[i] = contract_value(g, &fixed[i], NULL);
-  qa_guest_value_layout layouts[64];
+  qa_guest_value_layout layouts_stack[64]; qa_guest_value_layout *layouts = layouts_stack;
   size_t count = g->variadic_layouts(g->variadic_ctx, callback->id, values, fixed_count, layouts, 64);
+  /* TS has no limit on the variadic arguments a format names: a longer list is resolved again into its own storage
+   * (the resolver reports the whole count and fills what fits). */
+  if (count > 64) {
+    size_t capacity = count; layouts = xcalloc(capacity, sizeof *layouts);
+    count = g->variadic_layouts(g->variadic_ctx, callback->id, values, fixed_count, layouts, capacity);
+    if (count > capacity) count = capacity;
+  }
   if (values != values_stack) free(values);
-  if (count > 64) qa_range_error("Too many variadic guest arguments");
   *out = xcalloc(count, sizeof **out); *out_count = count;
   for (size_t i = 0; i < count; i++) (*out)[i] = core_value_layout(g, &layouts[i]);
+  if (layouts != layouts_stack) free(layouts);
   return true;
 }
 
@@ -444,8 +477,11 @@ static qa_guest_execution_stop run_x86(void *ctx, int64_t budget, bool has_retur
 static qa_guest_execution_stop run_x64(void *ctx, int64_t budget, bool has_return, qa_guest_core_address ret) { return qa_x64_cpu_run(ctx, budget, has_return, ret); }
 static const qa_pe_image *no_library(void *ctx, const char *library, const qa_pe_image *requesting) { (void)ctx; (void)library; (void)requesting; return NULL; }
 
+static void native_guest_cleanup(void *guest) { qa_app_sim_native_guest_destroy(guest); }
 qa_app_sim_native_guest *qa_app_sim_native_guest_create(const qa_app_sim_native_guest_options *options) {
   qa_app_sim_native_guest *g = calloc(1, sizeof *g); if (g == NULL) return NULL;
+  /* A refused image (mapPeImage) or a failed step releases what was built so far. */
+  qa_cleanup node; qa_cleanup_push(&node, native_guest_cleanup, g);
   g->module_strings[0] = xstrdup(options->module.id); g->module_strings[1] = xstrdup(options->module.artifact_path);
   g->module_strings[2] = xstrdup(options->module.digest); g->module_strings[3] = xstrdup(options->module.revision);
   g->module.id = g->module_strings[0]; g->module.artifact_path = g->module_strings[1]; g->module.digest = g->module_strings[2]; g->module.revision = g->module_strings[3];
@@ -492,6 +528,7 @@ qa_app_sim_native_guest *qa_app_sim_native_guest_create(const qa_app_sim_native_
   m->ctx = g; m->module = g->module; m->address_space = &g->memory; m->pointer_bytes = options->pointer_bytes; m->managed = options->managed;
   m->pointer = m_pointer; m->offset = m_offset; m->allocate = m_allocate; m->unmap = m_unmap; m->check = m_check; m->borrow = m_borrow;
   m->copy = m_copy; m->copy_into = m_copy_into; m->write = m_write; m->find_zero = m_find_zero; m->observe_writes = m_observe; m->unobserve_writes = m_unobserve; m->allocate_pooled = m_allocate_pooled;
+  m->borrow_mapped = m_borrow_mapped;
   qa_compat_q2_runner *r = &g->runner_mirror;
   r->ctx = g; r->memory = m; r->cpu_state = &g->state; r->simd_xmm = g->state.simd.xmm; r->simd_xmm_len = g->state.simd.xmm_len;
   r->invoke = r_invoke; r->invoke_loading = r_invoke_loading; r->current_context = r_current_context; r->depth = r_depth;
@@ -500,6 +537,7 @@ qa_app_sim_native_guest *qa_app_sim_native_guest_create(const qa_app_sim_native_
   r->bind = r_bind; r->observe_entry = r_observe_entry; r->bind_entry = r_bind_entry; r->remove_entry = r_remove;
   r->bind_inline_region = r_bind_region; r->remove_inline_region = r_remove; r->bind_inline_region_accepts = r_bind_region_accepts;
   r->read_register = r_read_register; r->write_register = r_write_register; r->unwind = r_unwind;
+  qa_cleanup_pop(&node);
   return g;
 }
 void qa_app_sim_native_guest_destroy(qa_app_sim_native_guest *g) {
@@ -507,7 +545,8 @@ void qa_app_sim_native_guest_destroy(qa_app_sim_native_guest *g) {
   while (g->handle_count > 0) release_handle(g, g->handle_count - 1);
   free(g->handles);
   qa_windows_guest_runtime_destroy(&g->runtime);
-  qa_guest_call_runner_destroy(g->runner); free(g->runner);
+  if (g->runner != NULL) qa_guest_call_runner_destroy(g->runner);
+  free(g->runner);
   if (g->x64_active) qa_x64_cpu_destroy(&g->x64);
   qa_guest_callback_table_destroy(&g->callbacks);
   for (write_observer *o = g->observers; o != NULL;) { write_observer *next = o->next; free(o); o = next; }
@@ -561,7 +600,8 @@ size_t qa_app_sim_native_guest_mapping_count(qa_app_sim_native_guest *g) { retur
 
 /* ===================== preparation ===================== */
 typedef struct world_storage { qa_compat_q2_classic_world_profile classic; qa_compat_q2_rerelease_primary_world_profile rerelease; bool is_classic, is_rerelease; } world_storage;
-typedef struct compatibility_storage { qa_compat_q2_native_compatibility_result result; world_storage world; } compatibility_storage;
+/* reference: opened.reference, the declaration TS records (declaration: opened.reference). */
+typedef struct compatibility_storage { qa_compat_q2_native_compatibility_result result; world_storage world; const qa_resolved_resource_reference *reference; } compatibility_storage;
 static const void *read_classic_world(void *ctx, const qa_save_reader *reader, qa_content_digest digest) {
   world_storage *w = ctx; if (!qa_compat_q2_read_classic_primary_world_profile(reader, digest, &w->classic)) qa_range_error("Out of memory");
   w->is_classic = true; return &w->classic;
@@ -576,17 +616,25 @@ static bool same_content(void *ctx, const qa_content_mount *mount) {
   qa_content_id content = mount->kind == QA_CONTENT_MOUNT_ARCHIVE ? mount->as.archive.identity.content : mount->as.loose.identity.content;
   return same(content, filter->content);
 }
+static void value_cleanup(void *value) { qa_save_value_free(value); }
+static void storage_cleanup(void *storage) { qa_app_sim_native_compatibility_free(&((compatibility_storage *)storage)->result); }
 qa_compat_q2_native_compatibility_result *qa_app_sim_read_native_compatibility(qa_content_mounted *mounts, const qa_resolved_execution_module *execution) {
   content_filter filter = {execution->owner.content};
   qa_content_opened_resource opened;
   if (!qa_content_mounted_open(mounts, "native-compatibility.json", same_content, &filter, &opened)) return NULL;
-  qa_save_value *value = qa_parse_json_value(opened.bytes, opened.byte_length, false);
-  if (value == NULL) qa_range_error("Invalid native-compatibility.json");
+  /* JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(opened.bytes)); a refusal releases what was read. */
+  qa_cleanup bytes_node; qa_cleanup_push(&bytes_node, free, opened.bytes);
+  qa_save_value *value = qa_content_parse_json_fatal(opened.bytes, opened.byte_length);
+  if (value == NULL) qa_range_error("Out of memory");
+  qa_cleanup value_node; qa_cleanup_push(&value_node, value_cleanup, value);
   compatibility_storage *storage = xcalloc(1, sizeof *storage);
+  qa_cleanup storage_node; qa_cleanup_push(&storage_node, storage_cleanup, storage);
   qa_compat_q2_world_readers readers = {&storage->world, read_classic_world, read_rerelease_world};
   if (!qa_compat_q2_parse_native_compatibility(value, execution, readers, &storage->result)) qa_range_error("Out of memory");
+  qa_cleanup_pop(&storage_node); qa_cleanup_pop(&value_node); qa_cleanup_pop(&bytes_node);
   qa_save_value_free(value); free(opened.bytes);
-  if (!storage->result.found) { free(storage); return NULL; }
+  storage->reference = opened.reference;
+  if (!storage->result.found) { qa_app_sim_native_compatibility_free(&storage->result); return NULL; }
   storage->result.profile.weapons = &storage->result.weapons; storage->result.profile.player = &storage->result.player;
   storage->result.profile.commands = &storage->result.commands; storage->result.profile.inventory = &storage->result.inventory;
   storage->result.profile.drop = &storage->result.drop; storage->result.profile.pickups = &storage->result.pickups;
@@ -612,26 +660,36 @@ static void validate_primary(const qa_compat_q2_native_primary_profile *profile,
     sections[i].permissions = qa_guest_permissions_name(pe->sections[i].permissions);
   }
   qa_compat_q2_pe_file file = {pe->image_size, pe->abi.pointer_bytes, sections, pe->section_count};
+  qa_cleanup node; qa_cleanup_push(&node, free, sections);
   qa_compat_q2_validate_native_primary(profile, file, primary_entity_bytes(profile));
+  qa_cleanup_pop(&node);
   free(sections);
 }
+typedef struct artifact_scratch { uint8_t **bytes; size_t *length; qa_pe_file pe; bool has_pe; qa_compat_q2_native_compatibility_result *primary; } artifact_scratch;
+static void artifact_cleanup(void *arg) {
+  artifact_scratch *scratch = arg;
+  if (scratch->has_pe) qa_pe_file_free(&scratch->pe);
+  qa_app_sim_native_compatibility_free(scratch->primary);
+  free(*scratch->bytes); *scratch->bytes = NULL; *scratch->length = 0;
+}
+/* A refusal keeps nothing: the read bytes, the parsed PE and the declaration are released. */
 qa_compat_q2_native_compatibility_result *qa_app_sim_prepare_native_artifact(const qa_resolved_execution_module *execution, qa_content_mounted *mounts,
                                                                            const char *edition, const char *abi_message, uint8_t **bytes, size_t *length,
                                                                            qa_compat_q2_native_primary_declaration *primary_out) {
   const qa_resolved_resource_reference *artifact = execution->artifact;
   *bytes = qa_content_mounted_read_reference(mounts, artifact, length);
   if (*bytes == NULL) qa_range_error("Native artifact could not be read");
-  qa_pe_file pe; qa_parse_pe(&pe, *bytes, *length);
-  if (!same(pe.abi.kind, execution->profile.kind)) qa_range_error("%s", abi_message);
-  qa_compat_q2_native_compatibility_result *primary = qa_app_sim_read_native_compatibility(mounts, execution);
-  if (primary != NULL) validate_primary(&primary->profile, &pe);
-  qa_pe_file_free(&pe);
-  if (primary != NULL && !same(primary->profile.edition, edition)) qa_range_error("Native declaration edition differs from selected API");
-  if (primary != NULL) {
-    const qa_resolved_resource_reference *reference = NULL;
-    if (!qa_content_mounted_resolve(mounts, "native-compatibility.json", &reference) || reference == NULL) qa_range_error("Native compatibility declaration disappeared");
-    primary_out->declaration = *reference; primary_out->profile = primary->profile;
-  }
+  artifact_scratch scratch; memset(&scratch, 0, sizeof scratch); scratch.bytes = bytes; scratch.length = length;
+  qa_cleanup node; qa_cleanup_push(&node, artifact_cleanup, &scratch);
+  qa_parse_pe(&scratch.pe, *bytes, *length); scratch.has_pe = true;
+  if (!same(scratch.pe.abi.kind, execution->profile.kind)) qa_raise("Error", 0, 0, "%s", abi_message);
+  scratch.primary = qa_app_sim_read_native_compatibility(mounts, execution);
+  if (scratch.primary != NULL) validate_primary(&scratch.primary->profile, &scratch.pe);
+  if (scratch.primary != NULL && !same(scratch.primary->profile.edition, edition)) qa_raise("Error", 0, 0, "%s", "Native declaration edition differs from selected API");
+  qa_compat_q2_native_compatibility_result *primary = scratch.primary;
+  if (primary != NULL) { primary_out->declaration = *((compatibility_storage *)primary)->reference; primary_out->profile = primary->profile; }
+  qa_cleanup_pop(&node);
+  qa_pe_file_free(&scratch.pe);
   return primary;
 }
 static bool classic_api(const qa_resolved_execution_module *execution) {
@@ -640,7 +698,7 @@ static bool classic_api(const qa_resolved_execution_module *execution) {
 }
 void qa_app_sim_prepare_classic_guest(const qa_resolved_execution_module *execution, qa_content_mounted *mounts, qa_app_sim_prepared_classic_guest *out) {
   memset(out, 0, sizeof *out);
-  if (!classic_api(execution)) qa_range_error("Classic Q2 guest requires Windows i386 game API 3");
+  if (!classic_api(execution)) qa_raise("Error", 0, 0, "%s", "Classic Q2 guest requires Windows i386 game API 3");
   qa_compat_q2_native_compatibility_result *primary = qa_app_sim_prepare_native_artifact(execution, mounts, "classic", "Classic native artifact ABI differs from the selected profile",
                                                                                          &out->bytes, &out->length, &out->primary);
   out->edition = "classic"; out->execution = *execution;
@@ -651,11 +709,11 @@ void qa_app_sim_prepared_classic_guest_free(qa_app_sim_prepared_classic_guest *p
   memset(prepared, 0, sizeof *prepared);
 }
 qa_module_identity qa_app_sim_prepared_module_identity(const qa_resolved_execution_module *execution, bool has_primary,
-                                                       const qa_compat_q2_native_primary_declaration *primary, char *scratch, size_t scratch_size) {
+                                                       const qa_compat_q2_native_primary_declaration *primary, char **owned_revision) {
   qa_app_sim_prepared_q2_native_guest prepared; memset(&prepared, 0, sizeof prepared);
   prepared.execution = *execution; prepared.has_primary = has_primary;
   if (has_primary) { prepared.primary_requested_path = primary->declaration.requested_path; prepared.primary_digest = primary->declaration.digest; }
-  return qa_app_sim_native_module_identity(prepared, scratch, scratch_size);
+  return qa_app_sim_native_module_identity(prepared, owned_revision);
 }
 
 /* ===================== ClassicGuestSource ===================== */
@@ -670,7 +728,7 @@ struct qa_app_sim_classic_guest_source {
   double budget;
   source_phase phase;
   owned_file *files; /* every wrapper, held or not */
-  char revision[1024];
+  char *revision; /* nativeModuleIdentity's revision when a primary exists */
 };
 static size_t f_read(void *ctx, size_t offset, uint8_t *out, size_t length) { owned_file *f = ctx; return f->inner->read(f->inner->ctx, offset, out, length); }
 static int64_t f_write(void *ctx, size_t offset, const uint8_t *bytes, size_t length) { owned_file *f = ctx; return f->inner->write(f->inner->ctx, offset, bytes, length); }
@@ -696,18 +754,16 @@ static void c_output(void *ctx, qa_windows_stream stream, const uint8_t *bytes, 
 static size_t c_input(void *ctx, size_t length, uint8_t *out) { qa_app_sim_classic_guest_source *s = ctx; return s->capabilities.standard_input(s->capabilities.ctx, length, out); }
 static size_t source_variadic(void *ctx, qa_callback_id id, const qa_guest_call_value *fixed, size_t count, qa_guest_value_layout *out, size_t capacity) {
   qa_app_sim_classic_guest_source *s = ctx;
-  if (s->host == NULL) qa_range_error("Classic API imports have not been bound");
+  if (s->host == NULL) qa_raise("Error", 0, 0, "%s", "Classic API imports have not been bound");
   return qa_compat_q2_classic_guest_host_variadic_layouts(s->host, id, fixed, count, out, capacity);
 }
-static void close_files(qa_app_sim_classic_guest_source *s) { for (owned_file *f = s->files; f != NULL; f = f->next) f_close(f); }
 static const qa_native_call_abi classic_abi = {"windows-i386", "pe32", 4, "cdecl"};
 
-qa_app_sim_classic_guest_source *qa_app_sim_classic_guest_source_create(const qa_app_sim_prepared_classic_guest *prepared,
-                                                                        const qa_app_sim_classic_guest_source_options *options) {
-  if (!classic_api(&prepared->execution)) qa_range_error("Classic guest source requires selected Windows i386 API 3");
-  qa_app_sim_classic_guest_source *s = xcalloc(1, sizeof *s);
-  s->capabilities = options->capabilities;
-  qa_module_identity module = qa_app_sim_prepared_module_identity(&prepared->execution, prepared->has_primary, &prepared->primary, s->revision, sizeof s->revision);
+typedef struct classic_create { qa_app_sim_classic_guest_source *s; const qa_app_sim_prepared_classic_guest *prepared; const qa_app_sim_classic_guest_source_options *options; } classic_create;
+static void classic_create_body(void *arg) {
+  classic_create *job = arg; qa_app_sim_classic_guest_source *s = job->s; const qa_app_sim_prepared_classic_guest *prepared = job->prepared;
+  const qa_app_sim_classic_guest_source_options *options = job->options;
+  qa_module_identity module = qa_app_sim_prepared_module_identity(&prepared->execution, prepared->has_primary, &prepared->primary, &s->revision);
   qa_app_sim_native_guest_options guest; memset(&guest, 0, sizeof guest);
   guest.module = module; guest.pointer_bytes = 4; guest.bytes = prepared->bytes; guest.length = prepared->length;
   /* sys_win.c runs _controlfp(_PC_24, _MCW_PC) before every frame, so retail game code computes at single precision. */
@@ -734,13 +790,35 @@ qa_app_sim_classic_guest_source *qa_app_sim_classic_guest_source_create(const qa
   if (s->host == NULL) qa_range_error("Out of memory");
   qa_app_sim_native_guest_initialize(s->guest, s->game, classic_abi, s->budget);
   (void)qa_compat_q2_classic_guest_host_get_game_api(s->host, s->game);
-  return s;
+}
+static void classic_close_files(void *arg);
+static void classic_discard_job(void *arg) { qa_app_sim_classic_guest_source_discard(arg); }
+static void classic_release_memory(void *arg) { qa_app_sim_classic_guest_source *s = arg; if (s->guest != NULL) qa_app_sim_native_guest_release_memory(s->guest); }
+/* TS: source !== null ? source.discard() : (closeFiles(files), releaseMemory(memory)), any failure an AggregateError. */
+static void classic_create_cleanup(void *arg) {
+  qa_app_sim_classic_guest_source *s = arg;
+  if (s->host != NULL) { qa_app_sim_classic_guest_source_discard(s); return; }
+  classic_close_files(s);
+  classic_release_memory(s);
+}
+qa_app_sim_classic_guest_source *qa_app_sim_classic_guest_source_create(const qa_app_sim_prepared_classic_guest *prepared,
+                                                                        const qa_app_sim_classic_guest_source_options *options) {
+  if (!classic_api(&prepared->execution)) qa_raise("Error", 0, 0, "%s", "Classic guest source requires selected Windows i386 API 3");
+  qa_app_sim_classic_guest_source *s = xcalloc(1, sizeof *s);
+  s->capabilities = options->capabilities;
+  classic_create job = {s, prepared, options}; qa_caught_error error;
+  if (qa_try(classic_create_body, &job, &error)) return s;
+  qa_caught_error cleanup; bool cleaned = qa_try(classic_create_cleanup, s, &cleanup);
+  qa_app_sim_classic_guest_source_destroy(s);
+  if (!cleaned) qa_raise("AggregateError", 0, 0, "%s", "Classic native guest construction and cleanup failed");
+  qa_rethrow(&error);
 }
 void qa_app_sim_classic_guest_source_destroy(qa_app_sim_classic_guest_source *s) {
   if (s == NULL) return;
   qa_compat_q2_classic_guest_host_destroy(s->host);
   qa_app_sim_native_guest_destroy(s->guest);
   for (owned_file *f = s->files; f != NULL;) { owned_file *next = f->next; free(f); f = next; }
+  free(s->revision);
   free(s);
 }
 qa_compat_q2_classic_guest_host *qa_app_sim_classic_guest_source_host(qa_app_sim_classic_guest_source *s) { return s->host; }
@@ -749,42 +827,69 @@ qa_compat_q2_memory *qa_app_sim_classic_guest_source_memory(qa_app_sim_classic_g
 qa_app_sim_native_guest *qa_app_sim_classic_guest_source_guest(qa_app_sim_classic_guest_source *s) { return s->guest; }
 qa_guest_address qa_app_sim_classic_guest_source_image_base(qa_app_sim_classic_guest_source *s) { return qa_app_sim_native_guest_image_base(s->guest); }
 qa_guest_address qa_app_sim_classic_guest_source_entry(qa_app_sim_classic_guest_source *s, const char *name) { return qa_app_sim_native_guest_entry(s->guest, name); }
-void qa_app_sim_classic_guest_source_init(qa_app_sim_classic_guest_source *s) {
-  if (s->phase != PHASE_CREATED) qa_range_error("Classic guest Init requires a fresh source");
-  s->phase = PHASE_INITIALIZING;
-  /* TS closes the source when Init throws; the C throw aborts. */
-  qa_compat_q2_classic_guest_host_init(s->host); s->phase = PHASE_RUNNING;
+typedef struct classic_init { qa_app_sim_classic_guest_source *s; void (*next_frame)(void *); void *next_ctx; bool loading; } classic_init;
+static void classic_init_body(void *arg) {
+  classic_init *job = arg;
+  if (job->loading) qa_compat_q2_classic_guest_host_init_loading(job->s->host, job->next_frame, job->next_ctx);
+  else qa_compat_q2_classic_guest_host_init(job->s->host);
+  job->s->phase = PHASE_RUNNING;
 }
+static void classic_close_job(void *arg) { qa_app_sim_classic_guest_source_close(arg); }
+/* TS init(): a throwing Init closes the source; a failing close joins it in an AggregateError. */
+static void classic_init_run(classic_init *job) {
+  qa_app_sim_classic_guest_source *s = job->s;
+  if (s->phase != PHASE_CREATED) qa_raise("Error", 0, 0, "%s", "Classic guest Init requires a fresh source");
+  s->phase = PHASE_INITIALIZING;
+  qa_caught_error error;
+  if (qa_try(classic_init_body, job, &error)) return;
+  qa_caught_error cleanup;
+  if (!qa_try(classic_close_job, s, &cleanup)) qa_raise("AggregateError", 0, 0, "%s", "Classic guest initialization and cleanup failed");
+  qa_rethrow(&error);
+}
+void qa_app_sim_classic_guest_source_init(qa_app_sim_classic_guest_source *s) { classic_init job = {s, NULL, NULL, false}; classic_init_run(&job); }
 void qa_app_sim_classic_guest_source_init_loading(qa_app_sim_classic_guest_source *s, void (*next_frame)(void *), void *next_ctx) {
-  if (s->phase != PHASE_CREATED) qa_range_error("Classic guest Init requires a fresh source");
-  s->phase = PHASE_INITIALIZING;
-  qa_compat_q2_classic_guest_host_init_loading(s->host, next_frame, next_ctx); s->phase = PHASE_RUNNING;
+  classic_init job = {s, next_frame, next_ctx, true}; classic_init_run(&job);
 }
-static void release_owned_actors(qa_app_sim_classic_guest_source *s) {
+/* closeFiles: every held file is closed; failures join in an AggregateError. */
+typedef struct file_job { owned_file *file; } file_job;
+static void close_one(void *arg) { f_close(((file_job *)arg)->file); }
+static void classic_close_files(void *arg) {
+  qa_app_sim_classic_guest_source *s = arg; size_t failures = 0;
+  for (owned_file *f = s->files; f != NULL; f = f->next) { file_job job = {f}; qa_caught_error caught; if (!qa_try(close_one, &job, &caught)) failures++; }
+  if (failures != 0) qa_raise("AggregateError", 0, 0, "%s", "Classic guest file cleanup failed");
+}
+typedef struct release_job { qa_session_actor_registry *actors; qa_owned_actor actor; } release_job;
+static void release_one(void *arg) { release_job *job = arg; qa_session_actor_registry_release(job->actors, job->actor); }
+static void dispose_job(void *arg) { qa_app_sim_classic_guest_source *s = arg; if (s->services.dispose != NULL) s->services.dispose(s->services.ctx); }
+/* Candidate disposal runs no game exports or DLL detach callbacks; each step runs, failures join in an AggregateError. */
+void qa_app_sim_classic_guest_source_discard(qa_app_sim_classic_guest_source *s) {
+  if (s->phase == PHASE_CLOSED) return;
+  if (qa_guest_call_runner_depth(qa_app_sim_native_guest_call_runner(s->guest)) != 0) qa_raise("Error", 0, 0, "%s", "Classic guest disposal requires a completed game call");
+  s->phase = PHASE_CLOSED;
+  size_t failures = 0; qa_caught_error caught;
+  if (!qa_try(dispose_job, s, &caught)) failures++;
   qa_session_actor_registry *actors = s->services.engine->actors;
   const qa_compat_q2_classic_guest_host_options *options = qa_compat_q2_classic_guest_host_get_options(s->host);
   size_t count = 0; const qa_owned_actor *owned = qa_session_actor_registry_owned_by(actors, options->provider, &count);
   qa_owned_actor *copy = xcalloc(count, sizeof *copy); if (count != 0) memcpy(copy, owned, count * sizeof *copy);
-  for (size_t i = 0; i < count; i++) qa_session_actor_registry_release(actors, copy[i]);
+  for (size_t i = 0; i < count; i++) { release_job job = {actors, copy[i]}; if (!qa_try(release_one, &job, &caught)) failures++; }
   free(copy);
+  if (!qa_try(classic_close_files, s, &caught)) failures++;
+  if (!qa_try(classic_release_memory, s, &caught)) failures++;
+  if (failures != 0) qa_raise("AggregateError", 0, 0, "%s", "Classic guest discard failed");
 }
-void qa_app_sim_classic_guest_source_discard(qa_app_sim_classic_guest_source *s) {
-  if (s->phase == PHASE_CLOSED) return;
-  if (qa_guest_call_runner_depth(qa_app_sim_native_guest_call_runner(s->guest)) != 0) qa_range_error("Classic guest disposal requires a completed game call");
-  s->phase = PHASE_CLOSED;
-  if (s->services.dispose != NULL) s->services.dispose(s->services.ctx);
-  release_owned_actors(s);
-  close_files(s);
-  qa_app_sim_native_guest_release_memory(s->guest);
-}
+static void shutdown_job(void *arg) { qa_app_sim_classic_guest_source *s = arg; qa_compat_q2_classic_guest_host_shutdown(s->host); }
+static void detach_job(void *arg) { qa_app_sim_classic_guest_source *s = arg; qa_app_sim_native_guest_detach(s->guest, s->game, classic_abi, s->budget); }
 void qa_app_sim_classic_guest_source_close(qa_app_sim_classic_guest_source *s) {
   if (s->phase == PHASE_CLOSED) return;
-  if (qa_guest_call_runner_depth(qa_app_sim_native_guest_call_runner(s->guest)) != 0) qa_range_error("Classic guest shutdown requires a completed game call");
+  if (qa_guest_call_runner_depth(qa_app_sim_native_guest_call_runner(s->guest)) != 0) qa_raise("Error", 0, 0, "%s", "Classic guest shutdown requires a completed game call");
   bool initialized = s->phase != PHASE_CREATED;
+  size_t failures = 0; qa_caught_error caught;
   qa_guest_call_runner_recover(qa_app_sim_native_guest_call_runner(s->guest));
-  if (initialized) qa_compat_q2_classic_guest_host_shutdown(s->host);
-  qa_app_sim_native_guest_detach(s->guest, s->game, classic_abi, s->budget);
-  qa_app_sim_classic_guest_source_discard(s);
+  if (initialized && !qa_try(shutdown_job, s, &caught)) failures++;
+  if (!qa_try(detach_job, s, &caught)) failures++;
+  if (!qa_try(classic_discard_job, s, &caught)) failures++;
+  if (failures != 0) qa_raise("AggregateError", 0, 0, "%s", "Classic native guest shutdown failed");
 }
 size_t qa_app_sim_classic_guest_source_open_files(qa_app_sim_classic_guest_source *s) {
   size_t count = 0; for (owned_file *f = s->files; f != NULL; f = f->next) if (f->held) count++;

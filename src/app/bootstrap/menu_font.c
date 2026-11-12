@@ -6,6 +6,7 @@
 #include "qa/content/roots.h"
 #include <stdio.h>
 #include "qa/formats/images/indexed.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/formats/images/palette.h"
 #include "qa/formats/images/wad.h"
 #include "qa/foundation/support.h"
@@ -150,6 +151,7 @@ static void load_q1_conchars(qa_app_menu_font *font, const qa_app_menu_font_opti
   qa_cleanup_pop(&guard);
   q1_scope_free(&scope);
 }
+static void dispose_loader_images(void *arg) { qa_scene_texture_loader_dispose_images(arg); }
 static void load_texture_conchars(qa_app_menu_font *font, const qa_app_menu_font_options *options, qa_texture_sampling sampling) {
   texture_slot *slot = &font->textures;
   if (options->family == QA_GAME_FAMILY_Q2) {
@@ -175,16 +177,16 @@ static void load_texture_conchars(qa_app_menu_font *font, const qa_app_menu_font
     }
   }
   texture_slot_open(slot, options->catalog, options->mounts, options->images, options->image_policy);
+  /* try { load; register } finally { textures.disposeImages() }: a raise releases the loader's images too. */
+  qa_cleanup dispose_guard;
+  qa_cleanup_push(&dispose_guard, dispose_loader_images, &slot->loader);
   const qa_scene_texture *texture = texture_slot_load(slot, options->family == QA_GAME_FAMILY_Q2 ? "pics/conchars.pcx" : "gfx/2d/bigchars",
                                                       options->family);
-  if (texture == NULL) {
-    qa_scene_texture_loader_dispose_images(&slot->loader);
-    qa_raise("Error", 0, 0, "Quake III console charset is missing");
-  }
+  if (texture == NULL) qa_raise("Error", 0, 0, "Quake III console charset is missing");
   /* images.register("conchars", texture.content, { wrap: "clamp", filter: "nearest" }, texture.image.source) */
   font->image = qa_scene_image_registry_register(options->images, "conchars", texture->content, sampling, texture->image)->image;
   font->has_image = true;
-  /* finally { textures.disposeImages() } */
+  qa_cleanup_pop(&dispose_guard);
   qa_scene_texture_loader_dispose_images(&slot->loader);
 }
 qa_app_menu_font *qa_app_load_menu_font(const qa_app_menu_font_options *options) {
@@ -353,13 +355,27 @@ static void load_installed_typography(qa_app_menu_typography *typography, qa_con
   coverage.names = qa_content_mounted_list_files(typography->mounted, "localization", ".txt", &coverage.name_count);
   if (coverage.names == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < coverage.name_count; i++) {
-    char path[1024];
-    snprintf(path, sizeof path, "localization/%s", coverage.names[i]);
+    size_t name_length = strlen(coverage.names[i]);
+    char *path = malloc(name_length + sizeof "localization/");
+    if (path == NULL) qa_range_error("Out of memory");
+    memcpy(path, "localization/", sizeof "localization/" - 1);
+    memcpy(path + sizeof "localization/" - 1, coverage.names[i], name_length + 1);
+    qa_cleanup path_guard;
+    qa_cleanup_push(&path_guard, free, path);
     qa_content_opened_resource resource;
-    if (!qa_content_mounted_open(typography->mounted, path, NULL, NULL, &resource)) continue;
-    size_t point_count = 0;
-    int64_t *points = qa_text_codepoints((const char *)resource.bytes, resource.byte_length, &point_count);
+    bool opened = qa_content_mounted_open(typography->mounted, path, NULL, NULL, &resource);
+    qa_cleanup_pop(&path_guard);
+    free(path);
+    if (!opened) continue;
+    /* textCodepoints(new TextDecoder().decode(bytes)): the BOM is dropped and invalid sequences become U+FFFD
+     * before the code points are collected. */
+    size_t text_length = 0;
+    char *text = qa_text_decoder_decode(resource.bytes, resource.byte_length, &text_length);
     free(resource.bytes);
+    if (text == NULL) qa_range_error("Out of memory");
+    size_t point_count = 0;
+    int64_t *points = qa_text_codepoints(text, text_length, &point_count);
+    free(text);
     if (points == NULL) qa_range_error("Out of memory");
     for (size_t j = 0; j < point_count; j++)
       if (points[j] >= 32) coverage_add(&coverage, (double)points[j]);

@@ -248,12 +248,15 @@ static inline qa_ui_script_token *lib_source_token(qa_ui_script_source_reader *s
   bool completed = qa_ui_script_source_reader_catch(source, lib_run_read_next, &next);
   return completed && next.read ? next.record.token : NULL;
 }
-/* TS `position`/`currentScriptFilename` as a location with the given column; path is malloc'd. */
+/* TS `{ path: source.currentScriptFilename, line: source.position.line, column }`: the path is
+ * the script being read (an included file names itself), the line that script's line. The path
+ * is malloc'd. */
 static inline qa_ui_script_location lib_source_location(qa_ui_script_source_reader *source,
                                                         int64_t column) {
   char filename[1024];
   int64_t line = 0;
   qa_ui_script_source_reader_position(source, filename, sizeof filename, &line);
+  qa_ui_script_source_reader_current_filename(source, filename, sizeof filename);
   return lib_location(filename, line, column);
 }
 #endif

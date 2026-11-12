@@ -43,7 +43,7 @@ void qa_q3_pres_mission_owner_draw_init(qa_q3_pres_mission_owner_draw *draw,
     qa_q3_pres_mission_owner_draw_host host) {
   if (state->product != QA_Q3_BASE_PRODUCT_MISSIONPACK || static_state->product != QA_Q3_BASE_PRODUCT_MISSIONPACK ||
       host.icons->state != state || host.icons->media.static_state != static_state)
-    qa_range_error("Mission owner drawing requires canonical Team Arena state and media");
+    qa_raise("Error", 0, 0, "Mission owner drawing requires canonical Team Arena state and media");
   draw->state = state;
   draw->static_state = static_state;
   draw->host = host;
@@ -52,7 +52,7 @@ static qa_q3_pres_client_draw_tools *tools_of(qa_q3_pres_mission_owner_draw *dra
   return draw->host.icons->tools;
 }
 static qa_q3_base_source_player_state *ps_of(qa_q3_pres_mission_owner_draw *draw) {
-  if (!draw->state->snap) qa_range_error("Mission owner drawing requires a current snapshot");
+  if (!draw->state->snap) qa_raise("Error", 0, 0, "Mission owner drawing requires a current snapshot");
   return &draw->state->snap->player_state;
 }
 static double owner_cvar(qa_q3_pres_mission_owner_draw *draw, const char *name) {
@@ -339,7 +339,7 @@ static void paint_player_head(qa_q3_pres_mission_owner_draw *draw, qa_rect rect)
   double frac = f(f(qa_int32(cg->time - cg->head_start_time)) / f(qa_int32(cg->head_end_time - cg->head_start_time)));
   frac = f(f(frac * frac) * f(3 - f(2 * frac)));
   qa_rect head = rect;
-  head.x = (float)x;
+  head.x = x; /* TS { ...rect, x }: the rect's own x is not rounded when no damage kick moves it */
   qa_vec3 angles = {(float)f(cg->head_start_pitch + f(f(cg->head_end_pitch - cg->head_start_pitch) * frac)),
                     (float)f(cg->head_start_yaw + f(f(cg->head_end_yaw - cg->head_start_yaw) * frac)), 0};
   qa_q3_pres_client_draw_icons_draw_head(draw->host.icons, head, ps_of(draw)->client_num, angles);
@@ -488,7 +488,7 @@ static void paint_area_powerup(qa_q3_pres_mission_owner_draw *draw, qa_rect rect
       qa_vec4 fade = {alpha, alpha, alpha, alpha};
       qa_draw2d_set_color(target, &fade);
     }
-    qa_rect icon = {(float)x, (float)y, (float)f(rect.width * 0.75), rect.height};
+    qa_rect icon = {x, y, (float)f(rect.width * 0.75), rect.height}; /* TS passes x and y as they are */
     qa_q3_pres_client_draw_tools * tools = tools_of(draw);
     const qa_q3_pres_scene_shader * shader = item_shader(draw, item);
     qa_q3_pres_client_draw_tools_draw_pic(tools, icon, shader);
@@ -523,7 +523,7 @@ static void paint_team_info(qa_q3_pres_mission_owner_draw *draw, qa_rect rect, d
       if ((qa_int32(ci->powerups) & (1 << j)) == 0) continue;
       const qa_q3_base_item_definition *item = qa_q3_base_find_item_for_powerup(QA_Q3_BASE_PRODUCT_MISSIONPACK, (qa_q3_powerup)j);
       if (item) {
-        qa_rect icon = {(float)x, (float)y, 12, 12};
+        qa_rect icon = {x, y, 12, 12};
         qa_q3_pres_client_draw_tools * tools = tools_of(draw);
         const qa_q3_pres_scene_shader * shader = item_shader(draw, item);
         qa_q3_pres_client_draw_tools_draw_pic(tools, icon, shader);
@@ -533,14 +533,14 @@ static void paint_team_info(qa_q3_pres_mission_owner_draw *draw, qa_rect rect, d
     x = trunc(f(rect.x + 38));
     qa_vec4 health = qa_q3_pres_get_color_for_health(ci->health, ci->armor);
     qa_draw2d_set_color(target, &health);
-    qa_rect heart = {(float)x, (float)f(y + 1), 10, 10};
+    qa_rect heart = {x, (float)f(y + 1), 10, 10};
     qa_q3_pres_client_draw_tools_draw_pic(tools_of(draw), heart, draw->host.graphics->heart_shader);
     x += 13;
     qa_draw2d_set_color(target, NULL);
     const qa_q3_pres_scene_shader *handle = order_blinked_off(draw) ? NULL
         : qa_q3_pres_mission_owner_draw_status_handle(draw, cgs->order_pending ? cgs->current_order : ci->team_task);
     if (handle) {
-      qa_rect status = {(float)x, (float)y, 12, 12};
+      qa_rect status = {x, y, 12, 12};
       qa_q3_pres_client_draw_tools_draw_pic(tools_of(draw), status, handle);
     }
     x += 13;
@@ -656,7 +656,7 @@ static void paint_medal(qa_q3_pres_mission_owner_draw *draw, int id, qa_rect rec
 void qa_q3_pres_mission_owner_draw_paint(qa_q3_pres_mission_owner_draw *draw,
                                          const qa_ui_owner_draw_paint_request *request) {
   if (request->draw != &tools_of(draw)->draw)
-    qa_range_error("Mission owner drawing must share the ordered HUD recorder");
+    qa_raise("Error", 0, 0, "Mission owner drawing must share the ordered HUD recorder");
   if (owner_cvar(draw, "cg_drawStatus") == 0) return;
   qa_rect rect = request->rect;
   double scale = request->text_scale, style = request->text_style;

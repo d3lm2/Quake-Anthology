@@ -1,7 +1,7 @@
 /* Port of src/compat/q2/classic/combat-binding.ts. GPL-2.0-or-later.
- * TS RemovedNativeDamage (a throw through the guest call) becomes a
- * recorded flag checked after invoke returns, restoring the saved
- * processor snapshot through the runner mirror. */
+ * TS RemovedNativeDamage is a native throw (qa/compat/q2/native_throw.h) whose
+ * token is the damage frame of its request: the guest's T_Damage is abandoned
+ * and the damage() that owns the request restores the saved processor. */
 #ifndef QA_COMPAT_Q2_CLASSIC_COMBAT_BINDING_H
 #define QA_COMPAT_Q2_CLASSIC_COMBAT_BINDING_H
 #include <stdbool.h>

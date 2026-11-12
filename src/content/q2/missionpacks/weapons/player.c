@@ -286,6 +286,24 @@ static void fire_etf(qa_q2mp_weapons *w, qa_q2w_context *context, qa_q2w_weapons
   qa_q2w_weapons_attack_animation(weapons, context, 1);
 }
 
+/* TS `const restore = ...begin(); try { ... } finally { restore?.() }`: the cleanup node rewinds the lag
+ * history when the trace or the shot raises. */
+typedef struct lag_scope { qa_q2w_weapons *w; bool active; void *token; qa_cleanup node; } lag_scope;
+static void lag_finally(void *arg) {
+  lag_scope *scope = arg;
+  if (scope->active) scope->w->base.hooks.lag_end(scope->w->base.hooks.ctx, scope->token);
+  scope->active = false;
+}
+static void lag_begin_if(qa_q2w_weapons *w, qa_q2w_context *c, qa_q2w_projection p, lag_scope *scope) {
+  scope->w = w;
+  scope->active = c->rerelease && w->base.hooks.lag_is_history;
+  scope->token = scope->active ? w->base.hooks.lag_begin(w->base.hooks.ctx, c->self.actor.id, p.start, p.direction) : NULL;
+  qa_cleanup_push(&scope->node, lag_finally, scope);
+}
+static void lag_end_if(lag_scope *scope) {
+  qa_cleanup_pop(&scope->node);
+  lag_finally(scope);
+}
 static void fire_tracker(qa_q2mp_weapons *w, qa_q2w_context *context, qa_q2w_weapons *weapons) {
   qa_q2_game_services *game = context->game;
   qa_q2w_owner self = context->self;
@@ -293,11 +311,10 @@ static void fire_tracker(qa_q2mp_weapons *w, qa_q2w_context *context, qa_q2w_wea
   qa_vec3 end = q2mp_add(projection.start, q2mp_scale(projection.direction, 8192));
   double mask = context->rerelease ? (double)(int64_t)0x46004003 : (double)0x6000003;
   if (context->rerelease && !context->input.players_collide) mask = (double)(qa_js_to_int32(q2mp_u32(mask) & ~0x40000000u));
-  void *token = NULL;
-  bool lag = context->rerelease && weapons->base.hooks.lag_is_history;
-  if (lag) token = weapons->base.hooks.lag_begin(weapons->base.hooks.ctx, self.actor.id, projection.start, projection.direction);
+  lag_scope lag;
+  lag_begin_if(weapons, context, projection, &lag);
   qa_trace_result trace = q2mp_trace(game, projection.start, end, NULL, &self.actor.id, mask);
-  if (lag) weapons->base.hooks.lag_end(weapons->base.hooks.ctx, token);
+  lag_end_if(&lag);
   qa_actor_id world = game->host->world_actor(game->host->ctx);
   if (trace.hit.kind != QA_TRACE_HIT_ACTOR || qa_same_actor(trace.hit.actor, world)) {
     qa_bounds bounds = {q2mp_v3(-16, -16, -16), q2mp_v3(16, 16, 16)};
@@ -348,9 +365,8 @@ static void fire_heat(qa_q2mp_weapons *w, qa_q2w_context *context, qa_q2w_weapon
     state->view_model = "models/weapons/v_beamer2/tris.md2";
   }
   qa_q2w_weapons_kick_default(weapons, context, q2mp_zero(), q2mp_zero());
-  void *token = NULL;
-  bool lag = context->rerelease && weapons->base.hooks.lag_is_history;
-  if (lag) token = weapons->base.hooks.lag_begin(weapons->base.hooks.ctx, self.actor.id, projection.start, projection.direction);
+  lag_scope lag;
+  lag_begin_if(weapons, context, projection, &lag);
   qa_q2mp_bolts * b = bolts_of(w);
   qa_owned_actor self2 = self.actor;
   qa_vec3 start2 = projection.start;
@@ -361,7 +377,7 @@ static void fire_heat(qa_q2mp_weapons *w, qa_q2w_context *context, qa_q2w_weapon
   double right = qa_q2w_weapons_multiplier(weapons, context);
   double kick = left * right;
   qa_q2mp_bolts_fire_heat_beam(b, self2, game, start2, direction2, offset, damage, kick);
-  if (lag) weapons->base.hooks.lag_end(weapons->base.hooks.ctx, token);
+  lag_end_if(&lag);
   qa_q2w_weapons_flash(weapons, context, 33);
   noise(weapons, context, projection.start);
   qa_q2w_weapons_consume_default(weapons, context);

@@ -43,6 +43,8 @@ void qa_app_q2_server_network_change_world(qa_app_q2_server_network *network,
 void qa_app_q2_server_network_heartbeat(qa_app_q2_server_network *network, double now);
 bool qa_app_q2_server_network_disconnect_client(qa_app_q2_server_network *network,
     qa_client_id client, const char *reason);
+/* The accepted qa_actor_command values since the last poll; owned by the network and valid
+ * until the next poll or destroy. */
 const void *const *qa_app_q2_server_network_poll(qa_app_q2_server_network *network,
     double now, size_t *out_count);
 void qa_app_q2_server_network_submit(qa_app_q2_server_network *network,

@@ -1,6 +1,7 @@
 /* Port of src/content/q3/base/game/targets.ts. GPL-2.0-or-later. */
 #include "qa/content/q3/base/game/targets.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qa/content/q3/base/game/format.h"
@@ -34,12 +35,12 @@ static double game_time(RT *r) {
 }
 static void owned(RT *r, qa_q3_game_entity *e) {
   if (qa_q3_entity_pool_get(r->entities, e->slot) != e)
-    qa_range_error("Target entity does not belong to its entity pool or was replaced");
+    qa_raise("Error", 0, 0, "Target entity does not belong to its entity pool or was replaced");
 }
 static qa_q3_game_combat_context *combat_ctx(RT *r) {
   qa_q3_game_combat_context *c = r->combat(r->ctx);
-  if (c->entities != r->entities) qa_range_error("Target combat context does not match its entity pool and world");
-  if (c->time != game_time(r)) qa_range_error("Target combat context contains stale game time");
+  if (c->entities != r->entities) qa_raise("Error", 0, 0, "Target combat context does not match its entity pool and world");
+  if (c->time != game_time(r)) qa_raise("Error", 0, 0, "Target combat context contains stale game time");
   return c;
 }
 static void dispatch(RT *r, qa_q3_game_entity *e, const qa_q3_use_participant *activator) {
@@ -122,7 +123,7 @@ static void use_speaker(void *ctx, qa_q3_game_entity *e, const qa_q3_use_partici
     qa_q3_use_participant req = *a;
     if (req.entity) qa_q3_entity_pool_add_event(r->entities, req.entity, QA_Q3_EV_GENERAL_SOUND, e->noise_index);
     else {
-      if (!r->has_participants) qa_range_error("Shared target sound requires actor events");
+      if (!r->has_participants) qa_raise("Error", 0, 0, "Shared target sound requires actor events");
       r->participants.event(r->participants.ctx, qa_q3_use_actor(req), QA_Q3_EV_GENERAL_SOUND, e->noise_index);
     }
   } else if ((qa_js_to_int32(e->spawnflags) & 4) != 0) qa_q3_entity_pool_add_event(r->entities, e, QA_Q3_EV_GLOBAL_SOUND, e->noise_index);
@@ -160,11 +161,11 @@ static void laser_think(RT *r, qa_q3_game_entity *e) {
     qa_q3_damage_participant target = c->participant(c->services_ctx, tr.hit_actor);
     if (!target.entity || target.entity->slot != 0) {
       qa_q3_damage_participant self = qa_q3_participant_entity(e);
-      qa_vec3 dir = e->movedir;
-      qa_q3_combat_damage(c, target, &self, e->has_activation ? &e->activation : NULL, &dir, &tr.end, e->damage, QA_Q3_DAMAGE_NO_KNOCKBACK, 21);
+      /* TS hands damage() the movedir object itself, which G_Damage normalizes in place. */
+      qa_q3_combat_damage(c, target, &self, e->has_activation ? &e->activation : NULL, &e->movedir, &tr.end, e->damage, QA_Q3_DAMAGE_NO_KNOCKBACK, 21);
     }
   }
-  e->s.origin2 = tr.end; pool_link(r, e);
+  e->s.origin2 = qa_math_vec3(tr.end.x, tr.end.y, tr.end.z); /* TS vec3(): binary32 */ pool_link(r, e);
   qa_q3_game_entity_set_nextthink(e, qa_int32(game_time(r) + 100));
 }
 static void laser_on(RT *r, qa_q3_game_entity *e) {
@@ -182,7 +183,7 @@ static void start_laser(RT *r, qa_q3_game_entity *e) {
   if (e->target) {
     qa_q3_game_entity *t = qa_q3_find_entity(r->entities, NULL, QA_Q3_FIELD_TARGETNAME, e->target);
     if (!t) {
-      qa_q3_game_format_arg value = qa_q3_game_format_string(qa_q3_game_entity_classname(e));
+      qa_q3_game_format_arg value = qa_q3_game_entity_classname(e) ? qa_q3_game_format_string(qa_q3_game_entity_classname(e)) : qa_q3_game_format_null();
       qa_q3_game_format_arg value2 = qa_q3_game_format_string(vtos_of(r, e->s.origin));
       qa_q3_game_format_arg value3 = qa_q3_game_format_string(e->target);
       qa_q3_game_format_arg args[3] = {value,
@@ -294,7 +295,8 @@ static void h_speaker(void *c, qa_q3_game_entity *e, const qa_q3_spawn_variables
   if (!noise.present) {
     qa_q3_game_format_arg arg = qa_q3_game_format_string(vtos_of(r, e->s.origin));
     char *m = qa_q3_game_format("target_speaker without a noise key at %s", &arg, 1, 32000);
-    qa_range_error("%s", m);
+    char text[128]; snprintf(text, sizeof text, "%s", m ? m : ""); free(m); /* the origin text is at most 31 bytes */
+    qa_raise("Error", 0, 0, "%s", text);
   }
   if (noise.value[0] == '*') e->spawnflags = qa_js_to_int32(e->spawnflags) | 8;
   qa_q3_game_format_arg arg = qa_q3_game_format_string(noise.value);
@@ -306,7 +308,7 @@ static void h_speaker(void *c, qa_q3_game_entity *e, const qa_q3_spawn_variables
   if ((qa_js_to_int32(e->spawnflags) & 1) != 0) e->s.loop_sound = e->noise_index;
   set_use(r, e, "q3.base.game.targets.spawnTargetSpeaker.use");
   if ((qa_js_to_int32(e->spawnflags) & 4) != 0) e->r.sv_flags = qa_js_to_int32(e->r.sv_flags) | 32; /* BROADCAST */
-  e->s.pos.base = e->s.origin; pool_link(r, e);
+  e->s.pos.base = qa_math_vec3(e->s.origin.x, e->s.origin.y, e->s.origin.z); /* TS vec3(): binary32 */ pool_link(r, e);
 }
 static void h_laser(void *c, qa_q3_game_entity *e, const qa_q3_spawn_variables *v) {
   (void)v; RT *r = c; qa_q3_bind_target_save_callbacks(r); owned(r, e);
@@ -316,7 +318,7 @@ static void h_laser(void *c, qa_q3_game_entity *e, const qa_q3_spawn_variables *
 static void h_teleporter(void *c, qa_q3_game_entity *e, const qa_q3_spawn_variables *v) {
   (void)v; RT *r = c; qa_q3_bind_target_save_callbacks(r); owned(r, e);
   if (!e->targetname) {
-    qa_q3_game_format_arg value = qa_q3_game_format_string(qa_q3_game_entity_classname(e));
+    qa_q3_game_format_arg value = qa_q3_game_entity_classname(e) ? qa_q3_game_format_string(qa_q3_game_entity_classname(e)) : qa_q3_game_format_null();
     qa_q3_game_format_arg value2 = qa_q3_game_format_string(vtos_of(r, e->s.origin));
     qa_q3_game_format_arg args[2] = {value, value2};
     warn_fmt(r, "untargeted %s at %s\n", args, 2);
@@ -346,7 +348,7 @@ static void h_location(void *c, qa_q3_game_entity *e, const qa_q3_spawn_variable
 }
 size_t qa_q3_target_spawn_handlers(RT *r, qa_q3_spawn_handler_entry *out, size_t cap) {
   qa_q3_bind_target_save_callbacks(r);
-  if (!r->item_lifecycle_matches) qa_range_error("Target item lifecycle context does not match its entity pool and world");
+  if (!r->item_lifecycle_matches) qa_raise("Error", 0, 0, "Target item lifecycle context does not match its entity pool and world");
   static const struct { const char *name; qa_q3_spawn_handler_fn fn; } T[] = {
     {"target_give", h_give}, {"target_remove_powerups", h_remove}, {"target_delay", h_delay},
     {"target_score", h_score}, {"target_print", h_print}, {"target_speaker", h_speaker},

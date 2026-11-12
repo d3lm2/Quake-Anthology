@@ -360,3 +360,28 @@ void qa_app_shared_sim_tick_lmctf(qa_app_shared_simulation *sim) {
   }
   free(players);
 }
+/* Plain flag CTF carries no rune or token state beyond the flags, which a restart rebuilds. */
+bool qa_app_foreign_flags_blocks_checkpoint(qa_app_shared_simulation *sim) { return qa_app_shared_sim_foreign_lmctf(sim); }
+void qa_app_foreign_flags_release(qa_app_shared_simulation *sim, qa_actor_id actor) {
+  qa_ss_map_delete(&sim->lmctf_teams, &actor); qa_ss_map_delete(&sim->lmctf_health, &actor); qa_ss_map_delete(&sim->lmctf_regen_at, &actor);
+}
+static void wl_lmctf_damage(void *ctx, const void *input, void *output) {
+  qa_app_shared_simulation *sim = ctx; const qa_damage_request *request = input; qa_damage_request *out = output;
+  *out = *request;
+  double amount = request->amount;
+  bool has_attacker = request->attack.attacker != NULL; qa_actor_id attacker = has_attacker ? *request->attack.attacker : request->target;
+  /* Native g_runes: Damage multiplies outgoing by 1.75, Resist divides incoming
+   * by 1.75, Vampire returns half the health damage dealt. */
+  if (has_attacker && qa_ss_is(qa_app_shared_sim_lmctf_rune_held(sim, attacker), "damage")) amount = trunc((float)(amount * 1.75));
+  if (qa_ss_is(qa_app_shared_sim_lmctf_rune_held(sim, request->target), "resist")) amount = trunc((float)(amount / 1.75));
+  if (has_attacker && !qa_same_actor(attacker, request->target) && amount > 0 && qa_ss_is(qa_app_shared_sim_lmctf_rune_held(sim, attacker), "vampire")) {
+    qa_owned_actor owned; qa_combat_state_result health = qa_gameplay_authority_read(sim->combat, attacker);
+    if (qa_session_actor_registry_resolve_owned(sim->actors, attacker, &owned) && health.has_value)
+      qa_gameplay_authority_set_health(sim->combat, owned, qa_js_min(250, health.value.health + qa_js_shr(amount, 1)));
+  }
+  if (amount != request->amount) out->amount = amount;
+}
+void qa_app_foreign_flags_register_combat(qa_app_shared_simulation *sim) {
+  if (!qa_app_shared_sim_foreign_lmctf(sim)) return;
+  qa_fm_register_transform(sim, "q2:lmctf", "q2:lmctf/runes", wl_lmctf_damage);
+}

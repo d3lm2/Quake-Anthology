@@ -132,7 +132,8 @@ static void player_delta(qa_q2_sizebuf *message, const qa_q2_wire_player *from,
   }
   if (bits & QA_Q2_PPS_WEAPONINDEX) {
     /* TS: to.gunindex | to.gunskin << 13 (ToInt32 then writeShort). */
-    int32_t packed = qa_js_to_int32(to->gunindex) | (qa_js_to_int32(to->gunskin) << 13);
+    int32_t packed = qa_js_to_int32(to->gunindex) |
+                     (int32_t)((uint32_t)qa_js_to_int32(to->gunskin) << 13);
     qa_q2_msg_write_short(message, (double)packed);
   }
   if (bits & QA_Q2_PPS_WEAPONFRAME) {

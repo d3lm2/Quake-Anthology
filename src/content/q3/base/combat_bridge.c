@@ -43,7 +43,7 @@ static bool context_check_obelisk(void *ctx, qa_q3_game_entity *target, qa_q3_us
       : qa_q3_base_entity_records_native_by_actor(bridge->host.records, true, attacker.actor);
   const qa_q3_base_record_host *records_host = qa_q3_base_entity_records_host(bridge->host.records);
   if (native == NULL && records_host->is_player(records_host->ctx, qa_q3_use_actor(attacker)))
-    qa_range_error("Admitted Q3 map player has no native client behavior record");
+    qa_raise("Error", 0, 0, "Admitted Q3 map player has no native client behavior record");
   return native == NULL ? false : bridge->host.check_obelisk_attack(bridge->host.ctx, target, native);
 }
 static void context_invulnerability(void *ctx, qa_q3_game_entity *target, qa_vec3 direction, qa_vec3 point) {
@@ -84,12 +84,12 @@ qa_q3_game_combat_context *qa_q3_base_combat_bridge_context(qa_q3_base_combat_br
   return &bridge->context;
 }
 qa_q3_base_combat_bridge_save_state qa_q3_base_combat_bridge_capture_save_state(qa_q3_base_combat_bridge *bridge) {
-  if (bridge->call_count != 0) qa_range_error("Cannot save Q3 during a combat call");
+  if (bridge->call_count != 0) qa_raise("Error", 0, 0, "Cannot save Q3 during a combat call");
   qa_q3_base_combat_bridge_save_state out = {bridge->sequence};
   return out;
 }
 void qa_q3_base_combat_bridge_restore_save_state(qa_q3_base_combat_bridge *bridge, const qa_save_value *value) {
-  if (bridge->call_count != 0) qa_range_error("Cannot restore Q3 during a combat call");
+  if (bridge->call_count != 0) qa_raise("Error", 0, 0, "Cannot restore Q3 during a combat call");
   qa_save_reader reader, field;
   if (!qa_save_reader_init(&reader, value, "q3.combatBridge")) qa_range_error("out of memory");
   if (!qa_save_reader_field(&reader, "sequence", &field)) qa_range_error("out of memory");

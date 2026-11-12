@@ -62,6 +62,11 @@ typedef struct qa_q2m_actor_entry {
   /* The entry's key (TS Map<ActorId, ...>): the entity is freed with its actor
    * before this module's release listener runs. */
   qa_actor_id actor;
+  /* Storage behind entity->last_attack: TS processPain sets entity.lastAttack
+   * to the pending attack object, which outlives the pending record. */
+  bool has_last_attack;
+  qa_attack_provenance last_attack;
+  qa_actor_id last_attack_attacker, last_attack_inflictor;
 } qa_q2m_actor_entry;
 typedef struct qa_q2m_pending_damage {
   qa_actor_id actor;
@@ -82,6 +87,11 @@ typedef struct qa_q2m_monsters {
   const qa_q2m_definition **definitions; size_t definition_count, definition_cap;
   const qa_q2m_definition **edition_definitions[2]; size_t edition_counts[2], edition_caps[2];
   qa_q2m_actor_entry **entries; size_t entry_count, entry_cap;
+  /* Entries whose actor was released or whose context was replaced. TS keeps a
+   * MonsterContext and its state alive while running code holds them (die
+   * after a removal, a move-end callback that removes its entity); the C
+   * entries are freed by the next beginFrame, restore or destroy. */
+  qa_q2m_actor_entry **retired; size_t retired_count, retired_cap;
   qa_q2m_perception perception;
   qa_q2m_pending_damage **pending; size_t pending_count, pending_cap;
   bool connected;

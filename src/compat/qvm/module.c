@@ -68,7 +68,7 @@ static void command_arguments(void *ctx, const char *const **out, size_t *out_co
 static void assert_owner(qa_qvm_module *module) {
   qa_qvm_memory_assert_live(module->memory);
   if (module->retired)
-    qa_range_error("%s QVM module has been retired", module->options.artifact->role);
+    qa_raise("Error", 0, 0, "%s QVM module has been retired", module->options.artifact->role);
 }
 
 static void live(qa_qvm_module *module) {
@@ -89,6 +89,20 @@ static void entry_scope_body(void *ctx) {
   job->body(job->ctx);
 }
 
+/* The try/finally scopes below catch into one buffer and rethrow the error as
+ * it was thrown: its class, code, detail and text (a guest's Com_Error is a
+ * CommonError "drop" and must stay one). Only one error is in flight at a time
+ * and nothing between a catch and its rethrow reenters these scopes, so the
+ * buffer is shared and no nested call level holds a message on the C stack. */
+static _Thread_local qa_caught_error scope_caught;
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static noreturn void rethrow_scope(void) {
+  qa_caught_error copy = scope_caught;
+  qa_rethrow(&copy);
+}
+
 /* Runs body with `entry` current (unchanged when NULL) and restores the
  * previous entry on return or throw. */
 static void with_entry(qa_qvm_module *module, const qa_qvm_module_syscall *entry,
@@ -100,19 +114,17 @@ static void with_entry(qa_qvm_module *module, const qa_qvm_module_syscall *entry
     module->has_current_entry = true;
   }
   entry_scope_job job = {body, ctx};
-  char message[512];
-  bool ok = qa_range_error_catch(entry_scope_body, &job, message, sizeof message);
+  bool ok = qa_try(entry_scope_body, &job, &scope_caught);
   module->current_entry = previous;
   module->has_current_entry = previous_has;
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) rethrow_scope();
 }
 
 /* Runs body and frees `owned` afterwards whether or not it throws. */
 static void with_cleanup(void (*body)(void *ctx), void *ctx, void *owned) {
-  char message[512];
-  bool ok = qa_range_error_catch(body, ctx, message, sizeof message);
+  bool ok = qa_try(body, ctx, &scope_caught);
   free(owned);
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) rethrow_scope();
 }
 
 /* ----- the module-built interpreter (TS constructor) ----- */
@@ -121,6 +133,7 @@ typedef struct rt_hook {
   qa_qvm_function_hook_fn fn;
   void *ctx;
   struct rt_state *rt;
+  struct rt_hook *next_resolved; /* a resolver's adapters, one per hook it has returned */
 } rt_hook;
 
 typedef struct rt_observer {
@@ -133,6 +146,7 @@ typedef struct rt_resolver {
   qa_qvm_function_resolver_fn fn;
   void *ctx;
   struct rt_state *rt;
+  rt_hook *resolved;
 } rt_resolver;
 
 typedef struct rt_binding {
@@ -393,11 +407,10 @@ static double rt_hook_call(void *ctx, qa_qvm_function_call *a) {
   b.proceed = rt_proceed;
   b.proceed_async = rt_proceed_async;
   rt_hook_job job = {hook, &b, 0};
-  char message[512];
-  bool ok = qa_range_error_catch(rt_hook_body, &job, message, sizeof message);
+  bool ok = qa_try(rt_hook_body, &job, &scope_caught);
   free(call.branch_adapters);
   free(call.region_adapters);
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) rethrow_scope();
   return job.result;
 }
 
@@ -432,10 +445,19 @@ static bool rt_resolve(void *ctx, double instruction_index, double first_argumen
   if (!resolver->fn(resolver->ctx, (int64_t)instruction_index, (int32_t)first_argument, words->bytes,
                     words->length, &fn, &fn_ctx))
     return false;
-  rt_hook *hook = rt_alloc(resolver->rt, sizeof *hook);
-  hook->fn = fn;
-  hook->ctx = fn_ctx;
-  hook->rt = resolver->rt;
+  /* The resolver runs on every unbound guest call. One adapter per hook it
+   * returns (TS hands the hook object itself to the interpreter): a new one per
+   * call would grow until the module is destroyed. */
+  rt_hook *hook = resolver->resolved;
+  while (hook != NULL && (hook->fn != fn || hook->ctx != fn_ctx)) hook = hook->next_resolved;
+  if (hook == NULL) {
+    hook = rt_alloc(resolver->rt, sizeof *hook);
+    hook->fn = fn;
+    hook->ctx = fn_ctx;
+    hook->rt = resolver->rt;
+    hook->next_resolved = resolver->resolved;
+    resolver->resolved = hook;
+  }
   out_hook->ctx = hook;
   out_hook->call = rt_hook_call;
   return true;
@@ -588,10 +610,9 @@ static void rt_restart_bytes(void *ctx, const uint8_t *bytes, size_t length, con
   if (!qa_qvm_parse_restart(bytes, length, artifact_path, &image)) qa_range_error("QVM memory allocation failed");
   /* The image is owned here; a refused restart still releases it. */
   rt_restart_job job = {rt->interp, &image};
-  char message[512];
-  bool ok = qa_range_error_catch(rt_restart_body, &job, message, sizeof message);
+  bool ok = qa_try(rt_restart_body, &job, &scope_caught);
   qa_qvm_data_image_destroy(&image);
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) rethrow_scope();
 }
 
 static void rt_restore_data(void *ctx, const uint8_t *data, size_t length) {
@@ -742,10 +763,11 @@ void qa_qvm_module_init(qa_qvm_module *module, const qa_qvm_module_options *opti
   init_common(module, options);
   if (strcmp(options->artifact->role, "ui") == 0) {
     /* TS retires, then rethrows. */
-    char message[512];
-    if (!qa_range_error_catch(ui_version_body, module, message, sizeof message)) {
+    /* Retiring runs other scopes, so this catch keeps its own buffer. */
+    qa_caught_error caught;
+    if (!qa_try(ui_version_body, module, &caught)) {
       qa_qvm_module_retire(module);
-      qa_range_error("%s", message);
+      qa_rethrow(&caught);
     }
   }
 }
@@ -754,14 +776,34 @@ void qa_qvm_module_init_deferred(qa_qvm_module *module, const qa_qvm_module_opti
   init_common(module, options);
 }
 
+typedef struct create_job {
+  qa_qvm_module *module;
+  qa_qvm_validate_fn validate;
+  void *validate_ctx;
+} create_job;
+
+static void create_body(void *ctx) {
+  create_job *job = ctx;
+  qa_qvm_module *module = job->module;
+  if (strcmp(module->options.artifact->role, "ui") == 0) {
+    int32_t words[] = {UI_GETAPIVERSION};
+    validate_ui_version(module, qa_qvm_module_call_async(module, words, 1, 0, job->validate, job->validate_ctx));
+  } else if (job->validate != NULL) {
+    job->validate(job->validate_ctx);
+  }
+}
+
 void qa_qvm_module_create(qa_qvm_module *module, const qa_qvm_module_options *options,
                           qa_qvm_validate_fn validate, void *validate_ctx) {
   init_common(module, options);
-  if (strcmp(options->artifact->role, "ui") == 0) {
-    int32_t words[] = {UI_GETAPIVERSION};
-    validate_ui_version(module, qa_qvm_module_call_async(module, words, 1, 0, validate, validate_ctx));
-  } else if (validate != NULL) {
-    validate(validate_ctx);
+  /* TS create(): try { the UI version call or validate() } catch (error) { module.retire(); throw error }.
+   * A UI of another API version, or a stale owner, closes the memory and frees the registry slot.
+   * Retiring runs other scopes, so this catch keeps its own buffer. */
+  create_job job = {module, validate, validate_ctx};
+  qa_caught_error caught;
+  if (!qa_try(create_body, &job, &caught)) {
+    qa_qvm_module_retire(module);
+    qa_rethrow(&caught);
   }
 }
 
@@ -784,7 +826,7 @@ int32_t qa_qvm_module_system_call(qa_qvm_module *module, const qa_qvm_module_sys
 
 void qa_qvm_module_cancel_function(qa_qvm_module *module, qa_qvm_cancellation_scope scope) {
   if (!module->has_current_entry)
-    qa_range_error("QVM cancellation requires the current source invocation");
+    qa_raise("Error", 0, 0, "QVM cancellation requires the current source invocation");
   module->current_entry.cancel_function(module->current_entry.call_ctx, scope);
   qa_range_error("QVM cancellation scope returned without unwinding");
 }
@@ -872,7 +914,7 @@ static size_t bind_entry(qa_qvm_module *module, const qa_guest_callback_referenc
                          qa_qvm_function_hook_fn hook, void *hook_ctx, bool invocation) {
   live(module);
   if (!same_module(reference->module, module->profile.module))
-    qa_range_error("QVM function hook belongs to a different module artifact");
+    qa_raise("Error", 0, 0, "QVM function hook belongs to a different module artifact");
   wrapper *wrap = malloc(sizeof *wrap);
   if (wrap == NULL) qa_range_error("QVM memory allocation failed");
   memset(wrap, 0, sizeof *wrap);
@@ -881,10 +923,9 @@ static size_t bind_entry(qa_qvm_module *module, const qa_guest_callback_referenc
   wrap->hook_ctx = hook_ctx;
   /* A refused binding releases its wrapper before rethrowing. */
   bind_job job = {module, reference, wrap, invocation, 0};
-  char message[512];
-  if (!qa_range_error_catch(bind_body, &job, message, sizeof message)) {
+  if (!qa_try(bind_body, &job, &scope_caught)) {
     free(wrap);
-    qa_range_error("%s", message);
+    rethrow_scope();
   }
   register_wrapper(module, job.id, wrap);
   return job.id;
@@ -983,7 +1024,7 @@ size_t qa_qvm_module_observe_function(qa_qvm_module *module, const qa_guest_call
                                       qa_qvm_function_observer_fn observe, void *observe_ctx) {
   assert_owner(module);
   if (!same_module(reference->module, module->profile.module))
-    qa_range_error("QVM function observer belongs to a different module artifact");
+    qa_raise("Error", 0, 0, "QVM function observer belongs to a different module artifact");
   wrapper *wrap = malloc(sizeof *wrap);
   if (wrap == NULL) qa_range_error("QVM memory allocation failed");
   memset(wrap, 0, sizeof *wrap);
@@ -1094,12 +1135,11 @@ static int32_t with_command_arguments(qa_qvm_module *module, const char *const *
   module->has_command_arguments = true;
   module->command_arguments = arguments;
   module->command_argument_count = argument_count;
-  char message[512];
-  bool ok = qa_range_error_catch(command_body, job, message, sizeof message);
+  bool ok = qa_try(command_body, job, &scope_caught);
   module->has_command_arguments = previous_has;
   module->command_arguments = previous;
   module->command_argument_count = previous_count;
-  if (!ok) qa_range_error("%s", message);
+  if (!ok) rethrow_scope();
   return job->result;
 }
 
@@ -1107,7 +1147,7 @@ int32_t qa_qvm_module_command_async(qa_qvm_module *module, const int32_t *words,
                                     const char *const *arguments, size_t argument_count,
                                     qa_qvm_validate_fn validate, void *validate_ctx) {
   if (module->interpreter->is_active(module->interpreter->ctx) && !module->has_current_entry)
-    qa_range_error("QVM is already active; command arguments belong to the current invocation");
+    qa_raise("Error", 0, 0, "QVM is already active; command arguments belong to the current invocation");
   command_job job = {module, words, count, true, validate, validate_ctx, 0};
   return with_command_arguments(module, arguments, argument_count, &job);
 }
@@ -1207,10 +1247,14 @@ int32_t qa_qvm_module_evaluate_region(qa_qvm_module *module, const int32_t *word
     evaluation.stack = *stack;
   }
   int32_t result;
+  /* The inputs are released when the evaluation raises. */
+  qa_cleanup held;
+  qa_cleanup_push(&held, free, input_words);
   if (!module->has_current_entry)
     result = module->interpreter->invoke(module->interpreter->ctx, args, arg_count, instruction_index, &evaluation);
   else
     result = module->current_entry.invoke(module->current_entry.call_ctx, args, arg_count, instruction_index, &evaluation);
+  qa_cleanup_pop(&held);
   free(input_words);
   return result;
 }
@@ -1234,7 +1278,7 @@ int32_t qa_qvm_module_evaluate_counter(qa_qvm_module *module, const int32_t *wor
   live(module);
   bool found = false;
   for (size_t i = 0; i < function_count; i++) if (functions[i] == instruction_index) found = true;
-  if (!found) qa_range_error("Counter operation lacks its original entry");
+  if (!found) qa_raise("Error", 0, 0, "Counter operation lacks its original entry");
   counter_job job = {module, words, count, instruction_index};
   return module->interpreter->evaluate_counter(module->interpreter->ctx, address, functions,
                                                function_count, run_counter, &job, stack);
@@ -1245,19 +1289,20 @@ qa_guest_call_result qa_qvm_module_invoke(qa_qvm_module *module, const qa_guest_
   const qa_guest_callback_reference *callback = &context->callback;
   if (callback->kind != QA_GUEST_CALLBACK_QVM || !same_module(callback->module, module->profile.module) ||
       !same_module(context->module, module->profile.module))
-    qa_range_error("QVM callback belongs to a different execution owner");
+    qa_raise("Error", 0, 0, "QVM callback belongs to a different execution owner");
   int32_t *words = malloc((argument_count == 0 ? 1 : argument_count) * sizeof *words);
   if (words == NULL) qa_range_error("QVM memory allocation failed");
+  /* Released when an argument is refused, a pointer is not borrowed or the call raises. */
+  qa_cleanup held;
+  qa_cleanup_push(&held, free, words);
   for (size_t i = 0; i < argument_count; i++) {
     const qa_guest_call_value *value = &arguments[i];
     switch (value->kind) {
       case QA_GUEST_VALUE_INT32: words[i] = qa_int32(value->number_value); break;
       case QA_GUEST_VALUE_UINT32: {
         if (!isfinite(value->number_value) || trunc(value->number_value) != value->number_value ||
-            value->number_value < 0 || value->number_value > 4294967295.0) {
-          free(words);
+            value->number_value < 0 || value->number_value > 4294967295.0)
           qa_range_error("Invalid QVM unsigned word");
-        }
         words[i] = (int32_t)(uint32_t)value->number_value;
         break;
       }
@@ -1272,24 +1317,16 @@ qa_guest_call_result qa_qvm_module_invoke(qa_qvm_module *module, const qa_guest_
         words[i] = (int32_t)(offset == 0 ? (int64_t)module->memory->length : offset);
         break;
       }
-      case QA_GUEST_VALUE_INT64:
-        free(words);
-        qa_range_error("QVM callback requires ABI lowering for int64");
-      case QA_GUEST_VALUE_UINT64:
-        free(words);
-        qa_range_error("QVM callback requires ABI lowering for uint64");
-      case QA_GUEST_VALUE_FLOAT64:
-        free(words);
-        qa_range_error("QVM callback requires ABI lowering for float64");
-      case QA_GUEST_VALUE_AGGREGATE:
-        free(words);
-        qa_range_error("QVM callback requires ABI lowering for aggregate");
-      default:
-        free(words);
-        qa_range_error("QVM callback requires ABI lowering for void");
+      /* TS: throw new Error(...), not a RangeError. */
+      case QA_GUEST_VALUE_INT64: qa_raise("Error", 0, 0, "QVM callback requires ABI lowering for int64");
+      case QA_GUEST_VALUE_UINT64: qa_raise("Error", 0, 0, "QVM callback requires ABI lowering for uint64");
+      case QA_GUEST_VALUE_FLOAT64: qa_raise("Error", 0, 0, "QVM callback requires ABI lowering for float64");
+      case QA_GUEST_VALUE_AGGREGATE: qa_raise("Error", 0, 0, "QVM callback requires ABI lowering for aggregate");
+      default: qa_raise("Error", 0, 0, "QVM callback requires ABI lowering for void");
     }
   }
   int32_t value = qa_qvm_module_call(module, words, argument_count, (int64_t)callback->instruction_index);
+  qa_cleanup_pop(&held);
   free(words);
   qa_guest_call_result result;
   memset(&result, 0, sizeof result);
@@ -1307,12 +1344,12 @@ void qa_qvm_module_restart(qa_qvm_module *module, const uint8_t *bytes, size_t l
 void qa_qvm_module_checkpoint(qa_qvm_module *module, qa_guest_checkpoint *out) {
   live(module);
   if (module->interpreter->is_active(module->interpreter->ctx))
-    qa_range_error("QVM checkpoints require a completed source call");
+    qa_raise("Error", 0, 0, "QVM checkpoints require a completed source call");
   const qa_qvm_host_state *state = module->options.host_state;
-  if (state == NULL) qa_range_error("QVM host has not bound checkpoint services");
+  if (state == NULL) qa_raise("Error", 0, 0, "QVM host has not bound checkpoint services");
   qa_qvm_host_checkpoint host = state->checkpoint(state->ctx);
   if (!same_module(host.state.module, module->profile.module))
-    qa_range_error("QVM host checkpoint belongs to another module");
+    qa_raise("Error", 0, 0, "QVM host checkpoint belongs to another module");
   memset(out, 0, sizeof *out);
   out->kind = QA_GUEST_CHECKPOINT_QVM;
   out->module = module->profile.module;
@@ -1340,7 +1377,7 @@ void qa_qvm_module_checkpoint(qa_qvm_module *module, qa_guest_checkpoint *out) {
 void qa_qvm_module_restore(qa_qvm_module *module, const qa_guest_checkpoint *checkpoint) {
   live(module);
   if (module->interpreter->is_active(module->interpreter->ctx))
-    qa_range_error("Cannot restore an active QVM");
+    qa_raise("Error", 0, 0, "Cannot restore an active QVM");
   const char *checkpoint_profile = checkpoint->has_abi_profile ? checkpoint->abi_profile : "q3-modern";
   if (checkpoint->kind != QA_GUEST_CHECKPOINT_QVM ||
       strcmp(checkpoint_profile, qa_qvm_module_get_abi_profile(module)) != 0 ||
@@ -1348,12 +1385,12 @@ void qa_qvm_module_restore(qa_qvm_module *module, const qa_guest_checkpoint *che
       checkpoint->q3_api.kind != module->profile.api.as.q3.kind ||
       checkpoint->q3_api.version != module->profile.api.as.q3.version ||
       !same_module(checkpoint->host_state.module, module->profile.module))
-    qa_range_error("QVM checkpoint artifact or API mismatch");
+    qa_raise("Error", 0, 0, "QVM checkpoint artifact or API mismatch");
   if (checkpoint->instruction_index != 0 || checkpoint->operand_stack.count != 0 ||
       checkpoint->program_stack != (double)module->memory->length)
-    qa_range_error("QVM checkpoint contains a suspended execution stack");
+    qa_raise("Error", 0, 0, "QVM checkpoint contains a suspended execution stack");
   const qa_qvm_host_state *state = module->options.host_state;
-  if (state == NULL) qa_range_error("QVM host has not bound checkpoint services");
+  if (state == NULL) qa_raise("Error", 0, 0, "QVM host has not bound checkpoint services");
   module->interpreter->restore_data(module->interpreter->ctx, checkpoint->data.bytes, checkpoint->data.length);
   qa_qvm_host_checkpoint host = {checkpoint->host_state, checkpoint->random, checkpoint->random_count,
                                  checkpoint->callbacks, checkpoint->callback_count};

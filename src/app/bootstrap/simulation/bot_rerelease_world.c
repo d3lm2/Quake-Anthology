@@ -10,23 +10,27 @@ static bool is(const char *a, const char *b) { return a != NULL && b != NULL && 
 static bool starts(const char *a, const char *prefix) { return a != NULL && strncmp(a, prefix, strlen(prefix)) == 0; }
 static noreturn void fail(const char *message) { qa_raise("Error", 0, 0, "%s", message); }
 
-/* name.replace(/^.*:/, "").replace(/^.*weapon[/_]/, "").replaceAll("_", "").replaceAll("/", "") */
-static void normalized(const char *name, char *out, size_t capacity) {
+/* name.replace(/^.*:/, "").replace(/^.*weapon[/_]/, ""): where the kept text starts. */
+static const char *normalized_start(const char *name) {
   const char *s = name != NULL ? name : "";
   const char *colon = strrchr(s, ':');
   if (colon != NULL) s = colon + 1;
   const char *cut = NULL;
   for (const char *p = s; (p = strstr(p, "weapon")) != NULL; p++)
     if (p[6] == '/' || p[6] == '_') cut = p + 7;
-  if (cut != NULL) s = cut;
-  size_t n = 0;
-  for (; *s != '\0' && n + 1 < capacity; s++) if (*s != '_' && *s != '/') out[n++] = *s;
-  out[n] = '\0';
+  return cut != NULL ? cut : s;
 }
+/* normalized(a) === normalized(b), where normalized also drops every "_"
+ * and "/" (.replaceAll). Compared in place: no length limit. */
 static bool same_normalized(const char *a, const char *b) {
-  char left[256], right[256];
-  normalized(a, left, sizeof left); normalized(b, right, sizeof right);
-  return strcmp(left, right) == 0;
+  const char *left = normalized_start(a), *right = normalized_start(b);
+  for (;;) {
+    while (*left == '_' || *left == '/') left++;
+    while (*right == '_' || *right == '/') right++;
+    if (*left != *right) return false;
+    if (*left == '\0') return true;
+    left++; right++;
+  }
 }
 static const qa_bot_weapon_rec *weapon_list(const qa_bot_knowledge *k, size_t *out_count) {
   if (k->replaced != NULL) { *out_count = k->replaced_count; return k->replaced; }

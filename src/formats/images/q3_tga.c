@@ -6,6 +6,19 @@
 #include <string.h>
 
 #include "qa/core/binary/index.h"
+#include "qa/foundation/support.h"
+
+/* A BinaryError caught by the caller (a missing-texture fallback) must not leak
+ * the reader's name or the partly decoded pixels. */
+typedef struct decode_guard {
+  qa_binary_reader *reader;
+  uint8_t **output;
+} decode_guard;
+static void decode_guard_release(void *arg) {
+  decode_guard *guard = (decode_guard *)arg;
+  free(*guard->output);
+  qa_binary_reader_destroy(guard->reader);
+}
 
 void qa_image_data_destroy(qa_image_data *image) {
   free(image->pixels);
@@ -47,6 +60,10 @@ int qa_decode_q3_tga(const uint8_t *bytes, size_t length, const char *source,
   const char *name = source != NULL ? source : "<buffer>";
   qa_binary_reader reader;
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, name)) return 0;
+  uint8_t *output = NULL;
+  decode_guard guard_state = {&reader, &output};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, decode_guard_release, &guard_state);
   if (qa_binary_reader_length(&reader) < 18) {
     qa_binary_error(name, 0, "truncated TGA header");
   }
@@ -95,8 +112,9 @@ int qa_decode_q3_tga(const uint8_t *bytes, size_t length, const char *source,
                     output_length);
   }
   size_t out_length = (size_t)(pixel_count * 4);
-  uint8_t *output = out_length == 0 ? NULL : (uint8_t *)malloc(out_length);
+  output = out_length == 0 ? NULL : (uint8_t *)malloc(out_length);
   if (out_length != 0 && output == NULL) {
+    qa_cleanup_pop(&guard);
     qa_binary_reader_destroy(&reader);
     return 0;
   }
@@ -129,6 +147,7 @@ int qa_decode_q3_tga(const uint8_t *bytes, size_t length, const char *source,
       }
     }
   }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   if ((descriptor & 0x20) != 0 && warning != NULL) {
     size_t text_length = strlen(name) + 96;

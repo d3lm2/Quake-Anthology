@@ -1,6 +1,6 @@
 /* Port of src/compat/q3/native/imports.ts. GPL-2.0-or-later.
- * NativeQ3ServiceUnavailable/NativeQ3GameError throws abort via
- * qa_range_error with the identical message. TS
+ * NativeQ3ServiceUnavailable/NativeQ3GameError throws are raises under
+ * those names with the identical message (the slot is the raise code). TS
  * NativeQ3EngineServices is Pick<Q3SourceHost, "engine" | "cvars" |
  * "configstrings"> + commandArguments(); the guest-free seam in
  * engine_services.h is bound to the landed host by

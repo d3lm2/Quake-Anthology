@@ -1,11 +1,14 @@
 /* Port of src/compat/q2/rerelease/debug-shapes.ts. GPL-2.0-or-later. */
 #include "qa/compat/q2/rerelease/debug_shapes.h"
+#include "qa/content/q2/rerelease/debug_shapes.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* TS re-exports content/q2/rerelease/debug-shapes.ts rereleaseDebugLifetime: float seconds to unsigned
+ * milliseconds, truncated, a negative value wrapping as the source's unsigned conversion does. */
 double qa_compat_q2_rerelease_debug_lifetime(double lifetime_seconds) {
-  return lifetime_seconds >= 0 ? lifetime_seconds * 1000 : 1000;
+  return qa_q2_rerelease_debug_lifetime(lifetime_seconds);
 }
 struct qa_compat_q2_rerelease_debug_shape_imports {
   qa_compat_q2_memory *memory; void *emit_ctx; void (*emit)(void *, qa_compat_q2_rerelease_debug_shapes_event);
@@ -18,7 +21,7 @@ qa_compat_q2_rerelease_debug_shape_imports *qa_compat_q2_rerelease_debug_shape_i
 void qa_compat_q2_rerelease_debug_shape_imports_destroy(qa_compat_q2_rerelease_debug_shape_imports *d) { free(d); }
 static double shape_float(const qa_guest_call_value *args, size_t count, size_t index) {
   const qa_guest_call_value *v = qa_compat_q2_guest_argument(args, count, index);
-  if (v->kind != QA_GUEST_VALUE_FLOAT32 || !isfinite(v->number_value)) qa_range_error("Q2 debug shape requires a finite source float");
+  if (v->kind != QA_GUEST_VALUE_FLOAT32 || !isfinite(v->number_value)) qa_raise("TypeError", 0, 0, "Q2 debug shape requires a finite source float");
   return v->number_value;
 }
 bool qa_compat_q2_rerelease_debug_shape_imports_invoke(qa_compat_q2_rerelease_debug_shape_imports *d,
@@ -55,12 +58,16 @@ bool qa_compat_q2_rerelease_debug_shape_imports_invoke(qa_compat_q2_rerelease_de
   double z = qa_compat_q2_mem_read_u8(memory, qa_compat_q2_mem_offset(memory, color_addr, 2)) / 255.0;
   double w = qa_compat_q2_mem_read_u8(memory, qa_compat_q2_mem_offset(memory, color_addr, 3)) / 255.0;
   qa_vec4 color = {x, y, z, w};
-  double lifetime = shape_float(args, count, lifetime_index);
+  /* TS argument order: the colour, depthTest, the lines, then the lifetime. */
   bool depth = qa_compat_q2_guest_integer(args, count, lifetime_index + 1) != 0;
   size_t needed = qa_debug_shape_lines(shape, color, depth, NULL, 0);
-  qa_debug_line *lines = malloc((needed ? needed : 1) * sizeof *lines);
+  qa_debug_line *lines = malloc((needed ? needed : 1) * sizeof *lines); if (!lines) qa_range_error("Out of memory");
+  /* The lines belong to this call: the receiver copies what it keeps (they were never freed). */
+  qa_cleanup lines_owned; qa_cleanup_push(&lines_owned, free, lines);
   qa_debug_shape_lines(shape, color, depth, lines, needed);
-  d->emit(d->emit_ctx, (qa_compat_q2_rerelease_debug_shapes_event){lines, needed, qa_compat_q2_rerelease_debug_lifetime(lifetime)});
+  double lifetime = qa_compat_q2_rerelease_debug_lifetime(shape_float(args, count, lifetime_index));
+  d->emit(d->emit_ctx, (qa_compat_q2_rerelease_debug_shapes_event){lines, needed, lifetime});
+  qa_cleanup_pop(&lines_owned); free(lines);
   if (out) *out = qa_compat_q2_call_void();
   return true;
 }

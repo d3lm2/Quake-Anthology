@@ -1,7 +1,6 @@
 /* Port of src/render/gl/output-gamma.ts: raw color buffers share the source
  * framebuffer's depth/stencil across draw-buffer changes. Render-level table
- * math is qa_output_gamma_table. TS throws become qa_range_error aborts
- * (docs/PORTING.md). GPL-2.0-or-later. */
+ * math is qa_output_gamma_table. GPL-2.0-or-later. */
 #ifndef QA_RENDER_GL_OUTPUT_GAMMA_H
 #define QA_RENDER_GL_OUTPUT_GAMMA_H
 #include <stdbool.h>

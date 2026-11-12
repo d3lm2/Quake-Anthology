@@ -1,6 +1,10 @@
 /* Port of src/app/bootstrap/q1-source-cvars.ts. GPL-2.0-or-later. */
 #include "qa/app/bootstrap/q1_source_cvars.h"
 #include <stddef.h>
+#include "qa/foundation/support.h"
+#include "qa/persistence/value.h"
+static void destroy_registry(void *registry) { qa_cvar_registry_destroy(registry); }
+static void free_state(void *state) { qa_save_value_free(state); }
 qa_cvar_registry *qa_app_clone_q1_source_cvars(qa_cvar_registry *source,
     qa_command_print_fn print, void *print_ctx) {
   qa_cvar_registry_options options = {0};
@@ -10,8 +14,17 @@ qa_cvar_registry *qa_app_clone_q1_source_cvars(qa_cvar_registry *source,
   options.print_ctx = print_ctx;
   qa_cvar_registry *candidate = qa_cvar_registry_create(&options);
   if (candidate == NULL) return NULL;
+  qa_cleanup candidate_node;
+  qa_cleanup_push(&candidate_node, destroy_registry, candidate);
   qa_save_value *state = qa_cvar_registry_capture_world_transfer_state(source);
+  if (state == NULL) qa_range_error("Out of memory");
+  /* The captured tree is the caller's (it was never freed). */
+  qa_cleanup state_node;
+  qa_cleanup_push(&state_node, free_state, state);
   qa_cvar_registry_restore_save_state(candidate, state);
+  qa_cleanup_pop(&state_node);
+  qa_cleanup_pop(&candidate_node);
+  qa_save_value_free(state);
   return candidate;
 }
 void qa_app_register_q1_bot_controls(qa_cvar_registry *cvars) {

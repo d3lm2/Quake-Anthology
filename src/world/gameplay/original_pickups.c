@@ -2,6 +2,7 @@
 #include "qa/world/gameplay/original_pickups.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,12 +40,28 @@ void qa_pickup_write_key(qa_pickup_write write, char *buffer, size_t buffer_size
   }
 }
 
+/* TS writeKey(write): `protection:${channel}` or `inventory:${item}`, compared whole. */
+static bool write_key_equal(qa_pickup_write a, qa_pickup_write b) {
+  if ((a.kind == QA_PICKUP_RESOURCE_PROTECTION) != (b.kind == QA_PICKUP_RESOURCE_PROTECTION)) return false;
+  if (a.kind == QA_PICKUP_RESOURCE_PROTECTION) return a.channel == b.channel;
+  return strcmp(a.item != NULL ? a.item : "", b.item != NULL ? b.item : "") == 0;
+}
+typedef struct captured_scope { qa_captured_original_pickup_rule *rules; size_t count; } captured_scope;
+static void captured_scope_free(void *ctx) {
+  captured_scope *scope = ctx;
+  qa_free_captured_original_pickup_rules(scope->rules, scope->count);
+}
 qa_captured_original_pickup_rule *qa_capture_original_pickup_rules(
     const qa_original_pickup_rule *rules, size_t rule_count, size_t *out_count) {
   qa_captured_original_pickup_rule *captured =
       calloc(rule_count != 0 ? rule_count : 1, sizeof *captured);
   if (captured == NULL) { *out_count = 0; return NULL; }
+  /* A refused rule set leaves the rules captured so far to TS's GC. */
+  captured_scope scope = {captured, 0};
+  qa_cleanup scope_node;
+  qa_cleanup_push(&scope_node, captured_scope_free, &scope);
   for (size_t i = 0; i < rule_count; i++) {
+    scope.count = i;
     const qa_original_pickup_rule *rule = &rules[i];
     if (rule->id == NULL || rule->id[0] == '\0' || rule->offered_count == 0)
       qa_error("Original pickup rules require unique IDs and offered items");
@@ -52,27 +69,21 @@ qa_captured_original_pickup_rule *qa_capture_original_pickup_rules(
       if (str_eq(rules[j].id, rule->id))
         qa_error("Original pickup rules require unique IDs and offered items");
     }
+    /* TS `offered` Set over every rule so far, this rule's earlier items included. */
     for (size_t o = 0; o < rule->offered_count; o++) {
-      for (size_t j = 0; j < i; j++) {
-        for (size_t k = 0; k < rules[j].offered_count; k++) {
-          if (str_eq(rules[j].offered[k], rule->offered[o])) {
-            char message[2048];
-            (void)snprintf(message, sizeof message, "Ambiguous original pickup rule for %s",
-                           rule->offered[o]);
-            qa_error(message);
-          }
+      for (size_t j = 0; j <= i; j++) {
+        size_t limit = j == i ? o : rules[j].offered_count;
+        for (size_t k = 0; k < limit; k++) {
+          if (str_eq(rules[j].offered[k], rule->offered[o]))
+            qa_raise("Error", 0, 0, "Ambiguous original pickup rule for %s", rule->offered[o]);
         }
       }
     }
     if (rule->writes.count == 0)
       qa_error("Original pickup requires a nonempty write set");
     for (size_t w = 0; w < rule->writes.count; w++) {
-      char key_a[1024];
-      qa_pickup_write_key(rule->writes.values[w], key_a, sizeof key_a);
       for (size_t x = w + 1; x < rule->writes.count; x++) {
-        char key_b[1024];
-        qa_pickup_write_key(rule->writes.values[x], key_b, sizeof key_b);
-        if (strcmp(key_a, key_b) == 0)
+        if (write_key_equal(rule->writes.values[w], rule->writes.values[x]))
           qa_error("Original pickup has duplicate resource writes");
       }
     }
@@ -89,6 +100,7 @@ qa_captured_original_pickup_rule *qa_capture_original_pickup_rules(
     captured[i].take_ctx = rule->ctx;
     captured[i].take = rule->take;
   }
+  qa_cleanup_pop(&scope_node);
   *out_count = rule_count;
   return captured;
 }
@@ -115,8 +127,10 @@ typedef struct pickup_scope {
    * selection and lifetime closures reach their state through handles, so a
    * source calling them after the close sees the TS closed-scope result. */
   qa_current_original_pickup *matches;
+  size_t match_count;
   struct selection_state *selection;
   void *selection_token;
+  bool grant_used; /* the selection's grant() ran (TS `used`) */
   struct lifetime_state *lifetime;
   void *lifetime_token;
 } pickup_scope;
@@ -228,15 +242,55 @@ static bool scope_current(qa_shared_original_pickup_admission *admission, pickup
   return qa_session_actor_registry_resolve_owned(admission->actors, scope->pickup.id, &resolved) &&
          qa_same_owned_actor(resolved, scope->pickup);
 }
+/* Drops the matches a scope holds: each releases what its current() reads. */
+static void release_matches(qa_current_original_pickup *matches, size_t count) {
+  for (size_t i = 0; i < count; i++)
+    if (matches[i].release != NULL) matches[i].release(matches[i].ctx);
+  free(matches);
+}
+typedef struct armor_scope { qa_current_original_pickup *matches; size_t count; } armor_scope;
+static void armor_scope_release(void *ctx) {
+  armor_scope *hold = ctx;
+  release_matches(hold->matches, hold->count);
+}
+/* The tokens of selections whose grant() was used before their scope closed: TS's closure keeps `used`, so a late
+ * grant() throws "already consumed" where an unused one returns "stale". One serial per consumed grant. */
+static uintptr_t *consumed_tokens;
+static size_t consumed_count, consumed_capacity;
+static void remember_consumed(void *token) {
+  if (consumed_count == consumed_capacity) {
+    size_t capacity = consumed_capacity != 0 ? consumed_capacity * 2 : 64;
+    uintptr_t *grown = realloc(consumed_tokens, capacity * sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    consumed_tokens = grown;
+    consumed_capacity = capacity;
+  }
+  /* Sorted by serial (scopes close in any order). */
+  size_t at = consumed_count;
+  while (at > 0 && consumed_tokens[at - 1] > (uintptr_t)token) at--;
+  memmove(&consumed_tokens[at + 1], &consumed_tokens[at], (consumed_count - at) * sizeof *consumed_tokens);
+  consumed_tokens[at] = (uintptr_t)token;
+  consumed_count++;
+}
+static bool was_consumed(const void *token) {
+  size_t low = 0, high = consumed_count;
+  while (low < high) {
+    size_t middle = low + (high - low) / 2;
+    if (consumed_tokens[middle] < (uintptr_t)token) low = middle + 1;
+    else high = middle;
+  }
+  return low < consumed_count && consumed_tokens[low] == (uintptr_t)token;
+}
 static void close_scope(qa_shared_original_pickup_admission *admission, pickup_scope *scope) {
   scope->open = false;
   set_touching(admission, scope->pickup.id, false);
   /* TS lets the scope go here; its closures stay callable through handles. */
+  if (scope->grant_used) remember_consumed(scope->selection_token);
   qa_world_handle_close(scope->selection_token);
   qa_world_handle_close(scope->lifetime_token);
   free(scope->selection);
   free(scope->lifetime);
-  free(scope->matches);
+  release_matches(scope->matches, scope->match_count);
   free(scope->cargo_copy);
   free(scope);
 }
@@ -346,11 +400,14 @@ static void *grant_operation(void *ctx, qa_protection_observer stores) {
 }
 static qa_original_pickup_outcome selection_grant(void *ctx) {
   selection_state *state = qa_world_handle_get(ctx);
-  /* After its scope closed TS returns "stale" from current() (a grant
-   * already used before the close throws in TS; C no longer has it). */
-  if (state == NULL) return QA_ORIGINAL_PICKUP_OUTCOME_STALE;
+  /* After its scope closed: a grant used before the close throws (TS `used`); otherwise current() is stale. */
+  if (state == NULL) {
+    if (was_consumed(ctx)) qa_error("Original source pickup grant already consumed");
+    return QA_ORIGINAL_PICKUP_OUTCOME_STALE;
+  }
   if (state->used) qa_error("Original source pickup grant already consumed");
   state->used = true;
+  state->scope->grant_used = true;
   if (!selection_current(state)) return QA_ORIGINAL_PICKUP_OUTCOME_STALE;
   grant_state grant;
   grant.selection = state;
@@ -384,71 +441,65 @@ static qa_source_pickup_selection make_selection(qa_shared_original_pickup_admis
   }
   qa_original_pickup_resolution armor =
       qa_gameplay_authority_resolve_pickup(admission->combat, scope->recipient, scope->request);
+  /* The armor matches are copied out of the authority's scratch before the inventory resolves (it may raise). */
+  qa_current_original_pickup *armor_matches = xcalloc((armor.match_count + 1) * sizeof *armor_matches);
+  if (armor.match_count != 0) memcpy(armor_matches, armor.matches, armor.match_count * sizeof *armor_matches);
+  armor_scope armor_hold = {armor_matches, armor.match_count};
+  qa_cleanup armor_node;
+  qa_cleanup_push(&armor_node, armor_scope_release, &armor_hold);
   qa_original_pickup_resolution items =
       qa_shared_inventory_table_resolve_pickup(admission->inventory, scope->recipient, scope->request);
+  qa_cleanup_pop(&armor_node);
   size_t total = armor.match_count + items.match_count;
   if (total == 0) {
+    free(armor_matches);
     selection.kind = (armor.blocks_primary || items.blocks_primary) ? QA_SOURCE_PICKUP_BLOCKED
                                                                     : QA_SOURCE_PICKUP_ORIGINAL;
     return selection;
   }
-  qa_current_original_pickup *matches = xcalloc(total * sizeof *matches);
-  free(scope->matches);
+  qa_current_original_pickup *matches = calloc(total, sizeof *matches);
+  if (matches == NULL) {
+    release_matches(armor_matches, armor.match_count);
+    for (size_t i = 0; i < items.match_count; i++)
+      if (items.matches[i].release != NULL) items.matches[i].release(items.matches[i].ctx);
+    qa_range_error("Out of memory");
+  }
+  release_matches(scope->matches, scope->match_count);
   scope->matches = matches;
+  scope->match_count = total;
   if (armor.match_count != 0)
-    memcpy(matches, armor.matches, armor.match_count * sizeof *matches);
+    memcpy(matches, armor_matches, armor.match_count * sizeof *matches);
+  free(armor_matches);
   if (items.match_count != 0)
     memcpy(matches + armor.match_count, items.matches, items.match_count * sizeof *matches);
   for (size_t i = 0; i < total; i++) {
     if (!str_eq(matches[i].owner, matches[0].owner) ||
-        !same_operation(matches[i].operation, matches[0].operation)) {
-      char message[2048];
-      (void)snprintf(message, sizeof message, "Multiple original pickup owners accept %s",
-                     scope->request.item);
-      qa_error(message);
-    }
+        !same_operation(matches[i].operation, matches[0].operation))
+      qa_raise("Error", 0, 0, "Multiple original pickup owners accept %s", scope->request.item);
   }
   qa_pickup_writes declared = matches[0].captured.writes;
   /* Distinct write keys across matches must cover declared exactly. */
-  char (*keys)[1024] = xcalloc(total * sizeof *keys);
+  size_t *distinct = xcalloc(total * sizeof *distinct);
   size_t key_count = 0;
   for (size_t i = 0; i < total; i++) {
-    char key[1024];
-    qa_pickup_write_key(matches[i].write, key, sizeof key);
     bool seen = false;
-    for (size_t k = 0; k < key_count; k++) {
-      if (strcmp(keys[k], key) == 0) seen = true;
-    }
-    if (!seen) (void)snprintf(keys[key_count++], sizeof keys[0], "%s", key);
+    for (size_t k = 0; k < key_count && !seen; k++) seen = write_key_equal(matches[distinct[k]].write, matches[i].write);
+    if (!seen) distinct[key_count++] = i;
   }
   bool incomplete = key_count != declared.count;
   for (size_t d = 0; d < declared.count && !incomplete; d++) {
-    char key[1024];
-    qa_pickup_write_key(declared.values[d], key, sizeof key);
     bool found = false;
-    for (size_t k = 0; k < key_count; k++) {
-      if (strcmp(keys[k], key) == 0) found = true;
-    }
+    for (size_t k = 0; k < key_count && !found; k++) found = write_key_equal(matches[distinct[k]].write, declared.values[d]);
     if (!found) incomplete = true;
   }
   for (size_t i = 0; i < total && !incomplete; i++) {
     if (!writes_equal(matches[i].captured.writes, declared)) incomplete = true;
   }
-  free(keys);
-  if (incomplete) {
-    char message[2048];
-    (void)snprintf(message, sizeof message,
-                   "Original pickup %s has an incomplete or changed resource write set",
-                   scope->request.item);
-    qa_error(message);
-  }
-  if (str_eq(scope->request.grant, "map-coupled")) {
-    char message[2048];
-    (void)snprintf(message, sizeof message,
-                   "Original pickup replacement for %s requires its map lifecycle",
-                   scope->request.item);
-    qa_error(message);
-  }
+  free(distinct);
+  if (incomplete)
+    qa_raise("Error", 0, 0, "Original pickup %s has an incomplete or changed resource write set", scope->request.item);
+  if (str_eq(scope->request.grant, "map-coupled"))
+    qa_raise("Error", 0, 0, "Original pickup replacement for %s requires its map lifecycle", scope->request.item);
   selection_state *state = xcalloc(sizeof *state);
   state->admission = admission;
   state->scope = scope;

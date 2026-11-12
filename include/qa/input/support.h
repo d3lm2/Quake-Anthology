@@ -27,6 +27,9 @@ noreturn void qa_input_error(const char *format, ...);
 char *qa_input_dup(const char *text);
 /* Malloc'd copy of the first length bytes, NUL-terminated. */
 char *qa_input_dup_range(const char *text, size_t length);
+/* Malloc'd printf text of any length (TS template literals have no cap).
+ * NULL only on allocation failure. */
+char *qa_input_format(const char *format, ...);
 
 /** TypeScript ToInt32 (the `| 0` and bitwise-operand conversion). */
 int32_t qa_input_to_int32(double value);
@@ -39,9 +42,14 @@ double qa_input_js_parse_number(const char *text);
 /** TypeScript Number.parseInt(text, 10). */
 double qa_input_js_parse_int10(const char *text);
 
-/** JS `\s` / String.prototype.trim whitespace, byte values only. */
+/** ASCII JS white space (one-byte forms only). */
 bool qa_input_js_space(unsigned char byte);
-/* Malloc'd trimmed copy (String.prototype.trim). NULL only on OOM. */
+/** JS `\s` / trim white space at `text` over UTF-8: its byte length, or 0. */
+size_t qa_input_js_space_length(const char *text);
+/* The end of `start` with trailing JS white space removed (by code point). */
+const char *qa_input_js_trim_end(const char *start);
+/* Malloc'd trimmed copy (String.prototype.trim over UTF-8 code points).
+ * NULL only on OOM. */
 char *qa_input_js_trim(const char *text);
 
 /** TS (key, down, time) => undefined queue callbacks. */

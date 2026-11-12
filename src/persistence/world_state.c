@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "qa/persistence/protection.h"
 #include "qa/persistence/save_image.h"
 #include "qa/persistence/value.h"
@@ -326,6 +327,21 @@ void qa_shared_world_restore_completion_free(
   free(completion);
 }
 
+/* Scratch of one restore_world call; a raise releases it and the context
+ * (TS drops both with the throwing frame). */
+typedef struct restore_scratch {
+  source_item_binding *bindings;
+  qa_owned_actor *body_actors, *combat_actors;
+  qa_shared_world_restore_completion *context;
+} restore_scratch;
+static void restore_scratch_release(void *arg) {
+  restore_scratch *scratch = arg;
+  free(scratch->bindings);
+  free(scratch->body_actors);
+  free(scratch->combat_actors);
+  context_free(scratch->context);
+}
+
 /* The shared body of both overloads. When `deferred` is set the
  * caller-owned completion keeps the captured context; otherwise it
  * is freed before returning. */
@@ -337,17 +353,20 @@ static void restore_world(const qa_save_image *save,
   context->save = save;
   context->host = host;
   context->state = COMPLETION_PENDING;
+  restore_scratch scratch = {NULL, NULL, NULL, context};
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, restore_scratch_release, &scratch);
   host->combat.assert_idle(host->combat.ctx);
   if (!qa_read_primary_protection(save, &host->actors, &context->hidden))
     qa_save_format_error("world:primary-protection", "out of memory");
   if (!qa_read_source_items(save, &context->source_items))
     qa_save_format_error("world", "out of memory");
   size_t binding_count = context->source_items.count;
-  source_item_binding *bindings = (source_item_binding *)calloc(
+  source_item_binding *bindings = scratch.bindings = (source_item_binding *)calloc(
       binding_count != 0 ? binding_count : 1, sizeof *bindings);
-  qa_owned_actor *body_actors = (qa_owned_actor *)calloc(
+  qa_owned_actor *body_actors = scratch.body_actors = (qa_owned_actor *)calloc(
       save->body_count != 0 ? save->body_count : 1, sizeof *body_actors);
-  qa_owned_actor *combat_actors = (qa_owned_actor *)calloc(
+  qa_owned_actor *combat_actors = scratch.combat_actors = (qa_owned_actor *)calloc(
       save->combat_count != 0 ? save->combat_count : 1, sizeof *combat_actors);
   context->inventory_actors = (qa_owned_actor *)calloc(
       save->inventory_count != 0 ? save->inventory_count : 1,
@@ -482,6 +501,7 @@ static void restore_world(const qa_save_image *save,
       host->combat.create(host->combat.ctx, restored, created);
     }
   }
+  /* Source graph hydration needs shared bodies/combat, and must finish before inventory receipt comparison. */
   if (hydrate != NULL) hydrate(hydrate_ctx);
   for (size_t i = 0; i < save->inventory_count; i++) {
     const qa_inventory_checkpoint *entry = &save->inventories[i];
@@ -508,6 +528,7 @@ static void restore_world(const qa_save_image *save,
       host->inventory.create(host->inventory.ctx, restored, primary, primary_count);
     }
   }
+  qa_cleanup_pop(&scratch_cleanup);
   free(bindings);
   free(body_actors);
   free(combat_actors);
@@ -519,13 +540,17 @@ void qa_restore_shared_world_state(const qa_save_image *save,
   qa_shared_world_restore_completion context;
   restore_world(save, host, false, NULL, NULL, &context);
 }
+static void free_completion(void *arg) { free(arg); }
 qa_shared_world_restore_completion *qa_restore_shared_world_state_deferred(
     const qa_save_image *save, qa_shared_world_restore_host *host,
     qa_hydrate_inventory_sources_fn hydrate, void *hydrate_ctx) {
   qa_shared_world_restore_completion *completion =
       (qa_shared_world_restore_completion *)calloc(1, sizeof *completion);
   if (completion == NULL) return NULL;
+  qa_cleanup completion_cleanup; /* a raise drops the completion (restore_world released its context) */
+  qa_cleanup_push(&completion_cleanup, free_completion, completion);
   restore_world(save, host, true, hydrate, hydrate_ctx, completion);
+  qa_cleanup_pop(&completion_cleanup);
   return completion;
 }
 void qa_shared_world_restore_assert_complete(
@@ -535,14 +560,21 @@ void qa_shared_world_restore_assert_complete(
                          state_name(completion->state));
 }
 
-/* TS completion.finish(). Every TS throw inside aborts in C, so the
- * "failed" transition is recorded before each throwing check only
- * insofar as the process survives it; assertComplete still observes
- * "pending"/"complete" exactly. */
+/* TS completion.finish(): the body runs inside TS's try; a throw marks the
+ * restoration "failed" and is rethrown (finish_body below). */
+static void finish_body(void *arg);
 void qa_shared_world_restore_finish(qa_shared_world_restore_completion *completion) {
   if (completion->state != COMPLETION_PENDING)
     qa_save_format_error("world.combat", "shared restoration is %s",
                          state_name(completion->state));
+  qa_caught_error caught;
+  if (!qa_try(finish_body, completion, &caught)) {
+    completion->state = COMPLETION_FAILED;
+    qa_rethrow(&caught);
+  }
+}
+static void finish_body(void *arg) {
+  qa_shared_world_restore_completion *completion = arg;
   const qa_save_image *save = completion->save;
   qa_shared_world_restore_host *host = completion->host;
   host->combat.assert_idle(host->combat.ctx);
@@ -553,6 +585,8 @@ void qa_shared_world_restore_finish(qa_shared_world_restore_completion *completi
   copied_entry *copied = (copied_entry *)calloc(
       save->combat_count != 0 ? save->combat_count : 1, sizeof *copied);
   if (copied == NULL) qa_save_format_error("world.combat", "out of memory");
+  qa_cleanup copied_cleanup;
+  qa_cleanup_push(&copied_cleanup, free, copied);
   size_t copied_count = 0;
   for (size_t i = 0; i < save->combat_count; i++) {
     const qa_combat_checkpoint *entry = &save->combat[i];
@@ -673,6 +707,7 @@ void qa_shared_world_restore_finish(qa_shared_world_restore_completion *completi
       qa_save_format_error("world.combat",
           "copied powered protection disagrees with saved shared state");
   }
+  qa_cleanup_pop(&copied_cleanup);
   free(copied);
   completion->state = COMPLETION_COMPLETE;
 }

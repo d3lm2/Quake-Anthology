@@ -14,8 +14,9 @@ static const int32_t events[] = {
 };
 #define EVENT_COUNT (sizeof events / sizeof events[0])
 
+/* An absent profile is the TS default, "q3-modern", as in the record files. */
 static bool modern(qa_qvm_abi_profile profile) {
-  return profile != NULL && strcmp(profile, "q3-modern") == 0;
+  return profile == NULL || strcmp(profile, "q3-modern") == 0;
 }
 
 /* Remote servers choose these values, so the client paths pass lenient and unrepresentable ones become none/general/absent. */
@@ -39,7 +40,7 @@ int32_t qa_qvm_legacy_event_ex(int32_t value, qa_qvm_abi_profile profile, bool r
   }
   if (mapped < 0) {
     if (lenient) return 0;
-    qa_range_error("QVM event %d is not represented by the selected legacy ABI", (int)event);
+    qa_raise("Error", 0, 0, "QVM event %d is not represented by the selected legacy ABI", (int)event);
   }
   return mapped | flags;
 }
@@ -53,11 +54,12 @@ int32_t qa_qvm_legacy_entity_type_ex(int32_t value, qa_qvm_abi_profile profile, 
   int32_t target_events = reverse ? 12 : 13;
   if (value >= source_events) {
     const int32_t event = qa_qvm_legacy_event_ex(value - source_events, profile, reverse, lenient);
-    return event == 0 && lenient ? 0 : target_events + event;
+    /* TS adds as numbers and the caller stores with ToInt32: the sum wraps, it does not overflow. */
+    return event == 0 && lenient ? 0 : (int32_t)((uint32_t)target_events + (uint32_t)event);
   }
   if (reverse && value == 12) {
     if (lenient) return 0;
-    qa_range_error("Legacy QVM has no team entity type");
+    qa_raise("Error", 0, 0, "Legacy QVM has no team entity type");
   }
   return value;
 }
@@ -77,7 +79,7 @@ int32_t qa_qvm_legacy_configstring(int32_t index, qa_qvm_abi_profile profile) {
   if (modern(profile)) return index;
   if (index >= 12 && index <= 15) return index + 8;
   if (index >= 16 && index <= 26)
-    qa_range_error("Legacy private configstring %d has no declared modern presentation mapping", (int)index);
+    qa_raise("Error", 0, 0, "Legacy private configstring %d has no declared modern presentation mapping", (int)index);
   return index;
 }
 
@@ -87,7 +89,7 @@ int32_t qa_qvm_legacy_powerup_bits(int32_t bits, qa_qvm_abi_profile profile) {
 int32_t qa_qvm_legacy_powerup_bits_ex(int32_t bits, qa_qvm_abi_profile profile, bool lenient) {
   if (!modern(profile) && lenient) return bits & 0x1ff;
   if (!modern(profile) && (bits & ~0x1ff) != 0)
-    qa_range_error("Legacy ball or private powerup has no modern presentation mapping");
+    qa_raise("Error", 0, 0, "Legacy ball or private powerup has no modern presentation mapping");
   return bits;
 }
 
@@ -95,7 +97,7 @@ qa_double_view qa_qvm_legacy_powerups(const double *values, size_t count, qa_qvm
   if (!modern(profile)) {
     for (size_t i = 9; i < count; i++) {
       if (values[i] != 0.0)
-        qa_range_error("Legacy ball or private powerup has no modern presentation mapping");
+        qa_raise("Error", 0, 0, "Legacy ball or private powerup has no modern presentation mapping");
     }
   }
   qa_double_view result = {values, count};

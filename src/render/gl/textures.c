@@ -10,7 +10,7 @@
 void qa_gl_with_pixel_store(qa_gl *gl,const char *direction,qa_gl_pixel_store_fn operation,void *ctx){
   int pack=!strcmp(direction,"pack");
   int32_t state=0; gl->glGetIntegerv(pack?0x88ed:0x88ef,&state);
-  if(state!=0) qa_range_error("OpenGL pixel transfers require client memory without a bound pixel buffer");
+  if(state!=0) qa_raise("Error", 0, 0, "OpenGL pixel transfers require client memory without a bound pixel buffer");
   const uint32_t pack_settings[5]={0xd05,0xd02,0xd03,0xd04,0xd00};
   const uint32_t unpack_settings[5]={0xcf5,0xcf2,0xcf3,0xcf4,0xcf0};
   const uint32_t *settings=pack?pack_settings:unpack_settings;
@@ -20,23 +20,29 @@ void qa_gl_with_pixel_store(qa_gl *gl,const char *direction,qa_gl_pixel_store_fn
   operation(ctx);
   for(int i=0;i<5;i++)gl->glPixelStorei(settings[i],saved[i]);
 }
-typedef struct tex { double ordinal; uint32_t name; bool mipmap; double width,height; qa_render_image content; double (*levels)[2]; size_t level_count; } tex;
+/* content is TS withoutPixels(content): no level pixels, and for indexed8 its own copy of the palette colours and
+ * the translation (colors.slice(), translation.slice()) that later update-image expansions read. The operation's
+ * storage does not outlive the call. */
+typedef struct tex { double ordinal; uint32_t name; bool mipmap; double width,height; qa_render_image content; double (*levels)[2]; size_t level_count;
+  uint8_t *palette_colors; bool has_fullbright; qa_fullbright_range fullbright; bool has_translation; qa_byte_view translation; uint8_t *translation_bytes; } tex;
+static void tex_free(tex *x){ free(x->levels); free(x->palette_colors); free(x->translation_bytes); }
+static uint8_t *copy_bytes(const uint8_t *bytes,size_t length){ uint8_t *copy=(uint8_t*)malloc(length?length:1); if(!copy)qa_range_error("OpenGL texture allocation failed"); if(length)memcpy(copy,bytes,length); return copy; }
 typedef struct timpl { qa_gl *gl; qa_renderer_resource_owner owner; double maximum; tex *items; size_t count,cap; } timpl;
 static timpl *T(qa_gl_textures *t){ return (timpl*)t->impl; }
 /* Number.isSafeInteger, without a C cast of NaN or a huge double. */
 static int safe_integer(double v){ return isfinite(v)&&v==floor(v)&&fabs(v)<=9007199254740991.0; }
 static void own(qa_gl_textures *t,qa_renderer_image image){
   timpl *p=T(t);
-  if(image.owner.identity!=p->owner.identity||image.owner.session.token!=p->owner.session.token||image.owner.generation!=p->owner.generation) qa_range_error("OpenGL image belongs to another renderer owner");
+  if(image.owner.identity!=p->owner.identity||image.owner.session.token!=p->owner.session.token||image.owner.generation!=p->owner.generation) qa_raise("Error", 0, 0, "OpenGL image belongs to another renderer owner");
   if(!safe_integer(image.ordinal)||image.ordinal<0) qa_range_error("OpenGL image ordinal must be a nonnegative safe integer");
 }
 static tex *find_tex(qa_gl_textures *t,double ord){ timpl *p=T(t); for(size_t i=0;i<p->count;i++)if(p->items[i].ordinal==ord)return &p->items[i]; return NULL; }
 qa_gl_texture_info qa_gl_textures_registered(qa_gl_textures *t,qa_renderer_image image){ own(t,image); tex *x=find_tex(t,image.ordinal);
-  if(!x)qa_range_error("OpenGL image is not registered");
+  if(!x)qa_raise("Error", 0, 0, "OpenGL image is not registered");
   if(image.width!=x->width||image.height!=x->height)qa_range_error("OpenGL image handle dimensions differ from its allocation");
   qa_gl_texture_info o;o.name=x->name;o.mipmap=x->mipmap;o.width=x->width;o.height=x->height;o.content_kind=x->content.kind;return o; }
 void qa_gl_textures_bind(qa_gl_textures *t,qa_texture_binding binding){
-  if(binding.kind==QA_TEXTURE_BINDING_DYNAMIC_IMAGE) qa_range_error("Dynamic texture must resolve before binding");
+  if(binding.kind==QA_TEXTURE_BINDING_DYNAMIC_IMAGE) qa_raise("Error", 0, 0, "Dynamic texture must resolve before binding");
   if(binding.kind==QA_TEXTURE_BINDING_BIND_IMAGE) T(t)->gl->glBindTexture(0xde1,qa_gl_textures_registered(t,binding.image).name);
 }
 static void apply_filter(qa_gl *gl,const char *filter){
@@ -62,7 +68,7 @@ typedef struct update_ctx { qa_gl *gl; double level; double w,h; int is_depth; c
 static void do_update(void *ctxp){ update_ctx *c=(update_ctx*)ctxp; c->gl->glTexSubImage2D(0xde1,(int32_t)c->level,0,0,(int32_t)c->w,(int32_t)c->h,c->is_depth?0x1902:0x1908,c->is_depth?0x1406:0x1401,c->pixels); }
 bool qa_gl_textures_init(qa_gl_textures *t,qa_gl *gl,qa_renderer_resource_owner owner,double maximum){ t->impl=calloc(1,sizeof(timpl)); if(!t->impl)return false; T(t)->gl=gl;T(t)->owner=owner;T(t)->maximum=maximum; return true; }
 void qa_gl_textures_close(qa_gl_textures *t){ if(!t->impl)return; timpl *p=T(t);
-  for(size_t i=0;i<p->count;i++){ p->gl->glDeleteTextures(1,&p->items[i].name); free(p->items[i].levels); }
+  for(size_t i=0;i<p->count;i++){ p->gl->glDeleteTextures(1,&p->items[i].name); tex_free(&p->items[i]); }
   free(p->items); free(p); t->impl=NULL; }
 void qa_gl_textures_apply(qa_gl_textures *t,qa_image_resource_operation op){
   timpl *p=T(t); qa_gl *gl=p->gl;
@@ -73,11 +79,12 @@ void qa_gl_textures_apply(qa_gl_textures *t,qa_image_resource_operation op){
   own(t,op.image);
   switch(op.kind){
   case QA_IMAGE_OP_RELEASE: {
-    tex *x=find_tex(t,op.image.ordinal); if(!x)qa_range_error("OpenGL image is not registered");
-    gl->glDeleteTextures(1,&x->name); free(x->levels);
+    (void)qa_gl_textures_registered(t,op.image); /* this.registered(image): also the handle's dimensions */
+    tex *x=find_tex(t,op.image.ordinal);
+    gl->glDeleteTextures(1,&x->name); tex_free(x);
     size_t idx=(size_t)(x-p->items); memmove(&p->items[idx],&p->items[idx+1],(p->count-idx-1)*sizeof *p->items); p->count--; return; }
   case QA_IMAGE_OP_CREATE: {
-    if(find_tex(t,op.image.ordinal)) qa_range_error("OpenGL image is already registered");
+    if(find_tex(t,op.image.ordinal)) qa_raise("Error", 0, 0, "OpenGL image is already registered");
     const qa_render_image *content=&op.content;
     double fw,fh; size_t lc;
     if(content->kind==QA_RENDER_IMAGE_DEPTH32F){ if(content->depth_level_count==0)qa_range_error("OpenGL image dimensions do not match its pixel allocation"); fw=content->depth_levels[0].width;fh=content->depth_levels[0].height;lc=content->depth_level_count; }
@@ -96,7 +103,7 @@ void qa_gl_textures_apply(qa_gl_textures *t,qa_image_resource_operation op){
       for(size_t i=0;i<lc;i++) if(!qa_expand_indexed_image(content,(int64_t)i,QA_PALETTE_LAYER_COMBINED,&expanded[i]))qa_range_error("OpenGL texture allocation failed");
     }
     uint32_t name=0; gl->glGenTextures(1,&name);
-    if(name==0){ if(expanded){for(size_t i=0;i<lc;i++)qa_image_level_destroy(&expanded[i]);free(expanded);} qa_range_error("OpenGL could not allocate a texture"); }
+    if(name==0){ if(expanded){for(size_t i=0;i<lc;i++)qa_image_level_destroy(&expanded[i]);free(expanded);} qa_raise("Error", 0, 0, "OpenGL could not allocate a texture"); }
     gl->glBindTexture(0xde1,name);
     upload_ctx uc; uc.gl=gl;uc.content=content;uc.levels=expanded?expanded:content->levels;
     qa_gl_with_pixel_store(gl,"unpack",do_upload,&uc);
@@ -107,17 +114,25 @@ void qa_gl_textures_apply(qa_gl_textures *t,qa_image_resource_operation op){
     if(content->kind==QA_RENDER_IMAGE_RGBA8){ float col[4]={(float)content->border_color.x,(float)content->border_color.y,(float)content->border_color.z,(float)content->border_color.w}; gl->glTexParameterfv(0xde1,0x1004,col); }
     uint32_t err=gl->glGetError();
     if(expanded){ for(size_t i=0;i<lc;i++)qa_image_level_destroy(&expanded[i]); }
-    if(err!=0){ gl->glDeleteTextures(1,&name); free(expanded); qa_range_error("OpenGL texture upload failed: 0x%x",err); }
+    if(err!=0){ gl->glDeleteTextures(1,&name); free(expanded); qa_raise("Error", 0, 0, "OpenGL texture upload failed: 0x%x",err); }
     if(p->count==p->cap){ size_t nc=p->cap?p->cap*2:8; tex *n=(tex*)realloc(p->items,nc*sizeof *n); if(!n)qa_range_error("OpenGL texture allocation failed"); p->items=n;p->cap=nc; }
     tex *x=&p->items[p->count++]; memset(x,0,sizeof *x);
     x->ordinal=op.image.ordinal;x->name=name;x->width=fw;x->height=fh;x->content=*content;
+    x->content.levels=NULL; x->content.level_count=0; x->content.depth_levels=NULL; x->content.depth_level_count=0;
+    x->content.fullbright=NULL; x->content.translation=NULL;
+    if(content->kind==QA_RENDER_IMAGE_INDEXED8){
+      x->palette_colors=copy_bytes(content->palette.colors.bytes,content->palette.colors.length); x->content.palette.colors.bytes=x->palette_colors;
+      if(content->fullbright){ x->has_fullbright=true; x->fullbright=*content->fullbright; }
+      if(content->translation){ x->has_translation=true; x->translation_bytes=copy_bytes(content->translation->bytes,content->translation->length); x->translation.bytes=x->translation_bytes; x->translation.length=content->translation->length; }
+    }
     x->mipmap=strcmp(op.sampling.filter,"nearest")&&strcmp(op.sampling.filter,"linear");
     x->levels=(double(*)[2])calloc(lc,sizeof(*x->levels)); if(!x->levels)qa_range_error("OpenGL texture allocation failed");
     x->level_count=lc;
     for(size_t i=0;i<lc;i++){ if(content->kind==QA_RENDER_IMAGE_DEPTH32F){x->levels[i][0]=content->depth_levels[i].width;x->levels[i][1]=content->depth_levels[i].height;} else if(expanded){x->levels[i][0]=expanded[i].width;x->levels[i][1]=expanded[i].height;} else {x->levels[i][0]=content->levels[i].width;x->levels[i][1]=content->levels[i].height;} }
     free(expanded); return; }
   case QA_IMAGE_OP_UPDATE: {
-    tex *x=find_tex(t,op.image.ordinal); if(!x)qa_range_error("OpenGL image is not registered");
+    (void)qa_gl_textures_registered(t,op.image); /* this.registered(image): also the handle's dimensions */
+    tex *x=find_tex(t,op.image.ordinal);
     long li=safe_integer(op.level)&&op.level>=0?(long)op.level:-1; /* levels[1.5] is undefined in TS */
     double uw=op.update_depth_level?op.update_depth_level->width:op.update_level?op.update_level->width:0;
     double uh=op.update_depth_level?op.update_depth_level->height:op.update_level?op.update_level->height:0;
@@ -133,6 +148,7 @@ void qa_gl_textures_apply(qa_gl_textures *t,qa_image_resource_operation op){
       check_dims(t,uw,uh,op.update_level->pixels.length,x->content.kind==QA_RENDER_IMAGE_RGBA8?4:1,0,NULL);
       uc.is_depth=0;
       if(x->content.kind==QA_RENDER_IMAGE_INDEXED8){ qa_render_image tmp=x->content; tmp.levels=op.update_level;tmp.level_count=1;
+        tmp.fullbright=x->has_fullbright?&x->fullbright:NULL; tmp.translation=x->has_translation?&x->translation:NULL;
         if(!qa_expand_indexed_image(&tmp,0,QA_PALETTE_LAYER_COMBINED,&ex))qa_range_error("OpenGL texture allocation failed");
         have_ex = 1; uc.pixels = ex.pixels.bytes; }
       else uc.pixels=op.update_level->pixels.bytes;
@@ -141,7 +157,7 @@ void qa_gl_textures_apply(qa_gl_textures *t,qa_image_resource_operation op){
     qa_gl_with_pixel_store(gl,"unpack",do_update,&uc);
     if(have_ex)qa_image_level_destroy(&ex);
     uint32_t err=gl->glGetError();
-    if(err!=0) qa_range_error("OpenGL texture update failed: 0x%x",err);
+    if(err!=0) qa_raise("Error", 0, 0, "OpenGL texture update failed: 0x%x",err);
     return; }
   default: qa_range_error("Invalid OpenGL image operation"); }
 }

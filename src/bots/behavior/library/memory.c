@@ -1,5 +1,6 @@
 /* See header. GPL-2.0-or-later. */
 #include "qa/bots/behavior/library/memory.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +36,7 @@ void qa_bot_memory_destroy(qa_bot_memory *m) {
 bool qa_bot_memory_allocate(qa_bot_memory *m, int64_t size, qa_bot_memory_kind kind, bool clear,
                             qa_bot_memory_allocation *out) {
   if (m->disposed)
-    qa_range_error("Bot memory owner is disposed");
+    qa_raise("Error", 0, 0, "Bot memory owner is disposed");
   if (size < 0 || size > 2147483647LL - 4)
     qa_range_error("Bot memory allocation must fit a signed source size with its four-byte prefix");
   uint8_t *b = malloc((size_t)size + 4);
@@ -66,14 +67,14 @@ void qa_bot_memory_free(qa_bot_memory *m, qa_bot_memory_allocation *a) {
       m->debug_print(m->debug_ctx, "fatal", "FreeMemory: invalid memory block\n");
       return;
     }
-    qa_range_error("Bot memory allocation belongs to another owner or has been freed");
+    qa_raise("Error", 0, 0, "Bot memory allocation belongs to another owner or has been freed");
   }
   uint32_t id;
   memcpy(&id, r->backing, 4);
   if (id != 0x12345678u)
     return;
   if (r->kind != QA_BOT_MEMORY_HEAP)
-    qa_range_error("Bot memory heap ID does not belong to a heap allocation");
+    qa_raise("Error", 0, 0, "Bot memory heap ID does not belong to a heap allocation");
   release_rec(m, r);
   a->bytes = NULL;
   a->length = 0;
@@ -81,7 +82,7 @@ void qa_bot_memory_free(qa_bot_memory *m, qa_bot_memory_allocation *a) {
 uint8_t *qa_bot_memory_allocation_bytes(const qa_bot_memory_allocation *a) {
   const rec *r = a->record;
   if (r == NULL || !r->live)
-    qa_range_error("Bot memory allocation has been freed");
+    qa_raise("Error", 0, 0, "Bot memory allocation has been freed");
   return r->backing + 4;
 }
 void qa_bot_memory_reset_hunk(qa_bot_memory *m) {
@@ -98,7 +99,7 @@ void qa_bot_memory_dispose(qa_bot_memory *m) {
 }
 double qa_bot_memory_available_memory(qa_bot_memory *m) {
   if (!m->has_host || !m->available_fn)
-    qa_range_error("Bot AvailableMemory requires a host arena with capacity accounting");
+    qa_raise("Error", 0, 0, "Bot AvailableMemory requires a host arena with capacity accounting");
   return m->available_fn(m->available_ctx);
 }
 size_t qa_bot_memory_get_live_allocations(const qa_bot_memory *m) { return m->live_count; }
@@ -107,18 +108,19 @@ void qa_bot_memory_print_used_memory_size(qa_bot_memory *m) {
   if (!m->has_debug || !m->debug_print)
     return;
   char buf[128];
-  snprintf(buf, sizeof buf, "total allocated memory: %lld KB\n",
-           (long long)(m->allocated_bytes >> 10));
+  /* TS `allocatedBytes >> 10`: the shift works on the ToInt32 of the byte count. */
+  snprintf(buf, sizeof buf, "total allocated memory: %d KB\n",
+           qa_js_to_int32((double)m->allocated_bytes) >> 10);
   m->debug_print(m->debug_ctx, "message", buf);
-  snprintf(buf, sizeof buf, "total botlib memory: %lld KB\n",
-           (long long)((m->allocated_bytes + 4 * m->live_count) >> 10));
+  snprintf(buf, sizeof buf, "total botlib memory: %d KB\n",
+           qa_js_to_int32((double)m->allocated_bytes + 4.0 * (double)m->live_count) >> 10);
   m->debug_print(m->debug_ctx, "message", buf);
   snprintf(buf, sizeof buf, "total memory blocks: %zu\n", m->live_count);
   m->debug_print(m->debug_ctx, "message", buf);
 }
 int64_t qa_bot_memory_memory_byte_size(qa_bot_memory *m, qa_bot_memory_allocation *a) {
   if (!m->has_debug)
-    qa_range_error("MemoryByteSize requires the bot memory manager profile");
+    qa_raise("Error", 0, 0, "MemoryByteSize requires the bot memory manager profile");
   rec *r = a ? a->record : NULL;
   return (!r || !r->live) ? 0 : (int64_t)r->size + 4;
 }
@@ -126,7 +128,7 @@ int64_t qa_bot_memory_memory_byte_size(qa_bot_memory *m, qa_bot_memory_allocatio
 /* Records are prepended; the TS live Map iterates allocation order. */
 bool qa_bot_memory_checkpoint(qa_bot_memory *m, qa_bot_memory_capture *out) {
   memset(out, 0, sizeof *out);
-  if (m->disposed) qa_range_error("Cannot checkpoint disposed bot memory");
+  if (m->disposed) qa_raise("Error", 0, 0, "Cannot checkpoint disposed bot memory");
   out->allocations =
       calloc(m->live_count == 0 ? 1 : m->live_count, sizeof *out->allocations);
   if (out->allocations == NULL) return false;
@@ -199,7 +201,7 @@ int64_t qa_bot_memory_capture_reference(qa_bot_memory_capture *capture,
                     : allocation != NULL && allocation->bytes == a->bytes;
     if (same) return (int64_t)i;
   }
-  qa_range_error("Bot checkpoint references an unowned or freed allocation");
+  qa_raise("Error", 0, 0, "Bot checkpoint references an unowned or freed allocation");
 }
 
 static void field_of(const qa_save_reader *reader, const char *name,
@@ -207,6 +209,17 @@ static void field_of(const qa_save_reader *reader, const char *name,
   if (!qa_save_reader_field(reader, name, out)) qa_range_error("out of memory");
 }
 
+typedef struct restore_scratch {
+  const char **kinds;
+  const uint8_t **bytes;
+  size_t *lengths;
+} restore_scratch;
+static void restore_scratch_free(void *arg) {
+  restore_scratch *scratch = arg;
+  free(scratch->kinds);
+  free(scratch->bytes);
+  free(scratch->lengths);
+}
 void qa_bot_memory_restore(qa_bot_memory *m, const qa_save_value *value,
                            qa_bot_memory_restored *out) {
   memset(out, 0, sizeof *out);
@@ -222,6 +235,10 @@ void qa_bot_memory_restore(qa_bot_memory *m, const qa_save_value *value,
   const char **kinds = calloc(count == 0 ? 1 : count, sizeof *kinds);
   const uint8_t **bytes = calloc(count == 0 ? 1 : count, sizeof *bytes);
   size_t *lengths = calloc(count == 0 ? 1 : count, sizeof *lengths);
+  /* The image arrays are released when a malformed image raises (TS leaves them to the GC). */
+  restore_scratch scratch = {kinds, bytes, lengths};
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, restore_scratch_free, &scratch);
   if (kinds == NULL || bytes == NULL || lengths == NULL)
     qa_range_error("out of memory");
   static const char *const kind_choices[] = {"heap", "hunk"};
@@ -256,9 +273,9 @@ void qa_bot_memory_restore(qa_bot_memory *m, const qa_save_value *value,
   qa_save_reader_destroy(&allocations_reader);
   qa_save_reader_destroy(&reader);
   if (m->disposed || m->live_count != 0)
-    qa_range_error("Bot memory restore requires a fresh owner and supported image");
+    qa_raise("Error", 0, 0, "Bot memory restore requires a fresh owner and supported image");
   for (size_t i = 0; i < count; i++)
-    if (lengths[i] > 2147483647u - 4u) qa_range_error("Invalid saved bot allocation");
+    if (lengths[i] > 2147483647u - 4u) qa_raise("Error", 0, 0, "Invalid saved bot allocation");
   out->allocations = calloc(count == 0 ? 1 : count, sizeof *out->allocations);
   if (out->allocations == NULL) qa_range_error("out of memory");
   out->count = count;
@@ -270,9 +287,8 @@ void qa_bot_memory_restore(qa_bot_memory *m, const qa_save_value *value,
       qa_range_error("out of memory");
     memcpy(out->allocations[i].bytes, bytes[i], lengths[i]);
   }
-  free(kinds);
-  free(bytes);
-  free(lengths);
+  qa_cleanup_pop(&scratch_cleanup);
+  restore_scratch_free(&scratch);
 }
 
 void qa_bot_memory_restored_destroy(qa_bot_memory_restored *restored) {
@@ -283,6 +299,6 @@ void qa_bot_memory_restored_destroy(qa_bot_memory_restored *restored) {
 qa_bot_memory_allocation qa_bot_memory_restored_allocation(
     qa_bot_memory_restored *restored, int64_t reference) {
   if (reference < 0 || (uint64_t)reference >= restored->count)
-    qa_range_error("Saved bot allocation reference is invalid");
+    qa_raise("Error", 0, 0, "Saved bot allocation reference is invalid");
   return restored->allocations[reference];
 }

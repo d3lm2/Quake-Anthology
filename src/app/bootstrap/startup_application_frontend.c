@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/app/bootstrap/audio/output_settings.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/app/bootstrap/input.h"
 #include "qa/app/bootstrap/shared_setting_cvars.h"
 #include "qa/console/discovery.h"
@@ -83,7 +84,9 @@ char *qa_startup_frontend_routing_state(qa_input_router *router) {
     snprintf(text, sizeof text, "%s{\"seat\":%lld,\"controller\":{\"kind\":\"%s\"", i == 0 ? "" : ",", (long long)seat.index, kind);
     append_text(&buffer, &length, &capacity, text);
     if (selection.kind == QA_CONTROLLER_SELECTION_DEVICE) {
-      snprintf(text, sizeof text, ",\"guid\":\"%s\",\"ordinal\":%.17g", selection.guid, selection.ordinal);
+      char ordinal[40];
+      qa_net_json_number(selection.ordinal, ordinal, sizeof ordinal); /* JSON.stringify of a number */
+      snprintf(text, sizeof text, ",\"guid\":\"%s\",\"ordinal\":%s", selection.guid, ordinal);
       append_text(&buffer, &length, &capacity, text);
     } else if (selection.kind == QA_CONTROLLER_SELECTION_SERIAL) {
       snprintf(text, sizeof text, ",\"guid\":\"%s\",\"serial\":\"", selection.guid);
@@ -342,9 +345,14 @@ void qa_startup_retire_menu_commands(void *ctx) { qa_startup_release_menu_input(
 void qa_startup_fail_active_source(qa_startup_application *app, bool active_is_game, const qa_caught_error *error) {
   if (app->closed || app->stopping || (active_is_game && app->game != NULL && qa_application_world_failed(app->game)))
     qa_rethrow(error);
-  /* TS error.stack ?? error.message: C errors carry no stack, so the message is printed. */
-  qa_startup_printf(app, "Session ended by an error: %s\n", error->message);
-  qa_startup_set_text(&app->status, error->message);
+  /* TS error.stack ?? error.message. Bun's stack is "<name>: <message>" ("<name>" for an empty message) followed by
+   * "\n    at <file>:<line>:<column>" frames of the TypeScript source; a C error has no such frames, so the header line
+   * is printed. */
+  const char *message = qa_caught_message(error);
+  const char *name = error->name != NULL ? error->name : "Error";
+  if (message[0] == '\0') qa_startup_printf(app, "Session ended by an error: %s\n", name);
+  else qa_startup_printf(app, "Session ended by an error: %s: %s\n", name, message);
+  qa_startup_set_text(&app->status, qa_caught_message(error));
   qa_startup_return_to_frontend(app);
 }
 
@@ -402,6 +410,7 @@ void qa_startup_return_to_frontend(qa_startup_application *app) {
 typedef struct frontend_routing {
   qa_startup_application *app;
   qa_app_client_bootstrap *client;
+  qa_app_console_script_files *scripts; /* TS captures client.configuration.current.scripts at publication */
   qa_cvar_registry *source, *movement, *fallback;
   qa_app_prepared_seat *seats; size_t seat_count;
   qa_cvar_registry **owners, **copies; size_t copy_count;
@@ -422,7 +431,7 @@ static qa_cvar_registry *copy_registry(frontend_routing *routing, qa_cvar_regist
   options.context = qa_cvar_registry_context(owner);
   for (size_t i = 0; i < routing->context_count; i++)
     if (routing->context_owners[i] == owner) options.context = *routing->contexts[i];
-  options.print = (qa_command_print_fn)qa_startup_host_print; options.print_ctx = app;
+  options.print = (qa_command_print_fn)qa_startup_application_print; options.print_ctx = app; /* print: text => this.print(text) */
   qa_cvar_registry *cvars = qa_cvar_registry_create(&options);
   if (cvars == NULL) qa_range_error("Out of memory");
   app->owned_registries = grow(app->owned_registries, app->owned_registry_count, sizeof *app->owned_registries);
@@ -430,6 +439,7 @@ static qa_cvar_registry *copy_registry(frontend_routing *routing, qa_cvar_regist
   qa_cvar_transfer *transfer = qa_cvar_registry_prepare_transfer(owner, cvars);
   if (transfer == NULL) qa_range_error("Out of memory");
   if (transfer->destroy != NULL) transfer->destroy(transfer->ctx);
+  free(transfer); /* the caller frees the qa_cvar_transfer itself (core/cvars/index.h) */
   routing->owners = grow(routing->owners, routing->copy_count, sizeof *routing->owners);
   routing->copies = grow(routing->copies, routing->copy_count, sizeof *routing->copies);
   routing->owners[routing->copy_count] = owner;
@@ -475,7 +485,7 @@ static void routing_forward(void *ctx, const char *name, const char *const *args
 /* TS read: (name, context) => scripts.read(name, context): the scope argument is not read. */
 static char *routing_read(void *ctx, const char *name, qa_command_context source, qa_app_startup_script_scope scope) {
   (void)scope;
-  return qa_app_console_script_files_read(((frontend_routing *)ctx)->client->configuration_current.scripts, name, source);
+  return qa_app_console_script_files_read(((frontend_routing *)ctx)->scripts, name, source);
 }
 void qa_startup_frontend_routing_free(void *raw) {
   frontend_routing *routing = raw;
@@ -493,6 +503,7 @@ void qa_startup_publish_frontend_routing(qa_startup_application *app, qa_app_cli
   if (routing == NULL) qa_range_error("Out of memory");
   routing->app = app;
   routing->client = client;
+  routing->scripts = scripts;
   qa_cleanup guard;
   qa_cleanup_push(&guard, qa_startup_frontend_routing_free, routing);
   size_t seat_count = 0;
@@ -591,18 +602,18 @@ void qa_startup_close_frontend_movie(qa_startup_application *app) {
   movie_close close = {app, current, images};
   void (*steps[4])(void *ctx) = {movie_clear, movie_close_body, movie_images_body, movie_clear};
   void *contexts[4] = {app, &close, &close, app};
-  char messages[4][sizeof ((qa_caught_error *)0)->message];
   size_t failures = 0;
   for (size_t i = 0; i < 4; i++) {
     qa_caught_error caught;
-    if (!qa_try(steps[i], contexts[i], &caught)) snprintf(messages[failures++], sizeof messages[0], "%s", caught.message);
+    if (!qa_try(steps[i], contexts[i], &caught)) failures++;
   }
   qa_app_campaign_cinematic_destroy(current);
   qa_scene_image_registry_destroy(images);
   free(images);
   qa_startup_movie_captions_free(app->frontend_movie_captions);
   app->frontend_movie_captions = NULL;
-  if (failures != 0) qa_raise("AggregateError", 0, 0, "Frontend movie retirement failed: %s", messages[0]);
+  /* TS AggregateError(errors, "Frontend movie retirement failed"): its message is only its own text. */
+  if (failures != 0) qa_raise("AggregateError", 0, (long long)failures, "Frontend movie retirement failed");
 }
 
 /* ---- openFrontendMovie(request) -------------------------------------------- */
@@ -623,6 +634,7 @@ void qa_startup_movie_captions_free(void *raw) {
   movie_captions *captions = raw;
   if (captions == NULL) return;
   if (captions->has_captions) qa_seat_media_captions_destroy(&captions->captions);
+  qa_ui_seat_preferences_destroy(&captions->preferences);
   free(captions->language);
   free(captions);
 }
@@ -754,16 +766,15 @@ void qa_startup_open_frontend_movie(qa_startup_application *app, const qa_app_st
   if (!opened) {
     void (*steps[3])(void *ctx) = {movie_failed_close, movie_failed_images, movie_failed_clear};
     size_t failures = 0;
-    char cleanup[sizeof caught.message] = "";
     for (size_t i = 0; i < 3; i++) {
       qa_caught_error failed;
-      if (!qa_try(steps[i], &open, &failed)) { if (failures++ == 0) snprintf(cleanup, sizeof cleanup, "%s", failed.message); }
+      if (!qa_try(steps[i], &open, &failed)) failures++;
     }
     if (open.prepared != NULL) qa_app_campaign_cinematic_destroy(open.prepared);
     qa_scene_image_registry_destroy(open.images);
     free(open.images);
     qa_startup_movie_captions_free(captions);
-    if (failures != 0) qa_raise("AggregateError", 0, 0, "Frontend movie preparation and cleanup failed: %s; %s", caught.message, cleanup);
+    if (failures != 0) qa_raise("AggregateError", 0, (long long)failures + 1, "Frontend movie preparation and cleanup failed");
     qa_rethrow(&caught);
   }
   app->frontend_movie = open.prepared;

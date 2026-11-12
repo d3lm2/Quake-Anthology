@@ -2,6 +2,7 @@
 #include "qa/core/binary/index.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -22,11 +23,62 @@ noreturn void qa_binary_error(const char *source, int64_t offset,
   qa_raise("BinaryError", 0, offset, "%s:%lld: %s", source, (long long)offset, text);
 }
 
-static char *copy_text(const char *text) {
-  size_t length = strlen(text) + 1;
-  char *copy = (char *)malloc(length);
-  if (copy != NULL) memcpy(copy, text, length);
-  return copy;
+/* Reader names are interned: TS keeps `source` as a shared immutable string,
+ * so a reader abandoned by a thrown BinaryError owns nothing to release. Each
+ * distinct name is stored once for the life of the process (names are file
+ * paths and `${source}@${offset}` sections of them, bounded by the content
+ * read). The table is shared, so it is locked. */
+static pthread_mutex_t intern_lock = PTHREAD_MUTEX_INITIALIZER;
+static char **intern_slots;
+static size_t intern_capacity, intern_count;
+
+static uint64_t intern_hash(const char *text) {
+  uint64_t hash = 1469598103934665603ull;
+  for (const unsigned char *p = (const unsigned char *)text; *p != 0; p++) hash = (hash ^ *p) * 1099511628211ull;
+  return hash;
+}
+static bool intern_grow(void) {
+  size_t capacity = intern_capacity == 0 ? 256 : intern_capacity * 2;
+  char **slots = (char **)calloc(capacity, sizeof *slots);
+  if (slots == NULL) return false;
+  for (size_t i = 0; i < intern_capacity; i++) {
+    if (intern_slots[i] == NULL) continue;
+    size_t at = (size_t)intern_hash(intern_slots[i]) & (capacity - 1);
+    while (slots[at] != NULL) at = (at + 1) & (capacity - 1);
+    slots[at] = intern_slots[i];
+  }
+  free(intern_slots);
+  intern_slots = slots;
+  intern_capacity = capacity;
+  return true;
+}
+/* NULL only on allocation failure. */
+static char *intern_name(const char *text) {
+  pthread_mutex_lock(&intern_lock);
+  char *found = NULL;
+  if ((intern_count + 1) * 2 > intern_capacity && !intern_grow()) {
+    pthread_mutex_unlock(&intern_lock);
+    return NULL;
+  }
+  size_t at = (size_t)intern_hash(text) & (intern_capacity - 1);
+  while (intern_slots[at] != NULL) {
+    if (strcmp(intern_slots[at], text) == 0) {
+      found = intern_slots[at];
+      break;
+    }
+    at = (at + 1) & (intern_capacity - 1);
+  }
+  if (found == NULL) {
+    size_t length = strlen(text) + 1;
+    found = (char *)malloc(length);
+    if (found != NULL) {
+      memcpy(found, text, length);
+      intern_slots[at] = found;
+      intern_count++;
+    }
+  }
+  pthread_mutex_unlock(&intern_lock);
+  return found;
 }
 
 int qa_binary_reader_init(qa_binary_reader *reader, uint8_t *data,
@@ -34,12 +86,11 @@ int qa_binary_reader_init(qa_binary_reader *reader, uint8_t *data,
   reader->data = data;
   reader->length = length;
   reader->cursor = 0;
-  reader->source = copy_text(source != NULL ? source : "<buffer>");
+  reader->source = intern_name(source != NULL ? source : "<buffer>");
   return reader->source != NULL;
 }
 
 void qa_binary_reader_destroy(qa_binary_reader *reader) {
-  free(reader->source);
   reader->source = NULL;
   reader->data = NULL;
   reader->length = 0;
@@ -256,10 +307,13 @@ int qa_binary_reader_section(const qa_binary_reader *reader, int64_t offset,
   char *name = (char *)malloc(name_length);
   if (name == NULL) return 0;
   snprintf(name, name_length, "%s@%lld", reader->source, (long long)offset);
+  char *interned = intern_name(name);
+  free(name);
+  if (interned == NULL) return 0;
   out->data = reader->data + offset;
   out->length = (size_t)length;
   out->cursor = 0;
-  out->source = name;
+  out->source = interned;
   return 1;
 }
 
@@ -310,13 +364,13 @@ void qa_binary_reader_expect_magic(qa_binary_reader *reader,
     char *got = json_stringify(actual != NULL ? actual : "");
     const char *want_text = want != NULL ? want : "\"\"";
     const char *got_text = got != NULL ? got : "\"\"";
-    char text[1536];
-    snprintf(text, sizeof text, "%s:%zu: expected %s, got %s",
-             reader->source, offset, want_text, got_text);
-    free(want);
-    free(got);
     free(actual);
-    qa_raise("BinaryError", 0, (long long)offset, "%s", text);
+    /* The raise formats the whole text (no length cap, as TS) before it unwinds these. */
+    qa_cleanup want_node, got_node;
+    qa_cleanup_push(&want_node, free, want);
+    qa_cleanup_push(&got_node, free, got);
+    qa_raise("BinaryError", 0, (long long)offset, "%s:%zu: expected %s, got %s",
+             reader->source, offset, want_text, got_text);
   }
   free(actual);
 }

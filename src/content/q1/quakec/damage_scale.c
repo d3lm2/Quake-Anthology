@@ -122,6 +122,12 @@ typedef struct scale_ctx {
   bool transform;
   value_map context;
   wset prefix_writes, named, mutable, scratch, constants;
+  /* Owned memory in flight, released when a reject raises (the TS garbage). */
+  qa_q1qc_damage_call_layout *layout;
+  struct pending_map *pending;
+  value_map *current, *merging;
+  wset *amount_inputs, *private_writes;
+  scale_value *left;
 } scale_ctx;
 
 static scale_value merge_values(scale_ctx *ctx, const scale_value *left, const scale_value *right) {
@@ -203,6 +209,25 @@ static void write_value(scale_ctx *ctx, value_map *values, int64_t word, scale_v
 
 typedef struct pending_entry { int64_t pc; value_map values; } pending_entry;
 typedef struct pending_map { pending_entry *items; size_t count, capacity; } pending_map;
+static void scale_ctx_release(void *arg) {
+  scale_ctx *ctx = arg;
+  qa_q1qc_damage_call_layout_destroy(ctx->layout);
+  if (ctx->pending != NULL) {
+    for (size_t i = 0; i < ctx->pending->count; i++) value_map_free(&ctx->pending->items[i].values);
+    free(ctx->pending->items);
+  }
+  if (ctx->current != NULL) value_map_free(ctx->current);
+  if (ctx->merging != NULL) value_map_free(ctx->merging);
+  if (ctx->amount_inputs != NULL) wset_free(ctx->amount_inputs);
+  if (ctx->private_writes != NULL) wset_free(ctx->private_writes);
+  if (ctx->left != NULL) value_free(ctx->left);
+  value_map_free(&ctx->context);
+  wset_free(&ctx->prefix_writes);
+  wset_free(&ctx->named);
+  wset_free(&ctx->mutable);
+  wset_free(&ctx->scratch);
+  wset_free(&ctx->constants);
+}
 static void pending_edge(scale_ctx *ctx, pending_map *pending, int64_t from, int64_t to,
                          value_map *values) {
   if (to <= from || to < (int64_t)ctx->source->entry || to > (int64_t)ctx->source->exit)
@@ -218,12 +243,14 @@ static void pending_edge(scale_ctx *ctx, pending_map *pending, int64_t from, int
     return;
   }
   value_map merged = {NULL, 0, 0};
+  ctx->merging = &merged;
   for (size_t i = 0; i < previous->values.count; i++) {
     value_entry *next = value_map_find(values, previous->values.items[i].word);
     if (next == NULL) continue;
     value_map_set(&merged, previous->values.items[i].word,
                   merge_values(ctx, &previous->values.items[i].value, &next->value));
   }
+  ctx->merging = NULL;
   value_map_free(&previous->values);
   previous->values = merged;
 }
@@ -256,7 +283,11 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
       (int64_t)source->entry < fn->first_statement ||
       (int64_t)source->exit <= (int64_t)source->entry || (int64_t)source->exit >= end)
     reject_scale(program, "original damage region bounds");
+  scale_ctx ctx = {0};
+  qa_cleanup node;
+  qa_cleanup_push(&node, scale_ctx_release, &ctx);
   qa_q1qc_damage_call_layout *layout = qa_q1qc_damage_call_layout_create(program, call);
+  ctx.layout = layout;
   qa_q1qc_role_locations amount = layout->roles[QA_Q1QC_ROLE_AMOUNT];
   if (amount.count != 1) reject_scale(program, "scale result requires one original float input");
   qa_q1qc_damage_role_location location = amount.items[0];
@@ -269,7 +300,6 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
     reject_scale(program, "original damage parameter");
   static const char *const AVAILABLE[] = {"self", "attacker", "inflictor", "amount", "time"};
   qa_q1qc_validate_source_call(program, call, AVAILABLE, 5, "damage scale");
-  scale_ctx ctx = {0};
   ctx.program = program;
   ctx.source = source;
   ctx.fn = fn;
@@ -301,6 +331,7 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
     }
   }
   wset amount_inputs = {NULL, 0, 0};
+  ctx.amount_inputs = &amount_inputs;
   wset_add(&amount_inputs, damage);
   for (size_t i = 0; i < ctx.context.count; i++)
     if (!ctx.context.items[i].is_null && ctx.context.items[i].value.kind == VALUE_SCALED)
@@ -321,6 +352,7 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
       for (size_t i = 0; i < access.write_count; i++) wset_add(&ctx.prefix_writes, access.write[i]);
   }
   wset_free(&amount_inputs);
+  ctx.amount_inputs = NULL;
   bool attacker_written = false;
   for (size_t i = 0; i < layout->roles[QA_Q1QC_ROLE_ATTACKER].count; i++) {
     const qa_q1qc_damage_role_location *at = &layout->roles[QA_Q1QC_ROLE_ATTACKER].items[i];
@@ -356,9 +388,12 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
     if (!at->is_global) value_map_set(&initial_values, at->frame_word, value_actor());
   }
   pending_map pending = {NULL, 0, 0};
+  ctx.current = &initial_values;
   pending.items = xmalloc(sizeof *pending.items);
   pending.capacity = 1;
   pending.items[pending.count++] = (pending_entry){(int64_t)source->entry, initial_values};
+  ctx.current = NULL;
+  ctx.pending = &pending;
   bool joined = false, multiplied = false;
   const char *kind = source->kind != NULL ? source->kind : "multiplier";
   while (pending.count != 0) {
@@ -371,6 +406,7 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
     pending.count--;
     int64_t pc = current.pc;
     value_map values = current.values;
+    ctx.current = &values;
     if (pc == (int64_t)source->exit) {
       value_entry *result = value_map_find(&values, damage);
       if (result == NULL || result->value.kind == VALUE_ACTOR ||
@@ -380,6 +416,7 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
           (result->value.kind != VALUE_SCALED || !result->value.identity))
         reject_scale(program, "identity region changes its original damage input");
       joined = true;
+      ctx.current = NULL;
       value_map_free(&values);
       continue;
     }
@@ -420,7 +457,9 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
       }
     } else if (is_binary(opcode)) {
       scale_value left = read_value(&ctx, &values, a);
+      ctx.left = &left;
       scale_value right = read_value(&ctx, &values, b);
+      ctx.left = NULL;
       if (ctx.transform) {
         if (left.kind == VALUE_ACTOR || right.kind == VALUE_ACTOR) {
           value_free(&left); value_free(&right);
@@ -468,8 +507,10 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
       reject_scale(program, "region must contain only source reads and scalar frame operations");
     }
     if (fallthrough) pending_edge(&ctx, &pending, pc, pc + 1, &values);
+    ctx.current = NULL;
     value_map_free(&values);
   }
+  ctx.pending = NULL;
   free(pending.items);
   if (!joined || (strcmp(kind, "identity") != 0 && !ctx.transform && !multiplied))
     reject_scale(program, "region has no original multiplicative result");
@@ -490,11 +531,13 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
       reject_scale(program, "source path repeats scaling");
   }
   wset private_writes = {NULL, 0, 0};
+  ctx.private_writes = &private_writes;
   for (size_t i = 0; i < ctx.scratch.count; i++)
     if (ctx.scratch.items[i] != damage) wset_add(&private_writes, ctx.scratch.items[i]);
   bool dead = qa_q1qc_region_private_writes_are_dead(program, (int64_t)source->exit, end,
                                                      private_writes.items, private_writes.count);
   wset_free(&private_writes);
+  ctx.private_writes = NULL;
   if (!dead) reject_scale(program, "private scale outputs remain live after suppression");
   qa_q1qc_damage_scale *scale = xmalloc(sizeof *scale);
   memset(scale, 0, sizeof *scale);
@@ -512,6 +555,7 @@ qa_q1qc_damage_scale *qa_q1qc_damage_scale_create(const qa_q1qc_program *program
   scale->region = (qa_q1qc_inline_region){fn->index, (int64_t)source->entry, (int64_t)source->exit,
                                           true, true, damage,
                                           location.is_global ? "global" : NULL};
+  qa_cleanup_pop(&node);
   qa_q1qc_damage_call_layout_destroy(layout);
   value_map_free(&ctx.context);
   wset_free(&ctx.prefix_writes);

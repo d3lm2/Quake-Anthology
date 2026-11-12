@@ -37,14 +37,19 @@ typedef struct qa_app_demo_recording_sink {
   const char *(*append)(void *ctx, qa_app_demo_recording_packet packet);
 } qa_app_demo_recording_sink;
 typedef struct qa_app_demo_recording qa_app_demo_recording;
-/* Malloc'd; caller frees. Aborts via normalizeResourcePath as TS. */
+/* TS recordingPath: malloc'd; caller frees. The name is console text; the path is TS's string as console text (the
+ * file system receives its UTF-8). normalizeResourcePath's RangeError is raised as TS throws it. */
 char *qa_app_recording_path(const char *root, const char *name, qa_app_demo_recording_identity identity);
-/* TS DemoRecording.open: *out_error set (static text) on failure, NULL return. */
-/* TS open(root, name, seed, replace = false): replace opens "w" (a typed name overwrites), else "wx". */
+/* TS DemoRecording.open(root, name, seed, replace = false): replace opens "w" (a typed name overwrites), else "wx".
+ * A rejection returns NULL with *out_error the TS error.message: Node's fs Error for the directory or the open
+ * ("EEXIST: file already exists, open '<path>'"), or the seed's write failure. The text stays valid until the next
+ * open on this thread. normalizeResourcePath's RangeError is raised. */
 qa_app_demo_recording *qa_app_demo_recording_open(const char *root, const char *name, qa_app_demo_recording_seed seed, bool replace,
                                                   const char **out_error);
 const char *qa_app_demo_recording_path(const qa_app_demo_recording *recording);
 qa_app_demo_recording_identity qa_app_demo_recording_identity_of(const qa_app_demo_recording *recording);
+/* append/stop/abort return the rejection's message or NULL; the text is owned by the recording (valid until
+ * destroy). A failed write is kept: every later write rejects with it. */
 /* Sink view of the recording itself (append forwards, errors as strings). */
 qa_app_demo_recording_sink qa_app_demo_recording_sink_of(qa_app_demo_recording *recording);
 const char *qa_app_demo_recording_append(qa_app_demo_recording *recording, qa_app_demo_recording_packet packet);

@@ -172,6 +172,18 @@ double qa_js_string_to_number(const char *text);
  */
 size_t qa_js_to_fixed(double value, int digits, char *buffer, size_t capacity);
 
+/* The digits of Number::toString for a finite nonzero value: the shortest
+ * decimal significand that reads back as `value` (ECMAScript picks the fewest
+ * digits k for which some k-digit decimal round-trips, and among those the one
+ * closest to the value). Writes 1..17 digits with no trailing zeros and a NUL
+ * to `digits` (capacity >= 18), ignoring the sign, and returns the decimal
+ * exponent of the first digit (value = d.ddd x 10^exponent).
+ * printf("%.*e") alone is not enough: it rounds the exact binary value to the
+ * nearest k-digit decimal, which at a power of two (where the gap below the
+ * value is half the gap above) can fall outside the round-trip interval while
+ * the next decimal up is inside it; 2^-24 is "5.960464477539063e-8". */
+int qa_js_shortest_digits(double value, char *digits);
+
 /** Array.prototype.sort comparator over two elements, with a caller context. */
 typedef int (*qa_js_compare_fn)(const void *a, const void *b, void *ctx);
 /** Stable sort, as Array.prototype.sort with a consistent comparator. */

@@ -24,11 +24,11 @@ bool qa_depth_atlas_target_init(qa_depth_atlas_target *t, const qa_gl_context *c
   if (p->positions == NULL || p->indices == NULL) { free(p->positions); free(p->indices); free(p); return false; }
   p->gl = gl; p->program = program;
   if (!qa_load_gl_framebuffers(context, &p->library)) { free(p->positions); free(p->indices); free(p); return false; }
-  /* /^(\d+)\.(\d+)/ over String(glGetString(GL_VERSION)); no match reads as 0.0. */
+  /* /^(\d+)\.(\d+)/ over String(glGetString(GL_VERSION)), each group through Number(); no match reads as 0.0. */
   const char *version = gl->glGetString(0x1f02);
-  int major = 0, minor = 0;
+  double major = 0, minor = 0;
   if (version != NULL) {
-    const char *c = version; int a = 0, b = 0; bool has_a = false, has_b = false;
+    const char *c = version; double a = 0, b = 0; bool has_a = false, has_b = false;
     while (*c >= '0' && *c <= '9') { a = a * 10 + (*c++ - '0'); has_a = true; }
     if (has_a && *c == '.') {
       c++;
@@ -41,8 +41,10 @@ bool qa_depth_atlas_target_init(qa_depth_atlas_target *t, const qa_gl_context *c
   p->library.glGenFramebuffers(1, p->handle);
   p->name = p->handle[0];
   if (p->name == 0) {
+    /* TS constructor catch: close the library, rethrow. */
     qa_gl_framebuffers_close(&p->library);
-    qa_range_error("OpenGL could not allocate a shadow framebuffer");
+    free(p->positions); free(p->indices); free(p);
+    qa_raise("Error", 0, 0, "OpenGL could not allocate a shadow framebuffer");
   }
   t->impl = p;
   return true;
@@ -76,37 +78,11 @@ static void flush_run(run *r) {
   r->vertex_count = 0; r->index_count = 0;
 }
 
-void qa_depth_atlas_target_draw(qa_depth_atlas_target *t, double texture, double width, double height, const qa_depth_atlas_pass *passes, size_t pass_count) {
-  dimpl *p = (dimpl *)t->impl; qa_gl *gl = p->gl; qa_gl_framebuffers *fbo = &p->library;
-  for (size_t i = 0; i < pass_count; i++) {
-    qa_rect v = passes[i].viewport;
-    if (!is_integer(v.x) || !is_integer(v.y) || !is_integer(v.width) || !is_integer(v.height)
-      || v.x < 0 || v.y < 0 || v.width <= 0 || v.height <= 0
-      || v.x + v.width > width || v.y + v.height > height)
-      qa_range_error("OpenGL depth atlas viewport is outside its image");
-    if (passes[i].has_clear_depth && (!isfinite(passes[i].clear_depth) || passes[i].clear_depth < 0 || passes[i].clear_depth > 1))
-      qa_range_error("OpenGL depth atlas clear must be in 0..1");
-    for (size_t j = 0; j < passes[i].draw_count; j++) validate_draw(&passes[i].draws[j]);
-  }
-  int32_t old_target = 0, old_read_target = 0, old_draw_buffer = 0, old_read_buffer = 0;
-  gl->glGetIntegerv(0x8ca6, &old_target); gl->glGetIntegerv(0x8caa, &old_read_target);
-  gl->glGetIntegerv(0xc01, &old_draw_buffer); gl->glGetIntegerv(0xc02, &old_read_buffer);
-  int32_t viewport[4] = {0, 0, 0, 0}, scissor[4] = {0, 0, 0, 0}, color_mask[4] = {0, 0, 0, 0}, polygon_mode[2] = {0, 0};
-  gl->glGetIntegerv(0xba2, viewport); gl->glGetIntegerv(0xc10, scissor); gl->glGetIntegerv(0xc23, color_mask);
-  float depth_range[2] = {0, 0}, depth_clear = 0, offset_factor = 0, offset_units = 0;
-  gl->glGetFloatv(0xb70, depth_range); gl->glGetFloatv(0xb73, &depth_clear);
-  int32_t depth_mask = 0, depth_function = 0, cull = 0, program = 0, stack = 0, stack_max = 0;
-  gl->glGetIntegerv(0xb72, &depth_mask); gl->glGetIntegerv(0xb74, &depth_function);
-  gl->glGetIntegerv(0xb45, &cull); gl->glGetIntegerv(0xb40, polygon_mode);
-  gl->glGetFloatv(0x8038, &offset_factor); gl->glGetFloatv(0x2a00, &offset_units);
-  gl->glGetIntegerv(0x8b8d, &program);
-  static const uint32_t enable_names[9] = {0xb71, 0xb44, 0xbe2, 0xb90, 0xbc0, 0x3000, 0xc11, 0x8037, 0x8f9d};
-  int enable_count = p->primitive_restart ? 9 : 8;
-  bool enabled[9];
-  for (int i = 0; i < enable_count; i++) enabled[i] = gl->glIsEnabled(enable_names[i]) != 0;
-  gl->glGetIntegerv(0xbb1, &stack); gl->glGetIntegerv(0xd3b, &stack_max);
-  if (stack >= stack_max) qa_range_error("OpenGL client attribute stack is full");
-  gl->glPushClientAttrib(2);
+typedef struct draw_scope { dimpl *p; double texture; const qa_depth_atlas_pass *passes; size_t pass_count; } draw_scope;
+/* The TS try block: everything between glPushClientAttrib and the finally. */
+static void draw_body(void *ctx) {
+  draw_scope *s = (draw_scope *)ctx; dimpl *p = s->p; qa_gl *gl = p->gl; qa_gl_framebuffers *fbo = &p->library;
+  const qa_depth_atlas_pass *passes = s->passes; size_t pass_count = s->pass_count;
   gl->glBindBuffer(0x8892, 0); gl->glBindBuffer(0x8893, 0);
   static const uint32_t client_states[6] = {0x8075, 0x8076, 0x8077, 0x8079, 0x8457, 0x845e};
   for (int i = 0; i < 6; i++) gl->glDisableClientState(client_states[i]);
@@ -116,10 +92,10 @@ void qa_depth_atlas_target_draw(qa_depth_atlas_target *t, double texture, double
   gl->glEnableClientState(0x8074); gl->glVertexPointer(4, 0x1406, 0, p->positions);
   if (p->primitive_restart) gl->glDisable(0x8f9d);
   fbo->glBindFramebuffer(0x8d40, p->name);
-  fbo->glFramebufferTexture2D(0x8d40, 0x8d00, 0xde1, (uint32_t)texture, 0);
+  fbo->glFramebufferTexture2D(0x8d40, 0x8d00, 0xde1, (uint32_t)s->texture, 0);
   gl->glDrawBuffer(0); fbo->glReadBuffer(0);
   uint32_t status = fbo->glCheckFramebufferStatus(0x8d40);
-  if (status != 0x8cd5) qa_range_error("OpenGL shadow framebuffer is incomplete: 0x%x", status);
+  if (status != 0x8cd5) qa_raise("Error", 0, 0, "OpenGL shadow framebuffer is incomplete: 0x%x", status);
   qa_gl_stage_program_use_depth(p->program);
   gl->glEnable(0xb71); gl->glDepthMask(1); gl->glDepthFunc(0x203); gl->glDepthRange(0, 1);
   gl->glEnable(0xc11); gl->glColorMask(0, 0, 0, 0); gl->glPolygonMode(0x408, 0x1b02);
@@ -170,7 +146,43 @@ void qa_depth_atlas_target_draw(qa_depth_atlas_target *t, double texture, double
     flush_run(&r);
   }
   uint32_t error = gl->glGetError();
-  if (error != 0) qa_range_error("OpenGL shadow atlas draw failed: 0x%x", error);
+  if (error != 0) qa_raise("Error", 0, 0, "OpenGL shadow atlas draw failed: 0x%x", error);
+}
+
+void qa_depth_atlas_target_draw(qa_depth_atlas_target *t, double texture, double width, double height, const qa_depth_atlas_pass *passes, size_t pass_count) {
+  dimpl *p = (dimpl *)t->impl; qa_gl *gl = p->gl; qa_gl_framebuffers *fbo = &p->library;
+  for (size_t i = 0; i < pass_count; i++) {
+    qa_rect v = passes[i].viewport;
+    if (!is_integer(v.x) || !is_integer(v.y) || !is_integer(v.width) || !is_integer(v.height)
+      || v.x < 0 || v.y < 0 || v.width <= 0 || v.height <= 0
+      || v.x + v.width > width || v.y + v.height > height)
+      qa_range_error("OpenGL depth atlas viewport is outside its image");
+    if (passes[i].has_clear_depth && (!isfinite(passes[i].clear_depth) || passes[i].clear_depth < 0 || passes[i].clear_depth > 1))
+      qa_range_error("OpenGL depth atlas clear must be in 0..1");
+    for (size_t j = 0; j < passes[i].draw_count; j++) validate_draw(&passes[i].draws[j]);
+  }
+  int32_t old_target = 0, old_read_target = 0, old_draw_buffer = 0, old_read_buffer = 0;
+  gl->glGetIntegerv(0x8ca6, &old_target); gl->glGetIntegerv(0x8caa, &old_read_target);
+  gl->glGetIntegerv(0xc01, &old_draw_buffer); gl->glGetIntegerv(0xc02, &old_read_buffer);
+  int32_t viewport[4] = {0, 0, 0, 0}, scissor[4] = {0, 0, 0, 0}, color_mask[4] = {0, 0, 0, 0}, polygon_mode[2] = {0, 0};
+  gl->glGetIntegerv(0xba2, viewport); gl->glGetIntegerv(0xc10, scissor); gl->glGetIntegerv(0xc23, color_mask);
+  float depth_range[2] = {0, 0}, depth_clear = 0, offset_factor = 0, offset_units = 0;
+  gl->glGetFloatv(0xb70, depth_range); gl->glGetFloatv(0xb73, &depth_clear);
+  int32_t depth_mask = 0, depth_function = 0, cull = 0, program = 0, stack = 0, stack_max = 0;
+  gl->glGetIntegerv(0xb72, &depth_mask); gl->glGetIntegerv(0xb74, &depth_function);
+  gl->glGetIntegerv(0xb45, &cull); gl->glGetIntegerv(0xb40, polygon_mode);
+  gl->glGetFloatv(0x8038, &offset_factor); gl->glGetFloatv(0x2a00, &offset_units);
+  gl->glGetIntegerv(0x8b8d, &program);
+  static const uint32_t enable_names[9] = {0xb71, 0xb44, 0xbe2, 0xb90, 0xbc0, 0x3000, 0xc11, 0x8037, 0x8f9d};
+  int enable_count = p->primitive_restart ? 9 : 8;
+  bool enabled[9];
+  for (int i = 0; i < enable_count; i++) enabled[i] = gl->glIsEnabled(enable_names[i]) != 0;
+  gl->glGetIntegerv(0xbb1, &stack); gl->glGetIntegerv(0xd3b, &stack_max);
+  if (stack >= stack_max) qa_raise("Error", 0, 0, "OpenGL client attribute stack is full");
+  gl->glPushClientAttrib(2);
+  draw_scope scope = {p, texture, passes, pass_count};
+  qa_caught_error caught; /* rethrown unchanged after the TS finally */
+  bool ok = qa_try(draw_body, &scope, &caught);
   gl->glPopClientAttrib();
   fbo->glFramebufferTexture2D(0x8d40, 0x8d00, 0xde1, 0, 0);
   fbo->glBindFramebuffer(0x8ca9, (uint32_t)old_target);
@@ -185,6 +197,7 @@ void qa_depth_atlas_target_draw(qa_depth_atlas_target *t, double texture, double
   gl->glPolygonOffset(offset_factor, offset_units);
   for (int i = 0; i < enable_count; i++) { if (enabled[i]) gl->glEnable(enable_names[i]); else gl->glDisable(enable_names[i]); }
   qa_gl_stage_program_restore(p->program, program);
+  if (!ok) qa_rethrow(&caught);
 }
 
 void qa_depth_atlas_target_close(qa_depth_atlas_target *t) {

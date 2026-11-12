@@ -6,11 +6,11 @@
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 qa_q3_arsenal_controls qa_app_sim_resolve_q3_arsenal_controls(qa_arsenal_state arsenal,
     const qa_arsenal_intent *intent, qa_movement_command command, const char *product) {
-  if (!is(arsenal.state.kind, "q3")) qa_range_error("Q3 controls require the selected Q3 arsenal");
+  if (!is(arsenal.state.kind, "q3")) qa_raise("Error", 0, 0, "Q3 controls require the selected Q3 arsenal");
   double requested = command.kind == QA_USER_COMMAND_Q3 ? command.as.q3.weapon : arsenal.state.source_weapon;
   if (intent != NULL) {
     if (intent->provider == NULL || arsenal.provider == NULL || strcmp(intent->provider, arsenal.provider) != 0)
-      qa_range_error("Arsenal command belongs to a different provider");
+      qa_raise("Error", 0, 0, "Arsenal command belongs to a different provider");
     requested = arsenal.state.source_weapon;
     if (intent->weapon != NULL) {
       const qa_q3_weapon_item *weapon = NULL;

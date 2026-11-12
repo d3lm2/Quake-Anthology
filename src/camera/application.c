@@ -1,5 +1,6 @@
 /* Port of src/camera/application.ts. GPL-2.0-or-later. */
 #include "qa/camera/application.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/network/common/js_number.h"
 #include "qa/core/math.h"
 #include "qa/render/scene/view.h"
@@ -116,9 +117,10 @@ typedef struct camera_job {
 static void queue(qa_application_spline_camera *camera, void (*operation)(void *), camera_job *job) {
   qa_caught_error caught;
   if (qa_try(operation, job, &caught)) return;
-  const size_t length = strlen(caught.message) + 16;
+  const char *whole = qa_caught_message(&caught);
+  const size_t length = strlen(whole) + 16;
   char *message = (char *)xrealloc(NULL, length);
-  (void)snprintf(message, length, "Camera: %s\n", caught.message);
+  (void)snprintf(message, length, "Camera: %s\n", whole);
   camera->services.print(camera->services.ctx, message);
   free(message);
 }
@@ -185,7 +187,7 @@ static void handle(void *ctx, qa_command_invocation *command,
   call.args = invocation_args(command, &call.count);
   qa_caught_error caught;
   if (!qa_try(camera_run_call, &call, &caught))
-    qa_raise(QA_COMMAND_USAGE_ERROR, 0, 0, "Camera: %s", caught.message);
+    qa_raise(QA_COMMAND_USAGE_ERROR, 0, 0, "Camera: %s", qa_caught_message(&caught));
 }
 
 static void loadcamera_command(void *ctx, qa_command_invocation *command) {

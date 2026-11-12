@@ -13,8 +13,9 @@
 
 noreturn void qa_q2_throw_unbound_server_message(double opcode,
                                                  qa_q2_protocol_identity protocol) {
-  qa_q2_throw_error("Q2 service opcode %s has no binding for %s", QA_JS_NUMBER(opcode),
-                    protocol.kind != NULL ? protocol.kind : "");
+  /* TS Q2UnboundServerMessage sets error.name to its class name. */
+  qa_raise("Q2UnboundServerMessage", 0, 0, "Q2 service opcode %s has no binding for %s", QA_JS_NUMBER(opcode),
+           protocol.kind != NULL ? protocol.kind : "");
 }
 
 static bool kind_is(const qa_q2_protocol_identity *p, const char *kind) {
@@ -48,6 +49,7 @@ void qa_q2_server_event_clear(qa_q2_server_event *event) {
   event->indicators = NULL;
   free(event->private_name);
   event->private_name = NULL;
+  qa_q2_server_data_result_clear(&event->data);
 }
 
 void qa_q2_server_records_free(qa_q2_server_record *records, size_t count) {
@@ -638,15 +640,14 @@ static bool parse_internal(qa_q2_server_message_reader *reader, record_list *lis
                             (int)protocol,
                             (long long)reader->wire.selected_protocol.version);
         }
-        qa_q2_server_data_result data;
-        codec->read_server_data(codec, &data);
+        /* Read straight into the event: list->current owns its strings if a later read raises. */
+        codec->read_server_data(codec, &event.data);
         qa_q2_wire_codec_accept_server_revision(
-            &reader->wire, data.has_r1q2_version, data.r1q2_version);
+            &reader->wire, event.data.has_r1q2_version, event.data.r1q2_version);
         qa_q2_message_check_read(m);
         qa_q2_server_message_reader_reset(reader);
         reader->legacy_demo26 = legacy;
         event.kind = QA_Q2_SERVER_DATA;
-        event.data = data;
         break;
       }
       case 13: {

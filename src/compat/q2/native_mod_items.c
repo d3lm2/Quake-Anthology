@@ -21,12 +21,12 @@ static bool is_packed_encoding(const char *encoding) {
   return false;
 }
 static void validate_counter(double value, qa_native_item_field field) {
-  if (!isfinite(value)) qa_range_error("Native inventory requires a finite source count");
+  if (!isfinite(value)) qa_raise("Error", 0, 0, "Native inventory requires a finite source count");
   const char *encoding = field.field.encoding;
   if (strcmp(encoding, "float32") == 0 || strcmp(encoding, "float64") == 0) return;
   int bits = scalar_bytes(field) * 8; bool is_signed = strncmp(encoding, "int", 3) == 0;
   double bound = qa_js_pow(2, bits - (is_signed ? 1 : 0));
-  if (!is_safe_integer(value) || value < (is_signed ? -bound : 0) || value >= bound) qa_range_error("Native inventory count exceeds its original integer storage");
+  if (!is_safe_integer(value) || value < (is_signed ? -bound : 0) || value >= bound) qa_raise("Error", 0, 0, "Native inventory count exceeds its original integer storage");
 }
 /* --- validateNativeModItems --- */
 typedef struct { const char *record; double index; const char *shared; } occupied_byte;
@@ -34,7 +34,15 @@ typedef struct {
   const qa_native_mod_declaration *d;
   occupied_byte *occupied; size_t occupied_count, occupied_capacity;
   char **shared; size_t shared_count;
+  bool *bound; size_t bound_count;
 } validation;
+/* The working sets are released when a declaration is refused too. */
+static void validation_release(void *value) {
+  validation *v = value;
+  for (size_t i = 0; i < v->shared_count; i++) free(v->shared[i]);
+  free(v->shared); free(v->occupied); free(v->bound);
+  memset(v, 0, sizeof *v);
+}
 static const qa_native_mod_actor_record *find_record(const qa_native_mod_declaration *d, const char *id) {
   for (size_t i = 0; i < d->actor_record_count; i++) if (strcmp(d->actor_records[i].id, id) == 0) return &d->actor_records[i];
   return NULL;
@@ -52,12 +60,12 @@ static void validate_field(validation *v, const char *record_id, double offset, 
   const qa_native_mod_actor_record *record = find_record(d, record_id);
   bool admitted = false;
   if (d->clients != NULL) for (size_t i = 0; i < d->clients->records.count; i++) if (strcmp(d->clients->records.values[i], record_id) == 0) admitted = true;
-  if (record == NULL || !admitted || !is_safe_integer(offset) || offset < 0 || offset + length > record->stride) qa_range_error("Native source item exceeds its client record");
+  if (record == NULL || !admitted || !is_safe_integer(offset) || offset < 0 || offset + length > record->stride) qa_raise("Error", 0, 0, "Native source item exceeds its client record");
   if (!exclusive) return;
   for (double index = offset; index < offset + length; index++) {
     occupied_byte *found = NULL;
     for (size_t i = 0; i < v->occupied_count && found == NULL; i++) if (v->occupied[i].index == index && strcmp(v->occupied[i].record, record_id) == 0) found = &v->occupied[i];
-    if (found != NULL && (shared_capacity == NULL || found->shared == NULL || strcmp(found->shared, shared_capacity) != 0)) qa_range_error("Overlapping native source item storage");
+    if (found != NULL && (shared_capacity == NULL || found->shared == NULL || strcmp(found->shared, shared_capacity) != 0)) qa_raise("Error", 0, 0, "Overlapping native source item storage");
     if (found == NULL) {
       if (v->occupied_count == v->occupied_capacity) {
         size_t capacity = v->occupied_capacity ? v->occupied_capacity * 2 : 64;
@@ -74,12 +82,19 @@ static void validate_field(validation *v, const char *record_id, double offset, 
     const qa_native_mod_actor_field *projection = &record->fields[i];
     double size = projection_size(d, projection);
     if (projection->offset < offset + length && offset < projection->offset + size && strcmp(projection->binding, "private") != 0 && strcmp(projection->binding, "constant") != 0)
-      qa_range_error("Native source item overlaps another canonical projection");
+      qa_raise("Error", 0, 0, "Native source item overlaps another canonical projection");
   }
 }
 static const qa_native_mod_item_definition *find_definition(const qa_native_mod_items *items, qa_item_id item) {
   for (size_t i = 0; i < items->definition_count; i++) if (strcmp(items->definitions[i].item, item) == 0) return &items->definitions[i];
   return NULL;
+}
+/* TS bind(item). */
+static void bind_item(validation *v, const qa_native_mod_items *items, qa_item_id name) {
+  const qa_native_mod_item_definition *definition = find_definition(items, name);
+  size_t index = definition == NULL ? 0 : (size_t)(definition - items->definitions);
+  if (definition == NULL || v->bound[index]) qa_raise("Error", 0, 0, "Native source item lacks distinct storage");
+  v->bound[index] = true; v->bound_count++;
 }
 static void validate_test_row(validation *v, const qa_native_item_test_row *rows, size_t row_count) {
   int64_t pointer_bytes = v->d->target.abi.pointer_bytes;
@@ -96,21 +111,20 @@ static bool any_empty(const qa_native_item_test_row *rows, size_t count) {
 void qa_compat_q2_validate_native_mod_items(const qa_native_mod_declaration *d) {
   const qa_native_mod_items *items = d->items;
   if (items == NULL) return;
-  if (d->clients == NULL || items->definition_count == 0) qa_range_error("Native items require original client admission");
+  if (d->clients == NULL || items->definition_count == 0) qa_raise("Error", 0, 0, "Native items require original client admission");
   for (size_t i = 0; i < items->definition_count; i++) for (size_t j = 0; j < i; j++)
-    if (strcmp(items->definitions[i].item, items->definitions[j].item) == 0) qa_range_error("Duplicate native source item");
+    if (strcmp(items->definitions[i].item, items->definitions[j].item) == 0) qa_raise("Error", 0, 0, "Duplicate native source item");
   validation v;
   memset(&v, 0, sizeof v);
   v.d = d;
+  qa_cleanup owned; qa_cleanup_push(&owned, validation_release, &v);
   size_t capacity_keys = items->storage_count;
   v.shared = calloc(capacity_keys ? capacity_keys : 1, sizeof *v.shared);
-  bool *bound = calloc(items->definition_count, sizeof *bound);
-  if (v.shared == NULL || bound == NULL) qa_range_error("Native items out of memory");
-  size_t bound_count = 0;
+  v.bound = calloc(items->definition_count, sizeof *v.bound);
+  if (v.shared == NULL || v.bound == NULL) qa_range_error("Native items out of memory");
   for (size_t s = 0; s < items->storage_count; s++) {
     const qa_native_item_storage *storage = &items->storage[s];
     validate_field(&v, storage->field.record, storage->field.field.offset, scalar_bytes(storage->field), true, NULL);
-    const qa_item_id *names = NULL; size_t name_count = 0;
     bool counter = strcmp(storage->kind, "counter") == 0;
     if (counter) {
       if (strcmp(storage->capacity.kind, "field") == 0) {
@@ -124,51 +138,45 @@ void qa_compat_q2_validate_native_mod_items(const qa_native_mod_declaration *d) 
         v.shared[v.shared_count++] = owned;
         validate_field(&v, capacity.record, capacity.field.offset, scalar_bytes(capacity), true, owned);
       }
-      names = &storage->item; name_count = 1;
+      bind_item(&v, items, storage->item);
     } else {
-      if (!is_packed_encoding(storage->field.field.encoding) || storage->item_count == 0 || !is_integer(storage->private_mask) || storage->private_mask < 0 || storage->private_mask > 4294967295.0) qa_range_error("Invalid native packed inventory");
-    }
-    for (size_t n = 0; n < (counter ? name_count : storage->item_count); n++) {
-      qa_item_id name = counter ? names[n] : storage->items[n].item;
-      const qa_native_mod_item_definition *definition = find_definition(items, name);
-      size_t index = definition == NULL ? 0 : (size_t)(definition - items->definitions);
-      if (definition == NULL || bound[index]) qa_range_error("Native source item lacks distinct storage");
-      bound[index] = true; bound_count++;
+      if (!is_packed_encoding(storage->field.field.encoding) || storage->item_count == 0 || !is_integer(storage->private_mask) || storage->private_mask < 0 || storage->private_mask > 4294967295.0) qa_raise("Error", 0, 0, "Invalid native packed inventory");
     }
     if (counter) {
-      if (strcmp(storage->capacity.kind, "constant") == 0 && (!isfinite(storage->capacity.value) || storage->capacity.value < 0)) qa_range_error("Invalid native source capacity");
+      if (strcmp(storage->capacity.kind, "constant") == 0 && (!isfinite(storage->capacity.value) || storage->capacity.value < 0)) qa_raise("Error", 0, 0, "Invalid native source capacity");
     } else {
       int32_t mask = qa_int32(storage->private_mask);
       for (size_t n = 0; n < storage->item_count; n++) {
+        /* TS binds each item before it checks that item's mask. */
+        bind_item(&v, items, storage->items[n].item);
         double value = storage->items[n].mask;
         int32_t bit = qa_int32(value);
-        if (!is_integer(value) || value < 1 || value > 2147483648.0 || (bit & qa_int32(value - 1)) != 0 || (mask & bit) != 0) qa_range_error("Overlapping native item bits");
+        if (!is_integer(value) || value < 1 || value > 2147483648.0 || (bit & qa_int32(value - 1)) != 0 || (mask & bit) != 0) qa_raise("Error", 0, 0, "Overlapping native item bits");
         mask |= bit;
       }
-      if (scalar_bytes(storage->field) < 4 && (double)(uint32_t)mask >= qa_js_pow(2, scalar_bytes(storage->field) * 8)) qa_range_error("Native packed item exceeds storage width");
+      if (scalar_bytes(storage->field) < 4 && (double)(uint32_t)mask >= qa_js_pow(2, scalar_bytes(storage->field) * 8)) qa_raise("Error", 0, 0, "Native packed item exceeds storage width");
     }
   }
-  free(bound);
-  if (bound_count != items->definition_count) qa_range_error("Native item definition lacks source storage");
+  if (v.bound_count != items->definition_count) qa_raise("Error", 0, 0, "Native item definition lacks source storage");
   size_t weapon_count = 0;
   for (size_t i = 0; i < items->definition_count; i++) if (items->definitions[i].is_weapon) weapon_count++;
-  if (weapon_count == 0 ? items->weapons != NULL : items->weapons == NULL) qa_range_error("Native weapon items require an original dispatcher");
+  if (weapon_count == 0 ? items->weapons != NULL : items->weapons == NULL) qa_raise("Error", 0, 0, "Native weapon items require an original dispatcher");
   const qa_native_weapon_stage *stage = items->weapons;
   if (stage != NULL) {
     const qa_native_weapon_dispatcher *dispatcher = &stage->dispatcher;
     if (find_record(d, dispatcher->record) == NULL || !is_safe_integer(dispatcher->arguments) || dispatcher->arguments < 1 || dispatcher->arguments > 16
         || !is_safe_integer(dispatcher->argument) || dispatcher->argument < 0 || dispatcher->argument >= dispatcher->arguments || stage->decision_count == 0
         || stage->settled_row_count == 0 || any_empty(stage->settled, stage->settled_row_count) || stage->continuation_row_count == 0 || any_empty(stage->continuations, stage->continuation_row_count)
-        || (stage->committed_input != NULL && any_empty(stage->committed_input, stage->committed_input_row_count))) qa_range_error("Native weapon stage lacks original decisions or actor ABI");
+        || (stage->committed_input != NULL && any_empty(stage->committed_input, stage->committed_input_row_count))) qa_raise("Error", 0, 0, "Native weapon stage lacks original decisions or actor ABI");
     for (size_t i = 0; i < stage->decision_count; i++) {
       const qa_native_weapon_decision *region = &stage->decisions[i];
       bool duplicate = false;
       for (size_t j = 0; j < i; j++) if (stage->decisions[j].entry == region->entry) duplicate = true;
-      if (!is_safe_integer(region->entry) || !is_safe_integer(region->join) || region->entry < 0 || region->join <= region->entry || duplicate || region->field_count == 0) qa_range_error("Invalid native weapon input-read region");
+      if (!is_safe_integer(region->entry) || !is_safe_integer(region->join) || region->entry < 0 || region->join <= region->entry || duplicate || region->field_count == 0) qa_raise("Error", 0, 0, "Invalid native weapon input-read region");
       for (size_t f = 0; f < region->field_count; f++) {
         const qa_native_weapon_decision_field *value = &region->fields[f];
         validate_field(&v, value->field.record, value->field.field.offset, scalar_bytes(value->field), false, NULL);
-        if (!is_packed_encoding(value->field.field.encoding) || !is_integer(value->clear_mask) || value->clear_mask < 1 || value->clear_mask > 2147483647.0) qa_range_error("Invalid native weapon input projection");
+        if (!is_packed_encoding(value->field.field.encoding) || !is_integer(value->clear_mask) || value->clear_mask < 1 || value->clear_mask > 2147483647.0) qa_raise("Error", 0, 0, "Invalid native weapon input projection");
       }
     }
     double pointer_bytes = (double)d->target.abi.pointer_bytes;
@@ -183,14 +191,14 @@ void qa_compat_q2_validate_native_mod_items(const qa_native_mod_declaration *d) 
       if (definition == NULL || !definition->is_weapon) differs = true;
       for (size_t j = 0; j < i; j++) if (strcmp(stage->selection.values[j].item, stage->selection.values[i].item) == 0) differs = true;
     }
-    if (differs) qa_range_error("Native weapon pointers differ from admitted source definitions");
+    if (differs) qa_raise("Error", 0, 0, "Native weapon pointers differ from admitted source definitions");
     for (size_t i = 0; i < items->definition_count; i++) {
       const qa_native_mod_item_definition *weapon = &items->definitions[i];
-      if (weapon->is_weapon && weapon->weapon.ammo != NULL && find_definition(items, weapon->weapon.ammo) == NULL) qa_range_error("Native weapon ammo lacks original storage");
+      if (weapon->is_weapon && weapon->weapon.ammo != NULL && find_definition(items, weapon->weapon.ammo) == NULL) qa_raise("Error", 0, 0, "Native weapon ammo lacks original storage");
     }
   }
-  for (size_t i = 0; i < v.shared_count; i++) free(v.shared[i]);
-  free(v.shared); free(v.occupied);
+  qa_cleanup_pop(&owned);
+  validation_release(&v);
 }
 /* --- readNativeItemCheckpoint --- */
 void qa_compat_q2_native_item_checkpoint_free(qa_compat_q2_native_item_checkpoint *checkpoint) {
@@ -208,6 +216,7 @@ qa_compat_q2_native_item_checkpoint qa_compat_q2_read_native_item_checkpoint(con
   size_t count = qa_save_reader_list_count(&list);
   qa_compat_q2_native_item_checkpoint_request *requests = calloc(count ? count : 1, sizeof *requests);
   if (requests == NULL) qa_range_error("Native items out of memory");
+  qa_cleanup owned; qa_cleanup_push(&owned, free, requests); /* a refused save keeps nothing */
   for (size_t i = 0; i < count; i++) {
     qa_save_reader row, value;
     if (!qa_save_reader_item(&list, i, &row)) qa_range_error("Native items out of memory");
@@ -226,9 +235,10 @@ qa_compat_q2_native_item_checkpoint qa_compat_q2_read_native_item_checkpoint(con
       if (requests[j].id == request->id || (requests[j].actor.slot == request->actor.slot && requests[j].actor.generation == request->actor.generation)) duplicate = true;
     if (definition->weapons != NULL && request->item != NULL)
       for (size_t j = 0; j < definition->weapons->selection.value_count; j++) if (strcmp(definition->weapons->selection.values[j].item, request->item) == 0) declared = true;
-    if (request->id > next_request || duplicate || definition->weapons == NULL || (request->item != NULL && !declared)) qa_range_error("Saved native request differs from its source declaration");
+    if (request->id > next_request || duplicate || definition->weapons == NULL || (request->item != NULL && !declared)) qa_raise("Error", 0, 0, "Saved native request differs from its source declaration");
     qa_save_reader_destroy(&row);
   }
+  qa_cleanup_pop(&owned);
   qa_save_reader_destroy(&list);
   return (qa_compat_q2_native_item_checkpoint){next_request, requests, count};
 }
@@ -304,7 +314,7 @@ static void read_storage(const items_t *s, qa_actor_id actor, const qa_native_it
   for (size_t i = 0; i < storage->item_count; i++) mask |= qa_int32(storage->items[i].mask);
   int bytes = scalar_bytes(storage->field);
   int32_t packed = qa_int32(count) & (bytes == 4 ? -1 : (int32_t)(qa_js_pow(2, bytes * 8) - 1));
-  if ((packed & ~mask) != 0) qa_range_error("Native inventory contains undeclared item bits");
+  if ((packed & ~mask) != 0) qa_raise("Error", 0, 0, "Native inventory contains undeclared item bits");
   for (size_t i = 0; i < storage->item_count; i++) {
     memset(&out[i], 0, sizeof out[i]);
     out[i].item = storage->items[i].item;
@@ -352,6 +362,7 @@ static void changed(items_t *s, entry_t *entry, const qa_native_item_storage *on
   qa_inventory_entry *after = calloc(capacity ? capacity : 1, sizeof *after);
   qa_source_item_store *changes = calloc(capacity ? capacity : 1, sizeof *changes);
   if (after == NULL || changes == NULL) qa_range_error("Native items out of memory");
+  qa_cleanup after_owned, changes_owned; qa_cleanup_push(&after_owned, free, after); qa_cleanup_push(&changes_owned, free, changes);
   size_t used = 0;
   if (only != NULL) { read_storage(s, entry->actor.id, only, after); used = capacity; }
   else for (size_t i = 0; i < s->definition->storage_count; i++) { read_storage(s, entry->actor.id, &s->definition->storage[i], after + used); used += storage_rows(&s->definition->storage[i]); }
@@ -360,13 +371,14 @@ static void changed(items_t *s, entry_t *entry, const qa_native_item_storage *on
     const qa_inventory_entry *value = &after[i], *before = previous_of(entry, value->item);
     if ((canonical_write == NULL || strcmp(value->item, canonical_write) != 0) && before != NULL && (before->count != value->count || before->capacity != value->capacity)) {
       const qa_original_pickup_execution *pickup = s->operations.pickup(s->operations.ctx);
-      if (pickup != NULL && !pickup_declares(pickup, before, value)) qa_range_error("Original pickup changed an undeclared native source item");
+      if (pickup != NULL && !pickup_declares(pickup, before, value)) qa_raise("Error", 0, 0, "Original pickup changed an undeclared native source item");
       changes[change_count++] = (qa_source_item_store){*before, *value};
     }
   }
   for (size_t i = 0; i < used; i++) { qa_inventory_entry *row = previous_of(entry, after[i].item); if (row != NULL) *row = after[i]; }
   stored_call call = {entry, changes, change_count};
   qa_compat_q2_native_thrown thrown;
+  qa_cleanup_pop(&changes_owned); qa_cleanup_pop(&after_owned);
   bool completed = change_count == 0 || qa_compat_q2_native_try(stored_body, &call, &thrown);
   free(after); free(changes);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
@@ -377,7 +389,7 @@ static void write_body(void *v) {
   write_call *c = v; const items_t *s = c->s; const qa_native_item_storage *storage = c->storage; qa_inventory_entry value = c->value;
   if (strcmp(storage->kind, "counter") == 0) {
     bool field_capacity = strcmp(storage->capacity.kind, "field") == 0;
-    if (!field_capacity && value.capacity != read_capacity(s, c->actor, &storage->capacity)) qa_range_error("Native capacity is owned by its original source");
+    if (!field_capacity && value.capacity != read_capacity(s, c->actor, &storage->capacity)) qa_raise("Error", 0, 0, "Native capacity is owned by its original source");
     validate_counter(value.count, storage->field);
     if (field_capacity) validate_counter(value.capacity, storage->capacity.field);
     op_write(s, field_address(s, c->actor, storage->field.record, storage->field.field.offset), storage->field.field.encoding, value.count);
@@ -386,7 +398,7 @@ static void write_body(void *v) {
   }
   const qa_native_item_mask *bit = NULL;
   for (size_t i = 0; i < storage->item_count && bit == NULL; i++) if (strcmp(storage->items[i].item, value.item) == 0) bit = &storage->items[i];
-  if (bit == NULL || value.capacity != 1 || (value.count != 0 && value.count != 1)) qa_range_error("Native item requires its original ownership bit");
+  if (bit == NULL || value.capacity != 1 || (value.count != 0 && value.count != 1)) qa_raise("Error", 0, 0, "Native item requires its original ownership bit");
   qa_guest_address address = field_address(s, c->actor, storage->field.record, storage->field.field.offset);
   int32_t previous = qa_int32(op_read(s, address, storage->field.field.encoding));
   int32_t next = value.count == 0 ? previous & ~qa_int32(bit->mask) : previous | qa_int32(bit->mask);
@@ -402,7 +414,7 @@ static void write_body(void *v) {
 static void state_write(void *v, qa_inventory_entry value) {
   entry_t *entry = v; items_t *s = entry->s;
   const qa_native_item_storage *storage = storage_of(s, value.item);
-  if (find_entry(s, entry->actor.id) == NULL || !entry_current(s, find_entry(s, entry->actor.id)) || storage == NULL) qa_range_error("Native item lease lost its original storage");
+  if (find_entry(s, entry->actor.id) == NULL || !entry_current(s, find_entry(s, entry->actor.id)) || storage == NULL) qa_raise("Error", 0, 0, "Native item lease lost its original storage");
   entry_t *owner = find_entry(s, entry->actor.id);
   s->writing++;
   write_call call = {s, entry->actor.id, storage, value};
@@ -431,7 +443,9 @@ static bool state_entry(void *v, qa_item_id item, qa_inventory_entry *out) {
   size_t rows = storage_rows(storage);
   qa_inventory_entry *values = calloc(rows ? rows : 1, sizeof *values);
   if (values == NULL) qa_range_error("Native items out of memory");
+  qa_cleanup owned; qa_cleanup_push(&owned, free, values);
   read_storage(s, entry->actor.id, storage, values);
+  qa_cleanup_pop(&owned);
   bool found = false;
   for (size_t i = 0; i < rows && !found; i++) if (strcmp(values[i].item, item) == 0) { *out = values[i]; found = true; }
   free(values);
@@ -448,7 +462,7 @@ static void item_invoke(void *v, qa_item_id item, qa_source_item_action action) 
   const qa_native_mod_item_definition *definition = find_definition(s->definition, item);
   const qa_native_mod_source_call *call = NULL;
   if (definition != NULL && definition->has_actions) call = action == QA_SOURCE_ITEM_ACTION_USE ? definition->action_use : definition->action_drop;
-  if (current == NULL || !entry_current(s, current) || call == NULL) qa_range_error("Source item action is no longer admitted");
+  if (current == NULL || !entry_current(s, current) || call == NULL) qa_raise("Error", 0, 0, "Source item action is no longer admitted");
   s->operations.invoke(s->operations.ctx, entry->actor.id, call);
 }
 static void storage_written(void *v) {
@@ -527,7 +541,7 @@ static void request_body(void *v) {
 }
 static qa_source_weapon_request binding_resume(void *v, qa_item_id item) {
   entry_t *entry = v; items_t *s = entry->s; qa_actor_id actor = entry->actor.id;
-  if (!entry_current(s, entry)) qa_range_error("Native weapon request lost its original actor");
+  if (!entry_current(s, entry)) qa_raise("Error", 0, 0, "Native weapon request lost its original actor");
   request_t *value = new_request(s, ++s->next_request, item, "pending");
   entry->request = value;
   if (item == NULL) value->status = qa_compat_q2_native_mod_weapon_stage_active(s->stage, actor) != NULL && qa_compat_q2_native_mod_weapon_stage_settled(s->stage, actor) ? "accepted" : "refused";
@@ -546,17 +560,17 @@ static bool binding_select(void *v, qa_item_id item) {
   qa_source_weapon_request request = binding_resume(v, item);
   return strcmp(request.status(request.ctx), "refused") != 0;
 }
-static void binding_holster(void *v) { entry_t *entry = v; if (!entry_current(entry->s, entry)) qa_range_error("Native weapon retired while holstering"); }
+static void binding_holster(void *v) { entry_t *entry = v; if (!entry_current(entry->s, entry)) qa_raise("Error", 0, 0, "Native weapon retired while holstering"); }
 static bool binding_is_holstered(void *v) { entry_t *entry = v; return entry_current(entry->s, entry) && qa_compat_q2_native_mod_weapon_stage_settled(entry->s->stage, entry->actor.id); }
 static qa_source_weapon_request binding_restore_request(void *v, double id, qa_item_id item) {
   entry_t *entry = v; request_t *request = entry->request;
-  if (!entry_current(entry->s, entry) || request == NULL || request->id != id || !same_item(request->item, item)) qa_range_error("Saved native weapon request differs from its source owner");
+  if (!entry_current(entry->s, entry) || request == NULL || request->id != id || !same_item(request->item, item)) qa_raise("Error", 0, 0, "Saved native weapon request differs from its source owner");
   return capability(entry, request);
 }
 static bool binding_current(void *v) { entry_t *entry = v; return entry_current(entry->s, entry); }
 static qa_source_weapon_presentation binding_read(void *v) {
   entry_t *entry = v; items_t *s = entry->s; qa_actor_id actor = entry->actor.id;
-  if (!entry_current(s, entry)) qa_range_error("Native weapon presentation lost its source owner");
+  if (!entry_current(s, entry)) qa_raise("Error", 0, 0, "Native weapon presentation lost its source owner");
   qa_source_weapon_presentation out;
   memset(&out, 0, sizeof out);
   out.source.provider = s->provider; out.source.content = s->content;
@@ -606,10 +620,13 @@ static bool stage_cancellation(void *v, qa_actor_id actor, qa_compat_q2_native_w
   else *out = (qa_compat_q2_native_weapon_cancellation){NULL, no_accepts, no_source_current};
   return true;
 }
+/* A constructor that throws (an icon that does not resolve, a weapon stage that fails to bind) leaves nothing. */
+static void create_abandon(void *value) { items_t *s = value; free(s->admissions); free(s->definitions); free(s->icons); free(s->actions); free(s); }
 qa_compat_q2_native_mod_items *qa_compat_q2_native_mod_items_create(const qa_native_mod_items *definition, qa_native_abi abi, qa_compat_q2_native_mod_item_host host, const qa_mod_host_services *services, qa_provider_id provider, qa_content_id content, qa_compat_q2_native_mod_item_operations operations) {
   items_t *s = calloc(1, sizeof *s);
   size_t count = definition->definition_count;
   if (s == NULL) qa_range_error("Native items out of memory");
+  qa_cleanup abandon; qa_cleanup_push(&abandon, create_abandon, s);
   s->definition = definition; s->host = host; s->services = services; s->provider = provider; s->content = content; s->operations = operations;
   s->admissions = calloc(count ? count : 1, sizeof *s->admissions);
   s->definitions = calloc(count ? count : 1, sizeof *s->definitions);
@@ -640,6 +657,7 @@ qa_compat_q2_native_mod_items *qa_compat_q2_native_mod_items_create(const qa_nat
     qa_compat_q2_native_weapon_host stage_host = {host.memory, host.runner, host.image_base, host.ctx, host.invoke, host.entry};
     s->stage = qa_compat_q2_native_mod_weapon_stage_create(definition->weapons, abi, stage_host, provider, stage);
   }
+  qa_cleanup_pop(&abandon);
   return s;
 }
 static void push_removal(entry_t *entry, uint64_t handle) {
@@ -655,10 +673,12 @@ static void add_address(entry_t *entry, const items_t *s, qa_actor_id actor, con
   entry->addresses[entry->address_count++] = (record_address){record, s->operations.pointer(s->operations.ctx, actor, record).byte_offset};
   for (size_t i = 0; i + 1 < entry->address_count; i++) if (strcmp(entry->addresses[i].record, record) == 0) { entry->addresses[i].address = entry->addresses[entry->address_count - 1].address; entry->address_count--; return; }
 }
+typedef struct { items_t *s; entry_t *entry; qa_actor_id actor; qa_owned_actor owner; } admit_call;
+static void admit_body(void *value);
 void qa_compat_q2_native_mod_items_admit(items_t *s, qa_actor_id actor) {
   if (find_entry(s, actor) != NULL) return;
   qa_owned_actor owner;
-  if (!qa_session_actor_registry_resolve_owned(s->services->actors, actor, &owner) || !s->operations.live(s->operations.ctx, actor)) qa_range_error("Native items require the current admitted client");
+  if (!qa_session_actor_registry_resolve_owned(s->services->actors, actor, &owner) || !s->operations.live(s->operations.ctx, actor)) qa_raise("Error", 0, 0, "Native items require the current admitted client");
   const qa_native_mod_items *definition = s->definition;
   entry_t *entry = calloc(1, sizeof *entry);
   if (entry == NULL) qa_range_error("Native items out of memory");
@@ -689,6 +709,16 @@ void qa_compat_q2_native_mod_items_admit(items_t *s, qa_actor_id actor) {
     s->entries = grown; s->entry_capacity = capacity;
   }
   s->entries[s->entry_count++] = entry;
+  /* TS try { observers, weapon binding } catch (error) { this.release(actor); throw error; } */
+  admit_call call = {s, entry, actor, owner}; qa_caught_error caught;
+  if (!qa_try(admit_body, &call, &caught)) {
+    qa_compat_q2_native_mod_items_release(s, actor);
+    qa_rethrow(&caught);
+  }
+}
+static void admit_body(void *value) {
+  admit_call *c = value; items_t *s = c->s; entry_t *entry = c->entry; qa_actor_id actor = c->actor; qa_owned_actor owner = c->owner;
+  const qa_native_mod_items *definition = s->definition;
   qa_compat_q2_memory *memory = s->host.memory;
   for (size_t i = 0; i < definition->storage_count; i++) {
     const qa_native_item_storage *storage = &definition->storage[i];
@@ -705,7 +735,7 @@ void qa_compat_q2_native_mod_items_admit(items_t *s, qa_actor_id actor) {
     }
   }
   if (s->stage != NULL) {
-    if (s->services->weapons == NULL) qa_range_error("Native source weapon service is unavailable");
+    if (s->services->weapons == NULL) qa_raise("Error", 0, 0, "Native source weapon service is unavailable");
     qa_source_weapon_binding weapon;
     memset(&weapon, 0, sizeof weapon);
     weapon.ctx = entry; weapon.current = binding_current; weapon.read = binding_read;
@@ -752,10 +782,12 @@ void qa_compat_q2_native_mod_items_restore(items_t *s, const qa_compat_q2_native
     const qa_compat_q2_native_item_checkpoint_request *row = &value->requests[i];
     qa_actor_id actor = s->services->reference_saved != NULL ? s->services->reference_saved(s->services->ctx, row->actor) : qa_session_actor_registry_reference_saved(s->services->actors, row->actor, "current");
     entry_t *entry = find_entry(s, actor);
-    if (entry == NULL || !entry_current(s, entry)) qa_range_error("Saved native request lost its exact source owner");
+    if (entry == NULL || !entry_current(s, entry)) qa_raise("Error", 0, 0, "Saved native request lost its exact source owner");
     entry->request = new_request(s, row->id, row->item, row->status);
   }
 }
+static void release_weapon_body(void *value) { entry_t *entry = value; entry->remove_weapon.invoke(entry->remove_weapon.ctx); }
+static void release_lease_body(void *value) { entry_t *entry = value; entry->lease.close(entry->lease.ctx); }
 void qa_compat_q2_native_mod_items_release(items_t *s, qa_actor_id actor) {
   entry_t *entry = find_entry(s, actor);
   if (entry == NULL) return;
@@ -763,9 +795,10 @@ void qa_compat_q2_native_mod_items_release(items_t *s, qa_actor_id actor) {
   entry->request = NULL;
   for (size_t i = entry->removal_count; i-- > 0;) s->host.memory->unobserve_writes(s->host.memory->ctx, entry->removals[i]);
   entry->removal_count = 0;
-  if (entry->has_remove_weapon) entry->remove_weapon.invoke(entry->remove_weapon.ctx);
-  entry->has_remove_weapon = false;
-  entry->lease.close(entry->lease.ctx);
+  /* try { entry.removeWeapon() } finally { entry.lease.close() } */
+  bool had_weapon = entry->has_remove_weapon; entry->has_remove_weapon = false;
+  if (had_weapon) qa_compat_q2_native_mod_finally(release_weapon_body, entry, release_lease_body, entry);
+  else entry->lease.close(entry->lease.ctx);
 }
 void qa_compat_q2_native_mod_items_clear(items_t *s) { while (s->entry_count != 0) qa_compat_q2_native_mod_items_release(s, s->entries[0]->actor.id); }
 void qa_compat_q2_native_mod_items_close(items_t *s) {

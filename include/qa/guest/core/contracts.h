@@ -10,8 +10,8 @@
  * module composes in one translation unit, as in TS.)
  * Throw channel: TS GuestMemoryFault / X86ProcessorFault /
  * X64ProcessorFault / Unsupported* throws become a longjmp through
- * qa_guest_throw when a CPU run installs one, else an abort with the
- * identical message (uncaught-throw behavior).
+ * qa_guest_throw when a CPU run installs one, else a qa_raise with the
+ * identical message (GuestMemoryFault under its TS error name).
  * GPL-2.0-or-later.
  */
 #ifndef QA_GUEST_CORE_CONTRACTS_H
@@ -89,7 +89,7 @@ typedef struct qa_guest_thread_tls {
 typedef enum qa_guest_memory_fault_reason {
   QA_FAULT_FOREIGN_ADDRESS_SPACE = 0, QA_FAULT_ADDRESS_OVERFLOW, QA_FAULT_NULL_ADDRESS,
   QA_FAULT_INVALID_LENGTH, QA_FAULT_UNMAPPED, QA_FAULT_PERMISSION, QA_FAULT_OVERLAP,
-  QA_FAULT_NONCONTIGUOUS_BORROW, QA_FAULT_QUOTA
+  QA_FAULT_NONCONTIGUOUS_BORROW
 } qa_guest_memory_fault_reason;
 const char *qa_guest_memory_fault_reason_name(qa_guest_memory_fault_reason reason);
 
@@ -129,6 +129,10 @@ void qa_guest_throw_init(qa_guest_throw *throw_ctx, jmp_buf *buf);
 _Noreturn void qa_guest_throw_memory(qa_guest_throw *throw_ctx, qa_guest_memory_fault_reason reason,
                                      const qa_guest_module_ref *module, uint64_t address,
                                      size_t byte_length, qa_guest_fault_access access, const char *detail);
+/* A GuestMemoryFault caught as an ordinary error (qa_try; name "GuestMemoryFault", raised with no fault target)
+ * goes back to a processor's fault target, as a TS rethrow reaches the processor's catch. Returns when throw_ctx
+ * has no target or `message` is not the fault raised last on this thread; the caller then rethrows the error. */
+void qa_guest_rethrow_memory(qa_guest_throw *throw_ctx, const char *message);
 /* TS X86ProcessorFault/X64ProcessorFault(vector, detail[, errorCode]). */
 _Noreturn void qa_guest_throw_processor(qa_guest_throw *throw_ctx, int vector, bool has_error_code,
                                         uint64_t error_code, const char *format, ...);

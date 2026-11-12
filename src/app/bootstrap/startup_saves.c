@@ -6,14 +6,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
 #include "qa/app/bootstrap/simulation/save.h"
+#include "qa/foundation/node_path.h"
 #include "qa/persistence/kex_q2_save.h"
+#include "qa/persistence/q2_save_folder.h"
 #include "qa/persistence/q1_selection.h"
 #include "qa/persistence/save_image.h"
 #include "qa/persistence/saved_game.h"
@@ -27,37 +31,57 @@ static char *join_path(const char *dir, const char *name) {
   snprintf(r, a + 1 + b + 1, "%s/%s", dir, name);
   return r;
 }
+/* Bun.file(path).exists(): true for an existing path that is not a directory (stat follows links). */
+static bool bun_file_exists(const char *path) {
+  struct stat info;
+  return stat(path, &info) == 0 && !S_ISDIR(info.st_mode);
+}
+/* Dirent isDirectory(): the entry itself, not a link target. */
+static bool entry_is_directory(const char *path) {
+  struct stat info;
+  return lstat(path, &info) == 0 && S_ISDIR(info.st_mode);
+}
 char *qa_app_resolve_external_save_path(const char *const *directories, size_t directory_count, const char *name) {
-  char filename_buf[1024];
-  if (ends_ci(name, ".sav")) snprintf(filename_buf, sizeof filename_buf, "%s", name);
-  else snprintf(filename_buf, sizeof filename_buf, "%s.sav", name);
-  if (strchr(filename_buf, '/') || strchr(filename_buf, '\\') || strcmp(filename_buf, ".sav") == 0) return NULL;
-  for (size_t i = 0; i < directory_count; i++) {
-    char *direct = join_path(directories[i], filename_buf);
-    if (access(direct, F_OK) == 0) return direct;
+  char *filename;
+  if (ends_ci(name, ".sav")) filename = xdup(name);
+  else {
+    size_t length = strlen(name);
+    filename = malloc(length + 5);
+    if (filename == NULL) qa_range_error("Out of memory");
+    memcpy(filename, name, length);
+    memcpy(filename + length, ".sav", 5);
+  }
+  if (strchr(filename, '/') || strchr(filename, '\\') || strcmp(filename, ".sav") == 0) { free(filename); return NULL; }
+  char *found = NULL;
+  for (size_t i = 0; i < directory_count && found == NULL; i++) {
+    char *direct = join_path(directories[i], filename);
+    if (bun_file_exists(direct)) { found = direct; break; }
     free(direct);
+    /* readdir(directory, { withFileTypes: true }).catch(() => []): its entries omit "." and "..". */
     DIR *dir = opendir(directories[i]);
     if (dir == NULL) continue;
     struct dirent *entry;
-    char *found = NULL;
     while ((entry = readdir(dir)) != NULL) {
-      if (entry->d_type != DT_DIR) continue;
+      if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
       char *subdir = join_path(directories[i], entry->d_name);
-      char *nested = join_path(subdir, filename_buf);
+      if (!entry_is_directory(subdir)) { free(subdir); continue; }
+      char *nested = join_path(subdir, filename);
       free(subdir);
-      if (access(nested, F_OK) == 0) { found = nested; break; }
+      if (bun_file_exists(nested)) { found = nested; break; }
       free(nested);
     }
     closedir(dir);
-    if (found) return found;
   }
-  return NULL;
+  free(filename);
+  return found;
 }
 typedef struct cached_row { char *path; double mtime_ms; double size; qa_app_startup_save_row row; } cached_row;
 struct qa_app_startup_saves {
   const qa_content_catalog *catalog;
   char *directory;
   char **external; size_t external_count;
+  /* Stock games' own save folders, which hold saves the original names and formats; scanned to the given depth. */
+  qa_app_native_save_folder *native_folders; size_t native_folder_count;
   qa_app_startup_save_list current;
   char **path_ids; char **paths; size_t path_count;
   cached_row *cache; size_t cache_count, cache_cap;
@@ -72,6 +96,11 @@ static void free_list(qa_app_startup_save_list *list) {
 }
 qa_app_startup_saves *qa_app_startup_saves_create(const qa_content_catalog *catalog, const char *directory,
                                                   const char *const *external_directories, size_t external_count) {
+  return qa_app_startup_saves_create_native(catalog, directory, external_directories, external_count, NULL, 0);
+}
+qa_app_startup_saves *qa_app_startup_saves_create_native(const qa_content_catalog *catalog, const char *directory,
+    const char *const *external_directories, size_t external_count,
+    const qa_app_native_save_folder *native_folders, size_t native_folder_count) {
   qa_app_startup_saves *s = calloc(1, sizeof *s);
   if (!s) return NULL;
   s->catalog = catalog;
@@ -80,6 +109,13 @@ qa_app_startup_saves *qa_app_startup_saves_create(const qa_content_catalog *cata
   if (!s->external) qa_range_error("Out of memory");
   s->external_count = external_count;
   for (size_t i = 0; i < external_count; i++) s->external[i] = xdup(external_directories[i]);
+  s->native_folders = calloc(native_folder_count ? native_folder_count : 1, sizeof *s->native_folders);
+  if (!s->native_folders) qa_range_error("Out of memory");
+  s->native_folder_count = native_folder_count;
+  for (size_t i = 0; i < native_folder_count; i++) {
+    s->native_folders[i] = native_folders[i];
+    s->native_folders[i].root = xdup(native_folders[i].root);
+  }
   return s;
 }
 void qa_app_startup_saves_destroy(qa_app_startup_saves *s) {
@@ -90,6 +126,8 @@ void qa_app_startup_saves_destroy(qa_app_startup_saves *s) {
   for (size_t i = 0; i < s->cache_count; i++) { free(s->cache[i].path); free_row(&s->cache[i].row); }
   free(s->cache);
   for (size_t i = 0; i < s->external_count; i++) free(s->external[i]);
+  for (size_t i = 0; i < s->native_folder_count; i++) free(s->native_folders[i].root);
+  free(s->native_folders);
   free(s->external); free(s->directory); free(s);
 }
 const char *qa_app_startup_saves_directory(const qa_app_startup_saves *s) { return s->directory; }
@@ -98,25 +136,91 @@ const qa_app_startup_save_list *qa_app_startup_saves_list(const qa_app_startup_s
 const char *qa_app_startup_saves_path(qa_app_startup_saves *s, const char *id) {
   const qa_app_startup_save_row *row = NULL;
   const char *path = NULL;
-  for (size_t i = 0; i < s->current.row_count; i++) if (strcmp(s->current.rows[i].id, id) == 0) row = &s->current.rows[i];
+  /* rows.find takes the first row with the id; the paths Map keeps the last path set for it. */
+  for (size_t i = 0; i < s->current.row_count && row == NULL; i++) if (strcmp(s->current.rows[i].id, id) == 0) row = &s->current.rows[i];
   for (size_t i = 0; i < s->path_count; i++) if (strcmp(s->path_ids[i], id) == 0) path = s->paths[i];
   if (row == NULL || path == NULL) qa_raise("Error", 0, 0, "This saved game is no longer listed. Refresh the saved games.");
   if (row->unavailable != NULL) qa_raise("Error", 0, 0, "%s", row->unavailable);
   return path;
 }
 char *qa_app_startup_saves_named_path(qa_app_startup_saves *s, const char *name) {
+  return qa_app_startup_saves_named_path_native(s, name, NULL);
+}
+/* /[\p{L}\p{N}]/u for one code point, from the table bun generates. */
+static bool is_letter_or_number(uint32_t code) {
+  static const struct {
+    uint32_t first, last;
+  } ranges[] = {
+#include "startup_saves_letters.inc"
+  };
+  size_t lo = 0, hi = sizeof ranges / sizeof *ranges;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (code < ranges[mid].first) hi = mid;
+    else if (code > ranges[mid].last) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+/* One strict UTF-8 code point; false for an invalid sequence (a lone surrogate or malformed
+ * bytes, which /[\p{L}\p{N} _-]/u never matches either). */
+static bool next_code_point(const unsigned char **cursor, uint32_t *out) {
+  const unsigned char *p = *cursor;
+  unsigned char lead = p[0];
+  size_t extra = lead < 0x80 ? 0 : (lead & 0xe0) == 0xc0 ? 1 : (lead & 0xf0) == 0xe0 ? 2 : (lead & 0xf8) == 0xf0 ? 3 : 4;
+  if (extra == 4) return false;
+  uint32_t code = extra == 0 ? lead : extra == 1 ? lead & 0x1fu : extra == 2 ? lead & 0x0fu : lead & 0x07u;
+  for (size_t i = 1; i <= extra; i++) {
+    if ((p[i] & 0xc0) != 0x80) return false;
+    code = code << 6 | (p[i] & 0x3fu);
+  }
+  static const uint32_t minimum[4] = {0, 0x80, 0x800, 0x10000};
+  if (code < minimum[extra] || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return false;
+  *cursor = p + extra + 1;
+  *out = code;
+  return true;
+}
+/* /^[\p{L}\p{N} _-]{1,48}$/u over UTF-8 text: 1 to 48 code points. */
+static bool valid_save_label(const char *label) {
+  const unsigned char *cursor = (const unsigned char *)label;
+  size_t count = 0;
+  while (*cursor != '\0') {
+    uint32_t code;
+    if (!next_code_point(&cursor, &code)) return false;
+    if (!(code == ' ' || code == '_' || code == '-' || is_letter_or_number(code))) return false;
+    if (++count > 48) return false;
+  }
+  return count >= 1;
+}
+char *qa_app_startup_saves_named_path_native(qa_app_startup_saves *s, const char *name, const qa_native_save_layout *native) {
   char *label = qa_input_js_trim(name);
   if (!label) qa_range_error("Out of memory");
-  size_t len = strlen(label);
-  bool ok = len >= 1 && len <= 48;
-  for (size_t i = 0; i < len; i++) {
-    unsigned char c = (unsigned char)label[i];
-    /* TS \p{L}\p{N} is Unicode; bytes >= 0x80 pass here as letters. */
-    if (!(isalnum(c) || c == ' ' || c == '-' || c == '_' || c >= 0x80)) ok = false;
+  if (!valid_save_label(label)) { free(label); qa_raise("Error", 0, 0, "Use 1-48 letters, numbers, spaces, - or _."); }
+  /* const path = native === null ? join(this.directory, `${label}.sav`) : native.locate(label) */
+  char *path;
+  if (native == NULL) {
+    size_t length = strlen(label);
+    char *file = malloc(length + 5);
+    if (file == NULL) { free(label); qa_range_error("Out of memory"); }
+    memcpy(file, label, length);
+    memcpy(file + length, ".sav", 5);
+    qa_cleanup file_guard[2];
+    qa_cleanup_push(&file_guard[0], free, label);
+    qa_cleanup_push(&file_guard[1], free, file);
+    path = join_path(s->directory, file);
+    qa_cleanup_pop(&file_guard[1]);
+    qa_cleanup_pop(&file_guard[0]);
+    free(file);
+  } else {
+    qa_cleanup label_guard;
+    qa_cleanup_push(&label_guard, free, label);
+    path = qa_native_save_layout_locate(native, label);
+    qa_cleanup_pop(&label_guard);
   }
-  if (!ok) { free(label); qa_raise("Error", 0, 0, "Use 1-48 letters, numbers, spaces, - or _."); }
-  /* mkdir(directory, { recursive: true }): a failure raises the Node error text. */
-  char *walk = xdup(s->directory);
+  /* mkdir(dirname(path), { recursive: true }): a failure raises the Node error text. */
+  char *directory = qa_node_path_dirname(path);
+  if (directory == NULL) qa_range_error("Out of memory");
+  char *walk = xdup(directory);
   size_t walk_length = strlen(walk);
   for (size_t i = 1; i <= walk_length; i++) {
     if (walk[i] != '/' && walk[i] != '\0') continue;
@@ -125,22 +229,47 @@ char *qa_app_startup_saves_named_path(qa_app_startup_saves *s, const char *name)
     struct stat info;
     if (stat(walk, &info) != 0 && mkdir(walk, 0777) != 0 && errno != EEXIST) {
       int error = errno;
-      free(walk); free(label);
+      qa_cleanup guards[4];
+      qa_cleanup_push(&guards[0], free, walk); qa_cleanup_push(&guards[1], free, label);
+      qa_cleanup_push(&guards[2], free, path); qa_cleanup_push(&guards[3], free, directory);
       qa_raise("Error", 0, 0, "%s: %s, mkdir '%s'", error == EACCES ? "EACCES" : error == EROFS ? "EROFS" : "EIO",
-               error == EACCES ? "permission denied" : error == EROFS ? "read-only file system" : strerror(error), s->directory);
+               error == EACCES ? "permission denied" : error == EROFS ? "read-only file system" : strerror(error), directory);
     }
     walk[i] = saved;
   }
   free(walk);
-  char file[1100];
-  snprintf(file, sizeof file, "%s.sav", label);
-  char *path = join_path(s->directory, file);
+  free(directory);
+  /* for (const taken of native === null ? [path] : [path, native.originalPath(label)]) */
+  char *original = native != NULL ? qa_native_save_layout_original_path(native, label) : NULL;
   free(label);
-  if (access(path, F_OK) == 0) { free(path); qa_raise("Error", 0, 0, "Name exists. Select its slot to overwrite."); }
+  bool exists = bun_file_exists(path) || (original != NULL && bun_file_exists(original));
+  free(original);
+  if (exists) { free(path); qa_raise("Error", 0, 0, "Name exists. Select its slot to overwrite."); }
   return path;
 }
 typedef struct found_file { char *path; char *id; } found_file;
-static void scan_dir(qa_app_startup_saves *s, const char *directory, const char *root, const char *external_prefix,
+/* The scans' `collect`: seen.add(path); files.push({ path, id: prefix + relative(root, path) }). Takes `path`. */
+static void collect_file(char *path, const char *root, const char *prefix,
+                         found_file **files, size_t *count, size_t *cap, char ***seen, size_t *seen_count, size_t *seen_cap) {
+  if (*seen_count == *seen_cap) { *seen_cap = *seen_cap ? *seen_cap * 2 : 16; *seen = realloc(*seen, *seen_cap * sizeof **seen); if (!*seen) qa_range_error("Out of memory"); }
+  (*seen)[(*seen_count)++] = xdup(path);
+  if (*count == *cap) { *cap = *cap ? *cap * 2 : 16; *files = realloc(*files, *cap * sizeof **files); if (!*files) qa_range_error("Out of memory"); }
+  char *relative = qa_node_path_relative(root, path);
+  if (relative == NULL) qa_range_error("Out of memory");
+  char *id;
+  if (prefix != NULL) {
+    size_t need = strlen(prefix) + strlen(relative) + 1;
+    id = malloc(need);
+    if (!id) qa_range_error("Out of memory");
+    snprintf(id, need, "%s%s", prefix, relative);
+    free(relative);
+  } else id = relative;
+  (*files)[*count].path = path;
+  (*files)[*count].id = id;
+  (*count)++;
+}
+/* `depth` < 0 is the TS Infinity. */
+static void scan_dir(qa_app_startup_saves *s, const char *directory, const char *root, const char *external_prefix, int depth,
                      found_file **files, size_t *count, size_t *cap, char ***seen, size_t *seen_count, size_t *seen_cap, bool *error) {
   DIR *dir = opendir(directory);
   if (dir == NULL) {
@@ -155,7 +284,8 @@ static void scan_dir(qa_app_startup_saves *s, const char *directory, const char 
     /* Dirent isDirectory()/isFile() do not follow symbolic links. */
     struct stat st;
     if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-      scan_dir(s, path, root, external_prefix, files, count, cap, seen, seen_count, seen_cap, error);
+      if (depth != 0)
+        scan_dir(s, path, root, external_prefix, depth < 0 ? depth : depth - 1, files, count, cap, seen, seen_count, seen_cap, error);
       free(path);
       continue;
     }
@@ -167,24 +297,54 @@ static void scan_dir(qa_app_startup_saves *s, const char *directory, const char 
     for (size_t i = 0; i < *seen_count; i++) if (strcmp((*seen)[i], path) == 0) dup = true;
     bool skip_pak = external_prefix == NULL && ends_ci(path, ".pak.gz");
     if (dup || skip_pak) { free(path); continue; }
-    if (*seen_count == *seen_cap) { *seen_cap = *seen_cap ? *seen_cap * 2 : 16; *seen = realloc(*seen, *seen_cap * sizeof **seen); if (!*seen) qa_range_error("Out of memory"); }
-    (*seen)[(*seen_count)++] = xdup(path);
-    if (*count == *cap) { *cap = *cap ? *cap * 2 : 16; *files = realloc(*files, *cap * sizeof **files); if (!*files) qa_range_error("Out of memory"); }
-    const char *relative = path + strlen(root);
-    if (*relative == '/') relative++;
-    char *id;
-    if (external_prefix != NULL) {
-      size_t need = strlen(external_prefix) + strlen(relative) + 1;
-      id = malloc(need);
-      if (!id) qa_range_error("Out of memory");
-      snprintf(id, need, "%s%s", external_prefix, relative);
-    } else id = xdup(relative);
-    (*files)[*count].path = path;
-    (*files)[*count].id = id;
-    (*count)++;
+    collect_file(path, root, external_prefix, files, count, cap, seen, seen_count, seen_cap);
   }
   closedir(dir);
   (void)s;
+}
+/* TS scanSlotFolders: Quake II keeps one folder per save. Each is listed once: by its `server.ssv` when the original
+ * format is there, else by the engine image. */
+static void scan_slot_folders(const char *root, const char *prefix,
+                              found_file **files, size_t *count, size_t *cap, char ***seen, size_t *seen_count, size_t *seen_cap, bool *error) {
+  DIR *dir = opendir(root);
+  if (dir == NULL) {
+    if (errno != ENOENT) *error = true;
+    return;
+  }
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+    char *folder = join_path(root, entry->d_name);
+    struct stat st;
+    if (lstat(folder, &st) != 0 || !S_ISDIR(st.st_mode) || qa_js_equals_ignore_case(entry->d_name, "current")) { free(folder); continue; }
+    DIR *slot = opendir(folder);
+    if (slot == NULL) {
+      /* The readdir of a slot folder throws into the same catch: a missing folder ends the scan quietly. */
+      bool missing = errno == ENOENT;
+      free(folder);
+      closedir(dir);
+      if (!missing) *error = true;
+      return;
+    }
+    /* names.find(server.ssv) ?? names.find(qts.sav), each the first in directory order */
+    char *server = NULL, *engine = NULL;
+    struct dirent *file;
+    while ((file = readdir(slot)) != NULL) {
+      if (server == NULL && qa_js_equals_ignore_case(file->d_name, "server.ssv")) server = xdup(file->d_name);
+      else if (engine == NULL && qa_js_equals_ignore_case(file->d_name, "qts.sav")) engine = xdup(file->d_name);
+    }
+    closedir(slot);
+    const char *handle = server != NULL ? server : engine;
+    if (handle != NULL) {
+      char *path = join_path(folder, handle);
+      bool dup = false;
+      for (size_t i = 0; i < *seen_count; i++) if (strcmp((*seen)[i], path) == 0) dup = true;
+      if (dup) free(path);
+      else collect_file(path, root, prefix, files, count, cap, seen, seen_count, seen_cap);
+    }
+    free(server); free(engine); free(folder);
+  }
+  closedir(dir);
 }
 static const char *base_name(const char *path) {
   const char *slash = strrchr(path, '/');
@@ -244,9 +404,8 @@ static void inspect_pak(void *ctx) {
     if (qa_js_equals_ignore_case(base, wanted)) product = candidate;
   }
   if (product != NULL) { char *game = game_label(product); free(detail->game); detail->game = game; }
-  if (qa_kex_q2_save_restorable(&save))
-    set_text(&detail->unavailable, product == NULL || product->availability.kind != QA_CATALOG_INSTALLED
-                                       ? "Required game content is not installed." : NULL);
+  if (product == NULL || product->availability.kind != QA_CATALOG_INSTALLED)
+    set_text(&detail->unavailable, "Required game content is not installed.");
   qa_cleanup_pop(&guard);
   qa_kex_q2_save_archive_free(&save);
 }
@@ -313,21 +472,89 @@ static void inspect_sav(void *ctx) {
   qa_cleanup_pop(&save_guard);
   qa_saved_game_free(&save);
 }
-static void inspect(qa_app_startup_saves *s, const char *path, bool pak, save_detail *detail) {
+static void folder_header_release(void *header) { qa_q2_classic_folder_header_free(header); }
+/* TS refresh, the server.ssv try block. */
+static void inspect_server(void *ctx) {
+  inspect_job *job = ctx;
+  save_detail *detail = job->detail;
+  FILE *file = fopen(job->path, "rb");
+  if (file == NULL) raise_io(errno, "open", job->path);
+  uint8_t *bytes = NULL;
+  size_t length = 0, capacity = 0;
+  for (;;) {
+    if (length == capacity) {
+      capacity = capacity == 0 ? 4096 : capacity * 2;
+      bytes = realloc(bytes, capacity);
+      if (bytes == NULL) qa_range_error("Out of memory");
+    }
+    size_t got = fread(bytes + length, 1, capacity - length, file);
+    if (got == 0) break;
+    length += got;
+  }
+  fclose(file);
+  qa_cleanup bytes_guard;
+  qa_cleanup_push(&bytes_guard, free, bytes);
+  qa_q2_classic_folder_header header;
+  memset(&header, 0, sizeof header);
+  qa_q2_classic_folder_header_read(bytes, length, &header);
+  qa_cleanup_pop(&bytes_guard);
+  free(bytes);
+  qa_cleanup header_guard;
+  qa_cleanup_push(&header_guard, folder_header_release, &header);
+  /* label = header.comment.trim() === "" ? slot : header.comment.trim() */
+  char *comment = qa_input_js_trim(header.comment != NULL ? header.comment : "");
+  if (comment == NULL) qa_range_error("Out of memory");
+  if (comment[0] != '\0') { free(detail->label); detail->label = comment; }
+  else free(comment);
+  char *map = short_map(header.map != NULL ? header.map : "");
+  free(detail->map); detail->map = map;
+  /* gameDirectory = basename(dirname(dirname(dirname(path)))) */
+  char *slot_folder = qa_node_path_dirname(job->path);
+  char *save_folder = qa_node_path_dirname(slot_folder);
+  char *game_folder = qa_node_path_dirname(save_folder);
+  char *game_directory = qa_node_path_basename(game_folder);
+  free(slot_folder); free(save_folder); free(game_folder);
+  if (game_directory == NULL) qa_range_error("Out of memory");
+  const qa_catalog_discovered_product *product = NULL;
+  for (size_t i = 0; i < job->catalog->product_count && product == NULL; i++) {
+    const qa_catalog_discovered_product *candidate = &job->catalog->products[i];
+    if (candidate->expectation.family != QA_GAME_FAMILY_Q2 || strcmp(candidate->expectation.edition, "classic") != 0) continue;
+    const char *base = strrchr(candidate->expectation.content_directory, '/');
+    base = base != NULL ? base + 1 : candidate->expectation.content_directory;
+    if (qa_js_equals_ignore_case(base, game_directory)) product = candidate;
+  }
+  free(game_directory);
+  if (product != NULL) { char *game = game_label(product); free(detail->game); detail->game = game; }
+  if (product == NULL || product->availability.kind != QA_CATALOG_INSTALLED)
+    set_text(&detail->unavailable, "Required game content is not installed.");
+  qa_cleanup_pop(&header_guard);
+  qa_q2_classic_folder_header_free(&header);
+}
+typedef enum inspect_kind { INSPECT_SAV, INSPECT_PAK, INSPECT_SERVER } inspect_kind;
+static void inspect(qa_app_startup_saves *s, const char *path, inspect_kind kind, save_detail *detail) {
   sav_job job = {{s->catalog, path, detail}, false};
   qa_caught_error caught;
-  if (qa_try(pak ? inspect_pak : inspect_sav, &job, &caught)) return;
-  set_text(&detail->unavailable, caught.message);
+  if (qa_try(kind == INSPECT_PAK ? inspect_pak : kind == INSPECT_SERVER ? inspect_server : inspect_sav, &job, &caught)) return;
+  set_text(&detail->unavailable, qa_caught_message(&caught));
 }
 void qa_app_startup_saves_refresh(qa_app_startup_saves *s) {
   found_file *files = NULL; size_t count = 0, cap = 0;
   char **seen = NULL; size_t seen_count = 0, seen_cap = 0;
   bool had_error = false;
-  scan_dir(s, s->directory, s->directory, NULL, &files, &count, &cap, &seen, &seen_count, &seen_cap, &had_error);
+  scan_dir(s, s->directory, s->directory, NULL, -1, &files, &count, &cap, &seen, &seen_count, &seen_cap, &had_error);
   for (size_t i = 0; i < s->external_count; i++) {
     char prefix[64];
     snprintf(prefix, sizeof prefix, "external/%zu/", i);
-    scan_dir(s, s->external[i], s->external[i], prefix, &files, &count, &cap, &seen, &seen_count, &seen_cap, &had_error);
+    scan_dir(s, s->external[i], s->external[i], prefix, -1, &files, &count, &cap, &seen, &seen_count, &seen_cap, &had_error);
+  }
+  for (size_t i = 0; i < s->native_folder_count; i++) {
+    const qa_app_native_save_folder *folder = &s->native_folders[i];
+    char prefix[64];
+    snprintf(prefix, sizeof prefix, "native/%zu/", i);
+    if (folder->arrangement == QA_NATIVE_SAVE_FOLDERS)
+      scan_slot_folders(folder->root, prefix, &files, &count, &cap, &seen, &seen_count, &seen_cap, &had_error);
+    else
+      scan_dir(s, folder->root, folder->root, prefix, folder->depth, &files, &count, &cap, &seen, &seen_count, &seen_cap, &had_error);
   }
   for (size_t i = 0; i < seen_count; i++) free(seen[i]);
   free(seen);
@@ -357,32 +584,43 @@ void qa_app_startup_saves_refresh(qa_app_startup_saves *s) {
     }
     save_detail detail; memset(&detail, 0, sizeof detail);
     if (ends_ci(path, ".pak.gz")) {
+      /* basename(path).replace(/\.pak\.gz$/i, ""): without the u flag only ASCII letters fold, so a
+       * name that ends_ci matched through a non-ASCII letter (U+212A KELVIN SIGN) keeps its suffix. */
       const char *base = base_name(path);
-      size_t base_len = strlen(base) - 7; /* .pak.gz */
+      size_t base_len = strlen(base);
+      if (base_len >= 7 && strncasecmp(base + base_len - 7, ".pak.gz", 7) == 0) base_len -= 7;
       detail.label = qa_input_dup_range(base, base_len);
       detail.map = xdup("Unknown map");
       detail.game = xdup("Quake II (rerelease)");
-      detail.saved_at_milliseconds = mtime_ms;
-      detail.unavailable = xdup("Retail Quake II saves with recorded client or level state cannot be restored by this engine yet.");
-      inspect(s, path, true, &detail);
+      detail.saved_at_milliseconds = 0;
+      inspect(s, path, INSPECT_PAK, &detail);
+    } else if (qa_js_equals_ignore_case(base_name(path), "server.ssv")) {
+      /* slot = basename(dirname(path)) */
+      char *folder = qa_node_path_dirname(path);
+      detail.label = folder != NULL ? qa_node_path_basename(folder) : NULL;
+      free(folder);
+      if (detail.label == NULL) qa_range_error("Out of memory");
+      detail.map = xdup("Unknown map");
+      detail.game = xdup("Quake II");
+      detail.saved_at_milliseconds = has_identity ? mtime_ms : 0; /* identity?.mtimeMs ?? 0 */
+      inspect(s, path, INSPECT_SERVER, &detail);
     } else {
       const char *base = base_name(path);
       size_t name_len = strlen(base) - 4; /* .sav */
       char *name = qa_input_dup_range(base, name_len);
       if (!name) qa_range_error("Out of memory");
-      char *lower = xdup(name);
-      for (char *p = lower; *p; p++) *p = (char)tolower((unsigned char)*p);
-      if (strcmp(lower, "autosave") == 0) detail.label = xdup("Autosave");
-      else if (strcmp(lower, "quicksave") == 0) detail.label = xdup("Quicksave");
+      /* name.toLowerCase() === "autosave": Unicode lowering (U+212A KELVIN SIGN is "k"). */
+      if (qa_js_equals_ignore_case(name, "autosave")) detail.label = xdup("Autosave");
+      else if (qa_js_equals_ignore_case(name, "quicksave")) detail.label = xdup("Quicksave");
       else {
         detail.label = xdup(name);
         for (char *p = detail.label; *p; p++) if (*p == '_') *p = ' ';
       }
-      free(name); free(lower);
+      free(name);
       detail.map = xdup("Unknown map");
       detail.game = xdup("Unknown game");
-      detail.saved_at_milliseconds = mtime_ms;
-      inspect(s, path, false, &detail);
+      detail.saved_at_milliseconds = 0;
+      inspect(s, path, INSPECT_SAV, &detail);
     }
     rows[i].id = xdup(id);
     rows[i].label = detail.label;

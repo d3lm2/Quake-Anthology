@@ -382,7 +382,7 @@ static const qa_q1_event *r_q1(scratch *s, const qa_save_value *t) {
   return e;
 }
 
-/* The inline char arrays of qa_q1_intermission_result (map[64], text[4096]). */
+/* The inline map array of qa_q1_intermission_result (map[64]); text is a pointer into the tree. */
 static void copy_into(char *target, size_t capacity, const char *text) {
   size_t length = text != NULL ? strlen(text) : 0;
   if (length >= capacity) length = capacity - 1;
@@ -401,7 +401,7 @@ static const qa_q1_intermission_result *r_intermission(scratch *s, const qa_save
   qa_q1_intermission_result *e = take(s, 1, sizeof *e);
   e->kind = rstr(t, "kind");
   if (is(e->kind, "travel")) copy_into(e->map, sizeof e->map, rstr(t, "map"));
-  else if (is(e->kind, "finale")) { copy_into(e->text, sizeof e->text, rstr(t, "text")); e->track = rnum(t, "track"); }
+  else if (is(e->kind, "finale")) { e->text = rstr(t, "text"); e->track = rnum(t, "track"); }
   else if (!is(e->kind, "waiting") && !is(e->kind, "sell-screen")) unknown("q1-level", e->kind);
   return e;
 }
@@ -1838,6 +1838,11 @@ void qa_app_unified_simulation_event_view(const qa_save_value *t, qa_simulation_
     p->channel = rnum(payload, "channel"); p->volume = rnum(payload, "volume"); p->attenuation = rnum(payload, "attenuation");
     return;
   }
+  /* A unified server drops damage and transition events (network-unified.ts permitted()), but
+   * a peer that sends one anyway has it decoded and passed on by TS, whose client consumers read
+   * only sound and message payloads. The view keeps the kind and leaves outcome/decision empty. */
+  if (is(kind, "damage")) { p->kind = QA_SIM_EVENT_DAMAGE; return; }
+  if (is(kind, "transition")) { p->kind = QA_SIM_EVENT_TRANSITION; return; }
   if (!is(kind, "message")) qa_range_error("Unified frames carry no %s simulation events", kind != NULL ? kind : "(null)");
   p->kind = QA_SIM_EVENT_MESSAGE;
   p->has_source_presentation_sequence = present(payload, "sourcePresentationSequence");

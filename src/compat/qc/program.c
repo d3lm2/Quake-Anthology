@@ -8,8 +8,15 @@
 #include "qa/core/binary/index.h"
 #include "qa/foundation/support.h"
 
+/* The text is formatted whole (a definition or function name has no length limit) and released
+ * as the raise unwinds. */
 noreturn void qa_compat_qc_program_error(const char *source, const char *format, ...) {
-  char msg[QA_CAUGHT_MESSAGE_CAPACITY]; va_list ap; va_start(ap, format); vsnprintf(msg, sizeof msg, format, ap); va_end(ap);
+  va_list ap, measure; va_start(ap, format); va_copy(measure, ap);
+  int needed = vsnprintf(NULL, 0, format, measure); va_end(measure);
+  char *msg = malloc((size_t)(needed < 0 ? 0 : needed) + 1);
+  if (!msg) { va_end(ap); qa_range_error("QC program error text allocation failed"); }
+  vsnprintf(msg, (size_t)(needed < 0 ? 0 : needed) + 1, format, ap); va_end(ap);
+  qa_cleanup text; qa_cleanup_push(&text, free, msg);
   qa_raise("QcProgramError", 0, 0, "%s: %s", source ? source : "progs.dat", msg);
 }
 static char *xstrdup(const char *s) { size_t n = strlen(s) + 1; char *r = malloc(n); if (r) memcpy(r, s, n); return r; }

@@ -7,6 +7,12 @@
 #include "qa/persistence/save_image.h"
 typedef qa_compat_qc_mod_messages M;
 static bool actor_eq(qa_actor_id a, qa_actor_id b){return qa_same_actor(a, b);}
+static qa_actor_id *actors_copy(const qa_actor_id *actors, size_t count) {
+  qa_actor_id *copy = malloc((count ? count : 1) * sizeof *copy);
+  if (!copy) qa_range_error("mod messages allocation failed");
+  if (count) memcpy(copy, actors, count * sizeof *copy);
+  return copy;
+}
 static bool client_fn_impl(void *ctx, qa_actor_id actor) {
   M *m = ctx;
   return !m->operations.has_clients ? m->operations.client_is_player(m->operations.ctx, actor) : m->operations.clients_for_actor(m->operations.ctx, actor);
@@ -15,7 +21,7 @@ typedef struct qa_compat_qc_mod_messages_host HostWrap;
 /* TS host.message: the sink is optional and required only when used. */
 static void wrap_message(void *ctx, qa_network_event event, const qa_actor_id *target) {
   HostWrap *w = ctx;
-  if (!w->inner.message) qa_range_error("Source mod message requires a destination message sink");
+  if (!w->inner.message) qa_raise("Error", 0, 0, "Source mod message requires a destination message sink");
   w->inner.message(w->inner.ctx, event, target);
 }
 /* TS emit(event, recipient = target ?? undefined). */
@@ -40,10 +46,13 @@ static bool wrap_muzzle(void *ctx, qa_actor_id actor, qa_vec3 *origin, qa_vec3 *
   return m->operations.camera_angles(m->operations.ctx, actor, angles);
 }
 static qa_actor_id wrap_actor_of(void *ctx, int64_t slot) { HostWrap *w = ctx; return w->m->operations.world_actor(w->m->operations.ctx, slot); }
+/* TS host(target): presentation check, services.time(), recipients: players(), sourceActor: world.actor(0). */
 static qa_compat_qc_local_message_host host_of(M *m, const qa_actor_id *target) {
+  if (m->operations.require_presentation) m->operations.require_presentation(m->operations.host_ctx);
+  double seconds = m->operations.time_seconds(m->operations.ctx);
   size_t count = 0; const qa_actor_id *players = m->operations.players(m->operations.ctx, &count);
   qa_actor_id source = m->operations.world_actor(m->operations.ctx, 0);
-  qa_compat_qc_local_message_host inner = m->operations.host(m->operations.host_ctx, target, m->operations.time_seconds(m->operations.ctx), players, count, source);
+  qa_compat_qc_local_message_host inner = m->operations.host(m->operations.host_ctx, target, seconds, players, count, source);
   HostWrap *w = &m->hosts[m->host_next++ % (sizeof m->hosts / sizeof m->hosts[0])];
   w->m = m; w->inner = inner; w->has_target = target != NULL; if (target) w->target = *target;
   qa_compat_qc_local_message_host host = inner;
@@ -69,13 +78,13 @@ static void retire_client(M *m, qa_actor_id actor) { m->local.retire(m->local.ct
 typedef struct { M *m; qa_actor_id actor; } OriginCtx;
 static qa_vec3 origin_of(void *ctx) {
   OriginCtx *c = ctx; qa_vec3 out;
-  if (!c->m->operations.body_origin(c->m->operations.ctx, c->actor, &out)) qa_range_error("QW multicast recipient has no destination body");
+  if (!c->m->operations.body_origin(c->m->operations.ctx, c->actor, &out)) qa_raise("Error", 0, 0, "QW multicast recipient has no destination body");
   return out;
 }
 typedef struct { M *m; } VisCtx;
 static qa_q1_client_visibility_scene visibility_of(void *ctx) {
   VisCtx *c = ctx; qa_q1_client_visibility_scene scene;
-  if (!c->m->operations.visibility(c->m->operations.ctx, &scene)) qa_range_error("QW multicast requires destination PVS/PHS queries");
+  if (!c->m->operations.visibility(c->m->operations.ctx, &scene)) qa_raise("Error", 0, 0, "QW multicast requires destination PVS/PHS queries");
   return scene;
 }
 typedef struct { const qa_compat_qc_routed_message *entries; size_t count; } ModCopyResolve;
@@ -84,6 +93,7 @@ static qa_actor_id copy_resolve(void *ctx, qa_saved_actor_id saved) {
   for (size_t i = 0; i < cr->count; i++) if (cr->entries[i].has_actor && cr->entries[i].actor.slot == (int64_t)saved.slot && cr->entries[i].actor.generation == (int64_t)saved.generation) return cr->entries[i].actor;
   qa_range_error("signon copy lost its source actor");
 }
+static void free_tree(void *arg) { qa_save_value_free(arg); }
 static void qw_route(void *ctx, const qa_compat_qc_routed_message *entries, size_t count, qa_compat_qc_message_destination destination) {
   M *m = ctx;
   if (destination.kind == QA_QC_DEST_SIGNON) {
@@ -91,8 +101,11 @@ static void qw_route(void *ctx, const qa_compat_qc_routed_message *entries, size
     qa_save_value *tree = qa_compat_qc_broadcast_capture_entries(&m->messages, entries, count);
     ModCopyResolve cr = {entries, count};
     size_t copied_count = 0;
+    qa_cleanup tree_scope; qa_cleanup_push(&tree_scope, free_tree, tree);
     qa_compat_qc_routed_message *copied = qa_compat_qc_broadcast_restore_entries(&m->messages, tree, (qa_compat_qc_actor_resolver){&cr, copy_resolve}, &copied_count);
+    qa_cleanup_pop(&tree_scope);
     qa_save_value_free(tree);
+    if (!copied) qa_range_error("mod messages allocation failed");
     for (size_t i = 0; i < copied_count; i++) { if(m->signon_count==m->signon_capacity){ size_t c=m->signon_capacity?m->signon_capacity*2:8; m->signon=realloc(m->signon,c*sizeof *m->signon); if(!m->signon) qa_range_error("mod messages allocation failed"); m->signon_capacity=c; }
       m->signon[m->signon_count++] = copied[i]; }
     free(copied);
@@ -101,9 +114,11 @@ static void qw_route(void *ctx, const qa_compat_qc_routed_message *entries, size
     qa_compat_qc_mod_messages_start(m);
     for (size_t i = 0; i < count; i++) qa_compat_qc_present_quakeworld_message(entries[i], NULL, m->local.messages, host_of(m, NULL));
   } else {
-    size_t player_count = 0; const qa_actor_id *players = m->operations.players(m->operations.ctx, &player_count);
-    const qa_actor_id *recipients = destination.kind == QA_QC_DEST_CLIENT ? &destination.actor : players;
-    size_t recipient_count = destination.kind == QA_QC_DEST_CLIENT ? 1 : player_count;
+    /* TS recipients = [destination.actor] or this.players(): a snapshot (players() reuses its storage). */
+    size_t recipient_count = 1; qa_actor_id *recipients = NULL;
+    if (destination.kind == QA_QC_DEST_CLIENT) recipients = actors_copy(&destination.actor, 1);
+    else { const qa_actor_id *players = m->operations.players(m->operations.ctx, &recipient_count); recipients = actors_copy(players, recipient_count); }
+    qa_cleanup scope; qa_cleanup_push(&scope, free, recipients);
     for (size_t ri = 0; ri < recipient_count; ri++) {
       qa_actor_id actor = recipients[ri];
       OriginCtx oc = {m, actor}; VisCtx vc = {m};
@@ -113,18 +128,21 @@ static void qw_route(void *ctx, const qa_compat_qc_routed_message *entries, size
         for (size_t i = 0; i < count; i++) qa_compat_qc_present_quakeworld_message(entries[i], &actor, m->local.messages, host_of(m, &actor));
       }
     }
+    qa_cleanup_pop(&scope); free(recipients);
   }
 }
 static bool qw_loading(void *ctx) { M *m=ctx; return m->operations.loading(m->operations.ctx); }
 static bool qw_phs(void *ctx) { M *m=ctx; return m->operations.phs(m->operations.ctx); }
 static void nq_route(void *ctx, const qa_netquake_message *messages, size_t count, qa_compat_qc_message_destination destination, const qa_actor_id *view_targets, const bool *view_has, size_t view_count) {
   M *m = ctx; (void)view_count;
-  if (destination.kind == QA_QC_DEST_MULTICAST) qa_range_error("NetQuake cannot route a multicast message");
+  if (destination.kind == QA_QC_DEST_MULTICAST) qa_raise("Error", 0, 0, "NetQuake cannot route a multicast message");
   const qa_actor_id *target = destination.kind == QA_QC_DEST_CLIENT ? &destination.actor : NULL;
   size_t player_count = 0; const qa_actor_id *players = m->operations.players(m->operations.ctx, &player_count);
   for (size_t i = 0; i < player_count; i++) m->local.admit(m->local.ctx, players[i]);
   for (size_t i = 0; i < count; i++) {
-    if (strcmp(messages[i].kind, "set-view") == 0 && !(view_has && view_has[i])) qa_range_error("QC camera message has no captured source actor");
+    /* TS viewTargets?.has(index), then receive(..., viewTargets?.get(index)): a present entry may hold
+     * null (an all-zero actor, token NULL), which clears the view. */
+    if (strcmp(messages[i].kind, "set-view") == 0 && !(view_has && view_has[i])) qa_raise("Error", 0, 0, "QC camera message has no captured source actor");
     m->local.messages.receive(m->local.messages.ctx, &messages[i], 1, target, view_has && view_has[i] ? &view_targets[i] : NULL);
     /* presentQuakeCLocalMessage via host.present_local */
     qa_compat_qc_local_message_host host = host_of(m, target);
@@ -168,7 +186,10 @@ const qa_compat_qc_local_messages *qa_compat_qc_mod_messages_client_state(M *m) 
 void qa_compat_qc_mod_messages_start(M *m) {
   if (!m->is_quakeworld) return;
   size_t count = 0; const qa_actor_id *players = m->operations.players(m->operations.ctx, &count);
-  for (size_t i = 0; i < count; i++) admit_actor(m, players[i]);
+  qa_actor_id *snapshot = actors_copy(players, count); /* admit re-reads players() */
+  qa_cleanup scope; qa_cleanup_push(&scope, free, snapshot);
+  for (size_t i = 0; i < count; i++) admit_actor(m, snapshot[i]);
+  qa_cleanup_pop(&scope); free(snapshot);
 }
 static qa_save_value *saved_value(qa_actor_id actor) {
   qa_saved_actor_id s = qa_saved_actor_id_of(actor); qa_save_value *o = qa_save_value_object();
@@ -217,29 +238,43 @@ qa_save_value *qa_compat_qc_mod_messages_capture(M *m) {
   m->local.capture_free(m->local.ctx, local); m->local.views_free(m->local.ctx, views);
   return o;
 }
+typedef struct { qa_netquake_message *baseline; size_t baseline_count; qa_compat_qc_local_client_messages *clients; size_t client_count; } RestoredLocal;
+static void restored_local_free(void *arg) {
+  RestoredLocal *owned = arg;
+  for (size_t i = 0; i < owned->client_count; i++) { for (size_t j = 0; j < owned->clients[i].message_count; j++) qa_netquake_message_destroy(&owned->clients[i].messages[j]); free(owned->clients[i].messages); }
+  free(owned->clients);
+  for (size_t i = 0; i < owned->baseline_count; i++) qa_netquake_message_destroy(&owned->baseline[i]);
+  free(owned->baseline);
+  memset(owned, 0, sizeof *owned);
+}
+typedef struct { qa_compat_qc_local_view *views; } RestoredViews;
+static void restored_views_free(void *arg) { RestoredViews *owned = arg; free(owned->views); owned->views = NULL; }
 void qa_compat_qc_mod_messages_restore(M *m, const qa_save_reader *reader, qa_compat_qc_actor_resolver resolve) {
   qa_save_reader mf; qa_save_reader_field(reader, "messages", &mf);
   qa_save_value *messages_value = (qa_save_value *)mf.value;
   qa_compat_qc_broadcast_messages_restore(&m->messages, messages_value, resolve);
   qa_save_reader_destroy(&mf);
+  /* The decoded baseline and client messages are released whether or not the saved state is accepted. */
+  RestoredLocal owned; memset(&owned, 0, sizeof owned);
+  qa_cleanup scope; qa_cleanup_push(&scope, restored_local_free, &owned);
   qa_save_reader bf; qa_save_reader_field(reader, "baseline", &bf);
   size_t bl = 0; const uint8_t *bb = qa_save_reader_bytes(&bf, &bl);
-  size_t bc = 0; qa_netquake_message *baseline = qa_compat_qc_broadcast_restore_netquake_messages(&m->messages, bb, bl, &bc);
+  owned.baseline = qa_compat_qc_broadcast_restore_netquake_messages(&m->messages, bb, bl, &owned.baseline_count);
   qa_save_reader_destroy(&bf);
   qa_save_reader cf; qa_save_reader_field(reader, "clients", &cf);
   size_t cn = qa_save_reader_list_count(&cf);
-  qa_compat_qc_local_client_messages *clients = calloc(cn ? cn : 1, sizeof *clients);
+  owned.clients = calloc(cn ? cn : 1, sizeof *owned.clients);
+  if (!owned.clients) qa_range_error("mod messages allocation failed");
   for (size_t i = 0; i < cn; i++) {
     qa_save_reader item, af, msgf; qa_save_reader_item(&cf, i, &item);
-    qa_save_reader_field(&item, "actor", &af); clients[i].actor = resolve.fn(resolve.ctx, qa_read_saved_actor(&af)); qa_save_reader_destroy(&af);
+    owned.client_count = i + 1;
+    qa_save_reader_field(&item, "actor", &af); owned.clients[i].actor = resolve.fn(resolve.ctx, qa_read_saved_actor(&af)); qa_save_reader_destroy(&af);
     qa_save_reader_field(&item, "messages", &msgf); size_t ml = 0; const uint8_t *mb = qa_save_reader_bytes(&msgf, &ml);
-    clients[i].messages = qa_compat_qc_broadcast_restore_netquake_messages(&m->messages, mb, ml, &clients[i].message_count);
+    owned.clients[i].messages = qa_compat_qc_broadcast_restore_netquake_messages(&m->messages, mb, ml, &owned.clients[i].message_count);
     qa_save_reader_destroy(&msgf); qa_save_reader_destroy(&item);
   }
-  m->local.restore(m->local.ctx, baseline, bc, clients, cn);
-  for (size_t i = 0; i < cn; i++) { for (size_t j = 0; j < clients[i].message_count; j++) { qa_netquake_message_destroy(&clients[i].messages[j]); } free(clients[i].messages); }
-  free(clients);
-  for (size_t i = 0; i < bc; i++) { qa_netquake_message_destroy(&baseline[i]); } free(baseline);
+  m->local.restore(m->local.ctx, owned.baseline, owned.baseline_count, owned.clients, cn);
+  qa_cleanup_pop(&scope); restored_local_free(&owned);
   qa_save_reader_destroy(&cf);
   qa_save_reader vf; qa_save_reader_field(reader, "views", &vf);
   if (!qa_save_reader_is_undefined(&vf)) {
@@ -249,7 +284,10 @@ void qa_compat_qc_mod_messages_restore(M *m, const qa_save_reader *reader, qa_co
     qa_save_reader_destroy(&bvf);
     qa_save_reader vcf; qa_save_reader_field(&vf, "clients", &vcf);
     size_t vn = qa_save_reader_list_count(&vcf);
-    qa_compat_qc_local_view *views = calloc(vn ? vn : 1, sizeof *views);
+    RestoredViews owned_views = {calloc(vn ? vn : 1, sizeof *owned_views.views)};
+    if (!owned_views.views) qa_range_error("mod messages allocation failed");
+    qa_cleanup views_scope; qa_cleanup_push(&views_scope, restored_views_free, &owned_views);
+    qa_compat_qc_local_view *views = owned_views.views;
     for (size_t i = 0; i < vn; i++) {
       qa_save_reader item, af, tf; qa_save_reader_item(&vcf, i, &item);
       qa_save_reader_field(&item, "actor", &af); views[i].actor = resolve.fn(resolve.ctx, qa_read_saved_actor(&af)); qa_save_reader_destroy(&af);
@@ -257,7 +295,7 @@ void qa_compat_qc_mod_messages_restore(M *m, const qa_save_reader *reader, qa_co
       qa_save_reader_destroy(&item);
     }
     m->local.restore_views(m->local.ctx, baseline_ptr, views, vn);
-    free(views); qa_save_reader_destroy(&vcf);
+    qa_cleanup_pop(&views_scope); restored_views_free(&owned_views); qa_save_reader_destroy(&vcf);
   }
   qa_save_reader_destroy(&vf);
   if (m->is_quakeworld) {
@@ -297,10 +335,11 @@ static void app_admit(void *ctx, qa_actor_id actor) {
 static void app_retire(void *ctx, qa_actor_id actor) {
   qa_app_sim_quakec_local_messages_retire(((AppAdapter *)ctx)->state, actor);
 }
+/* actor NULL: TS undefined (no view change); an actor with a NULL token: TS null (clears the view). */
 static void app_receive(void *ctx, const qa_netquake_message *messages, size_t count,
                         const qa_actor_id *target, const qa_actor_id *actor) {
   qa_app_sim_quakec_local_messages_receive(((AppAdapter *)ctx)->state, messages, count, target,
-                                           actor != NULL, actor);
+                                           actor != NULL, actor != NULL && actor->token != NULL ? actor : NULL);
 }
 static qa_compat_qc_local_capture app_capture(void *ctx) {
   AppAdapter *a = ctx;

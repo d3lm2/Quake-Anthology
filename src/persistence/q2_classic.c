@@ -6,7 +6,22 @@
 #include <string.h>
 
 #include "qa/core/binary/index.h"
+#include "qa/foundation/support.h"
 #include "qa/persistence/value.h"
+
+/* The BinaryReader source `${layout.module.id}/<file>`, whatever the id's length. */
+static bool reader_open(qa_binary_reader *reader, const uint8_t *bytes, size_t length,
+                        const char *module_id, const char *file) {
+  size_t size = strlen(module_id) + 1 + strlen(file) + 1;
+  char *source = (char *)malloc(size);
+  if (source == NULL) return false;
+  (void)snprintf(source, size, "%s/%s", module_id, file);
+  bool ok = qa_binary_reader_init(reader, (uint8_t *)bytes, length, source) != 0;
+  free(source);
+  return ok;
+}
+static void free_game(void *arg) { qa_q2_classic_game_save_free(arg); }
+static void free_level(void *arg) { qa_q2_classic_level_save_free(arg); }
 
 static size_t record_size(const qa_q2_classic_record *record) {
   size_t total = record->byte_length;
@@ -148,11 +163,12 @@ static void write_record(qa_binary_writer *writer,
 bool qa_decode_q2_classic_game(const uint8_t *bytes, size_t length,
                                const qa_q2_classic_save_layout *layout,
                                qa_q2_classic_game_save *out) {
-  char source[1024];
-  (void)snprintf(source, sizeof source, "%s/game.ssv", layout->module.id);
   qa_binary_reader reader;
-  if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, source)) return false;
   memset(out, 0, sizeof *out);
+  if (!reader_open(&reader, bytes, length, layout->module.id, "game.ssv")) return false;
+  /* A malformed file raises with what was read released (TS discards it). */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_game, out);
   out->build_date = qa_binary_reader_bytes(&reader, 16);
   out->game = qa_binary_reader_bytes(&reader, layout->game_bytes);
   out->game_length = layout->game_bytes > 0 ? (size_t)layout->game_bytes : 0;
@@ -162,8 +178,7 @@ bool qa_decode_q2_classic_game(const uint8_t *bytes, size_t length,
         "game.maxclients", layout->client_count_offset, QA_Q2_CLASSIC_FIELD_CLIENT};
     int32_t count = field_i32(out->game, out->game_length, &count_field);
     if (count < 0 || (layout->client.byte_length > 0 &&
-            count > (int32_t)(qa_binary_reader_remaining(&reader) /
-                              (size_t)layout->client.byte_length)))
+            (size_t)count > qa_binary_reader_remaining(&reader) / (size_t)layout->client.byte_length))
       qa_save_format_error("game.maxclients", "client count exceeds save bytes");
     /* TS divides by byteLength even when it is 0 (Infinity bound). */
     out->clients = count > 0
@@ -173,13 +188,13 @@ bool qa_decode_q2_classic_game(const uint8_t *bytes, size_t length,
     for (size_t i = 0; i < out->client_count; i++)
       if (!read_record(&reader, &layout->client, &out->clients[i])) goto oom;
   }
-  if (qa_binary_reader_remaining(&reader) != 0) {
-    qa_binary_reader_destroy(&reader);
+  if (qa_binary_reader_remaining(&reader) != 0)
     qa_save_format_error("game.ssv", "unconsumed bytes indicate a mismatched native layout");
-  }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   return true;
 oom:
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   qa_q2_classic_game_save_free(out);
   return false;
@@ -211,11 +226,11 @@ uint8_t *qa_encode_q2_classic_game(const qa_q2_classic_game_save *save,
 bool qa_decode_q2_classic_level(const uint8_t *bytes, size_t length,
                                 const qa_q2_classic_save_layout *layout,
                                 qa_q2_classic_level_save *out) {
-  char source[1024];
-  (void)snprintf(source, sizeof source, "%s/level.sav", layout->module.id);
   qa_binary_reader reader;
-  if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, source)) return false;
   memset(out, 0, sizeof *out);
+  if (!reader_open(&reader, bytes, length, layout->module.id, "level.sav")) return false;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_level, out);
   if (qa_binary_reader_i32(&reader) != layout->entity.byte_length)
     qa_save_format_error("level.sav", "native edict size mismatch");
   uint32_t low = qa_binary_reader_u32(&reader);
@@ -232,17 +247,18 @@ bool qa_decode_q2_classic_level(const uint8_t *bytes, size_t length,
     out->entities = entities;
     memset(&out->entities[out->entity_count], 0, sizeof out->entities[0]);
     out->entities[out->entity_count].slot = slot;
-    if (!read_record(&reader, &layout->entity, &out->entities[out->entity_count].record))
-      goto oom;
+    /* Counted before the read, so a record that raises midway is released with the rest. */
     out->entity_count++;
+    if (!read_record(&reader, &layout->entity, &out->entities[out->entity_count - 1].record))
+      goto oom;
   }
-  if (qa_binary_reader_remaining(&reader) != 0) {
-    qa_binary_reader_destroy(&reader);
+  if (qa_binary_reader_remaining(&reader) != 0)
     qa_save_format_error("level.sav", "unconsumed bytes indicate a mismatched native layout");
-  }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   return true;
 oom:
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   qa_q2_classic_level_save_free(out);
   return false;
@@ -278,6 +294,8 @@ uint8_t *qa_restore_q2_classic_record(const qa_q2_classic_record *record,
       ? (uint8_t *)malloc(record->byte_length) : NULL;
   if (record->byte_length > 0 && bytes == NULL) return NULL;
   if (record->byte_length > 0) memcpy(bytes, record->bytes, record->byte_length);
+  qa_cleanup guard; /* a refused field raises with the copy released */
+  qa_cleanup_push(&guard, free, bytes);
   for (size_t i = 0; i < layout->field_count; i++) {
     const qa_q2_classic_save_field *field = &layout->fields[i];
     uint64_t pointer;
@@ -300,12 +318,14 @@ uint8_t *qa_restore_q2_classic_record(const qa_q2_classic_record *record,
     uint64_t limit = relocations->pointer_bytes == 4 ? 0x100000000ULL : 0;
     if (relocations->pointer_bytes == 4 && pointer >= limit)
       qa_save_format_error(field->name, "restored pointer exceeds guest ABI");
-    if (field->offset < 0 ||
-        (size_t)field->offset + (size_t)relocations->pointer_bytes > record->byte_length)
-      qa_save_format_error(field->name, "save field is outside its native struct");
+    /* TS DataView.setUint32/setBigUint64 over the record copy. */
+    if (field->offset < 0) qa_range_error("byteOffset cannot be negative");
+    if ((uint64_t)field->offset + (uint64_t)relocations->pointer_bytes > record->byte_length)
+      qa_range_error("Out of bounds access");
     for (int b = 0; b < relocations->pointer_bytes; b++)
       bytes[(size_t)field->offset + (size_t)b] =
           (uint8_t)(pointer >> (8 * b));
   }
+  qa_cleanup_pop(&guard);
   return bytes;
 }

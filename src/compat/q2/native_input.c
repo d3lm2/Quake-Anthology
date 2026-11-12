@@ -30,7 +30,7 @@ struct qa_compat_q2_native_input_binding {
   qa_compat_q2_native_input_source source;
   qa_compat_q2_native_input_services services;
   qa_compat_q2_native_entry *command;
-  uint64_t release, movement;
+  uint64_t release, movement; bool release_bound, movement_bound;
   command_scope **commands; size_t command_count, command_capacity;
   qa_mod_client_application *current;
   bool closed;
@@ -77,7 +77,7 @@ static qa_user_command encode_aim(void *v, qa_vec3 aim, qa_user_command value) {
     value.as.q2_rerelease.angles.z = aim.z - qa_compat_q2_view_f32(state, 44);
     return value;
   }
-  qa_range_error("Native input output changed command dialect");
+  qa_raise("Error", 0, 0, "Native input output changed command dialect");
 }
 static void write_rerelease_command(void *ctx, uint8_t *view, size_t length, qa_q2_rerelease_user_command command) { (void)ctx; (void)length; qa_compat_q2_write_rerelease_user_command(view, command); }
 static size_t command_bytes(const binding_t *s) { return s->source.classic ? 16 : (size_t)qa_compat_q2_rerelease_usercmd_layout.byte_length; }
@@ -116,7 +116,7 @@ static void apply_body(void *v) {
   const qa_mod_client_movement_outputs *slice_outputs = a->movement_slice && services->client_outputs != NULL ? services->client_outputs(services->ctx, scope->identity.actor) : NULL;
   if (a->application != NULL) {
     qa_user_command effective = qa_client_stance_command(a->application->command, slice_outputs != NULL && slice_outputs->has_stance, slice_outputs != NULL && slice_outputs->stance);
-    if (effective.kind != QA_USER_COMMAND_Q2 && effective.kind != QA_USER_COMMAND_Q2_RERELEASE) qa_range_error("Native input output changed command dialect");
+    if (effective.kind != QA_USER_COMMAND_Q2 && effective.kind != QA_USER_COMMAND_Q2_RERELEASE) qa_raise("Error", 0, 0, "Native input output changed command dialect");
     if (!a->movement_slice && services->original_command != NULL) effective = services->original_command(services->ctx, scope->identity, effective);
     qa_compat_q2_write_native_user_command(a->command_view, command_bytes(s), effective, NULL, write_rerelease_command);
   }
@@ -135,6 +135,10 @@ static void apply_body(void *v) {
   qa_mod_client_application_dispose(finished);
   assert_live(s, scope);
 }
+static void apply_finish(void *v) {
+  apply_call *a = v;
+  qa_mod_client_applications_finish(a->s->services.applications, a->application, a->failed);
+}
 static qa_guest_call_result apply(binding_t *s, const command_scope *scope, bool movement_slice, const qa_user_command *command, uint8_t *state, uint8_t *command_view, void *run_ctx, apply_run_fn run) {
   qa_mod_client_application *previous = s->current;
   apply_call call;
@@ -143,11 +147,15 @@ static qa_guest_call_result apply(binding_t *s, const command_scope *scope, bool
   call.run_ctx = run_ctx; call.run = run; call.failed = true;
   qa_compat_q2_native_thrown thrown;
   bool completed = qa_compat_q2_native_try(apply_body, &call, &thrown);
-  qa_mod_client_applications_finish(s->services.applications, call.application, call.failed);
+  /* TS finally { try { finish(application, failed) } finally { ... } }: the projected movement type and the current
+   * application are put back even when finish raises, and its error is the one that leaves. */
+  qa_caught_error finish_error;
+  bool finished = qa_try(apply_finish, &call, &finish_error);
   if (call.application != NULL) qa_mod_client_application_dispose(call.application);
   if (call.has_projected && s->services.live(s->services.ctx, scope->identity) && qa_compat_q2_view_i32(state, 0) == call.projected_value)
     qa_compat_q2_view_set_i32(state, 0, call.projected_before);
   s->current = previous;
+  if (!finished) qa_rethrow(&finish_error);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
   return call.result;
 }
@@ -173,7 +181,7 @@ static void command_body(void *v) {
     if (qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, c->record->address, (int64_t)layout_offset(&qa_compat_q2_rerelease_edict_layout, "client")), &client))
       state = memory->borrow(memory->ctx, client, qa_compat_q2_rerelease_pmove_state_layout.byte_length);
   }
-  if (state == NULL) qa_range_error("Native input has no public client state");
+  if (state == NULL) qa_raise("Error", 0, 0, "Native input has no public client state");
   c->result = apply(s, scope, false, &command, state, command_view, c, command_original);
 }
 static qa_guest_call_result command_execute(void *v, const qa_guest_call_value *values, size_t count, qa_compat_q2_native_entry *binding) {
@@ -251,7 +259,7 @@ static qa_compat_q2_native_input_motion_view motion_view(void *v) {
   const movement_call *m = v; const binding_t *s = m->s; qa_compat_q2_native_input_motion_view out;
   if (s->source.classic) {
     const uint8_t *client = s->source.client_prefix(s->source.host, m->scope->slot);
-    if (client == NULL) qa_range_error("Native input has no public client view");
+    if (client == NULL) qa_raise("Error", 0, 0, "Native input has no public client view");
     out.view_offset.x = qa_compat_q2_view_f32(client, 40); out.view_offset.y = qa_compat_q2_view_f32(client, 44);
     out.view_offset.z = m->moved ? qa_compat_q2_view_f32(m->view, 192) : qa_compat_q2_view_f32(client, 48);
     out.crouched = ((m->moved ? m->view[16] : client[16]) & 1) != 0;
@@ -301,7 +309,6 @@ static void motion_write_outputs(void *v, const qa_compat_q2_native_input_motion
   size_t count = outputs->touch_count < 32 ? outputs->touch_count : 32;
   qa_guest_address ground = {0};
   bool has_ground = outputs->has_ground_slot;
-  if (has_ground) ground = s->source.at_slot(s->source.host, outputs->ground_slot).address;
   if (m->classic) {
     qa_guest_address a2;
     qa_guest_address v3;
@@ -312,6 +319,7 @@ static void motion_write_outputs(void *v, const qa_compat_q2_native_input_motion
     set_vec3(m->view, 180, outputs->view_angles);
     set_vec3(m->view, 196, outputs->bounds.min);
     set_vec3(m->view, 208, outputs->bounds.max);
+    if (has_ground) ground = s->source.at_slot(s->source.host, outputs->ground_slot).address; /* after the view writes, as in TS */
     qa_compat_q2_mem_write_pointer(memory, qa_compat_q2_mem_offset(memory, m->address, 220), has_ground, ground);
     qa_compat_q2_view_set_i32(m->view, 48, qa_js_to_int32(count));
     for (size_t index = 0; index < count; index++)
@@ -330,6 +338,7 @@ static void motion_write_outputs(void *v, const qa_compat_q2_native_input_motion
   write_plane(m->view, "groundplane", outputs->has_ground_plane ? &outputs->ground_plane : NULL);
   qa_vec3 zero = {0, 0, 0};
   set_vec3(m->view, (size_t)layout_offset(pmove, "viewoffset"), zero);
+  if (has_ground) ground = s->source.at_slot(s->source.host, outputs->ground_slot).address;
   qa_compat_q2_mem_write_pointer(memory, qa_compat_q2_mem_offset(memory, m->address, (int64_t)layout_offset(pmove, "groundentity")), has_ground, ground);
   qa_compat_q2_view_set_i32(m->view, (size_t)layout_offset(pmove, "touch.num"), qa_js_to_int32(count));
   for (size_t index = 0; index < count; index++) {
@@ -350,7 +359,7 @@ static qa_guest_call_result run_body(void *v) {
   const qa_bounds *requested = outputs != NULL ? outputs->body_bounds : NULL;
   qa_bounds current;
   bool has_current = services->body_bounds != NULL && services->body_bounds(services->ctx, m->scope->identity.actor, &current);
-  if (requested != NULL && !has_current) qa_range_error("Native body shape lost its current actor bounds");
+  if (requested != NULL && !has_current) qa_raise("Error", 0, 0, "Native body shape lost its current actor bounds");
   qa_movement_body_shape body;
   memset(&body, 0, sizeof body);
   if (has_current) {
@@ -398,25 +407,40 @@ static bool movement_active(void *v) {
   binding_t *s = v;
   return (qa_mod_client_applications_active(s->services.applications) || s->services.body_bounds != NULL) && s->command_count != 0;
 }
+static void create_body(void *v) {
+  binding_t *s = v; const qa_compat_q2_native_input_source *source = &s->source;
+  qa_guest_address address; qa_compat_q2_guest_call_signature signature;
+  source->entry(source->host, "ClientThink", &address, &signature);
+  /* `${memory.module.id}:input.ClientThink` with no length limit; the entry binding copies the id. */
+  const char *module = source->memory->module.id != NULL ? source->memory->module.id : "";
+  size_t need = strlen(module) + sizeof ":input.ClientThink";
+  char *id = malloc(need); if (id == NULL) qa_range_error("Native input out of memory");
+  snprintf(id, need, "%s:input.ClientThink", module);
+  qa_cleanup node; qa_cleanup_push(&node, free, id);
+  s->command = qa_compat_q2_native_entry_bind(source->memory, source->runner, source->host, source->invoke, address, id, signature, s, command_execute, s, command_accepts);
+  qa_cleanup_pop(&node); free(id);
+  s->release = s->services.on_release(s->services.ctx, on_release, s); s->release_bound = true;
+  s->movement = source->bind_input_movement(source->host, s, movement_boundary, s, movement_active); s->movement_bound = true;
+}
 qa_compat_q2_native_input_binding *qa_compat_q2_native_input_binding_create(qa_compat_q2_native_input_source source, qa_compat_q2_native_input_services services) {
   binding_t *s = calloc(1, sizeof *s);
   if (s == NULL) qa_range_error("Native input out of memory");
   s->source = source; s->services = services;
-  qa_guest_address address; qa_compat_q2_guest_call_signature signature;
-  source.entry(source.host, "ClientThink", &address, &signature);
-  char id[320];
-  snprintf(id, sizeof id, "%s:input.ClientThink", source.memory->module.id);
-  s->command = qa_compat_q2_native_entry_bind(source.memory, source.runner, source.host, source.invoke, address, id, signature, s, command_execute, s, command_accepts);
-  s->release = services.on_release(services.ctx, on_release, s);
-  s->movement = source.bind_input_movement(source.host, s, movement_boundary, s, movement_active);
+  /* TS: a constructor that throws leaves nothing bound; the catch around the later bindings closes the ones made. */
+  qa_caught_error caught;
+  if (!qa_try(create_body, s, &caught)) { qa_compat_q2_native_input_binding_destroy(s); qa_rethrow(&caught); }
   return s;
 }
+/* TS removals.runReverse(): the stack is emptied, then the movement binding, the release listener and the command
+ * entry are removed in that order. */
 void qa_compat_q2_native_input_binding_close(binding_t *s) {
   if (s->closed) return;
   s->closed = true;
-  s->source.unbind_input_movement(s->source.host, s->movement);
-  s->services.remove_release(s->services.ctx, s->release);
-  qa_compat_q2_native_entry_close(s->command);
+  bool movement = s->movement_bound, release = s->release_bound; qa_compat_q2_native_entry *command = s->command;
+  s->movement_bound = false; s->release_bound = false; s->command = NULL;
+  if (movement) s->source.unbind_input_movement(s->source.host, s->movement);
+  if (release) s->services.remove_release(s->services.ctx, s->release);
+  if (command != NULL) qa_compat_q2_native_entry_close(command);
 }
 void qa_compat_q2_native_input_binding_destroy(binding_t *s) {
   if (s == NULL) return;
@@ -427,9 +451,9 @@ void qa_compat_q2_native_input_binding_destroy(binding_t *s) {
 static void classic_entry(void *host, const char *name, qa_guest_address *out_address, qa_compat_q2_guest_call_signature *out_signature) {
   qa_compat_q2_classic_guest_host *h = host;
   const qa_compat_q2_classic_export *definition = qa_compat_q2_classic_find_export(name);
-  if (definition == NULL) qa_range_error("API3 lacks %s", name);
+  if (definition == NULL) qa_raise("Error", 0, 0, "API3 lacks %s", name);
   qa_compat_q2_memory *memory = qa_compat_q2_classic_guest_host_get_memory(h);
-  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, qa_compat_q2_classic_guest_host_get_exports(h), (int64_t)definition->offset), out_address)) qa_range_error("Null API3 %s", name);
+  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, qa_compat_q2_classic_guest_host_get_exports(h), (int64_t)definition->offset), out_address)) qa_raise("Error", 0, 0, "Null API3 %s", name);
   *out_signature = definition->signature;
 }
 static qa_guest_call_result classic_invoke(void *host, qa_guest_address address, qa_compat_q2_guest_call_signature signature, const qa_guest_call_value *values, size_t count) {
@@ -457,10 +481,10 @@ static void rerelease_entry(void *host, const char *name, qa_guest_address *out_
   qa_compat_q2_rerelease_guest_module *m = host;
   size_t count = 0; const qa_compat_q2_rerelease_api_entry *entries = qa_compat_q2_rerelease_get_game_exports(&count), *definition = NULL;
   for (size_t i = 0; i < count && definition == NULL; i++) if (strcmp(entries[i].name, name) == 0) definition = &entries[i];
-  if (definition == NULL) qa_range_error("API2023 lacks %s", name);
+  if (definition == NULL) qa_raise("Error", 0, 0, "API2023 lacks %s", name);
   qa_compat_q2_memory *memory = qa_compat_q2_rerelease_guest_module_get_memory(m);
   qa_guest_address game = qa_compat_q2_rerelease_guest_module_bind_game(m);
-  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, game, (int64_t)qa_compat_q2_rerelease_field_offset(qa_compat_q2_rerelease_get_game_export_layout(), name)), out_address)) qa_range_error("Null API2023 %s", name);
+  if (!qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, game, (int64_t)qa_compat_q2_rerelease_field_offset(qa_compat_q2_rerelease_get_game_export_layout(), name)), out_address)) qa_raise("Error", 0, 0, "Null API2023 %s", name);
   *out_signature = definition->signature;
 }
 static qa_guest_call_result rerelease_invoke(void *host, qa_guest_address address, qa_compat_q2_guest_call_signature signature, const qa_guest_call_value *values, size_t count) { return qa_compat_q2_rerelease_guest_module_invoke(host, address, signature, values, count, NULL, NULL); }

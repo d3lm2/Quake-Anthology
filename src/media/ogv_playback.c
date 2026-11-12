@@ -150,10 +150,15 @@ static void queue_audio(qa_ogv_playback *playback, double elapsed) {
     out.time = playback->epoch + source_time;
     out.loop = playback->pass;
     out.reset_stream = playback->reset_audio;
+    out.key_order = QA_CINEMATIC_AUDIO_KEYS_OGV;
     playback->options.on_audio(playback->options.on_audio_ctx, &out);
     playback->reset_audio = false;
     qa_pcm_sound_dispose(&chunk);
   }
+}
+
+static void picture_release(void *raw) {
+  qa_cinematic_frame_dispose((qa_cinematic_frame *)raw);
 }
 
 static void restore_checkpoint(qa_ogv_playback *playback,
@@ -174,6 +179,8 @@ static void restore_checkpoint(qa_ogv_playback *playback,
   qa_cinematic_frame picture;
   bool has_picture = qa_read_cinematic_frame(&f, &picture);
   qa_save_reader_destroy(&f);
+  qa_cleanup picture_guard;
+  qa_cleanup_push(&picture_guard, picture_release, &picture);
   if (next_index > (int64_t)playback->movie.video_count - 3) {
     qa_save_reader_fail(&r, "video packet cursor exceeds movie");
   }
@@ -223,6 +230,7 @@ static void restore_checkpoint(qa_ogv_playback *playback,
       qa_pcm_sound_dispose(&chunk);
     }
   }
+  qa_cleanup_pop(&picture_guard);
   if (playback->has_picture) qa_cinematic_frame_dispose(&playback->picture);
   playback->picture = picture;
   playback->has_picture = has_picture;
@@ -243,6 +251,18 @@ static void restore_checkpoint(qa_ogv_playback *playback,
   if (closed) qa_ogv_playback_close(playback);
 }
 
+static void init_unwind(void *raw) {
+  qa_ogv_playback *playback = (qa_ogv_playback *)raw;
+  if (playback->audio != NULL) {
+    qa_pcm_stream_close(playback->audio);
+    playback->audio = NULL;
+  }
+  qa_theora_decoder_close(&playback->decoder);
+  if (playback->has_picture) qa_cinematic_frame_dispose(&playback->picture);
+  playback->has_picture = false;
+  qa_ogg_movie_dispose(&playback->movie);
+}
+
 bool qa_ogv_playback_init(qa_ogv_playback *playback, const uint8_t *bytes,
                           size_t length,
                           const qa_ogv_playback_options *options,
@@ -252,13 +272,17 @@ bool qa_ogv_playback_init(qa_ogv_playback *playback, const uint8_t *bytes,
   playback->state = QA_OGV_PLAYBACK_PLAYING;
   playback->reset_audio = true;
   if (!qa_decode_ogg_movie(bytes, length, &playback->movie)) return false;
+  /* TS catch: this.audio?.close(); this.decoder.close(); throw. The movie,
+   * the reconstructed picture and the C copies go with them. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, init_unwind, playback);
   decoder_init_or_fail(playback, &playback->decoder);
   if (playback->movie.audio != NULL && !options->silent) {
     playback->audio = qa_vorbis_pcm_stream_from_bytes(
         playback->movie.audio, playback->movie.audio_length);
     if (playback->audio == NULL) {
-      qa_theora_decoder_close(&playback->decoder);
-      qa_ogg_movie_dispose(&playback->movie);
+      qa_cleanup_pop(&guard);
+      init_unwind(playback);
       return false;
     }
   }
@@ -269,6 +293,7 @@ bool qa_ogv_playback_init(qa_ogv_playback *playback, const uint8_t *bytes,
   } else {
     restore_checkpoint(playback, checkpoint);
   }
+  qa_cleanup_pop(&guard);
   return true;
 }
 

@@ -42,7 +42,7 @@ bool qa_create_model_grip(const qa_scene_entity *reference,
                           qa_model_grip *out) {
   memset(out, 0, sizeof *out);
   if (!str_eq(reference->resource.digest, definition.digest))
-    qa_range_error("Model attachment digest differs from its source bytes");
+    qa_raise("Error", 0, 0, "Model attachment digest differs from its source bytes");
   out->reference_id = reference->resource.id;
   out->grip = definition.grip;
   if (definition.is_joint) {
@@ -51,7 +51,7 @@ bool qa_create_model_grip(const qa_scene_entity *reference,
     return true;
   }
   if (reference->model.kind != QA_DECODED_MODEL_Q2_ALIAS)
-    qa_range_error("Mesh attachment requires its declared MD2 source");
+    qa_raise("Error", 0, 0, "Mesh attachment requires its declared MD2 source");
   const qa_q2_alias_model *source = reference->model.as.q2_alias;
   size_t frames = source->frame_count;
   out->owned_frames = calloc(frames ? frames : 1, sizeof *out->owned_frames);
@@ -99,7 +99,7 @@ bool qa_create_model_grip(const qa_scene_entity *reference,
                    positions, position_count, sizeof(qa_model_vertex), 2,
                    "attachment vertex"))->position;
   if (!triangle(a, b, c, &initial))
-    qa_range_error("Model attachment reference is degenerate");
+    qa_raise("Error", 0, 0, "Model attachment reference is degenerate");
   qa_model_transform identity = {{0, 0, 0}, {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}}, {1, 1, 1}};
   qa_model_transform inverse = qa_align_model_attachment(initial, identity);
   out->relative = qa_compose_model_transform(inverse, definition.grip);
@@ -111,7 +111,7 @@ bool qa_model_grip_transform(const qa_model_grip *grip,
                              qa_model_transform *out) {
   if (grip->is_joint) {
     if (!str_eq(entity->resource.id, grip->reference_id))
-      qa_range_error("Model attachment source changed");
+      qa_raise("Error", 0, 0, "Model attachment source changed");
     qa_scene_entity posed = *entity;
     if (entity->pose.is_frame) {
       qa_repaired_frames repaired = qa_repair_frames(entity);
@@ -121,14 +121,14 @@ bool qa_model_grip_transform(const qa_model_grip *grip,
     }
     qa_model_attachment_tag_result tag;
     if (!qa_model_attachment_tag(&posed, grip->name, &tag))
-      qa_range_error("Source model has no attachment %s", grip->name);
+      qa_raise("Error", 0, 0, "Source model has no attachment %s", grip->name);
     qa_model_transform tag_transform = {tag.tag.origin, tag.tag.axis,
                                         {tag.scale, tag.scale, tag.scale}};
     *out = qa_compose_model_transform(tag_transform, grip->grip);
     return true;
   }
   if (!str_eq(entity->resource.id, grip->reference_id) || !entity->pose.is_frame)
-    qa_range_error("Mesh attachment lost its original source pose");
+    qa_raise("Error", 0, 0, "Mesh attachment lost its original source pose");
   qa_repaired_frames repaired = qa_repair_frames(entity);
   size_t count = 0;
   qa_model_vertex *vertices = qa_interpolate_scene_md2(

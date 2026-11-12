@@ -9,6 +9,7 @@
 #include "qa/core/math.h"
 #include "qa/core/renderer_math.h"
 #include "qa/foundation/support.h"
+#include "qa/network/common/js_number.h"
 #include "qa/materials/q3_lighting.h"
 #include "qa/materials/shader_types.h"
 
@@ -22,17 +23,17 @@ void qa_light_grid_destroy(qa_light_grid *grid) {
 }
 
 static qa_vec3 shifted_color(qa_vec3 color, int shift) {
-  int32_t r = qa_mat_to_int32(color.x) << shift;
-  int32_t g = qa_mat_to_int32(color.y) << shift;
-  int32_t b = qa_mat_to_int32(color.z) << shift;
-  if ((r | g | b) <= 255) {
-    qa_vec3 out = {(double)r, (double)g, (double)b};
-    return out;
-  }
-  double maximum = r > g ? (r > b ? r : b) : (g > b ? g : b);
-  qa_vec3 out = {trunc(r * 255 / maximum), trunc(g * 255 / maximum),
-                 trunc(b * 255 / maximum)};
-  return out;
+  /* color << shift is an int32 shift (JS wraps; a C signed shift past int32 is undefined), and
+     the scale-down is double arithmetic (r * 255 can pass int32). */
+  double r = qa_js_shl(color.x, shift), g = qa_js_shl(color.y, shift), b = qa_js_shl(color.z, shift);
+  if (qa_js_bit_or(qa_js_bit_or(r, g), b) <= 255) return qa_math_vec3(r, g, b);
+  double maximum = qa_js_max(qa_js_max(r, g), b);
+  return qa_math_vec3(trunc((r * 255) / maximum), trunc((g * 255) / maximum), trunc((b * 255) / maximum));
+}
+
+/* JS \s (and String.prototype.trim) in a code-unit byte string: ASCII white space and U+00A0. */
+static bool js_space_byte(unsigned char c) {
+  return c == ' ' || (c >= '\t' && c <= '\r') || c == 0xa0;
 }
 
 /* gridFloat: TS parses a pre-matched numeric token. */
@@ -42,9 +43,9 @@ static double grid_float(const char *token, size_t length) {
   for (size_t i = 0; i < length; i++)
     copy[i] = (char)tolower((unsigned char)token[i]);
   copy[length] = '\0';
-  /* token may carry leading whitespace from the sscanf-style match */
+  /* token.trim(): it may carry leading white space from the sscanf-style match */
   char *p = copy;
-  while (isspace((unsigned char)*p)) p++;
+  while (js_space_byte((unsigned char)*p)) p++;
   bool hex = (p[0] == '+' || p[0] == '-' ? p[1] == '0' && p[2] == 'x'
                                          : p[0] == '0' && p[1] == 'x');
   double result;
@@ -70,7 +71,7 @@ static double grid_float(const char *token, size_t length) {
  * (including leading whitespace) or 0 for no match. */
 static size_t scan_float_token(const char *text) {
   size_t i = 0;
-  while (isspace((unsigned char)text[i])) i++;
+  while (js_space_byte((unsigned char)text[i])) i++;
   size_t start = i;
   if (text[i] == '+' || text[i] == '-') i++;
   /* inf / infinity / nan, case-insensitive */
@@ -95,7 +96,9 @@ static size_t scan_float_token(const char *text) {
       j++;
       while (isxdigit((unsigned char)text[j])) { j++; any = true; }
     }
-    if (!any || (!dot && j == i + 2)) return 0;
+    /* No hex digit: the regex's hex alternative fails and the decimal one
+       matches the leading "0" (fall through below). */
+    if (!any || (!dot && j == i + 2)) goto decimal;
     if (text[j] == 'p' || text[j] == 'P') {
       size_t k = j + 1;
       if (text[k] == '+' || text[k] == '-') k++;
@@ -107,6 +110,7 @@ static size_t scan_float_token(const char *text) {
     (void)start;
     return j;
   }
+decimal:;
   size_t j = i;
   bool any = false;
   while (isdigit((unsigned char)text[j])) { j++; any = true; }
@@ -300,7 +304,7 @@ qa_entity_lighting qa_setup_entity_lighting(qa_lighting_entity entity,
   if (!have) {
     sample.ambient_light = (qa_vec3){fallback, fallback, fallback};
     sample.directed_light = (qa_vec3){fallback, fallback, fallback};
-    sample.light_dir = state.sun_direction;
+    sample.light_dir = qa_math_vec3(state.sun_direction.x, state.sun_direction.y, state.sun_direction.z);
   }
   double minimum = fr(fr(state.identity_light) * 32.0);
   qa_vec3 ambient = qa_add3(sample.ambient_light,
@@ -310,36 +314,29 @@ qa_entity_lighting qa_setup_entity_lighting(qa_lighting_entity entity,
   for (size_t i = 0; i < state.dynamic_light_count; i++) {
     qa_q3_dynamic_light light = state.dynamic_lights[i];
     qa_vec3 relative = qa_sub3(light.origin, origin);
-    double length = qa_length3(relative);
-    double distance = length > 16 ? length : 16;
+    double distance = qa_js_max(qa_length3(relative), 16); /* Math.max keeps NaN */
     double power = fr(16.0 * fr(fr(light.radius) * fr(light.radius)));
     double attenuation = fr(power / fr(distance * distance));
     directed = qa_add3(directed, qa_scale3(light.color, attenuation));
     direction = qa_add3(direction,
                         qa_scale3(qa_normalize3(relative), attenuation));
   }
-  ambient = (qa_vec3){
-      ambient.x < state.identity_light_byte ? ambient.x : state.identity_light_byte,
-      ambient.y < state.identity_light_byte ? ambient.y : state.identity_light_byte,
-      ambient.z < state.identity_light_byte ? ambient.z : state.identity_light_byte};
+  ambient = qa_math_vec3(qa_js_min(ambient.x, state.identity_light_byte),
+                         qa_js_min(ambient.y, state.identity_light_byte),
+                         qa_js_min(ambient.z, state.identity_light_byte));
   output->light_dir = sample.light_dir;
   output->ambient_light = ambient;
   output->directed_light = directed;
   if (diagnostics != NULL && diagnostics->enabled &&
       (flags & RF_FIRST_PERSON_FLAG) != 0) {
-    int64_t max1 = (int64_t)trunc(output->ambient_light.x);
-    int64_t max2 = (int64_t)trunc(output->directed_light.x);
-    if (output->ambient_light.y > (double)max1)
-      max1 = (int64_t)trunc(output->ambient_light.y);
-    else if (output->ambient_light.z > (double)max1)
-      max1 = (int64_t)trunc(output->ambient_light.z);
-    if (output->directed_light.y > (double)max2)
-      max2 = (int64_t)trunc(output->directed_light.y);
-    else if (output->directed_light.z > (double)max2)
-      max2 = (int64_t)trunc(output->directed_light.z);
-    char text[64];
-    snprintf(text, sizeof text, "amb:%lld  dir:%lld\n",
-             (long long)max1, (long long)max2);
+    /* JS numbers: a NaN or infinite light prints as JS spells it. */
+    double max1 = trunc(output->ambient_light.x), max2 = trunc(output->directed_light.x);
+    if (output->ambient_light.y > max1) max1 = trunc(output->ambient_light.y);
+    else if (output->ambient_light.z > max1) max1 = trunc(output->ambient_light.z);
+    if (output->directed_light.y > max2) max2 = trunc(output->directed_light.y);
+    else if (output->directed_light.z > max2) max2 = trunc(output->directed_light.z);
+    char text[96];
+    snprintf(text, sizeof text, "amb:%s  dir:%s\n", QA_JS_NUMBER(max1), QA_JS_NUMBER(max2));
     diagnostics->print(diagnostics->ctx, text);
   }
   output->ambient_light_int =

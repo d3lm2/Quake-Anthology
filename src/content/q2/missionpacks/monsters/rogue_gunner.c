@@ -126,8 +126,9 @@ static void attack_fn(void *ctx, qa_q2m_context *c) {
     state->manual_steering = false;
     return;
   }
-  bool bad_area = qa_q2mpm_state_get(bundle->source, c->entity)->has_bad_area;
-  q2mpm_set_move(c, qa_q2m_target_distance(c) < 80 || bad_area ? "gunner_move_attack_chain"
+  /* TS order: the distance test first; source.get() creates (and so checkpoints) the state only when it is reached. */
+  q2mpm_set_move(c, qa_q2m_target_distance(c) < 80 || qa_q2mpm_state_get(bundle->source, c->entity)->has_bad_area
+                    ? "gunner_move_attack_chain"
                     : q2mpm_rnd(game) <= 0.5 && grenade_check(c) ? "gunner_move_attack_grenade"
                                                                  : "gunner_move_attack_chain");
 }

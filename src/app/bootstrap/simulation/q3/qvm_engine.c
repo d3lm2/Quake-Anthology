@@ -46,7 +46,11 @@ qa_app_q3_game_engine *qa_app_q3_qvm_engine_create(qa_app_q3_qvm_engine_options 
   module.host_ctx = engine;
   module.host_state = options.host_state;
   module.semantics = options.semantics;
+  /* A module the interpreter refuses raises from the constructor; the engine is released with the refusal. */
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, free, engine);
   qa_qvm_game_init(&engine->game, &module);
+  qa_cleanup_pop(&cleanup);
   engine->base.ops = &qvm_ops;
   engine->base.kind = "qvm";
   engine->base.module = engine->game.module.profile.module;

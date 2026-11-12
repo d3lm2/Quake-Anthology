@@ -27,7 +27,7 @@ void qa_app_assert_q3_guest_recipe(qa_executable_recipe recipe, const qa_app_q3_
       || !same_ref(recipe.inventory, owner) || !same_ref(recipe.match, owner) || !same_ref(recipe.transition, owner)
       || recipe.enemies.kind == QA_ENEMY_SELECTION_PLAYERS
       || !timing_q3) {
-    qa_range_error("Q3 bytecode requires one native Q3 server game, map-defined actors and supported source providers");
+    qa_raise("Error", 0, 0, "%s", "Q3 bytecode requires one native Q3 server game, map-defined actors and supported source providers");
   }
 }
 static bool ieq(const char *a, const char *b) {
@@ -86,43 +86,54 @@ static bool mounts_open(void *ctx, const char *path, uint8_t **out_bytes, size_t
   *out_bytes = opened.bytes; *out_length = opened.byte_length;
   return true;
 }
+static void reading_cleanup(void *reading) { qa_qvm_compatibility_reading_destroy(reading); }
+static void prepared_cleanup(void *game) { qa_app_prepared_q3_game_destroy(game); }
 void qa_app_prepare_q3_game(qa_app_q3_game_execution execution, qa_content_mounted *mounts, qa_app_prepared_q3_game *out) {
   const qa_resolved_resource_reference *reference = execution.artifact;
   if (execution.api.kind != QA_GAME_API_Q3 || execution.api.as.q3.kind != QA_Q3_API_QAGAME
       || !reference || !ieq(reference->requested_path, "vm/qagame.qvm"))
-    qa_range_error("Selected Q3 server artifact must provide a supported qagame ABI");
+    qa_raise("Error", 0, 0, "%s", "Selected Q3 server artifact must provide a supported qagame ABI");
   size_t length = 0;
   uint8_t *bytes = qa_content_mounted_read_reference(mounts, reference, &length);
   if (!bytes) qa_range_error("Selected Q3 server artifact is unreadable");
-  qa_qvm_compatibility_reading declaration;
+  /* What a throw abandons below is released: the read bytes, the declaration, the partly prepared game. */
+  qa_cleanup bytes_node; qa_cleanup_push(&bytes_node, free, bytes);
+  qa_qvm_compatibility_reading declaration; memset(&declaration, 0, sizeof declaration);
   qa_qvm_module_path_digest module = {reference->requested_path, reference->digest};
   if (!qa_qvm_read_compatibility_declaration(mounts, module, "qagame", &declaration)) qa_range_error("Out of memory");
+  qa_cleanup declaration_node; qa_cleanup_push(&declaration_node, reading_cleanup, &declaration);
   qa_qvm_abi_profile abi_profile = declaration.declaration.profile;
   if (execution.api.as.q3.version != (abi_profile && strcmp(abi_profile, "q3-modern") == 0 ? 8 : 7))
-    qa_range_error("Selected QVM ABI differs from its saved or resolved recipe");
+    qa_raise("Error", 0, 0, "%s", "Selected QVM ABI differs from its saved or resolved recipe");
   const qa_mount_identity *identity = reference->provenance.kind == QA_CONTENT_MOUNT_ARCHIVE && reference->provenance.archive_mount
       ? &reference->provenance.archive_mount->identity : reference->provenance.loose_mount ? &reference->provenance.loose_mount->identity : NULL;
-  char revision[512];
-  snprintf(revision, sizeof revision, "%s:%lld", identity ? identity->id : "", identity ? (long long)identity->generation : 0);
+  /* `${identity.id}:${identity.generation}`, any length */
+  const char *identity_id = identity ? identity->id : "";
+  long long generation = identity ? (long long)identity->generation : 0;
+  int revision_length = snprintf(NULL, 0, "%s:%lld", identity_id, generation);
+  char *revision = malloc(revision_length < 0 ? 1 : (size_t)revision_length + 1);
+  if (revision == NULL || revision_length < 0) { free(revision); qa_range_error("Out of memory"); }
+  snprintf(revision, (size_t)revision_length + 1, "%s:%lld", identity_id, generation);
   memset(out, 0, sizeof *out);
   out->kind = "qvm";
   out->execution = execution; out->resource = reference;
+  /* The resolved artifact borrows the revision text: the prepared game keeps it. */
+  out->artifact.module.revision = revision;
+  qa_cleanup prepared_node; qa_cleanup_push(&prepared_node, prepared_cleanup, out);
   qa_qvm_resolve_artifact_options resolve; memset(&resolve, 0, sizeof resolve);
   resolve.module.id = execution.owner.provider; resolve.module.artifact_path = reference->requested_path;
   resolve.module.digest = reference->digest; resolve.module.revision = revision;
   resolve.role = "qagame"; resolve.bytes = bytes; resolve.length = length;
   resolve.has_abi_profile = true; resolve.abi_profile = abi_profile;
-  if (!qa_qvm_resolve_artifact(resolve, &out->artifact)) qa_range_error("Out of memory");
-  free(bytes);
-  /* The resolved artifact borrows the revision text: keep it with the prepared game. */
-  out->artifact.module.revision = strdup(revision);
-  if (out->artifact.is_typescript) qa_range_error("Selected Q3 guest artifact did not resolve to bytecode");
+  if (!qa_qvm_resolve_artifact(resolve, &out->artifact)) { out->artifact.module.revision = revision; qa_range_error("Out of memory"); }
+  out->artifact.module.revision = revision;
+  if (out->artifact.is_typescript) qa_raise("Error", 0, 0, "%s", "Selected Q3 guest artifact did not resolve to bytecode");
   out->module = out->artifact.module;
   equipment_view_init(&out->equipment, &out->artifact);
   bool private_inventory = false;
   if (declaration.declaration.primary != NULL) {
     qa_save_reader primary;
-    if (!qa_save_reader_init(&primary, declaration.declaration.primary, "qvm.primary")) qa_range_error("Out of memory");
+    if (!qa_save_reader_init(&primary, declaration.declaration.primary, declaration.declaration.primary_path)) qa_range_error("Out of memory");
     qa_save_reader items = child(&primary, "items");
     out->items = qa_qvm_parse_item_layout(&items); out->has_items = true;
     qa_save_reader_destroy(&items);
@@ -139,21 +150,27 @@ void qa_app_prepare_q3_game(qa_app_q3_game_execution execution, qa_content_mount
     qa_qvm_builtin_primary_profile(&out->artifact, out->weapons.values, out->weapons.count, &out->primary);
   } else if (declaration.resource == NULL || !out->has_items) {
     qa_save_reader primary;
-    if (!qa_save_reader_init(&primary, declaration.declaration.primary, "qvm.primary")) qa_range_error("Out of memory");
+    if (!qa_save_reader_init(&primary, declaration.declaration.primary, declaration.declaration.primary_path)) qa_range_error("Out of memory");
     qa_save_reader_fail(&primary, "primary interface lost its declaration resource");
   } else {
     qa_save_reader primary;
-    if (!qa_save_reader_init(&primary, declaration.declaration.primary, "qvm.primary")) qa_range_error("Out of memory");
+    if (!qa_save_reader_init(&primary, declaration.declaration.primary, declaration.declaration.primary_path)) qa_range_error("Out of memory");
     bool live = out->items.has_source && out->items.source && strcmp(out->items.source, "live") == 0;
     qa_qvm_catalog_entry *catalog = calloc(out->weapons.count ? out->weapons.count : 1, sizeof *catalog);
     if (!catalog) qa_range_error("Out of memory");
     for (size_t i = 0; i < out->weapons.count; i++) { catalog[i].weapon = (int64_t)out->weapons.values[i].weapon; catalog[i].item = out->weapons.values[i].item; }
+    qa_cleanup catalog_node; qa_cleanup_push(&catalog_node, free, catalog);
     qa_qvm_read_primary_profile(&primary, &out->artifact, live ? NULL : catalog, live ? 0 : out->weapons.count, !live,
         &out->items, declaration.resource, &out->primary);
+    qa_cleanup_pop(&catalog_node);
     free(catalog);
     qa_save_reader_destroy(&primary);
   }
+  qa_cleanup_pop(&prepared_node);
+  qa_cleanup_pop(&declaration_node);
+  qa_cleanup_pop(&bytes_node);
   qa_qvm_compatibility_reading_destroy(&declaration);
+  free(bytes);
 }
 void qa_app_prepare_q3_native_game(const qa_app_q3_game_execution *execution, qa_content_mounted *mounts,
                                    qa_app_prepared_q3_game *out) {

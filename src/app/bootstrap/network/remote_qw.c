@@ -332,6 +332,7 @@ void qa_app_qw_remote_prepare_skins(qa_app_qw_remote *remote,
   }
   free(policy);
   remote->selected_count = 0;
+  qa_app_qw_player_skins_release_retired(remote->player_skins);
   for (size_t i = 0; i < remote->userinfo_count; i++) {
     userinfo_entry *entry = &remote->userinfos[i];
     const char *name = qa_qw_info_get(&entry->info, "name");
@@ -389,6 +390,7 @@ const char *const *qa_app_qw_remote_skin_names(qa_app_qw_remote *remote, size_t 
 void qa_app_qw_remote_skins_loading(qa_app_qw_remote *remote, bool value) {
   remote->skin_loading = value;
   remote->selected_count = 0;
+  qa_app_qw_player_skins_release_retired(remote->player_skins);
   if (!value) {
     qa_app_qw_player_skins_clear(remote->player_skins);
     free(remote->skin_signature);
@@ -441,6 +443,7 @@ double qa_app_qw_remote_game_state(qa_app_qw_remote *remote, const qa_quakeworld
   for (size_t i = 0; i < remote->userinfo_count; i++) qa_qw_info_destroy(&remote->userinfos[i].info);
   remote->userinfo_count = 0;
   remote->selected_count = 0;
+  qa_app_qw_player_skins_release_retired(remote->player_skins);
   free(remote->skin_signature);
   remote->skin_signature = copy_text("");
   remote->skin_loading = false;
@@ -535,7 +538,10 @@ static void translated_push(translated_list *list, qa_netquake_message message) 
 }
 static void scoreboard_info(qa_app_qw_remote *remote, double slot, qa_qw_info *info,
     translated_list *translated) {
-  if (slot != trunc(slot) || slot < 0 || slot >= 32) qa_raise("Error", 0, 0, "Invalid QW userinfo slot");
+  if (slot != trunc(slot) || slot < 0 || slot >= 32) {
+    qa_qw_info_destroy(info); /* not yet owned by the table */
+    qa_raise("Error", 0, 0, "Invalid QW userinfo slot");
+  }
   userinfo_entry *entry = userinfo_of(remote, slot, true);
   qa_qw_info_destroy(&entry->info);
   entry->info = *info;
@@ -591,18 +597,21 @@ static void link_solids(qa_app_qw_remote *remote, const qa_qw_player_state *play
     qa_q1_extended_entity_state *state = &states[index];
     if (remote->has_data && state->base.number == remote->data.player_slot + 1) continue;
     const qa_qw_player_state *player = NULL;
-    for (size_t i = 0; i < player_count; i++)
+    for (size_t i = 0; i < player_count && !player; i++) /* TS find(): the first match */
       if (players[i].number + 1 == state->base.number) player = &players[i];
     int64_t model_index = (int64_t)state->base.model_index - 1;
     const char *path = model_index >= 0 && (size_t)model_index < remote->model_count
         ? remote->model_names[model_index] : NULL;
+    /* TS model: path?.startsWith("*") ? Number(path.slice(1)) : null; a player keeps a
+     * non-integer model number (only a non-player needs an integer one). */
     bool has_model = false;
     double model = 0;
     if (path && path[0] == '*') {
-      model = qa_js_string_to_number(path + 1); /* Number(path.slice(1)); "*" is 0 */
-      has_model = isfinite(model) && model == trunc(model); /* Number.isInteger */
+      model = qa_js_string_to_number(path + 1); /* "*" is 0 */
+      has_model = true;
     }
-    if (!player && !has_model) continue;
+    bool integer_model = has_model && isfinite(model) && model == trunc(model); /* Number.isInteger */
+    if (!player && !integer_model) continue;
     if (player && (qa_js_to_int32(player->flags) & 512) != 0) continue;
     qa_bounds bounds = has_model
         ? remote->options.scene_model_bounds(remote->options.shared.ctx, scene, model)
@@ -715,6 +724,8 @@ static void receive_prediction(qa_app_qw_remote *remote, double now) {
   remote->predicted = qa_app_quakeworld_prediction_replay(remote->predictor);
   remote->has_predicted = true;
 }
+typedef struct receive_nails { qa_q1_extended_entity_state *items; } receive_nails;
+static void receive_nails_free(void *arg) { free(((receive_nails *)arg)->items); }
 void qa_app_qw_remote_receive(qa_app_qw_remote *remote,
     const qa_quakeworld_message *messages, size_t count, double now,
     qa_app_qw_remote_assert_fn assert_current, void *assert_ctx) {
@@ -732,13 +743,19 @@ void qa_app_qw_remote_receive(qa_app_qw_remote *remote,
       }
     return;
   }
+  /* Released on a raise (remote input): the players and nails, then the translated list. */
+  qa_qw_player_state *players = xmalloc(count * sizeof *players);
+  qa_cleanup players_guard;
+  qa_cleanup_push(&players_guard, free, players);
+  size_t player_count = 0;
+  receive_nails held_nails = {xmalloc((count * 64 + 1) * sizeof *held_nails.items)};
+  qa_cleanup nails_guard;
+  qa_cleanup_push(&nails_guard, receive_nails_free, &held_nails);
+  qa_q1_extended_entity_state *nails = held_nails.items;
+  size_t nail_count = 0, nail_cap = count * 64 + 1;
   translated_list translated = {0};
   qa_cleanup translated_guard;
   qa_cleanup_push(&translated_guard, translated_free, &translated);
-  qa_qw_player_state *players = xmalloc(count * sizeof *players);
-  size_t player_count = 0;
-  qa_q1_extended_entity_state *nails = xmalloc((count * 64 + 1) * sizeof *nails);
-  size_t nail_count = 0, nail_cap = count * 64 + 1;
   bool frame = false;
   for (size_t i = 0; i < count; i++) {
     const qa_quakeworld_message *message = &messages[i];
@@ -758,22 +775,20 @@ void qa_app_qw_remote_receive(qa_app_qw_remote *remote,
       free(remote->entities);
       remote->entities = xmalloc(message->entity_count * sizeof *remote->entities);
       remote->entity_count = message->entity_count;
-      for (size_t j = 0; j < message->entity_count; j++) {
-        qa_nq_wire_entity_from_extended(&message->entities[j].state,
-            (qa_q1_wire_entity_state *)&remote->entities[j]);
+      for (size_t j = 0; j < message->entity_count; j++)
         remote->entities[j] = message->entities[j].state;
-      }
       frame = true;
     } else if (strcmp(kind, "nails") == 0) {
       int64_t model_index = 0;
-      for (size_t j = 0; j < remote->model_count; j++)
+      for (size_t j = 0; j < remote->model_count && model_index == 0; j++) /* TS indexOf: the first */
         if (strcmp(remote->model_names[j], "progs/spike.mdl") == 0) model_index = (int64_t)j + 1;
       if (model_index != 0)
         for (size_t j = 0; j < message->projectile_count; j++) {
           if (nail_count == nail_cap) {
             nail_cap *= 2;
-            nails = realloc(nails, nail_cap * sizeof *nails);
-            if (!nails) qa_range_error("out of memory");
+            qa_q1_extended_entity_state *grown = realloc(nails, nail_cap * sizeof *nails);
+            if (!grown) qa_range_error("out of memory");
+            nails = held_nails.items = grown;
           }
           qa_q1_extended_entity_state *nail = &nails[nail_count++];
           memset(nail, 0, sizeof *nail);
@@ -951,6 +966,8 @@ void qa_app_qw_remote_receive(qa_app_qw_remote *remote,
   for (size_t i = 0; i < player_count; i++)
     if (players[i].number == remote->data.player_slot) has_own = true;
   if (has_own) receive_prediction(remote, now);
+  qa_cleanup_pop(&nails_guard);
+  qa_cleanup_pop(&players_guard);
   free(players);
   free(nails);
 }

@@ -171,6 +171,8 @@ bool qa_q2_read_status(const qa_q2_connectionless_message *message,
     const char *name_start = end + 2;
     size_t name_len = strlen(name_start);
     if (name_len < 1 || name_start[name_len - 1] != '"') continue;
+    /* (.*) does not match a line terminator; \r is the one a byte line can hold. */
+    if (memchr(name_start, '\r', name_len) != NULL) continue;
     if (player_count == player_capacity) {
       player_capacity *= 2;
       qa_player_detail *grown = (qa_player_detail *)realloc(
@@ -403,108 +405,6 @@ static void host_reply_text(const qa_q2_connectionless_host *host,
   }
 }
 
-bool qa_q2_connectionless_server_receive(qa_q2_connectionless_server *server,
-                                         const qa_net_address *from,
-                                         const uint8_t *bytes, size_t length,
-                                         double now) {
-  const qa_q2_connectionless_host *host = server->host;
-  qa_q2_connectionless_message message;
-  if (!qa_q2_read_out_of_band(bytes, length, false, &message)) return false;
-  const char *command = message.command != NULL ? message.command : "";
-  bool result = false;
-  if (strcmp(command, "ping") == 0) {
-    host_reply_text(host, from, "ack");
-    result = true;
-  } else if (strcmp(command, "status") == 0) {
-    qa_q2_status status = host->status(host->ctx);
-    char *status_text = qa_q2_status_text(&status, false, 0);
-    if (status_text != NULL) {
-      size_t needed = strlen("print\n") + strlen(status_text) + 1;
-      char *full = (char *)malloc(needed);
-      if (full != NULL) {
-        (void)snprintf(full, needed, "print\n%s", status_text);
-        host_reply_text(host, from, full);
-        free(full);
-      }
-      free(status_text);
-    }
-    result = true;
-  } else if (strcmp(command, "info") == 0) {
-    double version = message.argument_count > 0 ? js_number(message.arguments[0]) : 0.0 / 0.0;
-    /* TS Number(undefined) is NaN; missing arg compares unequal. */
-    if (message.argument_count == 0) version = NAN;
-    qa_q2_host_info info = host->info(host->ctx);
-    char *text = qa_q2_info_text(info, host->protocols, host->protocol_count, version);
-    if (text != NULL) {
-      host_reply_text(host, from, text);
-      free(text);
-    }
-    result = true;
-  } else if (strcmp(command, "getchallenge") == 0) {
-    size_t reply_len = 0;
-    uint8_t *reply = qa_q2_challenge_table_reply(server->challenges, from, now,
-                                                 host->protocols, host->protocol_count,
-                                                 &reply_len);
-    if (reply != NULL) {
-      host->reply(host->ctx, from, reply, reply_len);
-      free(reply);
-    }
-    result = true;
-  } else if (strcmp(command, "connect") == 0) {
-    qa_q2_connect_request request;
-    if (!qa_q2_read_connect(&message, &request)) {
-      qa_q2_connectionless_message_free(&message);
-      return false;
-    }
-    bool known = false;
-    for (size_t i = 0; i < host->protocol_count; i++) {
-      if (host->protocols[i].version == request.protocol.version) known = true;
-    }
-    if (!known) {
-      host_reply_text(host, from, "print\nUnsupported protocol.\n");
-      qa_q2_connect_request_free(&request);
-      result = true;
-    } else if (!qa_q2_challenge_table_validate(server->challenges, from,
-                                               request.challenge, now)) {
-      host_reply_text(host, from, "print\nBad challenge.\n");
-      qa_q2_connect_request_free(&request);
-      result = true;
-    } else {
-      qa_q2_connect_admission admission = host->connect(host->ctx, from, &request);
-      if (admission.accepted) {
-        if (admission.response_arguments != NULL) {
-          size_t needed = strlen("client_connect ") + strlen(admission.response_arguments) + 1;
-          char *full = (char *)malloc(needed);
-          if (full != NULL) {
-            (void)snprintf(full, needed, "client_connect %s", admission.response_arguments);
-            host_reply_text(host, from, full);
-            free(full);
-          }
-        } else {
-          host_reply_text(host, from, "client_connect");
-        }
-      } else {
-        const char *reason = admission.reason != NULL ? admission.reason : "";
-        size_t needed = strlen("print\n") + strlen(reason) + 2;
-        char *full = (char *)malloc(needed);
-        if (full != NULL) {
-          (void)snprintf(full, needed, "print\n%s\n", reason);
-          host_reply_text(host, from, full);
-          free(full);
-        }
-      }
-      qa_q2_connect_admission_free(&admission);
-      qa_q2_connect_request_free(&request);
-      result = true;
-    }
-  } else if (strcmp(command, "rcon") == 0) {
-    qa_q2_handle_rcon(host, from, &message, now);
-    result = true;
-  }
-  qa_q2_connectionless_message_free(&message);
-  return result;
-}
-
 typedef struct rcon_buffer {
   const qa_q2_connectionless_host *host;
   const qa_net_address *from;
@@ -628,8 +528,15 @@ static void rcon_body(void *arg) {
     free(t1);
     char *t2 = qa_parse_q2_token(&cursor, 128);
     free(t2);
-    const char *rest = message->text != NULL ? message->text + cursor.index : "";
-    while (*rest != '\0' && isspace((unsigned char)*rest)) rest++;
+    /* text.slice(cursor.index): an unterminated quoted token leaves the index past the end. */
+    const char *rest = cursor.index < cursor.length ? message->text + cursor.index : "";
+    /* trimStart(): JS white space, which for Latin-1 text includes U+00A0. */
+    for (;;) {
+      size_t skip = message->utf8 ? qa_js_white_space_length(rest)
+                    : (*rest == ' ' || (*rest >= 9 && *rest <= 13) || (unsigned char)*rest == 0xa0) ? 1 : 0;
+      if (skip == 0) break;
+      rest += skip;
+    }
     command = dup_str(rest);
     if (command == NULL) return;
   }

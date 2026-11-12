@@ -16,8 +16,8 @@ static qa_save_reader item(const qa_save_reader *reader, size_t index) {
     qa_save_reader_fail(reader, "out of memory");
   return out;
 }
-/* TS readSavedActor (save-image.ts, not yet ported as a module):
- * {slot: integer(0), generation: integer(0)}. Local copy only. */
+/* TS readSavedActor (save-image.ts): {slot: integer(0), generation: integer(0)},
+ * the same reads as qa_read_saved_actor (persistence/save_image.c). */
 static qa_saved_actor_id read_actor(const qa_save_reader *reader) {
   qa_saved_actor_id actor;
   qa_save_reader slot = field(reader, "slot");
@@ -258,8 +258,11 @@ fail:
 }
 
 qa_q2_items_checkpoint qa_read_q2_items_checkpoint(const qa_save_reader *reader, qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2_items_checkpoint out;
   read_q2_items_checkpoint(reader, &out, owner);
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 uint8_t *qa_encode_q2_items_checkpoint(const qa_q2_items_checkpoint *checkpoint, size_t *out_length) {
@@ -271,12 +274,19 @@ uint8_t *qa_encode_q2_items_checkpoint(const qa_q2_items_checkpoint *checkpoint,
 }
 bool qa_decode_q2_items_checkpoint(const uint8_t *bytes, size_t length, qa_q2_items_checkpoint *out,
                                    qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_save_value *root = qa_decode_checkpoint_value(bytes, length);
-  if (root == NULL) return false;
+  if (root == NULL) { qa_persist_decoded_leave(&owner_scope); return false; }
   qa_save_reader reader;
-  if (!qa_save_reader_init(&reader, root, "q2-items")) { qa_save_value_free(root); return false; }
+  if (!qa_save_reader_init(&reader, root, "q2-items")) {
+    qa_save_value_free(root);
+    qa_persist_decoded_leave(&owner_scope);
+    return false;
+  }
   owner->root = root;
   read_q2_items_checkpoint(&reader, out, owner);
   qa_save_reader_destroy(&reader);
+  qa_persist_decoded_leave(&owner_scope);
   return true;
 }

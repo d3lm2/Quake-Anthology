@@ -12,7 +12,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "qa/foundation/node_path.h"
 #include "qa/foundation/support.h"
+#include "qa/platform/files/contained.h"
 
 const char *qa_save_unavailable(const qa_save_eligibility *state,
                                 qa_save_purpose purpose) {
@@ -50,94 +52,19 @@ static char *dup_range(const char *start, size_t length) {
   return out;
 }
 
-/* Normalize an absolute path: collapse "/", "." and ".." segments. */
-static char *normalize_absolute(const char *path) {
-  size_t length = strlen(path);
-  char *work = dup_range(path, length);
-  if (work == NULL) return NULL;
-  /* Segment stack over the mutable copy. */
-  char **segments = malloc((length / 2 + 2) * sizeof *segments);
-  if (segments == NULL) { free(work); return NULL; }
-  size_t count = 0;
-  char *cursor = work;
-  while (*cursor != '\0') {
-    while (*cursor == '/') cursor++;
-    if (*cursor == '\0') break;
-    char *start = cursor;
-    while (*cursor != '\0' && *cursor != '/') cursor++;
-    if (*cursor == '/') { *cursor = '\0'; cursor++; }
-    if (strcmp(start, ".") == 0) continue;
-    if (strcmp(start, "..") == 0) { if (count > 0) count--; continue; }
-    segments[count++] = start;
-  }
-  size_t total = 1;
-  for (size_t i = 0; i < count; i++) total += strlen(segments[i]) + 1;
-  char *out = malloc(total + 1);
-  if (out == NULL) { free(segments); free(work); return NULL; }
-  char *at = out;
-  if (count == 0) {
-    *at++ = '/';
-  } else {
-    for (size_t i = 0; i < count; i++) {
-      *at++ = '/';
-      size_t n = strlen(segments[i]);
-      memcpy(at, segments[i], n);
-      at += n;
-    }
-  }
-  *at = '\0';
-  free(segments);
-  free(work);
-  return out;
-}
-
-/* node:path resolve(...): rightmost absolute segment wins, else the
- * result is anchored at the current working directory. */
+/* node:path resolve(directory, name) (name NULL: resolve(directory)), from foundation/node_path
+ * (checked against bun's node:path). */
 static char *path_resolve(const char *directory, const char *name) {
-  const char *joined_from = NULL;
-  char *joined = NULL;
-  if (name != NULL && name[0] == '/') {
-    joined_from = name;
-  } else if (directory != NULL && directory[0] == '/') {
-    size_t dl = strlen(directory), nl = name == NULL ? 0 : strlen(name);
-    joined = malloc(dl + 1 + nl + 1);
-    if (joined == NULL) return NULL;
-    memcpy(joined, directory, dl);
-    joined[dl] = '/';
-    if (nl > 0) memcpy(joined + dl + 1, name, nl);
-    joined[dl + 1 + nl] = '\0';
-    joined_from = joined;
-  } else {
-    char cwd[4096];
-    if (getcwd(cwd, sizeof cwd) == NULL) return NULL;
-    size_t cl = strlen(cwd);
-    size_t dl = directory == NULL ? 0 : strlen(directory);
-    size_t nl = name == NULL ? 0 : strlen(name);
-    joined = malloc(cl + 1 + dl + 1 + nl + 1);
-    if (joined == NULL) return NULL;
-    char *at = joined;
-    memcpy(at, cwd, cl); at += cl;
-    if (dl > 0) { *at++ = '/'; memcpy(at, directory, dl); at += dl; }
-    if (nl > 0) { *at++ = '/'; memcpy(at, name, nl); at += nl; }
-    *at = '\0';
-    joined_from = joined;
-  }
-  char *out = normalize_absolute(joined_from);
-  free(joined);
-  return out;
+  if (name == NULL) return qa_node_path_resolve1(directory != NULL ? directory : "");
+  return qa_node_path_resolve2(directory != NULL ? directory : "", name);
 }
 
-/* node:path extname: from the last "." in the final segment, where a
- * leading-dot basename (".sav") has no extension. */
+/* extname(name) !== "" (node:path). */
 static bool has_extension(const char *name) {
-  const char *base = strrchr(name, '/');
-  base = base == NULL ? name : base + 1;
-  const char *dot = strrchr(base, '.');
-  if (dot == NULL || dot == base) return false;
-  /* ".." and "." basenames: node returns "" for "." and ".." handled
-   * by the dot==base+? rule; "..sav" style names keep an extension. */
-  if (dot == base + 1 && base[0] == '.' && dot[1] == '\0') return false;
-  return true;
+  char *extension = qa_node_path_extname(name);
+  bool has = extension[0] != '\0';
+  free(extension);
+  return has;
 }
 
 char *qa_save_command_path(const char *directory, const char *name) {
@@ -198,12 +125,45 @@ static bool ascii_equal_ignore_case(const char *left, const char *right,
   return true;
 }
 
-static bool ends_with_sav_ignore_case(const char *name) {
-  size_t length = strlen(name);
-  return length >= 4 && ascii_equal_ignore_case(name + length - 4, ".sav", 4);
+/* name.toLowerCase().endsWith(extension), for an ASCII extension. */
+static bool ends_with_extension(const char *name, const char *extension) {
+  size_t length = strlen(name), extension_length = strlen(extension);
+  if (length < extension_length) return false;
+  for (size_t i = 0; i < extension_length; i++)
+    if (tolower((unsigned char)name[length - extension_length + i]) != (unsigned char)extension[i]) return false;
+  return true;
+}
+
+/* relative(resolve(directory), resolve(path)) when the path is the directory or inside it; otherwise the TS
+ * RangeError. `allow_empty` false also refuses the directory itself (writeContainedNativeFile). */
+static char *contained_relative(const char *directory, const char *path, bool allow_empty) {
+  char *root = path_resolve(directory, NULL);
+  char *full = path_resolve(path, NULL);
+  if (root == NULL || full == NULL) { free(root); free(full); return NULL; }
+  char *name = NULL;
+  size_t root_length = strlen(root);
+  if (strcmp(root, full) == 0) {
+    if (allow_empty) name = dup_range("", 0);
+  } else if (strncmp(full, root, root_length) == 0 &&
+             (root_length == 1 || full[root_length] == '/')) {
+    const char *rest = full + root_length;
+    if (*rest == '/') rest++;
+    name = dup_range(rest, strlen(rest));
+  }
+  free(full);
+  if (name == NULL) {
+    qa_cleanup root_node;
+    qa_cleanup_push(&root_node, free, root);
+    qa_range_error("Save path is outside the save directory: %s", root);
+  }
+  free(root);
+  return name;
 }
 
 char *qa_contained_save_name(const char *directory, const char *path) {
+  return qa_contained_save_name_extension(directory, path, ".sav");
+}
+char *qa_contained_save_name_extension(const char *directory, const char *path, const char *extension) {
   char *root = path_resolve(directory, NULL);
   char *full = path_resolve(path, NULL);
   if (root == NULL || full == NULL) { free(root); free(full); return NULL; }
@@ -218,17 +178,20 @@ char *qa_contained_save_name(const char *directory, const char *path) {
     if (*rest == '/') rest++;
     name = dup_range(rest, strlen(rest));
   }
+  free(full);
+  qa_cleanup root_node;
+  qa_cleanup_push(&root_node, free, root);
   if (name == NULL) {
     /* Relative form would be absolute-ish or start with "..". */
-    char *message_root = root;
-    free(full);
-    qa_range_error("Save path is outside the save directory: %s",
-                   message_root);
+    qa_range_error("Save path is outside the save directory: %s", root);
   }
-  free(full);
+  qa_cleanup name_node;
+  qa_cleanup_push(&name_node, free, name);
   char **parts = NULL;
   size_t part_count = 0;
   char *work = contained_file_parts(name, &parts, &part_count);
+  qa_cleanup_pop(&name_node);
+  qa_cleanup_pop(&root_node);
   if (work == NULL) { free(root); free(name); return NULL; }
   for (size_t i = 0; i < part_count; i++) {
     size_t part_length = strlen(parts[i]);
@@ -243,87 +206,162 @@ char *qa_contained_save_name(const char *directory, const char *path) {
   free(parts);
   free(work);
   free(root);
-  if (!ends_with_sav_ignore_case(name)) {
+  if (!ends_with_extension(name, extension)) {
     free(name);
-    qa_range_error("Save path must end in .sav");
+    qa_range_error("Save path must end in %s", extension);
   }
   return name;
 }
 
-/* mkdir -p for the save directory itself (TS mkdir recursive). */
-static bool mkdir_recursive(const char *directory) {
-  char *absolute = path_resolve(directory, NULL);
-  if (absolute == NULL) return false;
-  bool ok = true;
-  for (char *at = absolute + 1;; at++) {
-    if (*at == '/' || *at == '\0') {
-      char saved = *at;
-      *at = '\0';
-      if (mkdir(absolute, 0777) != 0 && errno != EEXIST) ok = false;
-      *at = saved;
-      if (saved == '\0' || !ok) break;
-    }
+/* TS mkdir(path, { recursive: true }) as Bun runs it: the whole path first; on ENOENT the
+ * missing ancestors from the deepest existing one down. A failure raises Bun's error with the
+ * path being created then (an existing non-directory is EEXIST). `absolute` is resolved. */
+static void free_text(void *arg) { free(arg); }
+static void mkdir_recursive(const char *absolute) {
+  if (mkdir(absolute, 0777) == 0) return;
+  int code = errno;
+  struct stat status;
+  if (code == EEXIST && stat(absolute, &status) == 0 && S_ISDIR(status.st_mode)) return;
+  if (code != ENOENT) qa_node_fs_error(code, "mkdir", absolute);
+  size_t length = strlen(absolute);
+  char *path = dup_range(absolute, length);
+  if (path == NULL) qa_range_error("Out of memory");
+  qa_cleanup path_node;
+  qa_cleanup_push(&path_node, free_text, path);
+  /* Up: cut at each separator until one ancestor exists or is made. */
+  size_t cut = length;
+  for (;;) {
+    while (cut > 0 && path[cut - 1] != '/') cut--;
+    if (cut <= 1) { cut = 1; break; } /* reached the root: create from the first component */
+    path[cut - 1] = '\0';
+    bool made = mkdir(path, 0777) == 0;
+    code = errno;
+    if (!made && code != EEXIST && code != ENOENT) qa_node_fs_error(code, "mkdir", path);
+    path[cut - 1] = '/';
+    if (made || code == EEXIST) break;
+    cut--;
   }
-  free(absolute);
-  return ok;
+  /* Down: every component after the one made or found, then the whole path. */
+  for (size_t at = cut; at < length; at++) {
+    if (path[at] != '/') continue;
+    path[at] = '\0';
+    if (mkdir(path, 0777) != 0 && errno != EEXIST) qa_node_fs_error(errno, "mkdir", path);
+    path[at] = '/';
+  }
+  if (mkdir(path, 0777) != 0) {
+    code = errno;
+    if (!(code == EEXIST && stat(path, &status) == 0 && S_ISDIR(status.st_mode))) qa_node_fs_error(code, "mkdir", path);
+  }
+  qa_cleanup_pop(&path_node);
+  free(path);
 }
+
+static bool commit_contained(const char *directory, char *name, const uint8_t *bytes, size_t length);
 
 bool qa_write_contained_save(const char *directory, const char *path,
                              const uint8_t *bytes, size_t length) {
-  char *name = qa_contained_save_name(directory, path);
+  return qa_write_contained_save_extension(directory, path, bytes, length, ".sav");
+}
+bool qa_write_contained_save_extension(const char *directory, const char *path, const uint8_t *bytes, size_t length,
+                                       const char *extension) {
+  char *name = qa_contained_save_name_extension(directory, path, extension);
   if (name == NULL) return false;
-  if (!mkdir_recursive(directory)) { free(name); return false; }
+  return commit_contained(directory, name, bytes, length);
+}
+
+/* TS writeContainedNativeFile: a file of a native save folder, which has the original's own names (`server.ssv`,
+ * `MAP.sv2`, `current/`). It is contained like any save, but it has no fixed extension and may sit in the
+ * `current` working folder. */
+bool qa_write_contained_native_file(const char *directory, const char *path, const uint8_t *bytes, size_t length) {
+  char *name = contained_relative(directory, path, false);
+  if (name == NULL) return false;
+  /* containedFileParts(name), for its validation. */
   char **parts = NULL;
   size_t part_count = 0;
+  qa_cleanup name_node;
+  qa_cleanup_push(&name_node, free, name);
   char *work = contained_file_parts(name, &parts, &part_count);
-  free(name);
-  if (work == NULL) return false;
-  /* TS paths here are already validated; a filename always exists. */
-  char *root = path_resolve(directory, NULL);
-  if (root == NULL) { free(parts); free(work); return false; }
-  int descriptor = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-  free(root);
-  if (descriptor < 0) { free(parts); free(work); return false; }
-  bool ok = true;
-  for (size_t i = 0; i + 1 < part_count && ok; i++) {
-    if (mkdirat(descriptor, parts[i], 0777) != 0 && errno != EEXIST) ok = false;
-    if (!ok) break;
-    int next = openat(descriptor, parts[i],
-                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-    if (next < 0) { ok = false; break; }
-    close(descriptor);
-    descriptor = next;
-  }
-  const char *leaf = parts[part_count - 1];
-  char temporary[1024];
-  static unsigned long counter = 0;
-  int written = snprintf(temporary, sizeof temporary, ".%s.%ld-%lu.tmp", leaf,
-                         (long)getpid(), ++counter);
-  if (written < 0 || (size_t)written >= sizeof temporary) ok = false;
-  int file = -1;
-  if (ok) {
-    file = openat(descriptor, temporary,
-                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-    if (file < 0) ok = false;
-  }
-  if (ok) {
-    size_t position = 0;
-    while (position < length) {
-      ssize_t count = write(file, bytes + position, length - position);
-      if (count <= 0) { ok = false; break; } /* TS: "Save write made no progress" */
-      position += (size_t)count;
-    }
-    if (ok && fsync(file) != 0) ok = false;
-    close(file);
-    file = -1;
-  }
-  if (ok && renameat(descriptor, temporary, descriptor, leaf) != 0) ok = false;
-  if (ok && fsync(descriptor) != 0) ok = false;
-  unlinkat(descriptor, temporary, 0); /* rm force: already renamed on success */
-  close(descriptor);
+  qa_cleanup_pop(&name_node);
+  if (work == NULL) { free(name); return false; }
   free(parts);
   free(work);
-  return ok;
+  return commit_contained(directory, name, bytes, length);
+}
+
+/* The TS finally of commitContained: close the temporary's descriptor, rm the temporary
+ * (force), close the parent. Runs on success and when a step raises. */
+typedef struct commit_scope {
+  int parent, file;
+  char *leaf;
+  char temporary[64 + 256 + 32];
+} commit_scope;
+static void commit_scope_finish(void *arg) {
+  commit_scope *scope = arg;
+  if (scope->file >= 0) close(scope->file);
+  scope->file = -1;
+  if (scope->parent >= 0) {
+    if (scope->temporary[0] != '\0') (void)unlinkat(scope->parent, scope->temporary, 0);
+    close(scope->parent);
+  }
+  scope->parent = -1;
+  free(scope->leaf);
+  scope->leaf = NULL;
+}
+/* "/proc/self/fd/<parent>/<name>": the path TS's calls name. */
+static void fd_path(char *out, size_t capacity, int parent, const char *name) {
+  (void)snprintf(out, capacity, "/proc/self/fd/%d/%s", parent, name);
+}
+
+/* TS commitContained: commits through a held parent descriptor so directory replacement cannot redirect a save.
+ * Takes ownership of `name`. Each failing step raises its Node error (mkdir, open, write, fsync, rename); false
+ * only on OOM. */
+static bool commit_contained(const char *directory, char *name, const uint8_t *bytes, size_t length) {
+  qa_cleanup name_node;
+  qa_cleanup_push(&name_node, free_text, name);
+  /* await mkdir(resolve(directory, dirname(name)), { recursive: true }) */
+  char *folder = qa_node_path_dirname(name);
+  char *target = folder != NULL ? path_resolve(directory, folder) : NULL;
+  free(folder);
+  if (target == NULL) { qa_cleanup_pop(&name_node); free(name); return false; }
+  qa_cleanup target_node;
+  qa_cleanup_push(&target_node, free_text, target);
+  mkdir_recursive(target);
+  qa_cleanup_pop(&target_node);
+  free(target);
+  commit_scope scope;
+  memset(&scope, 0, sizeof scope);
+  scope.file = -1;
+  scope.parent = qa_open_contained_parent(directory, name, true, &scope.leaf);
+  qa_cleanup_pop(&name_node);
+  free(name);
+  if (scope.parent < 0) return false;
+  qa_cleanup scope_node;
+  qa_cleanup_push(&scope_node, commit_scope_finish, &scope);
+  /* TS: `.${leaf}.${crypto.randomUUID()}.tmp` (a leaf is at most NAME_MAX bytes). */
+  static unsigned long counter = 0;
+  (void)snprintf(scope.temporary, sizeof scope.temporary, ".%s.%ld-%lu.tmp", scope.leaf, (long)getpid(), ++counter);
+  char path[sizeof scope.temporary + 64], destination[sizeof scope.temporary + 64];
+  fd_path(path, sizeof path, scope.parent, scope.temporary);
+  scope.file = openat(scope.parent, scope.temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (scope.file < 0) qa_node_fs_error(errno, "open", path);
+  size_t position = 0;
+  while (position < length) {
+    ssize_t count = write(scope.file, bytes + position, length - position);
+    if (count < 0) qa_node_fs_error(errno, "write", NULL);
+    if (count == 0) qa_raise("Error", 0, 0, "Save write made no progress");
+    position += (size_t)count;
+  }
+  if (fsync(scope.file) != 0) qa_node_fs_error(errno, "fsync", NULL);
+  int file = scope.file;
+  scope.file = -1;
+  if (close(file) != 0) qa_node_fs_error(errno, "close", NULL);
+  fd_path(destination, sizeof destination, scope.parent, scope.leaf);
+  if (renameat(scope.parent, scope.temporary, scope.parent, scope.leaf) != 0)
+    qa_node_fs_error_paths(errno, "rename", path, destination);
+  if (fsync(scope.parent) != 0) qa_node_fs_error(errno, "fsync", NULL);
+  qa_cleanup_pop(&scope_node);
+  commit_scope_finish(&scope);
+  return true;
 }
 
 /* TS assertLoadPathAllowed (added for startup.ts routeCommand). */
@@ -348,9 +386,8 @@ void qa_assert_load_path_allowed(const char *directory, const char *path, const 
     free(full);
     return;
   }
-  char message[4096];
-  snprintf(message, sizeof message, "%s", full);
-  free(full);
+  qa_cleanup full_node;
+  qa_cleanup_push(&full_node, free, full);
   qa_range_error("load of a path outside the save directory is only accepted from the local console; start with "
-      "--allow-load-paths to allow it from scripts, game modules and remote clients: %s", message);
+      "--allow-load-paths to allow it from scripts, game modules and remote clients: %s", full);
 }

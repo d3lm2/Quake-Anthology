@@ -135,7 +135,7 @@ bool qa_qvm_read_equipment_presentation(const qa_resolved_qvm_artifact *artifact
     return found;
   }
   if (!qa_save_reader_init(&equipment_reader, (qa_save_value *)reading.declaration.equipment_presentation,
-                           "qvm-compatibility.json"))
+                           reading.declaration.equipment_presentation_path))
     qa_range_error("QVM memory allocation failed");
   const char *abi_profile = artifact->has_abi_profile ? artifact->abi_profile : "q3-modern";
   if (strcmp(artifact->role, "cgame") != 0 || strcmp(declared_profile, abi_profile) != 0)
@@ -144,11 +144,6 @@ bool qa_qvm_read_equipment_presentation(const qa_resolved_qvm_artifact *artifact
   *out_owned = true;
   qa_save_reader view = field(&equipment_reader, "view");
   int64_t view_entry = entry_field(artifact, &view, "entry");
-  int64_t view_decision = decision_field(artifact, &view, "decision", view_entry);
-  qa_save_reader taken_reader = field(&view, "taken");
-  bool view_taken = qa_save_reader_boolean(&taken_reader);
-  qa_save_reader_destroy(&taken_reader);
-  qa_save_reader_destroy(&view);
   qa_save_reader warning = field(&equipment_reader, "warning");
   qa_save_reader states = field(&warning, "states");
   qa_save_reader held = field(&equipment_reader, "held");
@@ -166,6 +161,13 @@ bool qa_qvm_read_equipment_presentation(const qa_resolved_qvm_artifact *artifact
   const char *status_kind = qa_save_reader_choice_string(&kind_reader, status_kinds, 2);
   qa_save_reader_destroy(&kind_reader);
   out->hud = (double)entry_field(artifact, &equipment_reader, "hud");
+  /* TS reads the view decision and its sense here, after the held frame, the
+   * status kind and the HUD entry (the order decides which refusal is named). */
+  int64_t view_decision = decision_field(artifact, &view, "decision", view_entry);
+  qa_save_reader taken_reader = field(&view, "taken");
+  bool view_taken = qa_save_reader_boolean(&taken_reader);
+  qa_save_reader_destroy(&taken_reader);
+  qa_save_reader_destroy(&view);
   out->view_entry = (double)view_entry;
   out->view_decision = (double)view_decision;
   out->view_taken = view_taken;

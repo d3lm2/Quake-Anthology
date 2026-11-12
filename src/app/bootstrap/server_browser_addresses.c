@@ -28,6 +28,9 @@ const char *qa_app_direct_server_text(const char *value) {
 }
 const char *qa_app_direct_server_text_value(const qa_save_value *value) {
   if (value == NULL || value->kind != QA_SAVE_STRING) qa_raise("Error", 0, 0, "Invalid direct server address");
+  /* A JSON "\u0000" keeps the whole string in TS, where [\x00-\x1f] rejects it; the C
+   * string would end at the NUL; text_length runs past strlen only when the text holds one. */
+  if (value->text_length > strlen(value->text)) qa_raise("Error", 0, 0, "Invalid direct server address");
   return qa_app_direct_server_text(value->text);
 }
 void qa_app_parse_network_address_value(const qa_save_value *value, qa_net_address *out) {

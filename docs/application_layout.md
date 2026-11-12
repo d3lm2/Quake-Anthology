@@ -2,10 +2,10 @@
 
 Source: `../quake-anthology-ts/src/app/bootstrap/application.ts` (5,309 lines when this table was generated on
 2026-11-03; the TS tree is edited concurrently, so re-run the outline before trusting a line number). One TS class,
-`Application`, is ported as one C type, `qa_application`, built alongside the temporary "concrete host" layer in
-`application.c` (`qa_app_application`, which main.c still uses until the connection step). The two types share no
-code. The real class constructs the real `SharedSimulation` (`qa_app_shared_simulation`, shared_simulation.h), never
-`qa_app_sim_shared_simulation` (runtime.h).
+`Application`, is ported as one C type, `qa_application`. main.c opens it for a dedicated run and StartupApplication
+opens it over its graphical client (2026-11-12: the earlier "concrete host" layer, `qa_app_application` in
+`application.c` and `qa_app_sim_shared_simulation` in simulation/runtime.c, is deleted). The class constructs the
+`SharedSimulation` (`qa_app_shared_simulation`, shared_simulation.h).
 
 Naming: member `fooBar` is `qa_application_foo_bar(qa_application *app, ...)`; a setter is `qa_application_set_foo_bar`;
 a static member takes no `app`. Fields are members of `struct qa_application` in `src/app/bootstrap/application_internal.h`,
@@ -667,8 +667,8 @@ application_internal.h ("TS-shaped members of other modules"), to be defined by 
 - `qa_app_campaign_unit_attach` aborts (qa_range_error) on "Campaign save does not match the active map" where TS throws
   a catchable Error (autosave catches it); `qa_write_saved_game` reports I/O failure as false, so the raised message is
   the errno text, not Node's.
-- The SharedSimulation options' `prepare_rerelease_navigation` is typed with the old `qa_app_sim_shared_simulation`; the
-  shared simulation passes the real one cast, and the transaction's callback casts it back.
+- The SharedSimulation options' `prepare_rerelease_navigation` takes the `qa_app_shared_simulation` (2026-11-12: the
+  old `qa_app_sim_shared_simulation` typedef and the casts are gone).
 - createBots' `commands` is a buffer in C; the TS passes `{ insert: text => guestCommands().insert(text) }`, so the
   transaction hands it the candidate buffer, which publication makes the source buffer.
 
@@ -973,3 +973,28 @@ shaders) and update-level copies in resources.c.
 
 Link probe (build/agents/app-final/probe/undef.sh, private `ar qc` archive): 5 undefined before (the three members above,
 `qa_application_open_guest_browser` and `qa_q3_mirror_server_status_destroy` from the server browser re-port), 0 after.
+
+### TS drift D9b (2026-11-10, 87e98c5c -> 1.2.7)
+
+Members added or moved by the drift, and where they are in C:
+
+| TS member | C |
+|---|---|
+| `consoleLog`, `logConsole`, `closeConsoleLog`, `hostWithConsoleLog(host, ...)` | `qa_application.console_log` (application_internal.h); `qa_application_construct` (application_core.c) keeps the caller's host in `unlogged_host` and points `host.print` at a wrapper that writes the log, then prints. `console_log_attached` is set when `Application.open` assigns `application` (application_open.c); prints before that are not logged, as in TS. `qa_application_log_console` / `qa_application_close_console_log` (application_commands.c); closed after the game log in application_close.c. |
+| `gameLog` (now an `AppendLog`) | `qa_application.game_log` (`qa_app_append_log`), application_commands.c |
+| `static gameFilesRoot`, `stockGameDirectory(content, options, fallback)` | `qa_application_game_files_root`, `qa_application_stock_game_directory` (application_core.c) |
+| `nativeSaves()`, `savePath(name)`, `nativeQ2Original(native)`, `rereleasePortalCount(map)`, `captureSharedImage(autosave)` | `qa_application_native_saves` (application_core.c); `qa_application_save_path`, `qa_application_native_q2_original`, `rerelease_portal_count`, `capture_shared_image` (application_travel.c) |
+| `saveGame(path, format, saving)` returning the written path | `qa_application_save_game_at` (application_travel.c); `qa_application_save_game` keeps the old signature and drops the path |
+| `adoptQ2Current(files)` | `adopt_q2_current` (application_travel.c), after a restore whose prepared save carries `folder` |
+| `autosaveAvailable()` | `autosave_available` (application_saves.c) |
+| `saveHeadlessArchives()` | `step_save_headless_archives` (application_close.c) |
+
+New files: console_log.c, native_settings.c, native_migration.c, q2_native_saves.c, seat_profile.c (one TS file each).
+`ConsoleScriptFiles` gained `native` and `mixedLayers`: the construction sites (configuration.c `qa_app_source_console_scripts`,
+application_open.c `qa_app_open_configuration_scripts`, remote_application_config.c `qa_remote_profile_scripts`) own a
+`qa_app_configuration_layering` (the TS `legacyConfigurationOptions` native-or-mixed result) and free it with the files.
+
+Tests that drive real applications over the corpus (test_remote_loopback, test_application_open_real) set
+`QTS_TEST_GAME_WRITE_ROOT` beneath `$TMPDIR` and wipe it before every run, as tests/support/hermetic.ts does: a stock game
+now writes its config, logs, demos and saves beside the game data, and one run's written config.cfg would be mounted into
+the next.

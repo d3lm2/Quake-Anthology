@@ -796,7 +796,7 @@ bool qa_bot_find_enemy_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_
 
 static void weapon_info(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_a *state, qa_weapon_info_bots_a *out) {
   if (!ai_knowledge_weapon_info(ctx, state->src->ws, state->src->weapon_num, out))
-    qa_range_error("Bot weapon %d has no loaded weapon information", (int)state->src->weapon_num);
+    qa_raise("Error", 0, 0, "Bot weapon %d has no loaded weapon information", (int)state->src->weapon_num);
 }
 
 void qa_bot_aim_at_enemy_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state_bots_a *state) {
@@ -1248,7 +1248,8 @@ void qa_bot_check_events_bots_a(qa_game_ai_context_bots_a *ctx, qa_bot_state_bot
     break;
   }
   case QA_Q3_EV_PLAYER_TELEPORT_IN:
-    dm->last_teleport_origin = ai_fv(entity->origin);
+    /* TS lastTeleportOrigin is a plain vec3: Object.assign keeps the doubles. */
+    dm->last_teleport_origin = entity->origin;
     dm->last_teleport_time = ctx->time;
     break;
   case QA_Q3_EV_GENERAL_SOUND:

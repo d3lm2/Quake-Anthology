@@ -1,8 +1,8 @@
 /*
  * Port of src/core/cvars/mirror.ts (SharedCvarMirror): selected engine
  * controls share values while each client retains its own unrelated
- * settings. The TS imports CvarRegistry type-only from cvars/index
- * (not yet ported); the registry surface this file actually calls
+ * settings. The TS imports CvarRegistry type-only from cvars/index;
+ * the registry surface this file actually calls
  * becomes the callback interface below, and the WeakMap of shared
  * subscriptions becomes an explicit list keyed by owner ctx (entries
  * leave only through close, since C has no weak references).

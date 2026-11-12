@@ -1,10 +1,11 @@
 /*
  * Port of src/guest/pe/format.ts: checked PE32/PE32+ header parsing.
- * PeError aborts with the same "PE <stage>: <detail>" message via
- * qa_range_error. Section names are copied bytes (the TS fatal UTF-8
- * decode of the 8-byte name field is not re-validated). A parsed file
- * owns its section names; release with qa_pe_file_free(). Allocation
- * failure aborts (no TS counterpart). GPL-2.0-or-later.
+ * PeError is a qa_raise under that name (code = stage) with the same
+ * "PE <stage>: <detail>" message. A section name that is not UTF-8 raises
+ * TS's TypeError, and a leading byte-order mark is dropped, as the fatal
+ * TextDecoder does. A parsed file owns its section names; release with
+ * qa_pe_file_free(). A parse or load that raises frees what it had
+ * allocated (qa_pe_scope). GPL-2.0-or-later.
  */
 #ifndef QA_GUEST_PE_FORMAT_H
 #define QA_GUEST_PE_FORMAT_H
@@ -12,6 +13,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "qa/foundation/support.h"
 #include "qa/guest/abi/values.h"
 
 typedef enum qa_pe_stage {
@@ -48,6 +50,28 @@ typedef struct qa_pe_file {
 } qa_pe_file;
 
 void qa_pe_checked_range(size_t offset, size_t length, size_t limit, qa_pe_stage stage);
+
+/*
+ * Allocation scope of one PE operation. The PE readers allocate through qa_pe_xmalloc/xcalloc/xrealloc and free
+ * through qa_pe_xfree; while a scope is open every such block is recorded, and a raise frees them all after
+ * calling `abandon` (the TS collector's part, plus whatever the operation's own catch block does). A committed
+ * scope hands its blocks to the enclosing scope, or to the caller when there is none: from then on they are
+ * ordinary malloc blocks.
+ */
+typedef struct qa_pe_scope {
+  void **items;
+  size_t count, cap;
+  struct qa_pe_scope *previous;
+  void (*abandon)(void *ctx);
+  void *ctx;
+  qa_cleanup node;
+} qa_pe_scope;
+void qa_pe_scope_begin(qa_pe_scope *scope, void (*abandon)(void *ctx), void *ctx);
+void qa_pe_scope_commit(qa_pe_scope *scope);
+void *qa_pe_xmalloc(size_t size);
+void *qa_pe_xcalloc(size_t count, size_t size);
+void *qa_pe_xrealloc(void *p, size_t size);
+void qa_pe_xfree(void *p);
 
 typedef struct qa_pe_reader {
   uint8_t *bytes; /* mutable: loader relocation patches through it */

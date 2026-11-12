@@ -28,6 +28,14 @@ static size_t cp_prefix_bytes(const char *text, size_t n) {
   return i;
 }
 
+/* TS text.length: UTF-16 units. */
+static size_t utf16_units(const char *text) {
+  size_t units = 0;
+  for (const unsigned char *p = (const unsigned char *)text; *p; p++)
+    if ((*p & 0xc0) != 0x80) units += (*p & 0xf8) == 0xf0 ? 2 : 1;
+  return units;
+}
+
 static char *dup_range(const char *first, size_t length) {
   char *out = malloc(length + 1);
   if (out == NULL) return NULL;
@@ -99,13 +107,12 @@ bool qa_ui_draw_powerup_timers(const qa_active_powerup_timer *timers,
       strcpy(joined + bytes + 1, value);
       double measured = measure_text != NULL
           ? measure_text(measure_ctx, joined, scale)
-          : (double)cp_count(joined) * 8 * scale;
+          : (double)utf16_units(joined) * 8 * scale;
       if (keep == 0 || measured <= width - 8) {
         /* `.trimStart()` on the final text. */
         const char *text = joined;
-        while (*text == ' ' || *text == '\t' || *text == '\n'
-               || *text == '\r' || *text == '\v' || *text == '\f')
-          text++;
+        for (size_t space; (space = qa_js_white_space_length(text)) > 0;)
+          text += space;
         char *owned = dup_range(text, strlen(text));
         free(joined);
         if (owned == NULL) {

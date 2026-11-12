@@ -2,7 +2,9 @@
  * a loading operation owns it. The async frame pump becomes synchronous
  * cooperative pumping (docs/PORTING.md): the operation runs to completion on
  * the caller's stack, and each qa_app_loading_next_frame call it makes runs
- * service() once, where TS resolves the pending frame after a service pass.
+ * service() once, where TS resolves the pending frame after a service pass;
+ * an operation that asked for no frame still gets the one pass TS's loop
+ * makes before the operation's completion is observed.
  * Errors raise (qa_raise): an operation failure propagates; a service failure
  * rejects that and every later next_frame of the operation with the service
  * error, and once the operation has settled the service error is raised
@@ -16,6 +18,7 @@
 typedef struct qa_app_loading_frame {
   void (*service)(void *ctx); void *service_ctx;
   bool failed; qa_caught_error failure; /* TS state.failure */
+  bool serviced; /* a service pass ran (TS's loop runs at least one before the operation settles) */
 } qa_app_loading_frame;
 /* TS nextFrame(): services the window once; raises the service failure. */
 void qa_app_loading_next_frame(qa_app_loading_frame *frame);

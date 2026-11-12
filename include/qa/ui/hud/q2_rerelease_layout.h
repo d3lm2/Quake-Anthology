@@ -10,9 +10,8 @@
  *  - measure returns qa_vec2; localize returns a borrowed string
  *    and receives the TS args array. Both share environment ctx.
  *  - The TS cell() UTF-8 truncation to 23 bytes with lossy decode
- *    is reproduced as: cut at 23 bytes, then drop a trailing
- *    incomplete UTF-8 sequence (TextDecoder would emit U+FFFD for
- *    it; only non-ASCII cells cut mid-sequence can differ).
+ *    is reproduced as: cut at 23 bytes, and a trailing incomplete
+ *    UTF-8 sequence becomes one U+FFFD, as TextDecoder emits.
  *  - Plain TS Errors and RangeErrors abort via qa_range_error.
  * GPL-2.0-or-later.
  */

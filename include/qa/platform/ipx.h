@@ -31,6 +31,7 @@ typedef struct qa_ipx_listener {
   qa_ipx_readable_fn fn;
   void *ctx;
   size_t id;
+  bool queued; /* TS queueMicrotask for this listener after an unreported fault */
 } qa_ipx_listener;
 
 typedef struct qa_native_ipx_transport {

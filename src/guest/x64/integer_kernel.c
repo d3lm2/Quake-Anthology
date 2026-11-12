@@ -633,7 +633,22 @@ typedef struct block_state {
   bool finished;
   uint32_t low_flags, high_flags;
   qa_guest_throw rethrow;
+  bool unsafe_active; /* an unsafe step's TS try block (with its register checkpoint) is open */
 } block_state;
+/* TS executeBlock: an unsafe step that throws restores its checkpoint, and the outer catch leaves IP at the step;
+ * for an ordinary error (not a guest fault) the CPU then rethrows it. */
+typedef struct block_unwind { qa_x64_integer_kernel *kernel; block_state *bs; qa_guest_throw *previous; } block_unwind;
+static void block_run_unwind(void *arg) {
+  block_unwind *unwind = arg;
+  qa_x64_integer_kernel *kernel = unwind->kernel;
+  block_state *bs = unwind->bs;
+  if (bs->unsafe_active) {
+    qa_integer_register_file_restore(&kernel->state->registers, kernel->checkpoint, sizeof kernel->checkpoint);
+    qa_processor_flags_restore_words(&kernel->state->flags, bs->low_flags, bs->high_flags);
+  }
+  kernel->state->instruction_pointer = bs->current;
+  kernel->memory->throw_ctx = unwind->previous;
+}
 
 qa_x64_integer_block_result qa_x64_integer_kernel_execute_block(
     qa_x64_integer_kernel *kernel, const qa_x64_integer_step *steps, size_t step_count, int64_t budget,
@@ -651,7 +666,10 @@ qa_x64_integer_block_result qa_x64_integer_kernel_execute_block(
   kernel->memory->throw_ctx = outer;
   qa_x64_integer_block_result result;
   memset(&result, 0, sizeof result);
+  block_unwind unwind = {kernel, bs, previous};
+  qa_cleanup unwind_node;
   if (setjmp(outer_buf) != 0) {
+    qa_cleanup_pop(&unwind_node);
     kernel->state->instruction_pointer = bs->current;
     kernel->memory->throw_ctx = previous;
     result.kind = QA_KERNEL_BLOCK_FAULT;
@@ -660,6 +678,7 @@ qa_x64_integer_block_result qa_x64_integer_kernel_execute_block(
     result.fault.buf = previous != NULL ? previous->buf : NULL;
     return result;
   }
+  qa_cleanup_push(&unwind_node, block_run_unwind, &unwind);
   /* volatile: the outer setjmp handler above must see a defined counter
    * after a longjmp rethrow out of a step (it returns without resuming). */
   for (volatile size_t step_index = 0; step_index < step_count; step_index++) {
@@ -696,11 +715,14 @@ qa_x64_integer_block_result qa_x64_integer_kernel_execute_block(
       qa_guest_throw inner_throw;
       qa_guest_throw_init(&inner_throw, &inner_buf);
       kernel->memory->throw_ctx = &inner_throw;
+      bs->unsafe_active = true;
       if (setjmp(inner_buf) == 0) {
         qa_x64_flow flow = qa_x64_integer_kernel_execute(kernel, step->integer);
+        bs->unsafe_active = false;
         kernel->memory->throw_ctx = outer;
         if (flow.kind == QA_X64_BRANCH) { bs->next = flow.target; bs->instructions++; bs->finished = true; break; }
       } else {
+        bs->unsafe_active = false;
         qa_guest_throw caught = inner_throw;
         qa_integer_register_file_restore(&kernel->state->registers, kernel->checkpoint, sizeof kernel->checkpoint);
         qa_processor_flags_restore_words(&kernel->state->flags, bs->low_flags, bs->high_flags);
@@ -797,6 +819,7 @@ qa_x64_integer_block_result qa_x64_integer_kernel_execute_block(
     bs->instructions++;
     (void)bs->finished;
   }
+  qa_cleanup_pop(&unwind_node);
   kernel->memory->throw_ctx = previous;
   if (bs->returned_early) {
     result.kind = QA_KERNEL_BLOCK_RETURN;

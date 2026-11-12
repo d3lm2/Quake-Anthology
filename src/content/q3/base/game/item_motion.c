@@ -14,13 +14,13 @@ static double game_time(double v) {
   return v;
 }
 static double item_index(qa_q3_base_product pool_product, qa_q3_base_product product, const qa_q3_base_item_definition *item) {
-  if (pool_product != product) qa_range_error("Item motion product does not match its entity pool");
+  if (pool_product != product) qa_raise("Error", 0, 0, "Item motion product does not match its entity pool");
   size_t n = 0; const qa_q3_base_item_definition *items = qa_q3_base_item_list(product, &n);
   for (size_t i = 0; i < n; i++) if (&items[i] == item) { if (i < 1) break; return (double)i; }
   qa_range_error("Launched item does not belong to the selected product table");
 }
 static void require_owned(qa_q3_entity_pool *p, qa_q3_game_entity *e) {
-  if (qa_q3_entity_pool_get(p, e->slot) != e) qa_range_error("Item motion entity does not belong to its entity pool or was replaced");
+  if (qa_q3_entity_pool_get(p, e->slot) != e) qa_raise("Error", 0, 0, "Item motion entity does not belong to its entity pool or was replaced");
 }
 static qa_vec3 collision_normal(qa_q3_base_actor_trace_result t) { qa_vec3 z = {0,0,0}; return t.contact_is_plane ? t.contact_plane.normal : z; }
 void qa_q3_bounce_item(qa_q3_game_entity *entity, qa_q3_base_actor_trace_result trace, qa_q3_item_frame_time frame, qa_q3_entity_pool *entities) {
@@ -54,7 +54,8 @@ void qa_q3_run_item(qa_q3_game_entity *entity, qa_q3_run_item_context context) {
   query.shape.mins = qa_q3_base_entity_shared_mins(&entity->r); query.shape.maxs = qa_q3_base_entity_shared_maxs(&entity->r);
   query.pass_actor = pass; query.mask = entity->clipmask != 0 ? entity->clipmask : (0x1 | 0x10000);
   qa_q3_base_actor_trace_result trace = context.world.trace_actor(context.world.ctx, query);
-  qa_q3_base_entity_shared_set_current_origin(&entity->r, trace.end);
+  /* TS vec3(trace.end...) stores binary32 components. */
+  qa_q3_base_entity_shared_set_current_origin(&entity->r, qa_math_vec3(trace.end.x, trace.end.y, trace.end.z));
   if (context.entities->options.link) context.entities->options.link(context.entities->options.ctx, entity);
   qa_q3_run_think(entity, time);
   /* The think may free the item (30-second expiry); writes to a freed record would allocate a fresh actor. */
@@ -92,7 +93,7 @@ qa_q3_game_entity *qa_q3_launch_item(qa_q3_launch_item_context context, const qa
   dropped->r.contents = (double)(int32_t)0x40000000;
   dropped->touch = qa_q3_callback_family_resolve(&context.entities->callbacks.touch, "q3.item.touch");
   qa_q3_set_origin(dropped, origin);
-  dropped->s.pos.type = QA_Q3_BASE_TR_GRAVITY; dropped->s.pos.time = time; dropped->s.pos.delta = velocity;
+  dropped->s.pos.type = QA_Q3_BASE_TR_GRAVITY; dropped->s.pos.time = time; dropped->s.pos.delta = qa_math_vec3(velocity.x, velocity.y, velocity.z);
   dropped->s.e_flags = qa_js_to_int32(dropped->s.e_flags) | EF_BOUNCE_HALF;
   qa_q3_game_entity_set_nextthink(dropped, qa_int32(time + DROPPED_ITEM_LIFETIME));
   if (is_special_team_drop(context.product, context.game_type, item)) {
@@ -105,7 +106,8 @@ qa_q3_game_entity *qa_q3_launch_item(qa_q3_launch_item_context context, const qa
 }
 qa_q3_game_entity *qa_q3_drop_item(qa_q3_drop_item_context context, qa_q3_game_entity *entity, const qa_q3_base_item_definition *item, double angle) {
   require_owned(context.launch.entities, entity);
-  qa_vec3 forward = qa_qvm_angle_vectors((qa_vec3){0, entity->s.apos.base.y + angle, entity->s.apos.base.z}).forward;
+  /* TS vec3() rounds the summed yaw to binary32 before AngleVectors. */
+  qa_vec3 forward = qa_qvm_angle_vectors(qa_math_vec3(0, entity->s.apos.base.y + angle, entity->s.apos.base.z)).forward;
   qa_vec3 horizontal = qa_scale3(forward, 150); double random = context.random(context.random_ctx);
   if (!isfinite(random) || random < 0 || random > 1) qa_range_error("Drop_Item random value must be within [0, 1]");
   double crandom = (float)(2 * (float)((float)random - 0.5));

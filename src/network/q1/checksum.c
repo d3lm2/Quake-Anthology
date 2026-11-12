@@ -64,12 +64,13 @@ static int32_t rd_i32(const uint8_t *b, size_t o) {
   return (int32_t)((uint32_t)b[o] | ((uint32_t)b[o+1]<<8) | ((uint32_t)b[o+2]<<16) | ((uint32_t)b[o+3]<<24));
 }
 int32_t qa_quake_world_map_checksum2(const uint8_t *bytes, size_t length) {
-  if (length < 124) qa_range_error("Short Quake BSP header");
-  if (rd_i32(bytes, 0) != 29) qa_range_error("QW requires BSP version 29");
+  /* TS throws plain Error for a short header, another BSP version or a bad lump. */
+  if (length < 124) qa_raise("Error", 0, 0, "Short Quake BSP header");
+  if (rd_i32(bytes, 0) != 29) qa_raise("Error", 0, 0, "QW requires BSP version 29");
   uint32_t checksum = 0;
   for (int lump = 0; lump < 15; lump++) {
     int32_t start = rd_i32(bytes, 4 + (size_t)lump * 8), len = rd_i32(bytes, 8 + (size_t)lump * 8);
-    if (start < 0 || len < 0 || (long long)start + len > (long long)length) qa_range_error("Invalid Quake BSP lump");
+    if (start < 0 || len < 0 || (long long)start + len > (long long)length) qa_raise("Error", 0, 0, "Invalid Quake BSP lump");
     if (lump == 0 || lump == 4 || lump == 5 || lump == 10) continue;
     checksum ^= qa_block_checksum(bytes + start, (size_t)len);
   }

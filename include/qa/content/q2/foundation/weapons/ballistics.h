@@ -60,6 +60,10 @@ void qa_q2w_ballistics_fire_rail(qa_q2w_ballistics *b, qa_owned_actor self, qa_q
 bool qa_q2w_ballistics_fire_hit(qa_q2w_ballistics *b, qa_q2_entity *self, qa_q2_game_services *game, qa_vec3 aim, double damage, double kick);
 /* means_of_death default (hyper ? hyperblaster : blaster): pass
  * QA_Q2W_BLASTER_DEFAULT_MOD (-1) via _default wrapper. */
+/* fire_blaster and the grenade launchers can return a projectile that was
+ * already released (a bolt that hit at once, a hand grenade that went off in
+ * the hand), as TS returns the dead entity: it only answers isLive false and
+ * stays readable until the source clock advances (see entity_services.c). */
 qa_q2_entity *qa_q2w_ballistics_fire_blaster(qa_q2w_ballistics *b, qa_owned_actor self, qa_q2_game_services *game, qa_vec3 start, qa_vec3 direction,
                                               double damage, double speed, double effects, bool hyper, double means_of_death);
 qa_q2_entity *qa_q2w_ballistics_fire_blaster_default(qa_q2w_ballistics *b, qa_owned_actor self, qa_q2_game_services *game, qa_vec3 start, qa_vec3 direction,

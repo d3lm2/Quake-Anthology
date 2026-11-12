@@ -101,13 +101,21 @@ static void item_enable_combos(void *ctx, qa_q1_player_state *player) {
   qa_q1mp_mission_pack_arsenal *arsenal = ctx;
   qa_q1mp_players_enable_combos(&arsenal->players, player);
 }
+/* TS `finally { this.charmer = previous }`: also runs when a target raises. */
+typedef struct horn_restore { qa_q1mp_mission_pack_arsenal *arsenal; bool had; qa_actor_id previous; } horn_restore;
+static void restore_horn_charmer(void *arg) {
+  const horn_restore *restore = arg;
+  restore->arsenal->has_charmer = restore->had; restore->arsenal->charmer = restore->previous;
+}
 static void item_horn(void *ctx, qa_q1_actor *item, qa_q1_player_state *player) {
   qa_q1mp_mission_pack_arsenal *arsenal = ctx;
-  const bool had = arsenal->has_charmer;
-  const qa_actor_id previous = arsenal->charmer;
+  horn_restore restore = {arsenal, arsenal->has_charmer, arsenal->charmer};
+  qa_cleanup node;
+  qa_cleanup_push(&node, restore_horn_charmer, &restore);
   arsenal->has_charmer = true; arsenal->charmer = player->actor.id;
   qa_q1_use_targets(arsenal->game, item, &player->actor.id);
-  arsenal->has_charmer = had; arsenal->charmer = previous; /* TS finally */
+  qa_cleanup_pop(&node);
+  restore_horn_charmer(&restore);
 }
 void qa_q1mp_mission_pack_arsenal_init(qa_q1mp_mission_pack_arsenal *arsenal, qa_q1_services *game, qa_q1mp_pack pack) {
   memset(arsenal, 0, sizeof *arsenal);

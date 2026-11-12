@@ -4,6 +4,7 @@
 #include "qa/content/q2/foundation/fields.h"
 #include "qa/content/q2/rerelease/debug_shapes.h"
 #include "qa/content/q2/rerelease/spawns.h"
+#include "qa/foundation/support.h"
 #include "rr_internal.h"
 #include <math.h>
 #include <stdio.h>
@@ -121,8 +122,10 @@ bool qa_q2_create_rerelease_module(qa_q2_rerelease_module *m, qa_q2_rerelease_mo
 }
 static void free_capture_scratch(qa_q2_rerelease_module *m) {
   free(m->cp_bars); free(m->cp_ht); free(m->cp_picked); free(m->cp_sounds); free(m->cp_lights);
-  if (m->cp_slot_arrays) { for (size_t i = 0; i < m->picked_count; i++) free(m->cp_slot_arrays[i]); free(m->cp_slot_arrays); }
-  if (m->cp_levels) qa_q2_rerelease_unit_report_free(m->cp_levels, m->base.campaign.level_count);
+  /* The counts of the capture, not the live counts: both maps change between captures. */
+  if (m->cp_slot_arrays) { for (size_t i = 0; i < m->cp_slot_array_count; i++) free(m->cp_slot_arrays[i]); free(m->cp_slot_arrays); }
+  if (m->cp_levels) qa_q2_rerelease_unit_report_free(m->cp_levels, m->cp_level_count);
+  m->cp_slot_array_count = 0; m->cp_level_count = 0;
   free(m->cp_visited);
   m->cp_bars = NULL; m->cp_ht = NULL; m->cp_picked = NULL; m->cp_slot_arrays = NULL;
   m->cp_sounds = NULL; m->cp_lights = NULL; m->cp_levels = NULL; m->cp_visited = NULL;
@@ -228,6 +231,8 @@ qa_q2_rerelease_module_checkpoint qa_q2_rerelease_module_capture(qa_q2_rerelease
   for (size_t i = 0; i < m->base.campaign.visited_count; i++) m->cp_visited[i] = m->base.campaign.visited_maps[i];
   cp.campaign.visited_maps = m->cp_visited; cp.campaign.visited_count = m->base.campaign.visited_count;
   m->cp_levels = m->base.campaign.level_count ? calloc(m->base.campaign.level_count, sizeof *m->cp_levels) : NULL;
+  if (m->base.campaign.level_count && !m->cp_levels) qa_range_error("Out of memory");
+  m->cp_level_count = m->base.campaign.level_count;
   for (size_t i = 0; i < m->base.campaign.level_count; i++) {
     m->cp_levels[i] = m->base.campaign.levels[i];
     m->cp_levels[i].map = qa_q2rr_dup(m->base.campaign.levels[i].map);
@@ -252,10 +257,13 @@ qa_q2_rerelease_module_checkpoint qa_q2_rerelease_module_capture(qa_q2_rerelease
   cp.health_targets = m->cp_ht; cp.health_target_count = m->base.ht_count;
   m->cp_picked = m->picked_count ? calloc(m->picked_count, sizeof *m->cp_picked) : NULL;
   m->cp_slot_arrays = m->picked_count ? calloc(m->picked_count, sizeof(double *)) : NULL;
+  if (m->picked_count && (!m->cp_picked || !m->cp_slot_arrays)) qa_range_error("Out of memory");
+  m->cp_slot_array_count = m->picked_count;
   for (size_t i = 0; i < m->picked_count; i++) {
     m->cp_picked[i].actor = saved_of(m->picked_up_by[i].actor);
     if (m->picked_up_by[i].count) {
       m->cp_slot_arrays[i] = malloc(m->picked_up_by[i].count * sizeof(double));
+      if (!m->cp_slot_arrays[i]) qa_range_error("Out of memory");
       memcpy(m->cp_slot_arrays[i], m->picked_up_by[i].slots, m->picked_up_by[i].count * sizeof(double));
     }
     m->cp_picked[i].slots = m->cp_slot_arrays[i]; m->cp_picked[i].slot_count = m->picked_up_by[i].count;
@@ -305,6 +313,15 @@ void qa_q2_rerelease_module_restore(qa_q2_rerelease_module *m, qa_q2_game_servic
   for (size_t i = 0; i < camp->level_count; i++) { free(camp->levels[i].map); free(camp->levels[i].name); }
   camp->level_count = 0;
   for (size_t i = 0; i < cp.campaign.level_count; i++) {
+    /* TS levels.set(entry.map, ...): a repeated map replaces the entry at its first position. */
+    qa_q2_rerelease_level_entry *known = qa_q2_rerelease_campaign_get_level(camp, cp.campaign.levels[i].map);
+    if (known) {
+      char *map = known->map, *name = qa_q2rr_dup(cp.campaign.levels[i].name);
+      free(known->name);
+      *known = cp.campaign.levels[i];
+      known->map = map; known->name = name;
+      continue;
+    }
     if (camp->level_count == camp->level_cap) { size_t nc = camp->level_cap ? camp->level_cap * 2 : 8; void *q = realloc(camp->levels, nc * sizeof *camp->levels); if (!q) break; camp->levels = q; camp->level_cap = nc; }
     camp->levels[camp->level_count] = cp.campaign.levels[i];
     camp->levels[camp->level_count].map = qa_q2rr_dup(cp.campaign.levels[i].map);
@@ -335,6 +352,7 @@ void qa_q2_rerelease_module_restore(qa_q2_rerelease_module *m, qa_q2_game_servic
                               v));
   for (size_t i = 0; i < cp.picked_count; i++) {
     qa_q2rr_pickup_entry *e = picked_ensure(m, qa_q2_restore_actor(g, cp.picked_up_by[i].actor).id);
+    if (e) e->count = 0; /* TS pickedUpBy.set(actor, new Set(slots)) replaces */
     if (e) for (size_t j = 0; j < cp.picked_up_by[i].slot_count; j++) slots_add(e, cp.picked_up_by[i].slots[j]);
   }
   qa_q2rr_sound_time_clear(&m->triggers);
@@ -408,7 +426,7 @@ void qa_q2_rerelease_module_admitted(qa_q2_rerelease_module *m, qa_q2_entity *e,
       if (!other || !source || other->spectator || other->noclip) continue;
       size_t n = 0; const qa_inventory_entry *entries = qa_shared_inventory_table_entries(g->host->inventory, pls[i], &n);
       qa_inventory_entry *copy = NULL;
-      if (n) { copy = malloc(n * sizeof *copy); memcpy(copy, entries, n * sizeof *copy); }
+      if (n) { copy = malloc(n * sizeof *copy); if (!copy) qa_range_error("Out of memory"); memcpy(copy, entries, n * sizeof *copy); }
       for (size_t j = 0; j < n; j++) qa_shared_inventory_table_configure(g->host->inventory, e->actor, copy[j], NULL, NULL);
       free(copy);
       e->power_cubes = source->power_cubes;
@@ -463,10 +481,9 @@ void qa_q2_rerelease_module_after_pickup(qa_q2_rerelease_module *m, qa_q2_entity
   (void)g; (void)player; (void)taken;
   const char *msg = msg_get(m, e->actor.id);
   if (msg) {
-    /* restore borrowed message: leak-free copy retained in map until delete */
-    static char ring[16][512]; static size_t ri;
-    char *slot = ring[ri++ % 16]; snprintf(slot, 512, "%s", msg);
-    e->message = slot;
+    /* TS puts the saved string back. The saved copy is released with its map entry,
+     * so the entity gets the interned text: any length, valid as long as the entity. */
+    e->message = qa_q2_intern(msg);
     msg_delete(m, e->actor.id);
   }
 }
@@ -574,7 +591,7 @@ void qa_q2_rerelease_module_use_compass(qa_q2_rerelease_module *m, qa_actor_id a
   qa_q2rr_player_extra_state *extra = qa_q2_rerelease_players_get_extra(m->base.players, a);
   qa_q2rr_poi *poi = &m->base.poi;
   extra->help_location = poi->origin;
-  snprintf(extra->help_image, sizeof extra->help_image, "%s", poi->image ? poi->image : "");
+  qa_q2rr_set_text(&extra->help_image, poi->image ? poi->image : "");
   qa_q2rr_navigation path = m->base.hooks.navigation(m->base.hooks.ctx, body.origin, poi->origin, &a);
   if (path.kind && strcmp(path.kind, "path") == 0 && path.point_count != 0) {
     qa_vec3 points[160]; size_t pn = path.point_count < 128 ? path.point_count : 128;
@@ -612,9 +629,12 @@ void qa_q2_rerelease_module_use_compass(qa_q2_rerelease_module *m, qa_actor_id a
 }
 void qa_q2_rerelease_module_compass_update(qa_q2_rerelease_module *m, qa_actor_id a, qa_q2_game_services *g, bool first) {
   qa_q2rr_player_extra_state *extra = qa_q2_rerelease_players_get_extra(m->base.players, a);
-  size_t idx = extra->help_index >= 0 ? (size_t)extra->help_index : 0;
+  /* helpPoints[helpIndex]: an index that is not a whole number >= 0 reads undefined. */
+  bool indexed = extra->help_index >= 0 && extra->help_index == floor(extra->help_index) &&
+                 extra->help_index < (double)extra->help_point_count;
+  size_t idx = indexed ? (size_t)extra->help_index : 0;
   qa_body_state_result br = qa_shared_body_table_read(g->host->bodies, a);
-  if (idx >= extra->help_point_count || !br.has_value || extra->help_draw_time >= rr_now(g)) return;
+  if (!indexed || !br.has_value || extra->help_draw_time >= rr_now(g)) return;
   qa_vec3 point = extra->help_points[idx];
   if (qa_q2_length(qa_q2_subtract(point, br.value.origin)) > 4096 || !g->host->in_phs(g->host->ctx, br.value.origin, point)) {
     free(extra->help_points); extra->help_points = NULL; extra->help_point_count = extra->help_point_cap = 0;

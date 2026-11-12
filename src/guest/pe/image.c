@@ -4,16 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void *xmalloc(size_t size) {
-  void *p = malloc(size == 0 ? 1 : size);
-  if (p == NULL) qa_pe_error(QA_PE_STAGE_HEADERS, "out of memory");
-  return p;
-}
-static void *xrealloc(void *p, size_t size) {
-  void *next = realloc(p, size == 0 ? 1 : size);
-  if (next == NULL) qa_pe_error(QA_PE_STAGE_HEADERS, "out of memory");
-  return next;
-}
+static void *xmalloc(size_t size) { return qa_pe_xmalloc(size); }
+static void *xrealloc(void *p, size_t size) { return qa_pe_xrealloc(p, size); }
 
 char *qa_pe_own_string(qa_pe_owned_strings *pool, char *text) {
   if (pool->count == pool->cap) {
@@ -129,6 +121,8 @@ char *qa_pe_image_reader_text(const qa_pe_image_reader *reader, uint32_t rva, ui
   uint32_t bound = end;
   uint32_t section_bound = found == NULL ? reader->pe->header_size : found->rva + found->mapped_size;
   if (section_bound < bound) bound = section_bound;
+  if (bound < rva) /* TS passes the negative length on to checkedRange */
+    qa_pe_error(reader->stage, "range %u+-%u exceeds %zu", rva, rva - bound, reader->len);
   return qa_pe_reader_text(&reader->reader, rva, bound - rva);
 }
 uint8_t *qa_pe_image_reader_copy(const qa_pe_image_reader *reader, uint32_t rva, size_t size) {

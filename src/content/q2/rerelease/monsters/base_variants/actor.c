@@ -4,7 +4,11 @@
 #include "qa/network/common/js_number.h"
 #include "qa/foundation/js.h"
 
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+#include "qa/foundation/support.h"
 
 #include "qa/content/q2/base/monsters/actor.h"
 #include "qa/content/q2/foundation/fields.h"
@@ -30,6 +34,25 @@ static qa_vec3 movedir_of(qa_vec3 angles) {
   return qa_math_angle_vectors_rule(q2rm_v3(angles.x, angles.y, 0), QA_ANGLE_RULE_NATIVE).forward;
 }
 static const char *entity_text(const char *value) { return value ? value : ""; }
+#if defined(__GNUC__)
+__attribute__((format(printf, 2, 3)))
+#endif
+static void actor_diagnosticf(qa_q2_game_services *game, const char *format, ...) {
+  va_list args, copy;
+  va_start(args, format);
+  va_copy(copy, args);
+  int length = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *message = length < 0 ? NULL : malloc((size_t)length + 1);
+  if (!message) { va_end(args); qa_raise("Error", 0, 0, "Out of memory formatting an actor diagnostic"); }
+  (void)vsnprintf(message, (size_t)length + 1, format, args);
+  va_end(args);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, message);
+  game->host->diagnostic(game->host->ctx, message);
+  qa_cleanup_pop(&guard);
+  free(message);
+}
 
 static void dead_fn(void *ctx, qa_q2m_context *c) {
   (void)ctx;
@@ -59,9 +82,7 @@ static void use_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services *game,
     context->state->has_move_target = false;
   }
   if (!target || strcmp(target->classname, "target_actor") != 0) {
-    char message[256];
-    (void)snprintf(message, sizeof message, "misc_actor has bad target %s", entity_text(entity->target));
-    game->host->diagnostic(game->host->ctx, message);
+    actor_diagnosticf(game, "misc_actor has bad target %s", entity_text(entity->target)); /* authored text of any length */
     entity->target = "";
     context->state->pause_time = hold_forever;
     context->stand(context->impl_ctx, context);
@@ -95,8 +116,14 @@ static void touch_fn(void *ctx, qa_q2_entity *self, qa_q2_game_services *game, q
     size_t count = 0;
     const qa_actor_id *players = game->host->players(game->host->ctx, &count);
     for (size_t i = 0; i < count; i++) {
-      char text[512];
-      (void)snprintf(text, sizeof text, "%s: %s\n", qa_q2bm_actor_name(actor, game), self->message);
+      /* `${actorName}: ${self.message}\n`: the message is authored text of any length. */
+      const char *name = qa_q2bm_actor_name(actor, game);
+      size_t size = strlen(name) + strlen(self->message) + 4;
+      char *text = malloc(size);
+      if (!text) qa_raise("Error", 0, 0, "Out of memory printing a target_actor message");
+      (void)snprintf(text, size, "%s: %s\n", name, self->message);
+      qa_cleanup guard;
+      qa_cleanup_push(&guard, free, text);
       qa_q2_presentation_event event;
       memset(&event, 0, sizeof event);
       event.kind = "print";
@@ -104,6 +131,8 @@ static void touch_fn(void *ctx, qa_q2_entity *self, qa_q2_game_services *game, q
       event.level = "chat";
       event.text = text;
       game->host->emit(game->host->ctx, event);
+      qa_cleanup_pop(&guard);
+      free(text);
     }
   }
   if (q2rm_has(self->spawnflags, 1)) {
@@ -267,13 +296,13 @@ static bool targets_spawn_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_service
   change.bounds.max = q2rm_v3(8, 8, 8);
   q2rm_move_body(game, entity, change, false, false);
   if (q2rm_has(entity->spawnflags, 1)) {
-    if (entity->speed == 0) entity->speed = 200;
+    entity->speed = q2rm_else(entity->speed, 200);
     qa_vec3 angles = q2rm_body(game, entity).angles;
     qa_vec3 movedir_angles = angles;
-    movedir_angles.y = angles.y != 0 ? angles.y : 360;
+    movedir_angles.y = q2rm_else(angles.y, 360);
     entity->movedir = movedir_of(movedir_angles);
     double height = qa_q2_number_field(&entity->spawn, "height", 0);
-    entity->movedir.z = height != 0 ? height : 200;
+    entity->movedir.z = q2rm_else(height, 200);
     memset(&change, 0, sizeof change);
     change.has_angles = true; change.angles = q2rm_zero();
     q2rm_move_body(game, entity, change, false, false);

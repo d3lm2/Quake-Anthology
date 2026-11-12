@@ -46,17 +46,23 @@ static qa_ui_menu results_factory(void *ctx) {
   if (!has) r->title = xdup("Match complete");
   else {
     char *score = num(result.score), *opp = num(result.opponent);
-    snprintf(buf, sizeof buf, "%s: %s (%s - %s)", result.won ? "Victory" : "Defeat", result.title, score, opp);
+    size_t size = strlen(result.title) + strlen(score) + strlen(opp) + 16;
+    r->title = malloc(size);
+    if (r->title == NULL) { free(score); free(opp); qa_range_error("Out of memory"); }
+    snprintf(r->title, size, "%s: %s (%s - %s)", result.won ? "Victory" : "Defeat", result.title, score, opp);
     free(score); free(opp);
-    r->title = xdup(buf);
   }
   size_t n = 0;
   /* score row */
   {
     char *points = has ? num(result.points) : NULL;
-    snprintf(buf, sizeof buf, "Score %s \xc2\xb7 Time %s", points ? points : "", has ? result.time : "");
+    if (has) {
+      size_t size = strlen(points) + strlen(result.time) + 16;
+      r->labels[n] = malloc(size);
+      if (r->labels[n] == NULL) { free(points); qa_range_error("Out of memory"); }
+      snprintf(r->labels[n], size, "Score %s \xc2\xb7 Time %s", points, result.time);
+    } else r->labels[n] = xdup("");
     free(points);
-    r->labels[n] = xdup(has ? buf : "");
     r->ids[n] = xdup("ui:team-arena:score");
     r->actx_storage[n] = (actx){r, ACT_NONE};
     r->controls[n] = (qa_ui_control){0};

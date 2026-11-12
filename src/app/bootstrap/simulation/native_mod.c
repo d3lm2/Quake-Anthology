@@ -9,6 +9,7 @@
 #include "qa/app/bootstrap/simulation/mod_callbacks.h"
 #include "qa/app/bootstrap/simulation/native_mod_host.h"
 #include "qa/compat/q2/native_mod_provider.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/support.h"
 #include "qa/guest/pe/format.h"
 #include "qa/network/common/session.h"
@@ -199,8 +200,9 @@ static uint8_t *read_localization(void *ctx, const char *path, size_t *out_lengt
 static const char *mounted_script(void *ctx, const char *name) {
   prepared_ctx *p = ctx; qa_content_opened_resource resource;
   if (!qa_content_mounted_open(p->mounts, name, NULL, NULL, &resource)) return NULL;
-  char *text = malloc(resource.byte_length + 1); if (text == NULL) qa_range_error("Out of memory");
-  memcpy(text, resource.bytes, resource.byte_length); text[resource.byte_length] = '\0'; free(resource.bytes);
+  /* new TextDecoder().decode(file.bytes): a leading byte order mark dropped, invalid sequences U+FFFD */
+  char *text = qa_text_decoder_decode(resource.bytes, resource.byte_length, NULL); free(resource.bytes);
+  if (text == NULL) qa_range_error("Out of memory");
   char **grown = realloc(p->scripts, (p->script_count + 1) * sizeof *grown); if (grown == NULL) qa_range_error("Out of memory");
   p->scripts = grown; p->scripts[p->script_count++] = text; return text;
 }
@@ -208,6 +210,7 @@ static char *mounted_localize(void *ctx, const char *key, const char *const *arg
   prepared_ctx *p = ctx; char *text = qa_app_q2_localized_text(&p->localization, key, arguments, count); if (text == NULL) qa_range_error("Out of memory");
   return text;
 }
+static void localization_cleanup(void *table) { qa_localization_table_destroy(table); }
 qa_prepared_mod qa_app_sim_prepare_mounted_native_mod(qa_mod_description description, const qa_native_mod_declaration *declaration,
                                                       qa_content_digest declaration_digest, qa_content_mounted *mounts) {
   qa_content_opened_resource resource;
@@ -216,12 +219,16 @@ qa_prepared_mod qa_app_sim_prepare_mounted_native_mod(qa_mod_description descrip
     if (opened) free(resource.bytes);
     qa_raise("Error", 0, 0, "Selected native mod differs from its resolved artifact");
   }
+  /* A refusal below releases the program bytes and the loaded localization. */
+  qa_cleanup bytes_node; qa_cleanup_push(&bytes_node, free, resource.bytes);
   qa_localization_table localization;
   qa_load_server_localization_resources("english", read_localization, mounts, QA_LOC_Q2_RERELEASE, &localization);
+  qa_cleanup localization_node; qa_cleanup_push(&localization_node, localization_cleanup, &localization);
   qa_app_sim_prepare_native_mod_options options; memset(&options, 0, sizeof options);
   options.description = description; options.declaration = declaration; options.declaration_digest = declaration_digest;
   options.program = resource.bytes; options.program_length = resource.byte_length; options.artifact = resource.reference;
   qa_prepared_mod prepared = qa_app_sim_prepare_native_mod(&options);
+  qa_cleanup_pop(&localization_node); qa_cleanup_pop(&bytes_node);
   free(resource.bytes);
   prepared_ctx *p = prepared.ctx;
   p->mounts = mounts; p->localization = localization; p->has_localization = true;

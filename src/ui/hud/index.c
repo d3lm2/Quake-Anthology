@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "qa/foundation/event_ring.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/render/scene/view.h"
@@ -47,8 +48,16 @@ static size_t codepoint_prefix_bytes(const char *text, size_t count) {
   while (*p != '\0' && (*p & 0xC0) == 0x80) p++;
   return (size_t)(p - (const unsigned char *)text);
 }
-static double min_d(double a, double b) { return a < b ? a : b; }
-static double max_d(double a, double b) { return a > b ? a : b; }
+/* Math.min / Math.max: NaN propagates. */
+static double min_d(double a, double b) { return qa_js_min(a, b); }
+static double max_d(double a, double b) { return qa_js_max(a, b); }
+/* TS text.length: UTF-16 units of UTF-8 text. */
+static size_t utf16_units(const char *text) {
+  size_t units = 0;
+  for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++)
+    if ((*p & 0xC0) != 0x80) units += (*p & 0xF8) == 0xF0 ? 2 : 1;
+  return units;
+}
 
 void qa_ui_hud_rects_free(qa_ui_hud_rects *result) {
   if (result == NULL) return;
@@ -201,7 +210,7 @@ static bool time_alive(qa_source_time starts, qa_source_time duration,
 }
 static void require_seat(const qa_seat_hud_messages *messages, qa_seat_id seat) {
   if (!qa_same_seat(seat, messages->seat))
-    qa_range_error("HUD message belongs to another seat");
+    qa_raise("Error", 0, 0, "HUD message belongs to another seat");
 }
 static void free_center_text(const void *record, int64_t id, void *ctx) {
   (void)id;
@@ -593,10 +602,11 @@ static const char *hud_localize(hud_draw_ctx *h, const char *text) {
   const char *value = h->options->localize(h->options->localize_ctx, text);
   return value != NULL ? value : "";
 }
+/* The vital measure: options.measureText ?? text.length * 8 * scale. */
 static double hud_measure(hud_draw_ctx *h, const char *text, double scale) {
   if (h->options->measure_text != NULL)
     return h->options->measure_text(h->options->measure_ctx, text, scale);
-  return (double)codepoints(text) * 8 * scale;
+  return (double)utf16_units(text) * 8 * scale;
 }
 /* TS text() helper (localizes). */
 static void hud_text(hud_draw_ctx *h, const char *value, double x, double y,
@@ -629,7 +639,7 @@ bool qa_ui_draw_common_hud(qa_ui_draw_context context,
   memset(out, 0, sizeof *out);
   if (!qa_same_seat(data->seat, context.binding.seat) ||
       !qa_same_seat(data->seat, qa_seat_hud_messages_get_seat(options->messages)))
-    qa_range_error("HUD frame belongs to another seat");
+    qa_raise("Error", 0, 0, "HUD frame belongs to another seat");
   if (!data->visible) return true;
   qa_ui_preference_values preferences = options->preferences;
   qa_ui_skin skin = options->skin;
@@ -767,7 +777,7 @@ bool qa_ui_draw_common_hud(qa_ui_draw_context context,
           double unit = options->measure_text != NULL
                             ? options->measure_text(options->measure_ctx, line,
                                                     1)
-                            : (double)codepoints(line) * 8;
+                            : (double)utf16_units(line) * 8;
           row_scale = min_d(requested_scale, available / max_d(1, unit));
         }
         size_t chars = codepoints(line);
@@ -778,7 +788,7 @@ bool qa_ui_draw_common_hud(qa_ui_draw_context context,
           double measured = options->measure_text != NULL
                                 ? options->measure_text(options->measure_ctx,
                                                         shown, row_scale)
-                                : (double)codepoints(shown) * 8 * row_scale;
+                                : (double)utf16_units(shown) * 8 * row_scale;
           if (measured <= available) break;
           chars--;
         }
@@ -884,10 +894,11 @@ bool qa_ui_draw_common_hud(qa_ui_draw_context context,
       double per_character =
           print->has_character_milliseconds ? print->character_milliseconds
                                             : 125;
-      double shown_count = floor(elapsed / per_character);
-      size_t chars = shown_count > 0 ? (size_t)shown_count : 0;
+      /* slice(0, Math.max(0, floor(elapsed / ms))): NaN is 0, Infinity all. */
+      double shown_count = max_d(0, floor(elapsed / per_character));
       size_t total_chars = codepoints(print->text);
-      if (chars > total_chars) chars = total_chars;
+      size_t chars = !(shown_count > 0) ? 0
+        : shown_count >= (double)total_chars ? total_chars : (size_t)shown_count;
       value = xdup_range(print->text,
                          codepoint_prefix_bytes(print->text, chars));
     }
@@ -930,8 +941,8 @@ bool qa_ui_draw_common_hud(qa_ui_draw_context context,
           -(delta.x * axis1.x + delta.y * axis1.y + delta.z * axis1.z);
       double vertical =
           delta.x * axis0.x + delta.y * axis0.y + delta.z * axis0.z;
-      double length = hypot(horizontal, vertical);
-      if (length == 0) length = 1;
+      double length = qa_js_hypot2(horizontal, vertical);
+      if (length == 0 || isnan(length)) length = 1; /* Math.hypot(...) || 1 */
       qa_vec4 tint;
       tint.x = damage->is_direction ? damage->color.x : 1;
       tint.y = damage->is_direction ? damage->color.y : 0.15;
@@ -980,15 +991,16 @@ bool qa_ui_draw_common_hud(qa_ui_draw_context context,
         break;
       }
     double selected = selected_index > 0 ? (double)selected_index : 0;
-    double rows_d = floor(270 / h.line_height);
-    if (rows_d < 1) rows_d = 1;
-    double start_d = min_d((double)data->inventory_count - rows_d,
-                           selected - floor(rows_d / 2));
-    if (start_d < 0) start_d = 0;
-    size_t start = (size_t)start_d;
-    size_t rows = (size_t)rows_d;
-    size_t end = start + rows;
-    if (end > data->inventory_count) end = data->inventory_count;
+    double rows_d = max_d(1, floor(270 / h.line_height));
+    double start_d = max_d(0, min_d((double)data->inventory_count - rows_d,
+                                    selected - floor(rows_d / 2)));
+    /* slice(start, start + rows): NaN bounds are 0; Infinity runs to the end. */
+    double count_d = (double)data->inventory_count;
+    double end_d = start_d + rows_d;
+    size_t start = !(start_d > 0) ? 0 : start_d >= count_d ? data->inventory_count
+                                                         : (size_t)start_d;
+    size_t end = !(end_d > 0) ? 0 : end_d >= count_d ? data->inventory_count
+                                                     : (size_t)end_d;
     for (size_t i = start; i < end; i++) {
       const qa_ui_hud_inventory_item *item = &data->inventory[i];
       double y = 114 + (double)(i - start) * h.line_height;
@@ -1135,11 +1147,9 @@ bool qa_ui_draw_common_hud(qa_ui_draw_context context,
   clip.has_clip_rect = true;
   if (!push_result(out, clip, &result_capacity)) s.ok = false;
   double timer_bottom = area.y + area.height - 42;
-  for (size_t i = 0; i < status.count; i++) {
-    double candidate = status.transform.y +
-                       status.rects[i].y * status.transform.scale - 4;
-    if (candidate < timer_bottom) timer_bottom = candidate;
-  }
+  for (size_t i = 0; i < status.count; i++)
+    timer_bottom = min_d(timer_bottom, status.transform.y +
+                                         status.rects[i].y * status.transform.scale - 4);
   qa_ui_skin powerup_skin = skin;
   powerup_skin.colors.text = h.color;
   powerup_skin.colors.panel = h.background;
@@ -1224,8 +1234,8 @@ bool qa_ui_draw_common_hud(qa_ui_draw_context context,
       }
       double width = point->width * transform.scale;
       double height = point->height * transform.scale;
-      double distance = hypot(x - viewport.x - viewport.width / 2,
-                              y - viewport.y - viewport.height / 2);
+      double distance = qa_js_hypot2(x - viewport.x - viewport.width / 2,
+                                     y - viewport.y - viewport.height / 2);
       qa_vec4 color = point->color;
       color.w = point->color.w *
                 (point->hide_on_aim

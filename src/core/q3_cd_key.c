@@ -5,9 +5,7 @@
 #include <string.h>
 
 #include "qa/foundation/support.h"
-
-/* CvarFlag.Archive from cvars/index.ts (not yet ported). */
-#define QA_CVAR_FLAG_ARCHIVE 1
+#include "qa/core/cvars/index.h"
 
 const char *qa_q3_key_build_name(qa_q3_key_build build) {
   return build == QA_Q3_KEY_BUILD_CLIENT ? "client" : "dedicated";

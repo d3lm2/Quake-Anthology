@@ -2,6 +2,7 @@
 #include "qa/platform/freetype.h"
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -169,6 +170,13 @@ static FT_GlyphSlot load_glyph(qa_freetype_font_library *library,
   return slot;
 }
 
+/* TS freeTypeMetric on LP64: a long outside int32 is a RangeError. */
+static int64_t source_metric(FT_Pos value) {
+  if ((int64_t)value < -2147483648LL || (int64_t)value > 2147483647LL)
+    qa_range_error("FreeType metric exceeds source int32");
+  return (int64_t)value;
+}
+
 static int64_t floor_div64(int64_t value) {
   return value >= 0 ? value / 64 : -((-value + 63) / 64);
 }
@@ -188,10 +196,12 @@ bool qa_freetype_render_glyph(qa_freetype_font_library *library,
     emit(print, print_ctx, "Non-outline fonts are not supported\n");
     return false;
   }
-  int64_t width26 = (int64_t)slot->metrics.width;
-  int64_t height26 = (int64_t)slot->metrics.height;
-  int64_t bearing_x = (int64_t)slot->metrics.horiBearingX;
-  int64_t bearing_y = (int64_t)slot->metrics.horiBearingY;
+  /* TS metric(): freeTypeMetric over the LP64 longs, each refused past int32
+   * in read order. */
+  int64_t width26 = source_metric(slot->metrics.width);
+  int64_t height26 = source_metric(slot->metrics.height);
+  int64_t bearing_x = source_metric(slot->metrics.horiBearingX);
+  int64_t bearing_y = source_metric(slot->metrics.horiBearingY);
   int64_t left = floor_div64(bearing_x) * 64;
   int64_t right = ceil_div64(bearing_x + width26) * 64;
   int64_t top = ceil_div64(bearing_y) * 64;
@@ -207,6 +217,8 @@ bool qa_freetype_render_glyph(qa_freetype_font_library *library,
   size_t alloc = length == 0 ? 1u : (size_t)length;
   uint8_t *pixels = (uint8_t *)calloc(alloc, 1);
   if (pixels == NULL) return false;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, pixels);
   FT_Bitmap bitmap;
   memset(&bitmap, 0, sizeof bitmap);
   bitmap.rows = (unsigned int)height;
@@ -221,16 +233,19 @@ bool qa_freetype_render_glyph(qa_freetype_font_library *library,
                        : FT_Outline_Get_Bitmap((FT_Library)library->handle,
                                                &slot->outline, &bitmap);
   if (error != 0) {
+    qa_cleanup_pop(&guard);
     free(pixels);
     emitf(print, print_ctx, "FT_Outline_Get_Bitmap failed (%d).\n", (int)error);
     return false;
   }
+  int64_t advance = source_metric(slot->metrics.horiAdvance);
+  qa_cleanup_pop(&guard);
   out->width = width;
   out->height = height;
   out->pitch = pitch;
   out->top = floor_div64(bearing_y) + 1;
   out->bottom = bottom;
-  out->x_skip = floor_div64((int64_t)slot->metrics.horiAdvance) + 1;
+  out->x_skip = floor_div64(advance) + 1;
   out->pixels = pixels;
   out->pixel_length = (size_t)length;
   return true;
@@ -256,12 +271,22 @@ bool qa_freetype_render_bitmap(qa_freetype_font_library *library,
   int64_t length = qa_freetype_bitmap_length(width, height, native_pitch, pixel_mode);
   uint8_t *pixels = (uint8_t *)malloc(length == 0 ? 1u : (size_t)length);
   if (pixels == NULL) return false;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, pixels);
   if (length != 0) {
-    const uint8_t *start = slot->bitmap.buffer;
-    if (native_pitch < 0) start += (ptrdiff_t)((height - 1) * native_pitch);
-    memcpy(pixels, start, (size_t)length);
+    /* TS copy(): the start address is checked before memcpy. */
+    uintptr_t start = (uintptr_t)slot->bitmap.buffer;
+    if (native_pitch < 0) start += (uintptr_t)((height - 1) * native_pitch);
+    if (slot->bitmap.buffer == NULL || (intptr_t)start <= 0 ||
+        start + (uintptr_t)length < start)
+      qa_range_error("Invalid FreeType native memory range");
+    memcpy(pixels, (const uint8_t *)start, (size_t)length);
     qa_normalize_freetype_bitmap_rows(pixels, (size_t)length, height, native_pitch);
   }
+  /* The object literal reads left/top, then the two advance metrics. */
+  int64_t advance_x = source_metric(slot->advance.x);
+  int64_t advance_y = source_metric(slot->advance.y);
+  qa_cleanup_pop(&guard);
   out->width = width;
   out->height = height;
   out->pitch = pitch;
@@ -270,8 +295,8 @@ bool qa_freetype_render_bitmap(qa_freetype_font_library *library,
   out->num_grays = (int64_t)slot->bitmap.num_grays;
   out->left = (int64_t)slot->bitmap_left;
   out->top = (int64_t)slot->bitmap_top;
-  out->advance_x26 = (int64_t)slot->advance.x;
-  out->advance_y26 = (int64_t)slot->advance.y;
+  out->advance_x26 = advance_x;
+  out->advance_y26 = advance_y;
   out->pixels = pixels;
   out->pixel_length = (size_t)length;
   return true;
@@ -287,7 +312,8 @@ void qa_freetype_release_face(qa_freetype_font_library *library,
   record->bytes = NULL;
   if (library->face_count != 0) library->face_count--;
   if (error != 0)
-    qa_error("FT_Done_Face failed with FreeType error %d", (int)error);
+    qa_raise("FreeTypeError", (int)error, 0,
+             "FT_Done_Face failed with FreeType error %d", (int)error);
 }
 
 bool qa_freetype_font_library_close(qa_freetype_font_library *library) {

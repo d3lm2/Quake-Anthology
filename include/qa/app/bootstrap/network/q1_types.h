@@ -36,6 +36,7 @@ typedef struct qa_app_q1_server_host {
   qa_app_q1_game_state (*game_state)(void *ctx, qa_app_q1_player player);
   const void *const *(*spawn)(void *ctx, qa_app_q1_player player, size_t *out_count);
   qa_app_q1_frame (*frame)(void *ctx, qa_app_q1_player player, const void *output);
+  /* A qa_actor_command borrowed for the call: the network copies it into its queue. */
   const void *(*input)(void *ctx, qa_app_q1_player player, const qa_q1_user_command *command, double sequence);
   void (*command)(void *ctx, qa_app_q1_player player, const char *name, const char *const *args, size_t count);
   void (*observe)(void *ctx, const void *output, const void *const *events, size_t count);

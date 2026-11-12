@@ -14,10 +14,11 @@ struct qa_app_source_finale {
   qa_app_finale_host host;
   state_t *state;
   bool prepared;
+  /* TS prepared: the assets of the last completed prepare (kept across a new finale until it prepares). */
   double banner_width, banner_height;
+  char *prepared_content;
   char *message;
   double revision;
-  char **loaded; size_t loaded_count, loaded_cap;
 };
 static char *dup(const char *s) { size_t n = strlen(s) + 1; char *p = malloc(n); if (p) memcpy(p, s, n); return p; }
 static bool eq(const char *a, const char *b) { return a && b && strcmp(a, b) == 0; }
@@ -33,8 +34,7 @@ void qa_app_source_finale_destroy(qa_app_source_finale *finale) {
   if (!finale) return;
   state_free(finale->state);
   free(finale->message);
-  for (size_t i = 0; i < finale->loaded_count; i++) free(finale->loaded[i]);
-  free(finale->loaded);
+  free(finale->prepared_content);
   free(finale);
 }
 bool qa_app_source_finale_active(const qa_app_source_finale *finale) { return finale->state != NULL; }
@@ -47,7 +47,6 @@ static void finale_begin(qa_app_source_finale *finale, const qa_app_sim_presenta
   finale->state->source_text = dup(text);
   finale->state->started = source->seconds;
   finale->state->banner = banner;
-  finale->prepared = false;
 }
 void qa_app_source_finale_receive(qa_app_source_finale *finale, const qa_app_sim_presentation_event *events, size_t count) {
   for (size_t i = 0; i < count; i++) {
@@ -60,6 +59,8 @@ void qa_app_source_finale_receive(qa_app_source_finale *finale, const qa_app_sim
         state_free(finale->state);
         finale->state = NULL;
         finale->prepared = false;
+        free(finale->prepared_content);
+        finale->prepared_content = NULL;
         free(finale->message);
         finale->message = dup("");
       }
@@ -73,26 +74,22 @@ const char *qa_app_source_finale_prepare(qa_app_source_finale *finale) {
   state_t *state = finale->state;
   double revision = finale->revision;
   if (!state) return NULL;
-  bool known = false;
-  for (size_t i = 0; i < finale->loaded_count; i++) if (strcmp(finale->loaded[i], state->content) == 0) known = true;
-  double width = finale->banner_width, height = finale->banner_height;
-  if (!known) {
-    const char *error = finale->host.load_banner(finale->host.ctx, state->content, &width, &height);
-    /* TS: the banner is decoration; the host warns once, the finale ends and the game continues. */
-    if (error) {
-      if (finale->state == state) { state_free(finale->state); finale->state = NULL; }
-      return NULL;
-    }
-    if (finale->loaded_count == finale->loaded_cap) {
-      finale->loaded_cap = finale->loaded_cap ? finale->loaded_cap * 2 : 8;
-      finale->loaded = realloc(finale->loaded, finale->loaded_cap * sizeof *finale->loaded);
-    }
-    finale->loaded[finale->loaded_count++] = dup(state->content);
+  /* this.load(content): the host keeps the per-content cache (TS loaded) and drops a failed load
+   * so it is retried (cacheEvictingRejection); the size is that content's own banner. */
+  double width = 0, height = 0;
+  const char *error = finale->host.load_banner(finale->host.ctx, state->content, &width, &height);
+  /* TS: the banner is decoration; the host warns once, the finale ends and the game continues. */
+  if (error) {
+    if (finale->state == state) { state_free(finale->state); finale->state = NULL; }
+    return NULL;
   }
   char *message = NULL;
-  const char *error = finale->host.resolve_message(finale->host.ctx, state->content, state->source_text, &message);
+  error = finale->host.resolve_message(finale->host.ctx, state->content, state->source_text, &message);
   if (error) return error;
   if (finale->state != state || finale->revision != revision) { free(message); return NULL; }
+  char *content = dup(state->content);
+  free(finale->prepared_content);
+  finale->prepared_content = content;
   finale->banner_width = width;
   finale->banner_height = height;
   finale->prepared = true;
@@ -111,7 +108,7 @@ void qa_app_source_finale_draw(qa_app_source_finale *finale, double seconds) {
   size_t line_count = 1;
   for (const char *p = finale->message; *p; p++) if (*p == '\n') line_count++;
   double y = (line_count <= 4 ? trunc(height * 0.35) : 48) * scale;
-  long remaining = (long)qa_js_max(0, trunc(8 * (seconds - state->started))) + 1;
+  double remaining = qa_js_max(0, trunc(8 * (seconds - state->started))) + 1;
   const char *cursor = finale->message;
   for (;;) {
     const char *newline = strchr(cursor, '\n');
@@ -122,7 +119,7 @@ void qa_app_source_finale_draw(qa_app_source_finale *finale, double seconds) {
     line[length] = '\0';
     double width = finale->host.text_width(finale->host.ctx, line, scale);
     finale->host.draw_text(finale->host.ctx, line, scale, remaining, trunc((draw_width - width) / 2), y);
-    remaining -= (long)length;
+    remaining -= (double)length;
     if (remaining <= 0 || !newline) break;
     y += 8 * scale;
     cursor = newline + 1;
@@ -133,5 +130,5 @@ void qa_app_source_finale_resize(qa_app_source_finale *finale, double width, dou
   finale->host.height = height;
 }
 const char *qa_app_source_finale_content(const qa_app_source_finale *finale) {
-  return finale->state != NULL ? finale->state->content : NULL;
+  return finale->state != NULL && finale->prepared ? finale->prepared_content : NULL;
 }

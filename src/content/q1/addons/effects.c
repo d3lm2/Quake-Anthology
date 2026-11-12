@@ -4,6 +4,7 @@
 #include "qa/content/q1/addons/effects.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "qa/foundation/js.h"
@@ -120,12 +121,23 @@ static void damage_lightning(qa_q1ad_context *context, qa_q1_actor *entity, qa_v
     (void)qa_q1_damage(game, trace.actor, self, &self, entity->damage, NULL, NULL, NULL, NULL);
   }
 }
+/* TS game.find(name): every entity with that targetname, as a snapshot array
+ * with no size limit. The caller frees it. */
+static qa_q1_actor **find_all(qa_q1_services *game, const char *name, size_t *count) {
+  size_t total = qa_q1_find(game, name, NULL, 0);
+  qa_q1_actor **found = malloc((total != 0 ? total : 1) * sizeof *found);
+  if (found == NULL) qa_range_error("out of memory");
+  *count = qa_q1_find(game, name, found, total);
+  return found;
+}
 static void lightning_use(void *ctx, qa_q1_services *game, qa_q1_actor *entity, const qa_actor_id *other,
                           const qa_actor_id *activator) {
   (void)other;
   qa_q1ad_context *context = ctx;
-  qa_q1_actor *targets[256];
-  size_t count = qa_q1_find(game, entity->target, targets, 256);
+  size_t count = 0;
+  qa_q1_actor **targets = find_all(game, entity->target, &count);
+  qa_cleanup targets_node; /* the callbacks below can raise */
+  qa_cleanup_push(&targets_node, free, targets);
   double chosen = (spawnflags(entity) & 1) != 0 ? floor((double)count * qa_q1_host_random(game)) : -1;
   for (size_t index = 0; index < count; index++) {
     if (chosen >= 0 && chosen != (double)index) continue;
@@ -154,6 +166,8 @@ static void lightning_use(void *ctx, qa_q1_services *game, qa_q1_actor *entity, 
       target->delay = delay;
     }
   }
+  qa_cleanup_pop(&targets_node);
+  free(targets);
 }
 static void spawn_lightning(void *ctx, qa_q1_services *game, qa_q1_actor *entity) {
   qa_q1ad_context *context = ctx;
@@ -164,8 +178,10 @@ static void spawn_lightning(void *ctx, qa_q1_services *game, qa_q1_actor *entity
 }
 static void fade_targets(void *ctx, qa_q1_services *game, qa_q1_actor *entity) {
   qa_q1ad_context *context = ctx;
-  qa_q1_actor *targets[256];
-  size_t count = qa_q1_find(game, entity->target, targets, 256);
+  size_t count = 0;
+  qa_q1_actor **targets = find_all(game, entity->target, &count);
+  qa_cleanup targets_node; /* the callbacks below can raise */
+  qa_cleanup_push(&targets_node, free, targets);
   int remaining = 0;
   if (!entity->activated) {
     for (size_t i = 0; i < count; i++) qa_q1ad_alpha(context, targets[i], 1);
@@ -183,6 +199,8 @@ static void fade_targets(void *ctx, qa_q1_services *game, qa_q1_actor *entity) {
   }
   if (remaining > 0) schedule(game, entity, FX(context, "fade_targets"), 0);
   else qa_q1_remove(game, entity);
+  qa_cleanup_pop(&targets_node);
+  free(targets);
 }
 static void fade_use(void *ctx, qa_q1_services *game, qa_q1_actor *entity, const qa_actor_id *other,
                      const qa_actor_id *activator) {
@@ -204,8 +222,10 @@ static void freeze_use(void *ctx, qa_q1_services *game, qa_q1_actor *entity, con
                        const qa_actor_id *activator) {
   (void)other; (void)activator;
   qa_q1ad_context *context = ctx;
-  qa_q1_actor *targets[256];
-  size_t count = qa_q1_find(game, entity->target, targets, 256);
+  size_t count = 0;
+  qa_q1_actor **targets = find_all(game, entity->target, &count);
+  qa_cleanup targets_node; /* the callbacks below can raise */
+  qa_cleanup_push(&targets_node, free, targets);
   for (size_t i = 0; i < count; i++) {
     qa_q1_actor *target = targets[i];
     if (qa_q1_actor_number(target, "is_frozen") == 0) {
@@ -227,6 +247,8 @@ static void freeze_use(void *ctx, qa_q1_services *game, qa_q1_actor *entity, con
       qa_q1_actor_set_damageable(target, qa_q1_actor_number(target, "addon.frozenDamageable") != 0);
     }
   }
+  qa_cleanup_pop(&targets_node);
+  free(targets);
 }
 static void spawn_freeze(void *ctx, qa_q1_services *game, qa_q1_actor *entity) {
   (void)game;

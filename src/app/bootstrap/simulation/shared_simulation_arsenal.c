@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 #include "qa/foundation/support.h"
 #include "qa/app/bootstrap/simulation/provider_frames.h"
 #include "qa/app/bootstrap/simulation/classic_guest_source.h"
@@ -84,9 +85,7 @@
 #include "qa/app/bootstrap/simulation/q3/host.h"
 
 static noreturn void ss_fail(const char *format, ...) {
-  char message[1024];
-  va_list args; va_start(args, format); vsnprintf(message, sizeof message, format, args); va_end(args);
-  qa_raise("Error", 0, 0, "%s", message);
+  va_list args; va_start(args, format); qa_ss_raise_error(format, args);
 }
 static void *ss_grow(void *ptr, size_t *capacity, size_t need, size_t size) {
   if (need <= *capacity) return ptr;
@@ -185,6 +184,7 @@ static qa_arsenal_state ss_sel_read(qa_app_shared_simulation *sim, qa_actor_id a
 }
 static void ss_arsenal_free(qa_arsenal_state *state) { free((void *)state->ammo); state->ammo = NULL; state->ammo_count = 0; }
 static void ss_arsenal_free_cleanup(void *state) { ss_arsenal_free(state); }
+static void ss_arsenal_release(qa_app_shared_simulation *sim, qa_arsenal_state *state);
 /* admit(owner, maximum, team): Q1 and Q2 take no team argument. */
 static qa_arsenal_state ss_sel_admit(qa_app_shared_simulation *sim, qa_owned_actor actor, double maximum, bool team) {
   if (sim->selected_arsenal.q1) return qa_app_q1_selected_arsenal_admit(sim->selected_arsenal.q1, actor, maximum);
@@ -222,24 +222,38 @@ static qa_weapon_step_result ss_sel_step(qa_app_shared_simulation *sim, qa_weapo
   if (sim->selected_arsenal.q2) return qa_app_q2_selected_arsenal_step(sim->selected_arsenal.q2, input, intent);
   return qa_app_q3_selected_arsenal_step(sim->selected_arsenal.q3, input, intent);
 }
-/* catalog(): thread-local scratch, valid until the next call. */
+/* The rows catalog() and ui() write: one per selected weapon (TS arrays have no bound; storage is sized from this). */
+static size_t ss_sel_rows(qa_app_shared_simulation *sim) {
+  size_t count = 0;
+  if (sim->selected_arsenal.q1) { qa_app_q1_selected_arsenal_weapons(sim->selected_arsenal.q1, &count); return count; }
+  if (sim->selected_arsenal.q2) return qa_app_q2_selected_arsenal_weapon_count(sim->selected_arsenal.q2);
+  return QA_Q3_WEAPON_ITEM_COUNT;
+}
+/* catalog(): thread-local scratch grown to the selected weapons, valid until the next call. */
 static const qa_selected_pickup_weapon *ss_sel_catalog(qa_app_shared_simulation *sim, size_t *out_count) {
-  static __thread qa_selected_pickup_weapon storage[64];
-  size_t count = sim->selected_arsenal.q1 ? qa_app_q1_selected_arsenal_catalog(sim->selected_arsenal.q1, storage, 64)
-      : sim->selected_arsenal.q2 ? qa_app_q2_selected_arsenal_catalog(sim->selected_arsenal.q2, storage, 64)
-      : qa_app_q3_selected_arsenal_catalog(sim->selected_arsenal.q3, storage, 64);
-  *out_count = count < 64 ? count : 64;
+  static __thread qa_selected_pickup_weapon *storage; static __thread size_t capacity;
+  size_t rows = ss_sel_rows(sim);
+  storage = ss_grow(storage, &capacity, rows ? rows : 1, sizeof *storage);
+  *out_count = sim->selected_arsenal.q1 ? qa_app_q1_selected_arsenal_catalog(sim->selected_arsenal.q1, storage, capacity)
+      : sim->selected_arsenal.q2 ? qa_app_q2_selected_arsenal_catalog(sim->selected_arsenal.q2, storage, capacity)
+      : qa_app_q3_selected_arsenal_catalog(sim->selected_arsenal.q3, storage, capacity);
   return storage;
 }
-/* ui(actor, source): items and labels in caller storage. */
-#define SS_UI_ITEMS 96
-typedef struct ss_ui_storage { qa_app_player_ui_item items[SS_UI_ITEMS]; char labels[SS_UI_ITEMS + 1][64]; } ss_ui_storage;
+/* ui(actor, source): items and labels (labels[0] is the weapon status label) in caller storage, grown to the
+ * selected weapons. Growing moves the arrays: a UI read from this storage is valid until its next ss_sel_ui. */
+typedef struct ss_ui_storage { qa_app_player_ui_item *items; char (*labels)[64]; size_t capacity, label_capacity; } ss_ui_storage;
+static void ss_ui_reserve(ss_ui_storage *storage, size_t rows) {
+  storage->items = ss_grow(storage->items, &storage->capacity, rows ? rows : 1, sizeof *storage->items);
+  storage->labels = ss_grow(storage->labels, &storage->label_capacity, storage->capacity + 1, sizeof *storage->labels);
+}
 static qa_app_arsenal_ui ss_sel_ui(qa_app_shared_simulation *sim, qa_actor_id actor, qa_provider_reference source, ss_ui_storage *storage) {
+  ss_ui_reserve(storage, ss_sel_rows(sim));
+  size_t capacity = storage->capacity;
   if (sim->selected_arsenal.q1)
-    return qa_app_q1_selected_arsenal_ui(sim->selected_arsenal.q1, actor, source, storage->items, SS_UI_ITEMS, storage->labels, SS_UI_ITEMS + 1);
+    return qa_app_q1_selected_arsenal_ui(sim->selected_arsenal.q1, actor, source, storage->items, capacity, storage->labels, capacity + 1);
   if (sim->selected_arsenal.q2)
-    return qa_app_q2_selected_arsenal_ui(sim->selected_arsenal.q2, actor, source, storage->items, SS_UI_ITEMS, storage->labels, SS_UI_ITEMS + 1);
-  return qa_app_q3_selected_arsenal_ui(sim->selected_arsenal.q3, actor, source, storage->items, SS_UI_ITEMS, storage->labels, SS_UI_ITEMS + 1);
+    return qa_app_q2_selected_arsenal_ui(sim->selected_arsenal.q2, actor, source, storage->items, capacity, storage->labels, capacity + 1);
+  return qa_app_q3_selected_arsenal_ui(sim->selected_arsenal.q3, actor, source, storage->items, capacity, storage->labels, capacity + 1);
 }
 
 /* The selectedArsenal members phase A calls. */
@@ -491,13 +505,16 @@ static const void *ss_pickups_classic(void *ctx, qa_content_digest digest, const
 static const void *ss_pickups_rerelease(void *ctx, qa_content_digest digest, const qa_compat_q2_native_pickup_profile **out) {
   (void)ctx; *out = qa_compat_q2_rerelease_get_pickup_profile(digest); return *out;
 }
+/* TS primaryProfiles: a WeakMap keyed by the prepared guest, whose value depends only on the module's digest and
+ * edition. C has no weak keys (a freed prepared guest's address is reused), so the cache is keyed by what the
+ * value depends on; it grows with the distinct modules a process has run and is never full. */
 typedef struct ss_builtin_primary {
-  const void *prepared; bool found;
+  char *digest; bool classic; bool found;
   qa_compat_q2_native_primary_profile profile;
   qa_compat_q2_classic_world_profile classic_world;
 } ss_builtin_primary;
-static __thread ss_builtin_primary ss_builtin_primaries[8];
-static __thread size_t ss_builtin_primary_count;
+static __thread ss_builtin_primary **ss_builtin_primaries; /* each entry keeps its address: profiles are handed out */
+static __thread size_t ss_builtin_primary_count, ss_builtin_primary_capacity;
 static const void *ss_world_classic(void *ctx, qa_content_digest digest) {
   ss_builtin_primary *entry = ctx;
   return qa_compat_q2_classic_get_primary_world_profile(digest, &entry->classic_world) ? (const void *)&entry->classic_world : NULL;
@@ -513,13 +530,21 @@ const qa_compat_q2_native_primary_profile *qa_app_shared_sim_native_primary(qa_a
   const qa_app_sim_prepared_rerelease_guest *rerelease_prepared = classic ? NULL : guest->prepared;
   if (classic ? classic_prepared->has_primary : rerelease_prepared->has_primary)
     return classic ? &classic_prepared->primary.profile : &rerelease_prepared->primary.profile;
-  for (size_t i = 0; i < ss_builtin_primary_count; i++)
-    if (ss_builtin_primaries[i].prepared == guest->prepared) return ss_builtin_primaries[i].found ? &ss_builtin_primaries[i].profile : NULL;
-  if (ss_builtin_primary_count == 8) ss_fail("Native primary cache is full");
-  ss_builtin_primary *entry = &ss_builtin_primaries[ss_builtin_primary_count++];
-  memset(entry, 0, sizeof *entry);
-  entry->prepared = guest->prepared;
   const qa_resolved_resource_reference *artifact = classic ? classic_prepared->execution.artifact : rerelease_prepared->execution.artifact;
+  for (size_t i = 0; i < ss_builtin_primary_count; i++)
+    if (ss_builtin_primaries[i]->classic == classic && strcmp(ss_builtin_primaries[i]->digest, artifact->digest) == 0)
+      return ss_builtin_primaries[i]->found ? &ss_builtin_primaries[i]->profile : NULL;
+  if (ss_builtin_primary_count == ss_builtin_primary_capacity) {
+    size_t capacity = ss_builtin_primary_capacity == 0 ? 8 : ss_builtin_primary_capacity * 2;
+    ss_builtin_primary **grown = realloc(ss_builtin_primaries, capacity * sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    ss_builtin_primaries = grown; ss_builtin_primary_capacity = capacity;
+  }
+  ss_builtin_primary *entry = calloc(1, sizeof *entry);
+  if (entry == NULL) qa_range_error("Out of memory");
+  entry->digest = qa_ss_strdup(artifact->digest);
+  entry->classic = classic;
+  ss_builtin_primaries[ss_builtin_primary_count++] = entry;
   qa_compat_q2_primary_world_providers providers; memset(&providers, 0, sizeof providers);
   providers.ctx = entry; providers.pickups_classic = ss_pickups_classic; providers.pickups_rerelease = ss_pickups_rerelease;
   providers.world_classic = ss_world_classic; providers.world_rerelease = ss_world_rerelease;
@@ -692,6 +717,8 @@ void qa_app_shared_sim_project_quake_c_attack(qa_app_shared_simulation *sim, qa_
     player->animation = qa_app_sim_quakec_character_animation(player->animation, "attack", player->bounds.max.z < player->standing_bounds.max.z);
 }
 /* ---- runQuakeWorldNewMissile (5041-5050) ---- */
+static void ss_free_visited(void *ctx) { free(((qa_app_sim_actor_visited *)ctx)->actors); }
+static void ss_free_turns(void *ctx) { qa_app_sim_ordered_actor_turns_destroy(ctx); }
 void qa_app_shared_sim_run_quake_world_new_missile(qa_app_shared_simulation *sim) {
   if (!ss_source_is(sim, QA_SS_SOURCE_QUAKEC) || !qa_ss_is(qa_app_sim_quakec_source_kind(sim->source.quakec), "quakeworld")) return;
   qa_owned_actor actor;
@@ -702,7 +729,9 @@ void qa_app_shared_sim_run_quake_world_new_missile(qa_app_shared_simulation *sim
   qa_frame_context frame = sim->source_frame; frame.elapsed.kind = QA_SOURCE_TIME_SECONDS; frame.elapsed.value = 0.05;
   qa_app_sim_actor_execution_frame context = {sim->actors, ss_bodies(sim), sim->physics, sim->scheduler, frame,
       qa_app_shared_sim_time_seconds(sim), 0.05, &visited};
+  qa_cleanup node; qa_cleanup_push(&node, ss_free_visited, &visited); /* a raising missile turn frees the visited set */
   qa_app_sim_execute_actor(entry, &context);
+  qa_cleanup_pop(&node);
   free(visited.actors);
   qa_app_sim_shared_physics_commit_attachments(sim->physics);
 }
@@ -778,17 +807,27 @@ static double ss_q3_powerup(const qa_q3_game_client *client, double powerup) {
 }
 
 /* ---- bindEquipmentInventory (2845-2849) / bindSourceInventory (2851-2869) ---- */
-#define SS_SOURCE_ITEMS 128
+/* TS arrays and sets with no limit: each list grows in blocks the simulation keeps (a returned read() array stays
+ * valid until the simulation closes, as a TS array the caller still holds would). */
 typedef struct ss_source_inventory {
   qa_app_shared_simulation *sim;
   qa_owned_actor actor;
   qa_inventory_state_binding source;
-  qa_item_id replaced[SS_SOURCE_ITEMS]; size_t replaced_count; bool has_replaced;
-  qa_item_id native_items[SS_SOURCE_ITEMS]; size_t native_count;
-  qa_inventory_entry supplemental[SS_SOURCE_ITEMS]; size_t supplemental_count;
-  qa_inventory_entry read[2 * SS_SOURCE_ITEMS];
-  qa_inventory_entry original[SS_SOURCE_ITEMS];
+  qa_item_id *replaced; size_t replaced_count, replaced_capacity; bool has_replaced;
+  qa_item_id *native_items; size_t native_count, native_capacity;
+  qa_inventory_entry *supplemental; size_t supplemental_count, supplemental_capacity;
+  qa_inventory_entry *read; size_t read_capacity;
+  qa_inventory_entry *original; size_t original_capacity;
 } ss_source_inventory;
+static void *ss_source_reserve(qa_app_shared_simulation *sim, void *items, size_t *capacity, size_t need, size_t size) {
+  if (need <= *capacity) return items;
+  size_t next = *capacity ? *capacity * 2 : 32;
+  while (next < need) next *= 2;
+  void *grown = qa_app_shared_sim_keep(sim, next * size);
+  if (*capacity != 0) memcpy(grown, items, *capacity * size);
+  *capacity = next;
+  return grown;
+}
 static bool ss_item_in(const qa_item_id *items, size_t count, qa_item_id item) {
   for (size_t i = 0; i < count; i++) if (qa_ss_is(items[i], item)) return true;
   return false;
@@ -799,7 +838,7 @@ static size_t ss_source_original(ss_source_inventory *binding) {
   const qa_inventory_entry *entries = binding->source.read(binding->source.ctx, &count);
   for (size_t i = 0; i < count; i++) {
     if (binding->has_replaced && ss_item_in(binding->replaced, binding->replaced_count, entries[i].item)) continue;
-    if (kept == SS_SOURCE_ITEMS) qa_range_error("Source inventory exceeds the bound row capacity");
+    binding->original = ss_source_reserve(binding->sim, binding->original, &binding->original_capacity, kept + 1, sizeof *binding->original);
     binding->original[kept++] = entries[i];
   }
   return kept;
@@ -813,6 +852,7 @@ static bool ss_source_capacity(ss_source_inventory *binding, qa_item_id item, do
 static const qa_inventory_entry *ss_source_read(void *ctx, size_t *out_count) {
   ss_source_inventory *binding = ctx;
   size_t count = ss_source_original(binding), total = 0;
+  binding->read = ss_source_reserve(binding->sim, binding->read, &binding->read_capacity, count + binding->supplemental_count + 1, sizeof *binding->read);
   for (size_t i = 0; i < count; i++) {
     qa_inventory_entry entry = binding->original[i]; double capacity;
     if (ss_source_capacity(binding, entry.item, &capacity)) entry.capacity = capacity;
@@ -841,7 +881,8 @@ static void ss_source_write(void *ctx, qa_inventory_entry entry) {
   }
   for (size_t i = 0; i < binding->supplemental_count; i++)
     if (qa_ss_is(binding->supplemental[i].item, entry.item)) { binding->supplemental[i] = entry; return; }
-  if (binding->supplemental_count == SS_SOURCE_ITEMS) qa_range_error("Supplemental inventory exceeds the bound row capacity");
+  binding->supplemental = ss_source_reserve(binding->sim, binding->supplemental, &binding->supplemental_capacity,
+      binding->supplemental_count + 1, sizeof *binding->supplemental);
   binding->supplemental[binding->supplemental_count++] = entry;
 }
 void qa_app_shared_sim_bind_source_inventory(qa_app_shared_simulation *sim, qa_owned_actor actor, qa_inventory_state_binding source,
@@ -853,17 +894,21 @@ void qa_app_shared_sim_bind_source_inventory(qa_app_shared_simulation *sim, qa_o
   if (ss_source_is(sim, QA_SS_SOURCE_Q2_NATIVE) && sim->selected_original_supply != NULL) {
     size_t count = 0;
     qa_item_id *replaced = qa_ss_replaced_supply_items(sim->selected_original_supply, &count);
-    if (count + 1 > SS_SOURCE_ITEMS) { free(replaced); qa_range_error("Replaced inventory exceeds the bound row capacity"); }
+    qa_cleanup replaced_node; qa_cleanup_push(&replaced_node, free, replaced);
+    binding->replaced = ss_source_reserve(sim, binding->replaced, &binding->replaced_capacity, count + 1, sizeof *binding->replaced);
+    qa_cleanup_pop(&replaced_node);
     for (size_t i = 0; i < count; i++) binding->replaced[binding->replaced_count++] = replaced[i];
     binding->replaced[binding->replaced_count++] = "q2:weapon_blaster";
     binding->has_replaced = true;
     free(replaced);
   }
   size_t original = ss_source_original(binding);
+  binding->native_items = ss_source_reserve(sim, binding->native_items, &binding->native_capacity, original + 1, sizeof *binding->native_items);
   for (size_t i = 0; i < original; i++) binding->native_items[binding->native_count++] = binding->original[i].item;
   for (size_t i = 0; i < saved_count; i++) {
     if (ss_item_in(binding->native_items, binding->native_count, saved[i].item)) continue;
-    if (binding->supplemental_count == SS_SOURCE_ITEMS) qa_range_error("Supplemental inventory exceeds the bound row capacity");
+    binding->supplemental = ss_source_reserve(sim, binding->supplemental, &binding->supplemental_capacity,
+        binding->supplemental_count + 1, sizeof *binding->supplemental);
     binding->supplemental[binding->supplemental_count++] = saved[i];
   }
   qa_inventory_state_binding bound = {binding, ss_source_read, NULL, ss_source_write, ss_source_mutable_capacity};
@@ -1066,7 +1111,9 @@ static bool ss_q2_resume(void *ctx, qa_item_id item) {
       qa_app_shared_sim_q2_weapon_input(sim, handoff->player), definition ? definition->name : NULL);
   if (item == NULL) return true;
   qa_arsenal_state arsenal = qa_app_shared_sim_arsenal(sim, handoff->player);
-  return arsenal.active_weapon != NULL && qa_ss_is(arsenal.active_weapon, item);
+  bool active = arsenal.active_weapon != NULL && qa_ss_is(arsenal.active_weapon, item);
+  ss_arsenal_release(sim, &arsenal);
+  return active;
 }
 /* q3 */
 static qa_q3_arsenal_runtime_state *ss_q3_runtime(ss_handoff *handoff) {
@@ -1122,7 +1169,8 @@ qa_app_primary_weapon_handoff qa_app_shared_sim_primary_handoff(qa_app_shared_si
 static qa_app_primary_weapon_handoff ss_handoff_begin(qa_app_shared_simulation *sim, qa_actor_id actor, ss_handoff **out) {
   qa_app_primary_weapon_handoff handoff; memset(&handoff, 0, sizeof handoff);
   handoff.kind = "immediate"; handoff.provider = sim->weapon_provider.provider;
-  ss_handoff *record = qa_app_shared_sim_keep(sim, sizeof *record);
+  /* A per-call record (TS closure): a weapon slot that binds the handoff claims it (bindWeaponSlot). */
+  ss_handoff *record = qa_app_shared_sim_scratch(sim, sizeof *record);
   record->sim = sim; record->actor = actor; handoff.ctx = record;
   *out = record;
   return handoff;
@@ -1189,6 +1237,25 @@ static bool ss_slot_actor_current(void *ctx) {
   ss_slot_owner *record = ctx; qa_owned_actor current;
   return ss_owned(record->sim, record->owner.id, &current) && qa_same_owned_actor(current, record->owner);
 }
+/* The records a slot's callbacks borrow live as long as the slot (TS closures). */
+typedef struct ss_slot_binding { ss_slot_owner owner; void *handoff; } ss_slot_binding;
+static void ss_slot_binding_free(void *value) {
+  ss_slot_binding *binding = value;
+  if (binding != NULL) free(binding->handoff);
+  free(binding);
+}
+void qa_app_shared_sim_release_slot_bindings(qa_app_shared_simulation *sim, const qa_actor_id *actor) {
+  if (sim->b2_slot_bindings.value_size == 0) return;
+  if (actor == NULL) {
+    for (size_t i = 0; i < sim->b2_slot_bindings.count; i++) ss_slot_binding_free(*(ss_slot_binding **)qa_ss_map_value_at(&sim->b2_slot_bindings, i));
+    qa_ss_map_clear(&sim->b2_slot_bindings);
+    return;
+  }
+  ss_slot_binding **binding = qa_ss_map_get(&sim->b2_slot_bindings, actor);
+  if (binding == NULL) return;
+  ss_slot_binding_free(*binding);
+  qa_ss_map_delete(&sim->b2_slot_bindings, actor);
+}
 void qa_app_shared_sim_bind_weapon_slot_state(qa_app_shared_simulation *sim, qa_actor_id actor, const qa_app_sim_weapon_slot_restore_state *state) {
   qa_owned_actor owner;
   if (!ss_owned(sim, actor, &owner)) ss_fail("Weapon slot actor retired");
@@ -1197,12 +1264,20 @@ void qa_app_shared_sim_bind_weapon_slot_state(qa_app_shared_simulation *sim, qa_
   if (sim->grapple != NULL && qa_ss_is(qa_app_sim_grapple_runtime_selection(sim->grapple)->binding, "slot")) {
     equipment = qa_app_sim_grapple_runtime_handoff(sim->grapple, actor); has_equipment = true;
   }
-  ss_slot_owner *record = qa_app_shared_sim_keep(sim, sizeof *record);
-  record->sim = sim; record->owner = owner;
-  qa_app_sim_weapon_slot *slot = qa_app_sim_weapon_slot_create(primary, has_equipment ? &equipment : NULL, state, ss_slot_actor_current, record);
+  ss_slot_binding *binding = calloc(1, sizeof *binding);
+  if (binding == NULL) qa_range_error("Out of memory");
+  binding->owner.sim = sim; binding->owner.owner = owner;
+  /* A strategy handoff's record is per call; this slot keeps it (a selected arsenal owns its own). */
+  if (qa_app_shared_sim_scratch_claim(sim, primary.ctx)) binding->handoff = primary.ctx;
+  qa_cleanup release; qa_cleanup_push(&release, ss_slot_binding_free, binding);
+  qa_app_sim_weapon_slot *slot = qa_app_sim_weapon_slot_create(primary, has_equipment ? &equipment : NULL, state, ss_slot_actor_current, &binding->owner);
+  qa_cleanup_pop(&release);
   qa_app_sim_weapon_slot *previous = ss_slot(sim, actor);
   qa_ss_map_set(&sim->weapon_slots, &actor, &slot);
   if (previous != NULL) qa_app_sim_weapon_slot_destroy(previous);
+  qa_app_shared_sim_release_slot_bindings(sim, &actor);
+  if (sim->b2_slot_bindings.value_size == 0) qa_ss_map_init(&sim->b2_slot_bindings, QA_SS_KEY_ACTOR, sizeof(ss_slot_binding *));
+  qa_ss_map_set(&sim->b2_slot_bindings, &actor, &binding);
 }
 void qa_app_shared_sim_bind_weapon_slot(qa_app_shared_simulation *sim, qa_actor_id actor) {
   qa_app_shared_sim_bind_weapon_slot_state(sim, actor, NULL);
@@ -1498,8 +1573,17 @@ static void ss_presentation_powerup_sound(void *ctx) {
   game->host->emit(game->host->ctx, event);
 }
 static qa_grapple_weapon_presentation ss_slot_presentation(void *ctx, qa_actor_id actor) {
-  ss_actor_ctx *record = qa_app_shared_sim_keep(ctx, sizeof *record);
-  record->sim = ctx; record->actor = actor;
+  /* The record is the immutable {sim, actor} a TS closure captures: one per actor (a per-call copy grew until the end). */
+  qa_app_shared_simulation *sim = ctx;
+  if (sim->b2_slot_presentations.value_size == 0) qa_ss_map_init(&sim->b2_slot_presentations, QA_SS_KEY_ACTOR, sizeof(ss_actor_ctx *));
+  ss_actor_ctx **kept = qa_ss_map_get(&sim->b2_slot_presentations, &actor);
+  ss_actor_ctx *record = kept != NULL ? *kept : NULL;
+  if (record == NULL) {
+    record = calloc(1, sizeof *record);
+    if (record == NULL) qa_range_error("Out of memory");
+    record->sim = sim; record->actor = actor;
+    qa_ss_map_set(&sim->b2_slot_presentations, &actor, &record);
+  }
   qa_grapple_weapon_presentation presentation; memset(&presentation, 0, sizeof presentation);
   presentation.ctx = record; presentation.attack_animation = ss_presentation_attack; presentation.reverse_animation = ss_presentation_reverse;
   presentation.animation_time = ss_presentation_animation_time; presentation.powerup_sound = ss_presentation_powerup_sound;
@@ -1697,9 +1781,12 @@ static void ss_finally(void (*body)(void *ctx), void *ctx, void (*restore)(void 
 
 /* ---- bindSelectedOriginalPickups (2428-2432) ---- */
 typedef struct ss_pickup_binding { qa_app_shared_simulation *sim; qa_owned_actor actor; int64_t id; } ss_pickup_binding;
+/* The binding record is malloc'd per bind (every native or QVM respawn rebinds) and freed by its dispose; the
+ * simulation's destroy frees the records still bound. */
 static void ss_unbind_pickup(void *ctx) {
   ss_pickup_binding *binding = ctx;
   qa_shared_inventory_table_unbind_pickup(binding->sim->inventory, binding->actor, binding->id);
+  free(binding);
 }
 void qa_app_shared_sim_bind_selected_original_pickups(qa_app_shared_simulation *sim, qa_owned_actor actor) {
   qa_ss_dispose *previous = qa_ss_map_get(&sim->selected_pickup_bindings, &actor.id);
@@ -1707,9 +1794,12 @@ void qa_app_shared_sim_bind_selected_original_pickups(qa_app_shared_simulation *
   qa_ss_map_delete(&sim->selected_pickup_bindings, &actor.id);
   if (sim->selected_original_pickup_count == 0) return;
   qa_inventory_pickup_binding requested = {sim->weapon_provider.provider, sim->selected_original_pickups, sim->selected_original_pickup_count};
-  ss_pickup_binding *binding = qa_app_shared_sim_keep(sim, sizeof *binding);
+  ss_pickup_binding *binding = malloc(sizeof *binding);
+  if (binding == NULL) qa_range_error("Out of memory");
   binding->sim = sim; binding->actor = actor;
+  qa_cleanup cleanup; qa_cleanup_push(&cleanup, free, binding);
   binding->id = qa_shared_inventory_table_bind_pickup(sim->inventory, actor, requested);
+  qa_cleanup_pop(&cleanup);
   qa_ss_dispose dispose = {binding, ss_unbind_pickup};
   qa_ss_map_set(&sim->selected_pickup_bindings, &actor.id, &dispose);
 }
@@ -1721,6 +1811,10 @@ static void ss_ammo_assert_owned(void *ctx, qa_owned_actor actor) { qa_session_a
 static bool ss_ammo_resolve_saved(void *ctx, qa_saved_actor_id saved, qa_owned_actor *out) {
   return qa_session_actor_registry_resolve_saved(((qa_app_shared_simulation *)ctx)->actors, saved, out);
 }
+static void ss_ammo_released(void *ctx, qa_owned_actor actor) {
+  qa_app_shared_simulation *sim = ctx;
+  if (sim->selected_ammo_timers != NULL) qa_app_q3_mapped_ammo_regeneration_release_actor(sim->selected_ammo_timers, actor);
+}
 void qa_app_shared_sim_bind_selected_ammo(qa_app_shared_simulation *sim, const qa_pickup_supply_profile *profile) {
   if (!ss_source_is(sim, QA_SS_SOURCE_Q3) || qa_app_sim_provider_family(sim->weapon_provider.provider) == QA_GAME_FAMILY_Q3) return;
   if (sim->selected_ammo_timers != NULL) ss_fail("Selected ammo timers already have a source owner");
@@ -1730,6 +1824,18 @@ void qa_app_shared_sim_bind_selected_ammo(qa_app_shared_simulation *sim, const q
   sim->selected_ammo_timers = qa_app_q3_mapped_ammo_regeneration_create(*profile, actors, qa_app_shared_sim_inventory_access(sim),
       legacy->ammo_owners, legacy->ammo_owner_count);
   if (sim->selected_ammo_timers == NULL) qa_range_error("Out of memory");
+  /* The TS constructor's actors.onRelease(actor => entries.delete(actor)). */
+  sim->selected_ammo_release = qa_session_actor_registry_on_release(sim->actors, ss_ammo_released, sim);
+  sim->has_selected_ammo_release = true;
+}
+/* Q3MappedAmmoRegeneration.close(): unobserve before the entries are cleared. */
+void qa_app_shared_sim_close_selected_ammo(qa_app_shared_simulation *sim) {
+  if (sim->selected_ammo_timers == NULL) return;
+  if (sim->has_selected_ammo_release) {
+    sim->has_selected_ammo_release = false;
+    qa_session_actor_registry_off_release(sim->actors, sim->selected_ammo_release);
+  }
+  qa_app_q3_mapped_ammo_regeneration_close(sim->selected_ammo_timers);
 }
 /* false = TS null. */
 bool qa_app_shared_sim_selected_ammo(qa_app_shared_simulation *sim, qa_actor_id actor, const qa_q3_ta_mapped_ammo_timer **out,
@@ -2073,17 +2179,16 @@ bool qa_ss_q3_primary_weapon_step(qa_app_shared_simulation *sim, qa_app_sim_move
 
 /* ---- prepareArsenalCommand (4979-5019) ---- */
 qa_actor_command qa_app_shared_sim_prepare_arsenal_command(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player,
-    qa_actor_command received, bool paused) {
-  static __thread qa_arsenal_intent intents[16]; static __thread size_t next_intent;
+    qa_actor_command received, bool paused, qa_arsenal_intent *storage) {
+  /* storage: the caller's record behind a rewritten command.arsenal (TS builds a new intent object). */
   qa_actor_command command = received;
   qa_actor_id actor = player->actor.id;
   if (command.arsenal != NULL && command.arsenal->has_impulse) {
     double impulse = command.arsenal->impulse;
     if (!isfinite(impulse) || impulse != trunc(impulse) || impulse < 0 || impulse > 255) qa_range_error("Source impulse must fit one byte");
   }
-  qa_arsenal_intent *storage = &intents[next_intent++ % 16];
   if (sim->strategy->drops_impulse(sim) && command.arsenal != NULL && command.arsenal->has_impulse) {
-    *storage = *command.arsenal; storage->impulse = 0; command.arsenal = storage;
+    qa_arsenal_intent dropped = *command.arsenal; dropped.impulse = 0; *storage = dropped; command.arsenal = storage;
   }
   qa_app_sim_weapon_slot *slot = ss_slot(sim, actor);
   /* Remote peers choose these strings. An intent for a provider this player cannot use carries no request. */
@@ -2132,7 +2237,7 @@ qa_actor_command qa_app_shared_sim_prepare_arsenal_command(qa_app_shared_simulat
       qa_q3_movement_state *state = &player->state.as.q3;
       state->movement_flags = has_point ? (double)(qa_js_to_int32(state->movement_flags) | QA_Q3_FLAG_GRAPPLE_PULL)
           : (double)(qa_js_to_int32(state->movement_flags) & ~QA_Q3_FLAG_GRAPPLE_PULL);
-      state->grapple_point = has_point ? point : qa_ss_zero;
+      state->grapple_point = has_point ? point : qa_zero_vec3;
     } else {
       qa_vec3 velocity; qa_body_state body;
       bool pulled = qa_app_q3_selected_source_pull(selected_ballistics, player->actor, &velocity);
@@ -2165,6 +2270,7 @@ void qa_app_shared_sim_begin_native_equipment_frame(qa_app_shared_simulation *si
   qa_actor_id *players = calloc(player_count ? player_count : 1, sizeof *players);
   if (!players) qa_range_error("Out of memory");
   memcpy(players, listed, player_count * sizeof *players);
+  qa_cleanup players_node; qa_cleanup_push(&players_node, free, players); /* a raising player step frees the copy */
   for (size_t i = 0; i < player_count; i++) {
     qa_actor_id actor = players[i];
     qa_app_shared_sim_require_equipment_player(sim, actor);
@@ -2182,9 +2288,13 @@ void qa_app_shared_sim_begin_native_equipment_frame(qa_app_shared_simulation *si
     if (sim->strategy->steps_hand_grenades(sim)) qa_app_shared_sim_step_hand_grenade(sim, actor, available ? "alive" : "dead");
     if (grapple) qa_app_sim_grapple_runtime_step(grapple, actor, available);
   }
+  qa_cleanup_pop(&players_node);
   free(players);
   qa_app_sim_actor_visited visited = {0};
+  /* A raising turn frees the visited set and the turn cursor. */
+  qa_cleanup visited_node; qa_cleanup_push(&visited_node, ss_free_visited, &visited);
   qa_app_sim_ordered_actor_turns *turns = qa_app_sim_ordered_actor_turns_create(sim->actors, ss_equipment_turn_position, sim);
+  qa_cleanup turns_node; qa_cleanup_push(&turns_node, ss_free_turns, turns);
   qa_owned_actor actor;
   qa_q2_entity_services *independent = grenades ? qa_app_sim_hand_grenade_runtime_independent_game(grenades) : NULL;
   while (qa_app_sim_ordered_actor_turns_next(turns, &visited, &actor)) {
@@ -2202,6 +2312,7 @@ void qa_app_shared_sim_begin_native_equipment_frame(qa_app_shared_simulation *si
     qa_app_sim_execute_actor(&entry, &context);
     qa_app_sim_shared_physics_commit_attachments(sim->physics);
   }
+  qa_cleanup_pop(&turns_node); qa_cleanup_pop(&visited_node);
   qa_app_sim_ordered_actor_turns_destroy(turns);
   free(visited.actors);
   for (size_t i = 0; i < sim->weapon_slots.count; i++) qa_app_sim_weapon_slot_reconcile(*(qa_app_sim_weapon_slot **)qa_ss_map_value_at(&sim->weapon_slots, i));
@@ -2226,8 +2337,15 @@ void qa_app_shared_sim_give_q2_start_items(qa_app_shared_simulation *sim, qa_act
   /* this.startItems || worldspawn?.values.get("start_items") || "" */
   const char *expression = sim->start_items != NULL && sim->start_items[0] != '\0' ? sim->start_items
       : worldspawn_items != NULL && worldspawn_items[0] != '\0' ? worldspawn_items : "";
-  if (expression[0] != '\0') qa_q2_item_module_give_start_items(source->items, owned, game, expression);
+  /* The parsed entities are freed before the grant, which raises on an invalid item (the worldspawn text is copied). */
+  char *owned_expression = expression == worldspawn_items ? qa_ss_strdup(expression) : NULL;
+  if (expression == worldspawn_items && owned_expression == NULL) { qa_q2_entities_free(fields, field_count); qa_range_error("Out of memory"); }
+  if (owned_expression != NULL) expression = owned_expression;
   qa_q2_entities_free(fields, field_count);
+  qa_cleanup expression_cleanup; qa_cleanup_push(&expression_cleanup, free, owned_expression);
+  if (expression[0] != '\0') qa_q2_item_module_give_start_items(source->items, owned, game, expression);
+  qa_cleanup_pop(&expression_cleanup);
+  free(owned_expression);
   qa_ss_map_delete(&sim->pending_start_items, &actor);
   size_t count = 0;
   const qa_inventory_entry *entries = qa_shared_inventory_table_entries(sim->inventory, actor, &count);
@@ -2255,6 +2373,7 @@ bool qa_app_shared_sim_grant_selected_arsenal(qa_app_shared_simulation *sim, qa_
   const qa_item_id *native_items = sim->strategy->guest_grant_exclusions(sim, &native_count);
   qa_app_arsenal_ui ui = ss_sel_ui(sim, actor, sim->recipe.map.entities, &ss_grant_ui);
   qa_arsenal_state state = ss_sel_read(sim, actor);
+  qa_cleanup release; qa_cleanup_push(&release, ss_arsenal_free_cleanup, &state); /* freed if a configure raises */
   for (size_t i = 0; i < state.ammo_count; i++) {
     const qa_inventory_entry *entry = &state.ammo[i];
     bool native = false;
@@ -2266,6 +2385,7 @@ bool qa_app_shared_sim_grant_selected_arsenal(qa_app_shared_simulation *sim, qa_
       ss_configure(sim, owner, configured);
     }
   }
+  qa_cleanup_pop(&release);
   ss_arsenal_free(&state);
   qa_app_shared_sim_refresh_arsenal_cache(sim, actor);
   return true;
@@ -2317,20 +2437,35 @@ qa_app_sim_qc_weapon_target *qa_app_shared_sim_weapon_behavior_targets(qa_app_sh
 #define SS_UI_RING 4
 typedef struct ss_player_ui_storage {
   ss_ui_storage arsenal;
-  qa_app_sim_player_ui_item items[SS_UI_ITEMS];
-  char labels[SS_UI_ITEMS][64];
+  qa_app_sim_player_ui_item *items; size_t item_capacity; /* UI rows, grown per projection (TS no bound) */
   qa_active_powerup_timer powerups[32];
   qa_weapon_hud_status weapon_status;
-  char status_label[64];
-  qa_inventory_entry inventory[128];
-  qa_app_player_ui_item guest_items[SS_UI_ITEMS];
+  char *status_label; size_t status_label_capacity; /* the weapon status label, whole (TS no bound) */
+  qa_inventory_entry *inventory; size_t inventory_capacity; /* guest UI rows, grown to the source inventory (TS no bound) */
+  qa_app_player_ui_item *guest_items; size_t guest_item_capacity;
   qa_compat_q2_native_inventory_readout native_inventory;
 } ss_player_ui_storage;
 static __thread ss_player_ui_storage ss_ui_ring[SS_UI_RING];
+/* The slot's status label buffer, grown to `size` (a weapon_status *_label_size). */
+static char *ss_status_label(ss_player_ui_storage *storage, size_t size) {
+  if (size > storage->status_label_capacity) {
+    char *grown = realloc(storage->status_label, size);
+    if (grown == NULL) qa_range_error("Out of memory");
+    storage->status_label = grown;
+    storage->status_label_capacity = size;
+  }
+  storage->status_label[0] = '\0';
+  return storage->status_label;
+}
 static __thread size_t ss_ui_next;
 static ss_player_ui_storage *ss_ui_slot(void) {
   ss_player_ui_storage *slot = &ss_ui_ring[ss_ui_next++ % SS_UI_RING];
   return slot;
+}
+/* Room for count UI rows in this projection's slot. */
+static qa_app_sim_player_ui_item *ss_ui_rows(ss_player_ui_storage *storage, size_t count) {
+  storage->items = ss_grow(storage->items, &storage->item_capacity, count ? count : 1, sizeof *storage->items);
+  return storage->items;
 }
 static qa_app_sim_player_ui_item ss_ui_item(const qa_app_player_ui_item *item) {
   qa_app_sim_player_ui_item copy = {item->id, item->label, item->kind, item->source_ordinal, item->owned, item->has_ammo,
@@ -2344,6 +2479,7 @@ static void ss_spread_arsenal_ui(qa_app_sim_player_ui *ui, const qa_app_arsenal_
   ui->arsenal_warning = arsenal->arsenal_warning;
   ui->active_weapon = arsenal->active_weapon;
   ui->has_ammo = arsenal->has_ammo; ui->ammo_item = arsenal->ammo_item; ui->ammo_count = arsenal->ammo_count;
+  ss_ui_rows(storage, arsenal->item_count);
   for (size_t i = 0; i < arsenal->item_count; i++) storage->items[i] = ss_ui_item(&arsenal->items[i]);
   ui->items = storage->items; ui->item_count = arsenal->item_count;
 }
@@ -2369,8 +2505,8 @@ static qa_app_sim_q3_timer_client ss_q3_timer_client(qa_q3_game_client *client) 
   return view;
 }
 static qa_app_sim_q3_timer_client ss_q3_timer_client_at(void *ctx, double number) {
-  qa_q3_entity_pool *pool = ctx;
-  return ss_q3_timer_client(number >= 0 && number < QA_Q3_MAX_CLIENTS ? pool->clients[(size_t)number] : NULL);
+  /* source.game.pool.clientAt(clientNumber): RangeError "Game client N is unavailable" for a missing slot. */
+  return ss_q3_timer_client(qa_q3_entity_pool_client_at(ctx, number));
 }
 
 /* ---- primaryUi (6424-6476) ---- */
@@ -2398,7 +2534,8 @@ qa_app_sim_player_ui qa_app_shared_sim_primary_ui(qa_app_shared_simulation *sim,
     ui.powerup_count = quakec_ui.powerup_count < 32 ? quakec_ui.powerup_count : 32;
     ui.active_weapon = quakec_ui.weapon.active_weapon;
     ui.has_ammo = quakec_ui.weapon.has_ammo; ui.ammo_item = quakec_ui.weapon.ammo_item; ui.ammo_count = quakec_ui.weapon.ammo_count;
-    size_t count = quakec_ui.weapon.item_count < SS_UI_ITEMS ? quakec_ui.weapon.item_count : SS_UI_ITEMS;
+    size_t count = quakec_ui.weapon.item_count;
+    ss_ui_rows(storage, count);
     for (size_t i = 0; i < count; i++) storage->items[i] = quakec_ui.weapon.items[i];
     free(quakec_ui.weapon.items);
     ui.items = storage->items; ui.item_count = count;
@@ -2456,7 +2593,8 @@ void qa_ss_q1_arsenal_ui(qa_app_shared_simulation *sim, qa_actor_id actor, const
   ss_player_ui_storage *storage = ui_storage;
   size_t item_count = 0;
   qa_q1_services *game = sim->source.q1_game;
-  for (size_t ordinal = 0; ordinal < 8 + game->registered_weapon_count && item_count < SS_UI_ITEMS; ordinal++) {
+  ss_ui_rows(storage, 8 + game->registered_weapon_count);
+  for (size_t ordinal = 0; ordinal < 8 + game->registered_weapon_count; ordinal++) {
     qa_q1_weapon weapon = ordinal < 8 ? QA_Q1_WEAPONS[ordinal] : game->registered_weapons[ordinal - 8].def->id;
     qa_item_id item = qa_q1_services_weapon_ammo(game, weapon);
     double count = item == NULL ? 0 : ss_count(sim, actor, item);
@@ -2474,7 +2612,8 @@ void qa_ss_q1_arsenal_ui(qa_app_shared_simulation *sim, qa_actor_id actor, const
   qa_q1_player_state *state = qa_q1_player(game, actor);
   if (state != NULL) {
     qa_app_q1_status_host host = {game, ss_q1_status_item, ss_q1_status_ammo, ss_q1_status_count, ss_q1_status_available};
-    storage->weapon_status = qa_app_q1_weapon_status(host, state, sim->weapon_provider, storage->status_label, sizeof storage->status_label);
+    size_t label_size = qa_app_q1_weapon_label_size(state->weapon);
+    storage->weapon_status = qa_app_q1_weapon_status(host, state, sim->weapon_provider, ss_status_label(storage, label_size), label_size);
     ui->weapon_status = &storage->weapon_status;
     qa_item_id item = qa_q1_services_weapon_ammo(game, state->weapon);
     if (item != NULL) { ui->has_ammo = true; ui->ammo_item = item; ui->ammo_count = ss_count(sim, actor, item); }
@@ -2487,7 +2626,8 @@ void qa_ss_q2_arsenal_ui(qa_app_shared_simulation *sim, qa_actor_id actor, const
   ss_actor_ctx count_ctx = {sim, actor};
   size_t list_count = 0;
   const qa_q2_inventory_item *list = qa_q2_item_module_list(sim->source.product->items, &list_count);
-  for (size_t ordinal = 0; ordinal < list_count && item_count < SS_UI_ITEMS; ordinal++) {
+  ss_ui_rows(storage, list_count);
+  for (size_t ordinal = 0; ordinal < list_count; ordinal++) {
     const qa_q2_inventory_item *definition = &list[ordinal];
     if (!definition->usable) continue;
     const qa_q2w_definition *weapon = ss_q2_definition(sim->source.q2_weapons, definition->id);
@@ -2503,7 +2643,8 @@ void qa_ss_q2_arsenal_ui(qa_app_shared_simulation *sim, qa_actor_id actor, const
     entry->warning_count = weapon ? weapon->warning : 0;
   }
   const qa_q2w_definition *weapon = arsenal->active_weapon ? ss_q2_definition(sim->source.q2_weapons, arsenal->active_weapon) : NULL;
-  if (qa_app_q2_weapon_status(weapon, ss_ui_count, &count_ctx, sim->weapon_provider, storage->status_label, sizeof storage->status_label,
+  size_t label_size = qa_app_q2_weapon_label_size(weapon);
+  if (qa_app_q2_weapon_status(weapon, ss_ui_count, &count_ctx, sim->weapon_provider, ss_status_label(storage, label_size), label_size,
           &storage->weapon_status)) ui->weapon_status = &storage->weapon_status;
   if (weapon != NULL && weapon->ammo != NULL) { ui->has_ammo = true; ui->ammo_item = weapon->ammo; ui->ammo_count = ss_count(sim, actor, weapon->ammo); }
   ui->items = storage->items; ui->item_count = item_count;
@@ -2512,13 +2653,13 @@ void qa_ss_q3_arsenal_ui(qa_app_shared_simulation *sim, qa_actor_id actor, const
   ss_player_ui_storage *storage = ui_storage;
   size_t item_count = 0;
   ss_actor_ctx count_ctx = {sim, actor};
-  for (size_t i = 0; i < QA_Q3_WEAPON_ITEM_COUNT && item_count < SS_UI_ITEMS; i++) {
+  ss_ui_rows(storage, QA_Q3_WEAPON_ITEM_COUNT);
+  for (size_t i = 0; i < QA_Q3_WEAPON_ITEM_COUNT; i++) {
     const qa_q3_weapon_item *definition = &qa_q3_weapon_items[i];
-    qa_app_sim_player_ui_item *entry = &storage->items[item_count];
+    qa_app_sim_player_ui_item *entry = &storage->items[item_count++];
     memset(entry, 0, sizeof *entry);
-    snprintf(storage->labels[item_count], 64, "%s", definition->item + strlen("q3:weapon/"));
-    item_count++;
-    entry->id = definition->item; entry->label = storage->labels[item_count - 1]; entry->kind = "weapon";
+    /* definition.item.slice("q3:weapon/".length): a suffix of the static item id */
+    entry->id = definition->item; entry->label = definition->item + strlen("q3:weapon/"); entry->kind = "weapon";
     entry->source_ordinal = definition->weapon; entry->owned = ss_count(sim, actor, definition->item) > 0;
     entry->has_count = definition->ammo != NULL; entry->count = definition->ammo ? ss_count(sim, actor, definition->ammo) : 0;
     entry->has_ammo = !entry->has_count || entry->count > 0; entry->warning_count = 0;
@@ -2526,8 +2667,9 @@ void qa_ss_q3_arsenal_ui(qa_app_shared_simulation *sim, qa_actor_id actor, const
   const qa_q3_weapon_item *definition = qa_ss_is(arsenal->state.kind, "q3") ? qa_q3_get_weapon_item(arsenal->state.source_weapon) : NULL;
   if (definition != NULL && definition->ammo != NULL) { ui->has_ammo = true; ui->ammo_item = definition->ammo; ui->ammo_count = ss_count(sim, actor, definition->ammo); }
   const char *product = qa_app_q3_source_runtime_options(sim->source.q3)->product;
-  if (qa_app_q3_weapon_status(arsenal->active_weapon, product, ss_ui_count, &count_ctx, sim->weapon_provider, storage->status_label,
-          sizeof storage->status_label, &storage->weapon_status)) ui->weapon_status = &storage->weapon_status;
+  size_t label_size = qa_app_q3_weapon_label_size(arsenal->active_weapon, product);
+  if (qa_app_q3_weapon_status(arsenal->active_weapon, product, ss_ui_count, &count_ctx, sim->weapon_provider, ss_status_label(storage, label_size),
+          label_size, &storage->weapon_status)) ui->weapon_status = &storage->weapon_status;
   ui->arsenal_warning = qa_app_q3_arsenal_warning(product, ss_ui_count, &count_ctx);
   ui->items = storage->items; ui->item_count = item_count;
 }
@@ -2537,7 +2679,8 @@ void qa_ss_q3_arsenal_ui(qa_app_shared_simulation *sim, qa_actor_id actor, const
 static double ss_constant_count(void *ctx, qa_item_id item) { (void)item; return *(const double *)ctx; }
 static const qa_weapon_hud_status *ss_rerelease_status(void *ctx, const qa_q2w_definition *definition, double ammo, qa_provider_reference source) {
   ss_player_ui_storage *storage = ctx;
-  if (!qa_app_q2_weapon_status(definition, ss_constant_count, &ammo, source, storage->status_label, sizeof storage->status_label,
+  size_t label_size = qa_app_q2_weapon_label_size(definition);
+  if (!qa_app_q2_weapon_status(definition, ss_constant_count, &ammo, source, ss_status_label(storage, label_size), label_size,
           &storage->weapon_status)) return NULL;
   return &storage->weapon_status;
 }
@@ -2558,8 +2701,18 @@ qa_app_sim_player_ui qa_ss_q3_qvm_guest_ui(qa_app_shared_simulation *sim, qa_act
   qa_item_id active = sim->source.qvm_weapons != NULL ? qa_qvm_primary_weapons_active(sim->source.qvm_weapons, actor) : NULL;
   qa_app_guest_player_ui scratch; memset(&scratch, 0, sizeof scratch);
   scratch.powerups = storage->powerups; scratch.powerup_capacity = 32;
-  scratch.inventory = storage->inventory; scratch.inventory_capacity = 128;
-  scratch.items = storage->guest_items; scratch.item_capacity = SS_UI_ITEMS;
+  /* The guest UI copies the source inventory whole, or derives a weapon and an ammo row per catalog weapon. */
+  size_t inventory_need = inventory_count + 2 * (catalog_count + QA_Q3_STANDARD_GUEST_WEAPON_COUNT + QA_Q3_BASE_GUEST_WEAPON_COUNT);
+  if (storage->inventory_capacity < inventory_need) {
+    qa_inventory_entry *grown = realloc(storage->inventory, inventory_need * sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    storage->inventory = grown; storage->inventory_capacity = inventory_need;
+  }
+  scratch.inventory = storage->inventory; scratch.inventory_capacity = storage->inventory_capacity;
+  /* A guest UI row per catalog weapon, or per standard/base guest weapon without a catalog. */
+  storage->guest_items = ss_grow(storage->guest_items, &storage->guest_item_capacity,
+      catalog_count + QA_Q3_STANDARD_GUEST_WEAPON_COUNT + QA_Q3_BASE_GUEST_WEAPON_COUNT + 1, sizeof *storage->guest_items);
+  scratch.items = storage->guest_items; scratch.item_capacity = storage->guest_item_capacity;
   qa_app_guest_player_ui original = qa_app_q3_guest_player_ui(state.state, sim->recipe.map.entities, qa_app_shared_sim_time_seconds(sim) * 1000,
       catalog, catalog_count, product, inventory, inventory_count, sim->source.qvm_inventory != NULL, active, sim->source.qvm_weapons != NULL, scratch);
   qa_app_sim_player_ui ui; memset(&ui, 0, sizeof ui);
@@ -2569,6 +2722,7 @@ qa_app_sim_player_ui qa_ss_q3_qvm_guest_ui(qa_app_shared_simulation *sim, qa_act
   ui.inventory = original.inventory; ui.inventory_count = original.inventory_count;
   if (original.has_weapon_status) { storage->weapon_status = original.weapon_status; ui.weapon_status = &storage->weapon_status; }
   ui.arsenal_warning = original.arsenal_warning;
+  ss_ui_rows(storage, original.item_count);
   for (size_t i = 0; i < original.item_count; i++) storage->items[i] = ss_ui_item(&original.items[i]);
   ui.items = storage->items; ui.item_count = original.item_count;
   if (ss_sel_has(sim, actor)) {
@@ -2621,20 +2775,53 @@ qa_app_sim_player_ui qa_app_shared_sim_native_player_ui(qa_app_shared_simulation
 }
 
 /* ---- slotProjection (5709-5741) ---- */
-#define SS_SLOT_SOURCES 8
+/* The per-source rows grow to the slot's sources and weapons (TS arrays have no bound); a ring entry keeps its
+ * buffers for reuse. A projection stays valid until SS_UI_RING later projections on the thread (nested reads). */
+typedef struct ss_slot_buffers {
+  qa_weapon_reference *source_active, *source_pending;
+  qa_app_sim_source_weapon_projection *sources;
+  qa_app_simulation_presentation *models; /* one per source, then the equipment's */
+  qa_weapon_hud_status *statuses;
+  size_t source_capacity;
+  qa_app_sim_player_ui_item *items; size_t item_capacity; /* every source's weapon rows, in source order */
+} ss_slot_buffers;
 typedef struct ss_slot_storage {
   qa_app_sim_weapon_slot_projection projection; /* ui.items malloc'd by the projection */
   qa_weapon_reference primary_active, primary_pending;
-  qa_weapon_reference source_active[SS_SLOT_SOURCES], source_pending[SS_SLOT_SOURCES];
-  qa_app_sim_source_weapon_projection sources[SS_SLOT_SOURCES];
-  qa_app_simulation_presentation models[SS_SLOT_SOURCES + 1];
-  qa_weapon_hud_status statuses[SS_SLOT_SOURCES];
-  qa_app_sim_player_ui_item items[SS_SLOT_SOURCES][32];
-  qa_app_sim_presentation_attachment attachments[8];
   qa_app_sim_equipment_weapon_projection equipment;
+  qa_app_sim_weapon_slot_projection_scratch scratch;
+  ss_slot_buffers buffers;
 } ss_slot_storage;
 static __thread ss_slot_storage ss_slot_ring[SS_UI_RING];
 static __thread size_t ss_slot_next;
+static void *ss_slot_reserve(void *items, size_t count, size_t size) {
+  void *grown = realloc(items, (count ? count : 1) * size);
+  if (grown == NULL) qa_range_error("Out of memory");
+  return grown;
+}
+static void ss_slot_reserve_sources(ss_slot_buffers *buffers, size_t count) {
+  if (count <= buffers->source_capacity) return;
+  buffers->source_active = ss_slot_reserve(buffers->source_active, count, sizeof *buffers->source_active);
+  buffers->source_pending = ss_slot_reserve(buffers->source_pending, count, sizeof *buffers->source_pending);
+  buffers->sources = ss_slot_reserve(buffers->sources, count, sizeof *buffers->sources);
+  buffers->models = ss_slot_reserve(buffers->models, count + 1, sizeof *buffers->models);
+  buffers->statuses = ss_slot_reserve(buffers->statuses, count, sizeof *buffers->statuses);
+  buffers->source_capacity = count;
+}
+/* The equipment model's attachments as presentation rows: one converted copy per source array (the grapple
+ * presentation profile owns those for the simulation's life), so the presentation list that copies the model keeps a
+ * valid pointer after later projections reuse their ring entries. */
+static const qa_app_sim_presentation_attachment *ss_slot_attachments(qa_app_shared_simulation *sim, const qa_qvm_grapple_view_attachment *source,
+    size_t count) {
+  if (sim->b2_slot_attachments.value_size == 0) qa_ss_map_init(&sim->b2_slot_attachments, QA_SS_KEY_POINTER, sizeof(qa_app_sim_presentation_attachment *));
+  qa_app_sim_presentation_attachment **kept = qa_ss_map_get(&sim->b2_slot_attachments, &source);
+  if (kept != NULL) return *kept;
+  qa_app_sim_presentation_attachment *rows = calloc(count ? count : 1, sizeof *rows);
+  if (rows == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < count; i++) rows[i] = (qa_app_sim_presentation_attachment){source[i].path, source[i].tag};
+  qa_ss_map_set(&sim->b2_slot_attachments, &source, &rows);
+  return rows;
+}
 static qa_game_family ss_content_family(qa_content_id content) {
   return strncmp(content, "q1:", 3) == 0 ? QA_GAME_FAMILY_Q1 : strncmp(content, "q2:", 3) == 0 ? QA_GAME_FAMILY_Q2 : QA_GAME_FAMILY_Q3;
 }
@@ -2642,7 +2829,9 @@ qa_app_sim_weapon_slot_projection qa_app_shared_sim_slot_projection(qa_app_share
     const qa_app_simulation_presentation *model) {
   ss_slot_storage *storage = &ss_slot_ring[ss_slot_next++ % SS_UI_RING];
   free((void *)storage->projection.ui.items);
+  ss_slot_buffers buffers = storage->buffers;
   memset(storage, 0, sizeof *storage);
+  storage->buffers = buffers;
   bool native = sim->strategy->has_guest_ui(sim);
   qa_app_sim_movement_player *player = native ? NULL : qa_app_shared_sim_require_player(sim, actor);
   qa_app_sim_player_ui ui = native ? sim->strategy->guest_ui(sim, actor) : qa_app_shared_sim_primary_ui(sim, actor);
@@ -2670,21 +2859,30 @@ qa_app_sim_weapon_slot_projection qa_app_shared_sim_slot_projection(qa_app_share
   primary.ui = ui; primary.model = model;
   if (slot == NULL) { storage->projection = primary; storage->projection.ui.items = NULL; return primary; }
   qa_app_sim_player_view view = qa_app_shared_sim_player_view(sim, actor);
-  qa_vec3 eye = qa_ss_add(view.origin, (qa_vec3){0, 0, view.view_height});
+  qa_vec3 eye = qa_add3(view.origin, (qa_vec3){0, 0, view.view_height});
   bool visible_owner = ui.health > 0 && (player == NULL || (!player->intermission && !player->has_cutscene));
   size_t presentation_count = 0;
   const qa_source_weapon_presentation *presentations = qa_app_sim_weapon_slot_presentations(slot, &presentation_count);
-  if (presentation_count > SS_SLOT_SOURCES) ss_fail("Weapon slot has more sources than the projection holds");
+  ss_slot_buffers *rows = &storage->buffers;
+  ss_slot_reserve_sources(rows, presentation_count);
+  memset(rows->sources, 0, (presentation_count ? presentation_count : 1) * sizeof *rows->sources);
+  memset(rows->models, 0, (presentation_count + 1) * sizeof *rows->models);
+  memset(rows->statuses, 0, (presentation_count ? presentation_count : 1) * sizeof *rows->statuses);
+  size_t weapon_total = 0;
+  for (size_t i = 0; i < presentation_count; i++)
+    for (size_t j = 0; j < presentations[i].item_count; j++) if (presentations[i].items[j].is_weapon) weapon_total++;
+  if (weapon_total > rows->item_capacity) { rows->items = ss_slot_reserve(rows->items, weapon_total, sizeof *rows->items); rows->item_capacity = weapon_total; }
+  size_t item_base = 0;
   for (size_t i = 0; i < presentation_count; i++) {
     const qa_source_weapon_presentation *source = &presentations[i];
-    qa_app_sim_source_weapon_projection *projected = &storage->sources[i];
+    qa_app_sim_source_weapon_projection *projected = &rows->sources[i];
     const qa_source_item_definition *active = NULL;
     size_t definition_count = 0;
     for (size_t j = 0; j < source->item_count; j++) if (source->items[j].is_weapon) {
       const qa_source_item_definition *definition = &source->items[j];
       if (active == NULL && source->active != NULL && qa_ss_is(definition->item, source->active)) active = definition;
-      if (definition_count == 32) ss_fail("Weapon slot source has more weapons than the projection holds");
-      qa_app_sim_player_ui_item *item = &storage->items[i][definition_count];
+      qa_app_sim_player_ui_item *item = &rows->items[item_base + definition_count];
+      memset(item, 0, sizeof *item);
       item->id = definition->item; item->label = definition->label; item->kind = "weapon";
       item->source_ordinal = (double)(ui.item_count + definition_count);
       item->owned = ss_count(sim, actor, definition->item) > 0;
@@ -2695,11 +2893,11 @@ qa_app_sim_weapon_slot_projection qa_app_shared_sim_slot_projection(qa_app_share
     }
     qa_item_id ammo_item = active ? active->weapon.ammo : NULL;
     projected->provider = source->source.provider;
-    if (source->active != NULL) { storage->source_active[i] = (qa_weapon_reference){source->source.provider, source->active}; projected->active = &storage->source_active[i]; }
-    if (source->pending != NULL) { storage->source_pending[i] = (qa_weapon_reference){source->source.provider, source->pending}; projected->pending = &storage->source_pending[i]; }
+    if (source->active != NULL) { rows->source_active[i] = (qa_weapon_reference){source->source.provider, source->active}; projected->active = &rows->source_active[i]; }
+    if (source->pending != NULL) { rows->source_pending[i] = (qa_weapon_reference){source->source.provider, source->pending}; projected->pending = &rows->source_pending[i]; }
     if (ammo_item != NULL) { projected->has_ammo = true; projected->ammo_item = ammo_item; projected->ammo_count = ss_count(sim, actor, ammo_item); }
     if (active != NULL) {
-      qa_weapon_hud_status *status = &storage->statuses[i];
+      qa_weapon_hud_status *status = &rows->statuses[i];
       status->source = source->source; status->item = active->item; status->label = active->label;
       status->ammo_is_finite = ammo_item != NULL;
       if (ammo_item != NULL) { status->ammo_item = ammo_item; status->ammo_count = projected->ammo_count; status->has_ammo_to_start = projected->ammo_count > 0; status->low = false; }
@@ -2708,7 +2906,7 @@ qa_app_sim_weapon_slot_projection qa_app_shared_sim_slot_projection(qa_app_share
     const qa_source_weapon_presentation_model *asset = source->model;
     const qa_held_weapon_declaration *held = active ? active->weapon.held : NULL;
     if (asset != NULL || held != NULL) {
-      qa_app_simulation_presentation *presentation = &storage->models[i];
+      qa_app_simulation_presentation *presentation = &rows->models[i];
       presentation->actor = actor; presentation->content = source->source.content; presentation->held_weapon = held;
       presentation->family = ss_content_family(source->source.content);
       presentation->path = asset == NULL ? "" : asset->is_resolved ? asset->resource.requested_path : asset->path;
@@ -2720,10 +2918,11 @@ qa_app_sim_weapon_slot_projection qa_app_shared_sim_slot_projection(qa_app_share
         qa_app_sim_simulation_events_register_resource(sim->events, source->source.content, asset->resource.requested_path, asset->resource);
       projected->model = presentation;
     }
-    projected->items = storage->items[i]; projected->item_count = definition_count;
+    projected->items = &rows->items[item_base]; projected->item_count = definition_count;
+    item_base += definition_count;
   }
   if (grapple == NULL || !qa_ss_is(qa_app_sim_grapple_runtime_selection(grapple)->binding, "slot")) {
-    storage->projection = qa_app_sim_project_weapon_slot(qa_app_sim_weapon_slot_snapshot(slot), primary, NULL, storage->sources, presentation_count);
+    storage->projection = qa_app_sim_project_weapon_slot(qa_app_sim_weapon_slot_snapshot(slot), primary, NULL, rows->sources, presentation_count, &storage->scratch);
     return storage->projection;
   }
   const qa_grapple_selection *selection = qa_app_sim_grapple_runtime_selection(grapple);
@@ -2733,14 +2932,13 @@ qa_app_sim_weapon_slot_projection qa_app_shared_sim_slot_projection(qa_app_share
   qa_weapon_reference weapon = qa_app_sim_grapple_runtime_weapon(grapple);
   qa_app_simulation_presentation *gear_model = NULL;
   if (has_gear) {
-    gear_model = &storage->models[SS_SLOT_SOURCES];
+    gear_model = &rows->models[presentation_count];
     gear_model->actor = actor; gear_model->content = selection->source.content;
     gear_model->family = qa_ss_is(grapple_source->kind, "q1-threewave") ? QA_GAME_FAMILY_Q1 : qa_ss_is(grapple_source->kind, "q3-qvm") ? QA_GAME_FAMILY_Q3 : QA_GAME_FAMILY_Q2;
     gear_model->path = gear.path; gear_model->frame = gear.frame; gear_model->old_frame = gear.frame;
     if (gear.model_attachments != NULL) {
-      size_t count = gear.model_attachment_count < 8 ? gear.model_attachment_count : 8;
-      for (size_t i = 0; i < count; i++) storage->attachments[i] = (qa_app_sim_presentation_attachment){gear.model_attachments[i].path, gear.model_attachments[i].tag};
-      gear_model->model_attachments = storage->attachments; gear_model->model_attachment_count = count;
+      gear_model->model_attachments = ss_slot_attachments(sim, gear.model_attachments, gear.model_attachment_count);
+      gear_model->model_attachment_count = gear.model_attachment_count;
     }
     if (gear.has_q3) {
       gear_model->model_anchor = gear.model_anchor;
@@ -2749,10 +2947,10 @@ qa_app_sim_weapon_slot_projection qa_app_shared_sim_slot_projection(qa_app_share
       gear_model->q3_weapon_horizontal_speed = gear.q3_horizontal_speed; gear_model->q3_weapon_bob_cycle = gear.q3_bob_cycle;
       gear_model->q3_weapon_weapon = gear.q3_weapon;
     }
-    gear_model->origin = qa_ss_add(eye, gear.kick_origin);
+    gear_model->origin = qa_add3(eye, gear.kick_origin);
     gear_model->has_view_origin = true; gear_model->view_origin = eye;
     gear_model->has_view_angles = true; gear_model->view_angles = view.angles;
-    gear_model->angles = qa_ss_add(view.angles, (qa_vec3){gear.kick_pitch, 0, 0});
+    gear_model->angles = qa_add3(view.angles, (qa_vec3){gear.kick_pitch, 0, 0});
     gear_model->scale = 1; gear_model->visible = visible_owner; gear_model->view_weapon = true;
   }
   qa_app_sim_equipment_weapon_projection *equipment = &storage->equipment;
@@ -2762,7 +2960,7 @@ qa_app_sim_weapon_slot_projection qa_app_shared_sim_slot_projection(qa_app_share
   equipment->item.owned = ss_count(sim, actor, weapon.item) > 0; equipment->item.has_ammo = true; equipment->item.has_count = false;
   equipment->item.warning_count = 0;
   equipment->model = gear_model;
-  storage->projection = qa_app_sim_project_weapon_slot(qa_app_sim_weapon_slot_snapshot(slot), primary, equipment, storage->sources, presentation_count);
+  storage->projection = qa_app_sim_project_weapon_slot(qa_app_sim_weapon_slot_snapshot(slot), primary, equipment, rows->sources, presentation_count, &storage->scratch);
   return storage->projection;
 }
 /* ---- playerUi (5870) ---- */
@@ -2810,16 +3008,33 @@ void qa_app_shared_sim_use_selected_inventory_item(qa_app_shared_simulation *sim
 /* "Ambiguous <noun>; use a, b\n" */
 static void ss_print_ambiguous(qa_app_shared_simulation *sim, qa_actor_id actor, const char *noun, const qa_source_item_named_entry *rows,
     const size_t *indices, size_t count) {
-  char text[2048]; size_t length = (size_t)snprintf(text, sizeof text, "Ambiguous %s; use ", noun);
-  for (size_t i = 0; i < count && length < sizeof text; i++)
-    length += (size_t)snprintf(text + length, sizeof text - length, "%s%s", i ? ", " : "", rows[indices[i]].item);
-  if (length < sizeof text) snprintf(text + length, sizeof text - length, "\n");
+  /* The whole list (TS template string). */
+  size_t size = strlen("Ambiguous ") + strlen(noun) + strlen("; use ") + 2;
+  for (size_t i = 0; i < count; i++) size += strlen(rows[indices[i]].item) + 2;
+  char *text = malloc(size);
+  if (text == NULL) qa_range_error("Out of memory");
+  size_t length = (size_t)snprintf(text, size, "Ambiguous %s; use ", noun);
+  for (size_t i = 0; i < count; i++) length += (size_t)snprintf(text + length, size - length, "%s%s", i ? ", " : "", rows[indices[i]].item);
+  snprintf(text + length, size - length, "\n");
+  qa_cleanup text_cleanup; qa_cleanup_push(&text_cleanup, free, text);
   ss_print_to(sim, actor, text);
+  qa_cleanup_pop(&text_cleanup);
+  free(text);
 }
 /* args.join(" ") */
-static void ss_join(const char *const *args, size_t count, char *out, size_t capacity) {
-  size_t length = 0; out[0] = '\0';
-  for (size_t i = 0; i < count && length < capacity; i++) length += (size_t)snprintf(out + length, capacity - length, "%s%s", i ? " " : "", args[i]);
+/* Malloc'd args.join(" "), whole. */
+static char *ss_join(const char *const *args, size_t count) {
+  size_t length = 0;
+  for (size_t i = 0; i < count; i++) length += strlen(args[i]) + (i ? 1 : 0);
+  char *out = malloc(length + 1);
+  if (out == NULL) qa_range_error("Out of memory");
+  size_t at = 0;
+  for (size_t i = 0; i < count; i++) {
+    if (i) out[at++] = ' ';
+    size_t n = strlen(args[i]); memcpy(out + at, args[i], n); at += n;
+  }
+  out[at] = '\0';
+  return out;
 }
 
 /* ---- selectedWeaponCommand (7764-7776) ---- */
@@ -2828,16 +3043,21 @@ bool qa_app_shared_sim_selected_weapon_command(qa_app_shared_simulation *sim, qa
   if (!sim->has_selected_arsenal || !(qa_ss_is(name, "use") || qa_ss_is(name, "weapon") || qa_ss_is(name, "weapnext") || qa_ss_is(name, "weapprev")))
     return false;
   qa_app_sim_player_ui ui = qa_app_shared_sim_player_ui(sim, actor);
-  qa_source_item_named_entry owned[SS_UI_ITEMS]; size_t owned_count = 0;
-  for (size_t i = 0; i < ui.item_count && owned_count < SS_UI_ITEMS; i++)
+  /* Thread-local rows grown to the UI (TS arrays have no bound); valid until the next command. */
+  static __thread qa_source_item_named_entry *owned; static __thread size_t owned_capacity;
+  static __thread size_t *indices; static __thread size_t index_capacity;
+  owned = ss_grow(owned, &owned_capacity, ui.item_count + 1, sizeof *owned);
+  indices = ss_grow(indices, &index_capacity, ui.item_count + 1, sizeof *indices);
+  size_t owned_count = 0;
+  for (size_t i = 0; i < ui.item_count; i++)
     if (qa_ss_is(ui.items[i].kind, "weapon") && ui.items[i].owned) owned[owned_count++] = (qa_source_item_named_entry){ui.items[i].id, ui.items[i].label};
   if (sim->strategy->forwards_commands(sim) && qa_ss_is(name, "use")) return false;
   bool named = qa_ss_is(name, "use") || qa_ss_is(name, "weapon");
   const qa_source_item_named_entry *selected = NULL;
   if (named) {
-    char text[1024]; ss_join(args, arg_count, text, sizeof text);
-    size_t indices[SS_UI_ITEMS];
-    qa_source_item_named_result choice = qa_source_item_named(owned, owned_count, text, NULL, indices, SS_UI_ITEMS);
+    char *text = ss_join(args, arg_count);
+    qa_source_item_named_result choice = qa_source_item_named(owned, owned_count, text, NULL, indices, index_capacity);
+    free(text);
     if (choice.kind == QA_SOURCE_ITEM_NAMED_AMBIGUOUS) { ss_print_ambiguous(sim, actor, "weapon", owned, indices, choice.match_count); return true; }
     if (choice.kind == QA_SOURCE_ITEM_NAMED_MATCH) selected = &owned[choice.item_index];
   } else if (owned_count != 0) {
@@ -2860,18 +3080,25 @@ bool qa_app_shared_sim_source_item_command(qa_app_shared_simulation *sim, qa_act
     const char *const *args, size_t arg_count) {
   if (sim->strategy->forwards_commands(sim) || (!qa_ss_is(name, "use") && !qa_ss_is(name, "drop"))) return false;
   qa_owned_actor owner; bool owned = ss_owned(sim, actor, &owner);
-  qa_app_q3_source_inventory_row equipment[64]; size_t equipment_count = 0;
+  /* Thread-local rows grown to the sources (TS arrays have no bound); valid until the next command. */
+  static __thread qa_app_q3_source_inventory_row *equipment; static __thread size_t equipment_capacity;
+  static __thread qa_source_item_named_entry *rows; static __thread size_t row_capacity;
+  static __thread size_t *indices; static __thread size_t index_capacity;
+  size_t equipment_count = 0;
   if (owned && sim->selected_q3_source != NULL) {
-    equipment_count = qa_app_q3_selected_source_inventory(sim->selected_q3_source, owner, equipment, 64);
-    if (equipment_count > 64) equipment_count = 64;
+    equipment_count = qa_app_q3_selected_source_inventory(sim->selected_q3_source, owner, NULL, 0);
+    equipment = ss_grow(equipment, &equipment_capacity, equipment_count + 1, sizeof *equipment);
+    equipment_count = qa_app_q3_selected_source_inventory(sim->selected_q3_source, owner, equipment, equipment_count);
   }
   size_t definition_count = 0;
   const qa_source_item_definition *definitions = qa_shared_inventory_table_item_definitions(sim->inventory, actor, &definition_count);
   if (definition_count == 0 && equipment_count == 0) return false;
   qa_app_sim_player_ui ui = qa_app_shared_sim_player_ui(sim, actor);
   /* [...new Map([...primary, ...equipment, ...definitions].map(item => [item.item, item])).values()] */
-  qa_source_item_named_entry rows[2 * SS_UI_ITEMS + 64]; size_t row_count = 0;
-  const size_t capacity = sizeof rows / sizeof rows[0];
+  size_t row_count = 0;
+  const size_t capacity = ui.item_count + equipment_count + definition_count + 1;
+  rows = ss_grow(rows, &row_capacity, capacity, sizeof *rows);
+  indices = ss_grow(indices, &index_capacity, capacity, sizeof *indices);
   for (size_t pass = 0; pass < 3; pass++) {
     size_t count = pass == 0 ? ui.item_count : pass == 1 ? equipment_count : definition_count;
     for (size_t i = 0; i < count; i++) {
@@ -2879,13 +3106,13 @@ bool qa_app_shared_sim_source_item_command(qa_app_shared_simulation *sim, qa_act
           : pass == 1 ? (qa_source_item_named_entry){equipment[i].item, equipment[i].label} : (qa_source_item_named_entry){definitions[i].item, definitions[i].label};
       size_t at = row_count;
       for (size_t j = 0; j < row_count; j++) if (qa_ss_is(rows[j].item, row.item)) { at = j; break; }
-      if (at == row_count) { if (row_count == capacity) ss_fail("Source item rows exceed the command capacity"); row_count++; }
+      if (at == row_count) row_count++;
       rows[at] = row;
     }
   }
-  char text[1024]; ss_join(args, arg_count, text, sizeof text);
-  size_t indices[2 * SS_UI_ITEMS + 64];
+  char *text = ss_join(args, arg_count);
   qa_source_item_named_result choice = qa_source_item_named(rows, row_count, text, NULL, indices, capacity);
+  free(text);
   if (choice.kind == QA_SOURCE_ITEM_NAMED_AMBIGUOUS) { ss_print_ambiguous(sim, actor, "item", rows, indices, choice.match_count); return true; }
   if (choice.kind != QA_SOURCE_ITEM_NAMED_MATCH) return false;
   const qa_source_item_named_entry *item = &rows[choice.item_index];
@@ -2901,9 +3128,16 @@ bool qa_app_shared_sim_source_item_command(qa_app_shared_simulation *sim, qa_act
   bool in_equipment = false;
   for (size_t i = 0; i < equipment_count; i++) if (qa_ss_is(equipment[i].item, item->item)) { in_equipment = true; break; }
   if (definition == NULL && !in_equipment) return false;
-  char message[512];
-  snprintf(message, sizeof message, "%s cannot be %s.\n", item->label, qa_ss_is(name, "use") ? "used" : "dropped");
+  /* The whole label (TS template string). */
+  const char *verb = qa_ss_is(name, "use") ? "used" : "dropped", *label = item->label != NULL ? item->label : "";
+  size_t size = strlen(label) + strlen(" cannot be .\n") + strlen(verb) + 1;
+  char *message = malloc(size);
+  if (message == NULL) qa_range_error("Out of memory");
+  snprintf(message, size, "%s cannot be %s.\n", label, verb);
+  qa_cleanup message_cleanup; qa_cleanup_push(&message_cleanup, free, message);
   ss_print_to(sim, actor, message);
+  qa_cleanup_pop(&message_cleanup);
+  free(message);
   return true;
 }
 
@@ -2939,17 +3173,19 @@ qa_item_id qa_app_shared_sim_native_drop_ammo_source(qa_app_shared_simulation *s
 
 /* ---- giveSelectedItem (7714-7758) ---- */
 /* value.toLowerCase().replaceAll(" ", "").replaceAll("_", "") */
-static void ss_normalize(const char *value, char *out, size_t capacity) {
+static char *ss_normalize(const char *value) {
+  char *out = qa_js_to_lower_case(value);
+  if (out == NULL) qa_range_error("Out of memory");
   size_t length = 0;
-  for (const char *c = value; *c != '\0' && length + 1 < capacity; c++) {
-    if (*c == ' ' || *c == '_') continue;
-    out[length++] = (*c >= 'A' && *c <= 'Z') ? (char)(*c - 'A' + 'a') : *c;
-  }
+  for (const char *c = out; *c != '\0'; c++) if (*c != ' ' && *c != '_') out[length++] = *c;
   out[length] = '\0';
+  return out;
 }
 static bool ss_normalized_equal(const char *a, const char *b) {
-  char left[256], right[256]; ss_normalize(a, left, sizeof left); ss_normalize(b, right, sizeof right);
-  return strcmp(left, right) == 0;
+  char *left = ss_normalize(a), *right = ss_normalize(b);
+  bool equal = strcmp(left, right) == 0;
+  free(left); free(right);
+  return equal;
 }
 static bool ss_q1_registered(qa_q1_services *game, qa_q1_weapon weapon) {
   for (size_t i = 0; i < game->registered_weapon_count; i++) if (qa_ss_is(game->registered_weapons[i].def->id, weapon)) return true;
@@ -2987,6 +3223,8 @@ void qa_ss_q2_granted_weapon(qa_app_shared_simulation *sim, qa_owned_actor owner
   }
   ss_sel_pickup_weapons(sim, owner, destinations, destination_count, QA_PICKUP_SELECTION_BETTER);
 }
+static bool ss_give_selected_text(qa_app_shared_simulation *sim, qa_actor_id actor, qa_owned_actor owner, const char *requested,
+    bool has_quantity, double quantity);
 bool qa_app_shared_sim_give_selected_item(qa_app_shared_simulation *sim, qa_actor_id actor, const char *const *args, size_t arg_count) {
   if (!sim->has_selected_arsenal) return false;
   qa_owned_actor owner;
@@ -2999,8 +3237,19 @@ bool qa_app_shared_sim_give_selected_item(qa_app_shared_simulation *sim, qa_acto
     for (const char *c = digits; *c != '\0'; c++) if (*c < '0' || *c > '9') numeric = false;
     if (numeric) { has_quantity = true; quantity = qa_js_string_to_number(last); }
   }
-  char requested[1024]; ss_join(args, has_quantity ? arg_count - 1 : arg_count, requested, sizeof requested);
-  for (char *c = requested; *c != '\0'; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+  /* (quantity === null ? args : args.slice(0, -1)).join(" ").toLowerCase(), whole */
+  char *joined = ss_join(args, has_quantity ? arg_count - 1 : arg_count);
+  char *requested = qa_js_to_lower_case(joined);
+  free(joined);
+  if (requested == NULL) qa_range_error("Out of memory");
+  qa_cleanup requested_node; qa_cleanup_push(&requested_node, free, requested);
+  bool granted = ss_give_selected_text(sim, actor, owner, requested, has_quantity, quantity);
+  qa_cleanup_pop(&requested_node);
+  free(requested);
+  return granted;
+}
+static bool ss_give_selected_text(qa_app_shared_simulation *sim, qa_actor_id actor, qa_owned_actor owner, const char *requested,
+    bool has_quantity, double quantity) {
   if (sim->selected_q3_source != NULL && qa_app_q3_selected_source_give_holdable(sim->selected_q3_source, owner, requested)) return true;
   qa_arsenal_state state = ss_sel_read(sim, actor);
   qa_app_arsenal_ui ui = ss_sel_ui(sim, actor, sim->recipe.map.entities, &ss_give_ui);
@@ -3026,9 +3275,13 @@ bool qa_app_shared_sim_give_selected_item(qa_app_shared_simulation *sim, qa_acto
     if (destinations == NULL) {
       if ((has_source_item && (source_item.weapon || qa_ss_is(source_item.kind, "ammo"))) || strncmp(requested, "q1:weapon/", 10) == 0
           || strncmp(requested, "q1:ammo/", 8) == 0 || strncmp(requested, "rogue:ammo/", 11) == 0) {
-        char message[1200];
-        snprintf(message, sizeof message, "No selected-arsenal grant mapping for %s\n", has_source_item ? source_item.name : requested);
+        const char *subject = has_source_item ? source_item.name : requested;
+        char *message = malloc(strlen(subject) + 40);
+        if (message == NULL) qa_range_error("Out of memory");
+        sprintf(message, "No selected-arsenal grant mapping for %s\n", subject);
+        qa_cleanup message_node; qa_cleanup_push(&message_node, free, message);
         ss_print_to(sim, actor, message);
+        qa_cleanup_pop(&message_node); free(message);
         return true;
       }
       return false;
@@ -3094,15 +3347,42 @@ const qa_q3_character_view *qa_app_shared_sim_character_views(qa_app_shared_simu
 }
 
 /* ---- player->arsenal ownership: a selected read's ammo array is malloc'd;
- * the one a player holds is adopted here and freed when replaced. ---- */
+ * the one a player holds is adopted here. A replaced array is not freed at
+ * once: TS arrays are values, and a caller may still hold the previous
+ * arsenal (a movement input's arsenal is written back as the result's when no
+ * weapon hook replaced it, after a touch's weaponChanged refreshed the
+ * player). Adopted arrays are freed at the next step's start once no
+ * player's arsenal references them, and with the simulation. ---- */
 void qa_app_shared_sim_store_player_arsenal(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player, qa_arsenal_state arsenal) {
-  if (sim->b2_player_ammo.value_size == 0) qa_ss_map_init(&sim->b2_player_ammo, QA_SS_KEY_ACTOR, sizeof(qa_inventory_entry *));
-  qa_actor_id actor = player->actor.id;
-  qa_inventory_entry **kept = qa_ss_map_get(&sim->b2_player_ammo, &actor);
-  qa_inventory_entry *ammo = (qa_inventory_entry *)arsenal.ammo;
-  if (kept != NULL && *kept != ammo) free(*kept);
-  qa_ss_map_set(&sim->b2_player_ammo, &actor, &ammo);
+  void *ammo = (void *)arsenal.ammo;
+  bool adopted = ammo == NULL;
+  for (size_t i = 0; i < sim->b2_adopted_count && !adopted; i++) adopted = sim->b2_adopted_ammo[i] == ammo;
+  if (!adopted) {
+    if (sim->b2_adopted_count == sim->b2_adopted_capacity) {
+      size_t capacity = sim->b2_adopted_capacity ? sim->b2_adopted_capacity * 2 : 16;
+      void **grown = realloc(sim->b2_adopted_ammo, capacity * sizeof *grown);
+      if (grown == NULL) { free(ammo); qa_range_error("Out of memory"); }
+      sim->b2_adopted_ammo = grown; sim->b2_adopted_capacity = capacity;
+    }
+    sim->b2_adopted_ammo[sim->b2_adopted_count++] = ammo;
+  }
   player->arsenal = arsenal;
+}
+void qa_app_shared_sim_assign_player_arsenal(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player) {
+  qa_arsenal_state arsenal = qa_app_shared_sim_arsenal(sim, player);
+  if (sim->has_selected_arsenal) qa_app_shared_sim_store_player_arsenal(sim, player, arsenal);
+  else player->arsenal = arsenal;
+}
+void qa_app_shared_sim_collect_player_arsenals(qa_app_shared_simulation *sim) {
+  size_t kept = 0;
+  for (size_t i = 0; i < sim->b2_adopted_count; i++) {
+    void *ammo = sim->b2_adopted_ammo[i];
+    bool referenced = false;
+    for (size_t j = 0; j < sim->player_states.count && !referenced; j++)
+      referenced = (*(qa_app_sim_movement_player **)qa_ss_map_value_at(&sim->player_states, j))->arsenal.ammo == ammo;
+    if (referenced) sim->b2_adopted_ammo[kept++] = ammo; else free(ammo);
+  }
+  sim->b2_adopted_count = kept;
 }
 
 /* ======== B2 rows ported by runtime-b2b ======== */
@@ -3402,7 +3682,7 @@ void qa_app_shared_sim_selected_q3_client_changed(qa_app_shared_simulation *sim,
   if (!changed_angles && delta.x == 0 && delta.y == 0 && delta.z == 0) return;
   qa_movement_state state = qa_app_sim_movement_player_read_state(player);
   qa_vec3 turn = {delta.x * 360 / 65536, delta.y * 360 / 65536, delta.z * 360 / 65536};
-  qa_vec3 angles = changed_angles ? after.view_angles : qa_ss_add(player->view_angles, turn);
+  qa_vec3 angles = changed_angles ? after.view_angles : qa_add3(player->view_angles, turn);
   player->view_angles = angles;
   if (state.kind == QA_MOVEMENT_STATE_Q3) {
     state.as.q3.view_angles = angles;
@@ -3411,7 +3691,7 @@ void qa_app_shared_sim_selected_q3_client_changed(qa_app_shared_simulation *sim,
   } else if (state.kind == QA_MOVEMENT_STATE_Q2) {
     state.as.q2.delta_angle_shorts.values[0] += delta.x; state.as.q2.delta_angle_shorts.values[1] += delta.y;
     state.as.q2.delta_angle_shorts.values[2] += delta.z;
-  } else if (state.kind == QA_MOVEMENT_STATE_Q2_RERELEASE) state.as.q2_rerelease.delta_angles = qa_ss_add(state.as.q2_rerelease.delta_angles, turn);
+  } else if (state.kind == QA_MOVEMENT_STATE_Q2_RERELEASE) state.as.q2_rerelease.delta_angles = qa_add3(state.as.q2_rerelease.delta_angles, turn);
   else if (state.kind == QA_MOVEMENT_STATE_Q1) state.as.q1.view_angles = angles;
   else state.as.qw.angles = angles;
   player->state = state;
@@ -3463,7 +3743,12 @@ static bool ss_definition_has_action(const qa_source_item_definition *definition
   for (size_t i = 0; i < definition->action_count; i++) if (definition->actions[i] == action) return true;
   return false;
 }
-#define SS_Q3_INVENTORY 64
+/* selectedQ3Source.inventory(owner) into thread-local rows grown to the source's equipment (TS arrays have no bound). */
+static size_t ss_q3_equipment(qa_app_shared_simulation *sim, qa_owned_actor owner, qa_app_q3_source_inventory_row **rows, size_t *capacity) {
+  size_t count = qa_app_q3_selected_source_inventory(sim->selected_q3_source, owner, NULL, 0);
+  *rows = ss_grow(*rows, capacity, count + 1, sizeof **rows);
+  return qa_app_q3_selected_source_inventory(sim->selected_q3_source, owner, *rows, count);
+}
 /* ---- nativeDropProjection (5771-5794) ---- */
 qa_compat_q2_native_drop_projection qa_app_shared_sim_native_drop_projection(qa_app_shared_simulation *sim, qa_actor_id actor, qa_item_id item) {
   const qa_pickup_supply_profile *supply = sim->selected_original_supply;
@@ -3473,9 +3758,8 @@ qa_compat_q2_native_drop_projection qa_app_shared_sim_native_drop_projection(qa_
   qa_owned_actor owner;
   bool equipment = false;
   if (ss_owned(sim, actor, &owner) && sim->selected_q3_source != NULL) {
-    static __thread qa_app_q3_source_inventory_row rows[SS_Q3_INVENTORY];
-    size_t count = qa_app_q3_selected_source_inventory(sim->selected_q3_source, owner, rows, SS_Q3_INVENTORY);
-    if (count > SS_Q3_INVENTORY) ss_fail("Selected Q3 inventory exceeds its projection storage");
+    static __thread qa_app_q3_source_inventory_row *rows; static __thread size_t row_capacity;
+    size_t count = ss_q3_equipment(sim, owner, &rows, &row_capacity);
     for (size_t i = 0; i < count && !equipment; i++) equipment = qa_ss_is(rows[i].item, item);
   }
   qa_compat_q2_native_drop_projection result = {NULL, NULL, NULL};
@@ -3510,9 +3794,11 @@ qa_compat_q2_native_drop_projection qa_app_shared_sim_native_drop_projection(qa_
  * thread-local storage valid until the next call. ---- */
 typedef struct ss_inventory_rows {
   qa_compat_q2_native_inventory_row *rows; size_t count, capacity;
+  qa_compat_q2_native_inventory_row *native; size_t native_capacity;
   qa_weapon_hud_icon *icons; size_t icon_count, icon_capacity;
-  char (*paths)[160]; size_t path_count, path_capacity;
-  qa_app_q3_source_inventory_row equipment[SS_Q3_INVENTORY];
+  char **paths; size_t path_count, path_capacity; /* malloc'd icon paths of the last call (TS strings: whole) */
+  qa_app_q3_source_inventory_row *equipment; size_t equipment_capacity;
+  qa_weapon_hud_icon *equipment_icons; size_t equipment_icon_capacity; /* one per equipment row, sized before any row points in */
   ss_ui_storage ui;
 } ss_inventory_rows;
 static __thread ss_inventory_rows ss_rows;
@@ -3546,28 +3832,31 @@ const qa_compat_q2_native_inventory_row *qa_app_shared_sim_native_inventory_rows
   const qa_source_item_definition *definitions = qa_shared_inventory_table_item_definitions(sim->inventory, actor, &definition_count);
   *out_count = 0;
   if (!ss_source_is(sim, QA_SS_SOURCE_Q2_NATIVE) || commands == NULL || (!selected && definition_count == 0)) return NULL;
-  ss_rows.count = 0; ss_rows.icon_count = 0; ss_rows.path_count = 0;
+  ss_rows.count = 0; ss_rows.icon_count = 0;
+  for (size_t i = 0; i < ss_rows.path_count; i++) free(ss_rows.paths[i]);
+  ss_rows.path_count = 0;
   size_t slot_count = 0, label_count = 0;
   const qa_compat_q2_native_inventory_slot *slots = qa_compat_q2_native_primary_commands_inventory_slots(commands, &slot_count);
   const qa_app_sim_configstring *labels = ss_native_classic(sim)
       ? qa_app_sim_classic_guest_world_configstrings(sim->source.classic_world, &label_count)
       : qa_app_sim_rerelease_guest_world_configstrings(sim->source.rerelease_world, &label_count);
   double label_base = ss_native_classic(sim) ? 1056 : 11326;
-  /* Every row may carry one icon; reserve before any row points into the storage. */
-  size_t icon_need = slot_count + definition_count + SS_Q3_INVENTORY + 1;
+  /* Every retained ammunition row (one per slot) may carry one icon; reserve before any row points into the storage. */
+  size_t icon_need = slot_count + 1;
   if (ss_rows.icon_capacity < icon_need) {
     free(ss_rows.icons); ss_rows.icons = calloc(icon_need, sizeof *ss_rows.icons);
-    if (ss_rows.icons == NULL) qa_range_error("Out of memory");
+    if (ss_rows.icons == NULL) { ss_rows.icon_capacity = 0; qa_range_error("Out of memory"); }
     ss_rows.icon_capacity = icon_need;
   }
   if (ss_rows.path_capacity < slot_count + 1) {
-    free(ss_rows.paths); ss_rows.paths = calloc(slot_count + 1, sizeof *ss_rows.paths);
+    free(ss_rows.paths); ss_rows.paths = calloc(slot_count + 1, sizeof *ss_rows.paths); /* emptied above */
     if (ss_rows.paths == NULL) qa_range_error("Out of memory");
     ss_rows.path_capacity = slot_count + 1;
   }
   /* native: slots that are no selected weapon or ammunition. */
-  qa_compat_q2_native_inventory_row *native = calloc(slot_count + 1, sizeof *native);
-  if (native == NULL) qa_range_error("Out of memory");
+  /* Thread-local (a raise in a later row would leak a per-call array). */
+  ss_rows.native = ss_grow(ss_rows.native, &ss_rows.native_capacity, slot_count + 1, sizeof *ss_rows.native);
+  qa_compat_q2_native_inventory_row *native = ss_rows.native;
   size_t native_count = 0;
   for (size_t i = 0; i < slot_count; i++) {
     if (selected && (slots[i].weapon || slots[i].ammunition)) continue;
@@ -3575,7 +3864,7 @@ const qa_compat_q2_native_inventory_row *qa_app_shared_sim_native_inventory_rows
     native[native_count++] = ss_inventory_row(slots[i].item, label != NULL ? label : "", ss_count(sim, actor, slots[i].item), slots[i].index, false);
   }
   const qa_compat_q2_native_primary_inventory_profile *prototypes = ss_native_prototypes(sim);
-  if (prototypes == NULL) { free(native); ss_fail("Native inventory has no declared original item prototypes"); }
+  if (prototypes == NULL) ss_fail("Native inventory has no declared original item prototypes");
   const qa_compat_q2_native_inventory_slot *weapon_prototype = NULL, *ammo_prototype = NULL, *usable_prototype = NULL, *passive_prototype = NULL;
   for (size_t i = 0; i < slot_count; i++) {
     if (weapon_prototype == NULL && qa_ss_is(slots[i].item, prototypes->proto_weapon)) weapon_prototype = &slots[i];
@@ -3583,7 +3872,7 @@ const qa_compat_q2_native_inventory_row *qa_app_shared_sim_native_inventory_rows
     if (usable_prototype == NULL && qa_ss_is(slots[i].item, prototypes->proto_usable)) usable_prototype = &slots[i];
     if (passive_prototype == NULL && qa_ss_is(slots[i].item, prototypes->proto_passive)) passive_prototype = &slots[i];
   }
-  if (weapon_prototype == NULL || ammo_prototype == NULL) { free(native); ss_fail("Original inventory lacks its declared weapon/ammo prototypes"); }
+  if (weapon_prototype == NULL || ammo_prototype == NULL) ss_fail("Original inventory lacks its declared weapon/ammo prototypes");
   /* weapons: the selected arsenal's weapon UI items. */
   if (selected) {
     qa_app_arsenal_ui ui = ss_sel_ui(sim, actor, sim->weapon_provider, &ss_rows.ui);
@@ -3610,7 +3899,7 @@ const qa_compat_q2_native_inventory_row *qa_app_shared_sim_native_inventory_rows
       if (seen) continue;
       const qa_selected_pickup_weapon *weapon = NULL;
       for (size_t j = 0; j < catalog_count && weapon == NULL; j++) if (qa_ss_is(catalog[j].ammo, ammo)) weapon = &catalog[j];
-      if (weapon == NULL) { free(native); ss_fail("Selected ammo has no authored weapon presentation"); }
+      if (weapon == NULL) ss_fail("Selected ammo has no authored weapon presentation");
       qa_compat_q2_native_inventory_row row = ss_inventory_row(ammo, qa_app_selected_ammo_label(sim->selected_arsenal.family, ammo),
           ss_count(sim, actor, ammo), ammo_prototype->index, true);
       row.has_presentation = true; row.presentation.source = sim->weapon_provider; row.presentation.kind = "ammunition";
@@ -3638,9 +3927,13 @@ const qa_compat_q2_native_inventory_row *qa_app_shared_sim_native_inventory_rows
       row.presentation.has_icon = true;
       if (slots[i].icon != NULL && slots[i].icon[0] != '\0') {
         qa_weapon_hud_icon *icon = ss_row_icon();
-        char *path = ss_rows.paths[ss_rows.path_count++];
-        if (slots[i].icon[0] == '/' || slots[i].icon[0] == '\\') snprintf(path, sizeof ss_rows.paths[0], "%s", slots[i].icon + 1);
-        else snprintf(path, sizeof ss_rows.paths[0], "pics/%s.pcx", slots[i].icon);
+        /* icon.startsWith("/") || icon.startsWith("\\") ? icon.slice(1) : `pics/${icon}.pcx`, whole */
+        size_t length = strlen(slots[i].icon) + 9;
+        char *path = malloc(length);
+        if (path == NULL) qa_range_error("Out of memory");
+        if (slots[i].icon[0] == '/' || slots[i].icon[0] == '\\') snprintf(path, length, "%s", slots[i].icon + 1);
+        else snprintf(path, length, "pics/%s.pcx", slots[i].icon);
+        ss_rows.paths[ss_rows.path_count++] = path;
         icon->kind = QA_WEAPON_HUD_ICON_IMAGE; icon->resource.content = sim->recipe.map.entities.content; icon->resource.path = path;
         row.presentation.icon = icon;
       }
@@ -3648,12 +3941,15 @@ const qa_compat_q2_native_inventory_row *qa_app_shared_sim_native_inventory_rows
     }
   }
   for (size_t i = 0; i < native_count; i++) ss_put_row(native[i]);
-  free(native);
   if (usable_prototype == NULL || passive_prototype == NULL) ss_fail("Original inventory lacks usable and passive item prototypes");
   qa_owned_actor owner;
   if (ss_owned(sim, actor, &owner) && sim->selected_q3_source != NULL) {
-    size_t count = qa_app_q3_selected_source_inventory(sim->selected_q3_source, owner, ss_rows.equipment, SS_Q3_INVENTORY);
-    if (count > SS_Q3_INVENTORY) ss_fail("Selected Q3 inventory exceeds its projection storage");
+    size_t count = ss_q3_equipment(sim, owner, &ss_rows.equipment, &ss_rows.equipment_capacity);
+    if (ss_rows.equipment_icon_capacity < count + 1) {
+      free(ss_rows.equipment_icons); ss_rows.equipment_icons = calloc(count + 1, sizeof *ss_rows.equipment_icons);
+      if (ss_rows.equipment_icons == NULL) { ss_rows.equipment_icon_capacity = 0; qa_range_error("Out of memory"); }
+      ss_rows.equipment_icon_capacity = count + 1;
+    }
     for (size_t i = 0; i < count; i++) {
       const qa_app_q3_source_inventory_row *item = &ss_rows.equipment[i];
       qa_compat_q2_native_inventory_row row = ss_inventory_row(item->item, item->label, item->count,
@@ -3661,7 +3957,8 @@ const qa_compat_q2_native_inventory_row *qa_app_shared_sim_native_inventory_rows
       row.has_presentation = true; row.presentation.source = sim->weapon_provider; row.presentation.kind = "item";
       row.presentation.has_icon = true;
       if (item->icon != NULL) {
-        qa_weapon_hud_icon *icon = ss_row_icon();
+        qa_weapon_hud_icon *icon = &ss_rows.equipment_icons[i];
+        memset(icon, 0, sizeof *icon);
         icon->kind = QA_WEAPON_HUD_ICON_SHADER; icon->content = sim->weapon_provider.content; icon->name = item->icon;
         row.presentation.icon = icon;
       }
@@ -3798,12 +4095,12 @@ static void ss_native_entity_presentations(qa_app_shared_simulation *sim, ss_pre
     qa_app_sim_player_view view = qa_app_shared_sim_player_view(sim, actor.id);
     const char *path = ss_native_configstring(sim, (classic ? 32 : 62) + state.gun_index);
     if (state.gun_index == 0 || path == NULL || path[0] == '\0') continue;
-    qa_vec3 eye = qa_ss_add(view.origin, (qa_vec3){0, 0, view.view_height});
+    qa_vec3 eye = qa_add3(view.origin, (qa_vec3){0, 0, view.view_height});
     qa_app_simulation_presentation model; memset(&model, 0, sizeof model);
     model.actor = actor.id; model.content = content; model.family = QA_GAME_FAMILY_Q2; model.path = path;
     model.frame = state.gun_frame; model.old_frame = state.gun_frame; model.skin = gun_skin; model.effects = 0; model.render_flags = 0;
-    model.origin = qa_ss_add(eye, state.gun_offset); model.has_view_origin = true; model.view_origin = eye;
-    model.has_view_angles = true; model.view_angles = view.angles; model.angles = qa_ss_add(view.angles, state.gun_angles);
+    model.origin = qa_add3(eye, state.gun_offset); model.has_view_origin = true; model.view_origin = eye;
+    model.has_view_angles = true; model.view_angles = view.angles; model.angles = qa_add3(view.angles, state.gun_angles);
     model.scale = 1; model.visible = true; model.view_weapon = true;
     ss_push_presentation(list, &model);
   }
@@ -3973,14 +4270,14 @@ static void ss_weapon_model_presentation(qa_app_shared_simulation *sim, ss_prese
   if (has_arsenal) ss_arsenal_free(&arsenal);
   const qa_ss_presentation_pose *snapshot = qa_ss_map_get(&sim->presentation_snapshot, &actor);
   bool interpolated = snapshot != NULL && snapshot->view_path != NULL && qa_ss_is(snapshot->view_path, path) && fraction < 1;
-  qa_vec3 eye = qa_ss_add(view.origin, (qa_vec3){0, 0, view.view_height});
+  qa_vec3 eye = qa_add3(view.origin, (qa_vec3){0, 0, view.view_height});
   model.content = sim->weapon_provider.content; model.family = weapon_family; model.path = path; model.frame = frame;
   model.old_frame = interpolated ? snapshot->view_frame : frame; model.has_back_lerp = true; model.back_lerp = interpolated ? back_lerp : 0;
   model.skin = has_q2 ? view_model->q2_skin : 0; model.effects = 0; model.render_flags = weapon_family == QA_GAME_FAMILY_Q2 ? 1 | 4 | 16 : 0;
-  qa_vec3 offset = source_view != NULL ? source_view->gun_offset : has_q2 ? view_model->q2_kick_origin : qa_ss_zero;
-  qa_vec3 turn = source_view != NULL ? source_view->gun_angles : has_q2 ? view_model->q2_kick_angles : qa_ss_zero;
-  model.origin = qa_ss_add(eye, offset); model.has_view_origin = true; model.view_origin = eye;
-  model.has_view_angles = true; model.view_angles = view.angles; model.angles = qa_ss_add(view.angles, turn); model.scale = 1;
+  qa_vec3 offset = source_view != NULL ? source_view->gun_offset : has_q2 ? view_model->q2_kick_origin : qa_zero_vec3;
+  qa_vec3 turn = source_view != NULL ? source_view->gun_angles : has_q2 ? view_model->q2_kick_angles : qa_zero_vec3;
+  model.origin = qa_add3(eye, offset); model.has_view_origin = true; model.view_origin = eye;
+  model.has_view_angles = true; model.view_angles = view.angles; model.angles = qa_add3(view.angles, turn); model.scale = 1;
   bool visible;
   model.visible = sim->strategy->weapon_visible(sim, actor, &visible) ? visible : ss_health_or(sim, actor, 0) > 0;
   model.view_weapon = true;
@@ -4328,7 +4625,7 @@ static bool ss_grapple_dead(void *ctx, qa_actor_id actor, qa_q2_game_services *g
 }
 static qa_vec3 ss_grapple_previous_velocity(void *ctx, qa_actor_id actor) {
   qa_app_shared_simulation *sim = ((ss_grapple_record *)ctx)->sim;
-  return sim->grapple != NULL ? qa_app_sim_grapple_runtime_previous_velocity(sim->grapple, actor) : qa_ss_zero;
+  return sim->grapple != NULL ? qa_app_sim_grapple_runtime_previous_velocity(sim->grapple, actor) : qa_zero_vec3;
 }
 static void ss_grapple_set_previous_velocity(void *ctx, qa_actor_id actor, qa_vec3 velocity) {
   qa_app_shared_simulation *sim = ((ss_grapple_record *)ctx)->sim;
@@ -4507,11 +4804,24 @@ static bool ss_same_grapple_selection(const qa_grapple_selection *a, const qa_gr
       && ss_same_text(a->binding, b->binding) && ss_same_text(a->mechanic, b->mechanic) && ss_same_text(a->edition, b->edition)
       && ss_same_grapple_profile(a->profile, b->profile);
 }
+/* The userinfo texts a target list hands out, kept whole until the list is rebuilt (TS strings have no length limit). */
+typedef struct ss_text_pool { char **items; size_t count, capacity; } ss_text_pool;
+static void ss_text_pool_clear(ss_text_pool *pool) { for (size_t i = 0; i < pool->count; i++) free(pool->items[i]); pool->count = 0; }
+static void ss_text_pool_free(ss_text_pool *pool) { ss_text_pool_clear(pool); free(pool->items); pool->items = NULL; pool->capacity = 0; }
+static const char *ss_text_pool_keep(ss_text_pool *pool, const char *text) {
+  pool->items = ss_grow(pool->items, &pool->capacity, pool->count + 1, sizeof *pool->items);
+  size_t length = strlen(text);
+  char *copy = malloc(length + 1);
+  if (copy == NULL) qa_range_error("Out of memory");
+  memcpy(copy, text, length + 1);
+  pool->items[pool->count++] = copy;
+  return copy;
+}
 typedef struct ss_qvm_grapple_record {
   qa_app_shared_simulation *sim; qa_grapple_selection selection;
   qa_app_q3_qvm_server_game *primary; bool has_primary_combat; qa_qvm_game_combat primary_combat;
   qa_app_sim_qvm_grapple_target *targets; size_t target_count, target_capacity;
-  char (*userinfo)[512];
+  ss_text_pool userinfo;
   qa_actor_id attackers[2];
   qa_app_sim_grapple_slot_host slot_host;
 } ss_qvm_grapple_record;
@@ -4531,7 +4841,7 @@ static void ss_qvm_grapple_damage(void *ctx, qa_app_sim_qvm_grapple_damage hit) 
   ss_qvm_grapple_record *record = ctx; qa_app_shared_simulation *sim = record->sim;
   qa_damage_request request; memset(&request, 0, sizeof request);
   request.target = hit.target; request.amount = hit.amount; request.knockback = (qa_js_to_int32(hit.flags) & 4) != 0 ? 0 : hit.amount;
-  request.direction = hit.direction; request.point = hit.point; request.normal = qa_ss_zero; request.delivery = "direct";
+  request.direction = hit.direction; request.point = hit.point; request.normal = qa_zero_vec3; request.delivery = "direct";
   request.attack.sequence = sim->attack_sequence++; request.attack.time = sim->grapple_frame.time;
   if (hit.attacker != NULL) { record->attackers[0] = *hit.attacker; request.attack.attacker = &record->attackers[0]; }
   if (hit.inflictor != NULL) { record->attackers[1] = *hit.inflictor; request.attack.inflictor = &record->attackers[1]; }
@@ -4578,8 +4888,7 @@ static const qa_app_sim_qvm_grapple_target *ss_qvm_grapple_targets(void *ctx, si
   size_t observation_count = 0;
   const qa_actor_observation *observations = qa_session_actor_registry_observations(sim->actors, &observation_count);
   record->targets = ss_grow(record->targets, &record->target_capacity, observation_count + 1, sizeof *record->targets);
-  record->userinfo = realloc(record->userinfo, (observation_count + 1) * sizeof *record->userinfo);
-  if (record->userinfo == NULL) qa_range_error("Out of memory");
+  ss_text_pool_clear(&record->userinfo);
   qa_actor_id world; bool has_world = qa_app_shared_sim_world_actor(sim, &world);
   size_t count = 0;
   for (size_t i = 0; i < observation_count; i++) {
@@ -4608,8 +4917,7 @@ static const qa_app_sim_qvm_grapple_target *ss_qvm_grapple_targets(void *ctx, si
       target->health = has_native ? native.health : qvm ? state.stats[0] : qa_app_shared_sim_native_player_ui(sim, actor).health;
       target->is_player = true; target->view_height = view.view_height;
       target->team = qvm ? ss_qvm_team(state.persistent[3]) : "free";
-      snprintf(record->userinfo[count], sizeof record->userinfo[0], "%s", userinfo != NULL ? userinfo : "\\name\\Player\\ip\\localhost\\model\\sarge/default");
-      target->userinfo = record->userinfo[count];
+      target->userinfo = ss_text_pool_keep(&record->userinfo, userinfo != NULL ? userinfo : "\\name\\Player\\ip\\localhost\\model\\sarge/default");
       count++;
       continue;
     }
@@ -4626,9 +4934,8 @@ static const qa_app_sim_qvm_grapple_target *ss_qvm_grapple_targets(void *ctx, si
     }
     target->body = body; target->body.angles = player->view_angles; target->health = combat.has_value ? combat.value.health : 0;
     target->is_player = true; target->view_height = player->view_height;
-    snprintf(record->userinfo[count], sizeof record->userinfo[0], "%s",
+    target->userinfo = ss_text_pool_keep(&record->userinfo,
         userinfo != NULL ? userinfo : "\\name\\Player\\ip\\localhost\\model\\sarge/default\\handicap\\100");
-    target->userinfo = record->userinfo[count];
     target->team = qa_ss_is(team, "team:red") ? "red" : qa_ss_is(team, "team:blue") ? "blue" : qa_ss_is(team, "red") ? "red"
         : qa_ss_is(team, "blue") ? "blue" : "free";
     count++;
@@ -4638,7 +4945,7 @@ static const qa_app_sim_qvm_grapple_target *ss_qvm_grapple_targets(void *ctx, si
 }
 static void ss_dispose_qvm_grapple_record(void *ctx) {
   ss_qvm_grapple_record *record = ctx;
-  free(record->targets); free(record->userinfo);
+  free(record->targets); ss_text_pool_free(&record->userinfo);
   if (record->has_primary_combat) qa_qvm_game_combat_destroy(&record->primary_combat);
 }
 void qa_app_shared_sim_initialize_qvm_grapple(qa_app_shared_simulation *sim) {
@@ -4686,10 +4993,12 @@ void qa_app_shared_sim_initialize_qvm_grapple(qa_app_shared_simulation *sim) {
     qa_actor_id *actors = malloc((count ? count : 1) * sizeof *actors);
     if (actors == NULL) qa_range_error("Out of memory");
     memcpy(actors, players, count * sizeof *actors);
+    qa_cleanup actors_node; qa_cleanup_push(&actors_node, free, actors); /* an admission raise frees the copy */
     for (size_t i = 0; i < count; i++) {
       if (sim->strategy->owns_equipment_players(sim)) qa_app_shared_sim_require_equipment_player(sim, actors[i]);
       else qa_app_shared_sim_admit_grapple(sim, actors[i]);
     }
+    qa_cleanup_pop(&actors_node);
     free(actors);
     return;
   }
@@ -4711,10 +5020,10 @@ void qa_app_shared_sim_initialize_qvm_grapple(qa_app_shared_simulation *sim) {
 typedef struct ss_weapon_behavior_record {
   qa_app_shared_simulation *sim; bool team_mode;
   qa_app_sim_qvm_weapon_target *targets; size_t target_count, target_capacity;
-  char (*userinfo)[512];
+  ss_text_pool userinfo;
   qa_provider_reference reference; qa_q2_foundation_host engine; qa_localization_table localization; qa_provider_timing timing;
 } ss_weapon_behavior_record;
-static void ss_dispose_weapon_behavior_record(void *ctx) { ss_weapon_behavior_record *record = ctx; free(record->targets); free(record->userinfo); }
+static void ss_dispose_weapon_behavior_record(void *ctx) { ss_weapon_behavior_record *record = ctx; free(record->targets); ss_text_pool_free(&record->userinfo); }
 static double ss_behavior_real_time(void *ctx, bool has_output, qa_qvm_calendar *out) {
   const qa_app_sim_real_time *clock = ((ss_weapon_behavior_record *)ctx)->sim->options.weapon_behavior_real_time;
   return clock->real_time(clock->ctx, has_output, out);
@@ -4726,8 +5035,7 @@ static const qa_app_sim_qvm_weapon_target *ss_behavior_targets(void *ctx, size_t
   size_t observation_count = 0;
   const qa_actor_observation *observations = qa_session_actor_registry_observations(sim->actors, &observation_count);
   record->targets = ss_grow(record->targets, &record->target_capacity, observation_count + 1, sizeof *record->targets);
-  record->userinfo = realloc(record->userinfo, (observation_count + 1) * sizeof *record->userinfo);
-  if (record->userinfo == NULL) qa_range_error("Out of memory");
+  ss_text_pool_clear(&record->userinfo);
   size_t count = 0;
   for (size_t i = 0; i < observation_count; i++) {
     qa_actor_id actor = observations[i].id;
@@ -4741,11 +5049,11 @@ static const qa_app_sim_qvm_weapon_target *ss_behavior_targets(void *ctx, size_t
     qa_client_id client;
     if (!qa_app_shared_sim_player_client(sim, actor, &client)) { target->kind = "actor"; count++; continue; }
     const char *source_userinfo = qa_app_shared_sim_source_player_userinfo(sim, actor);
-    snprintf(record->userinfo[count], sizeof record->userinfo[0], "%s", source_userinfo != NULL ? source_userinfo : "");
+    const char *kept = ss_text_pool_keep(&record->userinfo, source_userinfo != NULL ? source_userinfo : "");
     char scratch[256];
-    const char *spectator = qa_q2_userinfo_get(record->userinfo[count], "spectator", scratch, sizeof scratch);
+    const char *spectator = qa_q2_userinfo_get(kept, "spectator", scratch, sizeof scratch);
     bool is_spectator = spectator != NULL && strcmp(spectator, "1") == 0;
-    const char *info_team = is_spectator ? NULL : qa_q2_userinfo_get(record->userinfo[count], "team", scratch, sizeof scratch);
+    const char *info_team = is_spectator ? NULL : qa_q2_userinfo_get(kept, "team", scratch, sizeof scratch);
     is_spectator = is_spectator || (info_team != NULL && (strcmp(info_team, "spectator") == 0 || strcmp(info_team, "s") == 0));
     char source_team[64] = "";
     if (combat.has_value && combat.value.team != NULL) {
@@ -4757,7 +5065,7 @@ static const qa_app_sim_qvm_weapon_target *ss_behavior_targets(void *ctx, size_t
         : qa_ss_is(source_team, "blue") || qa_ss_is(source_team, "team:blue") ? "blue" : NULL;
     if (team == NULL) ss_fail("QVM weapon component cannot represent source team %s",
         combat.has_value && combat.value.team != NULL ? combat.value.team : "unassigned");
-    target->kind = "player"; target->userinfo = record->userinfo[count]; target->team = team;
+    target->kind = "player"; target->userinfo = kept; target->team = team;
     count++;
   }
   *out_count = count;
@@ -4841,7 +5149,10 @@ qa_app_sim_rerelease_weapon_behavior_source *qa_app_shared_sim_create_native_wea
   const char *values[] = {qa_ss_number_text(sim->options.max_clients, clients), qa_ss_number_text(sim->options.skill, skill),
       qa_ss_is(sim->options.mode, "deathmatch") ? "1" : "0", qa_ss_is(sim->options.mode, "coop") ? "1" : "0",
       qa_ss_number_text(qa_app_sim_shared_physics_gravity(sim->physics), gravity)};
-  for (size_t i = 0; i < 5; i++) { qa_cvar_snapshot snapshot; qa_cvar_registry_register(cvars, names[i], values[i], 0, &snapshot); }
+  for (size_t i = 0; i < 5; i++) {
+    qa_cvar_snapshot snapshot;
+    if (qa_cvar_registry_register(cvars, names[i], values[i], 0, &snapshot)) qa_cvar_read_free(&snapshot);
+  }
   qa_app_sim_source_random *random = qa_app_sim_source_random_create(sim->options.seed, "q2-rerelease");
   if (random == NULL) qa_range_error("Out of memory");
   ss_own(sim, ss_dispose_random, random);
@@ -4900,6 +5211,8 @@ void qa_app_shared_sim_arsenal_destroy(qa_app_shared_simulation *sim) {
     memset(&sim->selected_arsenal, 0, sizeof sim->selected_arsenal); sim->has_selected_arsenal = false;
   }
   if (sim->selected_q3_source != NULL) { qa_app_q3_selected_source_destroy(sim->selected_q3_source); sim->selected_q3_source = NULL; }
+  if (sim->has_selected_ammo_release && sim->actors != NULL) qa_session_actor_registry_off_release(sim->actors, sim->selected_ammo_release);
+  sim->has_selected_ammo_release = false;
   if (sim->selected_ammo_timers != NULL) { qa_app_q3_mapped_ammo_regeneration_destroy(sim->selected_ammo_timers); sim->selected_ammo_timers = NULL; }
   /* selectedQ3Strings values are malloc'd copies the configstring store wrote. */
   for (size_t i = 0; i < sim->selected_q3_strings.count; i++) free(*(char **)qa_ss_map_value_at(&sim->selected_q3_strings, i));
@@ -4909,8 +5222,14 @@ void qa_app_shared_sim_arsenal_destroy(qa_app_shared_simulation *sim) {
     owner.dispose(owner.ctx);
   }
   free(sim->b2_owned); sim->b2_owned = NULL; sim->b2_owned_capacity = 0;
-  for (size_t i = 0; i < sim->b2_player_ammo.count; i++) free(*(qa_inventory_entry **)qa_ss_map_value_at(&sim->b2_player_ammo, i));
-  if (sim->b2_player_ammo.value_size != 0) qa_ss_map_free(&sim->b2_player_ammo);
+  for (size_t i = 0; i < sim->b2_slot_attachments.count; i++) free(*(qa_app_sim_presentation_attachment **)qa_ss_map_value_at(&sim->b2_slot_attachments, i));
+  if (sim->b2_slot_attachments.value_size != 0) qa_ss_map_free(&sim->b2_slot_attachments);
+  qa_app_shared_sim_release_slot_bindings(sim, NULL);
+  if (sim->b2_slot_bindings.value_size != 0) qa_ss_map_free(&sim->b2_slot_bindings);
+  for (size_t i = 0; i < sim->b2_slot_presentations.count; i++) free(*(ss_actor_ctx **)qa_ss_map_value_at(&sim->b2_slot_presentations, i));
+  if (sim->b2_slot_presentations.value_size != 0) qa_ss_map_free(&sim->b2_slot_presentations);
+  for (size_t i = 0; i < sim->b2_adopted_count; i++) free(sim->b2_adopted_ammo[i]);
+  free(sim->b2_adopted_ammo); sim->b2_adopted_ammo = NULL; sim->b2_adopted_count = sim->b2_adopted_capacity = 0;
 }
 
 /* ---- prepareSelectedOriginalPickups (2335-2430) ---- */
@@ -5592,15 +5911,36 @@ typedef struct ss_q3_execution { qa_app_q3_selected_source *source; qa_owned_act
 static void ss_q3_execution_step(void *ctx, double previous, double time) { ss_q3_execution *e = ctx; e->step(e->step_ctx, previous, time); }
 static qa_q2_motion ss_q3_execution_motion(void *ctx, qa_body_state body) { ss_q3_execution *e = ctx; return qa_app_q3_selected_source_motion(e->source, e->actor, body); }
 static qa_app_sim_shared_solid ss_q3_execution_collision(void *ctx) { ss_q3_execution *e = ctx; return qa_app_q3_selected_source_collision(e->source, e->actor); }
+/* The record lives as long as the actor's registered execution (TS: the closure entry actorExecutions holds until the
+ * actor is released); a registration the simulation refuses frees it. */
+void qa_app_shared_sim_retire_q3_execution(qa_app_shared_simulation *sim, qa_actor_id actor) {
+  void **stored = qa_ss_map_get(&sim->q3_source_executions, &actor);
+  if (stored == NULL) return;
+  void *execution = *stored;
+  qa_ss_map_delete(&sim->q3_source_executions, &actor);
+  sim->retired_q3_executions = ss_grow(sim->retired_q3_executions, &sim->retired_q3_execution_capacity,
+      sim->retired_q3_execution_count + 1, sizeof *sim->retired_q3_executions);
+  sim->retired_q3_executions[sim->retired_q3_execution_count++] = execution;
+}
+void qa_app_shared_sim_free_retired_q3_executions(qa_app_shared_simulation *sim) {
+  for (size_t i = 0; i < sim->retired_q3_execution_count; i++) free(sim->retired_q3_executions[i]);
+  sim->retired_q3_execution_count = 0;
+}
 static void ss_q3_execute(void *ctx, qa_owned_actor actor, qa_app_q3_selected_source_step_fn step, void *step_ctx) {
   ss_q3_selected *record = ctx; qa_app_shared_simulation *sim = record->sim;
-  ss_q3_execution *execution = qa_app_shared_sim_keep(sim, sizeof *execution);
+  ss_q3_execution *execution = calloc(1, sizeof *execution);
+  if (execution == NULL) qa_range_error("Out of memory");
   execution->source = record->source; execution->actor = actor; execution->step = step; execution->step_ctx = step_ctx;
   qa_app_sim_actor_execution entry; memset(&entry, 0, sizeof entry);
   entry.kind = QA_APP_SIM_ACTOR_EXECUTION_Q3_SOURCE; entry.actor = actor; entry.provider = sim->weapon_provider.provider;
   entry.content = sim->weapon_provider.content; entry.ctx = execution;
   entry.step = ss_q3_execution_step; entry.motion = ss_q3_execution_motion; entry.collision = ss_q3_execution_collision;
+  qa_cleanup refused; qa_cleanup_push(&refused, free, execution);
   qa_app_shared_sim_register_actor_execution(sim, entry);
+  qa_cleanup_pop(&refused);
+  /* Registration succeeds only for an actor without an execution, so no earlier record is replaced. */
+  void *kept = execution;
+  qa_ss_map_set(&sim->q3_source_executions, &actor.id, &kept);
 }
 static void ss_q3_event(void *ctx, qa_owned_actor actor, const qa_q3_base_entity_state *state, double time) {
   qa_app_shared_simulation *sim = ((ss_q3_selected *)ctx)->sim;
@@ -5651,8 +5991,9 @@ static qa_arsenal_state ss_q3_qvm_loadout(void *ctx, qa_owned_actor actor, qa_ar
   qa_arsenal_state state = defaults;
   state.active_weapon = active != NULL ? active->item : NULL;
   state.state.source_weapon = player.state.weapon;
-  /* The admitted arsenal keeps this array for the player's life: kept until the simulation is destroyed. */
-  qa_inventory_entry *ammo = qa_app_shared_sim_keep(sim, (defaults.ammo_count ? defaults.ammo_count : 1) * sizeof *ammo);
+  /* Q3SelectedArsenal.admit configures the inventory from this array and keeps none of it (read() rebuilds the
+   * ammo from the inventory): a per-call record. */
+  qa_inventory_entry *ammo = qa_app_shared_sim_scratch(sim, (defaults.ammo_count ? defaults.ammo_count : 1) * sizeof *ammo);
   for (size_t i = 0; i < defaults.ammo_count; i++) {
     const qa_inventory_entry *found = NULL;
     for (size_t j = 0; j < inventory_count && found == NULL; j++) if (qa_ss_is(inventory[j].item, defaults.ammo[i].item)) found = &inventory[j];

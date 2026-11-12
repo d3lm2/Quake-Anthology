@@ -262,7 +262,7 @@ static void rocket_fn(void *ctx, qa_q2m_context *c) {
   double id = entity->frame == frame->attak324 ? 23 : entity->frame == frame->attak327 ? 24 : 25;
   qa_vec3 start = qa_q2m_project_flash_default(c, qa_q2m_muzzle_offset(QA_Q2_EDITION_RERELEASE, id));
   bool heat = q2rm_has(entity->spawnflags, 16);
-  double speed = entity->speed != 0 ? entity->speed : heat ? 500 : 650;
+  double speed = q2rm_else(entity->speed, heat ? 500 : 650); /* TS `||`: 0 and NaN take the fallback */
   qa_vec3 target;
   if (state->manual_steering) target = state->blind_fire_target;
   else if (q2rm_rnd(game) < 0.66 || start.z < enemy.origin.z + enemy.bounds.min.z) {
@@ -292,7 +292,7 @@ static void rocket_fn(void *ctx, qa_q2m_context *c) {
   }
   if (heat)
     (void)weapons->fire_heat_rocket(weapons->ctx, entity, game, start, direction, 50, speed, 70, 50,
-                                    true, entity->accel != 0 ? entity->accel : 0.075);
+                                    true, q2rm_else(entity->accel, 0.075));
   else
     (void)c->weapons.fire_rocket(c->weapons.ctx, entity, game, start, direction, 50, speed, 70, 50);
   qa_q2rm_monster_flash(c, id, start, direction);
@@ -377,8 +377,7 @@ static bool stand_spawn(void *ctx, qa_q2_entity *entity, qa_q2_game_services *ga
   (void)ctx;
   if (strcmp(entity->classname, "monster_tank_stand") != 0) return false;
   if (game->options.mode == QA_Q2_MODE_DEATHMATCH) { game->remove(game->ctx, entity); return true; }
-  double scale_field = qa_q2_number_field(&entity->spawn, "scale", 0);
-  entity->scale = scale_field != 0 ? scale_field : 1.5;
+  entity->scale = q2rm_else(qa_q2_number_field(&entity->spawn, "scale", 0), 1.5);
   entity->model = "models/monsters/tank/tris.md2";
   entity->frame = qa_q2rm_tank_frames_value.stand01;
   entity->skin = 2;

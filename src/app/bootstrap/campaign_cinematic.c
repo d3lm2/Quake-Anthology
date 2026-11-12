@@ -219,6 +219,8 @@ static qa_cinematic_audio read_audio(const qa_save_reader *r) {
   int16_t *s16 = is_signed ? malloc((count ? count : 1) * sizeof *s16) : NULL;
   uint8_t *u8 = is_signed ? NULL : malloc(count ? count : 1);
   if (is_signed ? s16 == NULL : u8 == NULL) qa_range_error("Out of memory");
+  qa_cleanup samples_cleanup;
+  qa_cleanup_push(&samples_cleanup, free, is_signed ? (void *)s16 : (void *)u8);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader sample;
     qa_save_reader_item(&samples, i, &sample);
@@ -252,11 +254,17 @@ static qa_cinematic_audio read_audio(const qa_save_reader *r) {
   qa_save_reader_field(r, "resetStream", &field);
   block.reset_stream = qa_save_reader_boolean(&field);
   qa_save_reader_destroy(&field);
+  qa_cleanup_pop(&samples_cleanup);
   return block;
 }
 
+/* TS isDeepStrictEqual(readResource(saved), resource.reference): key order does not count, so both sides are written
+ * in one order (a reference read from a save otherwise keeps its parsed key order). */
 static bool same_resource(const qa_resolved_resource_reference *left, const qa_resolved_resource_reference *right) {
-  qa_save_value *a = qa_save_resource_reference_value(left), *b = qa_save_resource_reference_value(right);
+  qa_resolved_resource_reference first = *left, second = *right;
+  first.parsed_order = false;
+  second.parsed_order = false;
+  qa_save_value *a = qa_save_resource_reference_value(&first), *b = qa_save_resource_reference_value(&second);
   if (a == NULL || b == NULL) qa_range_error("Out of memory");
   char *ja = qa_json_stringify_value(a, NULL), *jb = qa_json_stringify_value(b, NULL);
   bool same = strcmp(ja, jb) == 0;
@@ -303,9 +311,11 @@ static qa_app_campaign_cinematic *prepare_images(qa_app_screen_cinematic_request
   c->captions = captions;
   assert_current(c);
   /* selected = /\.[^/]+$/.test(name) ? name : `${name}.roq` */
+  /* Some '.' after the last '/' with at least one character after it (not only the last '.': "a.b." matches). */
   const char *slash = strrchr(request.name, '/');
-  const char *dot = strrchr(request.name, '.');
-  bool has_extension = dot != NULL && (slash == NULL || dot > slash) && dot[1] != '\0';
+  const char *tail = slash != NULL ? slash + 1 : request.name;
+  const char *dot = strchr(tail, '.');
+  bool has_extension = dot != NULL && dot[1] != '\0';
   size_t selected_size = strlen(request.name) + 5;
   char *selected = malloc(selected_size);
   if (selected == NULL) qa_range_error("Out of memory");
@@ -392,8 +402,9 @@ static qa_app_campaign_cinematic *prepare_images(qa_app_screen_cinematic_request
     c->audio_started = qa_save_reader_boolean(&field);
     qa_save_reader_destroy(&field);
     qa_save_reader_field(saved, "pcm", &field);
+    /* pendingPcm !== null: a missing field is undefined and fails the outputRate read, as in TS. */
     const qa_save_value *pcm = field.value;
-    if (pcm != NULL && pcm->kind != QA_SAVE_NULL) {
+    if (pcm == NULL || pcm->kind != QA_SAVE_NULL) {
       qa_save_reader pcm_reader, rate;
       qa_save_reader_init(&pcm_reader, pcm, "campaign-cinematic.pcm");
       qa_save_reader_field(&pcm_reader, "outputRate", &rate);
@@ -431,8 +442,13 @@ static qa_app_campaign_cinematic *prepare_images(qa_app_screen_cinematic_request
     qa_save_reader_field(saved, "playback", &field);
     playback_checkpoint = field.value;
   }
-  if (!qa_cinematic_playback_init(&c->playback, &c->source, &options, playback_checkpoint)) qa_range_error("Out of memory");
+  bool initialized = qa_cinematic_playback_init(&c->playback, &c->source, &options, playback_checkpoint);
   if (saved != NULL) qa_save_reader_destroy(&field);
+  if (!initialized) {
+    /* False (OOM) leaves the copied source name and any partial decoder to release. */
+    qa_cinematic_playback_destroy(&c->playback);
+    qa_range_error("Out of memory");
+  }
   c->has_playback = true;
   /* try { ... } catch { playback.close(); throw } */
   if (captions != NULL) captions->prepare(captions->ctx, c->path);
@@ -506,10 +522,9 @@ static void start_audio(qa_app_campaign_cinematic *c) {
     qa_unified_audio_restore_stream_checkpoint(c->engine, target, c->pending_pcm);
   }
   c->ready = true;
-  for (size_t i = 0; i < c->initial_count; i++) {
-    qa_cinematic_audio_on_audio(&c->stream, &c->initial_audio[i], lane_target(c));
-    free_audio_block(&c->initial_audio[i]);
-  }
+  /* initialAudio.length = 0 only after every block was sent (a raise keeps them all owned). */
+  for (size_t i = 0; i < c->initial_count; i++) qa_cinematic_audio_on_audio(&c->stream, &c->initial_audio[i], lane_target(c));
+  for (size_t i = 0; i < c->initial_count; i++) free_audio_block(&c->initial_audio[i]);
   c->initial_count = 0;
   if (qa_cinematic_playback_status(&c->playback) == QA_CINEMATIC_PAUSED)
     qa_cinematic_audio_on_pause(&c->stream, true, c->playback.target);
@@ -517,20 +532,40 @@ static void start_audio(qa_app_campaign_cinematic *c) {
 
 static bool is_current(qa_app_campaign_cinematic *c) { return c->current(c->current_ctx); }
 
+/* TS { ...block, signed: block.samples instanceof Int16Array, samples: Array.from(block.samples) }: the block's own
+ * keys in its producer's order (samples keeps its place), then signed. */
 static qa_save_value *audio_block_value(const qa_cinematic_audio *block) {
   qa_save_value *o = qa_save_value_object(), *samples = qa_save_value_array();
   if (o == NULL || samples == NULL) qa_range_error("Out of memory");
   for (size_t i = 0; i < block->sample_count; i++)
     if (!qa_save_value_push(samples, qa_save_value_number(block->is_u8 ? block->samples_u8[i] : block->samples_s16[i])))
       qa_range_error("Out of memory");
-  bool ok = qa_save_value_set(o, "samples", samples) && qa_save_value_set(o, "channels", qa_save_value_number(block->channels))
-      && qa_save_value_set(o, "sampleRate", qa_save_value_number((double)block->sample_rate))
-      && qa_save_value_set(o, "sourceSample", qa_save_value_number((double)block->source_sample))
-      && qa_save_value_set(o, "sourceTime", qa_save_value_number(block->source_time))
-      && qa_save_value_set(o, "time", qa_save_value_number(block->time))
-      && qa_save_value_set(o, "loop", qa_save_value_number((double)block->loop))
-      && qa_save_value_set(o, "resetStream", qa_save_value_boolean(block->reset_stream))
-      && qa_save_value_set(o, "signed", qa_save_value_boolean(!block->is_u8));
+  static const char *const restored[] = {"samples", "channels", "sampleRate", "sourceSample", "sourceTime", "time", "loop", "resetStream", NULL};
+  static const char *const cin[] = {"samples", "sampleRate", "channels", "sourceSample", "sourceTime", "time", "loop", "resetStream", NULL};
+  static const char *const roq[] = {"samples", "channels", "sampleRate", "loop", "sourceSample", "sourceTime", "time", "resetStream", NULL};
+  static const char *const ogv[] = {"samples", "frames", "channels", "sampleRate", "frameCount", "loopStart", "sourceSample",
+                                    "sourceTime", "time", "loop", "resetStream", NULL};
+  const char *const *keys = block->key_order == QA_CINEMATIC_AUDIO_KEYS_CIN ? cin
+                            : block->key_order == QA_CINEMATIC_AUDIO_KEYS_ROQ ? roq
+                            : block->key_order == QA_CINEMATIC_AUDIO_KEYS_OGV ? ogv : restored;
+  double frames = block->channels > 0 ? (double)block->sample_count / block->channels : 0;
+  bool ok = true;
+  for (size_t k = 0; ok && keys[k] != NULL; k++) {
+    const char *key = keys[k];
+    qa_save_value *value;
+    if (strcmp(key, "samples") == 0) value = samples;
+    else if (strcmp(key, "channels") == 0) value = qa_save_value_number(block->channels);
+    else if (strcmp(key, "sampleRate") == 0) value = qa_save_value_number((double)block->sample_rate);
+    else if (strcmp(key, "sourceSample") == 0) value = qa_save_value_number((double)block->source_sample);
+    else if (strcmp(key, "sourceTime") == 0) value = qa_save_value_number(block->source_time);
+    else if (strcmp(key, "time") == 0) value = qa_save_value_number(block->time);
+    else if (strcmp(key, "loop") == 0) value = qa_save_value_number((double)block->loop);
+    else if (strcmp(key, "resetStream") == 0) value = qa_save_value_boolean(block->reset_stream);
+    else if (strcmp(key, "loopStart") == 0) value = qa_save_value_null();
+    else value = qa_save_value_number(frames); /* frames, frameCount: chunk.frames */
+    ok = qa_save_value_set(o, key, value);
+  }
+  ok = ok && qa_save_value_set(o, "signed", qa_save_value_boolean(!block->is_u8));
   if (!ok) qa_range_error("Out of memory");
   return o;
 }

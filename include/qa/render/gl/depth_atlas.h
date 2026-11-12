@@ -1,8 +1,8 @@
 /* Port of src/render/gl/depth-atlas.ts: Q2 rerelease gl_shadowmap.ts depth
  * passes using already projected caster geometry. The TS identity caches
  * (validated draws, packed positions) only avoid repeated work; C validates and
- * converts each draw, producing the same bytes. TS throws become qa_range_error
- * aborts (docs/PORTING.md). GPL-2.0-or-later. */
+ * converts each draw, producing the same bytes. A raise inside draw restores the
+ * saved GL state first, as the TS finally does. GPL-2.0-or-later. */
 #ifndef QA_RENDER_GL_DEPTH_ATLAS_H
 #define QA_RENDER_GL_DEPTH_ATLAS_H
 #include <stdbool.h>

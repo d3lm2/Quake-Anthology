@@ -48,10 +48,10 @@ const qa_actor_command *qa_shared_bot_population_frame(qa_shared_bot_population 
   const qa_actor_command *commands = qa_source_bot_director_frame(p->director, frame.time_milliseconds, &n);
   for (size_t i = 0; i < n; i++) {
     if (!p->is_live(p->is_live_ctx, commands[i].actor))
-      qa_range_error("Bot command targets an actor outside the shared world");
+      qa_raise("Error", 0, 0, "Bot command targets an actor outside the shared world");
     for (size_t j = 0; j < i; j++)
       if (qa_same_actor(commands[j].actor, commands[i].actor))
-        qa_range_error("Two bot commands target the same actor in one frame");
+        qa_raise("Error", 0, 0, "Two bot commands target the same actor in one frame");
   }
   *out_count = n;
   return commands;

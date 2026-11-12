@@ -211,7 +211,7 @@ char *qa_q3_pres_place_string(double rank_value) {
 typedef qa_q3_pres_client_event_runtime runtime_t;
 static qa_q3_pres_retail_snapshot *snapshot_of(runtime_t *runtime) {
   qa_q3_pres_retail_snapshot *snapshot = runtime->state->snap;
-  if (snapshot == NULL) qa_range_error("CG event requires cg.snap");
+  if (snapshot == NULL) qa_raise("Error", 0, 0, "CG event requires cg.snap");
   return snapshot;
 }
 static double center_y(runtime_t *runtime) {
@@ -234,7 +234,7 @@ static void custom_sound(runtime_t *runtime, qa_q3_pres_client_entity *entity, d
 
 void qa_q3_pres_client_event_runtime_init(runtime_t *runtime, qa_q3_pres_client_game_state *state,
     qa_q3_pres_client_event_host host) {
-  if (state->product != host.product) qa_range_error("Event host product differs from cgame state");
+  if (state->product != host.product) qa_raise("Error", 0, 0, "Event host product differs from cgame state");
   runtime->state = state;
   runtime->host = host;
 }
@@ -274,7 +274,8 @@ static void use_item(runtime_t *runtime, qa_q3_pres_client_entity *entity) {
     } else {
       const qa_q3_base_item_definition *definition =
           qa_q3_base_find_item_for_holdable(runtime->state->product, (qa_q3_holdable)item);
-      if (definition == NULL) qa_range_error("Cannot read properties of null (reading 'pickupName')");
+      /* TS findItemForHoldable never returns null: a holdable with no item throws
+       * CommonError("drop", "HoldableItem not found"), which the C lookup raises too. */
       snprintf(text, sizeof text, "Use %.120s", definition->pickup_name != NULL ? definition->pickup_name : "null");
     }
     runtime->host.center_print(runtime->host.ctx, text, center_y(runtime), 16);
@@ -614,7 +615,7 @@ static void source_entity_event(runtime_t *runtime, qa_q3_pres_client_entity *en
       int32_t delta = to_int32(state->time - state->step_time);
       double old_step = delta < 200 ? f_(f_(state->step_change * f_((double)to_int32(200 - (double)delta))) / 200) : 0;
       double grown = f_(old_step + 4 * (event - QA_Q3_EV_STEP_4 + 1));
-      state->step_change = grown < 32 ? grown : 32;
+      state->step_change = qa_js_min(32, grown);
       state->step_time = state->time;
       break;
     }
@@ -765,6 +766,8 @@ static void source_entity_event(runtime_t *runtime, qa_q3_pres_client_entity *en
     case QA_Q3_EV_RAILTRAIL:
       es->weapon = QA_Q3_WP_RAILGUN;
       host->weapons.rail_trail(host->weapons.ctx, client_num, es->origin2, es->pos.base);
+      /* TS hands es.origin2 itself to the trail, which lowers its z by 4 in place (CG_RailTrail's start[2] -= 4). */
+      es->origin2.z = f_(es->origin2.z - 4);
       if (es->event_parm != 255) {
         host->weapons.missile_hit_wall(host->weapons.ctx, es->weapon, es->client_num, position,
             qa_q3_base_byte_to_direction(es->event_parm), QA_Q3_PRES_IMPACT_DEFAULT);

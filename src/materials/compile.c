@@ -14,10 +14,17 @@ static qa_waveform semantic_wave(qa_mat_wave_storage wave) {
   static const char *const kinds[7] = {"none", "sin", "square", "triangle",
                                        "sawtooth", "inversesawtooth", "noise"};
   if (wave.func < 0 || wave.func > 6)
-    qa_range_error("Unknown source waveform %d", wave.func);
+    qa_raise("Error", 0, 0, "Unknown source waveform %d", wave.func);
   qa_waveform out = {kinds[wave.func], wave.base, wave.amplitude, wave.phase,
                      wave.frequency};
   return out;
+}
+
+typedef struct render_stages_guard { qa_shader_stage *stages; size_t count; } render_stages_guard;
+static void render_stages_release(void *raw) {
+  render_stages_guard *guard = raw;
+  for (size_t i = 0; i < guard->count; i++) free((void *)guard->stages[i].modifiers);
+  free(guard->stages);
 }
 
 qa_render_material qa_shader_render_material(
@@ -27,6 +34,10 @@ qa_render_material qa_shader_render_material(
     stages = calloc(definition.stage_count, sizeof *stages);
     if (stages == NULL) qa_range_error("compile allocation failed");
   }
+  /* An unknown source waveform raises: the stages built so far are released (TS GC). */
+  render_stages_guard guard = {stages, definition.stage_count};
+  qa_cleanup guard_node;
+  qa_cleanup_push(&guard_node, render_stages_release, &guard);
   for (size_t i = 0; i < definition.stage_count; i++) {
     const qa_mat_parsed_stage *stage = &definition.stages[i];
     qa_tex_coord_modifier *modifiers = NULL;
@@ -56,7 +67,7 @@ qa_render_material qa_shader_render_material(
     stages[i].color = stage->stage.rgb_gen;
     stages[i].alpha = stage->stage.alpha_gen;
     stages[i].coordinates = stage->stage.tc_gen;
-    stages[i].modifiers = modifiers;
+    stages[i].modifiers = modifiers; /* calloc'd stages: unset entries are NULL for the guard */
     stages[i].modifier_count = stage->stage.tc_mod_count;
     stages[i].source_state.active = stage->source_state.active;
     stages[i].source_state.state_bits = stage->source_state.state_bits;
@@ -70,6 +81,7 @@ qa_render_material qa_shader_render_material(
     stages[i].source_state.vertex_lightmap =
         stage->source_state.vertex_lightmap;
   }
+  qa_cleanup_pop(&guard_node);
   qa_render_material out;
   memset(&out, 0, sizeof out);
   out.kind = "q3";

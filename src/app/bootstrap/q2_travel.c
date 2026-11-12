@@ -37,39 +37,53 @@ static bool ends_with(const char *text, const char *suffix) {
   size_t a = strlen(text), b = strlen(suffix);
   return a >= b && strcmp(text + a - b, suffix) == 0;
 }
+/* A parse's working storage: a TS throw leaves it to the GC. */
+typedef struct travel_parse {
+  const char **starts; size_t *lengths;
+  char *name, *spawn;
+  qa_app_q2_travel_target *next;
+} travel_parse;
+static void travel_parse_free(void *v) {
+  travel_parse *parse = v;
+  free(parse->starts); free(parse->lengths); free(parse->name); free(parse->spawn);
+  qa_app_q2_travel_target_destroy(parse->next);
+}
 qa_app_q2_travel_target *qa_app_parse_q2_travel(const char *expression) {
   /* Split on '+', then fold from last to first (TS order). */
   size_t parts = 1;
   for (const char *p = expression; *p != '\0'; p++) if (*p == '+') parts++;
-  const char **starts = malloc(parts * sizeof *starts);
-  size_t *lengths = malloc(parts * sizeof *lengths);
-  if (starts == NULL || lengths == NULL) qa_range_error("Out of memory");
+  travel_parse parse = {malloc(parts * sizeof *parse.starts), malloc(parts * sizeof *parse.lengths), NULL, NULL, NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, travel_parse_free, &parse);
+  if (parse.starts == NULL || parse.lengths == NULL) qa_range_error("Out of memory");
   size_t at = 0; const char *start = expression;
   for (const char *p = expression;; p++) {
-    if (*p == '+' || *p == '\0') { starts[at] = start; lengths[at] = (size_t)(p - start); at++; start = p + 1; }
+    if (*p == '+' || *p == '\0') { parse.starts[at] = start; parse.lengths[at] = (size_t)(p - start); at++; start = p + 1; }
     if (*p == '\0') break;
   }
-  qa_app_q2_travel_target *next = NULL;
   for (size_t idx = parts; idx-- > 0;) {
-    if (lengths[idx] == 0) qa_range_error("Q2 travel has an empty destination");
-    char *part = dup_range(starts[idx], lengths[idx]);
+    if (parse.lengths[idx] == 0) qa_raise("Error", 0, 0, "Q2 travel has an empty destination");
+    char *part = dup_range(parse.starts[idx], parse.lengths[idx]);
     char *dollar = strchr(part, '$');
-    char *spawn = dup_range(dollar != NULL ? dollar + 1 : "", dollar != NULL ? strlen(dollar + 1) : 0);
+    parse.spawn = dup_range(dollar != NULL ? dollar + 1 : "", dollar != NULL ? strlen(dollar + 1) : 0);
     if (dollar != NULL) *dollar = '\0';
     bool new_unit = part[0] == '*';
-    char *name = dup_range(new_unit ? part + 1 : part, strlen(new_unit ? part + 1 : part));
+    parse.name = dup_range(new_unit ? part + 1 : part, strlen(new_unit ? part + 1 : part));
     free(part);
-    if (!name_ok(name)) qa_range_error("Invalid Q2 travel destination: %s", name);
-    if (!spawn_ok(spawn)) qa_range_error("Invalid Q2 spawn point: %s", spawn);
+    if (!name_ok(parse.name)) qa_raise("Error", 0, 0, "Invalid Q2 travel destination: %s", parse.name);
+    if (!spawn_ok(parse.spawn)) qa_raise("Error", 0, 0, "Invalid Q2 spawn point: %s", parse.spawn);
     qa_app_q2_travel_target *node = malloc(sizeof *node);
     if (node == NULL) qa_range_error("Out of memory");
-    node->kind = ends_with(name, ".cin") ? "cinematic" : ends_with(name, ".pcx") ? "picture" : ends_with(name, ".dm2") ? "demo" : "map";
-    node->name = name; node->spawn_point = spawn; node->new_unit = new_unit; node->next = next;
-    next = node;
+    node->kind = ends_with(parse.name, ".cin") ? "cinematic" : ends_with(parse.name, ".pcx") ? "picture"
+        : ends_with(parse.name, ".dm2") ? "demo" : "map";
+    node->name = parse.name; node->spawn_point = parse.spawn; node->new_unit = new_unit; node->next = parse.next;
+    parse.name = parse.spawn = NULL;
+    parse.next = node;
   }
-  free(starts); free(lengths);
-  if (next == NULL) qa_range_error("Q2 travel has no destination");
-  return next;
+  if (parse.next == NULL) qa_raise("Error", 0, 0, "Q2 travel has no destination");
+  qa_cleanup_pop(&guard);
+  free(parse.starts); free(parse.lengths);
+  return parse.next;
 }
 void qa_app_q2_travel_target_destroy(qa_app_q2_travel_target *target) {
   while (target != NULL) {
@@ -92,7 +106,10 @@ char *qa_app_q2_next_server_command(const qa_app_q2_travel_target *target) {
     if (w > 0) at += (size_t)w;
     first = false;
   }
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, expression);
   qa_app_q2_travel_target *check = qa_app_parse_q2_travel(expression);
+  qa_cleanup_pop(&guard);
   qa_app_q2_travel_target_destroy(check);
   char *out = malloc(at + 16);
   if (out == NULL) qa_range_error("Out of memory");

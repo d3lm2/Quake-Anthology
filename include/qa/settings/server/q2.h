@@ -3,7 +3,7 @@
  * DeathBall, rerelease and item-spawn setting collections. Defaults
  * come from createQ2PlayerRules() (timeLimitMinutes 0, fragLimit 0)
  * and createQ2CtfRules() (captureLimit 0) in the content module,
- * which is not yet ported; the built-in rerelease defaults are the
+ * copied here as literals; the built-in rerelease defaults are the
  * literals in the TS file itself. Returned collections point at
  * static definitions; do not free.
  * GPL-2.0-or-later.

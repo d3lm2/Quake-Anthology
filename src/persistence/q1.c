@@ -10,6 +10,7 @@
 #include "qa/persistence/source_bytes.h"
 #include "qa/persistence/value.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
 
 static char *dup_range(const char *text, size_t length) {
   char *out = (char *)malloc(length + 1);
@@ -79,10 +80,24 @@ static bool js_space(unsigned char byte) {
   return byte == ' ' || byte == '\t' || byte == '\n' || byte == '\v' || byte == '\f' ||
          byte == '\r' || byte == 0xa0;
 }
+/* Number(text) of a byte-string token: each byte is the character of the same value, so it is
+ * widened to UTF-8 first (byte 0xa0 is U+00A0, white space that Number() trims; a UTF-8
+ * sequence's bytes are separate characters, never white space). */
 static bool js_number(const char *text, size_t length, double *out) {
-  char *copy = dup_range(text, length);
+  char *copy = (char *)malloc(length * 2 + 1);
   if (copy == NULL) return false;
-  *out = qa_js_string_to_number(copy);
+  size_t at = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char byte = (unsigned char)text[i];
+    if (byte < 0x80) copy[at++] = (char)byte;
+    else {
+      copy[at++] = (char)(0xc0 | (byte >> 6));
+      copy[at++] = (char)(0x80 | (byte & 0x3f));
+    }
+  }
+  copy[at] = '\0';
+  /* A NUL (possible inside a quoted token) is no white space: Number() reads NaN. */
+  *out = memchr(text, 0, length) != NULL ? NAN : qa_js_string_to_number(copy);
   free(copy);
   return true;
 }
@@ -94,7 +109,11 @@ static bool scan_number(scanner *scan, double *out) {
   if (text == NULL) return false;
   double value = 0;
   bool parsed = js_number(text, length, &value);
-  if (!parsed || !isfinite(value)) scan_fail(scan, "invalid numeric field %s", text);
+  if (!parsed || !isfinite(value)) {
+    qa_cleanup token; /* the raise releases the token it names */
+    qa_cleanup_push(&token, free, text);
+    scan_fail(scan, "invalid numeric field %s", text);
+  }
   free(text);
   *out = value;
   return true;
@@ -125,8 +144,9 @@ static void record_clear(qa_q1_text_record *record) {
   record->pair_count = 0;
 }
 
-/* False only on OOM; the partial record is cleared on failure. */
-static bool scan_record(scanner *scan, qa_q1_text_record *out) {
+static void record_cleanup(void *arg) { record_clear((qa_q1_text_record *)arg); }
+/* False only on OOM; the partial record is cleared on failure, and by a raise (a malformed file). */
+static bool scan_record_body(scanner *scan, qa_q1_text_record *out) {
   size_t length = 0;
   char *open = scan_token(scan, &length);
   if (open == NULL) return false;
@@ -138,7 +158,10 @@ static bool scan_record(scanner *scan, qa_q1_text_record *out) {
     char *key = scan_token(scan, &length);
     if (key == NULL) { record_clear(out); return false; }
     if (strcmp(key, "}") == 0) { free(key); return true; }
+    qa_cleanup key_node;
+    qa_cleanup_push(&key_node, free, key);
     char *value = scan_token(scan, &length);
+    qa_cleanup_pop(&key_node);
     if (value == NULL) { free(key); record_clear(out); return false; }
     if (strcmp(value, "}") == 0) {
       free(key);
@@ -152,6 +175,14 @@ static bool scan_record(scanner *scan, qa_q1_text_record *out) {
       return false;
     }
   }
+}
+
+static bool scan_record(scanner *scan, qa_q1_text_record *out) {
+  qa_cleanup node;
+  qa_cleanup_push(&node, record_cleanup, out);
+  bool scanned = scan_record_body(scan, out);
+  qa_cleanup_pop(&node);
+  return scanned;
 }
 
 void qa_q1_save_data_free(qa_q1_save_data *save) {
@@ -173,10 +204,15 @@ void qa_q1_save_data_free(qa_q1_save_data *save) {
   memset(save, 0, sizeof *save);
 }
 
+static void save_data_cleanup(void *arg) { qa_q1_save_data_free((qa_q1_save_data *)arg); }
 bool qa_decode_q1_save(const uint8_t *bytes, size_t length, qa_q1_save_data *out) {
   memset(out, 0, sizeof *out);
   char *text = qa_byte_text(bytes, length);
   if (text == NULL) return false;
+  /* A malformed file raises SaveFormatError: the text and the partial save are released first. */
+  qa_cleanup text_node, out_node;
+  qa_cleanup_push(&text_node, free, text);
+  qa_cleanup_push(&out_node, save_data_cleanup, out);
   scanner scan = {text, length, 0};
   double version = 0;
   size_t token_length = 0;
@@ -245,9 +281,13 @@ bool qa_decode_q1_save(const uint8_t *bytes, size_t length, qa_q1_save_data *out
   out->extension_length = scan.length - scan.offset;
   out->extension_text = dup_range(text + scan.offset, out->extension_length);
   if (out->extension_text == NULL) goto oom;
+  qa_cleanup_pop(&out_node);
+  qa_cleanup_pop(&text_node);
   free(text);
   return true;
 oom:
+  qa_cleanup_pop(&out_node);
+  qa_cleanup_pop(&text_node);
   free(text);
   qa_q1_save_data_free(out);
   return false;

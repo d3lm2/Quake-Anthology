@@ -60,11 +60,10 @@ static void disguise_touch_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_servic
   (void)ctx;
   if (!game->host->is_player(game->host->ctx, contact.other)) return;
   qa_q2_entity *player = q2mp_ent(game, true, contact.other);
-  if (player != NULL) {
-    double high = player->flags >= 4294967296.0 ? 4294967296.0 : 0;
-    player->flags = (double)(((q2mp_u32(entity->spawnflags) & 4u) != 0)
-        ? (q2mp_u32(player->flags) & ~0x8000u) : (q2mp_u32(player->flags) | 0x8000u)) + high;
-  }
+  /* JS `&`/`|`: a signed int32 result; bits above 2^32 are dropped. */
+  if (player != NULL)
+    player->flags = (double)qa_js_to_int32(((q2mp_u32(entity->spawnflags) & 4u) != 0)
+        ? (q2mp_u32(player->flags) & ~0x8000u) : (q2mp_u32(player->flags) | 0x8000u));
 }
 static void disguise_use_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services *game, const qa_actor_id *other,
                             const qa_actor_id *activator) {
@@ -85,21 +84,17 @@ static void steam_start_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services 
     qa_q2_entity *const *found = game->targets(game->ctx, entity->target, &n);
     if (n > 0) { entity->enemy = found[0]->actor.id; entity->has_enemy = true; }
     else entity->has_enemy = false;
-    if (!entity->has_enemy) {
-      char message[256];
-      (void)snprintf(message, sizeof message, "%s: %s is a bad target", entity->classname, entity->target);
-      game->host->diagnostic(game->host->ctx, message);
-    }
+    if (!entity->has_enemy) q2mp_diagnosticf(game, "%s: %s is a bad target", entity->classname, entity->target);
   } else {
     entity->movedir = qa_q2_movedir(q2mp_body(game, entity).angles);
     qa_q2_body_changes c = q2mp_changes();
     c.has_angles = true; c.angles = q2mp_zero();
     q2mp_move(game, entity, c, false, false);
   }
-  entity->count = (double)(qa_js_to_int32(q2mp_u32(entity->count != 0 ? entity->count : 32) & 255u));
-  if (entity->speed == 0) entity->speed = 75;
+  entity->count = (double)(qa_js_to_int32(q2mp_u32(q2mp_truthy(entity->count) ? entity->count : 32) & 255u));
+  if (!q2mp_truthy(entity->speed)) entity->speed = 75;
   double sounds = qa_q2_integer_field(&entity->spawn, "sounds", 0);
-  entity->style = (double)(qa_js_to_int32(q2mp_u32(sounds != 0 ? sounds : 8) & 255u));
+  entity->style = (double)(qa_js_to_int32(q2mp_u32(q2mp_truthy(sounds) ? sounds : 8) & 255u));
   entity->wait *= 1000;
   entity->visible = false;
   game->show(game->ctx, entity);
@@ -140,20 +135,29 @@ static void anger_use_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services *g
   target->server_flags = (double)(qa_js_to_int32(q2mp_u32(target->server_flags) | 4u));
   if (!q2mp_cread(game, target->actor.id).has_value) q2mp_combat_create(game, target->actor, 300, 0, false);
   else qa_gameplay_authority_set_health(game->host->combat, target->actor, 300);
+  /* TS iterates its own array; game->targets returns the services' scratch list, which the next
+   * targets() call (the anger hook finds targets) overwrites or moves. */
   size_t count = 0;
-  qa_q2_entity *const *monsters = game->targets(game->ctx, entity->target, &count);
+  qa_q2_entity *const *listed = game->targets(game->ctx, entity->target, &count);
+  qa_q2_entity **monsters = malloc((count ? count : 1) * sizeof *monsters);
+  if (monsters == NULL) qa_raise("Error", 0, 0, "Out of memory listing target_anger targets");
+  if (count > 0) memcpy(monsters, listed, count * sizeof *monsters);
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, monsters);
   for (size_t i = 0; i < count; i++) {
     qa_q2_entity *monster = monsters[i];
     if (monster == entity) game->host->diagnostic(game->host->ctx, "WARNING: entity used itself.");
     else if (monster->use.fn != NULL) {
-      if (q2mp_health(game, monster->actor.id) < 0) return;
+      if (q2mp_health(game, monster->actor.id) < 0) break;
       e->hooks.target_anger(e->hooks.ctx, monster, target, game);
     }
     if (!q2mp_live(game, entity->actor.id)) {
       game->host->diagnostic(game->host->ctx, "entity was removed while using targets");
-      return;
+      break;
     }
   }
+  qa_cleanup_pop(&node);
+  free(monsters);
 }
 static void kill_players_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services *game, const qa_actor_id *other,
                             const qa_actor_id *activator) {
@@ -164,10 +168,18 @@ static void kill_players_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services
   for (size_t i = 0; i < players; i++)
     q2mp_damage(game, list[i], entity, entity->actor.id, &entity->actor.id, 100000, 0, q2mp_zero(), origin, q2mp_zero(),
                 21, true, 32, NULL);
-  for (size_t i = 0; i < qa_q2_game_entity_count(game); i++) {
-    qa_q2_entity *target = qa_q2_game_entity_at(game, i);
+  /* TS `[...game.entities.values()]`: the damage below removes and creates entities, so the loop runs over
+   * a snapshot; an entry removed earlier in the loop has no combat state in TS and is skipped. */
+  size_t count = 0;
+  qa_q2_entity **targets = q2mp_entity_snapshot(game, &count);
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, targets);
+  for (size_t i = 0; i < count; i++) {
+    qa_q2_entity *target = targets[i];
+    if (!q2mp_entity_present(game, target)) continue;
     qa_combat_state_result combat = q2mp_cread(game, target->actor.id);
     if (!combat.has_value || combat.value.health < 1 || !combat.value.can_take_damage) continue;
+    list = game->host->players(game->host->ctx, &players);
     for (size_t j = 0; j < players; j++) {
       qa_q2_entity *player = q2mp_ent(game, true, list[j]);
       if (player != NULL && qa_q2mp_sight(game, player, target->actor.id)) {
@@ -177,6 +189,8 @@ static void kill_players_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services
       }
     }
   }
+  qa_cleanup_pop(&node);
+  free(targets);
 }
 static void random_angles(qa_q2_entity *entity, qa_q2_game_services *game) {
   qa_q2_body_changes c = q2mp_changes();
@@ -203,7 +217,7 @@ bool qa_q2mp_rogue_entities_spawn(qa_q2mp_rogue_entities *e, qa_q2_entity *entit
   if (strcmp(classname, "info_teleport_destination") == 0) {
     /* TS: break (no-op) */
   } else if (strcmp(classname, "trigger_teleport") == 0) {
-    if (entity->wait == 0) entity->wait = 0.2;
+    if (!q2mp_truthy(entity->wait)) entity->wait = 0.2;
     entity->delay = strcmp(entity->targetname, "") != 0 && ((q2mp_u32(entity->spawnflags) & 8u) == 0) ? 1 : 0;
     entity->use = strcmp(entity->targetname, "") == 0 ? (qa_q2_use){NULL, NULL} : e->teleport_use;
     entity->touch = e->teleport_touch;
@@ -245,7 +259,8 @@ bool qa_q2mp_rogue_entities_spawn(qa_q2mp_rogue_entities *e, qa_q2_entity *entit
     } else {
       bool orb = strcmp(classname, "target_orb") == 0;
       entity->model = "models/items/spawngro2/tris.md2";
-      entity->effects = (double)(qa_js_to_int32(q2mp_u32(entity->effects) | (orb ? 0x10000000u : (0x80000000u | 0x4000000u))));
+      /* TS `(effects | bits) >>> 0`: an unsigned result (the black light sets bit 31). */
+      entity->effects = (double)(q2mp_u32(entity->effects) | (orb ? 0x10000000u : (0x80000000u | 0x4000000u)));
       entity->frame = orb ? 2 : 1;
       qa_q2_body_changes c = q2mp_changes();
       c.has_bounds = true; c.bounds = (qa_bounds){q2mp_zero(), q2mp_zero()};

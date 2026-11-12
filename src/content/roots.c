@@ -4,6 +4,7 @@
 
 #include <dirent.h>
 #include <limits.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
+#include "qa/foundation/node_path.h"
 
 static const char *const ANCHORS[3] = {"id1", "baseq2", "baseq3"};
 static const char *const CANONICAL[3] = {"q1", "q2", "q3a"};
@@ -28,77 +30,30 @@ static char *lowered(const char *text) { return qa_js_to_lower_case(text); }
 /* TS left.toLowerCase() === right (right already lowered). */
 static bool ascii_iequal(const char *left, const char *right) { return qa_js_equals_ignore_case(left, right); }
 
-/* Lexical absolute normalization (node:path resolve). */
-static char *normalize_absolute(const char *joined) {
-  size_t length = strlen(joined);
-  char *copy = (char *)malloc(length + 1);
-  if (copy == NULL) return NULL;
-  memcpy(copy, joined, length + 1);
-  char **parts = (char **)malloc((length / 2 + 2) * sizeof *parts);
-  if (parts == NULL) { free(copy); return NULL; }
-  size_t count = 0;
-  char *cursor = copy;
-  while (*cursor != '\0') {
-    while (*cursor == '/') cursor++;
-    if (*cursor == '\0') break;
-    char *start = cursor;
-    while (*cursor != '\0' && *cursor != '/') cursor++;
-    size_t part_length = (size_t)(cursor - start);
-    if (*cursor == '/') *cursor++ = '\0';
-    if (part_length == 1 && start[0] == '.') continue;
-    if (part_length == 2 && start[0] == '.' && start[1] == '.') {
-      if (count > 0) count--;
-      continue;
-    }
-    parts[count++] = start;
-  }
-  char *out = (char *)malloc(length + 2);
-  if (out == NULL) { free(parts); free(copy); return NULL; }
-  size_t at = 0;
-  if (count == 0) out[at++] = '/';
-  for (size_t i = 0; i < count; i++) {
-    out[at++] = '/';
-    size_t part_length = strlen(parts[i]);
-    memcpy(out + at, parts[i], part_length);
-    at += part_length;
-  }
-  out[at] = '\0';
-  free(parts);
-  free(copy);
-  return out;
-}
+/* node:path resolve / dirname (qa/foundation/node_path.h). */
 static char *resolve2(const char *first, const char *second) {
-  char joined[PATH_MAX * 2];
-  if (second != NULL && second[0] == '/') {
-    (void)snprintf(joined, sizeof joined, "%s", second);
-  } else if (first[0] == '/') {
-    if (second != NULL) (void)snprintf(joined, sizeof joined, "%s/%s", first, second);
-    else (void)snprintf(joined, sizeof joined, "%s", first);
-  } else {
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof cwd) == NULL) return copy_text(first);
-    if (second != NULL)
-      (void)snprintf(joined, sizeof joined, "%s/%s/%s", cwd, first, second);
-    else
-      (void)snprintf(joined, sizeof joined, "%s/%s", cwd, first);
-  }
-  return normalize_absolute(joined);
+  return second != NULL ? qa_node_path_resolve2(first, second)
+                        : qa_node_path_resolve1(first);
 }
-static char *dirname_of(const char *path) {
-  char *copy = copy_text(path);
-  if (copy == NULL) return NULL;
-  size_t length = strlen(copy);
-  while (length > 1 && copy[length - 1] == '/') copy[--length] = '\0';
-  char *slash = strrchr(copy, '/');
-  if (slash == NULL) { memcpy(copy, ".", 2); return copy; }
-  if (slash == copy) { copy[1] = '\0'; return copy; }
-  *slash = '\0';
-  return copy;
+static char *dirname_of(const char *path) { return qa_node_path_dirname(path); }
+
+/* os.homedir(): $HOME when it is set (even empty), else the password
+ * database entry of the effective user. */
+const char *qa_content_home_directory(void) {
+  const char *env = getenv("HOME");
+  if (env != NULL) return env;
+  static char fallback[PATH_MAX];
+  struct passwd record, *found = NULL;
+  char buffer[4096];
+  if (getpwuid_r(geteuid(), &record, buffer, sizeof buffer, &found) == 0 &&
+      found != NULL && found->pw_dir != NULL) {
+    (void)snprintf(fallback, sizeof fallback, "%s", found->pw_dir);
+    return fallback;
+  }
+  return "";
 }
 static const char *home_of(const char *home) {
-  if (home != NULL) return home;
-  const char *env = getenv("HOME");
-  return env != NULL ? env : "";
+  return home != NULL ? home : qa_content_home_directory();
 }
 
 const char *qa_game_family_directory(qa_game_family family) {
@@ -308,6 +263,20 @@ bool qa_has_game_anchor(const char *root) {
   return false;
 }
 
+bool qa_is_install_root(const char *path, const char *content_root) {
+  char *absolute = resolve2(path, NULL);
+  char *root = resolve2(content_root, NULL);
+  bool install = absolute != NULL && root != NULL && strcmp(absolute, root) == 0;
+  free(root);
+  for (int family = 0; !install && absolute != NULL && family < 3; family++) {
+    char *child = child_directory(absolute, ANCHORS[family]);
+    install = child != NULL;
+    free(child);
+  }
+  free(absolute);
+  return install;
+}
+
 void qa_content_free_string_list(char **list, size_t count) {
   if (list == NULL) return;
   for (size_t i = 0; i < count; i++) free(list[i]);
@@ -383,9 +352,8 @@ static bool steam_apps_directories(const char *home, char ***out, size_t *out_co
       search = cursor + 1;
       cursor += strlen("\"path\"");
       const char *spaces = cursor;
-      while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' ||
-             *cursor == '\r' || *cursor == '\v' || *cursor == '\f')
-        cursor++;
+      for (size_t white; (white = qa_js_white_space_length(cursor)) != 0;) /* regex \s */
+        cursor += white;
       if (cursor == spaces || *cursor != '"') continue;
       cursor++;
       const char *end = strchr(cursor, '"');
@@ -479,12 +447,12 @@ bool qa_nightdive_addon_directories(const char *home,
       {QA_GAME_FAMILY_Q2, "compatdata/2320/pfx/drive_c/users/steamuser/Saved Games/Nightdive Studios/Quake II", NULL},
       {QA_GAME_FAMILY_Q1, "Saved Games/Nightdive Studios/Quake", ""},
       {QA_GAME_FAMILY_Q2, "Saved Games/Nightdive Studios/Quake II", ""}};
-  for (int spec_index = 0; spec_index < 4; spec_index++) {
-    size_t bases = specs[spec_index].base != NULL ? 1 : app_count;
-    for (size_t base_index = 0; base_index < bases; base_index++) {
-      const char *base = specs[spec_index].base != NULL
-                             ? resolved_home
-                             : apps[base_index];
+  /* TS order: each steamapps directory adds Quake then Quake II; the
+   * profile's own Saved Games pair comes last. */
+  for (size_t base_index = 0; base_index <= app_count; base_index++) {
+    for (int pair = 0; pair < 2; pair++) {
+      int spec_index = (base_index < app_count ? 0 : 2) + pair;
+      const char *base = base_index < app_count ? apps[base_index] : resolved_home;
       char *absolute = resolve2(base, specs[spec_index].suffix);
       if (absolute == NULL) goto oom;
       if (!is_directory(absolute)) { free(absolute); continue; }

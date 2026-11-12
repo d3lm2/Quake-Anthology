@@ -14,22 +14,47 @@
 #include "qa/persistence/save_image.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
-#define MAX_SOURCES 16
 typedef struct behavior_source {
   const char *kind;
   void *source; /* per-kind source pointer */
+  struct quakec_random *random; /* QuakeC: the SourceRandom it retains (constructed or restored) */
+  struct quakec_binding *binding; /* QuakeC: its QcWeaponBehaviorOptions closures */
 } behavior_source;
+/* TS sources/definitions Maps and deferredEntries (any count). */
 struct qa_app_sim_simulation_weapon_behaviors {
   qa_weapon_behavior_attachments *attachments;
-  behavior_source sources[MAX_SOURCES]; size_t source_count;
-  qa_weapon_behavior_definition definitions[MAX_SOURCES]; size_t definition_count;
-  qa_app_prepared_weapon_behavior deferred[MAX_SOURCES]; size_t deferred_count;
+  behavior_source *sources; size_t source_count, source_capacity;
+  /* close() empties the sources Map; its entries stay owned here until destroy. */
+  behavior_source *closed; size_t closed_count;
+  qa_weapon_behavior_definition *definitions; size_t definition_count, definition_capacity;
+  qa_app_prepared_weapon_behavior *deferred; size_t deferred_count, deferred_capacity;
   bool has_pending_restore; qa_save_value *pending_tree;
   bool ready;
   qa_app_sim_weapon_behavior_runtime_host host;
-  struct quakec_random *randoms[MAX_SOURCES]; /* SourceRandom per source (constructed or restored), retained by it */
-  struct quakec_binding *bindings[MAX_SOURCES]; /* the QcWeaponBehaviorOptions closures of each QuakeC source */
 };
+static void *grow(void *items, size_t *capacity, size_t count, size_t size) {
+  if (count < *capacity) return items;
+  size_t next = *capacity ? *capacity * 2 : 4;
+  void *grown = realloc(items, next * size);
+  if (!grown) qa_range_error("Out of memory");
+  *capacity = next;
+  return grown;
+}
+/* sources.set(id, entry) for a new source: appended (and owned until destroy). */
+static behavior_source *add_source(qa_app_sim_simulation_weapon_behaviors *b) {
+  b->sources = grow(b->sources, &b->source_capacity, b->source_count, sizeof *b->sources);
+  behavior_source *entry = &b->sources[b->source_count];
+  memset(entry, 0, sizeof *entry);
+  return entry;
+}
+static void commit_source(qa_app_sim_simulation_weapon_behaviors *b) { b->source_count++; }
+static bool is(const char *a, const char *b);
+static void quakec_random_destroy(struct quakec_random *r);
+static void destroy_entry(behavior_source *entry) {
+  /* source is NULL for a QuakeC source whose construction raised */
+  if (is(entry->kind, "quakec") && entry->source) qa_app_sim_quakec_weapon_behavior_source_destroy(entry->source);
+  quakec_random_destroy(entry->random); free(entry->binding);
+}
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 /* TS `new SourceRandom(seed)` restored for a QuakeC source, as the RandomSource it retains. */
 typedef struct quakec_random { qa_app_sim_source_random *random; double words[31]; } quakec_random;
@@ -86,33 +111,46 @@ static qa_weapon_behavior_definition source_definition(behavior_source *s) {
   if (is(s->kind, "qvm")) return qa_app_sim_qvm_weapon_behavior_source_definition(s->source);
   return qa_app_sim_rerelease_weapon_behavior_source_definition(s->source);
 }
+static void create_failed(void *arg) { qa_app_sim_simulation_weapon_behaviors_destroy(arg); }
 qa_app_sim_simulation_weapon_behaviors *qa_app_sim_simulation_weapon_behaviors_create(
     const qa_app_prepared_weapon_behavior *prepared, size_t prepared_count,
     qa_app_sim_weapon_behavior_runtime_host host) {
   qa_app_sim_simulation_weapon_behaviors *b = calloc(1, sizeof *b);
   if (!b) qa_range_error("Out of memory");
   b->host = host;
+  /* A refused selection (two behaviors for one role) frees what was built (TS GC). */
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, create_failed, b);
   b->attachments = qa_weapon_behavior_attachments_create(host.actors);
   if (!b->attachments) qa_range_error("Out of memory");
   for (size_t i = 0; i < prepared_count; i++) {
     const qa_weapon_behavior_definition *definition = prepared[i].selection.definition;
     for (size_t j = 0; j < b->definition_count; j++)
       if (is(b->definitions[j].role, definition->role))
-        qa_range_error("Multiple selected trajectory behaviors for %s", definition->role);
-    if (b->definition_count >= MAX_SOURCES) qa_range_error("Out of memory");
-    b->definitions[b->definition_count++] = *definition;
+        qa_raise("Error", 0, 0, "Multiple selected trajectory behaviors for %s", definition->role);
+    /* definitions.set(definition.id, definition): an id already present keeps its place. */
+    size_t at = b->definition_count;
+    for (size_t j = 0; j < b->definition_count; j++) if (is(b->definitions[j].id, definition->id)) at = j;
+    if (at == b->definition_count) {
+      b->definitions = grow(b->definitions, &b->definition_capacity, b->definition_count, sizeof *b->definitions);
+      b->definition_count++;
+    }
+    b->definitions[at] = *definition;
     if (!is(prepared[i].kind, "quakec")) {
-      if (b->deferred_count < MAX_SOURCES) b->deferred[b->deferred_count++] = prepared[i];
+      b->deferred = grow(b->deferred, &b->deferred_capacity, b->deferred_count, sizeof *b->deferred);
+      b->deferred[b->deferred_count++] = prepared[i];
       continue;
     }
     const qa_app_prepared_quakec_weapon_behavior *payload = prepared[i].payload;
-    size_t index = b->source_count;
+    behavior_source *entry = add_source(b);
+    commit_source(b); /* owned from here: a raise below frees its parts with the runtime */
+    entry->kind = "quakec";
     quakec_random *random = calloc(1, sizeof *random);
     quakec_binding *binding = calloc(1, sizeof *binding);
-    if (!random || !binding) qa_range_error("Out of memory");
+    if (!random || !binding) { free(random); free(binding); qa_range_error("Out of memory"); }
+    entry->random = random; entry->binding = binding;
     random->random = qa_app_sim_source_random_create(host.seed, "classic");
     binding->behaviors = b; binding->resources = payload->resources;
-    b->randoms[index] = random; b->bindings[index] = binding;
     qa_app_sim_qc_weapon_behavior_options options; memset(&options, 0, sizeof options);
     options.definition = *definition;
     options.program = (qa_compat_qc_program *)payload->program;
@@ -122,20 +160,21 @@ qa_app_sim_simulation_weapon_behaviors *qa_app_sim_simulation_weapon_behaviors_c
     options.print = quakec_print;
     qa_app_sim_quakec_weapon_behavior_source *source = qa_app_sim_quakec_weapon_behavior_source_create(options);
     if (!source) qa_range_error("Out of memory");
-    b->sources[b->source_count++] = (behavior_source){"quakec", source};
+    entry->source = source;
     qa_weapon_behavior_attachments_register(b->attachments,
         qa_app_sim_quakec_weapon_behavior_source_as_source(source));
   }
   b->ready = b->deferred_count == 0;
+  qa_cleanup_pop(&cleanup);
   return b;
 }
 void qa_app_sim_simulation_weapon_behaviors_destroy(qa_app_sim_simulation_weapon_behaviors *behaviors) {
   if (!behaviors) return;
   qa_weapon_behavior_attachments_destroy(behaviors->attachments);
   qa_save_value_free(behaviors->pending_tree);
-  for (size_t i = 0; i < behaviors->source_count; i++)
-    if (is(behaviors->sources[i].kind, "quakec")) qa_app_sim_quakec_weapon_behavior_source_destroy(behaviors->sources[i].source);
-  for (size_t i = 0; i < MAX_SOURCES; i++) { quakec_random_destroy(behaviors->randoms[i]); free(behaviors->bindings[i]); }
+  for (size_t i = 0; i < behaviors->source_count; i++) destroy_entry(&behaviors->sources[i]);
+  for (size_t i = 0; i < behaviors->closed_count; i++) destroy_entry(&behaviors->closed[i]);
+  free(behaviors->sources); free(behaviors->closed); free(behaviors->definitions); free(behaviors->deferred);
   free(behaviors);
 }
 static void restore_loading(qa_app_sim_simulation_weapon_behaviors *b, const qa_save_reader *reader,
@@ -146,13 +185,17 @@ void qa_app_sim_simulation_weapon_behaviors_initialize_loading(qa_app_sim_simula
   for (size_t i = 0; i < b->deferred_count; i++) {
     if (is(b->deferred[i].kind, "qvm")) {
       qa_app_sim_qvm_weapon_behavior_source *source = b->host.create_qvm(b->host.ctx, b->deferred[i]);
-      b->sources[b->source_count++] = (behavior_source){"qvm", source};
+      behavior_source *entry = add_source(b);
+      entry->kind = "qvm"; entry->source = source;
+      commit_source(b);
       qa_weapon_behavior_attachments_register(b->attachments,
           qa_app_sim_qvm_weapon_behavior_source_as_source(source));
     } else {
       qa_app_sim_rerelease_weapon_behavior_source *source =
           b->host.create_native(b->host.ctx, b->deferred[i], next_frame, frame_ctx);
-      b->sources[b->source_count++] = (behavior_source){"rerelease-native", source};
+      behavior_source *entry = add_source(b);
+      entry->kind = "rerelease-native"; entry->source = source;
+      commit_source(b);
       qa_weapon_behavior_attachments_register(b->attachments,
           qa_app_sim_rerelease_weapon_behavior_source_as_source(source));
     }
@@ -168,7 +211,7 @@ void qa_app_sim_simulation_weapon_behaviors_initialize_loading(qa_app_sim_simula
 }
 qa_weapon_trajectory_update_result qa_app_sim_simulation_weapon_behaviors_launch(
     qa_app_sim_simulation_weapon_behaviors *b, qa_weapon_behavior_launch input) {
-  if (!b->ready) qa_range_error("Weapon components require completed asynchronous loading");
+  if (!b->ready) qa_raise("Error", 0, 0, "Weapon components require completed asynchronous loading");
   for (size_t i = 0; i < b->definition_count; i++)
     if (is(b->definitions[i].role, input.role))
       return qa_weapon_behavior_attachments_launch(b->attachments, b->definitions[i].id, input);
@@ -371,12 +414,12 @@ static qa_app_sim_weapon_behavior_runtime_checkpoint wb_checkpoint(qa_app_sim_si
 qa_app_sim_weapon_behavior_runtime_checkpoint qa_app_sim_simulation_weapon_behaviors_checkpoint(qa_app_sim_simulation_weapon_behaviors *b) {
   bool has_native = false;
   for (size_t i = 0; i < b->deferred_count; i++) if (is(b->deferred[i].kind, "rerelease-native")) has_native = true;
-  if (!b->ready || has_native) qa_range_error("Native weapon components require asynchronous checkpoint capture");
+  if (!b->ready || has_native) qa_raise("Error", 0, 0, "Native weapon components require asynchronous checkpoint capture");
   return wb_checkpoint(b, false, NULL, NULL);
 }
 qa_app_sim_weapon_behavior_runtime_checkpoint qa_app_sim_simulation_weapon_behaviors_checkpoint_loading(
     qa_app_sim_simulation_weapon_behaviors *b, void (*next_frame)(void *ctx), void *frame_ctx) {
-  if (!b->ready) qa_range_error("Weapon components have not finished loading");
+  if (!b->ready) qa_raise("Error", 0, 0, "Weapon components have not finished loading");
   return wb_checkpoint(b, true, next_frame, frame_ctx);
 }
 typedef struct read_entry {
@@ -385,32 +428,42 @@ typedef struct read_entry {
   qa_app_sim_qvm_weapon_behavior_checkpoint qvm;
   qa_app_sim_rerelease_weapon_behavior_checkpoint rerelease;
 } read_entry;
-static size_t read_sources(qa_app_sim_simulation_weapon_behaviors *b, const qa_save_reader *reader, read_entry *out) {
+/* The checkpoints readSources returns: entries from `next` on are still owned here, so a raise
+ * part way (a refused save) frees them (TS drops its list). */
+typedef struct read_list { read_entry *items; size_t count, next; } read_list;
+static void free_read_entry(read_entry *e) {
+  if (is(e->kind, "quakec")) qa_app_sim_quakec_weapon_behavior_checkpoint_free(&e->quakec);
+  else if (is(e->kind, "qvm")) qa_app_sim_qvm_weapon_behavior_checkpoint_free(&e->qvm);
+  else if (is(e->kind, "rerelease-native")) qa_app_sim_rerelease_weapon_behavior_checkpoint_free(&e->rerelease);
+}
+static void read_list_release(void *arg) {
+  read_list *list = arg;
+  for (size_t i = list->next; i < list->count; i++) free_read_entry(&list->items[i]);
+  free(list->items);
+  list->items = NULL; list->count = list->next = 0;
+}
+static void read_sources(qa_app_sim_simulation_weapon_behaviors *b, const qa_save_reader *reader, read_list *out) {
   qa_save_reader f = fld(reader, "version"); qa_save_reader_literal_number(&f, 1); qa_save_reader_destroy(&f);
   qa_save_reader sources = fld(reader, "sources");
   size_t count = qa_save_reader_list_count(&sources);
-  size_t n = 0;
+  /* Each saved id matches a distinct source, so there are at most source_count entries. */
+  out->items = calloc(b->source_count ? b->source_count : 1, sizeof *out->items);
+  if (!out->items) qa_range_error("Out of memory");
   for (size_t i = 0; i < count; i++) {
     qa_save_reader value, df, idf;
     qa_save_reader_item(&sources, i, &value);
     df = fld(&value, "definition"); idf = fld(&df, "id");
     const char *id = qa_save_reader_string(&idf);
     qa_save_reader_destroy(&idf); qa_save_reader_destroy(&df);
-    behavior_source *entry = NULL;
-    for (size_t s = 0; s < b->source_count; s++)
+    behavior_source *entry = NULL; /* sources.get(id): keyed by each source's definition id */
+    for (size_t s = 0; s < b->source_count && !entry; s++)
       if (is(source_definition(&b->sources[s]).id, id)) entry = &b->sources[s];
-    /* definitions map when source struct definition is not directly readable */
-    if (entry == NULL) {
-      for (size_t s = 0; s < b->source_count; s++)
-        if (s < b->definition_count && is(b->definitions[s].id, id)) entry = &b->sources[s];
-    }
     bool dup = false;
-    for (size_t s = 0; s < n; s++) if (out[s].source == entry && entry) dup = true;
+    for (size_t s = 0; s < out->count; s++) if (out->items[s].source == entry && entry) dup = true;
     if (entry == NULL || dup) qa_save_reader_fail(&value, "Saved weapon behavior differs from selection");
-    read_entry *e = &out[n++]; memset(e, 0, sizeof *e);
-    e->kind = entry->kind; e->source = entry;
+    read_entry *e = &out->items[out->count]; memset(e, 0, sizeof *e);
+    e->source = entry;
     qa_weapon_behavior_definition def = source_definition(entry);
-    if (def.id == NULL) { for (size_t s = 0; s < b->definition_count; s++) if (is(b->definitions[s].id, id)) def = b->definitions[s]; }
     if (is(entry->kind, "quakec")) e->quakec = qa_app_sim_read_quakec_weapon_behavior_checkpoint(&value, def);
     else if (is(entry->kind, "qvm")) e->qvm = qa_app_sim_read_qvm_weapon_behavior_checkpoint(&value, def);
     else {
@@ -418,54 +471,96 @@ static size_t read_sources(qa_app_sim_simulation_weapon_behaviors *b, const qa_s
           qa_app_sim_rerelease_weapon_behavior_source_declaration(entry->source);
       e->rerelease = qa_app_sim_read_rerelease_weapon_behavior_checkpoint(&value, def, decl, b->host.profiles);
     }
+    e->kind = entry->kind; /* owned by the list from here */
+    out->count++;
     qa_save_reader_destroy(&value);
   }
   qa_save_reader_destroy(&sources);
-  if (n != b->source_count) qa_save_reader_fail(reader, "Saved weapon behavior source is missing");
-  return n;
+  if (out->count != b->source_count) qa_save_reader_fail(reader, "Saved weapon behavior source is missing");
 }
 static qa_actor_id ref_saved(void *ctx, qa_saved_actor_id saved) {
   qa_app_sim_simulation_weapon_behaviors *b = ctx;
   return qa_session_actor_registry_reference_saved(b->host.actors, saved, "checkpoint");
 }
+static void quakec_checkpoint_release(void *arg) { qa_app_sim_quakec_weapon_behavior_checkpoint_free(arg); }
+static void quakec_random_release(void *arg) { quakec_random_destroy(arg); }
+static void qvm_checkpoint_release(void *arg) { qa_app_sim_qvm_weapon_behavior_checkpoint_free(arg); }
+/* resolveActor(saved, reader): a retired actor fails the reader (qvm and native sources). */
+typedef struct resolve_ctx { qa_app_sim_simulation_weapon_behaviors *b; const qa_save_reader *reader; } resolve_ctx;
+static qa_owned_actor resolve_owned(void *ctx, qa_saved_actor_id saved) {
+  resolve_ctx *resolve = ctx;
+  qa_owned_actor actor;
+  if (!qa_session_actor_registry_resolve_saved(resolve->b->host.actors, saved, &actor))
+    qa_save_reader_fail(resolve->reader, "Weapon component references a retired actor");
+  return actor;
+}
+static qa_actor_id resolve_id(void *ctx, qa_saved_actor_id saved) { return resolve_owned(ctx, saved).id; }
+/* restoreQuakeC; takes the checkpoint (freed here, also when it is refused). */
 static void restore_quakec(qa_app_sim_simulation_weapon_behaviors *b, behavior_source *entry,
     qa_app_sim_quakec_weapon_behavior_checkpoint checkpoint, const qa_save_reader *reader) {
+  qa_cleanup checkpoint_guard;
+  qa_cleanup_push(&checkpoint_guard, quakec_checkpoint_release, &checkpoint);
   if (checkpoint.random.kind != QA_RANDOM_STATE_GLIBC_RANDOM)
     qa_save_reader_fail(reader, "QuakeC trajectory requires its source random stream");
+  /* SourceRandom.restore: 31 words and a front/rear inside them, else RangeError. */
+  if (checkpoint.random.words.count != 31 || !(checkpoint.random.front >= 0 && checkpoint.random.front < 31)
+      || !(checkpoint.random.rear >= 0 && checkpoint.random.rear < 31))
+    qa_range_error("Invalid source random state");
   quakec_random *random = calloc(1, sizeof *random);
   if (!random) qa_range_error("Out of memory");
+  qa_cleanup random_guard;
+  qa_cleanup_push(&random_guard, quakec_random_release, random);
   random->random = qa_app_sim_source_random_create(b->host.seed, "classic");
   qa_app_sim_source_random_state state; memset(&state, 0, sizeof state);
   state.kind = "glibc-random";
-  for (size_t i = 0; i < checkpoint.random.words.count && i < 31; i++) state.words[i] = qa_js_to_int32(checkpoint.random.words.values[i]);
+  for (size_t i = 0; i < 31; i++) state.words[i] = qa_js_to_int32(checkpoint.random.words.values[i]);
   state.front = (int)checkpoint.random.front; state.rear = (int)checkpoint.random.rear; state.draws = (int64_t)checkpoint.random.draws;
   qa_app_sim_source_random_restore(random->random, state);
   qa_random_source source = {random, quakec_random_next_integer, quakec_random_next_unit, quakec_random_checkpoint};
   qa_app_sim_quakec_weapon_behavior_source_restore(entry->source, &checkpoint, ref_saved, b, source);
-  size_t index = (size_t)(entry - b->sources);
-  quakec_random_destroy(b->randoms[index]); b->randoms[index] = random;
+  qa_cleanup_pop(&random_guard);
+  quakec_random_destroy(entry->random); entry->random = random;
+  qa_cleanup_pop(&checkpoint_guard);
   qa_app_sim_quakec_weapon_behavior_checkpoint_free(&checkpoint);
 }
-static void restore_loading(qa_app_sim_simulation_weapon_behaviors *b, const qa_save_reader *reader,
-    void (*next_frame)(void *ctx), void *frame_ctx) {
-  read_entry entries[MAX_SOURCES];
-  size_t n = read_sources(b, reader, entries);
-  for (size_t i = 0; i < n; i++) {
-    if (is(entries[i].kind, "quakec")) restore_quakec(b, entries[i].source, entries[i].quakec, reader);
-    else if (is(entries[i].kind, "qvm"))
-      { qa_app_sim_qvm_weapon_behavior_source_restore(entries[i].source->source, &entries[i].qvm, ref_saved, b); qa_app_sim_qvm_weapon_behavior_checkpoint_free(&entries[i].qvm); }
-    else qa_app_sim_rerelease_weapon_behavior_source_restore(entries[i].source->source, entries[i].rerelease, next_frame, frame_ctx);
-  }
+static void restore_attachments(qa_app_sim_simulation_weapon_behaviors *b, const qa_save_reader *reader) {
   qa_save_reader af = fld(reader, "attachments");
   qa_weapon_behavior_attachment_checkpoint attachments =
       qa_read_weapon_behavior_attachment_checkpoint(&af, b->definitions, b->definition_count);
   qa_save_reader_destroy(&af);
   qa_weapon_behavior_attachments_restore(b->attachments, attachments);
 }
+static void restore_loading(qa_app_sim_simulation_weapon_behaviors *b, const qa_save_reader *reader,
+    void (*next_frame)(void *ctx), void *frame_ctx) {
+  read_list list = {NULL, 0, 0};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, read_list_release, &list);
+  read_sources(b, reader, &list);
+  for (size_t i = 0; i < list.count; i++) {
+    read_entry *e = &list.items[i];
+    list.next = i + 1; /* the restore below takes the checkpoint */
+    if (is(e->kind, "quakec")) restore_quakec(b, e->source, e->quakec, reader);
+    else if (is(e->kind, "qvm")) {
+      qa_cleanup qvm_guard;
+      qa_cleanup_push(&qvm_guard, qvm_checkpoint_release, &e->qvm);
+      resolve_ctx resolve = {b, reader};
+      qa_app_sim_qvm_weapon_behavior_source_restore(e->source->source, &e->qvm, resolve_id, &resolve);
+      qa_cleanup_pop(&qvm_guard);
+      qa_app_sim_qvm_weapon_behavior_checkpoint_free(&e->qvm);
+    } else {
+      resolve_ctx resolve = {b, reader};
+      qa_app_sim_rerelease_weapon_behavior_source_restore_with(e->source->source, e->rerelease, &resolve, resolve_owned,
+          next_frame, frame_ctx);
+    }
+  }
+  qa_cleanup_pop(&cleanup);
+  read_list_release(&list);
+  restore_attachments(b, reader);
+}
 void qa_app_sim_simulation_weapon_behaviors_restore(qa_app_sim_simulation_weapon_behaviors *b, const qa_save_reader *reader) {
   if (qa_save_reader_is_undefined(reader) && b->definition_count == 0) return;
   if (!b->ready) {
-    if (b->has_pending_restore) qa_range_error("Weapon component restore is already queued");
+    if (b->has_pending_restore) qa_raise("Error", 0, 0, "Weapon component restore is already queued");
     /* TS retains the reader; copy its tree for the deferred restore. */
     size_t length = 0;
     uint8_t *bytes = qa_encode_checkpoint_value(reader->value, &length);
@@ -474,24 +569,53 @@ void qa_app_sim_simulation_weapon_behaviors_restore(qa_app_sim_simulation_weapon
     b->has_pending_restore = true;
     return;
   }
-  read_entry entries[MAX_SOURCES];
-  size_t n = read_sources(b, reader, entries);
-  for (size_t i = 0; i < n; i++) {
-    if (is(entries[i].kind, "rerelease-native")) qa_range_error("Native weapon components require asynchronous restoration");
-    if (is(entries[i].kind, "quakec")) restore_quakec(b, entries[i].source, entries[i].quakec, reader);
-    else { qa_app_sim_qvm_weapon_behavior_source_restore(entries[i].source->source, &entries[i].qvm, ref_saved, b); qa_app_sim_qvm_weapon_behavior_checkpoint_free(&entries[i].qvm); }
+  read_list list = {NULL, 0, 0};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, read_list_release, &list);
+  read_sources(b, reader, &list);
+  for (size_t i = 0; i < list.count; i++) {
+    read_entry *e = &list.items[i];
+    if (is(e->kind, "rerelease-native")) qa_raise("Error", 0, 0, "Native weapon components require asynchronous restoration");
+    list.next = i + 1;
+    if (is(e->kind, "quakec")) restore_quakec(b, e->source, e->quakec, reader);
+    else {
+      qa_cleanup qvm_guard;
+      qa_cleanup_push(&qvm_guard, qvm_checkpoint_release, &e->qvm);
+      resolve_ctx resolve = {b, reader};
+      qa_app_sim_qvm_weapon_behavior_source_restore(e->source->source, &e->qvm, resolve_id, &resolve);
+      qa_cleanup_pop(&qvm_guard);
+      qa_app_sim_qvm_weapon_behavior_checkpoint_free(&e->qvm);
+    }
   }
-  qa_save_reader af = fld(reader, "attachments");
-  qa_weapon_behavior_attachment_checkpoint attachments =
-      qa_read_weapon_behavior_attachment_checkpoint(&af, b->definitions, b->definition_count);
-  qa_save_reader_destroy(&af);
-  qa_weapon_behavior_attachments_restore(b->attachments, attachments);
+  qa_cleanup_pop(&cleanup);
+  read_list_release(&list);
+  restore_attachments(b, reader);
+}
+static void close_attachments(void *ctx) {
+  qa_weapon_behavior_attachments_close(((qa_app_sim_simulation_weapon_behaviors *)ctx)->attachments);
+}
+static void close_source(void *ctx) {
+  behavior_source *entry = ctx;
+  if (is(entry->kind, "qvm")) qa_app_sim_qvm_weapon_behavior_source_close(entry->source);
+  else qa_app_sim_rerelease_weapon_behavior_source_close(entry->source);
 }
 void qa_app_sim_simulation_weapon_behaviors_close(qa_app_sim_simulation_weapon_behaviors *b) {
-  qa_weapon_behavior_attachments_close(b->attachments);
-  for (size_t i = 0; i < b->source_count; i++) {
-    if (is(b->sources[i].kind, "qvm")) qa_app_sim_qvm_weapon_behavior_source_close(b->sources[i].source);
-    else if (is(b->sources[i].kind, "rerelease-native")) qa_app_sim_rerelease_weapon_behavior_source_close(b->sources[i].source);
+  /* Every part closes even when one raises; the failures become one AggregateError. */
+  size_t failures = 0;
+  qa_caught_error caught;
+  if (!qa_try(close_attachments, b, &caught)) failures++;
+  for (size_t i = 0; i < b->source_count; i++)
+    if (!is(b->sources[i].kind, "quakec") && !qa_try(close_source, &b->sources[i], &caught)) failures++;
+  /* sources.clear(): the entries stay owned (attachments and the host may still name them). */
+  if (b->source_count > 0) {
+    behavior_source *grown = realloc(b->closed, (b->closed_count + b->source_count) * sizeof *grown);
+    if (!grown) qa_range_error("Out of memory");
+    b->closed = grown;
+    memcpy(b->closed + b->closed_count, b->sources, b->source_count * sizeof *b->sources);
+    b->closed_count += b->source_count;
   }
-  b->source_count = 0; b->definition_count = 0; b->has_pending_restore = false;
+  b->source_count = 0; b->definition_count = 0;
+  b->has_pending_restore = false;
+  qa_save_value_free(b->pending_tree); b->pending_tree = NULL;
+  if (failures != 0) qa_raise("AggregateError", 0, 0, "Weapon component cleanup failed");
 }

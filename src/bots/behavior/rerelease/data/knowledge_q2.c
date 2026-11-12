@@ -23,7 +23,7 @@ bool qa_bot_load_knowledge(qa_bot_knowledge *out, qa_bot_asset_files *files, con
   char *txt[10] = {0}; const char *names[8] = {"characters","items","monsters","interactables","game_rules","teams","chats","dangers"};
   char *weapons = qa_read_bot_source_text(files, "bots/weapons.txt");
   snprintf(spath, sizeof spath, "bots/settings_%s.txt", plat); char *settings = qa_read_bot_source_text(files, spath);
-  if (!weapons || !settings) qa_range_error("Q2 rerelease bot source data unavailable: weapons.txt and settings_%s.txt are required", plat);
+  if (!weapons || !settings) { free(weapons); free(settings); qa_raise("Error", 0, 0, "Q2 rerelease bot source data unavailable: weapons.txt and settings_%s.txt are required", plat); }
   for (int i = 0; i < 8; i++) { snprintf(path, sizeof path, "bots/%s.txt", names[i]); txt[i] = qa_read_bot_source_text(files, path); }
   qa_bot_data_files f = {txt[0] ? txt[0] : "", weapons, txt[1] ? txt[1] : "", txt[2] ? txt[2] : "", txt[3] ? txt[3] : "", txt[4] ? txt[4] : "", txt[5] ? txt[5] : "", txt[6] ? txt[6] : "", settings, txt[7] ? txt[7] : ""};
   bool ok = qa_bot_build_knowledge(out, f);

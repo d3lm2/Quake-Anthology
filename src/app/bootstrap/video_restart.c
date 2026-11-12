@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/foundation/caught_message.h"
 #include "qa/input/client_commands.h"
 struct qa_app_video_restart {
   qa_app_native_renderer *renderer;
@@ -60,9 +61,10 @@ static void vid_restart_handler(void *ctx, qa_command_invocation *command) {
     v->host.print(v->host.ctx, "vid_restart is a local client command.\n", &command->source);
     return;
   }
-  /* Landed argv excludes the command name (TS command.args). */
-  const char *kind = command->argc > 0 ? command->argv[0] : NULL;
-  if (command->argc > 1 || (kind != NULL && strcmp(kind, "cpu") != 0 && strcmp(kind, "gl") != 0)) {
+  /* TS command.args: argv[0] is the command name. */
+  size_t arg_count = command->argc > 0 ? command->argc - 1 : 0;
+  const char *kind = arg_count > 0 ? command->argv[1] : NULL;
+  if (arg_count > 1 || (kind != NULL && strcmp(kind, "cpu") != 0 && strcmp(kind, "gl") != 0)) {
     v->host.print(v->host.ctx, "vid_restart [cpu|gl]\n", &command->source);
     return;
   }
@@ -140,9 +142,15 @@ static void call_failed(void *ctx) {
 typedef struct print_call { qa_app_video_restart *v; const char *message; const qa_command_context *source; } print_call;
 static void print_rejected(void *ctx) {
   print_call *call = ctx;
-  char text[QA_CAUGHT_MESSAGE_CAPACITY + 64];
-  snprintf(text, sizeof text, "Video restart rejected: %s\n", call->message);
+  size_t size = strlen(call->message) + 32;
+  char *text = malloc(size);
+  if (text == NULL) qa_range_error("Out of memory");
+  snprintf(text, size, "Video restart rejected: %s\n", call->message);
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, text);
   call->v->host.print(call->v->host.ctx, text, call->source);
+  qa_cleanup_pop(&node);
+  free(text);
 }
 bool qa_app_video_restart_drain(qa_app_video_restart *v) {
   if (v->running) qa_raise("Error", 0, 0, "Video restart is already preparing");
@@ -185,7 +193,7 @@ bool qa_app_video_restart_drain(qa_app_video_restart *v) {
       qa_try(call_failed, &call, &raised);
       raise = true;
     } else {
-      print_call call = {v, error.message, s.source};
+      print_call call = {v, qa_caught_message(&error), s.source};
       if (!qa_try(print_rejected, &call, &raised)) raise = true;
     }
   }
@@ -280,16 +288,13 @@ static void registration_close(void *ctx) {
 static void guest_restart(void *ctx) {
   guest_prep *g = ctx;
   size_t errors = 0;
-  qa_caught_error first;
-  memset(&first, 0, sizeof first);
   for (size_t i = 0; i < g->guest_count; i++) {
     qa_caught_error caught;
-    if (!qa_try(client_shutdown, g->guests[i].seat.client, &caught) && errors++ == 0) first = caught;
-    if (!qa_try(client_close, g->guests[i].seat.client, &caught) && errors++ == 0) first = caught;
+    if (!qa_try(client_shutdown, g->guests[i].seat.client, &caught)) errors++;
+    if (!qa_try(client_close, g->guests[i].seat.client, &caught)) errors++;
   }
   if (errors != 0)
-    qa_raise("AggregateError", 0, (long long)errors, "Previous guest video shutdown failed (%zu errors; first %s: %s)", errors,
-             first.name, first.message);
+    qa_raise("AggregateError", 0, (long long)errors, "Previous guest video shutdown failed");
   for (size_t i = 0; i < g->guest_count; i++) {
     guest_entry *entry = &g->guests[i];
     reopen_call call = {g, entry, NULL, NULL};
@@ -302,8 +307,7 @@ static void guest_restart(void *ctx) {
     if (!qa_try(replacement_close, &call, &cleanup)) failures++;
     if (!qa_try(registration_close, &call, &cleanup)) failures++;
     if (failures > 1)
-      qa_raise("AggregateError", 0, (long long)failures, "Guest video reopen and cleanup failed (%zu errors; first %s: %s)",
-               failures, error.name, error.message);
+      qa_raise("AggregateError", 0, (long long)failures, "Guest video reopen and cleanup failed");
     qa_rethrow(&error);
   }
 }

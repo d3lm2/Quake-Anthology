@@ -12,6 +12,9 @@
 #include <string.h>
 #include "qa/foundation/js_case.h"
 static char *xstrdup(const char *s) { size_t n = strlen(s); char *r = malloc(n + 1); if (r) memcpy(r, s, n + 1); return r; }
+/* Cleanup adapters: a host binding (print, admit, dropBot, query) can raise past these frames. */
+static void release_text(void *slot) { char **text = slot; free(*text); *text = NULL; }
+static void release_address(void *address) { qa_q3_mirror_address_destroy(address); }
 bool qa_q3_mirror_address_copy(qa_q3_mirror_address *dst, const qa_q3_mirror_address *src) {
   *dst = *src;
   dst->loopback_id = NULL; dst->ipv6_host = NULL;
@@ -196,25 +199,35 @@ bool qa_q3_client_admission_begin(qa_q3_client_admission *a, const qa_q3_address
 bool qa_q3_client_admission_resend(qa_q3_client_admission *a, double now, const char *userinfo, qa_q3_outgoing_datagram *out) {
   memset(out, 0, sizeof *out);
   if ((a->phase != QA_Q3_PHASE_CONNECTING && a->phase != QA_Q3_PHASE_CHALLENGING) || now - a->connect_time < 3000) return false;
-  if (!a->has_address) qa_range_error("Connection resend has no resolved address");
+  if (!a->has_address) qa_raise("Error", 0, 0, "Connection resend has no resolved address");
   a->connect_time = now;
   a->connect_packet_count = (int32_t)((uint32_t)a->connect_packet_count + 1u);
   if (!qa_q3_mirror_address_copy(&out->to, &a->address)) return false;
   if (a->phase == QA_Q3_PHASE_CONNECTING)
     return qa_q3_encode_connectionless_text("getchallenge", &out->payload, &out->payload_len);
+  /* The host print and encodeConnect (quote, newline, length) raise; nothing here outlives that. */
   char *info = qa_source_command_text(userinfo);
   if (!info) return false;
+  /* sourceCommandText(userinfo).slice(0, 1023): the text is source bytes (TS rejects any unit
+   * above 0xff), so one byte is one UTF-16 unit and the byte cut is the TS cut. */
   if (strlen(info) > 1023) info[1023] = 0;
+  qa_cleanup info_guard, to_guard;
+  qa_cleanup_push(&to_guard, release_address, &out->to);
+  qa_cleanup_push(&info_guard, release_text, &info);
   char num[32];
+  bool ok = false;
   char *next = info_set(info, "protocol", "68", a->print, a->print_ctx); free(info); info = next;
-  if (!info) return false;
-  snprintf(num, sizeof num, "%lld", (long long)a->qport);
-  next = info_set(info, "qport", num, a->print, a->print_ctx); free(info); info = next;
-  if (!info) return false;
-  snprintf(num, sizeof num, "%lld", (long long)a->challenge);
-  next = info_set(info, "challenge", num, a->print, a->print_ctx); free(info); info = next;
-  if (!info) return false;
-  bool ok = qa_q3_encode_connect(info, &out->payload, &out->payload_len);
+  if (info) {
+    snprintf(num, sizeof num, "%lld", (long long)a->qport);
+    next = info_set(info, "qport", num, a->print, a->print_ctx); free(info); info = next;
+  }
+  if (info) {
+    snprintf(num, sizeof num, "%lld", (long long)a->challenge);
+    next = info_set(info, "challenge", num, a->print, a->print_ctx); free(info); info = next;
+  }
+  if (info) ok = qa_q3_encode_connect(info, &out->payload, &out->payload_len);
+  qa_cleanup_pop(&info_guard);
+  qa_cleanup_pop(&to_guard);
   free(info);
   return ok;
 }
@@ -284,7 +297,12 @@ static void sadm_reply(qa_q3_server_admission *a, const qa_q3_address *to, const
   uint8_t *packet = NULL; size_t len = 0;
   if (!qa_q3_encode_connectionless_text(text, &packet, &len)) return;
   qa_q3_address copy; memset(&copy, 0, sizeof copy);
+  qa_cleanup packet_guard, copy_guard;
+  qa_cleanup_push(&packet_guard, free, packet);
+  qa_cleanup_push(&copy_guard, release_address, &copy);
   if (qa_q3_mirror_address_copy(&copy, to)) a->bindings.send(a->bindings.ctx, &copy, packet, len);
+  qa_cleanup_pop(&copy_guard);
+  qa_cleanup_pop(&packet_guard);
   qa_q3_mirror_address_destroy(&copy);
   free(packet);
 }
@@ -337,7 +355,14 @@ static void sadm_authorize(qa_q3_server_admission *a, const qa_q3_address *from,
     if (ci_eq(result, "demo")) sadm_reply(a, &challenge->address, "print\nServer is not a demo server\n");
     else {
       size_t n = strlen(reason) + 16; char *buf = malloc(n);
-      if (buf) { snprintf(buf, n, "print\n%s\n", reason); sadm_reply(a, &challenge->address, buf); free(buf); }
+      if (buf) {
+        snprintf(buf, n, "print\n%s\n", reason);
+        qa_cleanup buf_guard;
+        qa_cleanup_push(&buf_guard, release_text, &buf);
+        sadm_reply(a, &challenge->address, buf);
+        qa_cleanup_pop(&buf_guard);
+        free(buf);
+      }
     }
     qa_q3_mirror_address_destroy(&challenge->address); challenge->has_address = false;
     challenge->challenge = 0; challenge->time = 0; challenge->first_time = 0; challenge->ping_time = 0; challenge->connected = false;
@@ -349,17 +374,17 @@ static bool slot_matches(const qa_q3_address *from, const qa_q3_admission_slot *
   if (slot->qport == qport) return true;
   return from->kind != QA_Q3_ADDR_LOOPBACK && slot->address.kind != QA_Q3_ADDR_LOOPBACK && from->port == slot->address.port;
 }
-static bool sadm_connect(qa_q3_server_admission *a, const qa_q3_address *from, const char *input, double now) {
+/* TS connect(): userinfo lives in the caller's slot so a raising host binding (print, dropBot,
+ * admit, the fatal full-server error) leaves nothing allocated behind. */
+static bool sadm_connect_body(qa_q3_server_admission *a, const qa_q3_address *from, char **userinfo_slot, double now) {
   qa_q3_server_admission_bindings *host = &a->bindings;
-  char *userinfo = qa_source_command_text(input);
-  if (!userinfo) return false;
-  if (strlen(userinfo) > 1023) userinfo[1023] = 0;
+  char *userinfo = *userinfo_slot;
   char *proto = qa_q3_info_value(userinfo, "protocol");
   int is68 = proto && qa_native_atoi(proto) == 68; free(proto);
-  if (!is68) { sadm_reply(a, from, "print\nServer uses protocol version 68.\n"); free(userinfo); return true; }
+  if (!is68) { sadm_reply(a, from, "print\nServer uses protocol version 68.\n"); return true; }
   char *qs = qa_q3_info_value(userinfo, "qport"); int64_t qport = qa_native_atoi(qs ? qs : ""); free(qs);
   char *cs = qa_q3_info_value(userinfo, "challenge"); int64_t challenge_number = qa_native_atoi(cs ? cs : ""); free(cs);
-  if (qport < 0 || qport > 65535) { sadm_reply(a, from, "print\nInvalid qport.\n"); free(userinfo); return true; }
+  if (qport < 0 || qport > 65535) { sadm_reply(a, from, "print\nInvalid qport.\n"); return true; }
   size_t slot_count = 0;
   const qa_q3_admission_slot *slots = host->slots(host->ctx, &slot_count);
   const qa_q3_admission_slot *existing = NULL;
@@ -367,16 +392,16 @@ static bool sadm_connect(qa_q3_server_admission *a, const qa_q3_address *from, c
     if (slots[i].phase != QA_Q3_SLOT_FREE && slot_matches(from, &slots[i], qport)) { existing = &slots[i]; break; }
   /* ((now - lastConnectTime) | 0) < Math.imul(reconnectLimitSeconds, 1000) */
   if (existing && qa_int32(now - existing->last_connect_time)
-        < (int32_t)((uint32_t)qa_int32(host->reconnect_limit_seconds(host->ctx)) * 1000u)) { free(userinfo); return true; }
+        < (int32_t)((uint32_t)qa_int32(host->reconnect_limit_seconds(host->ctx)) * 1000u)) return true;
   if (from->kind != QA_Q3_ADDR_LOOPBACK) {
     qa_q3_challenge *challenge = NULL;
     for (int i = 0; i < 1024; i++) {
       qa_q3_challenge *c = &a->challenges[i];
       if (c->has_address && qa_q3_mirror_same_address(from, &c->address, true) && c->challenge == challenge_number) { challenge = c; break; }
     }
-    if (!challenge) { sadm_reply(a, from, "print\nNo or bad challenge for address.\n"); free(userinfo); return true; }
+    if (!challenge) { sadm_reply(a, from, "print\nNo or bad challenge for address.\n"); return true; }
     char text[128]; address_text(from, text, sizeof text);
-    char *next = info_set(userinfo, "ip", text, host->print, host->print_ctx); free(userinfo); userinfo = next;
+    char *next = info_set(userinfo, "ip", text, host->print, host->print_ctx); free(userinfo); userinfo = *userinfo_slot = next;
     if (!userinfo) return false;
     int32_t ping = qa_int32(now - challenge->ping_time);
     challenge->connected = true;
@@ -385,13 +410,13 @@ static bool sadm_connect(qa_q3_server_admission *a, const qa_q3_address *from, c
       if (minp != 0 && (float)ping < minp) {
         sadm_reply(a, from, "print\nServer is for high pings only\n");
         challenge->address.port = 0; /* TS {...from, port:0}; kinds here are ipv4/ipx */
-        free(userinfo); return true;
+        return true;
       }
       float maxp = (float)host->maximum_ping(host->ctx);
-      if (maxp != 0 && (float)ping > maxp) { sadm_reply(a, from, "print\nServer is for low pings only\n"); free(userinfo); return true; }
+      if (maxp != 0 && (float)ping > maxp) { sadm_reply(a, from, "print\nServer is for low pings only\n"); return true; }
     }
   } else {
-    char *next = info_set(userinfo, "ip", "localhost", host->print, host->print_ctx); free(userinfo); userinfo = next;
+    char *next = info_set(userinfo, "ip", "localhost", host->print, host->print_ctx); free(userinfo); userinfo = *userinfo_slot = next;
     if (!userinfo) return false;
   }
   char *pw = qa_q3_info_value(userinfo, "password");
@@ -400,40 +425,73 @@ static bool sadm_connect(qa_q3_server_admission *a, const qa_q3_address *from, c
   const qa_q3_admission_slot *selected = existing;
   if (!selected) for (size_t i = 0; i < slot_count; i++)
     if (slots[i].slot >= start && slots[i].phase == QA_Q3_SLOT_FREE) { selected = &slots[i]; break; }
-  if (!selected) {
-    if (from->kind != QA_Q3_ADDR_LOOPBACK) { sadm_reply(a, from, "print\nServer is full.\n"); free(userinfo); return true; }
+  /* TS keeps the slot record it selected; the host's slot array can be rebuilt by dropBot, so
+   * only the number is carried past it. */
+  int64_t selected_slot;
+  if (selected) selected_slot = selected->slot;
+  else {
+    if (from->kind != QA_Q3_ADDR_LOOPBACK) { sadm_reply(a, from, "print\nServer is full.\n"); return true; }
     bool any_non_bot = false; const qa_q3_admission_slot *last = NULL;
     for (size_t i = 0; i < slot_count; i++) if (slots[i].slot >= start) { if (!slots[i].bot) any_non_bot = true; last = &slots[i]; }
-    if (any_non_bot || !last) { free(userinfo); qa_common_error(QA_COMMON_ERROR_FATAL, "server is full on local connect\n"); }
-    selected = last;
-    host->drop_bot(host->ctx, selected->slot);
-    if (!host->enabled(host->ctx)) { free(userinfo); return true; }
+    if (any_non_bot || !last) qa_common_error(QA_COMMON_ERROR_FATAL, "server is full on local connect\n");
+    selected_slot = last->slot;
+    host->drop_bot(host->ctx, selected_slot);
+    if (!host->enabled(host->ctx)) return true;
   }
   qa_q3_accepted_connect accepted; memset(&accepted, 0, sizeof accepted);
-  accepted.slot = selected->slot; accepted.qport = qport; accepted.challenge = challenge_number;
-  if (!qa_q3_mirror_address_copy(&accepted.address, from)) { free(userinfo); return false; }
+  accepted.slot = selected_slot; accepted.qport = qport; accepted.challenge = challenge_number;
+  if (!qa_q3_mirror_address_copy(&accepted.address, from)) { qa_q3_mirror_address_destroy(&accepted.address); return false; }
   accepted.userinfo = userinfo;
+  qa_cleanup address_guard;
+  qa_cleanup_push(&address_guard, release_address, &accepted.address);
   char *rejected = host->admit(host->ctx, &accepted);
+  qa_cleanup_pop(&address_guard);
   qa_q3_mirror_address_destroy(&accepted.address);
-  free(userinfo);
-  if (!host->enabled(host->ctx)) { free(rejected); return true; }
-  if (rejected) {
-    size_t n = strlen(rejected) + 16; char *buf = malloc(n);
-    if (buf) { snprintf(buf, n, "print\n%s\n", rejected); sadm_reply(a, from, buf); free(buf); }
-    free(rejected);
+  if (!rejected) {
+    if (host->enabled(host->ctx)) sadm_reply(a, from, "connectResponse");
     return true;
   }
-  sadm_reply(a, from, "connectResponse");
+  qa_cleanup rejected_guard;
+  qa_cleanup_push(&rejected_guard, release_text, &rejected);
+  if (host->enabled(host->ctx)) {
+    size_t n = strlen(rejected) + 16; char *buf = malloc(n);
+    if (buf) {
+      snprintf(buf, n, "print\n%s\n", rejected);
+      qa_cleanup buf_guard;
+      qa_cleanup_push(&buf_guard, release_text, &buf);
+      sadm_reply(a, from, buf);
+      qa_cleanup_pop(&buf_guard);
+      free(buf);
+    }
+  }
+  qa_cleanup_pop(&rejected_guard);
+  free(rejected);
   return true;
 }
+static bool sadm_connect(qa_q3_server_admission *a, const qa_q3_address *from, const char *input, double now) {
+  char *userinfo = qa_source_command_text(input);
+  if (!userinfo) return false;
+  /* sourceCommandText(input).slice(0, 1023): wire text is source bytes, one byte per UTF-16 unit. */
+  if (strlen(userinfo) > 1023) userinfo[1023] = 0;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_text, &userinfo);
+  bool ok = sadm_connect_body(a, from, &userinfo, now);
+  qa_cleanup_pop(&guard);
+  free(userinfo);
+  return ok;
+}
+static void release_packet(void *packet) { qa_q3_connectionless_packet_destroy(packet); }
 bool qa_q3_server_admission_receive(qa_q3_server_admission *a, const qa_q3_address *from, const uint8_t *bytes, size_t len, double now) {
   qa_q3_connectionless_packet packet;
   if (!qa_q3_decode_connectionless(bytes, len, QA_Q3_CONNLESS_SERVER, NULL, &packet)) return false;
   bool ok = true;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_packet, &packet);
   if (ci_eq(packet.command, "getchallenge")) sadm_challenge(a, from, now);
   else if (ci_eq(packet.command, "ipAuthorize")) sadm_authorize(a, from, &packet, now);
   else if (ci_eq(packet.command, "connect")) ok = sadm_connect(a, from, packet.argument_count ? packet.arguments[0] : "", now);
   else a->bindings.query(a->bindings.ctx, from, &packet);
+  qa_cleanup_pop(&guard);
   qa_q3_connectionless_packet_destroy(&packet);
   return ok;
 }

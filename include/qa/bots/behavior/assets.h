@@ -23,7 +23,8 @@ typedef bool (*qa_bot_asset_open_fn)(void *ctx, const char *path, const uint8_t 
                                      size_t *out_len);
 /* TS unread entry: a listed path whose bytes load only for a legacy digest. */
 typedef struct qa_bot_asset_unread {
-  char *path;
+  char *path;      /* TS `paths` entry: backslashes replaced */
+  char *open_path; /* the path as given, which the TS open closure captures */
   char *key;
   size_t sequence;
   qa_bot_asset_open_fn open;

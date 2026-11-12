@@ -55,14 +55,12 @@ void qa_app_preflight_application_match(qa_app_preflight_content content, const 
         strncat(joined, result.missing[i], sizeof joined - strlen(joined) - 1);
       }
       qa_q3_ta_foreign_objective_adaptation_destroy(&result);
-      qa_range_error("Selected Q3 match map is missing: %s", joined);
+      qa_raise("Error", 0, 0, "Selected Q3 match map is missing: %s", joined);
     }
     if (result.kind == QA_Q3_TA_OBJECTIVE_UNSUPPORTED) {
       double bad = result.game_type;
       qa_q3_ta_foreign_objective_adaptation_destroy(&result);
-      if ((fabs(bad) < 9.2e18 && bad == trunc(bad)))
-        qa_range_error("Selected Q3 product does not support game type %s", QA_JS_NUMBER(bad));
-      qa_range_error("Selected Q3 product does not support game type %s", QA_JS_NUMBER(bad));
+      qa_raise("Error", 0, 0, "Selected Q3 product does not support game type %s", QA_JS_NUMBER(bad));
     }
     qa_q3_ta_foreign_objective_adaptation_destroy(&result);
     return;
@@ -87,5 +85,5 @@ void qa_app_preflight_application_match(qa_app_preflight_content content, const 
   if (unavailable) snprintf(message, sizeof message, "%s", reason);
   free(classnames);
   qa_q1_entities_destroy(entities, entity_count);
-  if (unavailable) qa_range_error("%s", message);
+  if (unavailable) qa_raise("Error", 0, 0, "%s", message);
 }

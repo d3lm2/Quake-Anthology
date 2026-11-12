@@ -1,8 +1,9 @@
 /*
  * Port of src/compat/qvm/compatibility.ts. The TS SaveReader|null
  * fields become borrowed qa_save_value subtrees (NULL when absent);
- * build a qa_save_reader over one with path "qvm-compatibility.json"
- * to reproduce its diagnostics. GPL-2.0-or-later.
+ * build a qa_save_reader over one with the declaration's primary_path or
+ * equipment_presentation_path to reproduce its diagnostics.
+ * GPL-2.0-or-later.
  */
 #ifndef QA_COMPAT_QVM_COMPATIBILITY_H
 #define QA_COMPAT_QVM_COMPATIBILITY_H
@@ -18,6 +19,12 @@ typedef struct qa_qvm_compatibility_declaration {
   qa_qvm_abi_profile profile;
   const qa_save_value *primary;               /* borrowed */
   const qa_save_value *equipment_presentation; /* borrowed */
+  /* The path of the TS SaveReader each subtree was read with
+   * ("qvm-compatibility.json.modules[2].primary"): a reader built over the
+   * subtree with this path names what the TS reader names when it fails.
+   * Empty when the subtree is absent. */
+  char primary_path[256];
+  char equipment_presentation_path[256];
 } qa_qvm_compatibility_declaration;
 
 typedef struct qa_qvm_module_path_digest {

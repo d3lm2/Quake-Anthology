@@ -2,17 +2,16 @@
 #include "qa/network/q3/server.h"
 #include "qa/foundation/event_ring.h"
 #include "qa/core/numeric.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 static char *xstrdup(const char *s) { size_t n = strlen(s); char *r = malloc(n + 1); if (r) memcpy(r, s, n + 1); return r; }
 int64_t qa_q3_rate_milliseconds(double message_size, double rate, double max_rate) {
-  if (message_size > 1500) message_size = 1500;
-  if (max_rate != 0) {
-    double cap = max_rate > 1000 ? max_rate : 1000;
-    rate = rate < cap ? rate : cap;
-  }
+  /* Math.min/Math.max keep a NaN operand; the trailing |0 then makes the interval 0. */
+  message_size = qa_js_min(message_size, 1500);
+  if (max_rate != 0) rate = qa_js_min(rate, qa_js_max(max_rate, 1000));
   if (rate == 0) qa_range_error("Source snapshot rate division by zero");
   /* Math.trunc(Math.imul((messageSize+48)|0, 1000) / rate) | 0 */
   int32_t imul = (int32_t)((uint32_t)qa_int32(message_size + 48) * 1000u);
@@ -38,7 +37,7 @@ struct qa_q3_server_connection {
   bool rate_delayed;
   int64_t reliable_sent;
   int32_t next_reliable_time;
-  bool has_last_resend; int32_t last_resend;
+  bool has_last_resend; double last_resend; /* TS keeps time() as returned */
 };
 static void server_print(void *ctx, const char *text) {
   qa_q3_server_connection *s = ctx;
@@ -186,9 +185,9 @@ void qa_q3_server_connection_execute_message(qa_q3_server_connection *s, qa_q3_c
       && !strstr(s->last_client_command_string, "nextdl")) {
     if (header.server_id >= host->restarted_server_id(host->ctx) && header.server_id < host->server_id(host->ctx)) return;
     /* The client picks both fields, so rebuilding the gamestate is limited to once per second. */
-    int32_t now = (int32_t)host->time(host->ctx);
+    double now = host->time(host->ctx);
     if (s->message_acknowledge > s->gamestate_message_number
-        && (!s->has_last_resend || (int32_t)((uint32_t)now - (uint32_t)s->last_resend) >= 1000)) {
+        && (!s->has_last_resend || qa_int32(now - s->last_resend) >= 1000)) {
       s->has_last_resend = true; s->last_resend = now;
       host->resend_gamestate(host->ctx);
     }
@@ -261,14 +260,22 @@ static void transmit(qa_q3_server_connection *s, qa_q3_message_writer *writer, c
   if (!qa_q3_message_writer_to_bytes(writer, &plaintext, &plain_len)) qa_range_error("server transmit allocation failed");
   if (qa_q3_netchannel_has_unsent_fragments(s->channel)) {
     queued_t q = { plaintext, plain_len };
+    /* A full ring raises; the plaintext is the ring's only once admitted. */
+    qa_cleanup plain_guard;
+    qa_cleanup_push(&plain_guard, free, plaintext);
     qa_event_ring_admit(&s->queued_messages, &q);
+    qa_cleanup_pop(&plain_guard);
     qa_q3_netchannel_transmit_next_fragment(s->channel, delivery);
   } else {
     uint8_t *encoded = NULL;
-    if (!qa_q3_xor_server_message(plaintext, plain_len, s->challenge, qa_q3_netchannel_outgoing_sequence(s->channel), s->last_client_command_string, &encoded))
-      qa_range_error("server transmit allocation failed");
+    bool encoded_ok = qa_q3_xor_server_message(plaintext, plain_len, s->challenge, qa_q3_netchannel_outgoing_sequence(s->channel), s->last_client_command_string, &encoded);
     free(plaintext);
+    if (!encoded_ok) qa_range_error("server transmit allocation failed");
+    /* The owner's send and trace can raise out of beginTransmit. */
+    qa_cleanup encoded_guard;
+    qa_cleanup_push(&encoded_guard, free, encoded);
     qa_q3_netchannel_begin_transmit(s->channel, encoded, plain_len, delivery);
+    qa_cleanup_pop(&encoded_guard);
     free(encoded);
   }
   if (rate->local || (rate->force_lan && rate->lan)) { s->next_snapshot_time = qa_int32(now_d - 1); return; }
@@ -286,19 +293,30 @@ static qa_q3_entity_state_record *baseline_adapter(void *ctx, int64_t number) {
   qa_q3_server_snapshot_history_baseline(a->s->snapshots, number, &a->scratch);
   return &a->scratch;
 }
+typedef struct { qa_q3_message_writer *writer; qa_q3_reliable_command *pending; qa_q3_server_operation *ops; } gamestate_scratch;
+static void gamestate_scratch_release(void *arg) {
+  gamestate_scratch *scratch = arg;
+  qa_q3_message_writer_destroy(scratch->writer); free(scratch->pending); free(scratch->ops);
+  scratch->writer = NULL; scratch->pending = NULL; scratch->ops = NULL;
+}
 void qa_q3_server_connection_send_gamestate(qa_q3_server_connection *s, const qa_q3_gamestate *state,
                                             const qa_q3_server_rate *rate, const qa_q3_channel_delivery *delivery) {
   s->phase = QA_Q3_SERVER_PHASE_PRIMED;
   s->pure_authentic = false; s->got_pure_command = false;
   s->gamestate_message_number = qa_q3_netchannel_outgoing_sequence(s->channel);
-  qa_q3_message_writer *writer = NULL;
-  if (!qa_q3_message_writer_init(&writer, QA_Q3_MESSAGE_BITSTREAM, 16384, &s->source_state)) qa_range_error("gamestate writer allocation failed");
+  /* writeServerMessage raises on a bad gamestate entry, and transmit on the owner's send; the
+   * writer and the borrowed operation list are released on that path. */
+  gamestate_scratch scratch = { NULL, NULL, NULL };
+  qa_cleanup scratch_guard;
+  qa_cleanup_push(&scratch_guard, gamestate_scratch_release, &scratch);
+  if (!qa_q3_message_writer_init(&scratch.writer, QA_Q3_MESSAGE_BITSTREAM, 16384, &s->source_state)) qa_range_error("gamestate writer allocation failed");
+  qa_q3_message_writer *writer = scratch.writer;
   int64_t outstanding = qa_q3_reliable_ring_outstanding(s->reliable);
   size_t pending_cap = outstanding > 0 ? (size_t)outstanding : 1;
-  qa_q3_reliable_command *pending = calloc(pending_cap, sizeof *pending);
+  qa_q3_reliable_command *pending = scratch.pending = calloc(pending_cap, sizeof *pending);
   if (!pending) qa_range_error("gamestate allocation failed");
   size_t pending_count = qa_q3_reliable_ring_pending(s->reliable, pending, pending_cap);
-  qa_q3_server_operation *ops = calloc(pending_count + 1, sizeof *ops);
+  qa_q3_server_operation *ops = scratch.ops = calloc(pending_count + 1, sizeof *ops);
   if (!ops) qa_range_error("gamestate allocation failed");
   for (size_t i = 0; i < pending_count; i++) {
     ops[i].kind = QA_Q3_OP_COMMAND; ops[i].sequence = pending[i].sequence; ops[i].text = pending[i].text;
@@ -320,9 +338,11 @@ void qa_q3_server_connection_send_gamestate(qa_q3_server_connection *s, const qa
   ctx.history = NULL; ctx.history_ctx = NULL;
   qa_q3_write_server_message(writer, s->last_client_command, ops, pending_count + 1, &ctx);
   free(ops); free(pending); /* gamestate/text borrowed; not destroyed */
+  scratch.ops = NULL; scratch.pending = NULL;
   s->reliable_sent = qa_q3_reliable_ring_sequence(s->reliable);
   transmit(s, writer, rate, delivery);
-  qa_q3_message_writer_destroy(writer);
+  qa_cleanup_pop(&scratch_guard);
+  gamestate_scratch_release(&scratch);
 }
 void qa_q3_server_connection_send_snapshot(qa_q3_server_connection *s, int64_t server_flags, const qa_q3_server_rate *rate,
                                            const qa_q3_channel_delivery *delivery, qa_q3_append_download_fn append_download, void *append_ctx) {
@@ -334,12 +354,16 @@ void qa_q3_server_connection_send_snapshot(qa_q3_server_connection *s, int64_t s
     qa_q3_server_connection_transmit_next_fragment(s, delivery);
     return;
   }
-  qa_q3_message_writer *writer = NULL;
-  if (!qa_q3_message_writer_init(&writer, QA_Q3_MESSAGE_BITSTREAM, 16384, &s->source_state)) qa_range_error("snapshot writer allocation failed");
+  /* The snapshot merge, appendDownload and transmit raise; release the writer on that path. */
+  gamestate_scratch scratch = { NULL, NULL, NULL };
+  qa_cleanup scratch_guard;
+  qa_cleanup_push(&scratch_guard, gamestate_scratch_release, &scratch);
+  if (!qa_q3_message_writer_init(&scratch.writer, QA_Q3_MESSAGE_BITSTREAM, 16384, &s->source_state)) qa_range_error("snapshot writer allocation failed");
+  qa_q3_message_writer *writer = scratch.writer;
   qa_q3_message_writer_write_long(writer, s->last_client_command);
   int64_t outstanding = qa_q3_reliable_ring_outstanding(s->reliable);
   size_t pending_cap = outstanding > 0 ? (size_t)outstanding : 1;
-  qa_q3_reliable_command *pending = calloc(pending_cap, sizeof *pending);
+  qa_q3_reliable_command *pending = scratch.pending = calloc(pending_cap, sizeof *pending);
   if (!pending) qa_range_error("snapshot allocation failed");
   size_t pending_count = qa_q3_reliable_ring_pending(s->reliable, pending, pending_cap);
   for (size_t i = 0; i < pending_count; i++) {
@@ -347,7 +371,7 @@ void qa_q3_server_connection_send_snapshot(qa_q3_server_connection *s, int64_t s
     qa_q3_message_writer_write_long(writer, pending[i].sequence);
     qa_q3_message_writer_write_string(writer, pending[i].text);
   }
-  free(pending);
+  free(pending); scratch.pending = NULL;
   s->reliable_sent = qa_q3_reliable_ring_sequence(s->reliable);
   qa_q3_server_snapshot_history * h = s->snapshots;
   qa_q3_message_writer * writer2 = writer;
@@ -364,20 +388,24 @@ void qa_q3_server_connection_send_snapshot(qa_q3_server_connection *s, int64_t s
     qa_q3_message_writer_clear(writer);
   }
   transmit(s, writer, rate, delivery);
-  qa_q3_message_writer_destroy(writer);
+  qa_cleanup_pop(&scratch_guard);
+  gamestate_scratch_release(&scratch);
 }
 void qa_q3_server_connection_transmit_next_fragment(qa_q3_server_connection *s, const qa_q3_channel_delivery *delivery) {
-  if (!qa_q3_netchannel_has_unsent_fragments(s->channel)) qa_range_error("No pending server fragments");
+  if (!qa_q3_netchannel_has_unsent_fragments(s->channel)) qa_raise("Error", 0, 0, "No pending server fragments");
   qa_q3_netchannel_transmit_next_fragment(s->channel, delivery);
   if (!qa_q3_netchannel_has_unsent_fragments(s->channel)) {
     queued_t next;
     if (qa_event_ring_shift(&s->queued_messages, &next)) {
       uint8_t *encoded = NULL;
-      if (!qa_q3_xor_server_message(next.data, next.len, s->challenge, qa_q3_netchannel_outgoing_sequence(s->channel), s->last_client_command_string, &encoded))
-        qa_range_error("server transmit allocation failed");
-      qa_q3_netchannel_begin_transmit(s->channel, encoded, next.len, delivery);
-      free(encoded);
+      bool encoded_ok = qa_q3_xor_server_message(next.data, next.len, s->challenge, qa_q3_netchannel_outgoing_sequence(s->channel), s->last_client_command_string, &encoded);
       free(next.data);
+      if (!encoded_ok) qa_range_error("server transmit allocation failed");
+      qa_cleanup encoded_guard;
+      qa_cleanup_push(&encoded_guard, free, encoded);
+      qa_q3_netchannel_begin_transmit(s->channel, encoded, next.len, delivery);
+      qa_cleanup_pop(&encoded_guard);
+      free(encoded);
     }
   }
 }

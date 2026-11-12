@@ -32,7 +32,7 @@ static const char *mod_name(RT *r, double mod) {
   return "<bad obituary>";
 }
 static qa_q3_game_client *client_of(qa_q3_game_entity *e) {
-  if (!e->client) qa_range_error("Death operation requires a client entity");
+  if (!e->client) qa_raise("Error", 0, 0, "Death operation requires a client entity");
   return e->client;
 }
 static double slot_get(qa_q3_base_player_state_slots *s, double i) { return qa_q3_base_player_state_slots_get(s, (size_t)i); }
@@ -67,7 +67,7 @@ static qa_q3_drop_item_context drop_context(RT *r) {
 }
 void qa_q3_death_runtime_init(RT *r, qa_q3_death_host host) {
   if (host.team_scores->length != 4) qa_range_error("Death scoring requires four shared team-score slots");
-  if (host.pool->options.product != host.product) qa_range_error("Death product does not match its entity pool");
+  if (host.pool->options.product != host.product) qa_raise("Error", 0, 0, "Death product does not match its entity pool");
   r->host = host; qa_q3_death_bind_save_callbacks(r);
 }
 void qa_q3_death_score_plum(RT *r, qa_q3_game_entity *e, qa_vec3 origin, double score) {
@@ -92,7 +92,8 @@ void qa_q3_death_toss_client_items(RT *r, qa_q3_game_entity *e) {
   double weapon = e->s.weapon;
   if (qa_js_to_int32(weapon) == QA_Q3_WP_MACHINEGUN || qa_js_to_int32(weapon) == QA_Q3_WP_GRAPPLING_HOOK) {
     if (qa_js_to_int32(client->ps.weapon_state) == QA_Q3_WEAPON_DROPPING) weapon = client->pers.cmd.weapon;
-    if (!((qa_js_to_int32(slot_get(&client->ps.stats, schema(r)->weapons)) & (1 << qa_js_to_int32(weapon))) != 0)) weapon = QA_Q3_WP_NONE;
+    /* JS `1 << weapon` takes the count modulo 32; cmd.weapon is a client byte. */
+    if (!((qa_js_to_int32(slot_get(&client->ps.stats, schema(r)->weapons)) & (int32_t)(1u << ((uint32_t)qa_js_to_int32(weapon) & 31u))) != 0)) weapon = QA_Q3_WP_NONE;
   }
   if (weapon > QA_Q3_WP_MACHINEGUN && qa_js_to_int32(weapon) != QA_Q3_WP_GRAPPLING_HOOK && slot_get(&client->ps.ammo, weapon) != 0)
     (void)qa_q3_drop_item(context, e, qa_q3_base_find_item_for_weapon(r->host.product, (qa_q3_weapon)weapon), 0);
@@ -109,16 +110,17 @@ void qa_q3_death_toss_client_items(RT *r, qa_q3_game_entity *e) {
   }
 }
 void qa_q3_death_toss_client_cubes(RT *r, qa_q3_game_entity *e) {
-  if (r->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("TossClientCubes requires missionpack");
+  if (r->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "TossClientCubes requires missionpack");
   qa_q3_game_client *client = client_of(e); double time = r->host.frame(r->host.ctx).time;
   client->ps.generic1 = 0;
   if (!qa_q3_entity_pool_entities_free(r->host.pool)) return;
   const qa_q3_base_item_definition *item = qa_q3_base_find_item(r->host.product, client->sess.session_team == 1 ? "Red Cube" : "Blue Cube");
-  if (!item) qa_range_error("Missing source Harvester cube item");
+  if (!item) qa_raise("Error", 0, 0, "Missing source Harvester cube item");
   qa_vec3 forward = qa_scale3(qa_qvm_angle_vectors((qa_vec3){0, fmod(time, 360), 0}).forward, 150);
   qa_vec3 velocity = {forward.x, forward.y, f32(forward.z + f32(200 + f32(r->host.crandom(r->host.ctx) * 50)))};
   qa_q3_game_entity *obelisk = r->host.neutral_obelisk(r->host.ctx);
-  qa_vec3 origin = obelisk ? (qa_vec3){obelisk->s.pos.base.x, obelisk->s.pos.base.y, obelisk->s.pos.base.z + 44} : (qa_vec3){0, 0, 0};
+  /* TS vec3() stores binary32 components. */
+  qa_vec3 origin = obelisk ? qa_math_vec3(obelisk->s.pos.base.x, obelisk->s.pos.base.y, obelisk->s.pos.base.z + 44) : (qa_vec3){0, 0, 0};
   qa_q3_game_entity *dropped = qa_q3_launch_item(drop_context(r).launch, item, origin, velocity);
   qa_q3_game_entity_set_nextthink(dropped, qa_int32(time + qa_js_to_int32((double)((uint32_t)qa_js_to_int32(r->host.cube_timeout_seconds(r->host.ctx)) * 1000u))) /* Math.imul: the cvar can be any number */);
   dropped->think = qa_q3_callback_family_resolve(&r->host.pool->callbacks.think, "q3.base.game.death.tossClientCubes.think");
@@ -126,7 +128,7 @@ void qa_q3_death_toss_client_cubes(RT *r, qa_q3_game_entity *e) {
 }
 static void return_cb(void *ctx, qa_q3_game_entity *p) { RT *r = ctx; qa_q3_return_persistent_powerup(p, r->host.world); }
 void qa_q3_death_toss_client_persistant_powerups(RT *r, qa_q3_game_entity *e) {
-  if (r->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("Persistent powerup tossing requires missionpack");
+  if (r->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "Persistent powerup tossing requires missionpack");
   qa_q3_toss_client_persistent_powerup(e, return_cb, r);
 }
 static bool part_origin(const qa_q3_damage_participant *p, qa_q3_game_entity *self, qa_vec3 *out) {
@@ -162,7 +164,7 @@ void qa_q3_death_body_die(RT *r, qa_q3_game_entity *self) {
   qa_q3_death_gib_entity(r, self, 0);
 }
 static void kamikaze_timer(RT *r, qa_q3_game_entity *self) {
-  if (r->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("Kamikaze death timer requires missionpack");
+  if (r->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "Kamikaze death timer requires missionpack");
   qa_q3_game_entity *timer = qa_q3_entity_pool_spawn(r->host.pool);
   qa_q3_game_entity_set_classname(timer, "kamikaze timer");
   timer->s.pos.base = self->s.pos.base; timer->r.sv_flags = qa_js_to_int32(timer->r.sv_flags) | 1;
@@ -173,7 +175,7 @@ static void kamikaze_timer(RT *r, qa_q3_game_entity *self) {
 static void almost_reward(RT *r, qa_q3_game_entity *self, const qa_q3_damage_participant *attacker) {
   qa_q3_base_player_state_slots *p = &client_of(self)->ps.persistant;
   slot_set(p, QA_Q3_BASE_PERS_PLAYEREVENTS, qa_js_to_int32(slot_get(p, QA_Q3_BASE_PERS_PLAYEREVENTS)) ^ 4);
-  if (!attacker) qa_range_error("Source almost-score reward dereferences a null attacker");
+  if (!attacker) qa_raise("Error", 0, 0, "Source almost-score reward dereferences a null attacker");
   if (attacker->entity && attacker->entity->client) {
     qa_q3_base_player_state_slots *ap = &attacker->entity->client->ps.persistant;
     slot_set(ap, QA_Q3_BASE_PERS_PLAYEREVENTS, qa_js_to_int32(slot_get(ap, QA_Q3_BASE_PERS_PLAYEREVENTS)) ^ 4);
@@ -278,7 +280,7 @@ void qa_q3_death_player_die(RT *r, qa_q3_game_entity *self, const qa_q3_damage_p
     double y3;
     qa_q3_game_entity_set_takedamage(self, true); self->s.weapon = 0; self->s.powerups = 0;
     self->r.contents = health <= GIB_HEALTH_V ? 0 : CONTENTS_CORPSE_V;
-    qa_q3_base_entity_shared_set_maxs(&self->r, (x3 = qa_q3_base_entity_shared_maxs(&self->r).x, y3 = qa_q3_base_entity_shared_maxs(&self->r).y, (qa_vec3){x3, y3, -8})); self->s.loop_sound = 0;
+    qa_q3_base_entity_shared_set_maxs(&self->r, (x3 = qa_q3_base_entity_shared_maxs(&self->r).x, y3 = qa_q3_base_entity_shared_maxs(&self->r).y, qa_math_vec3(x3, y3, -8))); self->s.loop_sound = 0;
     client->respawn_time = qa_int32(frame.time + 1700);
     for (size_t i = 0; i < client->ps.powerups.length; i++) slot_set(&client->ps.powerups, (double)i, 0);
     if ((health <= GIB_HEALTH_V && !nodrop && frame.blood) || qa_js_to_int32(mod) == 20) qa_q3_death_gib_entity(r, self, killer);
@@ -289,10 +291,10 @@ void qa_q3_death_player_die(RT *r, qa_q3_game_entity *self, const qa_q3_damage_p
     r->host.world.link(r->host.world.ctx, self); return;
   }
   qa_q3_game_entity_set_takedamage(self, true); self->s.weapon = 0; self->s.powerups = 0;
-  self->r.contents = CONTENTS_CORPSE_V; self->s.angles = (qa_vec3){0, self->s.angles.y, 0};
+  self->r.contents = CONTENTS_CORPSE_V; self->s.angles = qa_math_vec3(0, self->s.angles.y, 0);
   qa_q3_death_look_at_killer(r, self, inflictor, attacker);
   client->ps.viewangles = self->s.angles; self->s.loop_sound = 0;
-  qa_q3_base_entity_shared_set_maxs(&self->r, (x2 = qa_q3_base_entity_shared_maxs(&self->r).x, y2 = qa_q3_base_entity_shared_maxs(&self->r).y, (qa_vec3){x2, y2, -8}));
+  qa_q3_base_entity_shared_set_maxs(&self->r, (x2 = qa_q3_base_entity_shared_maxs(&self->r).x, y2 = qa_q3_base_entity_shared_maxs(&self->r).y, qa_math_vec3(x2, y2, -8)));
   client->respawn_time = qa_int32(frame.time + 1700);
   for (size_t i = 0; i < client->ps.powerups.length; i++) slot_set(&client->ps.powerups, (double)i, 0);
   if ((health <= GIB_HEALTH_V && !nodrop && frame.blood) || qa_js_to_int32(mod) == 20) qa_q3_death_gib_entity(r, self, killer);
@@ -311,7 +313,7 @@ static void cb_free(void *ctx, qa_q3_game_entity *s) { RT *r = ctx; qa_q3_entity
 static void cb_free_player(void *ctx, qa_q3_game_entity *s) { RT *r = ctx; qa_q3_entity_pool_free(r->host.pool, s); }
 static void cb_kamikaze(void *ctx, qa_q3_game_entity *s) {
   RT *r = ctx;
-  if (r->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_range_error("Kamikaze callback requires missionpack");
+  if (r->host.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) qa_raise("Error", 0, 0, "Kamikaze callback requires missionpack");
   r->host.start_kamikaze(r->host.ctx, s); qa_q3_entity_pool_free(r->host.pool, s);
 }
 static void cb_body_die(void *ctx, qa_q3_game_entity *s, qa_q3_damage_inflictor i, qa_q3_damage_participant a, double d, double m) {

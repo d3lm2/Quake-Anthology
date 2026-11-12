@@ -43,7 +43,7 @@ bool qa_q2mpm_check_rogue_ground_spawn_point(qa_q2_game_services *game, qa_vec3 
   bool all = true;
   for (int i = 0; i < 4; i++) {
     qa_vec3 point = {corners[i].x, corners[i].y, gravity > 0 ? max.z + 1 : min.z - 1};
-    if (game->host->point_contents(game->host->ctx, point) != 1) all = false;
+    if (game->host->point_contents(game->host->ctx, point) != 1) { all = false; break; } /* Array.every stops at the first miss */
   }
   if (all) return true;
   qa_vec3 start = {(min.x + max.x) * 0.5, (min.y + max.y) * 0.5, min.z};

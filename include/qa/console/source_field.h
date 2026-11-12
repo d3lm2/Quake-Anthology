@@ -1,8 +1,8 @@
 /*
  * Port of src/console/source-field.ts (EditField): Quake III
  * cl_keys.c-style 256-byte source edit field. Key codes are the
- * numeric KeyCode values of src/input/key-codes.ts (that module is
- * not yet ported; the values used here are named in source_field.c).
+ * numeric KeyCode values of src/input/key-codes.ts (the values used
+ * here are named in source_field.c).
  * RangeErrors abort via qa_range_error with the TS messages.
  * Ownership: the field owns only its fixed buffer; init/destroy do
  * not allocate. qa_edit_field_text returns a malloc'd copy.

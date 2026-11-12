@@ -9,6 +9,7 @@
 #include "qa/compat/qvm/memory.h"
 #include "qa/compat/qvm/operations.h"
 #include "qa/compat/qvm/trace_record.h"
+#include "qa/core/math.h"
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
 #include "qa/world/actors/body.h"
@@ -53,7 +54,6 @@ typedef struct request_box {
 
 typedef int32_t (*damage_execute_fn)(void *ctx, qa_damage_request request);
 
-static const qa_vec3 zero_vec = {0, 0, 0};
 
 static const qa_qvm_combat_role_index legacy_damage_roles[] = {
     {"target", 0}, {"inflictor", 1}, {"attacker", 2}, {"direction", 3},
@@ -161,7 +161,7 @@ static const qa_qvm_mod_actor_record *find_record(const qa_qvm_mod_callback_decl
 static void validate_field(const qa_qvm_mod_actor_record *record, double offset) {
   if (!is_safe_integer(offset) || offset < 0 || fmod(offset, 4.0) != 0 ||
       offset + 4 > record->stride)
-    qa_range_error("QVM actor semantic field exceeds its declared record");
+    qa_raise("Error", 0, 0, "QVM actor semantic field exceeds its declared record");
 }
 
 /* TS team template `${string}:${string}` per /^[^:]+:.+$/. */
@@ -180,7 +180,7 @@ void qa_qvm_validate_mod_actors(const qa_resolved_qvm_artifact *artifact,
   if (callbacks == NULL && combat == NULL) return;
   const qa_qvm_mod_actor_record *record = find_record(declaration, declaration->entity_record);
   if (declaration->source_actors == NULL || record == NULL)
-    qa_range_error("QVM actor callbacks and combat require declared source actors");
+    qa_raise("Error", 0, 0, "QVM actor callbacks and combat require declared source actors");
   if (callbacks != NULL) {
     if (callbacks->has_touch) validate_field(record, callbacks->touch);
     if (callbacks->has_use) validate_field(record, callbacks->use);
@@ -192,7 +192,7 @@ void qa_qvm_validate_mod_actors(const qa_resolved_qvm_artifact *artifact,
   bool entry_is_function = is_integer(fields->entry) && fields->entry >= 0 &&
                            artifact != NULL && fields->entry < (double)artifact->image.instruction_count &&
                            artifact->image.instructions[(size_t)fields->entry].opcode == QA_QVMY_OP_ENTER;
-  if (!entry_is_function) qa_range_error("QVM damage entry is not a source function");
+  if (!entry_is_function) qa_raise("Error", 0, 0, "QVM damage entry is not a source function");
   validate_field(record, fields->health);
   validate_field(record, fields->takedamage);
   validate_field(record, fields->flags);
@@ -200,8 +200,8 @@ void qa_qvm_validate_mod_actors(const qa_resolved_qvm_artifact *artifact,
   const double masks[] = {fields->godmode, fields->no_knockback};
   for (size_t i = 0; i < 2; i++)
     if (!is_integer(masks[i]) || masks[i] <= 0 || masks[i] > mask_limit)
-      qa_range_error("Invalid QVM combat flag mask");
-  if (callbacks == NULL) qa_range_error("QVM source damage requires declared reaction fields");
+      qa_raise("Error", 0, 0, "Invalid QVM combat flag mask");
+  if (callbacks == NULL) qa_raise("Error", 0, 0, "QVM source damage requires declared reaction fields");
   if (str_eq(combat->abi, "declared")) {
     double data_bytes = artifact != NULL
                             ? (double)(artifact->image.data_length + artifact->image.literal_length +
@@ -222,15 +222,15 @@ void qa_qvm_validate_mod_actors(const qa_resolved_qvm_artifact *artifact,
       uint32_t bits = (uint32_t)qa_int32(mask);
       if (!is_integer(mask) || mask <= 0 || mask > 4294967295.0 || (bits & (bits - 1u)) != 0 ||
           (used & bits) != 0)
-        qa_range_error("QVM source damage flag masks overlap or are not single positive bits");
+        qa_raise("Error", 0, 0, "QVM source damage flag masks overlap or are not single positive bits");
       used |= bits;
     }
     if (!combat->mass.is_constant)
       validate_field(record, combat->mass.offset);
     else if (!isfinite(combat->mass.value) || combat->mass.value < 0)
-      qa_range_error("Invalid QVM source mass");
+      qa_raise("Error", 0, 0, "Invalid QVM source mass");
     if (fields->client == NULL && combat->team_count != 0)
-      qa_range_error("QVM source team mapping requires a client team field");
+      qa_raise("Error", 0, 0, "QVM source team mapping requires a client team field");
     for (size_t i = 0; i < combat->team_count; i++) {
       double value = combat->teams[i].value;
       bool duplicate = false;
@@ -238,19 +238,19 @@ void qa_qvm_validate_mod_actors(const qa_resolved_qvm_artifact *artifact,
         if (combat->teams[j].value == value) duplicate = true;
       if (!is_integer(value) || value < -2147483648.0 || value > 2147483647.0 || duplicate ||
           !valid_team_name(combat->teams[i].team))
-        qa_range_error("Invalid QVM source team mapping");
+        qa_raise("Error", 0, 0, "Invalid QVM source team mapping");
     }
   }
   if (fields->client != NULL) {
     validate_field(record, fields->client->pointer);
     const qa_qvm_mod_actor_record *client = find_record(declaration, fields->client->record);
-    if (client == NULL) qa_range_error("QVM combat client has no declared record");
+    if (client == NULL) qa_raise("Error", 0, 0, "QVM combat client has no declared record");
     validate_field(client, fields->client->health);
     validate_field(client, fields->client->armor);
     validate_field(client, fields->client->team);
     if (!isfinite(fields->client->protection) || fields->client->protection < 0 ||
         fields->client->protection > 1)
-      qa_range_error("Invalid QVM armor protection");
+      qa_raise("Error", 0, 0, "Invalid QVM armor protection");
   }
 }
 
@@ -277,12 +277,12 @@ static int64_t call_bytes_for(const qa_qvm_mod_actors *actors, reaction_kind kin
 static int64_t role_index(qa_qvm_combat_call call, const char *role) {
   for (size_t i = 0; i < call.role_count; i++)
     if (str_eq(call.roles[i].role, role)) return (int64_t)call.roles[i].index;
-  qa_range_error("Missing declared QVM damage argument");
+  qa_raise("Error", 0, 0, "Missing declared QVM damage argument");
 }
 
 static void require_arguments(int64_t bytes, size_t word_length) {
   if ((int64_t)word_length < bytes)
-    qa_range_error("QVM combat declaration exceeds the actual source caller frame");
+    qa_raise("Error", 0, 0, "QVM combat declaration exceeds the actual source caller frame");
 }
 
 static int32_t bytes_i32(const uint8_t *bytes, size_t offset) {
@@ -320,7 +320,7 @@ static float float_at(qa_qvm_mod_actors *actors, int64_t address) {
 }
 
 static qa_vec3 vector_at(qa_qvm_mod_actors *actors, int64_t address) {
-  if (address == 0) return zero_vec;
+  if (address == 0) return qa_zero_vec3;
   qa_qvm_writable_view view;
   qa_qvm_memory_view(memory_of(actors), address, 12, 0, &view);
   qa_vec3 result = {qa_qvm_writable_view_get_float32(&view, 0, true),
@@ -358,7 +358,7 @@ static bool client_at(qa_qvm_mod_actors *actors, int64_t pointer, int64_t *out) 
       (double)address >= record->address + record->stride * record->capacity ||
       record->stride == 0 ||
       fmod((double)address - record->address, record->stride) != 0)
-    qa_range_error("QVM combat client pointer is outside its source declaration");
+    qa_raise("Error", 0, 0, "QVM combat client pointer is outside its source declaration");
   *out = address;
   return true;
 }
@@ -380,7 +380,7 @@ static qa_armor_state armor_at(qa_qvm_mod_actors *actors, int64_t pointer) {
 
 static qa_combat_state read_state(qa_qvm_mod_actors *actors, qa_actor_id actor) {
   const qa_qvm_mod_combat *combat = actors->options.declaration->combat;
-  if (combat == NULL) qa_range_error("Missing QVM combat declaration");
+  if (combat == NULL) qa_raise("Error", 0, 0, "Missing QVM combat declaration");
   const qa_qvm_mod_combat_fields *fields = &combat->fields;
   int64_t pointer = pointer_for(actors, &actor);
   int32_t flags = word_at(actors, pointer + (int64_t)fields->flags);
@@ -468,7 +468,11 @@ static int32_t invoke_call(qa_qvm_mod_actors *actors, int64_t entry, const doubl
   input.name = "time";
   input.value.kind = "float";
   input.value.number_value = seconds_of(actors);
+  /* The source function is guest code: its raise must not strand the words. */
+  qa_cleanup arguments_cleanup;
+  qa_cleanup_push(&arguments_cleanup, free, arguments);
   int32_t result = actors->options.invoke(actors->options.ctx, &call, &input, 1);
+  qa_cleanup_pop(&arguments_cleanup);
   free(arguments);
   return result;
 }
@@ -491,6 +495,17 @@ static void call_actor(qa_qvm_mod_actors *actors, qa_owned_actor actor, reaction
                 combat != NULL ? combat->fields.globals : NULL,
                 combat != NULL ? combat->fields.global_count : 0);
   }
+}
+
+/* call_actor over words this caller allocated: released whether or not the
+ * source reaction raises. */
+static void call_actor_owned(qa_qvm_mod_actors *actors, qa_owned_actor actor, reaction_kind kind,
+                             double *words, size_t word_count) {
+  qa_cleanup words_cleanup;
+  qa_cleanup_push(&words_cleanup, free, words);
+  call_actor(actors, actor, kind, words, word_count);
+  qa_cleanup_pop(&words_cleanup);
+  free(words);
 }
 
 static pointer_entry *pointer_entries(qa_qvm_mod_actors *actors) {
@@ -604,7 +619,7 @@ static void flush_frame(qa_qvm_mod_actors *actors, damage_frame *frame) {
   bool had_velocity = frame->has_velocity;
   qa_vec3 velocity = frame->velocity;
   qa_combat_state after = read_state(actors, frame->request.target);
-  qa_vec3 current_velocity = zero_vec;
+  qa_vec3 current_velocity = qa_zero_vec3;
   bool has_current = body_velocity(actors, frame->request.target, &current_velocity);
   damage_frame **entries = frame_entries(actors);
   for (size_t i = 0; i < actors->damage_frame_count; i++)
@@ -684,11 +699,15 @@ static qa_source_damage_result run_execute(void *ctx, qa_source_damage_observer 
     frame->request.attack.inflictor = &frame->inflictor;
   }
   frame->observer = observer;
+  /* TS reads the state before the frame is pushed: a refused read pushes nothing. */
+  qa_cleanup unpushed;
+  qa_cleanup_push(&unpushed, free, frame);
   frame->before = read_state(actors, frame->request.target);
   frame->has_velocity = body_velocity(actors, frame->request.target, &frame->velocity);
   frame->result.applied_damage = 0;
   frame->result.reaction = "none";
   push_frame(actors, frame);
+  qa_cleanup_pop(&unpushed);
   frame_pop pop = {actors, frame};
   qa_cleanup guard;
   qa_cleanup_push(&guard, pop_frame, &pop);
@@ -746,8 +765,11 @@ static int32_t invoke_damage_at(void *ctx, int32_t address) {
   const qa_qvm_mod_combat *combat = damage->actors->options.declaration->combat;
   size_t count = 0;
   double *words = damage_words(damage->actors, damage->request, address, 0, &count);
+  qa_cleanup words_cleanup;
+  qa_cleanup_push(&words_cleanup, free, words);
   int32_t result = invoke_call(damage->actors, (int64_t)combat->fields.entry, words, count,
                                combat->fields.globals, combat->fields.global_count);
+  qa_cleanup_pop(&words_cleanup);
   free(words);
   return result;
 }
@@ -755,7 +777,7 @@ static int32_t invoke_damage_at(void *ctx, int32_t address) {
 static int32_t invoke_damage_execute(void *ctx, qa_damage_request request) {
   qa_qvm_mod_actors *actors = ctx;
   if (actors->options.declaration->combat == NULL)
-    qa_range_error("Missing QVM combat declaration");
+    qa_raise("Error", 0, 0, "Missing QVM combat declaration");
   invoke_damage_ctx damage = {actors, request};
   return actors->options.scratch(actors->options.ctx, 24, invoke_damage_at, &damage);
 }
@@ -829,7 +851,7 @@ static bool callback_match(qa_qvm_mod_actors *actors, int64_t entry, const uint8
     if (!get_pointer_actor(actors, bytes_i32(words, (size_t)offset), &owner)) continue;
     if (entry_for(actors, owner.id, kinds[i]) != entry) continue;
     require_arguments(call_bytes_for(actors, kinds[i]), word_length);
-    if (found) qa_range_error("QVM callback entry has ambiguous source signatures");
+    if (found) qa_raise("Error", 0, 0, "QVM callback entry has ambiguous source signatures");
     found = true;
     *out_owner = owner;
     *out_kind = kinds[i];
@@ -882,7 +904,7 @@ typedef struct touch_ctx {
 static void touch_execute(void *ctx, qa_touch_contact effective) {
   touch_ctx *touch = ctx;
   if (effective.plane != touch->plane || effective.surface != touch->surface)
-    qa_range_error("QVM source trace changes require callback replacement");
+    qa_raise("Error", 0, 0, "QVM source trace changes require callback replacement");
   word_edit value = {touch->role_target,
        same_owned(effective.self, touch->owner)
            ? call_word(touch->call, touch->role_target)
@@ -968,7 +990,7 @@ static int32_t source_callback(qa_qvm_mod_actors *actors, int64_t entry,
   if (!callback_match(actors, entry, call->words, call->words_length, &owner, &kind))
     return proceed_call(call);
   qa_actor_callback_table *callbacks = actors->options.services->callbacks;
-  if (callbacks == NULL) qa_range_error("Missing shared QVM actor callbacks");
+  if (callbacks == NULL) qa_raise("Error", 0, 0, "Missing shared QVM actor callbacks");
   if (kind == REACTION_USE) {
     qa_qvm_combat_call roles = actors->calls.use;
     use_ctx use;
@@ -1061,7 +1083,7 @@ static int32_t source_callback(qa_qvm_mod_actors *actors, int64_t entry,
     memset(&death, 0, sizeof death);
     death.pain = reaction;
     death.inflictor = has_inflictor ? &inflictor : NULL;
-    death.point = frame != NULL ? frame->request.point : zero_vec;
+    death.point = frame != NULL ? frame->request.point : qa_zero_vec3;
     die_ctx die;
     memset(&die, 0, sizeof die);
     die.actors = actors;
@@ -1112,10 +1134,10 @@ static void source_request(qa_qvm_mod_actors *actors, qa_qvm_module_function_cal
   int64_t role_method = role_index(roles, "method");
   qa_actor_id target;
   if (!call_actor_at(actors, call, role_target, &target))
-    qa_range_error("QVM damage target is not a canonical actor");
+    qa_raise("Error", 0, 0, "QVM damage target is not a canonical actor");
   const qa_mod_host_services *services = actors->options.services;
   if (services->damage_context == NULL)
-    qa_range_error("QVM source damage requires canonical attack provenance");
+    qa_raise("Error", 0, 0, "QVM source damage requires canonical attack provenance");
   memset(out, 0, sizeof *out);
   qa_damage_request *request = &out->request;
   services->damage_context(services->ctx, actors->options.module->profile.module.id,
@@ -1123,18 +1145,8 @@ static void source_request(qa_qvm_mod_actors *actors, qa_qvm_module_function_cal
                            &request->attack.combat_provider,
                            &request->attack.inventory_provider,
                            &request->attack.movement_provider);
-  request->attack.time = services->time(services->ctx);
-  if (call_actor_at(actors, call, role_attacker, &out->attacker))
-    request->attack.attacker = &out->attacker;
-  if (call_actor_at(actors, call, role_inflictor, &out->inflictor))
-    request->attack.inflictor = &out->inflictor;
-  request->attack.weapon = NULL;
-  request->attack.cause.kind = QA_ATTACK_CAUSE_Q3;
   int32_t flags = call_word(call, role_flags);
   int32_t amount = call_word(call, role_amount);
-  request->attack.cause.damage_flags =
-      qa_qvm_canonical_damage_flags(actors->flags, flags);
-  request->attack.cause.means_of_death = call_word(call, role_method);
   request->target = target;
   request->amount = amount;
   request->knockback =
@@ -1143,8 +1155,20 @@ static void source_request(qa_qvm_mod_actors *actors, qa_qvm_module_function_cal
           : amount;
   request->direction = vector_at(actors, call_word(call, role_direction));
   request->point = vector_at(actors, call_word(call, role_point));
-  request->normal = zero_vec;
+  request->normal = qa_zero_vec3;
   request->delivery = (flags & qa_int32(actors->flags.radius)) == 0 ? "direct" : "radius";
+  /* TS builds the attack last: the clock and the actor lookups follow the
+   * two guest vectors (which a bad pointer refuses). */
+  request->attack.time = services->time(services->ctx);
+  if (call_actor_at(actors, call, role_attacker, &out->attacker))
+    request->attack.attacker = &out->attacker;
+  if (call_actor_at(actors, call, role_inflictor, &out->inflictor))
+    request->attack.inflictor = &out->inflictor;
+  request->attack.weapon = NULL;
+  request->attack.cause.kind = QA_ATTACK_CAUSE_Q3;
+  request->attack.cause.damage_flags =
+      qa_qvm_canonical_damage_flags(actors->flags, flags);
+  request->attack.cause.means_of_death = call_word(call, role_method);
 }
 
 typedef struct replay_ctx {
@@ -1168,7 +1192,10 @@ static int32_t replay_at(void *ctx, int32_t address) {
   size_t count = 0;
   double *words = damage_words(actors, *effective, address,
                                call_word(replay->call, role_flags), &count);
+  qa_cleanup words_cleanup, edits_cleanup;
+  qa_cleanup_push(&words_cleanup, free, words);
   word_edit *edits = xmalloc((roles.role_count == 0 ? 1 : roles.role_count) * sizeof *edits);
+  qa_cleanup_push(&edits_cleanup, free, edits);
   size_t edit_count = 0;
   for (size_t i = 0; i < roles.role_count; i++) {
     int64_t index = (int64_t)roles.roles[i].index;
@@ -1180,16 +1207,15 @@ static int32_t replay_at(void *ctx, int32_t address) {
     if (index == role_inflictor &&
         actor_ptr_eq(effective->attack.inflictor, original->attack.inflictor))
       continue;
-    if (index < 0 || (size_t)index >= count) {
-      free(words);
-      free(edits);
-      qa_range_error("Missing declared QVM damage argument");
-    }
+    if (index < 0 || (size_t)index >= count)
+      qa_raise("Error", 0, 0, "Missing declared QVM damage argument");
     edits[edit_count].index = index;
     edits[edit_count].word = qa_int32(words[index]);
     edit_count++;
   }
   int32_t result = proceed_with_edits(replay->call, edits, edit_count);
+  qa_cleanup_pop(&edits_cleanup);
+  qa_cleanup_pop(&words_cleanup);
   free(words);
   free(edits);
   return result;
@@ -1242,12 +1268,12 @@ static int32_t touch_at(void *ctx, int32_t address) {
   touch_call_ctx *touch = ctx;
   qa_qvm_mod_actors *actors = touch->actors;
   const qa_touch_contact *contact = &touch->contact;
-  qa_vec3 normal = contact->plane != NULL ? contact->plane->normal : zero_vec;
+  qa_vec3 normal = contact->plane != NULL ? contact->plane->normal : qa_zero_vec3;
   qa_body_state_result body =
       qa_shared_body_table_read(actors->options.services->bodies, contact->self.id);
   qa_qvm_trace_record record;
   memset(&record, 0, sizeof record);
-  record.result.end = body.has_value ? body.value.origin : zero_vec;
+  record.result.end = body.has_value ? body.value.origin : qa_zero_vec3;
   record.result.plane.plane.normal = normal;
   record.result.plane.plane.distance = contact->plane != NULL ? contact->plane->distance : 0;
   record.result.plane.type = normal.x == 1 ? 0 : normal.y == 1 ? 1 : normal.z == 1 ? 2 : 3;
@@ -1265,8 +1291,7 @@ static int32_t touch_at(void *ctx, int32_t address) {
       {"trace", address}};
   size_t count = 0;
   double *words = combat_words(actors->calls.touch, values, 3, &count);
-  call_actor(actors, contact->self, REACTION_TOUCH, words, count);
-  free(words);
+  call_actor_owned(actors, contact->self, REACTION_TOUCH, words, count);
   return 0;
 }
 
@@ -1285,8 +1310,7 @@ static void actor_use(void *ctx, qa_owned_actor self, const qa_actor_id *other,
   qa_qvm_combat_role_value values[3] = {value, value2, value3};
   size_t count = 0;
   double *words = combat_words(actors->calls.use, values, 3, &count);
-  call_actor(actors, self, REACTION_USE, words, count);
-  free(words);
+  call_actor_owned(actors, self, REACTION_USE, words, count);
 }
 
 static void actor_pain(void *ctx, qa_pain_reaction reaction) {
@@ -1298,8 +1322,7 @@ static void actor_pain(void *ctx, qa_pain_reaction reaction) {
       value, value2, value3};
   size_t count = 0;
   double *words = combat_words(actors->calls.pain, values, 3, &count);
-  call_actor(actors, reaction.self, REACTION_PAIN, words, count);
-  free(words);
+  call_actor_owned(actors, reaction.self, REACTION_PAIN, words, count);
 }
 
 static void actor_die(void *ctx, qa_death_reaction reaction) {
@@ -1319,8 +1342,7 @@ static void actor_die(void *ctx, qa_death_reaction reaction) {
                      : 0}};
   size_t count = 0;
   double *words = combat_words(actors->calls.die, values, 5, &count);
-  call_actor(actors, reaction.pain.self, REACTION_DIE, words, count);
-  free(words);
+  call_actor_owned(actors, reaction.pain.self, REACTION_DIE, words, count);
 }
 
 static qa_combat_state binding_read(void *ctx) {
@@ -1338,7 +1360,7 @@ static void binding_validate_armor(void *ctx, qa_armor_state armor) {
   if (!str_eq(armor.powered.kind, "none") ||
       (armor.regular.kind != QA_REGULAR_ARMOR_NONE &&
        armor.regular.kind != QA_REGULAR_ARMOR_Q3))
-    qa_range_error("Native Q3 armor requires Q3 armor values");
+    qa_raise("Error", 0, 0, "Native Q3 armor requires Q3 armor values");
 }
 
 static void binding_write_health(void *ctx, double health) {
@@ -1360,13 +1382,13 @@ static void binding_write_armor(void *ctx, qa_armor_state armor) {
   bool has_client = client_at(actors, pointer_for(actors, &node->actor.id), &client);
   if (!has_client || combat->fields.client == NULL) {
     if (armor.regular.kind != QA_REGULAR_ARMOR_NONE || !str_eq(armor.powered.kind, "none"))
-      qa_range_error("QVM actor has no declared armor store");
+      qa_raise("Error", 0, 0, "QVM actor has no declared armor store");
     return;
   }
   if (!str_eq(armor.powered.kind, "none") ||
       (armor.regular.kind != QA_REGULAR_ARMOR_NONE &&
        armor.regular.kind != QA_REGULAR_ARMOR_Q3))
-    qa_range_error("QVM source armor requires Q3 armor values");
+    qa_raise("Error", 0, 0, "QVM source armor requires Q3 armor values");
   store_word(actors, client + (int64_t)combat->fields.client->armor,
              armor.regular.kind == QA_REGULAR_ARMOR_NONE ? 0 : qa_int32(armor.regular.points));
 }
@@ -1446,7 +1468,7 @@ void qa_qvm_mod_actors_init(qa_qvm_mod_actors *actors,
   memset(actors, 0, sizeof *actors);
   actors->options = *options;
   if (options->services->callbacks == NULL)
-    qa_range_error("QVM actor semantics require shared actor callbacks");
+    qa_raise("Error", 0, 0, "QVM actor semantics require shared actor callbacks");
   const qa_qvm_mod_combat *combat = options->declaration->combat;
   if (combat != NULL && str_eq(combat->abi, "declared")) {
     actors->calls = combat->calls;

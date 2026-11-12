@@ -25,6 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "qa/foundation/support.h"
 #include "qa/persistence/value.h"
 #include "qa/ui/common/legacy/script/memory.h"
 
@@ -266,6 +267,9 @@ qa_save_value *qa_ui_script_lexer_capture_save_state(
     qa_ui_script_lexer *lexer, const qa_ui_script_memory_capture *capture);
 void qa_ui_script_lexer_dispose(qa_ui_script_lexer *lexer);
 void qa_ui_script_lexer_destroy(qa_ui_script_lexer *lexer);
+/* Frees a lexer dropped by a failed restore: a restored storage keeps the
+   allocations of its memory owner (TS drops the object). */
+void qa_ui_script_lexer_discard(qa_ui_script_lexer *lexer);
 
 qa_ui_source_script_storage *qa_ui_script_lexer_source_storage(
     qa_ui_script_lexer *lexer);
@@ -324,9 +328,21 @@ void qa_ui_script_lexer_reset(qa_ui_script_lexer *lexer);
 
 /* ---- Internal to the script modules (lexer/token/preprocessor) ---- */
 
+struct qa_ui_script_fail_env;
+/* One catch frame of the ScriptLanguageError channel. Enter it with
+ * qa_ui_script_catch_enter before the setjmp and leave it with
+ * qa_ui_script_catch_leave on every path out (after a throw landed here the
+ * frame is already left, and leaving again does nothing). A throw to this
+ * frame first unwinds what was pushed since it was entered: cleanup nodes run,
+ * inner qa_try frames and inner script frames are forgotten. A qa_raise that
+ * passes through leaves the frame too. Frames nest strictly. */
 typedef struct qa_ui_script_catch {
   jmp_buf buf;
   struct qa_ui_script_catch *prev;
+  struct qa_ui_script_fail_env *env;
+  qa_unwind_mark mark;
+  qa_cleanup restore;
+  volatile bool entered;
 } qa_ui_script_catch;
 
 /** Shared ScriptLanguageError channel (catch stack + pending). */
@@ -338,6 +354,9 @@ typedef struct qa_ui_script_fail_env {
   const qa_ui_script_diagnostic *pending_identity;
 } qa_ui_script_fail_env;
 
+void qa_ui_script_catch_enter(qa_ui_script_fail_env *env,
+                              qa_ui_script_catch *frame);
+void qa_ui_script_catch_leave(qa_ui_script_catch *frame);
 void qa_ui_script_fail_env_init(qa_ui_script_fail_env *env);
 void qa_ui_script_fail_env_destroy(qa_ui_script_fail_env *env);
 /* Drop a caught pending failure (after a setjmp catch handled it). */

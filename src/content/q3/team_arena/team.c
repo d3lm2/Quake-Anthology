@@ -22,7 +22,10 @@
 enum { AWARDS = 0x8 | 0x40 | 0x800 | 0x8000 | 0x10000 | 0x20000 };
 static double s32(double v) { return qa_js_to_int32(v); }
 static double f32(double v) { return (float)v; }
-static double imul(double a, double b) { return (int32_t)(qa_js_to_int32(a) * qa_js_to_int32(b)); }
+/* Math.imul wraps; a signed C product of cvar-sized operands is undefined past 2^31. */
+static double imul(double a, double b) {
+  return qa_js_to_int32((double)((uint32_t)qa_js_to_int32(a) * (uint32_t)qa_js_to_int32(b)));
+}
 static double slot_get(qa_q3_base_player_state_slots *s, double i) { return qa_q3_base_player_state_slots_get(s, (size_t)i); }
 static void slot_set(qa_q3_base_player_state_slots *s, double i, double v) { qa_q3_base_player_state_slots_set(s, (size_t)i, v); }
 static bool mission(qa_q3_ta_team_runtime *r) { return r->host.product == QA_Q3_BASE_PRODUCT_MISSIONPACK; }
@@ -49,12 +52,12 @@ bool qa_q3_ta_on_same_team(double game_type, qa_q3_game_entity *first, qa_q3_gam
 void qa_q3_ta_spawn_team_point(qa_q3_game_entity *entity) { (void)entity; }
 
 static qa_q3_game_client *client_of(qa_q3_game_entity *entity) {
-  if (entity->client == NULL) qa_range_error("Team player operation requires a client");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "Team player operation requires a client");
   return entity->client;
 }
 /* TS flagTeam: returns false for TS null (non-flag item). */
 static bool flag_team(qa_q3_game_entity *entity, qa_q3_base_team *out) {
-  if (entity->item == NULL) qa_range_error("Team item operation requires an item");
+  if (entity->item == NULL) qa_raise("Error", 0, 0, "Team item operation requires an item");
   if (entity->item->tag == QA_Q3_PW_REDFLAG) { *out = QA_Q3_BASE_TEAM_RED; return true; }
   if (entity->item->tag == QA_Q3_PW_BLUEFLAG) { *out = QA_Q3_BASE_TEAM_BLUE; return true; }
   if (entity->item->tag == QA_Q3_PW_NEUTRALFLAG) { *out = QA_Q3_BASE_TEAM_FREE; return true; }
@@ -137,7 +140,7 @@ void qa_q3_ta_team_runtime_init_game(qa_q3_ta_team_runtime *runtime) {
 
 void qa_q3_ta_team_runtime_print_message(qa_q3_ta_team_runtime *runtime, qa_q3_game_entity *entity, const char *text) {
   size_t length = strlen(text); /* C string already ends at TS first NUL */
-  if (length > 1024) qa_range_error("PrintMsg overrun");
+  if (length > 1024) qa_raise("Error", 0, 0, "PrintMsg overrun");
   char *message = malloc(length + 1);
   char *command = malloc(length + 16);
   if (!message || !command) { free(message); free(command); qa_range_error("out of memory"); }
@@ -209,6 +212,10 @@ void qa_q3_ta_team_runtime_check_hurt_carrier(qa_q3_ta_team_runtime *runtime, qa
     attacker->client->pers.team_state.last_hurt_carrier = f32(runtime->host.time);
 }
 
+/* TS string | null fields (GameEntity.classname, .message): null prints "(null)". */
+static qa_q3_game_format_arg nullable_string(const char *value) {
+  return value != NULL ? qa_q3_game_format_string(value) : qa_q3_game_format_null();
+}
 static void print_formatted(qa_q3_ta_team_runtime *r, qa_q3_game_entity *entity, const char *format,
     const qa_q3_game_format_arg *args, size_t count) {
   char *text = qa_q3_game_format(format, args, count, 32000);
@@ -527,10 +534,10 @@ char *qa_q3_ta_team_runtime_get_location_message(qa_q3_ta_team_runtime *runtime,
   if (location->count != 0) {
     location->count = qa_js_max(0, qa_js_min(7, location->count));
     qa_q3_game_format_arg a[] = {qa_q3_game_format_number(94), qa_q3_game_format_number(location->count + 48),
-        qa_q3_game_format_string(location->message)};
+        nullable_string(location->message)};
     return qa_q3_game_format("%c%c%s^7", a, 3, capacity);
   }
-  qa_q3_game_format_arg a = qa_q3_game_format_string(location->message);
+  qa_q3_game_format_arg a = nullable_string(location->message);
   return qa_q3_game_format("%s", &a, 1, capacity);
 }
 
@@ -610,18 +617,18 @@ void qa_q3_ta_team_runtime_check_team_status(qa_q3_ta_team_runtime *runtime) {
 
 
 static qa_q3_ta_obelisk_settings obelisk_settings(qa_q3_ta_team_runtime *r) {
-  if (!mission(r)) qa_range_error("Obelisk handlers belong to the missionpack product");
+  if (!mission(r)) qa_raise("Error", 0, 0, "Obelisk handlers belong to the missionpack product");
   return r->host.obelisk;
 }
 static qa_q3_game_entity *obelisk_model(qa_q3_game_entity *entity) {
-  if (entity->activator == NULL) qa_range_error("Obelisk callback requires its spawned model entity");
+  if (entity->activator == NULL) qa_raise("Error", 0, 0, "Obelisk callback requires its spawned model entity");
   return entity->activator;
 }
 static qa_q3_base_team obelisk_team(qa_q3_game_entity *entity) {
   if (entity->spawnflags == QA_Q3_BASE_TEAM_FREE || entity->spawnflags == QA_Q3_BASE_TEAM_RED ||
       entity->spawnflags == QA_Q3_BASE_TEAM_BLUE || entity->spawnflags == QA_Q3_BASE_TEAM_SPECTATOR)
     return (qa_q3_base_team)entity->spawnflags;
-  qa_range_error("Spawned obelisk has no source team");
+  qa_raise("Error", 0, 0, "Spawned obelisk has no source team");
 }
 static void obelisk_regen_fn(void *ctx, qa_q3_game_entity *self) {
   qa_q3_ta_team_runtime *r = ctx;
@@ -754,7 +761,7 @@ qa_q3_game_entity *qa_q3_ta_team_runtime_spawn_obelisk(qa_q3_ta_team_runtime *ru
     if (trace.solidity != QA_Q3_BASE_SOLID_CLEAR) {
       entity->s.origin = qa_math_vec3(entity->s.origin.x, entity->s.origin.y, entity->s.origin.z - 1);
       const char *vtos = (const char *)qa_q3_game_utility_scratch_vtos(runtime->host.pool->utilities, entity->s.origin);
-      qa_q3_game_format_arg a[] = {qa_q3_game_format_string(qa_q3_game_entity_classname(entity)),
+      qa_q3_game_format_arg a[] = {nullable_string(qa_q3_game_entity_classname(entity)),
           qa_q3_game_format_string(vtos)};
       char *text = qa_q3_game_format("SpawnObelisk: %s startsolid at %s\n", a, 2, 32000);
       runtime->host.warn(runtime->host.ctx, text);

@@ -1,8 +1,7 @@
 /* Port of src/app/bootstrap/application.ts: the Application class (one C type,
- * qa_application). Built alongside the temporary concrete-host layer in
- * application.h (qa_app_application, main.c's path until the connection step);
- * the two share nothing. The application constructs the real SharedSimulation
- * (shared_simulation.h).
+ * qa_application). main.c opens it for a dedicated run and StartupApplication
+ * opens it over its graphical client. The application constructs the
+ * SharedSimulation (shared_simulation.h).
  *
  * The member layout (TS member, C function, C file, status) is
  * docs/application_layout.md. TS async members are synchronous; a TS throw
@@ -108,7 +107,7 @@ void qa_application_pending_client_commands_discard(qa_application_pending_clien
 
 /* ---- Members StartupApplication (startup_application*.c) calls. The same
  * declarations as src/app/bootstrap/application_internal.h, made visible to
- * the frontend; networkWire has no definition yet (docs/application_layout.md). */
+ * the frontend. */
 #include "qa/app/bootstrap/client_bootstrap.h"
 #include "qa/app/bootstrap/demo_recording.h"
 #include "qa/contracts/ui.h"

@@ -52,9 +52,9 @@ static void ss_release_q3_bridge_policy(void *ctx) {
   qa_q3_base_combat_bridge_policy_destroy(policy);
 }
 
+/* Every TS throw these sites port is a plain Error. */
 static noreturn void ck_fail(const char *format, ...) {
-  char text[512]; va_list args; va_start(args, format); vsnprintf(text, sizeof text, format, args); va_end(args);
-  qa_range_error(text);
+  va_list args; va_start(args, format); qa_ss_raise_error(format, args);
 }
 static void ck_oom(const void *ptr) { if (ptr == NULL) qa_range_error("Out of memory"); }
 
@@ -268,6 +268,25 @@ static void ck_hosts_init(ck_hosts *hosts, qa_app_shared_simulation *sim) {
   hosts->inventory = (qa_shared_inventory_table){hosts, ck_h_source_items, ck_h_entries, ck_h_has, ck_h_inventory_create};
 }
 static void ck_hosts_free(ck_hosts *hosts) { free(hosts->groups); hosts->groups = NULL; hosts->group_capacity = 0; }
+static void ck_hosts_cleanup(void *hosts) { ck_hosts_free(hosts); }
+/* Cleanup nodes for the read-then-restore pairs below: a raise in the restore frees the read checkpoint. */
+static void ck_free_foreign_q2(void *saved) { qa_app_sim_foreign_q2_world_checkpoint_free(saved); }
+static void ck_free_foreign_q1(void *saved) { qa_app_sim_foreign_q1_world_checkpoint_free(saved); }
+static void ck_free_grapple(void *saved) { qa_app_sim_grapple_runtime_checkpoint_destroy(saved); }
+static void ck_free_grenades(void *saved) { qa_app_sim_hand_grenade_runtime_checkpoint_destroy(saved); }
+static void ck_free_q1_foundation(void *saved) { qa_q1_foundation_checkpoint_free(saved); }
+static void ck_free_legacy_q3(void *saved) { qa_app_legacy_q3_source_destroy(saved); }
+/* load: simulation.sourceItemsRestore?.finish(simulation.actors, simulation.inventory). persistence/source_items.h
+ * takes the registry and the inventory table as fn+ctx tables, so the owners travel through the host views. */
+void qa_app_shared_sim_finish_source_item_restore(qa_app_shared_simulation *sim) {
+  if (sim->source_items_restore == NULL) return;
+  ck_hosts hosts; ck_hosts_init(&hosts, sim);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, ck_hosts_cleanup, &hosts);
+  qa_source_item_restore_finish(sim->source_items_restore, &hosts.actors, &hosts.inventory);
+  qa_cleanup_pop(&guard);
+  ck_hosts_free(&hosts);
+}
 
 /* ---- B1: selected monsters and the foreign Q1 world ---- */
 static qa_save_value *ck_definition_value(qa_monster_definition_reference definition) {
@@ -698,14 +717,20 @@ static qa_provider_checkpoint ck_keep_record(qa_persist_decoded *owner, qa_provi
   return record;
 }
 void qa_app_shared_sim_native_original_checkpoint(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *rerelease_save,
-    qa_persist_decoded *owner, qa_provider_checkpoint *out) {
+    bool autosave, qa_persist_decoded *owner, qa_provider_checkpoint *out) {
   const char *map = sim->recipe.map.geometry.requested_path;
   ck_native_server server; memset(&server, 0, sizeof server); server.sim = sim;
+  /* The original has written no file for a level it was only just entered; it has one for a level the unit returned to. */
+  bool unwritten = autosave && qa_ss_map_get(&sim->source.visited, &map) == NULL;
   if (qa_ss_is(sim->source.edition, "rerelease")) {
     qa_app_sim_rerelease_guest_world *world = sim->source.rerelease_world;
+    /* const written = rereleaseSave ?? source.game.writeSave(autosave), before the server state is read */
+    qa_app_sim_rerelease_guest_save written; bool wrote = rerelease_save == NULL;
+    if (wrote) written = qa_app_sim_rerelease_guest_world_write_save(world, autosave);
+    const qa_app_sim_rerelease_guest_save *game = wrote ? &written : rerelease_save;
     qa_app_sim_q2_rerelease_native_save save; memset(&save, 0, sizeof save);
     save.module = qa_app_sim_rerelease_guest_world_module(world);
-    save.map = map; save.autosave = false;
+    save.map = map; save.autosave = autosave;
     ck_native_server_capture(&server);
     qa_app_sim_q2_rerelease_configstring *strings = calloc(server.configstring_count != 0 ? server.configstring_count : 1, sizeof *strings);
     qa_app_sim_q2_rerelease_portal *portals = calloc(server.portal_count != 0 ? server.portal_count : 1, sizeof *portals);
@@ -714,11 +739,9 @@ void qa_app_shared_sim_native_original_checkpoint(qa_app_shared_simulation *sim,
     for (size_t i = 0; i < server.portal_count; i++) { portals[i].portal = server.portals[i].portal; portals[i].open = server.portals[i].open; }
     save.server = (qa_app_sim_q2_rerelease_level_state){strings, server.configstring_count, portals, server.portal_count};
     save.server_cvars = (qa_byte_view){server.cvars, server.cvars_length};
-    /* ...(rereleaseSave ?? source.game.writeSave(false)) */
-    qa_app_sim_rerelease_guest_save written; bool wrote = rerelease_save == NULL;
-    if (wrote) written = qa_app_sim_rerelease_guest_world_write_save(world, false);
-    const qa_app_sim_rerelease_guest_save *game = wrote ? &written : rerelease_save;
-    save.game = game->game; save.level = game->level;
+    /* game: written.game, level: unwritten ? null : written.level */
+    save.game = game->game;
+    if (unwritten) save.level_absent = true; else save.level = game->level;
     qa_app_sim_q2_rerelease_visited_level *visited = calloc(sim->source.visited.count != 0 ? sim->source.visited.count : 1, sizeof *visited);
     ck_oom(visited);
     for (size_t i = 0; i < sim->source.visited.count; i++) {
@@ -744,7 +767,9 @@ void qa_app_shared_sim_native_original_checkpoint(qa_app_shared_simulation *sim,
     qa_q2_classic_original_identity identity = {qa_app_sim_classic_guest_world_module(world), map};
     qa_q2_classic_original_save captured;
     if (!qa_classic_original_save_files_capture(sim->source.files, identity, ck_classic_server_state, &server,
-        ck_classic_write, world, false, &captured)) qa_range_error("Out of memory");
+        ck_classic_write, world, autosave, &captured)) qa_range_error("Out of memory");
+    /* { ...captured, level: unwritten ? null : captured.level } (the captured bytes stay owned by `captured`) */
+    if (unwritten) captured.level_absent = true;
     qa_q2_classic_visited_level *visited = calloc(sim->source.visited.count != 0 ? sim->source.visited.count : 1, sizeof *visited);
     ck_oom(visited);
     size_t count = 0;
@@ -889,7 +914,7 @@ static qa_save_value *ck_q3_runtime_value(qa_app_shared_simulation *sim) {
   for (size_t i = 0; i < sim->last_attack.count; i++) {
     qa_save_value *entry = ck_obj();
     ck_set(entry, "actor", ck_actor(qa_ss_map_key_at(&sim->last_attack, i)->owned.id));
-    ck_set(entry, "attack", qa_app_sim_save_q2_attack_value(qa_ss_map_value_at(&sim->last_attack, i)));
+    ck_set(entry, "attack", qa_app_sim_save_q2_attack_value(&(*(qa_ss_attack_box **)qa_ss_map_value_at(&sim->last_attack, i))->attack));
     ck_push(attacks, entry);
   }
   ck_set(runtime, "arsenals", arsenals); ck_set(runtime, "movement", movement); ck_set(runtime, "lastAttacks", attacks);
@@ -914,7 +939,7 @@ void qa_ss_q3_qvm_checkpoint_extras(qa_app_shared_simulation *sim, qa_save_value
 static qa_save_value *ck_double_item(const void *item) { return ck_num(*(const double *)item); }
 static qa_save_value *ck_vector_item(const void *item) { return ck_vector(*(const qa_vec3 *)item); }
 
-void qa_app_shared_sim_checkpoint_from_source(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *rerelease_save,
+void qa_app_shared_sim_checkpoint_from_source(qa_app_shared_simulation *sim, bool autosave, const qa_app_sim_rerelease_guest_save *rerelease_save,
     const qa_save_value *weapon_behaviors, const qa_mod_session_checkpoint *mods, qa_app_shared_sim_save *out) {
   qa_app_shared_sim_assert_checkpoint_ready(sim);
   size_t enabled_count = 0;
@@ -924,12 +949,12 @@ void qa_app_shared_sim_checkpoint_from_source(qa_app_shared_simulation *sim, con
   memset(out, 0, sizeof *out);
   ck_providers providers = {0};
   qa_provider_checkpoint native_original;
-  bool has_native_original = sim->strategy->original_save(sim, rerelease_save, &out->owner, &native_original);
+  bool has_native_original = sim->strategy->original_save(sim, rerelease_save, autosave, &out->owner, &native_original);
   qa_provider_id provider = sim->recipe.map.entities.provider;
   size_t player_count = sim->player_states.count;
   for (size_t i = 0; i < player_count; i++) {
     qa_app_sim_movement_player *player = *(qa_app_sim_movement_player **)qa_ss_map_value_at(&sim->player_states, i);
-    player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+    qa_app_shared_sim_assign_player_arsenal(sim, player);
   }
   /* Projected selected monsters (guest proxies) are rebuilt on restore, not checkpointed. */
   qa_ss_map projected; qa_ss_map_init(&projected, QA_SS_KEY_ACTOR, 0);
@@ -1459,9 +1484,12 @@ void qa_app_shared_sim_save_free(qa_app_shared_sim_save *save) {
   memset(save, 0, sizeof *save);
 }
 
-/* checkpoint(): checkpointFromSource() with no asynchronous captures. */
+/* checkpoint(options = {}): checkpointFromSource(options.autosave === true) with no asynchronous captures. */
+void qa_app_shared_sim_checkpoint_with(qa_app_shared_simulation *sim, qa_app_sim_save_capture_options options, qa_app_shared_sim_save *out) {
+  qa_app_shared_sim_checkpoint_from_source(sim, options.autosave, NULL, NULL, NULL, out);
+}
 void qa_app_shared_sim_checkpoint(qa_app_shared_simulation *sim, qa_app_shared_sim_save *out) {
-  qa_app_shared_sim_checkpoint_from_source(sim, NULL, NULL, NULL, out);
+  qa_app_shared_sim_checkpoint_with(sim, (qa_app_sim_save_capture_options){false}, out);
 }
 
 /* checkpointLoading(nextFrame): the mod session, weapon components and the
@@ -1469,9 +1497,17 @@ void qa_app_shared_sim_checkpoint(qa_app_shared_simulation *sim, qa_app_shared_s
  * checkpointFromSource assembles the image. */
 void qa_app_shared_sim_checkpoint_loading(qa_app_shared_simulation *sim, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx,
     qa_app_shared_sim_save *out) {
+  qa_app_shared_sim_checkpoint_loading_with(sim, next_frame, frame_ctx, (qa_app_sim_save_capture_options){false}, out);
+}
+static void ck_checkpoint_in_progress_off(void *ctx) { ((qa_app_shared_simulation *)ctx)->checkpoint_in_progress = false; }
+static void ck_save_value_free(void *ctx) { qa_save_value_free(ctx); }
+void qa_app_shared_sim_checkpoint_loading_with(qa_app_shared_simulation *sim, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx,
+    qa_app_sim_save_capture_options options, qa_app_shared_sim_save *out) {
   qa_app_shared_sim_assert_checkpoint_ready(sim);
   sim->strategy->assert_savable(sim);
   sim->checkpoint_in_progress = true;
+  /* try { ... } finally { this.checkpointInProgress = false; } */
+  qa_cleanup in_progress; qa_cleanup_push(&in_progress, ck_checkpoint_in_progress_off, sim);
   qa_mod_session_checkpoint mods; bool has_mods = false;
   qa_mod_checkpoint *mod_entries = NULL;
   if (sim->mod_owner != NULL) {
@@ -1480,12 +1516,15 @@ void qa_app_shared_sim_checkpoint_loading(qa_app_shared_simulation *sim, qa_app_
     mods.version = 1; mods.mods = mod_entries; mods.mod_count = count;
     has_mods = true;
   }
+  qa_cleanup mods_node; qa_cleanup_push(&mods_node, free, mod_entries);
   qa_app_sim_weapon_behavior_runtime_checkpoint behaviors =
       qa_app_sim_simulation_weapon_behaviors_checkpoint_loading(sim->weapon_behavior, next_frame, frame_ctx);
+  qa_cleanup behaviors_node; qa_cleanup_push(&behaviors_node, ck_save_value_free, behaviors.value);
   qa_app_sim_rerelease_guest_save captured;
-  bool has_captured = sim->strategy->capture_guest_save(sim, next_frame, frame_ctx, &captured);
+  bool has_captured = sim->strategy->capture_guest_save(sim, next_frame, frame_ctx, options.autosave, &captured);
+  qa_cleanup_pop(&behaviors_node); qa_cleanup_pop(&mods_node); qa_cleanup_pop(&in_progress);
   sim->checkpoint_in_progress = false;
-  qa_app_shared_sim_checkpoint_from_source(sim, has_captured ? &captured : NULL, behaviors.value, has_mods ? &mods : NULL, out);
+  qa_app_shared_sim_checkpoint_from_source(sim, options.autosave, has_captured ? &captured : NULL, behaviors.value, has_mods ? &mods : NULL, out);
   if (has_mods) {
     /* The image keeps its own copy of the record; the entries stay with it. */
     qa_mod_checkpoint *kept = qa_persist_decoded_array(&out->owner, mods.mod_count, sizeof *kept);
@@ -1581,10 +1620,13 @@ typedef struct ck_server_restore {
   qa_app_shared_simulation *sim;
   const qa_app_sim_configstring *strings; size_t string_count;
   const double *portals; const bool *open; size_t portal_count;
+  bool level_absent; /* original.level === null */
 } ck_server_restore;
 static void ck_restore_server_state(void *ctx) {
   ck_server_restore *restore = ctx;
   qa_app_shared_simulation *sim = restore->sim;
+  /* A level the save never wrote keeps the strings and portals the fresh spawn just set. */
+  if (restore->level_absent) return;
   if (sim->source.classic_world != NULL) qa_app_sim_classic_guest_world_restore_configstrings(sim->source.classic_world, restore->strings, restore->string_count);
   else qa_app_sim_rerelease_guest_world_restore_configstrings(sim->source.rerelease_world, restore->strings, restore->string_count);
   for (size_t i = 0; i < restore->portal_count; i++) {
@@ -1602,7 +1644,7 @@ static void ck_server_storage_init(ck_server_storage *storage, qa_app_shared_sim
   storage->portals = calloc(portal_count ? portal_count : 1, sizeof *storage->portals);
   storage->open = calloc(portal_count ? portal_count : 1, sizeof *storage->open);
   ck_oom(storage->strings); ck_oom(storage->portals); ck_oom(storage->open);
-  storage->restore = (ck_server_restore){sim, storage->strings, string_count, storage->portals, storage->open, portal_count};
+  storage->restore = (ck_server_restore){sim, storage->strings, string_count, storage->portals, storage->open, portal_count, false};
 }
 
 /* nativeQ2RereleaseSave(save, module), decoded in full and kept for the
@@ -1627,29 +1669,28 @@ static qa_q2_classic_original_save *ck_classic_original(qa_app_shared_simulation
   ck_own(sim, ck_dispose_classic_save, original);
   return original;
 }
-static void ck_require_native_original(qa_app_shared_simulation *sim, const void *original, const char *message) {
-  if (original == NULL || sim->q2_server_registry == NULL || qa_cvar_registry_variable_value(sim->q2_server_registry, "deathmatch") != 0)
-    ck_fail("%s", message);
-}
 static void ck_require_non_deathmatch(qa_app_shared_simulation *sim) {
   if (qa_cvar_registry_variable_value(sim->q2_server_registry, "deathmatch") != 0) ck_fail("Selected DLL does not support non-deathmatch original saves");
 }
-static void ck_rerelease_server_storage(ck_server_storage *storage, qa_app_shared_simulation *sim, const qa_app_sim_q2_rerelease_native_save *original) {
-  ck_server_storage_init(storage, sim, original->server.configstring_count, original->server.portal_count);
-  for (size_t i = 0; i < original->server.configstring_count; i++) {
-    storage->strings[i].index = original->server.configstrings[i].index; storage->strings[i].value = original->server.configstrings[i].value;
+static void ck_rerelease_server_storage(ck_server_storage *storage, qa_app_shared_simulation *sim, const qa_app_sim_q2_rerelease_level_state *state,
+    bool level_absent) {
+  ck_server_storage_init(storage, sim, state->configstring_count, state->portal_count);
+  for (size_t i = 0; i < state->configstring_count; i++) {
+    storage->strings[i].index = state->configstrings[i].index; storage->strings[i].value = state->configstrings[i].value;
   }
-  for (size_t i = 0; i < original->server.portal_count; i++) {
-    storage->portals[i] = original->server.portals[i].portal; storage->open[i] = original->server.portals[i].open;
+  for (size_t i = 0; i < state->portal_count; i++) {
+    storage->portals[i] = state->portals[i].portal; storage->open[i] = state->portals[i].open;
   }
+  storage->restore.level_absent = level_absent;
 }
-static void ck_classic_server_storage(ck_server_storage *storage, qa_app_shared_simulation *sim, const qa_q2_classic_original_save *original) {
-  const qa_q2_classic_level_state *state = &original->server.state;
+static void ck_classic_server_storage(ck_server_storage *storage, qa_app_shared_simulation *sim, const qa_q2_classic_level_state *state,
+    bool level_absent) {
   ck_server_storage_init(storage, sim, state->configstring_count, state->portal_count);
   for (size_t i = 0; i < state->configstring_count; i++) {
     storage->strings[i].index = state->configstrings[i].index; storage->strings[i].value = state->configstrings[i].value;
   }
   for (size_t i = 0; i < state->portal_count; i++) { storage->portals[i] = state->portals[i].portal; storage->open[i] = state->portals[i].open; }
+  storage->restore.level_absent = level_absent;
 }
 /* files.restore callback: (game, level) => source.game.restoreOriginal(game, level, map, restoreServerState). */
 typedef struct ck_classic_read { qa_app_shared_simulation *sim; ck_native_map *map; ck_server_storage *server; bool loading;
@@ -1662,47 +1703,98 @@ static void ck_classic_read_original(void *ctx, const char *game_path, const cha
   else qa_app_sim_classic_guest_world_restore_original(read->sim->source.classic_world, game_path, level_path, read->map->view,
       ck_restore_server_state, &read->server->restore);
 }
-/* nativeRestorePrelude plus both native original arms of restoreNativeLoading (loading) and restore (!nativeRestored). */
-static void ck_restore_native_original(qa_app_shared_simulation *sim, const qa_save_image *save, bool loading,
+/* nativeRestorePrelude's checks: `label` follows the source edition. has_original false is the TS null. */
+static void ck_native_prelude_check(qa_app_shared_simulation *sim, bool has_original) {
+  if (!has_original || sim->q2_server_registry == NULL || qa_cvar_registry_variable_value(sim->q2_server_registry, "deathmatch") != 0)
+    ck_fail("%s requires a matching non-deathmatch source",
+        qa_ss_is(sim->source.edition, "rerelease") ? "Native rerelease save" : "Native original save");
+}
+/* nativeRestorePrelude (after its checks) and the rerelease arm shared by restoreLoading, restoreGuest, importLoading
+ * and importOriginal: visit, request, init, afterInit, readSave({ game, level }, request, applyServerState). The
+ * visited levels are referenced by source.visited, so their owner outlives the simulation's source. */
+static void ck_native_rerelease_read(qa_app_shared_simulation *sim, const qa_app_sim_q2_rerelease_level_state *server,
+    qa_compat_q2_rerelease_source_save game, qa_compat_q2_rerelease_source_save level, bool level_absent,
+    const qa_app_sim_q2_rerelease_visited_level *visited, size_t visited_count, bool loading,
     void (*next_frame)(void *frame_ctx), void *frame_ctx) {
-  const char *map = sim->recipe.map.geometry.requested_path;
-  if (qa_ss_is(sim->source.edition, "rerelease")) {
-    qa_app_sim_q2_rerelease_native_save *original = ck_rerelease_original(sim, save);
-    ck_require_native_original(sim, original, "Native rerelease save requires a matching non-deathmatch source");
-    for (size_t i = 0; i < original->visited_level_count; i++) {
-      const qa_app_sim_q2_rerelease_visited_level *level = &original->visited_levels[i];
-      qa_ss_map_set(&sim->source.visited, &level->map, &level);
-    }
-    ck_native_map native = ck_native_map_of(sim); /* nativeRestorePrelude's request, built before init */
-    if (loading) qa_app_sim_rerelease_guest_world_init_loading(sim->source.rerelease_world, next_frame, frame_ctx);
-    else qa_app_sim_rerelease_guest_world_init(sim->source.rerelease_world);
-    ck_require_non_deathmatch(sim);
-    ck_server_storage server; ck_rerelease_server_storage(&server, sim, original);
-    qa_app_sim_rerelease_guest_save saved = {original->game, original->level};
-    if (loading) qa_app_sim_rerelease_guest_world_read_save_loading(sim->source.rerelease_world, saved, native.view, ck_restore_server_state,
-        &server.restore, next_frame, frame_ctx);
-    else qa_app_sim_rerelease_guest_world_read_save(sim->source.rerelease_world, saved, native.view, ck_restore_server_state, &server.restore);
-    ck_server_storage_free(&server);
-    ck_native_map_free(&native);
-    return;
+  for (size_t i = 0; i < visited_count; i++) {
+    const qa_app_sim_q2_rerelease_visited_level *entry = &visited[i];
+    qa_ss_map_set(&sim->source.visited, &entry->map, &entry);
   }
-  qa_q2_classic_original_save *original = ck_classic_original(sim, save);
-  ck_require_native_original(sim, original, "Native original save requires a matching non-deathmatch source");
-  for (size_t i = 0; i < original->visited_level_count; i++) {
-    const qa_q2_classic_visited_level *level = &original->visited_levels[i];
-    qa_ss_map_set(&sim->source.visited, &level->map, &level);
+  ck_native_map native = ck_native_map_of(sim); /* nativeRestorePrelude's request, built before init */
+  if (loading) qa_app_sim_rerelease_guest_world_init_loading(sim->source.rerelease_world, next_frame, frame_ctx);
+  else qa_app_sim_rerelease_guest_world_init(sim->source.rerelease_world);
+  ck_require_non_deathmatch(sim);
+  ck_server_storage storage; ck_rerelease_server_storage(&storage, sim, server, level_absent);
+  qa_app_sim_rerelease_guest_save saved = {game, level, level_absent};
+  if (loading) qa_app_sim_rerelease_guest_world_read_save_loading(sim->source.rerelease_world, saved, native.view, ck_restore_server_state,
+      &storage.restore, next_frame, frame_ctx);
+  else qa_app_sim_rerelease_guest_world_read_save(sim->source.rerelease_world, saved, native.view, ck_restore_server_state, &storage.restore);
+  ck_server_storage_free(&storage);
+  ck_native_map_free(&native);
+}
+/* The classic arm: visit, request, init, afterInit, files.restore(save, (game, level) => restoreOriginal(...)).
+ * `files` carries the game and level bytes (TS Pick<Q2ClassicOriginalSave, "game" | "level">). */
+static void ck_native_classic_read(qa_app_shared_simulation *sim, const qa_q2_classic_level_state *server,
+    const qa_q2_classic_original_save *files, const qa_q2_classic_visited_level *visited, size_t visited_count, bool loading,
+    void (*next_frame)(void *frame_ctx), void *frame_ctx) {
+  for (size_t i = 0; i < visited_count; i++) {
+    const qa_q2_classic_visited_level *entry = &visited[i];
+    qa_ss_map_set(&sim->source.visited, &entry->map, &entry);
   }
   ck_native_map native = ck_native_map_of(sim); /* nativeRestorePrelude's request, built before init */
   if (loading) qa_app_sim_classic_guest_world_init_loading(sim->source.classic_world, next_frame, frame_ctx);
   else qa_app_sim_classic_guest_world_init(sim->source.classic_world);
   ck_require_non_deathmatch(sim);
-  ck_server_storage server; ck_classic_server_storage(&server, sim, original);
-  ck_classic_read read = {sim, &native, &server, loading, next_frame, frame_ctx};
-  qa_q2_classic_original_identity identity = {qa_app_sim_classic_guest_world_module(sim->source.classic_world), map};
-  if (loading) qa_classic_original_save_files_restore_loading(sim->source.files, original, identity, ck_classic_read_original, &read);
-  else qa_classic_original_save_files_restore(sim->source.files, original, identity, ck_classic_read_original, &read);
-  ck_server_storage_free(&server);
+  ck_server_storage storage; ck_classic_server_storage(&storage, sim, server, files->level_absent);
+  ck_classic_read read = {sim, &native, &storage, loading, next_frame, frame_ctx};
+  if (loading) qa_classic_original_save_files_restore_loading(sim->source.files, files, ck_classic_read_original, &read);
+  else qa_classic_original_save_files_restore(sim->source.files, files, ck_classic_read_original, &read);
+  ck_server_storage_free(&storage);
   ck_native_map_free(&native);
+}
+/* nativeRestorePrelude plus both native original arms of restoreNativeLoading (loading) and restore (!nativeRestored). */
+static void ck_restore_native_original(qa_app_shared_simulation *sim, const qa_save_image *save, bool loading,
+    void (*next_frame)(void *frame_ctx), void *frame_ctx) {
+  if (qa_ss_is(sim->source.edition, "rerelease")) {
+    qa_app_sim_q2_rerelease_native_save *original = ck_rerelease_original(sim, save);
+    ck_native_prelude_check(sim, original != NULL);
+    ck_native_rerelease_read(sim, &original->server, original->game, original->level, original->level_absent,
+        original->visited_levels, original->visited_level_count, loading, next_frame, frame_ctx);
+    return;
+  }
+  qa_q2_classic_original_save *original = ck_classic_original(sim, save);
+  ck_native_prelude_check(sim, original != NULL);
+  ck_native_classic_read(sim, &original->server.state, original, original->visited_levels, original->visited_level_count, loading,
+      next_frame, frame_ctx);
+}
+/* Q2NativeStrategy.importLoading (loading) and importOriginal: SV_Loadgame on the files of a save folder: game state
+ * first, then the map, then its level file. */
+static void ck_import_native_original(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported, bool loading,
+    void (*next_frame)(void *frame_ctx), void *frame_ctx) {
+  if (qa_ss_is(sim->source.edition, "rerelease")) {
+    if (!imported->rerelease) ck_fail("A classic save folder needs a classic game module");
+    const qa_app_sim_q2_rerelease_native_import *original = imported->rerelease_import;
+    ck_native_prelude_check(sim, true);
+    ck_native_rerelease_read(sim, &original->server, original->game, original->level, original->level_absent,
+        original->visited_levels, original->visited_level_count, loading, next_frame, frame_ctx);
+    return;
+  }
+  if (imported->rerelease) ck_fail("A rerelease save archive needs a rerelease game module");
+  const qa_q2_classic_original_import *original = imported->classic;
+  ck_native_prelude_check(sim, true);
+  qa_q2_classic_original_save files; memset(&files, 0, sizeof files);
+  files.game = (qa_byte_view){original->game, original->game_length};
+  files.level = (qa_byte_view){original->level, original->level_length};
+  files.level_absent = original->level_absent;
+  ck_native_classic_read(sim, &original->server, &files, original->visited_levels, original->visited_level_count, loading,
+      next_frame, frame_ctx);
+}
+void qa_ss_q2_native_import_loading(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported,
+    qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx) {
+  ck_import_native_original(sim, imported, true, next_frame, frame_ctx);
+}
+void qa_ss_q2_native_import_original(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported) {
+  ck_import_native_original(sim, imported, false, NULL, NULL);
 }
 /* Q2NativeStrategy.restoreLoading(save, nextFrame). */
 void qa_ss_q2_native_restore_loading(qa_app_shared_simulation *sim, const qa_save_image *save, qa_app_shared_sim_next_frame_fn next_frame,
@@ -1805,7 +1897,9 @@ static void ck_selected_q1_restore(qa_app_shared_simulation *sim, const qa_save_
   qa_save_reader entities = ck_f(selected_source, "entities");
   qa_persist_q1_foundation_checkpoint saved = qa_read_q1_foundation_checkpoint(&entities);
   qa_save_reader_destroy(&entities);
+  qa_cleanup saved_node; qa_cleanup_push(&saved_node, ck_free_q1_foundation, &saved);
   ck_q1_restore(sim->selected_weapon_source.q1_game, &saved, false);
+  qa_cleanup_pop(&saved_node);
   qa_q1_foundation_checkpoint_free(&saved);
 }
 static void ck_hydrate_selected_q1(void *ctx) {
@@ -1825,7 +1919,7 @@ static const char *ck_movement_kind(qa_movement_state_kind kind) {
   switch (kind) {
     case QA_MOVEMENT_STATE_Q1: return "q1-netquake";
     case QA_MOVEMENT_STATE_QW: return "q1-quakeworld";
-    case QA_MOVEMENT_STATE_Q2: return "q2";
+    case QA_MOVEMENT_STATE_Q2: return "q2-classic";
     case QA_MOVEMENT_STATE_Q2_RERELEASE: return "q2-rerelease";
     case QA_MOVEMENT_STATE_Q3: return "q3";
   }
@@ -1945,9 +2039,9 @@ void qa_ss_q3_restore_continuation(qa_app_shared_simulation *sim, const qa_save_
     qa_owned_actor actor;
     if (!qa_session_actor_registry_resolve_saved(sim->actors, native.last_attacks[i].actor, &actor) || qa_ss_map_has(&sim->last_attack, &actor))
       ck_fail("Saved Q3 attack has no unique matching actor");
-    qa_actor_id *scratch = qa_app_shared_sim_keep(sim, 2 * sizeof *scratch);
+    qa_actor_id scratch[2];
     qa_attack_provenance attack = qa_q2_restore_attack(native.last_attacks[i].attack, ck_reference_saved, sim, &scratch[0], &scratch[1]);
-    qa_ss_map_set(&sim->last_attack, &actor, &attack);
+    qa_app_shared_sim_record_attack(sim, actor, &attack);
   }
   qa_app_sim_native_q3_runtime_free(&native);
   if (qa_app_sim_provider_family(sim->recipe.combat.provider) == QA_GAME_FAMILY_Q3) {
@@ -1965,7 +2059,9 @@ void qa_ss_q1_restore_foundation(qa_app_shared_simulation *sim, const qa_save_im
     qa_save_reader list = ck_f(reader, "sourceCvars");
     for (size_t i = 0, n = qa_save_reader_list_count(&list); i < n; i++) {
       qa_save_reader value = ck_i(&list, i);
-      const char *name = ck_string_of(&value, "name"), *text = ck_string_of(&value, "value");
+      /* this.source.cvars.set(value.field("name").string(), value.field("value").string(), true): name read first */
+      const char *name = ck_string_of(&value, "name");
+      const char *text = ck_string_of(&value, "value");
       qa_cvar_read snapshot;
       if (qa_cvar_registry_set(sim->source.q1_cvars, name, text, true, &snapshot)) qa_cvar_read_free(&snapshot);
       qa_save_reader_destroy(&value);
@@ -1976,7 +2072,9 @@ void qa_ss_q1_restore_foundation(qa_app_shared_simulation *sim, const qa_save_im
   qa_provider_checkpoint record = qa_app_sim_simulation_provider_checkpoint(*save, "q1:foundation");
   qa_persist_q1_foundation_checkpoint saved;
   if (!qa_decode_q1_foundation_checkpoint(record.bytes.bytes, record.bytes.length, &saved)) qa_range_error("Out of memory");
+  qa_cleanup saved_node; qa_cleanup_push(&saved_node, ck_free_q1_foundation, &saved);
   ck_q1_restore(sim->source.q1_game, &saved, false);
+  qa_cleanup_pop(&saved_node);
   qa_q1_foundation_checkpoint_free(&saved);
 }
 /* Q2Strategy.restoreFoundation(save). */
@@ -2116,7 +2214,7 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     if (sim->source_items_restore != NULL) {
       const qa_inventory_checkpoint *effective = qa_source_item_restore_effective(sim->source_items_restore, inventories.items, inventories.count,
           &shared.inventory_count);
-      ck_oom(effective);
+      if (shared.inventory_count != 0) ck_oom(effective); /* an empty list has no array */
       shared.inventories = effective;
     } else { shared.inventories = inventories.items; shared.inventory_count = inventories.count; }
     if (legacy_qvm_combat != NULL) {
@@ -2145,6 +2243,7 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     for (size_t i = 0, n = qa_save_reader_list_count(&players); i < n; i++) {
       qa_save_reader value = ck_i(&players, i);
       qa_app_sim_saved_movement_player saved = qa_app_sim_read_movement_player(&value, ck_reference_saved, sim);
+      qa_cleanup ammo_node; qa_cleanup_push(&ammo_node, free, saved.ammo);
       qa_owned_actor actor = ck_owner_of(sim, &value, "actor");
       qa_client_id client;
       if (!ck_restored_client(sim, saved.client_slot, &client) || !qa_app_shared_sim_owns_client(sim, client))
@@ -2172,8 +2271,10 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
       }
       qa_app_sim_movement_player *player = qa_app_shared_sim_create_player_with(sim, actor, client, body.value.origin, saved.view_angles, saved.arsenal,
           saved.has_character ? &definition : NULL, saved.has_character_appearance ? &appearance : NULL);
-      if (!qa_ss_is(ck_movement_kind(saved.state.kind), player->profile.kind))
+      if (!qa_ss_is(ck_movement_kind(saved.state.kind), player->profile.kind)) {
+        qa_app_sim_movement_player_destroy(player);
         qa_save_reader_fail(&value, "Saved movement state differs from the selected movement provider");
+      }
       /* Object.assign(player, state) over every saved member but actor,
        * clientSlot, characterDefinition and characterAppearance. */
       player->has_body_shape_base = saved.has_body_shape_base; player->body_shape_base = saved.body_shape_base;
@@ -2186,6 +2287,9 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
       player->has_netquake_command = saved.has_netquake_command; player->netquake_command = saved.netquake_command;
       player->flight = saved.flight;
       player->state = saved.state; player->arsenal = saved.arsenal; player->animation = saved.animation;
+      if (saved.has_jump_pad && player->state.kind == QA_MOVEMENT_STATE_Q3) {
+        player->restored_jump_pad = saved.jump_pad; player->state.as.q3.jump_pad = &player->restored_jump_pad;
+      }
       player->animation.provider = qa_app_shared_sim_intern(sim, saved.animation.provider);
       player->view_angles = saved.view_angles; player->command_angles = saved.command_angles; player->view_height = saved.view_height;
       player->bounds = saved.bounds; player->ground = saved.ground;
@@ -2196,6 +2300,7 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
       player->has_cutscene = saved.has_cutscene; player->cutscene_origin = saved.cutscene_origin;
       player->cutscene_angles = saved.cutscene_angles; player->cutscene_view_offset = saved.cutscene_view_offset;
       qa_ss_map_set(&sim->player_states, &actor, &player);
+      qa_cleanup_pop(&ammo_node);
       free(saved.ammo);
       qa_save_reader_destroy(&value);
     }
@@ -2273,7 +2378,7 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     }
     for (size_t i = 0; i < sim->player_states.count; i++) {
       qa_app_sim_movement_player *player = *(qa_app_sim_movement_player **)qa_ss_map_value_at(&sim->player_states, i);
-      player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+      qa_app_shared_sim_assign_player_arsenal(sim, player);
     }
   } else if (!qa_save_reader_is_null(selected_source)) qa_save_reader_fail(selected_source, "Saved selected weapon source has no matching authority");
   sim->strategy->restore_foundation(sim, save, &reader);
@@ -2314,6 +2419,7 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
       if (ck_given(&selected_q3)) qa_save_reader_fail(&old_ballistics, "Saved Q3 source has two projectile owners");
       if (sim->strategy->legacy_q3_family(sim) == NULL) qa_save_reader_fail(&old_ballistics, "Legacy Q3 source requires its original foreign map");
       qa_app_legacy_q3_source saved = qa_app_read_legacy_q3_source(&old_ballistics, ck_legacy_owner, sim, ck_reference_saved, sim);
+      qa_cleanup saved_node; qa_cleanup_push(&saved_node, ck_free_legacy_q3, &saved);
       sim->selected_milliseconds = saved.milliseconds; sim->selected_q3_time = trunc(saved.milliseconds);
       qa_provider_timing timing = qa_app_sim_provider_timing(sim->recipe, sim->weapon_provider.provider);
       if (timing.clock.kind != QA_CLOCK_Q3 || sim->selected_q3_time < 0 || sim->selected_q3_time > 2147483647)
@@ -2326,6 +2432,7 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
       }
       if (!covered) qa_save_reader_fail(&old_ballistics, "Legacy Q3 source client coverage differs from its saved players");
       qa_app_q3_selected_source_restore_legacy(sim->selected_q3_source, &saved, client_actors, client_states, client_count);
+      qa_cleanup_pop(&saved_node);
       qa_app_legacy_q3_source_destroy(&saved);
     } else {
       sim->selected_milliseconds = ck_finite_of(&selected_q3, "milliseconds");
@@ -2367,7 +2474,7 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     }
     for (size_t i = 0; i < sim->player_states.count; i++) {
       qa_app_sim_movement_player *player = *(qa_app_sim_movement_player **)qa_ss_map_value_at(&sim->player_states, i);
-      player->arsenal = qa_app_shared_sim_arsenal(sim, player);
+      qa_app_shared_sim_assign_player_arsenal(sim, player);
     }
   } else if (ck_given(&selected)) qa_save_reader_fail(&selected, "Saved selected arsenal has no matching authority");
   qa_save_reader_destroy(&selected); qa_save_reader_destroy(&selected_q3); qa_save_reader_destroy(&old_ballistics);
@@ -2394,7 +2501,9 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     if (sim->has_foreign_world) {
       if (!ck_given(&foreign)) qa_save_reader_fail(&foreign, "Foreign world adjunct has no saved state");
       qa_app_sim_foreign_q2_world_checkpoint saved = qa_app_sim_read_foreign_q2_world_checkpoint(&foreign);
+      qa_cleanup saved_node; qa_cleanup_push(&saved_node, ck_free_foreign_q2, &saved);
       qa_app_shared_sim_restore_foreign_world(sim, &saved);
+      qa_cleanup_pop(&saved_node);
       qa_app_sim_foreign_q2_world_checkpoint_free(&saved);
     } else if (ck_given(&foreign)) qa_save_reader_fail(&foreign, "Saved foreign world has no matching adjunct");
     qa_save_reader_destroy(&foreign);
@@ -2402,7 +2511,9 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     if (sim->has_foreign_q1_world) {
       if (!ck_given(&foreign_q1)) qa_save_reader_fail(&foreign_q1, "Foreign Q1 world adjunct has no saved state");
       qa_app_sim_foreign_q1_world_checkpoint saved = qa_app_sim_read_foreign_q1_world_checkpoint(&foreign_q1);
+      qa_cleanup saved_node; qa_cleanup_push(&saved_node, ck_free_foreign_q1, &saved);
       qa_app_shared_sim_restore_foreign_q1_world(sim, &saved);
+      qa_cleanup_pop(&saved_node);
       qa_app_sim_foreign_q1_world_checkpoint_free(&saved);
     } else if (ck_given(&foreign_q1)) qa_save_reader_fail(&foreign_q1, "Saved foreign Q1 world has no matching adjunct");
     qa_save_reader_destroy(&foreign_q1);
@@ -2411,7 +2522,9 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     qa_save_reader grapple = ck_f(&reader, "grapple"), slots = ck_f(&reader, "weaponSlots");
     if (sim->grapple != NULL) {
       qa_app_sim_grapple_runtime_checkpoint saved = qa_app_sim_read_grapple_runtime_checkpoint(&grapple);
+      qa_cleanup saved_node; qa_cleanup_push(&saved_node, ck_free_grapple, &saved);
       qa_app_sim_grapple_runtime_restore(sim->grapple, &saved);
+      qa_cleanup_pop(&saved_node);
       qa_app_sim_grapple_runtime_checkpoint_destroy(&saved);
     } else if (sim->recipe.equipment.grapple.is_enabled && qa_ss_is(sim->recipe.equipment.grapple.mechanic, "q3-qvm")) {
       sim->pending_qvm_grapple_restore_grapple = qa_app_sim_read_grapple_runtime_checkpoint(&grapple);
@@ -2423,22 +2536,27 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     /* weaponSlots.clear(): the C map owns its slots. */
     for (size_t i = 0; i < sim->weapon_slots.count; i++) qa_app_sim_weapon_slot_destroy(*(qa_app_sim_weapon_slot **)qa_ss_map_value_at(&sim->weapon_slots, i));
     qa_ss_map_clear(&sim->weapon_slots);
+    qa_app_shared_sim_release_slot_bindings(sim, NULL);
     if (!sim->has_pending_qvm_grapple_restore) {
       size_t count = 0;
       qa_app_sim_saved_weapon_slot *saved = qa_app_sim_read_weapon_slots(&slots, &count);
+      qa_cleanup saved_node; qa_cleanup_push(&saved_node, free, saved);
       for (size_t i = 0; i < count; i++) {
         qa_owned_actor actor;
-        if (!qa_session_actor_registry_resolve_saved(sim->actors, saved[i].actor, &actor)) { free(saved); ck_fail("Saved slot actor is missing"); }
+        if (!qa_session_actor_registry_resolve_saved(sim->actors, saved[i].actor, &actor)) ck_fail("Saved slot actor is missing");
         qa_app_sim_weapon_slot_restore_state state = ck_intern_slot_state(sim, saved[i].state);
         qa_app_shared_sim_bind_weapon_slot_state(sim, actor.id, &state);
       }
+      qa_cleanup_pop(&saved_node);
       free(saved);
     }
     qa_save_reader_destroy(&grapple); qa_save_reader_destroy(&slots);
     qa_save_reader equipment = ck_f(&reader, "handGrenades");
     if (sim->hand_grenades != NULL) {
       qa_app_sim_hand_grenade_runtime_checkpoint saved = qa_app_sim_read_hand_grenade_runtime_checkpoint(&equipment);
+      qa_cleanup saved_node; qa_cleanup_push(&saved_node, ck_free_grenades, &saved);
       qa_app_sim_hand_grenade_runtime_restore(sim->hand_grenades, &saved);
+      qa_cleanup_pop(&saved_node);
       qa_app_sim_hand_grenade_runtime_checkpoint_destroy(&saved);
     } else if (ck_given(&equipment)) qa_save_reader_fail(&equipment, "Saved equipment has no selected controller");
     qa_save_reader_destroy(&equipment);
@@ -2458,7 +2576,9 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
     qa_save_reader foundation = ck_f(&reader, "q1CharacterFoundation");
     if (ck_given(&foundation)) {
       qa_persist_q1_foundation_checkpoint saved = qa_read_q1_foundation_checkpoint(&foundation);
+      qa_cleanup saved_node; qa_cleanup_push(&saved_node, ck_free_q1_foundation, &saved);
       ck_q1_restore(qa_app_shared_sim_q1_character_source(sim), &saved, false);
+      qa_cleanup_pop(&saved_node);
       qa_q1_foundation_checkpoint_free(&saved);
     }
     qa_save_reader_destroy(&foundation);
@@ -2613,15 +2733,15 @@ void qa_app_shared_sim_restore(qa_app_shared_simulation *sim, const qa_save_imag
         if (attached_count != 3) qa_save_reader_fail(&value, "Q2 attached models must retain three slots");
         qa_q2_presentation_event model; memset(&model, 0, sizeof model);
         model.kind = "model"; model.has_actor = true; model.actor = actor;
-        model.path = qa_app_shared_sim_intern(sim, ck_string_of(&value, "path"));
-        for (int k = 0; k < 3; k++) model.attached_models[k] = qa_app_shared_sim_intern(sim, attached[k]);
+        model.path = ck_string_of(&value, "path"); /* the map copies its strings */
+        for (int k = 0; k < 3; k++) model.attached_models[k] = attached[k];
         model.frame = ck_number_of(&value, "frame"); model.old_frame = ck_number_of(&value, "oldFrame");
         model.scale = ck_number_of(&value, "scale"); model.skin = ck_number_of(&value, "skin");
         model.effects = ck_number_of(&value, "effects"); model.render_flags = ck_number_of(&value, "renderFlags");
         qa_save_reader alpha = ck_f(&value, "alpha");
         model.alpha = ck_present(&alpha) ? qa_save_reader_finite(&alpha) : 1;
         qa_save_reader_destroy(&alpha);
-        qa_ss_map_set(&sim->source_models, &actor, &model);
+        qa_app_shared_sim_set_source_model(sim, &model);
         bool read_order = true;
         qa_ss_map_set(&sim->source_model_read_order, &actor, &read_order);
       }

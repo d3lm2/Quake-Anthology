@@ -1,7 +1,8 @@
 /*
  * Port of src/compat/qvm/cgame.ts. QvmCgameLifetime.current's
- * dropped Error becomes a message string (NULL when none) that is
- * re-raised through qa_range_error. GPL-2.0-or-later.
+ * dropped Error becomes a message string (NULL when none) with its
+ * class name, code and detail, re-raised through qa_raise.
+ * GPL-2.0-or-later.
  */
 #ifndef QA_COMPAT_QVM_CGAME_H
 #define QA_COMPAT_QVM_CGAME_H
@@ -17,6 +18,11 @@
 typedef struct qa_qvm_cgame_lifetime_state {
   double generation, server_message_number;
   const char *dropped; /* NULL is the TS null */
+  /* The dropped error's class, code and detail (TS rethrows the Error object
+   * itself). A NULL name is the plain Error. */
+  const char *dropped_name;
+  int dropped_code;
+  long long dropped_detail;
 } qa_qvm_cgame_lifetime_state;
 
 typedef struct qa_qvm_cgame_lifetime {

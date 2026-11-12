@@ -13,6 +13,7 @@
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/js_case.h"
+#include "qa/platform/files/contained.h"
 static char *dup(const char *s) { size_t n = strlen(s) + 1; char *p = malloc(n); if (p) memcpy(p, s, n); return p; }
 static char *join_path(const char *a, const char *b) {
   size_t cap = strlen(a) + strlen(b) + 2;
@@ -38,45 +39,75 @@ static const qa_command_origin *caller_origin(const qa_command_origin *origin) {
   while (origin->kind == QA_COMMAND_ORIGIN_SCRIPT && origin->caller) origin = origin->caller;
   return origin;
 }
+/* TS (await readFile(path)).toString("latin1"): the file's bytes, one per code unit (a NUL ends the C text). A
+ * read that fails raises the Node error, as readFile rejects. */
 static char *read_file_text(const char *path) {
   FILE *file = fopen(path, "rb");
-  if (!file) return NULL;
-  fseek(file, 0, SEEK_END);
-  long size = ftell(file);
-  fseek(file, 0, SEEK_SET);
-  char *text = malloc((size_t)size + 1);
-  size_t read = size > 0 ? fread(text, 1, (size_t)size, file) : 0;
-  text[read] = '\0'; /* latin1 bytes preserved except embedded NUL bounds */
+  if (!file) qa_node_fs_error(errno, "open", path);
+  struct stat status;
+  if (fstat(fileno(file), &status) != 0 || S_ISDIR(status.st_mode)) {
+    fclose(file);
+    qa_raise("Error", 0, 0, "EISDIR: illegal operation on a directory, read");
+  }
+  size_t capacity = 4096, length = 0;
+  char *text = malloc(capacity);
+  if (text == NULL) { fclose(file); qa_range_error("Out of memory"); }
+  for (;;) {
+    if (length + 1 >= capacity) {
+      char *grown = realloc(text, capacity * 2);
+      if (grown == NULL) { free(text); fclose(file); qa_range_error("Out of memory"); }
+      text = grown;
+      capacity *= 2;
+    }
+    size_t read = fread(text + length, 1, capacity - length - 1, file);
+    length += read;
+    if (read == 0) break;
+  }
+  bool failed = ferror(file) != 0;
   fclose(file);
+  if (failed) { free(text); qa_raise("Error", 0, 0, "EIO: i/o error, read '%s'", path); }
+  text[length] = '\0';
   return text;
 }
+/* TS configNames: readdir withFileTypes, so a symbolic link is neither a file nor a directory. */
 static void config_names(const char *root, const char *prefix, char ***names, size_t *count, size_t *cap) {
-  char full[8192];
-  snprintf(full, sizeof full, "%s%s%s", root, prefix[0] ? "/" : "", prefix);
+  char *full = NULL;
+  if (asprintf(&full, "%s%s%s", root, prefix[0] ? "/" : "", prefix) < 0) qa_range_error("Out of memory");
   DIR *dir = opendir(full);
   if (!dir) {
-    if (qa_is_missing_file(errno)) return;
-    qa_range_error("could not list configuration directory");
+    int code = errno;
+    if (code == ENOENT) { free(full); return; }
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, full);
+    qa_node_fs_error(code, "scandir", full);
   }
+  free(full);
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-    char name[8192];
-    snprintf(name, sizeof name, "%s%s%s", prefix, prefix[0] ? "/" : "", entry->d_name);
-    char disk[16384];
-    snprintf(disk, sizeof disk, "%s/%s", root, name);
+    char *name = NULL, *disk = NULL;
+    if (asprintf(&name, "%s%s%s", prefix, prefix[0] ? "/" : "", entry->d_name) < 0) { closedir(dir); qa_range_error("Out of memory"); }
+    if (asprintf(&disk, "%s/%s", root, name) < 0) { free(name); closedir(dir); qa_range_error("Out of memory"); }
     struct stat st;
-    if (stat(disk, &st) != 0) continue;
-    if (S_ISDIR(st.st_mode)) config_names(root, name, names, count, cap);
-    else if (S_ISREG(st.st_mode)) {
+    bool known = lstat(disk, &st) == 0;
+    free(disk);
+    if (known && S_ISDIR(st.st_mode)) config_names(root, name, names, count, cap);
+    else if (known && S_ISREG(st.st_mode)) {
+      /* name.toLowerCase().endsWith(".cfg") */
       size_t len = strlen(name);
-      bool cfg = len >= 4 && name[len-4] == '.' && tolower((unsigned char)name[len-3]) == 'c' &&
-          tolower((unsigned char)name[len-2]) == 'f' && tolower((unsigned char)name[len-1]) == 'g';
+      bool cfg = len >= 4 && qa_js_equals_ignore_case(name + len - 4, ".cfg");
       if (cfg) {
-        if (*count == *cap) { *cap = *cap ? *cap * 2 : 16; *names = realloc(*names, *cap * sizeof **names); }
-        (*names)[(*count)++] = dup(name);
+        if (*count == *cap) {
+          *cap = *cap ? *cap * 2 : 16;
+          char **grown = realloc(*names, *cap * sizeof **names);
+          if (grown == NULL) { free(name); closedir(dir); qa_range_error("Out of memory"); }
+          *names = grown;
+        }
+        (*names)[(*count)++] = name;
+        continue;
       }
     }
+    free(name);
   }
   closedir(dir);
 }
@@ -101,53 +132,69 @@ static char *legacy_config_path(qa_app_legacy_console_config_sources sources) {
   }
   return newest;
 }
+static void free_text_slot(void *raw) { free(*(char **)raw); }
+/* readFile(path).toString("latin1") of a path a lookup found; the path is freed either way. */
+static char *read_found(char *path) {
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, path);
+  char *text = read_file_text(path);
+  qa_cleanup_pop(&guard);
+  free(path);
+  return text;
+}
 char *qa_app_read_console_script(qa_app_read_console_script_options options) {
   char *name = qa_normalize_resource_path(options.name);
+  if (name == NULL) qa_range_error("Out of memory");
+  qa_cleanup name_guard;
+  qa_cleanup_push(&name_guard, free_text_slot, &name);
   const qa_command_origin *origin = caller_origin(&options.source.origin);
   if (origin->kind == QA_COMMAND_ORIGIN_REMOTE_CLIENT)
-    qa_range_error("Remote clients cannot read local configuration scripts");
+    qa_raise("Error", 0, 0, "%s", "Remote clients cannot read local configuration scripts");
   char *result = NULL;
-  if (origin->kind == QA_COMMAND_ORIGIN_LOCAL_SEAT) {
-    char relative[8192];
-    snprintf(relative, sizeof relative, "settings/seat-%lld/%s", (long long)origin->seat.index, name);
+  /* name.toLowerCase() === options.native.layout.script */
+  if (options.native != NULL && qa_js_equals_ignore_case(name, options.native->layout->script))
+    result = qa_native_config_read_script(options.native);
+  if (result == NULL && origin->kind == QA_COMMAND_ORIGIN_LOCAL_SEAT) {
+    char *relative = NULL;
+    if (asprintf(&relative, "settings/seat-%lld/%s", (long long)origin->seat.index, name) < 0) qa_range_error("Out of memory");
     char *path = NULL;
-    if (qa_find_content_path(options.console_root, relative, QA_CONTENT_PATH_CASE_INSENSITIVE, &path)) {
-      result = read_file_text(path);
-      free(path);
-      if (result) { free(name); return result; }
-    }
+    bool found = qa_find_content_path(options.console_root, relative, QA_CONTENT_PATH_CASE_INSENSITIVE, &path);
+    free(relative);
+    if (found) result = read_found(path);
   }
-  bool is_config = true;
-  const char *want = "config.cfg";
-  if (strlen(name) != strlen(want)) is_config = false;
-  else for (size_t i = 0; want[i]; i++) if (tolower((unsigned char)name[i]) != want[i]) is_config = false;
-  if (!result && options.has_legacy_config && is_config) {
+  /* name.toLowerCase() === "config.cfg" */
+  if (result == NULL && options.has_legacy_config && qa_js_equals_ignore_case(name, "config.cfg")) {
     char *legacy = legacy_config_path(options.legacy_config);
-    if (legacy) { result = read_file_text(legacy); free(legacy); if (result) { free(name); return result; } }
+    if (legacy != NULL) result = read_found(legacy);
   }
-  if (!result) {
+  if (result == NULL) {
     char *path = NULL;
-    if (qa_find_content_path(options.settings->root, name, QA_CONTENT_PATH_CASE_INSENSITIVE, &path)) {
-      result = read_file_text(path);
-      free(path);
-      if (result) { free(name); return result; }
+    if (qa_find_content_path(options.settings->root, name, QA_CONTENT_PATH_CASE_INSENSITIVE, &path)) result = read_found(path);
+  }
+  if (result == NULL && options.native != NULL) {
+    /* Scripts the game itself writes into its folder (listip.cfg) are read back from there. */
+    char *written = NULL;
+    if (qa_find_content_path(options.native->layout->directory, name, QA_CONTENT_PATH_CASE_INSENSITIVE, &written)) {
+      struct stat status;
+      if (stat(written, &status) == 0 && S_ISREG(status.st_mode)) result = read_found(written);
+      else free(written);
     }
   }
   qa_app_source_script_reader reader = options.has_mounted_script ? options.mounted_script : options.mounted;
   bool has_reader = options.has_mounted_script || options.has_mounted;
-  if (has_reader) {
+  if (result == NULL && has_reader) {
     uint8_t *bytes = NULL; size_t count = 0;
     if (reader.open(reader.ctx, name, &bytes, &count)) {
-      char *text = malloc(count + 1);
-      memcpy(text, bytes, count);
-      text[count] = '\0';
+      result = malloc(count + 1);
+      if (result == NULL) { free(bytes); qa_range_error("Out of memory"); }
+      memcpy(result, bytes, count);
+      result[count] = '\0';
       free(bytes);
-      free(name);
-      return text;
     }
   }
+  qa_cleanup_pop(&name_guard);
   free(name);
-  return NULL;
+  return result;
 }
 struct qa_app_console_script_files {
   qa_app_console_script_files_options options;
@@ -166,53 +213,80 @@ void qa_app_console_script_files_destroy(qa_app_console_script_files *files) {
   free(files);
 }
 const char *qa_app_console_script_files_root(const qa_app_console_script_files *files) { return files->options.settings->root; }
+qa_native_config *qa_app_console_script_files_native(const qa_app_console_script_files *files) { return files->options.native; }
+qa_game_layers *qa_app_console_script_files_layers(const qa_app_console_script_files *files) {
+  return files->options.native != NULL ? files->options.native->layers : files->options.mixed_layers;
+}
 static void acquire(qa_app_console_script_files *files) {
-  if (files->retiring) qa_range_error("Configuration reader is retired");
+  if (files->retiring) qa_raise("Error", 0, 0, "%s", "Configuration reader is retired");
   files->reads++;
 }
 static void release_read(qa_app_console_script_files *files) { files->reads--; }
+/* TS `try { ... } finally { this.releaseRead(); }` around a read that can raise. */
+static void release_read_cleanup(void *files) { release_read(files); }
 static int by_entry_name(const void *a, const void *b) {
   return strcmp(((const qa_app_console_script_entry *)a)->name, ((const qa_app_console_script_entry *)b)->name);
 }
-/* TS entries.set(name.toLowerCase(), { name, kind }): a Unicode case-insensitive key keeps
- * its first position and takes the latest entry. */
-static void set_entry(qa_app_console_script_entry **entries, size_t *count, char *name, const char *kind) {
-  for (size_t j = 0; j < *count; j++) {
-    if (qa_js_equals_ignore_case((*entries)[j].name, name)) {
-      free((*entries)[j].name);
-      (*entries)[j] = (qa_app_console_script_entry){name, kind};
-      return;
+/* TS entries.set(name.toLowerCase(), { name, kind }): a Unicode case-insensitive key keeps its first position and
+ * takes the latest entry (list_take_names). */
+/* TS list's try/finally (releaseRead) and C storage on a raise. */
+typedef struct list_state {
+  qa_app_console_script_files *files;
+  qa_app_console_script_entry *entries; size_t count;
+  char **names; size_t name_count, name_cap;
+} list_state;
+static void list_state_release(void *raw) {
+  list_state *state = raw;
+  for (size_t i = 0; i < state->count; i++) free(state->entries[i].name);
+  free(state->entries);
+  for (size_t i = 0; i < state->name_count; i++) free(state->names[i]);
+  free(state->names);
+  release_read(state->files);
+}
+static void list_take_names(list_state *state, const char *root, const char *kind) {
+  config_names(root, "", &state->names, &state->name_count, &state->name_cap);
+  for (size_t i = 0; i < state->name_count; i++) {
+    char *name = state->names[i];
+    state->names[i] = NULL;
+    bool replaced = false;
+    for (size_t j = 0; j < state->count && !replaced; j++) {
+      if (!qa_js_equals_ignore_case(state->entries[j].name, name)) continue;
+      free(state->entries[j].name);
+      state->entries[j] = (qa_app_console_script_entry){name, kind};
+      replaced = true;
     }
+    if (replaced) continue;
+    qa_app_console_script_entry *grown = realloc(state->entries, (state->count + 1) * sizeof *grown);
+    if (grown == NULL) { free(name); qa_range_error("Out of memory"); }
+    state->entries = grown;
+    state->entries[state->count++] = (qa_app_console_script_entry){name, kind};
   }
-  *entries = realloc(*entries, (*count + 1) * sizeof **entries);
-  (*entries)[(*count)++] = (qa_app_console_script_entry){name, kind};
+  free(state->names);
+  state->names = NULL; state->name_count = state->name_cap = 0;
 }
 qa_app_console_script_entry *qa_app_console_script_files_list(qa_app_console_script_files *files, qa_command_context source, size_t *out_count) {
   acquire(files);
+  list_state state = {files, NULL, 0, NULL, 0, 0};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, list_state_release, &state);
   const qa_command_origin *origin = caller_origin(&source.origin);
-  if (origin->kind == QA_COMMAND_ORIGIN_REMOTE_CLIENT) {
-    release_read(files);
-    qa_range_error("Remote clients cannot list local configuration scripts");
-  }
-  qa_app_console_script_entry *entries = NULL;
-  size_t count = 0;
-  char **names = NULL; size_t name_count = 0, name_cap = 0;
-  config_names(files->options.settings->root, "", &names, &name_count, &name_cap);
-  for (size_t i = 0; i < name_count; i++) set_entry(&entries, &count, names[i], "product");
-  free(names);
+  if (origin->kind == QA_COMMAND_ORIGIN_REMOTE_CLIENT)
+    qa_raise("Error", 0, 0, "%s", "Remote clients cannot list local configuration scripts");
+  list_take_names(&state, files->options.settings->root, "product");
   if (origin->kind == QA_COMMAND_ORIGIN_LOCAL_SEAT) {
     qa_config_store seat_store;
-    qa_app_seat_console_config(files->options.console_root, origin->seat, &seat_store);
-    names = NULL; name_count = 0; name_cap = 0;
-    config_names(seat_store.root, "", &names, &name_count, &name_cap);
-    for (size_t i = 0; i < name_count; i++) set_entry(&entries, &count, names[i], "seat");
-    free(names);
+    if (!qa_app_seat_console_config(files->options.console_root, origin->seat, &seat_store)) qa_range_error("Out of memory");
+    qa_cleanup store_guard;
+    qa_cleanup_push(&store_guard, (void (*)(void *))qa_config_store_destroy, &seat_store);
+    list_take_names(&state, seat_store.root, "seat");
+    qa_cleanup_pop(&store_guard);
     qa_config_store_destroy(&seat_store);
   }
-  qa_js_sort(entries, count, sizeof *entries, by_entry_name);
+  qa_js_sort(state.entries, state.count, sizeof *state.entries, by_entry_name);
+  qa_cleanup_pop(&guard);
   release_read(files);
-  *out_count = count;
-  return entries;
+  *out_count = state.count;
+  return state.entries;
 }
 void qa_app_console_script_entries_free(qa_app_console_script_entry *entries, size_t count) {
   if (!entries) return;
@@ -229,7 +303,11 @@ char *qa_app_console_script_files_read(qa_app_console_script_files *files, const
   options.mounted = files->options.mounted; options.has_mounted = files->options.has_mounted;
   options.mounted_script = files->options.mounted_script; options.has_mounted_script = files->options.has_mounted_script;
   options.has_legacy_config = files->options.has_legacy_config; options.legacy_config = files->options.legacy_config;
+  options.native = files->options.native;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_read_cleanup, files);
   char *text = qa_app_read_console_script(options);
+  qa_cleanup_pop(&guard);
   release_read(files);
   return text;
 }
@@ -237,13 +315,19 @@ bool qa_app_console_script_files_read_mounted_script(qa_app_console_script_files
   acquire(files);
   qa_app_source_script_reader reader = files->options.has_mounted_script ? files->options.mounted_script : files->options.mounted;
   bool has = files->options.has_mounted_script || files->options.has_mounted;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_read_cleanup, files);
   bool found = has && reader.open(reader.ctx, name, out_bytes, out_count);
+  qa_cleanup_pop(&guard);
   release_read(files);
   return found;
 }
 bool qa_app_console_script_files_read_mounted(qa_app_console_script_files *files, const char *name, uint8_t **out_bytes, size_t *out_count) {
   acquire(files);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_read_cleanup, files);
   bool found = files->options.has_mounted && files->options.mounted.open(files->options.mounted.ctx, name, out_bytes, out_count);
+  qa_cleanup_pop(&guard);
   release_read(files);
   return found;
 }
@@ -252,10 +336,13 @@ char **qa_app_console_script_files_list_mounted(qa_app_console_script_files *fil
   const qa_command_origin *origin = caller_origin(&source.origin);
   if (origin->kind == QA_COMMAND_ORIGIN_REMOTE_CLIENT) {
     release_read(files);
-    qa_range_error("Remote clients cannot list local mounted files");
+    qa_raise("Error", 0, 0, "%s", "Remote clients cannot list local mounted files");
   }
   *out_count = 0;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_read_cleanup, files);
   char **names = files->options.mounted_files ? files->options.mounted_files(files->options.mounted_ctx, directory, extension, out_count) : NULL;
+  qa_cleanup_pop(&guard);
   release_read(files);
   return names;
 }
@@ -264,9 +351,12 @@ bool qa_app_console_script_files_open_mounted(qa_app_console_script_files *files
   const qa_command_origin *origin = caller_origin(&source.origin);
   if (origin->kind == QA_COMMAND_ORIGIN_REMOTE_CLIENT) {
     release_read(files);
-    qa_range_error("Remote clients cannot open local mounted files");
+    qa_raise("Error", 0, 0, "%s", "Remote clients cannot open local mounted files");
   }
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, release_read_cleanup, files);
   bool found = files->options.mounted_resource && files->options.mounted_resource(files->options.mounted_ctx, path, out_bytes, out_count);
+  qa_cleanup_pop(&guard);
   release_read(files);
   return found;
 }

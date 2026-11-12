@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/input/gamepad.h"
 #include "qa/llm/errors.h"
@@ -342,6 +343,15 @@ const char *qa_app_controller_settings_message(const qa_app_controller_settings 
   return entry != NULL ? entry->profile->message : "Connect a controller with a gyroscope.";
 }
 
+typedef struct gyro_save_call {
+  const qa_config_store *store;
+  const char *path;
+  const qa_gyro_profile *profile;
+} gyro_save_call;
+static void gyro_save_run(void *arg) {
+  gyro_save_call *call = arg;
+  if (!qa_config_store_save_gyro(call->store, call->path, call->profile)) qa_settings_raise_write_failure();
+}
 void qa_app_controller_settings_save(qa_app_controller_settings *settings, qa_seat_id seat) {
   profile_entry *entry = find_profile(settings, seat);
   qa_seat_input *input = qa_input_router_seat(settings->router, seat);
@@ -357,9 +367,12 @@ void qa_app_controller_settings_save(qa_app_controller_settings *settings, qa_se
   memcpy(saved.guid, value->guid, sizeof saved.guid);
   saved.serial = value->serial;
   saved.tuning = tuning;
-  errno = 0;
-  if (!qa_config_store_save_gyro(settings->store, value->path, &saved) && current(settings, seat, value))
-    failed(settings, value, errno != 0 ? strerror(errno) : "Gyro settings could not be saved");
+  /* TS try { await saveGyro } catch (cause) { failed(profile, cause) }: the cause is saveGyro's own error
+   * (validation, or the Node fs error its write rejects with). */
+  gyro_save_call call = {settings->store, value->path, &saved};
+  qa_caught_error caught;
+  if (!qa_try(gyro_save_run, &call, &caught) && current(settings, seat, value))
+    failed(settings, value, qa_caught_message(&caught));
   if (current(settings, seat, value)) value->busy = false;
 }
 

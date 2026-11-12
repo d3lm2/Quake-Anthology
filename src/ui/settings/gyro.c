@@ -38,6 +38,24 @@ static void save(gyro_state *s) {
   const char *error = s->settings.save(s->settings.ctx);
   if (error != NULL) set_error(s, error);
 }
+/* text.slice(0, units) in UTF-16 units over UTF-8 text. A pair the cut would
+ * split is left out (JS keeps its lone high surrogate, which UTF-8 cannot hold). */
+static void utf16_prefix(char *out, size_t size, const char *text, size_t units) {
+  size_t at = 0, taken = 0;
+  const unsigned char *p = (const unsigned char *)text;
+  while (p[at] != 0) {
+    size_t n = p[at] < 0x80 ? 1 : (p[at] & 0xe0) == 0xc0 ? 2 : (p[at] & 0xf0) == 0xe0 ? 3
+             : (p[at] & 0xf8) == 0xf0 ? 4 : 1;
+    for (size_t i = 1; i < n; i++)
+      if ((p[at + i] & 0xc0) != 0x80) { n = 1; break; }
+    size_t width = n == 4 ? 2 : 1;
+    if (taken + width > units || at + n >= size) break;
+    taken += width;
+    at += n;
+  }
+  memcpy(out, text, at);
+  out[at] = '\0';
+}
 static qa_seat_id seat_of(gyro_state *s) {
   return qa_native_ui_controller_get_seat(s->controller);
 }
@@ -144,7 +162,7 @@ static qa_ui_menu factory(void *v) {
     status = "Place the controller on a steady surface.";
   const char *name = have_device && device.name != NULL ? device.name
                                                         : "Controller";
-  snprintf(s->label, 51, "%s", name); /* TS slice(0, 50) */
+  utf16_prefix(s->label, sizeof s->label, name, 50); /* TS slice(0, 50) */
   qa_ui_control *controls = s->controls;
   size_t at = 0;
   controls[at] = button(s, at, "ui:gyro:device", s->label, 0, G_NONE, false);

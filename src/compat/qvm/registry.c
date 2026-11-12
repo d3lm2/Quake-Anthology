@@ -29,13 +29,13 @@ static bool is_current(const qa_qvm_vm_registration *registration) {
 }
 
 static slot *current(const qa_qvm_vm_registration *registration) {
-  if (!is_current(registration)) qa_range_error("VM registration has been freed");
+  if (!is_current(registration)) qa_raise("Error", 0, 0, "VM registration has been freed");
   return &slots_of(registration->registry)[registration->slot];
 }
 
 static slot *preparing(const qa_qvm_vm_registration *registration) {
   slot *entry = current(registration);
-  if (strcmp(entry->kind, "initializing") != 0) qa_range_error("VM registration is already bound");
+  if (strcmp(entry->kind, "initializing") != 0) qa_raise("Error", 0, 0, "VM registration is already bound");
   return entry;
 }
 

@@ -69,7 +69,7 @@ SHAPE(q1_event_shape, STR(qa_q1_event, kind), IN(qa_q1_event, actor, actor_shape
       IN(qa_q1_event, attack, q1_attack_shape));
 
 /* Q1IntermissionResult / Q1SourceFinale (map and text are inline). */
-SHAPE(q1_intermission_shape, STR(qa_q1_intermission_result, kind));
+SHAPE(q1_intermission_shape, STR(qa_q1_intermission_result, kind), STR(qa_q1_intermission_result, text));
 
 /* Q1CompositionEvent. */
 SHAPE(q1ad_event_shape, IN(qa_q1ad_event, actor, actor_shape), IN(qa_q1ad_event, player, actor_shape),

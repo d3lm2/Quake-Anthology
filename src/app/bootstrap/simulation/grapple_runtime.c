@@ -6,8 +6,8 @@
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/persistence/save_image.h"
+#include "qa/core/math.h"
 
-static const qa_vec3 zero = {0, 0, 0};
 static bool is(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 static void *xcalloc(size_t count, size_t size) {
   void *p = calloc(count == 0 ? 1 : count, size);
@@ -31,10 +31,18 @@ typedef struct q2_binding {
   qa_q2_grapple_weapon weapon;
 } q2_binding;
 typedef struct control_entry { qa_actor_id actor; qa_app_sim_grapple_control control; } control_entry;
+/* The TS handoff closures of one actor's weapon slot. The runtime keeps one
+ * block per actor: a later handoff for the actor (its slot is rebound and
+ * the old slot destroyed) reuses it with the newly captured q2 weapon, and a
+ * released actor's block is marked dead and freed at the next handoff, once
+ * the release has destroyed the slot that holds it (TS GC drops the closures
+ * with the slot). If a rebinding slot refuses its restore state, the kept
+ * old slot sees the new q2 weapon (TS: its own closure's). */
 typedef struct handoff_block {
   qa_app_sim_grapple_runtime *runtime;
   qa_actor_id actor;
   q2_binding *q2; /* the TS closure's captured q2 weapon */
+  bool dead;
 } handoff_block;
 
 struct qa_app_sim_grapple_runtime {
@@ -45,7 +53,7 @@ struct qa_app_sim_grapple_runtime {
   qa_app_sim_grapple_slot_host slot_host;
   control_entry *controls; size_t control_count, control_capacity;
   q2_binding **q2; size_t q2_count, q2_capacity;          /* TS weaponAnimations/q2Weapons */
-  q2_binding **retired; size_t retired_count, retired_capacity; /* still referenced by TS closures */
+  q2_binding **retired; size_t retired_count, retired_capacity; /* retired but captured by a handoff block */
   bool has_q1_weapon;
   qa_q1_threewave_weapon q1_weapon;
   qa_actor_id *holstered; size_t holstered_count, holstered_capacity; /* TS q3Holstered */
@@ -53,6 +61,8 @@ struct qa_app_sim_grapple_runtime {
   int64_t release_subscription;
 };
 
+/* Cleanup node for a converted Q1 content checkpoint (qa_cleanup fn). */
+static void q1_content_release(void *arg) { qa_persist_q1_foundation_content_free(arg); }
 static qa_session_actor_registry *actors_of(const qa_app_sim_grapple_runtime *r) {
   const qa_app_sim_grapple_source *s = &r->source;
   if (is(s->kind, "q1-threewave")) return s->q1_game->host.actors;
@@ -94,7 +104,24 @@ static void delete_control(qa_app_sim_grapple_runtime *r, qa_actor_id actor) {
     }
 }
 /* --- TS weaponAnimations/q2Weapons Maps --- */
+static bool captured(const qa_app_sim_grapple_runtime *r, const q2_binding *binding) {
+  for (size_t i = 0; i < r->handoff_count; i++) if (r->handoffs[i]->q2 == binding) return true;
+  return false;
+}
+/* A handoff block stopped capturing binding: free it once it is retired
+ * and no other block captures it (TS GC). */
+static void uncapture(qa_app_sim_grapple_runtime *r, q2_binding *binding) {
+  if (binding == NULL || captured(r, binding)) return;
+  for (size_t i = 0; i < r->retired_count; i++)
+    if (r->retired[i] == binding) {
+      free(binding);
+      memmove(&r->retired[i], &r->retired[i + 1], (r->retired_count - i - 1) * sizeof *r->retired);
+      r->retired_count--;
+      return;
+    }
+}
 static void retire(qa_app_sim_grapple_runtime *r, q2_binding *binding) {
+  if (!captured(r, binding)) { free(binding); return; } /* no closure keeps it */
   if (r->retired_count == r->retired_capacity) {
     r->retired_capacity = r->retired_capacity ? r->retired_capacity * 2 : 4;
     r->retired = xrealloc(r->retired, r->retired_capacity * sizeof *r->retired);
@@ -142,6 +169,8 @@ static void holstered_delete(qa_app_sim_grapple_runtime *r, qa_actor_id actor) {
 
 static void on_release(void *ctx, qa_owned_actor actor) {
   qa_app_sim_grapple_runtime *r = ctx;
+  for (size_t i = 0; i < r->handoff_count; i++)
+    if (qa_same_actor(r->handoffs[i]->actor, actor.id)) r->handoffs[i]->dead = true;
   delete_control(r, actor.id);
   delete_q2(r, actor.id);
   holstered_delete(r, actor.id);
@@ -296,13 +325,31 @@ qa_app_sim_equipment_weapon_handoff qa_app_sim_grapple_runtime_handoff(qa_app_si
     q2 = find_q2(r, actor);
     if (q2 == NULL) qa_raise("Error", 0, 0, "Missing grapple weapon animation owner");
   }
-  handoff_block *h = xcalloc(1, sizeof *h);
-  h->runtime = r; h->actor = actor; h->q2 = q2;
-  if (r->handoff_count == r->handoff_capacity) {
-    r->handoff_capacity = r->handoff_capacity ? r->handoff_capacity * 2 : 4;
-    r->handoffs = xrealloc(r->handoffs, r->handoff_capacity * sizeof *r->handoffs);
+  /* Free the blocks of released actors (their slots are destroyed by now). */
+  for (size_t i = 0; i < r->handoff_count;) {
+    handoff_block *block = r->handoffs[i];
+    if (!block->dead) { i++; continue; }
+    memmove(&r->handoffs[i], &r->handoffs[i + 1], (r->handoff_count - i - 1) * sizeof *r->handoffs);
+    r->handoff_count--;
+    uncapture(r, block->q2); /* after removal: captured() scans the blocks */
+    free(block);
   }
-  r->handoffs[r->handoff_count++] = h;
+  handoff_block *h = NULL;
+  for (size_t i = 0; i < r->handoff_count && h == NULL; i++)
+    if (qa_same_actor(r->handoffs[i]->actor, actor)) h = r->handoffs[i];
+  if (h != NULL) {
+    q2_binding *previous = h->q2;
+    h->q2 = q2;
+    if (previous != q2) uncapture(r, previous);
+  } else {
+    h = xcalloc(1, sizeof *h);
+    h->runtime = r; h->actor = actor; h->q2 = q2;
+    if (r->handoff_count == r->handoff_capacity) {
+      r->handoff_capacity = r->handoff_capacity ? r->handoff_capacity * 2 : 4;
+      r->handoffs = xrealloc(r->handoffs, r->handoff_capacity * sizeof *r->handoffs);
+    }
+    r->handoffs[r->handoff_count++] = h;
+  }
   out.ctx = h;
   if (is(r->source.kind, "q3-qvm")) { out.holster = h_q3_holster; out.is_holstered = h_q3_is_holstered; out.resume = h_q3_resume; }
   else if (r->has_q1_weapon) { out.holster = h_q1_holster; out.is_holstered = h_q1_is_holstered; out.resume = h_q1_resume; }
@@ -408,7 +455,7 @@ void qa_app_sim_grapple_runtime_input(qa_app_sim_grapple_runtime *r, qa_actor_id
 }
 qa_vec3 qa_app_sim_grapple_runtime_previous_velocity(const qa_app_sim_grapple_runtime *r, qa_actor_id actor) {
   control_entry *state = find_control(r, actor);
-  return state == NULL ? zero : state->control.previous_velocity;
+  return state == NULL ? qa_zero_vec3 : state->control.previous_velocity;
 }
 void qa_app_sim_grapple_runtime_set_previous_velocity(qa_app_sim_grapple_runtime *r, qa_actor_id actor, qa_vec3 velocity) {
   control_entry *state = find_control(r, actor);
@@ -578,12 +625,18 @@ void qa_app_sim_grapple_runtime_restore(qa_app_sim_grapple_runtime *r, const qa_
   const qa_app_sim_grapple_source_checkpoint *saved_source = &checkpoint->source;
   qa_session_actor_registry *actors = actors_of(r);
   if (is(s->kind, "q1-threewave") && is(saved_source->kind, "q1-threewave")) {
-    /* The persistence reader still decodes its own Q1FoundationCheckpoint
-     * copy (persistence/q1_foundation.h) with no conversion to the content
-     * type, so a read Q1 checkpoint cannot restore the source game. */
-    if (saved_source->has_q1_saved)
-      qa_raise("Error", 0, 0, "Q1 foundation checkpoint from a save has no content conversion");
-    qa_q1_services_restore(s->q1_game, &saved_source->q1_entities, false);
+    /* TS game.restore(savedSource.entities, { scheduleThinks: false }). A
+     * checkpoint read from a save holds the persistence form: convert it to
+     * the content type first (released on a raise too). */
+    if (saved_source->has_q1_saved) {
+      qa_q1_foundation_checkpoint content;
+      qa_persist_q1_foundation_to_content(&saved_source->q1_saved, &content);
+      qa_cleanup cleanup;
+      qa_cleanup_push(&cleanup, q1_content_release, &content);
+      qa_q1_services_restore(s->q1_game, &content, false);
+      qa_cleanup_pop(&cleanup);
+      qa_persist_q1_foundation_content_free(&content);
+    } else qa_q1_services_restore(s->q1_game, &saved_source->q1_entities, false);
   } else if (is(s->kind, "q2-ctf") && is(saved_source->kind, "q2-ctf")) {
     qa_q2_entity_services_restore(s->q2_game, saved_source->q2_entities);
     qa_q2_ctf_grapple_clear_states(s->ctf_core);

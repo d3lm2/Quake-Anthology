@@ -41,11 +41,14 @@ struct qa_compat_q2_classic_edicts {
   bool has_projection; qa_compat_q2_classic_actor_projection projection;
   qa_guest_address f_base, f_stride, f_count, f_capacity;
   bool has_descriptor; qa_compat_q2_classic_edict_descriptor descriptor;
-  double retained[256]; size_t retained_count; double retired[256]; size_t retired_count;
+  /* TS #retainedClients / #retiredInputClients: Sets with no size limit. */
+  double *retained; size_t retained_count, retained_cap; double *retired; size_t retired_count, retired_cap;
   /* currentActor closures of borrowed records, one per slot, owned for the edicts' lifetime. */
   struct slot_cell **cells; size_t cell_count;
 };
-typedef struct slot_cell { qa_compat_q2_classic_edicts *e; double slot; } slot_cell;
+/* `record` is the TS record object the closure captured: currentActor projects that record and never re-reads the
+ * descriptor (a slot past a shrunken num_edicts still answers). */
+typedef struct slot_cell { qa_compat_q2_classic_edicts *e; double slot; qa_raw_entity_view record; } slot_cell;
 static slot_cell *cell_of(qa_compat_q2_classic_edicts *e, double slot) {
   size_t index = (size_t)slot;
   if (index >= e->cell_count) {
@@ -58,8 +61,16 @@ static slot_cell *cell_of(qa_compat_q2_classic_edicts *e, double slot) {
   return e->cells[index];
 }
 static bool slot_has(const double *list, size_t n, double slot) { for (size_t i = 0; i < n; i++) if (list[i] == slot) return true; return false; }
-static void slot_add(double *list, size_t *n, double slot) { if (!slot_has(list, *n, slot) && *n < 256) list[(*n)++] = slot; }
-static void slot_del(double *list, size_t *n, double slot) { for (size_t i = 0; i < *n; i++) if (list[i] == slot) list[i] = list[--(*n)]; }
+static void slot_add(double **list, size_t *n, size_t *cap, double slot) {
+  if (slot_has(*list, *n, slot)) return;
+  if (*n == *cap) {
+    size_t grown_cap = *cap ? *cap * 2 : 16;
+    double *grown = realloc(*list, grown_cap * sizeof *grown); if (!grown) qa_range_error("Classic Q2 records out of memory");
+    *list = grown; *cap = grown_cap;
+  }
+  (*list)[(*n)++] = slot;
+}
+static void slot_del(double *list, size_t *n, double slot) { for (size_t i = 0; i < *n; i++) if (list[i] == slot) { list[i] = list[--(*n)]; return; } }
 
 qa_compat_q2_classic_edicts *qa_compat_q2_classic_edicts_create(
     qa_compat_q2_memory *memory, qa_guest_address exports, qa_session_actor_registry *actors,
@@ -69,24 +80,41 @@ qa_compat_q2_classic_edicts *qa_compat_q2_classic_edicts_create(
   e->memory = memory; e->exports = exports; e->actors = actors; e->provider = provider;
   e->bind_ctx = bind_ctx; e->bind = bind;
   if (projection) { e->has_projection = true; e->projection = *projection; }
+  /* A constructor that throws leaves no object behind. */
+  qa_cleanup node; qa_cleanup_push(&node, free, e);
   memory->check(memory->ctx, exports, QA_COMPAT_Q2_CLASSIC_EXPORT_BYTES, "read");
   if (qa_compat_q2_mem_read_i32(memory, exports) != 3) qa_range_error("GetGameAPI returned an API version other than 3");
+  qa_cleanup_pop(&node);
   e->f_base = qa_compat_q2_mem_offset(memory, exports, 64); e->f_stride = qa_compat_q2_mem_offset(memory, exports, 68);
   e->f_count = qa_compat_q2_mem_offset(memory, exports, 72); e->f_capacity = qa_compat_q2_mem_offset(memory, exports, 76);
   return e;
 }
+/* TS rebindWorld's `new ClassicQ2Edicts(...)` over the same exports: the constructor's checks run first (a raise leaves
+ * the previous table in place, as the TS assignment never happens), then the table takes the services as they are now
+ * (a world rebind swaps the actor registry) and the retained and retired sets and the descriptor start empty. The
+ * object is reused so records handed out earlier keep a live currentActor closure. */
+void qa_compat_q2_classic_edicts_rebind(qa_compat_q2_classic_edicts *e, qa_session_actor_registry *actors, qa_provider_id provider,
+                                        void *bind_ctx, void (*bind)(void *, qa_raw_entity_view, qa_owned_actor),
+                                        const qa_compat_q2_classic_actor_projection *projection) {
+  e->memory->check(e->memory->ctx, e->exports, QA_COMPAT_Q2_CLASSIC_EXPORT_BYTES, "read");
+  if (qa_compat_q2_mem_read_i32(e->memory, e->exports) != 3) qa_range_error("GetGameAPI returned an API version other than 3");
+  e->actors = actors; e->provider = provider; e->bind_ctx = bind_ctx; e->bind = bind;
+  e->has_projection = projection != NULL;
+  if (projection) e->projection = *projection;
+  e->retained_count = 0; e->retired_count = 0; e->has_descriptor = false;
+}
 void qa_compat_q2_classic_edicts_destroy(qa_compat_q2_classic_edicts *e) {
   if (!e) return;
   for (size_t i = 0; i < e->cell_count; i++) free(e->cells[i]);
-  free(e->cells); free(e);
+  free(e->cells); free(e->retained); free(e->retired); free(e);
 }
-void qa_compat_q2_classic_edicts_retire_input_client(qa_compat_q2_classic_edicts *e, double slot) { slot_add(e->retired, &e->retired_count, slot); }
+void qa_compat_q2_classic_edicts_retire_input_client(qa_compat_q2_classic_edicts *e, double slot) { slot_add(&e->retired, &e->retired_count, &e->retired_cap, slot); }
 void qa_compat_q2_classic_edicts_finish_input_retirement(qa_compat_q2_classic_edicts *e, double slot) { slot_del(e->retired, &e->retired_count, slot); }
 qa_compat_q2_classic_edict_descriptor qa_compat_q2_classic_edicts_descriptor(qa_compat_q2_classic_edicts *e) {
   qa_guest_address base; bool has = qa_compat_q2_mem_read_pointer(e->memory, e->f_base, &base);
   double stride = qa_compat_q2_mem_read_i32(e->memory, e->f_stride), count = qa_compat_q2_mem_read_i32(e->memory, e->f_count),
          capacity = qa_compat_q2_mem_read_i32(e->memory, e->f_capacity);
-  if (!has) qa_range_error("API 3 edicts are not allocated; Init has not completed");
+  if (!has) qa_raise("Error", 0, 0, "API 3 edicts are not allocated; Init has not completed");
   if (stride < QA_COMPAT_Q2_CLASSIC_EDICT_BYTES || (int64_t)stride % 4 != 0 || count < 0 || capacity < count || capacity > 65536)
     qa_range_error("Invalid source API 3 edict descriptor");
   e->memory->check(e->memory->ctx, base, stride * capacity, "read");
@@ -98,9 +126,8 @@ qa_compat_q2_classic_edict_descriptor qa_compat_q2_classic_edicts_descriptor(qa_
 static qa_actor_id_result current_actor_cb(void *ctx) {
   slot_cell *cell = ctx; qa_compat_q2_classic_edicts *e = cell->e; double slot = cell->slot;
   qa_actor_id_result r; memset(&r, 0, sizeof r);
-  qa_raw_entity_view rec = qa_compat_q2_classic_edicts_at(e, slot);
   qa_owned_actor owned;
-  if (e->has_projection) { if (e->projection.project(e->projection.ctx, rec, &owned)) { r.has_value = true; r.value = owned.id; } return r; }
+  if (e->has_projection) { if (e->projection.project(e->projection.ctx, cell->record, &owned)) { r.has_value = true; r.value = owned.id; } return r; }
   if (qa_session_actor_registry_at_source(e->actors, e->provider, (int64_t)slot, &owned)) { r.has_value = true; r.value = owned.id; }
   return r;
 }
@@ -113,6 +140,7 @@ static qa_raw_entity_view at_desc(qa_compat_q2_classic_edicts *e, double slot, q
   rec.public_layout = qa_compat_q2_classic_edict_layout;
   rec.bytes.bytes = e->memory->borrow(e->memory->ctx, address, d.stride); rec.bytes.length = (size_t)d.stride;
   rec.current_actor = current_actor_cb;
+  cell->record = rec;
   return rec;
 }
 qa_raw_entity_view qa_compat_q2_classic_edicts_at(qa_compat_q2_classic_edicts *e, double slot) {
@@ -132,8 +160,11 @@ bool qa_compat_q2_classic_edicts_current(qa_compat_q2_classic_edicts *e, qa_raw_
   if (qa_compat_q2_view_i32((const uint8_t *)current.bytes.bytes, 88) == 0 && !slot_has(e->retained, e->retained_count, record.slot)) return false;
   return qa_session_actor_registry_at_source(e->actors, e->provider, (int64_t)record.slot, out);
 }
+typedef struct resolve_call { qa_compat_q2_classic_edicts *e; qa_actor_id actor; } resolve_call;
+static void resolve_fn(void *ctx) { resolve_call *c = ctx; (void)c->e->projection.address(c->e->projection.ctx, c->actor); }
 bool qa_compat_q2_classic_edicts_resolves(qa_compat_q2_classic_edicts *e, qa_actor_id actor) {
-  if (e->has_projection) { (void)e->projection.address(e->projection.ctx, actor); return true; }
+  /* TS: try { this.projection.address(actor); return true; } catch { return false; } */
+  if (e->has_projection) { resolve_call call = {e, actor}; qa_caught_error caught; return qa_try(resolve_fn, &call, &caught); }
   qa_actor_source_result s = qa_session_actor_registry_source_of(e->actors, actor);
   return s.has_value && s.provider && e->provider && strcmp(s.provider, e->provider) == 0;
 }
@@ -141,9 +172,11 @@ qa_guest_address qa_compat_q2_classic_edicts_pointer(qa_compat_q2_classic_edicts
   if (e->has_projection) return e->projection.address(e->projection.ctx, actor);
   qa_actor_source_result s = qa_session_actor_registry_source_of(e->actors, actor);
   if (!s.has_value || !s.provider || !e->provider || strcmp(s.provider, e->provider) != 0)
-    qa_range_error("Foreign actor requires an explicit native semantic edict adapter");
+    qa_raise("Error", 0, 0, "Foreign actor requires an explicit native semantic edict adapter");
   return qa_compat_q2_classic_edicts_at(e, (double)s.slot).address;
 }
+typedef struct bind_guard { qa_session_actor_registry *actors; qa_owned_actor actor; } bind_guard;
+static void bind_guard_release(void *arg) { bind_guard *g = arg; qa_session_actor_registry_release(g->actors, g->actor); }
 static bool observe_record(qa_compat_q2_classic_edicts *e, qa_raw_entity_view record, qa_owned_actor *out) {
   if (slot_has(e->retired, e->retired_count, record.slot)) return false;
   if (e->has_projection) return e->projection.project(e->projection.ctx, record, out);
@@ -154,7 +187,10 @@ static bool observe_record(qa_compat_q2_classic_edicts *e, qa_raw_entity_view re
   }
   if (has_existing) { if (out) *out = existing; return true; }
   qa_owned_actor actor = qa_session_actor_registry_allocate_at_source(e->actors, e->provider, (int64_t)record.slot, "q2-native:edict");
+  /* TS: try { this.bind(record, actor); } catch (error) { this.actors.release(actor); throw error; } */
+  bind_guard guard = {e->actors, actor}; qa_cleanup node; qa_cleanup_push(&node, bind_guard_release, &guard);
   e->bind(e->bind_ctx, record, actor);
+  qa_cleanup_pop(&node);
   if (out) *out = actor;
   return true;
 }
@@ -164,9 +200,9 @@ bool qa_compat_q2_classic_edicts_observe(qa_compat_q2_classic_edicts *e, qa_gues
 qa_owned_actor qa_compat_q2_classic_edicts_retain_client(qa_compat_q2_classic_edicts *e, double slot) {
   if (slot != trunc(slot) || slot < 1) qa_range_error("Invalid retained API 3 client slot");
   qa_raw_entity_view record = qa_compat_q2_classic_edicts_at(e, slot);
-  slot_add(e->retained, &e->retained_count, slot);
+  slot_add(&e->retained, &e->retained_count, &e->retained_cap, slot);
   qa_owned_actor actor;
-  if (!qa_compat_q2_classic_edicts_observe(e, record.address, &actor)) qa_range_error("Retained source client has no actor");
+  if (!qa_compat_q2_classic_edicts_observe(e, record.address, &actor)) qa_raise("Error", 0, 0, "Retained source client has no actor");
   return actor;
 }
 void qa_compat_q2_classic_edicts_release_client(qa_compat_q2_classic_edicts *e, double slot) {
@@ -177,11 +213,14 @@ void qa_compat_q2_classic_edicts_reconcile(qa_compat_q2_classic_edicts *e) {
   if (e->has_projection) return;
   qa_compat_q2_classic_edict_descriptor d = qa_compat_q2_classic_edicts_descriptor(e);
   size_t n = 0; const qa_owned_actor *owned = qa_session_actor_registry_owned_by(e->actors, e->provider, &n);
-  qa_owned_actor copy[512]; size_t m = n < 512 ? n : 512; if (owned) memcpy(copy, owned, m * sizeof *copy);
-  for (size_t i = 0; i < m; i++) {
+  /* Every owned actor is checked: TS has no limit on the provider's actor count. */
+  qa_owned_actor *copy = xmalloc((n ? n : 1) * sizeof *copy); if (owned && n) memcpy(copy, owned, n * sizeof *copy);
+  qa_cleanup node; qa_cleanup_push(&node, free, copy);
+  for (size_t i = 0; i < n; i++) {
     qa_actor_source_result s = qa_session_actor_registry_source_of(e->actors, copy[i].id);
     if (s.has_value && (double)s.slot >= d.count) qa_session_actor_registry_release(e->actors, copy[i]);
   }
+  qa_cleanup_pop(&node); free(copy);
   for (double slot = 0; slot < d.count; slot++) { qa_owned_actor o; (void)observe_record(e, qa_compat_q2_classic_edicts_at(e, slot), &o); }
 }
 uint8_t *qa_compat_q2_classic_edicts_client_prefix(qa_compat_q2_classic_edicts *e, double slot) {

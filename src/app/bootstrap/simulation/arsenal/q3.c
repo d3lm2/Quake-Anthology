@@ -24,8 +24,17 @@ typedef struct player_arsenal {
 } player_arsenal;
 struct qa_app_q3_selected_arsenal {
   qa_app_q3_selected_arsenal_options options;
-  player_arsenal players[64];
-  size_t player_count;
+  player_arsenal **players; /* TS players Map: one allocation per player, so a step's player stays put */
+  size_t player_count, player_capacity;
+  /* Players removed while a step runs (that step still holds one, as TS keeps the object):
+   * freed when the outermost step ends. */
+  player_arsenal **retired; size_t retired_count;
+  size_t step_depth;
+  char **strings; size_t string_count; /* interned pending holdable item ids */
+  /* ui()'s weapon status labels, whole, one per distinct weapon item and kept until destroy (a nested ui() read
+   * cannot release a label an outer read holds). */
+  char **label_items, **labels; size_t label_count;
+  struct handoff_ctx **handoffs; size_t handoff_count; /* handoff() closure state, one record per actor slot */
 };
 
 static bool item_eq(qa_item_id a, qa_item_id b) { return a && b && strcmp(a, b) == 0; }
@@ -36,13 +45,38 @@ static qa_q3_base_product product_of(const char *product) {
   return product && strcmp(product, "missionpack") == 0 ? QA_Q3_BASE_PRODUCT_MISSIONPACK : QA_Q3_BASE_PRODUCT_BASEQ3;
 }
 static player_arsenal *find_player(qa_app_q3_selected_arsenal *arsenal, qa_actor_id actor) {
-  for (size_t i = 0; i < arsenal->player_count; i++) if (qa_same_actor(arsenal->players[i].actor.id, actor)) return &arsenal->players[i];
+  for (size_t i = 0; i < arsenal->player_count; i++) if (qa_same_actor(arsenal->players[i]->actor.id, actor)) return arsenal->players[i];
   return NULL;
 }
 static player_arsenal *require_player(qa_app_q3_selected_arsenal *arsenal, qa_actor_id actor) {
   player_arsenal *player = find_player(arsenal, actor);
-  if (!player) qa_range_error("Actor has no selected Q3 arsenal");
+  if (!player) qa_raise("Error", 0, 0, "Actor has no selected Q3 arsenal");
   return player;
+}
+/* players.set(actor, ...) for a new actor: a zeroed record. */
+static player_arsenal *add_player(qa_app_q3_selected_arsenal *arsenal) {
+  if (arsenal->player_count == arsenal->player_capacity) {
+    size_t capacity = arsenal->player_capacity ? arsenal->player_capacity * 2 : 16;
+    player_arsenal **grown = realloc(arsenal->players, capacity * sizeof *grown);
+    if (!grown) qa_range_error("Out of memory");
+    arsenal->players = grown; arsenal->player_capacity = capacity;
+  }
+  player_arsenal *player = calloc(1, sizeof *player);
+  if (!player) qa_range_error("Out of memory");
+  arsenal->players[arsenal->player_count++] = player;
+  return player;
+}
+/* A held item id kept by the arsenal (TS strings need no owner): equal texts share one copy. */
+static qa_item_id intern(qa_app_q3_selected_arsenal *arsenal, const char *text) {
+  if (text == NULL) return NULL;
+  for (size_t i = 0; i < arsenal->string_count; i++) if (strcmp(arsenal->strings[i], text) == 0) return arsenal->strings[i];
+  char **grown = realloc(arsenal->strings, (arsenal->string_count + 1) * sizeof *grown);
+  if (!grown) qa_range_error("Out of memory");
+  arsenal->strings = grown;
+  char *copy = strdup(text);
+  if (!copy) qa_range_error("Out of memory");
+  arsenal->strings[arsenal->string_count++] = copy;
+  return copy;
 }
 static bool in_inventory_items(qa_app_q3_selected_arsenal *arsenal, qa_item_id item) {
   for (size_t i = 0; i < QA_Q3_WEAPON_ITEM_COUNT; i++) {
@@ -69,7 +103,16 @@ qa_app_q3_selected_arsenal *qa_app_q3_selected_arsenal_create(qa_app_q3_selected
   arsenal->options = options;
   return arsenal;
 }
-void qa_app_q3_selected_arsenal_destroy(qa_app_q3_selected_arsenal *arsenal) { free(arsenal); }
+void qa_app_q3_selected_arsenal_destroy(qa_app_q3_selected_arsenal *arsenal) {
+  if (!arsenal) return;
+  for (size_t i = 0; i < arsenal->player_count; i++) free(arsenal->players[i]);
+  for (size_t i = 0; i < arsenal->retired_count; i++) free(arsenal->retired[i]);
+  for (size_t i = 0; i < arsenal->string_count; i++) free(arsenal->strings[i]);
+  for (size_t i = 0; i < arsenal->handoff_count; i++) free(arsenal->handoffs[i]);
+  free(arsenal->players); free(arsenal->retired); free(arsenal->strings); free(arsenal->handoffs);
+  for (size_t i = 0; i < arsenal->label_count; i++) { free(arsenal->label_items[i]); free(arsenal->labels[i]); }
+  free(arsenal->label_items); free(arsenal->labels); free(arsenal);
+}
 size_t qa_app_q3_selected_arsenal_catalog(qa_app_q3_selected_arsenal *arsenal, qa_selected_pickup_weapon *out, size_t capacity) {
   size_t count = 0;
   for (size_t i = 0; i < QA_Q3_WEAPON_ITEM_COUNT && count < capacity; i++) {
@@ -96,13 +139,13 @@ qa_arsenal_state qa_app_q3_selected_arsenal_read(qa_app_q3_selected_arsenal *ars
 }
 qa_arsenal_state qa_app_q3_selected_arsenal_admit(qa_app_q3_selected_arsenal *arsenal, qa_owned_actor actor,
     double max_health, bool team_deathmatch) {
-  if (find_player(arsenal, actor.id)) qa_range_error("Selected Q3 arsenal already admitted");
+  if (find_player(arsenal, actor.id)) qa_raise("Error", 0, 0, "Selected Q3 arsenal already admitted");
   qa_arsenal_state defaults = arsenal->options.has_supply ? arsenal->options.supply_loadout
       : qa_q3_spawn_loadout(arsenal->options.provider, arsenal->options.product, team_deathmatch);
   qa_arsenal_state state = arsenal->options.loadout ? arsenal->options.loadout(arsenal->options.ctx, actor, defaults) : defaults;
   if (!state.provider || !arsenal->options.provider || strcmp(state.provider, arsenal->options.provider) != 0
       || !state.state.kind || strcmp(state.state.kind, "q3") != 0)
-    qa_range_error("Selected Q3 starter belongs to a different arsenal");
+    qa_raise("Error", 0, 0, "Selected Q3 starter belongs to a different arsenal");
   size_t entry_count = 0;
   const qa_inventory_entry *entries = arsenal->options.inventory.entries(arsenal->options.inventory.ctx, actor.id, &entry_count);
   for (size_t i = 0; i < entry_count; i++) {
@@ -114,10 +157,11 @@ qa_arsenal_state qa_app_q3_selected_arsenal_admit(qa_app_q3_selected_arsenal *ar
     }
   }
   for (size_t i = 0; i < state.ammo_count; i++) arsenal->options.inventory.configure(arsenal->options.inventory.ctx, actor, state.ammo[i]);
-  if (arsenal->player_count >= 64) qa_range_error("Out of memory");
-  player_arsenal *player = &arsenal->players[arsenal->player_count++];
-  memset(player, 0, sizeof *player);
-  player->actor = actor; player->arsenal = state;
+  player_arsenal *player = add_player(arsenal);
+  /* The player keeps no ammo array (read() rebuilds it from the inventory); the spawn loadout this
+   * admission built is released once configured. */
+  if (!arsenal->options.has_supply) free((void *)defaults.ammo);
+  player->actor = actor; player->arsenal = state; player->arsenal.ammo = NULL; player->arsenal.ammo_count = 0;
   player->runtime = qa_q3_spawn_arsenal_runtime(arsenal->options.product, max_health, 0);
   player->torso_animation = qa_q3_spawn_animation().torso;
   return qa_app_q3_selected_arsenal_read(arsenal, actor.id);
@@ -128,7 +172,7 @@ void qa_app_q3_selected_arsenal_set_spawn_weapon(qa_app_q3_selected_arsenal *ars
   const qa_q3_weapon_item *entry = NULL;
   for (size_t i = 0; i < QA_Q3_WEAPON_ITEM_COUNT && entry == NULL; i++) if (qa_q3_weapon_items[i].weapon == weapon) entry = &qa_q3_weapon_items[i];
   if (entry == NULL || player->arsenal.state.kind == NULL || strcmp(player->arsenal.state.kind, "q3") != 0)
-    qa_range_error("Spawn weapon is not a Q3 weapon");
+    qa_raise("Error", 0, 0, "Spawn weapon is not a Q3 weapon");
   player->arsenal.active_weapon = entry->item;
   player->arsenal.state.source_weapon = weapon;
   player->runtime.has_requested_weapon = false;
@@ -150,14 +194,18 @@ bool qa_app_q3_selected_arsenal_owns_holdable_input(qa_app_q3_selected_arsenal *
   bool owns = !(arsenal->options.has_equipment && arsenal->options.equipment.has_owns_holdables && !arsenal->options.equipment.owns_holdables);
   return owns && (player->runtime.use_item_held || held_item(arsenal, player) != 0);
 }
-static char PENDING_BUFFERS[64][128];
-static size_t pending_cursor;
+/* `q3:${item.classname}` for a held holdable, interned (a pending use keeps it across frames). */
 static qa_item_id holdable_item_id(qa_app_q3_selected_arsenal *arsenal, double held) {
   const qa_q3_base_item_definition *item = qa_q3_base_item_at(product_of(arsenal->options.product), held);
   if (!item || item->type != QA_Q3_BASE_IT_HOLDABLE) return NULL;
-  char *buffer = PENDING_BUFFERS[pending_cursor++ % 64];
-  snprintf(buffer, 128, "q3:%s", item->class_name ? item->class_name : "");
-  return buffer;
+  const char *name = item->class_name ? item->class_name : "";
+  size_t length = strlen(name) + 4;
+  char *text = malloc(length);
+  if (!text) qa_range_error("Out of memory");
+  snprintf(text, length, "q3:%s", name);
+  qa_item_id kept = intern(arsenal, text);
+  free(text);
+  return kept;
 }
 void qa_app_q3_selected_arsenal_observe_holdable_input(qa_app_q3_selected_arsenal *arsenal, qa_actor_id actor,
     qa_user_command command, const qa_arsenal_intent *intent) {
@@ -180,7 +228,7 @@ bool qa_app_q3_selected_arsenal_use_item(qa_app_q3_selected_arsenal *arsenal, qa
   player_arsenal *player = require_player(arsenal, actor);
   qa_item_id held = holdable_item_id(arsenal, held_item(arsenal, player));
   if (!held || !item_eq(held, item)) return false;
-  player->pending_use = item;
+  player->pending_use = held; /* the arsenal's copy of the caller's equal item id */
   return true;
 }
 qa_item_id qa_app_q3_selected_arsenal_pending_weapon(qa_app_q3_selected_arsenal *arsenal, qa_actor_id actor) {
@@ -191,8 +239,6 @@ qa_item_id qa_app_q3_selected_arsenal_pending_weapon(qa_app_q3_selected_arsenal 
 }
 
 typedef struct handoff_ctx { qa_app_q3_selected_arsenal *arsenal; qa_actor_id actor; } handoff_ctx;
-static handoff_ctx HANDOFFS[16];
-static size_t handoff_cursor;
 static bool in_product(qa_app_q3_selected_arsenal *arsenal, qa_item_id item) {
   const qa_q3_weapon_item *weapon = find_weapon(item);
   return weapon && (missionpack(arsenal) || weapon->weapon <= 10);
@@ -217,7 +263,7 @@ static bool handoff_holstered(void *v) {
 static bool handoff_resume(void *v, qa_item_id item) {
   handoff_ctx *ctx = (handoff_ctx *)v;
   player_arsenal *player = require_player(ctx->arsenal, ctx->actor);
-  if (item != NULL && !in_product(ctx->arsenal, item)) qa_range_error("Resume item is not a Q3 primary weapon");
+  if (item != NULL && !in_product(ctx->arsenal, item)) qa_raise("Error", 0, 0, "Resume item is not a Q3 primary weapon");
   qa_q3_arsenal_runtime_state runtime = qa_q3_request_weapon_resume(player->runtime);
   const qa_q3_weapon_item *requested = find_weapon(item ? item : player->arsenal.active_weapon);
   player->runtime = requested == NULL ? runtime : qa_q3_request_weapon(runtime, requested->weapon);
@@ -226,8 +272,27 @@ static bool handoff_resume(void *v, qa_item_id item) {
 }
 qa_app_primary_weapon_handoff qa_app_q3_selected_arsenal_handoff(qa_app_q3_selected_arsenal *arsenal, qa_actor_id actor) {
   (void)require_player(arsenal, actor);
-  handoff_ctx *ctx = &HANDOFFS[handoff_cursor++ % 16];
-  ctx->arsenal = arsenal; ctx->actor = actor;
+  /* The TS closures capture (this, actor) only: one record per actor serves every handoff of it. */
+  /* A record whose actor slot now holds a newer generation belonged to a released actor; the
+   * release destroyed the weapon slot that held its handoff, so the record is reused: the records
+   * stay one per live actor slot (TS closures are collected with their holder). */
+  handoff_ctx *ctx = NULL;
+  for (size_t i = 0; i < arsenal->handoff_count && !ctx; i++)
+    if (qa_same_actor(arsenal->handoffs[i]->actor, actor)) ctx = arsenal->handoffs[i];
+  for (size_t i = 0; i < arsenal->handoff_count && !ctx; i++)
+    if (arsenal->handoffs[i]->actor.token == actor.token && arsenal->handoffs[i]->actor.slot == actor.slot) {
+      ctx = arsenal->handoffs[i];
+      ctx->actor = actor;
+    }
+  if (!ctx) {
+    handoff_ctx **grown = realloc(arsenal->handoffs, (arsenal->handoff_count + 1) * sizeof *grown);
+    if (!grown) qa_range_error("Out of memory");
+    arsenal->handoffs = grown;
+    ctx = calloc(1, sizeof *ctx);
+    if (!ctx) qa_range_error("Out of memory");
+    arsenal->handoffs[arsenal->handoff_count++] = ctx;
+    ctx->arsenal = arsenal; ctx->actor = actor;
+  }
   qa_app_primary_weapon_handoff handoff; memset(&handoff, 0, sizeof handoff);
   handoff.ctx = ctx; handoff.kind = "immediate"; handoff.provider = arsenal->options.provider;
   handoff.accepts = handoff_accepts; handoff.select = handoff_select; handoff.holster = handoff_holster;
@@ -242,7 +307,8 @@ static const qa_q3_weapon_item *best_weapon(qa_app_q3_selected_arsenal *arsenal,
     if (arsenal->options.inventory.count(arsenal->options.inventory.ctx, actor, weapon->item) <= 0) continue;
     if (weapon->ammo) {
       double amount = arsenal->options.inventory.count(arsenal->options.inventory.ctx, actor, weapon->ammo);
-      for (size_t i = 0; i < before_count; i++) if (item_eq(before[i].item, weapon->ammo)) amount = before[i].before;
+      for (size_t i = 0; i < before_count; i++) /* before.find(...): the first grant of this ammo */
+        if (item_eq(before[i].item, weapon->ammo)) { amount = before[i].before; break; }
       if (amount <= 0) continue;
     }
     return weapon;
@@ -279,7 +345,27 @@ static double delay_cb(void *v, double milliseconds) {
   delay_ctx *ctx = (delay_ctx *)v;
   return ctx->arsenal->options.firing_delay(ctx->arsenal->options.ctx, ctx->actor, milliseconds);
 }
+static void release_retired(qa_app_q3_selected_arsenal *arsenal) {
+  for (size_t i = 0; i < arsenal->retired_count; i++) free(arsenal->retired[i]);
+  arsenal->retired_count = 0;
+}
+static void step_leave(void *v) {
+  qa_app_q3_selected_arsenal *arsenal = v;
+  if (--arsenal->step_depth == 0) release_retired(arsenal);
+}
+static qa_weapon_step_result step_body(qa_app_q3_selected_arsenal *arsenal,
+    qa_weapon_step_input input, const qa_arsenal_intent *intent);
 qa_weapon_step_result qa_app_q3_selected_arsenal_step(qa_app_q3_selected_arsenal *arsenal,
+    qa_weapon_step_input input, const qa_arsenal_intent *intent) {
+  arsenal->step_depth++;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, step_leave, arsenal);
+  qa_weapon_step_result result = step_body(arsenal, input, intent);
+  qa_cleanup_pop(&guard);
+  step_leave(arsenal);
+  return result;
+}
+static qa_weapon_step_result step_body(qa_app_q3_selected_arsenal *arsenal,
     qa_weapon_step_input input, const qa_arsenal_intent *intent) {
   player_arsenal *player = require_player(arsenal, input.actor.id);
   qa_arsenal_state state = qa_app_q3_selected_arsenal_read(arsenal, input.actor.id);
@@ -293,7 +379,7 @@ qa_weapon_step_result qa_app_q3_selected_arsenal_step(qa_app_q3_selected_arsenal
   double holdable = player->runtime.holdable_item;
   if (intent && (!intent->provider || !arsenal->options.provider || strcmp(intent->provider, arsenal->options.provider) != 0)) {
     free((void *)state.ammo);
-    qa_range_error("Arsenal intent belongs to a different provider");
+    qa_raise("Error", 0, 0, "Arsenal intent belongs to a different provider");
   }
   if (intent && intent->weapon) {
     const qa_q3_weapon_item *requested = find_weapon(intent->weapon);
@@ -326,7 +412,8 @@ qa_weapon_step_result qa_app_q3_selected_arsenal_step(qa_app_q3_selected_arsenal
   double milliseconds = trunc(elapsed + player->runtime.fractional_milliseconds);
   if (arsenal->options.has_equipment && arsenal->options.equipment.advance)
     arsenal->options.equipment.advance(arsenal->options.equipment.ctx, player->actor, milliseconds);
-  player->arsenal = result.arsenal;
+  /* The player keeps no ammo array: read() rebuilds ammo from the inventory each time. */
+  player->arsenal = result.arsenal; player->arsenal.ammo = NULL; player->arsenal.ammo_count = 0;
   player->runtime = stepped.runtime;
   if (use && !controls_use_holdable) player->runtime.use_item_held = false;
   if (holdable != 0 && stepped.runtime.holdable_item == 0 && arsenal->options.has_equipment)
@@ -335,7 +422,7 @@ qa_weapon_step_result qa_app_q3_selected_arsenal_step(qa_app_q3_selected_arsenal
   for (size_t i = 0; i < result.arsenal.ammo_count; i++)
     arsenal->options.inventory.configure(arsenal->options.inventory.ctx, player->actor, result.arsenal.ammo[i]);
   if (!result.arsenal.state.kind || strcmp(result.arsenal.state.kind, "q3") != 0)
-    qa_range_error("Selected Q3 step returned a foreign arsenal");
+    qa_raise("Error", 0, 0, "Selected Q3 step returned a foreign arsenal");
   for (size_t i = 0; i < result.effect_count; i++) {
     if (result.effects[i].kind != QA_MOVEMENT_EFFECT_EVENT) continue;
     double event = result.effects[i].value.event;
@@ -350,14 +437,24 @@ qa_weapon_step_result qa_app_q3_selected_arsenal_step(qa_app_q3_selected_arsenal
   bool present = find_player(arsenal, player->actor.id) != NULL;
   if (present && arsenal->options.has_equipment && arsenal->options.equipment.end_command)
     arsenal->options.equipment.end_command(arsenal->options.equipment.ctx, player->actor, milliseconds);
-  result.arsenal = present ? qa_app_q3_selected_arsenal_read(arsenal, player->actor.id) : result.arsenal;
+  if (present) {
+    free((void *)result.arsenal.ammo); /* stepQ3Arsenal's ammo list, configured into the inventory above */
+    result.arsenal = qa_app_q3_selected_arsenal_read(arsenal, player->actor.id);
+  }
   result.animation = (input.animation.state.kind && strcmp(input.animation.state.kind, "q3") == 0) ? result.animation : input.animation;
   free((void *)state.ammo);
   return result;
 }
 void qa_app_q3_selected_arsenal_remove(qa_app_q3_selected_arsenal *arsenal, qa_actor_id actor) {
   for (size_t i = 0; i < arsenal->player_count; i++) {
-    if (qa_same_actor(arsenal->players[i].actor.id, actor)) {
+    if (qa_same_actor(arsenal->players[i]->actor.id, actor)) {
+      if (arsenal->step_depth == 0) free(arsenal->players[i]);
+      else {
+        player_arsenal **grown = realloc(arsenal->retired, (arsenal->retired_count + 1) * sizeof *grown);
+        if (!grown) qa_range_error("Out of memory");
+        arsenal->retired = grown;
+        arsenal->retired[arsenal->retired_count++] = arsenal->players[i];
+      }
       memmove(arsenal->players + i, arsenal->players + i + 1, (arsenal->player_count - i - 1) * sizeof *arsenal->players);
       arsenal->player_count--; return;
     }
@@ -388,11 +485,11 @@ void qa_app_q3_selected_arsenal_restore(qa_app_q3_selected_arsenal *arsenal, qa_
   qa_item_id expected_profile = arsenal->options.has_supply ? arsenal->options.supply_profile : NULL;
   if ((checkpoint.supply_profile == NULL) != (expected_profile == NULL)
       || (checkpoint.supply_profile && !item_eq(checkpoint.supply_profile, expected_profile)))
-    qa_range_error("Saved pickup supply differs from selected arsenal composition");
+    qa_raise("Error", 0, 0, "Saved pickup supply differs from selected arsenal composition");
   if (!checkpoint.arsenal.provider || !arsenal->options.provider || strcmp(checkpoint.arsenal.provider, arsenal->options.provider) != 0
       || !checkpoint.arsenal.state.kind || strcmp(checkpoint.arsenal.state.kind, "q3") != 0
       || !checkpoint.runtime.product || strcmp(checkpoint.runtime.product, arsenal->options.product) != 0)
-    qa_range_error("Saved arsenal differs from selected Q3 provider");
+    qa_raise("Error", 0, 0, "Saved arsenal differs from selected Q3 provider");
   for (size_t i = 0; i < checkpoint.arsenal.ammo_count; i++)
     if (in_inventory_items(arsenal, checkpoint.arsenal.ammo[i].item))
       arsenal->options.inventory.configure(arsenal->options.inventory.ctx, actor, checkpoint.arsenal.ammo[i]);
@@ -402,21 +499,39 @@ void qa_app_q3_selected_arsenal_restore(qa_app_q3_selected_arsenal *arsenal, qa_
     arsenal->options.equipment.restore(arsenal->options.equipment.ctx, actor, equipment);
   }
   player_arsenal *player = find_player(arsenal, actor.id);
-  if (!player) {
-    if (arsenal->player_count >= 64) qa_range_error("Out of memory");
-    player = &arsenal->players[arsenal->player_count++];
-  }
+  if (!player) player = add_player(arsenal);
   memset(player, 0, sizeof *player);
   player->actor = actor; player->arsenal = checkpoint.arsenal; player->runtime = checkpoint.runtime;
+  player->arsenal.ammo = NULL; player->arsenal.ammo_count = 0; /* the checkpoint's list stays its owner's */
   player->torso_animation = checkpoint.torso_animation;
   player->has_last_fire = checkpoint.has_last_fire_milliseconds;
   player->last_fire_milliseconds = checkpoint.last_fire_milliseconds;
-  player->pending_use = checkpoint.pending_use;
+  player->pending_use = intern(arsenal, checkpoint.pending_use);
   player->arsenal_read_order = checkpoint.arsenal_read_order;
 }
 static double ui_count(void *v, qa_item_id item) {
   struct { qa_app_inventory_access inventory; qa_actor_id actor; } *ctx = v;
   return ctx->inventory.count(ctx->inventory.ctx, ctx->actor, item);
+}
+static double no_count(void *ctx, qa_item_id item) { (void)ctx; (void)item; return -1; }
+/* The whole weapon status label for item, interned until destroy; on a raise frees pending (the read's ammo). */
+static const char *status_label(qa_app_q3_selected_arsenal *arsenal, qa_item_id item, void *pending) {
+  for (size_t i = 0; i < arsenal->label_count; i++) if (strcmp(arsenal->label_items[i], item) == 0) return arsenal->labels[i];
+  size_t size = qa_app_q3_weapon_label_size(item, arsenal->options.product);
+  char *label = calloc(size, 1), *copy = malloc(strlen(item) + 1);
+  char **items = realloc(arsenal->label_items, (arsenal->label_count + 1) * sizeof *items);
+  if (items != NULL) arsenal->label_items = items;
+  char **labels = items == NULL ? NULL : realloc(arsenal->labels, (arsenal->label_count + 1) * sizeof *labels);
+  if (labels != NULL) arsenal->labels = labels;
+  if (label == NULL || copy == NULL || labels == NULL) { free(label); free(copy); free(pending); qa_range_error("Out of memory"); }
+  qa_weapon_hud_status ignored;
+  qa_provider_reference none;
+  memset(&none, 0, sizeof none);
+  (void)qa_app_q3_weapon_status(item, arsenal->options.product, no_count, NULL, none, label, size, &ignored);
+  memcpy(copy, item, strlen(item) + 1);
+  arsenal->label_items[arsenal->label_count] = copy;
+  arsenal->labels[arsenal->label_count++] = label;
+  return label;
 }
 qa_app_arsenal_ui qa_app_q3_selected_arsenal_ui(qa_app_q3_selected_arsenal *arsenal, qa_actor_id actor,
     qa_provider_reference source, qa_app_player_ui_item *items, size_t capacity, char (*labels)[64], size_t label_capacity) {
@@ -425,9 +540,9 @@ qa_app_arsenal_ui qa_app_q3_selected_arsenal_ui(qa_app_q3_selected_arsenal *arse
       ? qa_q3_get_weapon_item(state.state.source_weapon) : NULL;
   qa_app_arsenal_ui ui; memset(&ui, 0, sizeof ui);
   struct { qa_app_inventory_access inventory; qa_actor_id actor; } ctx = {arsenal->options.inventory, actor};
-  char label[64] = {0};
-  ui.has_weapon_status = qa_app_q3_weapon_status(state.active_weapon, arsenal->options.product, ui_count, &ctx, source, label, sizeof label, &ui.weapon_status);
-  if (ui.has_weapon_status && labels && label_capacity) { memcpy(labels[0], label, strlen(label) + 1); ui.weapon_status.label = labels[0]; }
+  ui.has_weapon_status = qa_app_q3_weapon_status(state.active_weapon, arsenal->options.product, ui_count, &ctx, source, NULL, 0, &ui.weapon_status);
+  ui.weapon_status.label = ui.has_weapon_status ? status_label(arsenal, state.active_weapon, (void *)state.ammo) : NULL;
+  (void)labels; (void)label_capacity; /* item labels are the static pickup names */
   ui.arsenal_warning = qa_app_q3_arsenal_warning(arsenal->options.product, ui_count, &ctx);
   ui.active_weapon = state.active_weapon;
   if (weapon && weapon->ammo) {
@@ -441,13 +556,13 @@ qa_app_arsenal_ui qa_app_q3_selected_arsenal_ui(qa_app_q3_selected_arsenal *arse
     const qa_q3_weapon_item *entry_weapon = &qa_q3_weapon_items[i];
     if (!missionpack(arsenal) && entry_weapon->weapon > 10) continue;
     const char *pickup = NULL;
-    for (size_t j = 0; j < item_count; j++)
+    for (size_t j = 0; j < item_count && pickup == NULL; j++) /* itemList(product).find(...): the first match */
       if (definitions[j].type == QA_Q3_BASE_IT_WEAPON && definitions[j].tag == entry_weapon->weapon) pickup = definitions[j].pickup_name;
-    if (!pickup) { free((void *)state.ammo); qa_range_error("Selected Q3 weapon lacks its original item label"); }
+    if (!pickup) { free((void *)state.ammo); qa_raise("Error", 0, 0, "Selected Q3 weapon lacks its original item label"); }
     qa_app_player_ui_item *entry = &items[ui.item_count];
     memset(entry, 0, sizeof *entry);
     entry->id = entry_weapon->item; entry->kind = "weapon"; entry->source_ordinal = entry_weapon->weapon;
-    if (labels && ui.item_count + 1 < label_capacity) { strncpy(labels[ui.item_count + 1], pickup, 63); entry->label = labels[ui.item_count + 1]; }
+    entry->label = pickup;
     entry->owned = arsenal->options.inventory.count(arsenal->options.inventory.ctx, actor, entry_weapon->item) > 0;
     entry->has_count = entry_weapon->ammo != NULL;
     entry->count = entry_weapon->ammo ? arsenal->options.inventory.count(arsenal->options.inventory.ctx, actor, entry_weapon->ammo) : 0;
@@ -470,7 +585,7 @@ qa_app_arsenal_view qa_app_q3_selected_arsenal_view(qa_app_q3_selected_arsenal *
   qa_app_arsenal_view view; memset(&view, 0, sizeof view);
   if (!state.state.kind || strcmp(state.state.kind, "q3") != 0) {
     free((void *)state.ammo);
-    qa_range_error("Selected Q3 player has foreign arsenal state");
+    qa_raise("Error", 0, 0, "Selected Q3 player has foreign arsenal state");
   }
   size_t count = 0;
   const qa_q3_base_item_definition *definitions = qa_q3_base_item_list(product_of(arsenal->options.product), &count);

@@ -44,17 +44,22 @@ char *qa_app_sim_prepare_native_q2_map(qa_app_sim_native_q2_map_geometry world, 
   size_t total = 0;
   for (size_t i = 0; i < count + extra_n; i++) {
     const qa_q1_entity *e = &parsed[i < count ? i : extra[i - count]];
-    total += 4;
+    total += 5; /* "{\n", "}\n" and the "\n" an entity without fields still has */
     for (size_t p = 0; p < e->property_count; p++) {
       const char *v = (i >= count && strcmp(e->properties[p].key, "classname") == 0) ? wanted : e->properties[p].value;
-      if (strchr(e->properties[p].key, '"') != NULL || strchr(v, '"') != NULL) qa_range_error("Native Quake II entity field cannot be quoted");
+      if (strchr(e->properties[p].key, '"') != NULL || strchr(v, '"') != NULL) {
+        free(extra); qa_q1_entities_destroy(parsed, count);
+        qa_raise("Error", 0, 0, "Native Quake II entity field cannot be quoted");
+      }
       total += strlen(e->properties[p].key) + strlen(v) + 6;
     }
   }
-  char *out = malloc(total + 1); if (out == NULL) qa_range_error("Out of memory"); size_t o = 0;
+  char *out = malloc(total + 1); if (out == NULL) { free(extra); qa_q1_entities_destroy(parsed, count); qa_range_error("Out of memory"); } size_t o = 0;
   for (size_t i = 0; i < count + extra_n; i++) {
     const qa_q1_entity *e = &parsed[i < count ? i : extra[i - count]];
     o += (size_t)snprintf(out + o, total + 1 - o, "{\n");
+    /* "{\n" + fields.join("\n") + "\n}\n": no fields still leaves the blank line. */
+    if (e->property_count == 0) o += (size_t)snprintf(out + o, total + 1 - o, "\n");
     for (size_t p = 0; p < e->property_count; p++) {
       const char *v = (i >= count && strcmp(e->properties[p].key, "classname") == 0) ? wanted : e->properties[p].value;
       o += (size_t)snprintf(out + o, total + 1 - o, "\"%s\" \"%s\"\n", e->properties[p].key, v);

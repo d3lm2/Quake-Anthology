@@ -3,7 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/app/bootstrap/simulation/arsenal_intent.h"
+#include "qa/app/bootstrap/simulation/player_movement.h"
 #include "qa/app/bootstrap/simulation/q3_commands.h"
+#include "qa/app/bootstrap/simulation/shared_quakeworld_movement.h"
 #include "qa/content/q3/foundation/character.h"
 #include "qa/core/numeric.h"
 #include "qa/foundation/support.h"
@@ -54,7 +56,7 @@ static qa_weapon_step_result weapon_step(step_ctx *ctx, qa_weapon_step_input inp
     qa_weapon_step_result result; memset(&result, 0, sizeof result);
     result.arsenal = input.arsenal; result.animation = input.animation; return result;
   }
-  if (!ctx->has_runtime) qa_range_error("Q3 prediction needs the snapshot's private arsenal runtime");
+  if (!ctx->has_runtime) qa_raise("Error", 0, 0, "Q3 prediction needs the snapshot's private arsenal runtime");
   qa_q3_arsenal_controls controls = resolve_controls(ctx, input.arsenal, input.command, ctx->runtime.product);
   if (input.command.kind == QA_USER_COMMAND_Q3) controls.use_holdable = ((qa_js_to_int32(input.command.as.q3.buttons)) & 4) != 0;
   qa_q3_arsenal_step stepped = qa_q3_step_arsenal(input, ctx->runtime, controls, NULL, NULL);
@@ -150,6 +152,7 @@ static qa_trace_policy trace_policy_cb(void *v, qa_q3_movement_input input) {
   policy.curves = true; policy.player_curve_clip = true; return policy;
 }
 
+static void release_shared_quakeworld(void *arg) { qa_app_sim_shared_quakeworld_movement_destroy(*(qa_movement_provider *)arg); }
 qa_app_prediction_step_result qa_app_predict_movement_command(const qa_app_movement_probe_options *configuration,
     qa_app_movement_prediction_snapshot snapshot, qa_app_prediction_command entry,
     qa_app_prediction_step_options options, const qa_trace_shape *shape_in) {
@@ -174,8 +177,8 @@ qa_app_prediction_step_result qa_app_predict_movement_command(const qa_app_movem
     }
   } else if (!configuration->movement_only && entry.has_arsenal) {
     if (!entry.arsenal.provider || !ctx.source.arsenal.provider || strcmp(entry.arsenal.provider, ctx.source.arsenal.provider) != 0)
-      qa_range_error("Arsenal command belongs to a different provider");
-    if (arsenal_q3) qa_range_error("Prediction has no selected arsenal owner for this intent");
+      qa_raise("Error", 0, 0, "Arsenal command belongs to a different provider");
+    if (arsenal_q3) qa_raise("Error", 0, 0, "Prediction has no selected arsenal owner for this intent");
   }
   qa_movement_environment environment = ctx.source.environment;
   if (ctx.source.state.kind == QA_MOVEMENT_STATE_Q3) environment.gravity_multiplier = 1;
@@ -223,9 +226,24 @@ qa_app_prediction_step_result qa_app_predict_movement_command(const qa_app_movem
   } else if (strcmp(pk, "q1-quakeworld") == 0 && state.kind == QA_MOVEMENT_STATE_QW && command.kind == QA_USER_COMMAND_QW) {
     base.kind = "q1-quakeworld";
     bool stance = environment.client_outputs && environment.client_outputs->has_stance;
-    if (stance) { base.shape.kind = "box"; base.shape.bounds = ctx.source.bounds; }
-    qa_movement_provider provider = qa_create_qw_movement_provider(profile->id, q1_options);
-    result = provider.move(provider.ctx, base, services); free(provider.ctx);
+    if (!stance) {
+      qa_movement_provider provider = qa_create_qw_movement_provider(profile->id, q1_options);
+      result = provider.move(provider.ctx, base, services); free(provider.ctx);
+    } else {
+      /* createSharedQuakeWorldMovement with playerPostures({ character: animation.state.kind, ... }). */
+      base.shape.kind = "box"; base.shape.bounds = ctx.source.bounds;
+      bool q3_character = ctx.source.animation.state.kind && strcmp(ctx.source.animation.state.kind, "q3") == 0;
+      qa_q3_postures postures = qa_app_sim_player_postures(q3_character ? QA_GAME_FAMILY_Q3 : QA_GAME_FAMILY_Q1,
+          configuration->standing_bounds);
+      qa_app_sim_qw_postures qw = {postures.standing_view_height, postures.crouched};
+      qa_movement_provider provider = qa_app_sim_create_shared_quakeworld_movement(profile->id, q1_options,
+          configuration->standing_bounds, qw, NULL, NULL);
+      qa_cleanup provider_cleanup;
+      qa_cleanup_push(&provider_cleanup, release_shared_quakeworld, &provider);
+      result = provider.move(provider.ctx, base, services);
+      qa_cleanup_pop(&provider_cleanup);
+      qa_app_sim_shared_quakeworld_movement_destroy(provider);
+    }
   } else if (strcmp(pk, "q2-classic") == 0 && state.kind == QA_MOVEMENT_STATE_Q2 && command.kind == QA_USER_COMMAND_Q2) {
     base.kind = "q2-classic"; base.profile.snap_initial = false;
     qa_movement_provider provider = qa_create_q2_classic_movement_provider(profile->id);
@@ -254,10 +272,12 @@ qa_app_prediction_step_result qa_app_predict_movement_command(const qa_app_movem
     result = provider.move(provider.ctx, base, services);
     free(provider_options);
   } else {
-    qa_range_error("Prediction command %d and state %d do not match selected %s", (int)command.kind, (int)state.kind, pk);
+    static const char *const kinds[] = {"q1-netquake", "q1-quakeworld", "q2-classic", "q2-rerelease", "q3"};
+    qa_raise("Error", 0, 0, "Prediction command %s and state %s do not match selected %s",
+        (unsigned)command.kind < 5 ? kinds[command.kind] : "", (unsigned)state.kind < 5 ? kinds[state.kind] : "", pk);
   }
   if (!result.status || strcmp(result.status, "active") != 0)
-    qa_range_error("Private movement prediction cannot remove an authoritative actor");
+    qa_raise("Error", 0, 0, "Private movement prediction cannot remove an authoritative actor");
   if (result.kind && (strcmp(result.kind, "q2-classic") == 0 || strcmp(result.kind, "q2-rerelease") == 0)
       && result.arsenal.state.kind && strcmp(result.arsenal.state.kind, "q3") == 0) {
     qa_weapon_step_input input; memset(&input, 0, sizeof input);

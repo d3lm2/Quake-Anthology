@@ -30,7 +30,7 @@ typedef struct qa_guest_format_request {
   qa_guest_core_address arguments;
   bool has_buffer;
   qa_guest_core_address buffer;
-  int64_t capacity;
+  uint64_t capacity; /* the guest's size_t */
   qa_guest_format_termination termination;
   bool continue_count;
   qa_format_rounding rounding;

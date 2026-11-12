@@ -9,28 +9,102 @@
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 
+/* What one load holds while it can still raise: its allocations, and the state TS's catch block undoes (the pages
+ * it mapped and the GNU-unique names it registered). */
+typedef struct load_scope {
+  void **items; size_t count, cap;
+  struct load_scope *previous;
+  qa_elf_guest_image *out;
+  const qa_elf_load_options *options;
+  const qa_guest_mapping *planned;
+  size_t mapped_count;
+  size_t prior_unique_count;
+  qa_elf_import_list *imports;
+  qa_elf_unwind_view *view;
+  qa_guest_unwind_region *unwind;
+  size_t unwind_count;
+} load_scope;
+static _Thread_local load_scope *active_scope;
+static void scope_track(void *p) {
+  load_scope *scope = active_scope;
+  if (scope == NULL) return;
+  if (scope->count == scope->cap) {
+    size_t cap = scope->cap == 0 ? 64 : scope->cap * 2;
+    void **items = realloc(scope->items, cap * sizeof *items);
+    if (items == NULL) { free(p); qa_range_error("ELF: out of memory"); }
+    scope->items = items; scope->cap = cap;
+  }
+  scope->items[scope->count++] = p;
+}
+static void scope_replace(uintptr_t old, void *next) {
+  load_scope *scope = active_scope;
+  if (scope == NULL || old == (uintptr_t)next) return;
+  for (size_t i = scope->count; i-- > 0;)
+    if ((uintptr_t)scope->items[i] == old) {
+      if (next != NULL) scope->items[i] = next;
+      else scope->items[i] = scope->items[--scope->count];
+      return;
+    }
+}
+static void xfree(void *p) {
+  if (p == NULL) return;
+  scope_replace((uintptr_t)p, NULL);
+  free(p);
+}
 static void *xmalloc(size_t size) {
   void *p = malloc(size == 0 ? 1 : size);
   if (p == NULL) qa_range_error("ELF: out of memory");
+  scope_track(p);
   return p;
 }
 static void *xcalloc(size_t count, size_t size) {
   void *p = calloc(count == 0 ? 1 : count, size == 0 ? 1 : size);
   if (p == NULL) qa_range_error("ELF: out of memory");
+  scope_track(p);
   return p;
 }
 static void *xrealloc(void *p, size_t size) {
+  const uintptr_t old = (uintptr_t)p; /* the address only: realloc may have released the block */
   void *next = realloc(p, size == 0 ? 1 : size);
   if (next == NULL) qa_range_error("ELF: out of memory");
+  if (old == 0) scope_track(next);
+  else scope_replace(old, next);
   return next;
 }
+static void unmap_planned(void *arg) {
+  load_scope *scope = arg;
+  for (size_t i = 0; i < scope->mapped_count; i++) {
+    qa_guest_core_address base = {scope->planned[i].base};
+    qa_gmem_unmap(scope->options->memory_ext, base, scope->planned[i].byte_length);
+  }
+}
+/* TS loadElf's catch: forget the unique names this load added, unmap what it mapped, rethrow. */
+static void load_abandon(void *arg) {
+  load_scope *scope = arg;
+  qa_elf_unique_symbols *unique = scope->options->unique_symbols;
+  if (unique != NULL)
+    while (unique->count > scope->prior_unique_count) { /* names are only ever appended during a load */
+      free(unique->entries[unique->count - 1].name);
+      unique->count--;
+    }
+  qa_caught_error ignored;
+  (void)qa_try(unmap_planned, scope, &ignored);
+  if (scope->imports != NULL) free(scope->imports->items);
+  if (scope->view != NULL) qa_elf_unwind_view_free(scope->view);
+  qa_elf_unwind_regions_free(scope->unwind, scope->unwind_count);
+  for (size_t i = 0; i < scope->count; i++) free(scope->items[i]);
+  free(scope->items);
+  qa_elf_inspection_full_free(&scope->out->elf);
+  memset(scope->out, 0, sizeof *scope->out);
+  active_scope = scope->previous;
+}
 static void elf_error(const char *format, ...) {
-  char buffer[640];
+  char buffer[QA_CAUGHT_MESSAGE_CAPACITY]; /* whole symbol names: only the error record bounds the text */
   va_list args;
   va_start(args, format);
   (void)vsnprintf(buffer, sizeof buffer, format, args);
   va_end(args);
-  qa_range_error("ELF: %s", buffer);
+  qa_raise("ElfError", 0, 0, "ELF: %s", buffer); /* TS ElfError (error.name) */
 }
 
 #define PAGE_BYTES 4096ULL
@@ -107,6 +181,8 @@ static void pointer_array(const qa_elf_inspection_full *elf, qa_mapped_guest_mem
   size_t length = qa_elf_checked_number(size, "function array length");
   if (length == 0) return;
   (void)qa_elf_file_offset(elf->segments, elf->segment_count, address, length);
+  /* The range is checked before the copy is sized: `length` is the file's word. */
+  qa_memory_check(memory, qa_elf_address(memory, load_bias + address), length, QA_ACCESS_READ);
   uint8_t *bytes = xmalloc(length);
   qa_memory_copy(memory, qa_elf_address(memory, load_bias + address), bytes, length);
   addr_list list; memset(&list, 0, sizeof list);
@@ -116,7 +192,7 @@ static void pointer_array(const qa_elf_inspection_full *elf, qa_mapped_guest_mem
     for (int i = elf->abi.pointer_bytes - 1; i >= 0; i--) value = (value << 8) | bytes[offset + (size_t)i];
     if (value != 0 && value != sentinel) addr_push(&list, qa_elf_address(memory, value));
   }
-  free(bytes);
+  xfree(bytes);
   *out = list.items; *out_count = list.count;
 }
 
@@ -148,6 +224,15 @@ static void append_export(export_list *list, const qa_elf_symbol *symbol, qa_gue
 
 bool qa_load_elf(qa_elf_guest_image *out, const qa_elf_load_options *options) {
   memset(out, 0, sizeof *out);
+  load_scope scope;
+  memset(&scope, 0, sizeof scope);
+  scope.previous = active_scope;
+  scope.out = out;
+  scope.options = options;
+  scope.prior_unique_count = options->unique_symbols != NULL ? options->unique_symbols->count : 0;
+  qa_cleanup scope_node;
+  qa_cleanup_push(&scope_node, load_abandon, &scope);
+  active_scope = &scope;
   uint8_t *bytes = xmalloc(options->bytes_len);
   memcpy(bytes, options->bytes, options->bytes_len);
   out->bytes_copy = bytes;
@@ -235,15 +320,18 @@ bool qa_load_elf(qa_elf_guest_image *out, const qa_elf_load_options *options) {
     planned[planned_count].label = make_label(out, artifact);
     planned_count++;
   }
-  free(boundaries);
+  xfree(boundaries);
   /* The PE loader refuses images over 256 MiB for the same reason: the guest can size its own mappings. */
   uint64_t planned_total = 0;
   for (size_t i = 0; i < planned_count; i++) planned_total += planned[i].byte_length;
   if (planned_total > 256u * 1024u * 1024u) elf_error("ELF image exceeds the supported mapped size");
 
-  for (size_t i = 0; i < planned_count; i++)
+  scope.planned = planned;
+  for (size_t i = 0; i < planned_count; i++) {
     (void)qa_gmem_map(ext, planned[i].base, planned[i].byte_length,
                       QA_PERM_READ_WRITE_EXECUTE, planned[i].label, NULL, 0);
+    scope.mapped_count = i + 1;
+  }
   for (size_t i = 0; i < elf->segment_count; i++) {
     const qa_elf_segment_info *segment = &elf->segments[i];
     if (segment->type != 1 || segment->memory_size == 0) continue;
@@ -259,7 +347,7 @@ bool qa_load_elf(qa_elf_guest_image *out, const qa_elf_load_options *options) {
       uint8_t *zero = xcalloc(zero_len, 1);
       qa_memory_write(memory, qa_elf_address(memory, load_bias + segment->address + segment->file_size),
                       zero, zero_len);
-      free(zero);
+      xfree(zero);
     }
   }
 
@@ -271,8 +359,10 @@ bool qa_load_elf(qa_elf_guest_image *out, const qa_elf_load_options *options) {
   }
   for (size_t i = 0; i < elf->symbol_count; i++) {
     const qa_elf_symbol *symbol = &elf->symbols[i];
+    /* bigint sum in TS: a value near 2^64 must not wrap under the template size. */
     if (symbol->type == 6 && symbol->section != 0
-        && (tls_segment == NULL || symbol->value + symbol->size > tls_segment->memory_size))
+        && (tls_segment == NULL || symbol->size > tls_segment->memory_size
+            || symbol->value > tls_segment->memory_size - symbol->size))
       elf_error("TLS symbol %s exceeds its template", symbol->name);
   }
 
@@ -339,6 +429,7 @@ bool qa_load_elf(qa_elf_guest_image *out, const qa_elf_load_options *options) {
   context.resolve_symbol_size = options->resolve_symbol_size;
   context.unique_symbols = options->unique_symbols;
   context.imports = &imports;
+  scope.imports = &imports;
 
   for (size_t i = 0; i < elf->symbol_count; i++) {
     const qa_elf_symbol *symbol = &elf->symbols[i];
@@ -383,23 +474,26 @@ bool qa_load_elf(qa_elf_guest_image *out, const qa_elf_load_options *options) {
   size_t at = 0;
   if (has_init && init != 0) initializers[at++] = qa_elf_address(memory, load_bias + init);
   for (size_t i = 0; i < init_array_count; i++) initializers[at++] = init_array[i];
-  free(init_array);
+  xfree(init_array);
   qa_guest_core_address *fini_array = NULL; size_t fini_array_count = 0;
   pointer_array(elf, memory, load_bias, 26, 28, &fini_array, &fini_array_count);
   size_t finalizer_count = fini_array_count + (has_fini && fini != 0 ? 1 : 0);
   qa_guest_core_address *finalizers = xcalloc(finalizer_count, sizeof(qa_guest_core_address));
   at = 0;
   for (size_t i = fini_array_count; i-- > 0;) finalizers[at++] = fini_array[i];
-  free(fini_array);
+  xfree(fini_array);
   if (has_fini && fini != 0) finalizers[at++] = qa_elf_address(memory, load_bias + fini);
 
   qa_elf_unwind_view view;
   qa_elf_unwind_view_init(&view, elf);
+  scope.view = &view;
   qa_guest_unwind_region *unwind = NULL; size_t unwind_count = 0;
   if (!qa_read_elf_unwind(&view.inspection, bytes, options->bytes_len, memory, load_bias,
                           &unwind, &unwind_count))
-    elf_error("out of memory");
+    qa_range_error("ELF: out of memory");
+  scope.view = NULL;
   qa_elf_unwind_view_free(&view);
+  scope.unwind = unwind; scope.unwind_count = unwind_count;
 
   if (image.has_tls && tls_segment != NULL && tls_segment->file_size > 0)
     qa_memory_copy(memory, qa_elf_address(memory, load_bias + tls_segment->address),
@@ -450,7 +544,7 @@ bool qa_load_elf(qa_elf_guest_image *out, const qa_elf_load_options *options) {
     }
     final_mappings[final_count++] = live[i];
   }
-  free(image.mappings);
+  xfree(image.mappings);
   image.mappings = final_mappings; image.mapping_count = final_count;
   image.initializers = initializers; image.initializer_count = initializer_count;
   image.finalizers = finalizers; image.finalizer_count = finalizer_count;
@@ -462,6 +556,10 @@ bool qa_load_elf(qa_elf_guest_image *out, const qa_elf_load_options *options) {
   out->executable_stack = stack_segment != NULL && (stack_segment->flags & 1) != 0;
   out->preinitializers = preinitializers;
   out->preinitializer_count = preinitializer_count;
+  /* Loaded: everything the scope tracked now belongs to `out`. */
+  qa_cleanup_pop(&scope_node);
+  active_scope = scope.previous;
+  free(scope.items);
   return true;
 }
 

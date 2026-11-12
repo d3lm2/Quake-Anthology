@@ -80,7 +80,9 @@ typedef struct qa_q2_frame_header {
 
 #define QA_Q2_SERVER_DATA_CLIENTNUMS_MAX 256
 
-/* TS ServerDataReadResultT. */
+/* TS ServerDataReadResultT. gamedir and levelname are owned strings of any length (NULL reads
+ * as ""): free with qa_q2_server_data_result_clear, copy with qa_q2_server_data_result_copy;
+ * a plain struct copy shares them. */
 typedef struct qa_q2_server_data_result {
   bool has_server_fps;
   double server_fps;
@@ -90,12 +92,12 @@ typedef struct qa_q2_server_data_result {
   double protocol_revision;
   double servercount;
   bool attractloop;
-  char gamedir[2048];
+  char *gamedir; /* owned */
   double clientnum;
   bool has_clientnums;
   double clientnums[QA_Q2_SERVER_DATA_CLIENTNUMS_MAX];
   size_t clientnum_count;
-  char levelname[2048];
+  char *levelname; /* owned */
   double server_state;
   bool has_r1q2_version;
   double r1q2_version;
@@ -120,6 +122,16 @@ typedef struct qa_q2_clc_batch_move {
 } qa_q2_clc_batch_move;
 
 void qa_q2_clc_batch_move_free(qa_q2_clc_batch_move *move);
+
+/* Frees gamedir and levelname and leaves them NULL; the rest of the result is kept. */
+void qa_q2_server_data_result_clear(qa_q2_server_data_result *result);
+/* Replaces gamedir and levelname with copies (NULL copies ""); raises RangeError on OOM and
+ * leaves the result unchanged. */
+void qa_q2_server_data_result_set_strings(qa_q2_server_data_result *result, const char *gamedir,
+                                          const char *levelname);
+/* *out = a deep copy of *in (out's previous strings are not freed); raises RangeError on OOM
+ * with out untouched. */
+void qa_q2_server_data_result_copy(qa_q2_server_data_result *out, const qa_q2_server_data_result *in);
 
 /* TS ClcUserinfoDeltaT / ClcClientSettingT. */
 typedef struct qa_q2_clc_userinfo_delta {

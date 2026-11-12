@@ -6,6 +6,7 @@
 
 #include "qa/core/math.h"
 #include "qa/foundation/support.h"
+#include "qa/network/common/js_number.h"
 #include "qa/materials/lighting.h"
 #include "qa/materials/shader_types.h"
 
@@ -69,11 +70,11 @@ static double byte_at(const uint8_t *values, size_t length, int64_t index) {
                    (long long)index, length);
   return values[index];
 }
-static double style_at(const double *values, size_t length, int64_t index) {
-  if (index < 0 || (size_t)index >= length)
-    qa_range_error("Lightmap sample %lld is outside %zu values",
-                   (long long)index, length);
-  return values[index];
+/* element(styles, style): any number indexes; a fraction, NaN or a negative misses. */
+static double style_at(const double *values, size_t length, double index) {
+  if (!(index >= 0 && index == trunc(index) && index < (double)length))
+    qa_range_error("Lightmap sample %s is outside %zu values", QA_JS_NUMBER(index), length);
+  return values[(size_t)index];
 }
 
 static int64_t face_size(qa_lightmap_face face) {
@@ -122,8 +123,9 @@ static void add_dynamic(void *block, bool is_u32, qa_lightmap_face face,
     if (kind_is(face.projection.kind, "classic")) {
       step_s = 16; step_t = 16;
     } else {
-      step_s = 1 / qa_hypot3(face.projection.mapping.axes[0]);
-      step_t = 1 / qa_hypot3(face.projection.mapping.axes[1]);
+      qa_vec3 s = face.projection.mapping.axes[0], t = face.projection.mapping.axes[1];
+      step_s = 1 / qa_js_hypot3(s.x, s.y, s.z);
+      step_t = 1 / qa_js_hypot3(t.x, t.y, t.z);
     }
     int64_t w = (int64_t)face.width, h = (int64_t)face.height;
     for (int64_t y = 0; y < h; y++) {
@@ -163,6 +165,9 @@ qa_built_lightmap qa_build_q1_lightmap(qa_lightmap_face face,
   int64_t size = face_size(face);
   uint32_t *block = calloc((size_t)size * 3, sizeof *block);
   if (block == NULL) qa_range_error("lightmap allocation failed");
+  /* A missing style or sample raises: the accumulator goes with it (TS GC). */
+  qa_cleanup block_node;
+  qa_cleanup_push(&block_node, free, block);
   const char *encoding = options.encoding != NULL ? options.encoding
       : (face.lighting != NULL && face.lighting->is_rgb8)
           ? "rgb" : "inverted-luminance";
@@ -172,7 +177,7 @@ qa_built_lightmap qa_build_q1_lightmap(qa_lightmap_face face,
     for (size_t map_index = 0; map_index < face.style_count; map_index++) {
       double style = face.styles[map_index];
       if (style == 255) break;
-      double scale = style_at(styles, style_count, (int64_t)style);
+      double scale = style_at(styles, style_count, style);
       for (int64_t pixel = 0; pixel < size; pixel++) {
         for (int channel = 0; channel < 3; channel++) {
           int64_t offset = pixel * 3 + channel;
@@ -189,10 +194,12 @@ qa_built_lightmap qa_build_q1_lightmap(qa_lightmap_face face,
   uint8_t *pixels = malloc((size_t)size * 4);
   if (pixels == NULL) qa_range_error("lightmap allocation failed");
   for (int64_t pixel = 0; pixel < size; pixel++) {
-    int brightness[3];
+    /* Math.min(255, block[i] >> 7): `>>` reads the Uint32 as int32, so a block value of 2^31 or
+       more is negative here, and the Uint8Array stores wrap it (modulo 256). */
+    int64_t brightness[3];
     for (int c = 0; c < 3; c++) {
-      uint32_t v = block[pixel * 3 + c] >> 7;
-      brightness[c] = v > 255 ? 255 : (int)v;
+      int64_t v = (int32_t)block[pixel * 3 + c] >> 7;
+      brightness[c] = v > 255 ? 255 : v;
     }
     uint8_t *p = pixels + pixel * 4;
     if (kind_is(encoding, "rgb")) {
@@ -205,6 +212,7 @@ qa_built_lightmap qa_build_q1_lightmap(qa_lightmap_face face,
       p[0] = 0; p[1] = 0; p[2] = 0; p[3] = (uint8_t)(255 - brightness[0]);
     }
   }
+  qa_cleanup_pop(&block_node);
   free(block);
   qa_built_lightmap out = {{face.width, face.height,
       {pixels, (size_t)size * 4}}, encoding};
@@ -217,6 +225,9 @@ qa_built_lightmap qa_build_q2_lightmap(qa_lightmap_face face,
   int64_t size = face_size(face);
   float *block = calloc((size_t)size * 3, sizeof *block);
   if (block == NULL) qa_range_error("lightmap allocation failed");
+  /* A missing style or sample raises: the accumulator goes with it (TS GC). */
+  qa_cleanup block_node;
+  qa_cleanup_push(&block_node, free, block);
   double modulate = options.has_modulate ? options.modulate : 1;
   const char *mono = options.mono != NULL ? options.mono : "0";
   if (face.lighting == NULL) {
@@ -225,8 +236,9 @@ qa_built_lightmap qa_build_q2_lightmap(qa_lightmap_face face,
     for (size_t map_index = 0; map_index < face.style_count; map_index++) {
       double style_index = face.styles[map_index];
       if (style_index == 255) break;
-      if (style_index < 0 || (size_t)style_index >= style_count)
-        qa_range_error("Missing Q2 lightstyle %lld", (long long)style_index);
+      /* styles[styleIndex]: a fraction, NaN or a negative index is undefined. */
+      if (!(style_index >= 0 && style_index == trunc(style_index) && style_index < (double)style_count))
+        qa_range_error("Missing Q2 lightstyle %s", QA_JS_NUMBER(style_index));
       qa_q2_light_style style = styles[(size_t)style_index];
       float scales[3] = {fr(style.rgb.x * modulate),
                          fr(style.rgb.y * modulate),
@@ -247,30 +259,30 @@ qa_built_lightmap qa_build_q2_lightmap(qa_lightmap_face face,
   uint8_t *pixels = malloc((size_t)size * 4);
   if (pixels == NULL) qa_range_error("lightmap allocation failed");
   for (int64_t pixel = 0; pixel < size; pixel++) {
-    double rd = trunc(block[pixel * 3]), gd = trunc(block[pixel * 3 + 1]),
-           bd = trunc(block[pixel * 3 + 2]);
-    int64_t r = rd > 0 ? (int64_t)rd : 0, g = gd > 0 ? (int64_t)gd : 0,
-            b = bd > 0 ? (int64_t)bd : 0;
-    int64_t a = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    /* JS numbers throughout: Math.max keeps NaN (a NaN channel skips the scale-down), an infinite
+       channel scales by 0 to NaN, and the Uint8Array stores apply ToUint8 (NaN and infinities 0). */
+    double r = qa_js_max(0, trunc(block[pixel * 3])), g = qa_js_max(0, trunc(block[pixel * 3 + 1])),
+           b = qa_js_max(0, trunc(block[pixel * 3 + 2]));
+    double a = qa_js_max(qa_js_max(r, g), b);
     if (a > 255) {
-      float s = fr(255.0 / (double)a);
-      r = (int64_t)trunc(fr((double)r * s));
-      g = (int64_t)trunc(fr((double)g * s));
-      b = (int64_t)trunc(fr((double)b * s));
-      a = (int64_t)trunc(fr((double)a * s));
+      double s = fr(255 / a);
+      r = trunc(fr(r * s));
+      g = trunc(fr(g * s));
+      b = trunc(fr(b * s));
+      a = trunc(fr(a * s));
     }
     if (kind_is(mono, "L") || kind_is(mono, "I")) { r = a; g = 0; b = 0; }
     else if (kind_is(mono, "A")) { r = 0; g = 0; b = 0; a = 255 - a; }
     else if (kind_is(mono, "C")) {
-      a = 255 - (r + g + b) / 3;
-      r = (int64_t)trunc((double)r * ((double)a / 255));
-      g = (int64_t)trunc((double)g * ((double)a / 255));
-      b = (int64_t)trunc((double)b * ((double)a / 255));
+      a = 255 - trunc((r + g + b) / 3);
+      r = trunc(r * (a / 255));
+      g = trunc(g * (a / 255));
+      b = trunc(b * (a / 255));
     }
     uint8_t *p = pixels + pixel * 4;
-    /* Uint8Array store wraps mod 256. */
-    p[0] = (uint8_t)r; p[1] = (uint8_t)g; p[2] = (uint8_t)b; p[3] = (uint8_t)a;
+    p[0] = qa_js_to_uint8(r); p[1] = qa_js_to_uint8(g); p[2] = qa_js_to_uint8(b); p[3] = qa_js_to_uint8(a);
   }
+  qa_cleanup_pop(&block_node);
   free(block);
   qa_built_lightmap out = {{face.width, face.height,
       {pixels, (size_t)size * 4}}, kind_is(mono, "0") ? "q2-rgb" : "q2-mono"};
@@ -363,7 +375,7 @@ bool qa_lightmap_atlas_allocate(qa_lightmap_atlas *atlas, double width,
 
 qa_image_level qa_direct_lightmap_pixels(qa_built_lightmap built) {
   if (kind_is(built.encoding, "q2-mono"))
-    qa_range_error("Q2 alternate monochrome encodings require their matching texture environment");
+    qa_raise("Error", 0, 0, "Q2 alternate monochrome encodings require their matching texture environment");
   size_t length = built.image.pixels.length;
   uint8_t *pixels = malloc(length > 0 ? length : 1);
   if (pixels == NULL) qa_range_error("lightmap allocation failed");

@@ -285,7 +285,6 @@ void qa_q2m_perception_restore(qa_q2m_perception *p, qa_q2_game_services *game, 
     qa_actor_id actor2;
     qa_actor_id primary2;
     qa_actor_id secondary2;
-    if (!grow((void **)&p->noises, &p->noise_cap, p->noise_count, sizeof *p->noises)) return;
     actor2 = qa_session_actor_registry_reference_saved(game->host->actors, cp->noises[i].actor, NULL);
     primary2 = qa_session_actor_registry_reference_saved(game->host->actors, cp->noises[i].primary, NULL);
     secondary2 = qa_session_actor_registry_reference_saved(game->host->actors, cp->noises[i].secondary, NULL);
@@ -298,11 +297,19 @@ void qa_q2m_perception_restore(qa_q2m_perception *p, qa_q2_game_services *game, 
     if (!cp->noises[i].secondary_record.has_value && p->has_secondary && qa_same_actor(p->secondary.owner, actor2)) {
       pair.has_secondary_record = true; pair.secondary_record = p->secondary;
     } else pair.has_secondary_record = restore_noise_record(game, cp->noises[i].secondary_record, &pair.secondary_record);
-    p->noises[p->noise_count++] = pair;
+    /* TS noises.set: a second entry for one player replaces the first and keeps its place. */
+    size_t at = 0;
+    while (at < p->noise_count && !qa_same_actor(p->noises[at].actor, actor2)) at++;
+    if (at == p->noise_count) {
+      if (!grow((void **)&p->noises, &p->noise_cap, p->noise_count, sizeof *p->noises)) return;
+      p->noise_count++;
+    }
+    p->noises[at] = pair;
   }
   for (size_t i = 0; i < cp->trail_count; i++) {
     qa_q2m_trail *t = trail_of(p, qa_session_actor_registry_reference_saved(game->host->actors, cp->trails[i].actor, NULL), true);
     if (!t) return;
+    t->count = 0; /* TS trails.set: a second entry for one player replaces the first */
     for (size_t j = 0; j < cp->trails[i].point_count; j++) {
       if (!grow((void **)&t->points, &t->cap, t->count, sizeof *t->points)) return;
       t->points[t->count++] = cp->trails[i].points[j];
@@ -745,16 +752,30 @@ bool qa_q2m_perception_check_attack(qa_q2m_perception *p, qa_q2m_context *c, qa_
   qa_q2_game_services *game = c->game;
   qa_q2_entity *entity = c->entity;
   qa_q2m_state *state = c->state;
-  if (state->combat_point) return false;
+  /* The rerelease lets a monster at its combat point attack an enemy within 100 units (or look for a new one when
+   * it has none). */
+  if (state->combat_point && (!q2m_rr(game) || (entity->has_enemy && qa_q2m_target_distance(c) > 100))) return false;
   if (state->has_sound_target) {
     qa_q2m_sound_target fresh = state->sound_target;
-    if (p->has_primary && qa_same_actor(p->primary.actor, state->sound_target.actor))
+    if (q2m_rr(game)) {
+      /* The rerelease refreshes from the noise owner's own records, not from the most recent noise of any player. */
+      const qa_q2m_noise_pair *pair = NULL;
+      for (size_t i = 0; i < p->noise_count; i++)
+        if (qa_same_actor(p->noises[i].actor, state->sound_target.owner)) { pair = &p->noises[i]; break; }
+      if (pair != NULL && pair->has_primary_record && qa_same_actor(pair->primary_record.actor, state->sound_target.actor))
+        fresh = (qa_q2m_sound_target){pair->primary_record.actor, pair->primary_record.owner, pair->primary_record.origin,
+                                      pair->primary_record.time};
+      else if (pair != NULL && pair->has_secondary_record && qa_same_actor(pair->secondary_record.actor, state->sound_target.actor))
+        fresh = (qa_q2m_sound_target){pair->secondary_record.actor, pair->secondary_record.owner, pair->secondary_record.origin,
+                                      pair->secondary_record.time};
+    } else if (p->has_primary && qa_same_actor(p->primary.actor, state->sound_target.actor))
       fresh = (qa_q2m_sound_target){p->primary.actor, p->primary.owner, p->primary.origin, p->primary.time};
     else if (p->has_secondary && qa_same_actor(p->secondary.actor, state->sound_target.actor))
       fresh = (qa_q2m_sound_target){p->secondary.actor, p->secondary.owner, p->secondary.origin, p->secondary.time};
     state->sound_target = fresh;
     if (q2m_now(game) - fresh.time <= 5) { state->show_hostile = q2m_now(game) + 1; return false; }
-    if (entity->has_goal && entity->has_enemy && qa_same_actor(entity->goal, entity->enemy)) {
+    /* TS `entity.goal === entity.enemy`: two nulls are equal too. */
+    if (entity->has_goal == entity->has_enemy && (!entity->has_goal || qa_same_actor(entity->goal, entity->enemy))) {
       entity->has_goal = state->has_move_target;
       if (state->has_move_target) entity->goal = state->move_target;
     }
@@ -767,7 +788,8 @@ bool qa_q2m_perception_check_attack(qa_q2m_perception *p, qa_q2m_context *c, qa_
   bool enemy_gone = !has_enemy_body || (state->medic ? enemy_health > 0
                                        : state->brutal ? (!q2m_rr(game) && enemy_health <= -80) : enemy_health <= 0);
   if (enemy_gone) {
-    if (p->source_combat_rules == QA_Q2M_RULES_ROGUE) state->medic = false;
+    /* A medic whose patient is alive again has finished its errand; g_ai.c drops AI_MEDIC there. */
+    if (p->source_combat_rules == QA_Q2M_RULES_ROGUE || (state->medic && has_enemy_body)) state->medic = false;
     entity->has_enemy = false; state->close_sight_tripped = false;
     if (q2m_rr(game)) entity->has_goal = false;
     if (state->has_old_enemy && qa_q2m_health(game, &state->old_enemy) > 0) {

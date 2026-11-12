@@ -2,6 +2,7 @@
  * GPL-2.0-or-later. */
 #include "qa/app/bootstrap/network/q3_downloads.h"
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,10 +33,14 @@ static char *copy_text(const char *s) {
 static char *lower_copy(const char *s) { return qa_js_to_lower_case(s); }
 static void archive_cleanup(void *archive) { qa_archive_destroy(archive); }
 static double one_random(void *ctx) { (void)ctx; return 1; }
+static void packages_unwind(void *arg) { qa_app_q3_packages_destroy(arg); }
 qa_app_q3_packages *qa_app_q3_packages_open(const qa_app_q3_package_mount *mounts,
     size_t mount_count, double checksum_feed) {
   qa_app_q3_packages *packages = calloc(1, sizeof *packages);
   if (!packages) return NULL;
+  /* A malformed archive raises out of the loop: the packs registered so far go with it. */
+  qa_cleanup packages_guard;
+  qa_cleanup_push(&packages_guard, packages_unwind, packages);
   size_t capacity = 0;
   for (size_t i = 0; i < mount_count; i++) {
     const qa_app_q3_package_mount *candidate = &mounts[i];
@@ -66,12 +71,14 @@ qa_app_q3_packages *qa_app_q3_packages_open(const qa_app_q3_package_mount *mount
       if (!packages->packs || !packages->members || !packages->games || !packages->basenames)
         qa_range_error("out of memory");
     }
-    size_t slot = packages->pack_count++;
-    packages->games[slot] = game_copy; packages->basenames[slot] = basename;
-    packages->packs[slot] = qa_q3_register_pak(&candidate->mount, archive,
-        game_copy, basename, (int64_t)checksum_feed);
+    size_t slot = packages->pack_count;
     member_set *set = &packages->members[slot];
     set->paths = NULL; set->count = 0;
+    packages->games[slot] = game_copy; packages->basenames[slot] = basename;
+    memset(&packages->packs[slot], 0, sizeof packages->packs[slot]);
+    packages->pack_count++;
+    packages->packs[slot] = qa_q3_register_pak(&candidate->mount, archive,
+        game_copy, basename, (int64_t)checksum_feed);
     size_t member_cap = 0;
     for (size_t e = 0; e < archive->entry_count; e++) {
       if (archive->entries[e].is_directory) continue;
@@ -85,6 +92,7 @@ qa_app_q3_packages *qa_app_q3_packages_open(const qa_app_q3_package_mount *mount
     qa_cleanup_pop(&archive_guard);
     qa_archive_destroy(archive);
   }
+  qa_cleanup_pop(&packages_guard);
   if (!qa_q3_content_references_init(&packages->references, packages->packs,
           packages->pack_count, (int64_t)checksum_feed, one_random, NULL)) {
     qa_app_q3_packages_destroy(packages);
@@ -169,7 +177,7 @@ static int64_t download_read(void *ctx, uint8_t *target, size_t capacity) {
   int64_t remaining = file->size - file->position;
   size_t want = capacity < (size_t)remaining ? capacity : (size_t)remaining;
   ssize_t count = pread(file->fd, target, want, file->position);
-  if (count < 0) qa_range_error("Truncated mounted download");
+  if (count < 0) qa_raise("Error", 0, 0, "Truncated mounted download");
   file->position += count;
   return count;
 }
@@ -208,7 +216,8 @@ bool qa_app_q3_packages_open_download(qa_app_q3_packages *packages,
   }
   if (!mounted) return false;
   int fd = open(mounted->mount.archive_path, O_RDONLY);
-  if (fd < 0) qa_range_error("out of memory");
+  /* TS openSync throws Bun's Error naming the path (ENOENT: no such file or directory, open '...'). */
+  if (fd < 0) qa_content_fs_error(errno, "open", mounted->mount.archive_path);
   struct stat original;
   if (fstat(fd, &original) != 0 || !S_ISREG(original.st_mode)
       || original.st_size <= 0 || original.st_size > 0x7fffffff) {

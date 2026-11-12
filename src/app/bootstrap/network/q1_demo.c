@@ -264,7 +264,9 @@ static void qw_packet(qa_app_quakeworld_demo_input *in, qa_quakeworld_demo_recor
     qa_quakeworld_message *message = &messages[i];
     if (strcmp(message->kind, "server-data") == 0) {
       if (message->player_slot >= 32) qa_raise("Error", 0, 0, "QWD requires a valid native player slot");
-      if (in->has_data) qa_quakeworld_message_destroy(&in->data);
+      /* A server-data moved out of this same packet is still the scope's message (the scope
+       * frees it once `moved` points past it); only an earlier packet's is released here. */
+      if (in->has_data && scope.moved == count) qa_quakeworld_message_destroy(&in->data);
       in->data = *message;
       scope.moved = i; /* ownership moved to in->data; the scope skips it */
       in->has_data = true;

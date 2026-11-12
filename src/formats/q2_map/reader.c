@@ -10,11 +10,33 @@
 #include "qa/core/binary/index.h"
 #include "qa/foundation/support.h"
 
+/* Zeroed, so a raise partway through a lump finds every unfilled slot empty. */
 static void *xmalloc(size_t size) {
-  void *p = malloc(size == 0 ? 1 : size);
+  void *p = calloc(size == 0 ? 1 : size, 1);
   if (p == NULL) qa_range_error("Out of memory");
   return p;
 }
+/* A Quake byte string is Latin-1 text in TS (fixedByteString): a byte past
+ * 0x7f is one code unit, two UTF-8 bytes in a message. Caller frees. */
+static char *latin1_text(const char *bytes) {
+  size_t length = 0;
+  for (const unsigned char *p = (const unsigned char *)bytes; *p != 0; p++) length += *p >= 0x80 ? 2 : 1;
+  char *text = malloc(length + 1);
+  if (text == NULL) qa_range_error("Out of memory");
+  size_t at = 0;
+  for (const unsigned char *p = (const unsigned char *)bytes; *p != 0; p++) {
+    if (*p < 0x80) {
+      text[at++] = (char)*p;
+    } else {
+      text[at++] = (char)(0xc0 | (*p >> 6));
+      text[at++] = (char)(0x80 | (*p & 0x3f));
+    }
+  }
+  text[at] = '\0';
+  return text;
+}
+static void free_slot(void *slot) { free(*(void **)slot); }
+static void reader_release(void *reader) { qa_binary_reader_destroy((qa_binary_reader *)reader); }
 
 static void *xrealloc(void *p, size_t size) {
   void *next = realloc(p, size == 0 ? 1 : size);
@@ -100,12 +122,17 @@ static qa_q2_visibility *read_visibility(qa_binary_reader *reader) {
     qa_range_error("Out of memory");
   uint8_t *compressed = qa_binary_reader_bytes(&copy_section, (int64_t)reader->length);
   qa_binary_reader_destroy(&copy_section);
+  /* A malformed cluster table raises: the copies must not leak. */
+  qa_cleanup compressed_guard;
+  qa_cleanup_push(&compressed_guard, free_slot, &compressed);
   uint32_t count = qa_binary_reader_u32(reader);
   qa_binary_reader records;
   if (!qa_binary_reader_records(reader, (int64_t)reader->cursor, (int64_t)count * 8, 8, &records))
     qa_range_error("Out of memory");
   qa_binary_reader_destroy(&records);
   qa_q2_visibility_cluster *clusters = xmalloc(count * sizeof *clusters);
+  qa_cleanup clusters_guard;
+  qa_cleanup_push(&clusters_guard, free_slot, &clusters);
   for (uint32_t i = 0; i < count; i++) {
     double pvs_offset = qa_binary_reader_i32(reader);
     double phs_offset = qa_binary_reader_i32(reader);
@@ -119,6 +146,8 @@ static qa_q2_visibility *read_visibility(qa_binary_reader *reader) {
     clusters[i].pvs_offset = pvs_offset;
     clusters[i].phs_offset = phs_offset;
   }
+  qa_cleanup_pop(&clusters_guard);
+  qa_cleanup_pop(&compressed_guard);
   qa_q2_visibility *result = xmalloc(sizeof *result);
   result->clusters = clusters;
   result->cluster_count = count;
@@ -129,15 +158,43 @@ static qa_q2_visibility *read_visibility(qa_binary_reader *reader) {
 
 static void validate_q2_bsp(const qa_q2_bsp *map);
 
+/* TS: a throw leaves no map behind. A caught BinaryError from malformed input
+ * releases the readers and everything read into `out` so far. */
+typedef struct q2_parse_state {
+  qa_binary_reader reader, row, section, entity;
+  qa_q2_bsp *out;
+} q2_parse_state;
+static void q2_parse_release(void *arg) {
+  q2_parse_state *state = (q2_parse_state *)arg;
+  qa_binary_reader_destroy(&state->entity);
+  qa_binary_reader_destroy(&state->section);
+  qa_binary_reader_destroy(&state->row);
+  qa_binary_reader_destroy(&state->reader);
+  qa_q2_bsp_destroy(state->out);
+}
+
 void qa_read_q2_bsp(const uint8_t *bytes, size_t length, const char *source, qa_q2_bsp *out) {
   memset(out, 0, sizeof *out);
   const char *name = source != NULL ? source : "<q2-map>";
+  q2_parse_state state;
+  memset(&state, 0, sizeof state);
+  state.out = out;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, q2_parse_release, &state);
   out->source = xstrdup(name);
-  qa_binary_reader reader;
+#define reader state.reader
+#define row state.row
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, name)) qa_range_error("Out of memory");
   char *magic = qa_binary_reader_fixed_byte_string(&reader, 4);
   if (magic == NULL || (strcmp(magic, "IBSP") != 0 && strcmp(magic, "QBSP") != 0)) {
-    qa_binary_error(name, 0, "unsupported Q2 map identifier %s", magic != NULL ? magic : "");
+    char text[16] = {0};
+    if (magic != NULL) {
+      char *utf8 = latin1_text(magic);
+      memcpy(text, utf8, strlen(utf8) < 15 ? strlen(utf8) : 15);
+      free(utf8);
+    }
+    free(magic);
+    qa_binary_error(name, 0, "unsupported Q2 map identifier %s", text);
   }
   bool extended = strcmp(magic, "QBSP") == 0;
   free(magic);
@@ -168,22 +225,19 @@ void qa_read_q2_bsp(const uint8_t *bytes, size_t length, const char *source, qa_
 #define LUMP(n) (out->lumps[n])
   /* Entities */
   {
-    qa_binary_reader section;
-    if (!qa_binary_reader_section(&reader, (int64_t)LUMP(0).offset, (int64_t)LUMP(0).length, &section))
+    if (!qa_binary_reader_section(&reader, (int64_t)LUMP(0).offset, (int64_t)LUMP(0).length, &state.section))
       qa_range_error("Out of memory");
-    out->entity_bytes = qa_binary_reader_bytes(&section, (int64_t)LUMP(0).length);
+    out->entity_bytes = qa_binary_reader_bytes(&state.section, (int64_t)LUMP(0).length);
     out->entity_byte_length = (size_t)LUMP(0).length;
-    qa_binary_reader_destroy(&section);
+    qa_binary_reader_destroy(&state.section);
     char entity_source[1024];
     snprintf(entity_source, sizeof entity_source, "%s:entities", name);
-    qa_binary_reader entity_reader;
-    if (!qa_binary_reader_init(&entity_reader, out->entity_bytes, out->entity_byte_length, entity_source))
+    if (!qa_binary_reader_init(&state.entity, out->entity_bytes, out->entity_byte_length, entity_source))
       qa_range_error("Out of memory");
-    out->entities = qa_binary_reader_fixed_byte_string(&entity_reader, (int64_t)out->entity_byte_length);
-    qa_binary_reader_destroy(&entity_reader);
+    out->entities = qa_binary_reader_fixed_byte_string(&state.entity, (int64_t)out->entity_byte_length);
+    qa_binary_reader_destroy(&state.entity);
   }
   size_t count = 0;
-  qa_binary_reader row;
   row = lump_records(&reader, LUMP(1), 20, &count);
   out->planes = xmalloc(count * sizeof *out->planes);
   out->plane_count = count;
@@ -201,11 +255,10 @@ void qa_read_q2_bsp(const uint8_t *bytes, size_t length, const char *source, qa_
   for (size_t i = 0; i < count; i++) out->vertices[i] = vector(&row);
   qa_binary_reader_destroy(&row);
   {
-    qa_binary_reader section;
-    if (!qa_binary_reader_section(&reader, (int64_t)LUMP(3).offset, (int64_t)LUMP(3).length, &section))
+    if (!qa_binary_reader_section(&reader, (int64_t)LUMP(3).offset, (int64_t)LUMP(3).length, &state.section))
       qa_range_error("Out of memory");
-    out->visibility = read_visibility(&section);
-    qa_binary_reader_destroy(&section);
+    out->visibility = read_visibility(&state.section);
+    qa_binary_reader_destroy(&state.section);
   }
   row = lump_records(&reader, LUMP(4), extended ? 44 : 28, &count);
   out->nodes = xmalloc(count * sizeof *out->nodes);
@@ -244,12 +297,11 @@ void qa_read_q2_bsp(const uint8_t *bytes, size_t length, const char *source, qa_
   }
   qa_binary_reader_destroy(&row);
   {
-    qa_binary_reader section;
-    if (!qa_binary_reader_section(&reader, (int64_t)LUMP(7).offset, (int64_t)LUMP(7).length, &section))
+    if (!qa_binary_reader_section(&reader, (int64_t)LUMP(7).offset, (int64_t)LUMP(7).length, &state.section))
       qa_range_error("Out of memory");
-    out->lighting = qa_binary_reader_bytes(&section, (int64_t)LUMP(7).length);
+    out->lighting = qa_binary_reader_bytes(&state.section, (int64_t)LUMP(7).length);
     out->lighting_length = (size_t)LUMP(7).length;
-    qa_binary_reader_destroy(&section);
+    qa_binary_reader_destroy(&state.section);
   }
   row = lump_records(&reader, LUMP(8), extended ? 52 : 28, &count);
   out->leaves = xmalloc(count * sizeof *out->leaves);
@@ -313,12 +365,11 @@ void qa_read_q2_bsp(const uint8_t *bytes, size_t length, const char *source, qa_
   }
   qa_binary_reader_destroy(&row);
   {
-    qa_binary_reader section;
-    if (!qa_binary_reader_section(&reader, (int64_t)LUMP(16).offset, (int64_t)LUMP(16).length, &section))
+    if (!qa_binary_reader_section(&reader, (int64_t)LUMP(16).offset, (int64_t)LUMP(16).length, &state.section))
       qa_range_error("Out of memory");
-    out->pop = qa_binary_reader_bytes(&section, (int64_t)LUMP(16).length);
+    out->pop = qa_binary_reader_bytes(&state.section, (int64_t)LUMP(16).length);
     out->pop_length = (size_t)LUMP(16).length;
-    qa_binary_reader_destroy(&section);
+    qa_binary_reader_destroy(&state.section);
   }
   row = lump_records(&reader, LUMP(17), 8, &count);
   out->areas = xmalloc(count * sizeof *out->areas);
@@ -340,7 +391,10 @@ void qa_read_q2_bsp(const uint8_t *bytes, size_t length, const char *source, qa_
 #undef LUMP
   out->has_bspx = qa_read_q2_bspx(&reader, end_of_lumps, &out->bspx);
   qa_binary_reader_destroy(&reader);
+#undef reader
+#undef row
   validate_q2_bsp(out);
+  qa_cleanup_pop(&guard);
 }
 
 static const qa_q2_bsp *validate_map;
@@ -433,11 +487,15 @@ static void validate_q2_bsp(const qa_q2_bsp *map) {
     reference(map->area_portals[i].portal, (double)map->area_portal_count, "portal");
   }
   uint8_t *complete = xmalloc(map->node_count);
+  qa_cleanup complete_guard;
+  qa_cleanup_push(&complete_guard, free_slot, &complete);
   uint8_t *active = xmalloc(map->node_count);
-  memset(complete, 0, map->node_count);
-  memset(active, 0, map->node_count);
+  qa_cleanup active_guard;
+  qa_cleanup_push(&active_guard, free_slot, &active);
+  pending_node *pending = NULL;
+  qa_cleanup pending_guard;
+  qa_cleanup_push(&pending_guard, free_slot, &pending);
   for (size_t m = 0; m < map->model_count; m++) {
-    pending_node *pending = NULL;
     size_t pending_count = 0, pending_capacity = 0;
 #define PUSH(item)                                                     \
   do {                                                                 \
@@ -465,8 +523,12 @@ static void validate_q2_bsp(const qa_q2_bsp *map) {
       PUSH(first);
     }
     free(pending);
+    pending = NULL;
 #undef PUSH
   }
+  qa_cleanup_pop(&pending_guard);
+  qa_cleanup_pop(&active_guard);
+  qa_cleanup_pop(&complete_guard);
   free(complete);
   free(active);
 }
@@ -529,9 +591,13 @@ uint8_t *qa_decompress_q2_visibility(const qa_q2_visibility *visibility, double 
   char source[128];
   snprintf(source, sizeof source, "Q2 %s cluster %s", kind, QA_JS_NUMBER(cluster));
   qa_binary_reader reader;
+  qa_cleanup row_guard;
+  qa_cleanup_push(&row_guard, free_slot, &row);
   if (!qa_binary_reader_init(&reader, (uint8_t *)visibility->compressed.bytes,
                              visibility->compressed.length, source))
     qa_range_error("Out of memory");
+  qa_cleanup reader_guard;
+  qa_cleanup_push(&reader_guard, reader_release, &reader);
   qa_binary_reader_seek(&reader, (int64_t)offset);
   size_t output = 0;
   while (output < length) {
@@ -543,6 +609,8 @@ uint8_t *qa_decompress_q2_visibility(const qa_q2_visibility *visibility, double 
     }
     output += run;
   }
+  qa_cleanup_pop(&reader_guard);
+  qa_cleanup_pop(&row_guard);
   qa_binary_reader_destroy(&reader);
   return row;
 }

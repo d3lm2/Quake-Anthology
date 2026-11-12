@@ -25,34 +25,14 @@ typedef struct qa_app_configuration_command_request {
   bool has_seat; qa_seat_id seat;
   qa_command_context source;
 } qa_app_configuration_command_request;
-/* Catalog product facts used by the pure selectors. */
-typedef struct qa_app_configuration_catalog_host {
-  void *ctx;
-  /* Fills family/edition/content directory + optional user root. */
-  bool (*product)(void *ctx, const char *content_id, qa_game_family *family, const char **edition,
-                  const char **content_directory, const char **user_root, const char **base_product);
-  /* All q1 non-quakeworld product content directories/user roots. */
-  size_t (*q1_products)(void *ctx, const char **directories, const char **user_roots, size_t capacity);
-  /* Content open / prepared composition steps. */
-  const char *(*open_initial)(void *ctx, qa_app_configuration_content *content);
-  const char *(*prepare_profile)(void *ctx, const void *args);
-  const char *(*prepare_initial)(void *ctx, const void *args);
-} qa_app_configuration_host;
 /* TS configurationDialect from family/edition. */
 qa_command_dialect qa_app_configuration_dialect_for(qa_game_family family, const char *edition);
-qa_command_dialect qa_app_configuration_dialect(qa_app_configuration_host host, const qa_app_configuration_content *content);
 /* TS configurationStore: fills a store for the reference product. */
-bool qa_app_configuration_store(qa_app_configuration_host host, const qa_app_options *options,
-                                const qa_app_configuration_content *content, const char *reference, qa_config_store *out);
 /* TS legacyConfigurationOptions: false mirrors the TS {} result.
  * game_roots strings are malloc'd into caller arrays (capacity). */
-bool qa_app_legacy_configuration_options(qa_app_configuration_host host, const qa_app_options *options, const char *reference,
-                                         qa_app_legacy_console_config_sources *out, const char **roots_storage, size_t capacity, char **owned_storage);
 /* Routed application command names registered in prepareProfileConfiguration
  * (static base list; q3 map commands added by the caller for q3). */
 const char *const *qa_app_configuration_routed_commands(size_t *out_count);
-qa_app_configuration_content *qa_app_open_initial_configuration_content(qa_app_configuration_host host, qa_app_content_host content_host,
-                                                                        qa_app_options options, const qa_executable_recipe *recipe, bool has_recipe);
 /* --- Catalog-backed forms (landed qa_content_catalog services; the
  * host forms above stay for existing callers). --- */
 /* TS CommandDialect exact text for a dialect. */
@@ -73,6 +53,31 @@ bool qa_app_configuration_store_for_catalog(const qa_content_catalog *catalog, c
 bool qa_app_legacy_configuration_options_for_catalog(const qa_content_catalog *catalog, const qa_app_options *options,
                                                      const char *reference, qa_app_legacy_console_config_sources *out,
                                                      const char **roots_storage, size_t capacity, char **owned_storage);
+/* TS legacyConfigurationOptions' `native` / `mixedLayers` part: a stock game's own configuration files joined to
+ * the settings layers, or a mixed combination's layers. Exactly one of the two is set. `components` are the
+ * selected components (TS default `[reference]` when NULL). The layering owns both; the script files borrow them
+ * (qa_app_configuration_layering_apply) and the construction site destroys the layering when the files go. */
+typedef struct qa_app_configuration_layering {
+  struct qa_app_stock_native *native; /* NULL for a mixed combination */
+  struct qa_app_mixed_layers *mixed;  /* NULL for a stock game */
+} qa_app_configuration_layering;
+qa_app_configuration_layering qa_app_configuration_layering_open(const qa_content_catalog *catalog,
+    const qa_app_options *options, const char *reference, const char *const *components, size_t component_count);
+void qa_app_configuration_layering_apply(const qa_app_configuration_layering *layering,
+    qa_app_console_script_files_options *files);
+void qa_app_configuration_layering_destroy(qa_app_configuration_layering *layering);
+/* TS selectionComponents: source, engine behavior, match, combat, movement (borrowed). */
+#define QA_APP_SELECTION_COMPONENT_COUNT 5
+void qa_app_selection_components(const qa_app_application_configuration_selection *selection,
+    const char *out[QA_APP_SELECTION_COMPONENT_COUNT]);
+/* TS movementConfigurationStore: movement, input and fallback settings belong to the movement provider's product,
+ * so a mixed combination shares them with that product played stock. Files saved earlier in the engine-behavior
+ * product's folder are still read. Returns `settings` itself when the movement owner is the engine-behavior
+ * product; otherwise fills `storage` (a store over the movement product's folder with `settings` as its legacy
+ * store; the caller destroys it) and returns it. */
+const qa_config_store *qa_app_movement_configuration_store(const qa_content_catalog *catalog, const qa_app_options *options,
+    const qa_app_application_configuration_selection *selection, const qa_config_store *settings,
+    qa_config_store *storage, bool *out_owned);
 /* TS configurationScriptReader roots + the hasMod test: caller arrays
  * borrow catalog strings. has_mod mirrors
  * product.contentDirectory !== base.contentDirectory. */
@@ -106,9 +111,6 @@ qa_app_configuration_command_request qa_app_configuration_make_request(const cha
  * present), then opens recipe or launch-preset configuration content
  * and records the (possibly restricted) catalog on it. q3_host may be
  * NULL only when the selected product is not Q3. */
-qa_app_configuration_content *qa_app_open_initial_configuration_content_for_catalog(qa_app_content_host content_host,
-    const qa_content_catalog *catalog, qa_app_options *options, const qa_executable_recipe *recipe, bool has_recipe,
-    const qa_app_q3_product_host *q3_host);
 /* TS sourceConsoleScripts(content, options, settings): console scripts for a
  * loaded world, user files plus the scripts its source product mounts; the
  * content's main mounts stay retained (retainMainMounts) until the files close.
@@ -146,6 +148,9 @@ typedef struct qa_app_prepare_initial_args {
   double default_capacity;
   void (*next_frame)(void *ctx); void *next_frame_ctx;
   void (*on_prepared)(void *ctx, qa_app_prepared_startup *prepared); void *on_prepared_ctx;
+  /* C-only, optional: set to the configuration as soon as it exists, so a caller can close (its image and
+   * prepared startup) and destroy what a raise left behind; TS's catch closes the image and scripts. */
+  struct qa_app_prepared_initial **pending;
 } qa_app_prepare_initial_args;
 typedef struct qa_app_prepared_initial qa_app_prepared_initial;
 qa_app_prepared_initial *qa_app_prepare_initial_configuration(qa_app_options *options,
@@ -201,6 +206,8 @@ typedef struct qa_app_prepare_profile_args {
   const qa_cvar_archive_entry *source_archive; size_t source_archive_count;
   double default_capacity;
   void (*next_frame)(void *ctx); void *next_frame_ctx;
+  /* C-only, optional: as qa_app_prepare_initial_args.pending (TS's catch closes the routing and scripts). */
+  struct qa_app_prepared_profile **pending;
 } qa_app_prepare_profile_args;
 typedef struct qa_app_prepared_profile qa_app_prepared_profile;
 /* TS PreparedProfileConfiguration.bindingChoices row. authored NULL
@@ -241,5 +248,7 @@ void qa_app_prepared_profile_apply_binding_defaults(qa_app_prepared_profile *pro
     const qa_input_binding *defaults, size_t default_count);
 void qa_app_prepared_profile_forward_commands(qa_app_prepared_profile *profile,
     qa_app_profile_forward_fn forward, void *forward_ctx);
+/* The client's prepared startup this profile's continuation was published to, or NULL. */
+qa_app_prepared_startup *qa_app_prepared_profile_published(const qa_app_prepared_profile *profile);
 void qa_app_prepared_profile_destroy(qa_app_prepared_profile *profile);
 #endif

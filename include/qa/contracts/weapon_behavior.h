@@ -34,7 +34,7 @@ typedef struct qa_weapon_behavior_callback {
   qa_module_identity module;
   double function_index;    /* quakec */
   double instruction_index; /* qvm */
-  int64_t image_offset;     /* native-artifact (TS bigint) */
+  uint64_t image_offset;    /* native-artifact (TS bigint, 0..2^64-1 after the reader) */
   qa_native_call_abi abi;   /* native-artifact */
 } qa_weapon_behavior_callback;
 

@@ -45,7 +45,7 @@ void qa_q2_emit_shadow_light(qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_presentation_event ev = {0};
   ev.kind = "dynamic-light";
   ev.has_actor = true; ev.actor = e->actor.id; ev.origin = origin;
-  ev.light_color = packed == 0 ? (qa_vec3){1, 1, 1}
+  ev.light_color = e->skin == 0 ? (qa_vec3){1, 1, 1}
       : (qa_vec3){(qa_js_to_int32((packed >> 24) & 255)) / 255.0, (qa_js_to_int32((packed >> 16) & 255)) / 255.0, (qa_js_to_int32((packed >> 8) & 255)) / 255.0};
   ev.visible = (qa_js_to_int32(e->server_flags) & 1) == 0;
   ev.radius = qa_q2_number_field(&e->spawn, "shadowlightradius", 0);

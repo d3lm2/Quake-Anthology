@@ -23,7 +23,7 @@ static const qa_qvm_instruction *at(const qa_qvm_instruction *instructions,
 static int64_t function_end(const qa_qvm_instruction *instructions, size_t count, int64_t entry) {
   const qa_qvm_instruction *instruction = at(instructions, count, entry);
   if (instruction == NULL || instruction->opcode != QA_QVMY_OP_ENTER)
-    qa_range_error("QVM weapon entry is not an original function");
+    qa_raise("Error", 0, 0, "QVM weapon entry is not an original function");
   int64_t end = entry + 1;
   while (end < (int64_t)count) {
     const qa_qvm_instruction *next = at(instructions, count, end);
@@ -44,13 +44,13 @@ void qa_qvm_validate_weapon_dispatcher(const qa_qvm_weapon_stage *stage,
     for (size_t j = 0; j < i; j++) if ((int64_t)stage->predicates[j].instruction == pc) seen = true;
     if (pc <= entry || pc >= end || seen || instruction == NULL ||
         instruction->opcode < QA_QVMY_OP_EQ || instruction->opcode > QA_QVMY_OP_GEF)
-      qa_range_error("QVM weapon predicate is not a distinct conditional in its original dispatcher");
+      qa_raise("Error", 0, 0, "QVM weapon predicate is not a distinct conditional in its original dispatcher");
   }
   (void)function_end(instructions, instruction_count, (int64_t)stage->request.entry);
   double argument = stage->request.argument;
   if (stage->predicate_count == 0 || stage->settled_count == 0 || stage->request.accepted_count == 0 ||
       !isfinite(argument) || argument != trunc(argument) || argument < 0 || argument >= 62)
-    qa_range_error("QVM weapon stage lacks its original decisions or settlement state");
+    qa_raise("Error", 0, 0, "QVM weapon stage lacks its original decisions or settlement state");
 }
 
 void qa_qvm_validate_weapon_stage(const qa_qvm_weapon_stage *stage,
@@ -62,7 +62,7 @@ void qa_qvm_validate_weapon_stage(const qa_qvm_weapon_stage *stage,
   int64_t instruction_index = (int64_t)continuation->instruction;
   const qa_qvm_instruction *branch = at(instructions, instruction_count, instruction_index);
   if (continuation->when_count == 0)
-    qa_range_error("QVM weapon continuation lacks its source mode conditions");
+    qa_raise("Error", 0, 0, "QVM weapon continuation lacks its source mode conditions");
   for (size_t i = 0; i < continuation->predicate_count; i++) {
     int64_t pc = (int64_t)continuation->predicates[i].instruction;
     const qa_qvm_instruction *instruction = at(instructions, instruction_count, pc);
@@ -70,11 +70,11 @@ void qa_qvm_validate_weapon_stage(const qa_qvm_weapon_stage *stage,
     for (size_t j = 0; j < i; j++) if ((int64_t)continuation->predicates[j].instruction == pc) seen = true;
     if (pc <= entry || pc >= limit || seen || instruction == NULL ||
         instruction->opcode < QA_QVMY_OP_EQ || instruction->opcode > QA_QVMY_OP_GEF)
-      qa_range_error("QVM weapon continuation predicate is not a distinct original conditional");
+      qa_raise("Error", 0, 0, "QVM weapon continuation predicate is not a distinct original conditional");
   }
   if (instruction_index <= entry || instruction_index >= limit || branch == NULL ||
       branch->opcode < QA_QVMY_OP_EQ || branch->opcode > QA_QVMY_OP_GEF || branch->operand_width != 4)
-    qa_range_error("QVM weapon continuation lacks an original conditional boundary");
+    qa_raise("Error", 0, 0, "QVM weapon continuation lacks an original conditional boundary");
   int64_t pc = continuation->original_taken ? instruction_index + 1 : branch->operand;
   int64_t *visited = NULL;
   size_t visited_count = 0;
@@ -83,7 +83,7 @@ void qa_qvm_validate_weapon_stage(const qa_qvm_weapon_stage *stage,
     for (size_t i = 0; i < visited_count; i++) if (visited[i] == pc) seen = true;
     if (pc <= entry || pc >= limit || seen) {
       free(visited);
-      qa_range_error("QVM weapon continuation does not take an original return edge");
+      qa_raise("Error", 0, 0, "QVM weapon continuation does not take an original return edge");
     }
     visited = realloc(visited, (visited_count + 1) * sizeof *visited);
     if (visited == NULL) qa_range_error("QVM memory allocation failed");
@@ -101,7 +101,7 @@ void qa_qvm_validate_weapon_stage(const qa_qvm_weapon_stage *stage,
       continue;
     }
     free(visited);
-    qa_range_error("QVM weapon continuation return edge has source side effects");
+    qa_raise("Error", 0, 0, "QVM weapon continuation return edge has source side effects");
   }
   free(visited);
   int64_t previous = instruction_index;
@@ -114,14 +114,14 @@ void qa_qvm_validate_weapon_stage(const qa_qvm_weapon_stage *stage,
         instruction->opcode != QA_QVMY_OP_CALL || target == NULL ||
         target->opcode != QA_QVMY_OP_CONST || target->operand != (int64_t)call->entry ||
         call->argument_count != 0 || call->global_count != 0 || strcmp(call->returns, "void") != 0)
-      qa_range_error("QVM weapon continuation differs from its ordered original no-argument calls");
+      qa_raise("Error", 0, 0, "QVM weapon continuation differs from its ordered original no-argument calls");
     (void)function_end(instructions, instruction_count, (int64_t)call->entry);
     previous = at_index;
   }
   bool has_dispatcher = false;
   for (size_t i = 0; i < continuation->call_count; i++)
     if (continuation->calls[i].call.entry == stage->dispatcher.entry) has_dispatcher = true;
-  if (!has_dispatcher) qa_range_error("QVM continuation omits its original weapon dispatcher");
+  if (!has_dispatcher) qa_raise("Error", 0, 0, "QVM continuation omits its original weapon dispatcher");
 }
 
 static int32_t proceed_call(qa_qvm_module_function_call *call) {
@@ -181,10 +181,10 @@ qa_item_id qa_qvm_weapon_dispatcher_runtime_active(qa_qvm_weapon_dispatcher_runt
   int32_t selected = scalar_word(dispatcher, actor, &dispatcher->definition->selection.field);
   if (selected == 0) return NULL;
   for (size_t i = 0; i < dispatcher->definition->selection.value_count; i++) {
-    if ((int32_t)dispatcher->definition->selection.values[i].value == selected)
+    if (dispatcher->definition->selection.values[i].value == (double)selected)
       return dispatcher->definition->selection.values[i].item;
   }
-  qa_range_error("Original QVM selected an undeclared source weapon");
+  qa_raise("Error", 0, 0, "Original QVM selected an undeclared source weapon");
 }
 
 typedef struct predicate_state {
@@ -198,7 +198,7 @@ typedef struct predicate_state {
 static bool decide_predicate(void *ctx, bool original, void *call_ctx, qa_qvm_cancel_fn cancel) {
   predicate_state *state = ctx;
   if (!state->dispatcher->operations.live(state->dispatcher->operations.ctx, state->actor))
-    { cancel(call_ctx, state->cancellation); qa_range_error("QVM function scope cancelled"); }
+    { cancel(call_ctx, state->cancellation); qa_raise("Error", 0, 0, "QVM function scope cancelled"); }
   *state->reached = true;
   return state->dispatcher->operations.selected(state->dispatcher->operations.ctx, state->actor)
       ? original : state->unselected;
@@ -231,13 +231,23 @@ typedef struct dispatch_unwind_ctx {
   void *cleanup_ctx;
   qa_qvm_module_branch_binding *bindings;
   predicate_state *states;
+  bool pushed; /* inside the TS try: the scope leaves the list on a raise */
 } dispatch_unwind_ctx;
 
-/* TS catch: try { cleanup(); } finally { remove(); }. */
+static void dispatch_cleanup_body(void *ctx) {
+  dispatch_unwind_ctx *unwind = ctx;
+  void (*cleanup)(void *) = unwind->cleanup;
+  unwind->cleanup = NULL; /* TS cleanup(): the restore runs once */
+  if (cleanup != NULL) cleanup(unwind->cleanup_ctx);
+}
+
+/* TS catch: try { cleanup(); } finally { remove(); }. Nothing raises while the
+ * raise that brought us here unwinds. */
 static void dispatch_unwind(void *ctx) {
   dispatch_unwind_ctx *unwind = ctx;
-  if (unwind->cleanup != NULL) unwind->cleanup(unwind->cleanup_ctx);
-  remove_scope(unwind->dispatcher, unwind->call);
+  qa_caught_error ignored;
+  (void)qa_try(dispatch_cleanup_body, unwind, &ignored);
+  if (unwind->pushed) remove_scope(unwind->dispatcher, unwind->call);
   free(unwind->bindings);
   free(unwind->states);
 }
@@ -253,7 +263,7 @@ static int32_t dispatch_hook(void *ctx, qa_qvm_module_function_call *call) {
     current->entered = true;
     if (!has_actor || !qa_same_actor(actor, current->actor) ||
         !dispatcher->operations.live(dispatcher->operations.ctx, actor))
-      qa_range_error("QVM weapon evaluation lost its original source actor");
+      qa_raise("Error", 0, 0, "QVM weapon evaluation lost its original source actor");
     /* Copy out: nested evaluations may realloc the stack array. */
     qa_qvm_region_evaluation region = current->region;
     const int64_t *inputs = current->inputs;
@@ -275,19 +285,20 @@ static int32_t dispatch_hook(void *ctx, qa_qvm_module_function_call *call) {
     bindings[i].ctx = &states[i];
     bindings[i].decide = decide_predicate;
   }
-  call->branches(call->call_ctx, bindings, count);
-  void (*cleanup)(void *) = NULL;
-  void *cleanup_ctx = NULL;
-  if (dispatcher->operations.prepare != NULL)
-    dispatcher->operations.prepare(dispatcher->operations.ctx, actor, call, &cleanup, &cleanup_ctx);
-  dispatch_unwind_ctx unwind = {dispatcher, call, cleanup, cleanup_ctx, bindings, states};
+  dispatch_unwind_ctx unwind = {dispatcher, call, NULL, NULL, bindings, states, false};
   qa_cleanup guard;
   qa_cleanup_push(&guard, dispatch_unwind, &unwind);
+  call->branches(call->call_ctx, bindings, count); /* before the TS try: its raise keeps the scope */
+  unwind.pushed = true;
+  /* TS try { prepare; proceed; cleanup; completed } catch { cleanup; remove; throw }. */
+  if (dispatcher->operations.prepare != NULL)
+    dispatcher->operations.prepare(dispatcher->operations.ctx, actor, call, &unwind.cleanup,
+                                   &unwind.cleanup_ctx);
   int32_t result = proceed_call(call);
-  qa_cleanup_pop(&guard);
-  if (cleanup != NULL) cleanup(cleanup_ctx);
+  dispatch_cleanup_body(&unwind);
   if (dispatcher->operations.live(dispatcher->operations.ctx, actor))
     dispatcher->operations.completed(dispatcher->operations.ctx, actor, reached);
+  qa_cleanup_pop(&guard);
   remove_scope(dispatcher, call);
   free(bindings);
   free(states);
@@ -304,7 +315,7 @@ static int32_t request_hook(void *ctx, qa_qvm_module_function_call *call) {
       dispatcher->definition->request.accepted, dispatcher->definition->request.accepted_count);
   size_t offset = (size_t)(int64_t)dispatcher->definition->request.argument * 4;
   if (offset > call->words_length || call->words_length - offset < 4)
-    qa_range_error("Offset is outside the bounds of the DataView");
+    qa_range_error("Out of bounds access");
   int32_t requested;
   memcpy(&requested, call->words + offset, 4);
   if (!accepted) dispatcher->operations.attempted(dispatcher->operations.ctx, scope.actor, requested);
@@ -325,6 +336,11 @@ static size_t bind_dispatcher(qa_qvm_weapon_dispatcher_runtime *dispatcher, doub
   return qa_qvm_module_bind_invocation(dispatcher->operations.module, &reference, hook, dispatcher);
 }
 
+static void unbind_first_dispatcher_hook(void *arg) {
+  qa_qvm_weapon_dispatcher_runtime *dispatcher = arg;
+  qa_qvm_module_unbind(dispatcher->operations.module, dispatcher->removal_ids[0]);
+}
+
 void qa_qvm_weapon_dispatcher_runtime_init(qa_qvm_weapon_dispatcher_runtime *dispatcher,
                                    const qa_qvm_weapon_stage *definition,
                                    const qa_qvm_weapon_dispatcher_ops *operations) {
@@ -332,7 +348,11 @@ void qa_qvm_weapon_dispatcher_runtime_init(qa_qvm_weapon_dispatcher_runtime *dis
   dispatcher->definition = definition;
   dispatcher->operations = *operations;
   dispatcher->removal_ids[0] = bind_dispatcher(dispatcher, definition->dispatcher.entry, dispatch_hook);
+  /* TS catch { this.close(); throw }: a refused request hook removes the dispatch hook. */
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, unbind_first_dispatcher_hook, dispatcher);
   dispatcher->removal_ids[1] = bind_dispatcher(dispatcher, definition->request.entry, request_hook);
+  qa_cleanup_pop(&refused);
 }
 
 void qa_qvm_weapon_dispatcher_runtime_destroy(qa_qvm_weapon_dispatcher_runtime *dispatcher) {
@@ -351,7 +371,7 @@ int32_t qa_qvm_weapon_dispatcher_runtime_evaluate(qa_qvm_weapon_dispatcher_runti
                                           const qa_qvm_region_evaluation *region,
                                           const int64_t *inputs, size_t input_count) {
   if (!dispatcher->operations.live(dispatcher->operations.ctx, actor))
-    qa_range_error("QVM weapon evaluation requires its current source actor");
+    qa_raise("Error", 0, 0, "QVM weapon evaluation requires its current source actor");
   if (dispatcher->evaluation_count == dispatcher->evaluation_capacity) {
     dispatcher->evaluation_capacity = dispatcher->evaluation_capacity == 0 ? 8 : dispatcher->evaluation_capacity * 2;
     dispatcher->evaluations = realloc(dispatcher->evaluations, dispatcher->evaluation_capacity * sizeof(evaluation));
@@ -391,7 +411,7 @@ static int64_t resolve_address(qa_qvm_memory *memory, const qa_qvm_mod_input_poi
   if (!pointer->is_global) {
     size_t offset = (size_t)(int64_t)pointer->index * 4;
     if (offset > call->words_length || call->words_length - offset < 4)
-      qa_range_error("Offset is outside the bounds of the DataView");
+      qa_range_error("Out of bounds access");
     memcpy(&value, call->words + offset, 4);
   } else {
     qa_qvm_writable_view view;
@@ -453,10 +473,10 @@ static int32_t input_hook(void *ctx, qa_qvm_module_function_call *call) {
   qa_actor_id actor = input->actor;
   qa_qvm_cancellation_scope cancellation = input->cancellation;
   if (!stage->operations.live(stage->operations.ctx, actor))
-    { call->cancel_function(call->call_ctx, cancellation); qa_range_error("QVM function scope cancelled"); }
+    { call->cancel_function(call->call_ctx, cancellation); qa_raise("Error", 0, 0, "QVM function scope cancelled"); }
   int32_t result = proceed_call(call);
   if (!stage->operations.live(stage->operations.ctx, actor))
-    { call->cancel_function(call->call_ctx, cancellation); qa_range_error("QVM function scope cancelled"); }
+    { call->cancel_function(call->call_ctx, cancellation); qa_raise("Error", 0, 0, "QVM function scope cancelled"); }
   return result;
 }
 
@@ -471,7 +491,7 @@ typedef struct continuation_state {
 static bool decide_continuation_predicate(void *ctx, bool original, void *call_ctx, qa_qvm_cancel_fn cancel) {
   continuation_state *state = ctx;
   if (!state->stage->operations.live(state->stage->operations.ctx, state->actor))
-    { cancel(call_ctx, state->cancellation); qa_range_error("QVM function scope cancelled"); }
+    { cancel(call_ctx, state->cancellation); qa_raise("Error", 0, 0, "QVM function scope cancelled"); }
   return state->stage->operations.selected(state->stage->operations.ctx, state->actor)
       ? original : state->unselected;
 }
@@ -480,7 +500,7 @@ static bool decide_continuation_boundary(void *ctx, bool original, void *call_ct
   continuation_state *state = ctx;
   qa_qvm_mod_weapon_stage *stage = state->stage;
   if (!stage->operations.live(stage->operations.ctx, state->actor))
-    { cancel(call_ctx, state->cancellation); qa_range_error("QVM function scope cancelled"); }
+    { cancel(call_ctx, state->cancellation); qa_raise("Error", 0, 0, "QVM function scope cancelled"); }
   if (original != stage->definition->continuation.original_taken ||
       !qa_qvm_weapon_dispatcher_runtime_matches(&stage->dispatcher, state->actor,
           stage->definition->continuation.when, stage->definition->continuation.when_count))
@@ -537,10 +557,10 @@ static int32_t continue_hook(void *ctx, qa_qvm_module_function_call *call) {
   bindings[count - 1].instruction_index = (int64_t)stage->definition->continuation.instruction;
   bindings[count - 1].ctx = &states[count - 1];
   bindings[count - 1].decide = decide_continuation_boundary;
-  call->branches(call->call_ctx, bindings, count);
   continue_storage storage = {bindings, states};
   qa_cleanup guard;
   qa_cleanup_push(&guard, continue_unwind, &storage);
+  call->branches(call->call_ctx, bindings, count);
   int32_t result = proceed_call(call);
   if (continued) {
     const qa_qvm_weapon_projection *projection = &stage->definition->continuation.projection;
@@ -555,7 +575,7 @@ static int32_t continue_hook(void *ctx, qa_qvm_module_function_call *call) {
             (int64_t)projection->ground.offset, posture.ground);
     for (size_t i = 0; i < stage->definition->continuation.call_count; i++) {
       if (!stage->operations.live(stage->operations.ctx, actor))
-        { call->cancel_function(call->call_ctx, cancellation); qa_range_error("QVM function scope cancelled"); }
+        { call->cancel_function(call->call_ctx, cancellation); qa_raise("Error", 0, 0, "QVM function scope cancelled"); }
       (void)stage->operations.invoke(stage->operations.ctx, actor, &stage->definition->continuation.calls[i].call);
     }
   }
@@ -601,6 +621,25 @@ static void fwd_completed(void *ctx, qa_actor_id actor, bool reached) {
   stage->operations.completed(stage->operations.ctx, actor);
 }
 
+typedef struct stage_init_scope {
+  qa_qvm_mod_weapon_stage *stage;
+  void *adapter;
+  int bound;
+  bool dispatcher_ready;
+} stage_init_scope;
+
+static void stage_init_unwind(void *arg) {
+  stage_init_scope *scope = arg;
+  qa_qvm_mod_weapon_stage *stage = scope->stage;
+  if (scope->bound > 0) qa_qvm_module_unbind(stage->operations.module, stage->removal_ids[0]);
+  if (scope->dispatcher_ready) {
+    qa_qvm_weapon_dispatcher_runtime_close(&stage->dispatcher);
+    qa_qvm_weapon_dispatcher_runtime_destroy(&stage->dispatcher);
+  }
+  free(scope->adapter);
+  memset(stage, 0, sizeof *stage);
+}
+
 void qa_qvm_mod_weapon_stage_init(qa_qvm_mod_weapon_stage *stage, const qa_qvm_weapon_stage *definition,
                                   int64_t input_entry, const qa_qvm_mod_weapon_stage_operations *operations) {
   memset(stage, 0, sizeof *stage);
@@ -620,9 +659,17 @@ void qa_qvm_mod_weapon_stage_init(qa_qvm_mod_weapon_stage *stage, const qa_qvm_w
   dispatcher_ops.attempted = fwd_attempted;
   dispatcher_ops.accepted = fwd_accepted;
   dispatcher_ops.completed = fwd_completed;
+  /* TS: a dispatcher that cannot bind closes itself; a stage hook that cannot
+   * bind closes the stage (the hooks bound so far and its dispatcher). */
+  stage_init_scope scope = {stage, adapter, 0, false};
+  qa_cleanup refused;
+  qa_cleanup_push(&refused, stage_init_unwind, &scope);
   qa_qvm_weapon_dispatcher_runtime_init(&stage->dispatcher, definition, &dispatcher_ops);
+  scope.dispatcher_ready = true;
   stage->removal_ids[0] = bind_stage(stage, (double)input_entry, input_hook);
+  scope.bound = 1;
   stage->removal_ids[1] = bind_stage(stage, definition->continuation.entry, continue_hook);
+  qa_cleanup_pop(&refused);
 }
 
 void qa_qvm_mod_weapon_stage_destroy(qa_qvm_mod_weapon_stage *stage) {

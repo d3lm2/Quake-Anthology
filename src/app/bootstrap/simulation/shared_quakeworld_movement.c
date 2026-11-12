@@ -34,7 +34,7 @@ static void posture(shared_ctx *s, qa_qw_user_command command, qa_qw_movement_st
   wrapped.kind = QA_USER_COMMAND_QW; wrapped.as.qw = command;
   const qa_mod_client_movement_outputs *outputs = s->input.environment.client_outputs;
   qa_user_command effective = qa_client_stance_command(wrapped, outputs ? outputs->has_stance : false, outputs ? outputs->stance : false);
-  if (effective.kind != QA_USER_COMMAND_QW) qa_range_error("Client stance changed movement dialect");
+  if (effective.kind != QA_USER_COMMAND_QW) qa_raise("Error", 0, 0, "Client stance changed movement dialect");
   bool requested = !s->input.environment.flight && effective.as.qw.up_move < 0;
   if (!requested && s->bounds.max.z < s->standing.max.z) {
     clear_env env = {s, state.origin};
@@ -118,7 +118,8 @@ static qa_movement_result shared_move(void *ctx, qa_movement_input input, qa_mov
   if (!(orig && orig->sound)) s->hooks.sound = NULL;
   if (!(orig && orig->player_action)) s->hooks.player_action = NULL;
   s->inner_options = s->options;
-  s->inner_options.has_view_height = true; s->inner_options.view_height = s->view_height;
+  /* get viewHeight() { return viewHeight; }: the posture hook may change it during the move. */
+  s->inner_options.has_view_height = true; s->inner_options.view_height = s->view_height; s->inner_options.view_height_ref = &s->view_height;
   s->inner_options.hooks = &s->hooks;
   qa_movement_provider inner = qa_create_qw_movement_provider(s->id, s->inner_options);
   qa_movement_input next = input;

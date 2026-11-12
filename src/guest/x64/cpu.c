@@ -352,6 +352,9 @@ static qa_x64_flow do_unary(qa_x64_cpu *cpu, qa_x64_decode_cursor *cursor) {
     bool overflow;
     if (width == 64) {
       mul_u64(accumulator, value, &high, &low);
+      /* The signed 128-bit product's high half: subtract each operand where the other is negative. */
+      if (is_signed && (int64_t)accumulator < 0) high -= value;
+      if (is_signed && (int64_t)value < 0) high -= accumulator;
       overflow = is_signed ? high != (((int64_t)low) < 0 ? UINT64_MAX : 0) : high != 0;
     } else if (is_signed) {
       int64_t full = as_int_n(width, accumulator) * as_int_n(width, value);
@@ -411,6 +414,8 @@ static qa_x64_flow do_unary(qa_x64_cpu *cpu, qa_x64_decode_cursor *cursor) {
       int64_t divisor = as_int_n(width, value);
       int64_t dividend = as_int_n(width * 2, raw_dividend);
       if (divisor == 0) pfault(cpu, 0, "Integer divide by zero");
+      /* TS BigInt: 2^63 does not fit; in C the division itself would trap. */
+      if (dividend == INT64_MIN && divisor == -1) pfault(cpu, 0, "Integer quotient overflow");
       int64_t q = dividend / divisor;
       int64_t r = dividend % divisor;
       if (as_int_n(width, (uint64_t)q) != q) pfault(cpu, 0, "Integer quotient overflow");
@@ -1204,6 +1209,7 @@ typedef struct x64_run_state {
   qa_x64_integer_kernel kernel;
   qa_guest_throw *tc;
   qa_guest_throw *previous_throw;
+  bool active; /* an instruction's TS try block is open */
   qa_x64_decode_cursor cursor; /* last: large, initialized on first use */
 } x64_run_state;
 
@@ -1367,7 +1373,6 @@ static void caught_stop(qa_x64_cpu *cpu, x64_run_state *rs) {
   else if (tc->kind == QA_GUEST_THROW_UNSUPPORTED)
     unsupported_stop(cpu, rs, tc, rs->start, rs->has_cursor ? &rs->cursor : NULL, rs->prepared_instruction);
   else {
-    cpu->memory->throw_ctx = rs->previous_throw;
     qa_range_error("Guest throw channel is inconsistent");
   }
   rs->have_stop = true;
@@ -1498,14 +1503,17 @@ static void run_generic(qa_x64_cpu *cpu, x64_run_state *rs, jmp_buf *buf) {
     rs->high_flags = state->flags.high;
     rs->has_cursor = false;
     rs->prepared_instruction = NULL;
+    rs->active = true;
     if (setjmp(*buf) == 0) {
       (void)qa_x64_canonical_address(rs->tc, rs->start);
       uint64_t revision = cpu->callbacks != NULL ? qa_guest_callback_table_entry_revision(cpu->callbacks) : 0;
       rs->retained = select_retained(cpu, rs, rs->start, revision);
       if (enter_instruction(cpu, rs, revision, cpu->blocks_allowed)) return;
       execute_cached_or_decode(cpu, rs);
+      rs->active = false;
       if (rs->have_stop) return;
     } else {
+      rs->active = false;
       caught_stop(cpu, rs);
       return;
     }
@@ -1569,18 +1577,36 @@ static void run_managed(qa_x64_cpu *cpu, x64_run_state *rs, jmp_buf *buf) {
     rs->has_cursor = false;
     rs->prepared_instruction = NULL;
     rs->revision = revision;
+    rs->active = true;
     if (setjmp(*buf) == 0) {
       (void)qa_x64_canonical_address(rs->tc, rs->start);
       if (enter_instruction(cpu, rs, rs->revision, true)) return;
       execute_cached_or_decode(cpu, rs);
+      rs->active = false;
       if (rs->have_stop) return;
     } else {
+      rs->active = false;
       caught_stop(cpu, rs);
       return;
     }
   }
 }
 
+/* TS run(): any other error leaves the instruction's try block with registers, flags and IP restored, then is
+ * rethrown; the memory's fault target and the cache's run depth go back as the run ends. */
+typedef struct x64_unwind { qa_x64_cpu *cpu; x64_run_state *rs; qa_guest_throw *previous; } x64_unwind;
+static void x64_run_unwind(void *arg) {
+  x64_unwind *unwind = arg;
+  x64_run_state *rs = unwind->rs;
+  qa_x64_cpu *cpu = unwind->cpu;
+  if (rs->active) {
+    qa_integer_register_file_restore(&cpu->state->registers, rs->registers, sizeof rs->registers);
+    qa_processor_flags_restore_words(&cpu->state->flags, rs->low_flags, rs->high_flags);
+    cpu->state->instruction_pointer = rs->start;
+  }
+  cpu->cache->run_depth--;
+  cpu->memory->throw_ctx = unwind->previous;
+}
 qa_guest_execution_stop qa_x64_cpu_run(qa_x64_cpu *cpu, int64_t instruction_budget,
                                        bool has_return_address, qa_guest_core_address return_address) {
   if (instruction_budget < 0 || instruction_budget > QA_MAX_SAFE_INTEGER)
@@ -1604,8 +1630,12 @@ qa_guest_execution_stop qa_x64_cpu_run(qa_x64_cpu *cpu, int64_t instruction_budg
   rs->kernel.execute_plan_ctx = cpu;
   if (cpu->cache->run_depth == 0) cache_free_retired(cpu->cache);
   cpu->cache->run_depth++;
+  x64_unwind unwind = {cpu, rs, previous};
+  qa_cleanup unwind_node;
+  qa_cleanup_push(&unwind_node, x64_run_unwind, &unwind);
   if (cpu->managed) run_managed(cpu, rs, &buf);
   else run_generic(cpu, rs, &buf);
+  qa_cleanup_pop(&unwind_node);
   cpu->cache->run_depth--;
   cpu->memory->throw_ctx = previous;
   if (rs->have_stop) return rs->stop;

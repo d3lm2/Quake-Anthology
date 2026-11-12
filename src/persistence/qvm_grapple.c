@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
 #include "qa/persistence/execution.h"
 #include "qa/persistence/shared.h"
 
@@ -59,19 +60,33 @@ static double field_finite(const qa_save_reader *reader, const char *name) {
   return value;
 }
 
+/* The definition and its arrays, released when a malformed declaration raises. */
+static void free_partial(void *arg) {
+  qa_qvm_grapple_definition *definition = arg;
+  free((void *)definition->fire_arguments.values);
+  free((void *)definition->movement.words);
+  free((void *)definition->initial_cvars);
+  free((void *)definition->presentation.view_attachments);
+  free(definition);
+}
 qa_qvm_grapple_definition *qa_read_qvm_grapple_definition(const qa_save_reader *reader) {
   static const char *const profiles[] = {"q3-modern", "q3-1.16n-base"};
   static const char *const cable_kinds[] = {"shader", "model"};
   qa_qvm_grapple_definition *definition =
       (qa_qvm_grapple_definition *)calloc(1, sizeof *definition);
   if (definition == NULL) return NULL;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_partial, definition);
   qa_save_reader fields = field(reader, "fields");
   qa_save_reader globals = field(reader, "globals");
   qa_save_reader callbacks = field(reader, "callbacks");
   qa_save_reader movement = field(reader, "movement");
   qa_save_reader cvars = field(reader, "initialCvars");
   const qa_save_value *cvar_value = cvars.value;
-  if (cvar_value == NULL || cvar_value->kind != QA_SAVE_OBJECT)
+  /* TS: null, a non-object or an array is refused; raw bytes are an object whose keys are its
+   * indexes (none when empty; reading the first fails as a record). */
+  bool cvar_bytes = cvar_value != NULL && cvar_value->kind == QA_SAVE_BYTES;
+  if (cvar_value == NULL || (cvar_value->kind != QA_SAVE_OBJECT && !cvar_bytes))
     qa_save_reader_fail(&cvars, "Expected source settings");
   qa_save_reader presentation = field(reader, "presentation");
   qa_save_reader cable = field(&presentation, "cable");
@@ -125,13 +140,13 @@ qa_qvm_grapple_definition *qa_read_qvm_grapple_definition(const qa_save_reader *
     size_t count = qa_save_reader_list_count(&arguments);
     double *values = count > 0 ? (double *)malloc(count * sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&arguments, "out of memory");
+    definition->fire_arguments.values = values;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&arguments, i);
       values[i] = qa_save_reader_integer(&entry);
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&arguments);
-    definition->fire_arguments.values = values;
     definition->fire_arguments.count = count;
   }
   definition->movement.byte_length = field_integer_min(&movement, "byteLength", 4);
@@ -141,6 +156,7 @@ qa_qvm_grapple_definition *qa_read_qvm_grapple_definition(const qa_save_reader *
     qa_qvm_grapple_movement_word *values =
         count > 0 ? (qa_qvm_grapple_movement_word *)malloc(count * sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&words, "out of memory");
+    definition->movement.words = values;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&words, i);
       values[i].offset = field_integer_min(&entry, "offset", 4);
@@ -154,10 +170,12 @@ qa_qvm_grapple_definition *qa_read_qvm_grapple_definition(const qa_save_reader *
     definition->movement.word_count = count;
   }
   {
-    size_t count = cvar_value->entry_count;
+    if (cvar_bytes && cvar_value->byte_length > 0) qa_save_reader_fail(&cvars, "expected a record");
+    size_t count = cvar_bytes ? 0 : cvar_value->entry_count;
     qa_qvm_grapple_cvar *values =
         count > 0 ? (qa_qvm_grapple_cvar *)malloc(count * sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&cvars, "out of memory");
+    definition->initial_cvars = values;
     for (size_t i = 0; i < count; i++) {
       values[i].name = cvar_value->entries[i].key;
       values[i].value = field_string(&cvars, cvar_value->entries[i].key);
@@ -189,6 +207,7 @@ qa_qvm_grapple_definition *qa_read_qvm_grapple_definition(const qa_save_reader *
     qa_qvm_grapple_view_attachment *values = count > 0
         ? (qa_qvm_grapple_view_attachment *)malloc(count * sizeof *values) : NULL;
     if (count > 0 && values == NULL) qa_save_reader_fail(&attachments, "out of memory");
+    definition->presentation.view_attachments = values;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&attachments, i);
       values[i].path = field_string(&entry, "path");
@@ -224,5 +243,6 @@ qa_qvm_grapple_definition *qa_read_qvm_grapple_definition(const qa_save_reader *
   qa_save_reader_destroy(&cable);
   qa_save_reader_destroy(&anchor);
   qa_save_reader_destroy(&presentation);
+  qa_cleanup_pop(&guard);
   return definition;
 }

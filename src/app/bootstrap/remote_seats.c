@@ -100,14 +100,25 @@ qa_simulation_output qa_app_remote_seat_channel_receive(qa_app_remote_seat_chann
   qa_simulation_output out = {output.snapshot, event_buffer, n};
   return out;
 }
-void qa_app_remote_seat_channel_close(qa_app_remote_seat_channel *c) {
-  if (c->closed) return;
-  c->closed = true;
+static void channel_close_network(void *ctx) {
+  qa_app_remote_seat_channel *c = ctx;
   qa_app_remote_seat_network_close(c->services.network);
+}
+static void channel_disconnect(void *ctx) {
+  qa_app_remote_seat_channel *c = ctx;
   qa_session_client *client = qa_session_seat_client(c->seat);
   if (c->connection != NULL && qa_session_client_connection(client) == c->connection)
     qa_session_client_disconnect(client);
+}
+/* TS: each step in its own try; any failure makes an AggregateError. */
+void qa_app_remote_seat_channel_close(qa_app_remote_seat_channel *c) {
+  if (c->closed) return;
+  c->closed = true;
+  qa_caught_error caught;
+  bool failed = !qa_try(channel_close_network, c, &caught);
+  if (!qa_try(channel_disconnect, c, &caught)) failed = true;
   c->connection = NULL;
+  if (failed) qa_raise("AggregateError", 0, 0, "Remote seat channel cleanup failed");
 }
 typedef struct prepare_state {
   qa_session_seat **seats; qa_app_remote_seat_channel_factory factory;

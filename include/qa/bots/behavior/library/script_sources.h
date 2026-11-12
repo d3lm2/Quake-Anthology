@@ -44,6 +44,9 @@ typedef struct qa_bot_script_sources {
   void *common_print_ctx;
   void (*debug_eval)(void *ctx, const char *text); /* NULL: absent */
   void *debug_eval_ctx;
+  /* The path of the last include resolved (TS ScriptSource.path: the path that was read, with its
+   * separators collapsed, or the including directory's retry). Owned; valid until the next resolve. */
+  char *resolved_path;
 } qa_bot_script_sources;
 
 void qa_bot_script_sources_init(qa_bot_script_sources *s);

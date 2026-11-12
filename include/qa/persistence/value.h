@@ -16,9 +16,15 @@
  *    readers the caller destroys. Generic list<T> becomes an item
  *    count plus per-index readers (callers loop).
  *  - JSON parse/stringify follow JSON.parse/JSON.stringify for the
- *    packed envelope; number formatting uses shortest round-trip
- *    decimal (exponent spelling may differ cosmetically outside
- *    [1e-6, 1e21), as noted in contracts/presentation.c).
+ *    packed envelope; number formatting is qa_net_js_number.
+ *  - Nesting: the parser, the unpack/pack walks and the free are
+ *    iterative. TS's unpack (and the walks its consumers make over a
+ *    plain JSON.parse result) recurse on the JS stack and throw
+ *    RangeError "Maximum call stack size exceeded." at a depth that
+ *    depends on the stack and JIT state (bun 1.3.14: objects nested
+ *    17500 deep failed in some runs, arrays decoded to 25000); C raises
+ *    that RangeError for a node deeper than QA_SAVE_VALUE_MAX_DEPTH, the
+ *    lowest depth measured to fail, after the whole text parsed.
  * GPL-2.0-or-later.
  */
 #ifndef QA_PERSISTENCE_VALUE_H
@@ -30,6 +36,9 @@
 #include <stdnoreturn.h>
 
 noreturn void qa_save_format_error(const char *path, const char *format, ...);
+
+/* See the nesting note above. */
+#define QA_SAVE_VALUE_MAX_DEPTH 17500
 
 typedef enum qa_save_value_kind {
   QA_SAVE_UNDEFINED,
@@ -47,6 +56,9 @@ typedef struct qa_save_value qa_save_value;
 typedef struct qa_save_entry {
   char *key; /* owned */
   qa_save_value *value; /* owned */
+  /* Bytes of `key` when it holds a NUL (a JSON "\u0000" escape), else 0 (strlen). Such a key
+   * never matches a field name, as in TS. */
+  size_t key_length;
 } qa_save_entry;
 
 struct qa_save_value {
@@ -65,6 +77,13 @@ struct qa_save_value {
    * sees it. */
   void *attachment;
   size_t attachment_length;
+  /* Bytes of a string `text` when it holds a NUL (a JSON "\u0000" escape, which a TS string
+   * keeps), else 0 (strlen). The encoder writes the whole text; C-string readers see the
+   * part before the first NUL; qa_save_reader_string_length reports the whole length. */
+  size_t text_length;
+  /* Not data: the whole paths of the readers opened under this node whose path outgrew the
+   * reader's inline text (qa_save_reader.long_path); released with the node. */
+  void *reader_paths;
 };
 
 /* Copies `length` bytes as the node's attachment, replacing any; false on allocation failure. */
@@ -77,6 +96,7 @@ qa_save_value *qa_save_value_boolean(bool value);
 qa_save_value *qa_save_value_number(double value);
 qa_save_value *qa_save_value_bigint_text(const char *decimal);
 qa_save_value *qa_save_value_bigint_i64(int64_t value);
+qa_save_value *qa_save_value_bigint_u64(uint64_t value);
 qa_save_value *qa_save_value_string(const char *value);
 qa_save_value *qa_save_value_bytes(const uint8_t *data, size_t length);
 qa_save_value *qa_save_value_array(void);
@@ -104,8 +124,11 @@ qa_save_value *qa_parse_json_value(const uint8_t *bytes, size_t length, bool qui
 typedef struct qa_save_reader {
   const qa_save_value *value; /* borrowed; NULL means TS undefined */
   /* Held inline so a reader abandoned by a thrown decode error owns nothing. Only error
-   * text reads it; a path beyond the capacity shortens that text. */
+   * text reads it. A path that does not fit keeps its first 255 bytes here, and the whole
+   * path in long_path, a node chain owned by the value tree the reader walks (released with
+   * that tree); qa_save_reader_path builds the whole text. */
   char path[256];
+  const struct qa_save_path_node *long_path;
 } qa_save_reader;
 
 /* `path` NULL means "save". Returns false only on OOM. */
@@ -119,6 +142,9 @@ bool qa_save_reader_is_undefined(const qa_save_reader *reader);
 bool qa_save_reader_is_null(const qa_save_reader *reader);
 
 const char *qa_save_reader_string(const qa_save_reader *reader);
+/* qa_save_reader_string with the whole byte length (TS string.length in UTF-8 bytes), which
+ * exceeds strlen() when the text holds a NUL. */
+const char *qa_save_reader_string_length(const qa_save_reader *reader, size_t *out_length);
 bool qa_save_reader_boolean(const qa_save_reader *reader);
 double qa_save_reader_number(const qa_save_reader *reader);
 double qa_save_reader_finite(const qa_save_reader *reader);
@@ -126,6 +152,9 @@ double qa_save_reader_finite(const qa_save_reader *reader);
 double qa_save_reader_integer(const qa_save_reader *reader);
 double qa_save_reader_integer_min(const qa_save_reader *reader, double minimum);
 int64_t qa_save_reader_bigint(const qa_save_reader *reader);
+/* The bigint as an unsigned 64-bit value; false (out 0) when it is negative or above
+ * 2^64 - 1 (TS compares the whole bigint). */
+bool qa_save_reader_bigint_u64(const qa_save_reader *reader, uint64_t *out);
 const char *qa_save_reader_bigint_text(const qa_save_reader *reader);
 /* Borrowed bytes; *out_length set (may be NULL). */
 const uint8_t *qa_save_reader_bytes(const qa_save_reader *reader, size_t *out_length);
@@ -137,6 +166,9 @@ const char *qa_save_reader_choice_string(const qa_save_reader *reader,
 double qa_save_reader_choice_number(const qa_save_reader *reader,
                                     const double *choices, size_t count);
 noreturn void qa_save_reader_fail(const qa_save_reader *reader, const char *format, ...);
+/* The reader's whole path, malloc'd (NULL on OOM); for callers that raise their own
+ * SaveFormatError with a reader's path. */
+char *qa_save_reader_path(const qa_save_reader *reader);
 
 /* Borrowed string value when it is a namespaced identity. */
 const char *qa_namespaced(const qa_save_reader *reader);

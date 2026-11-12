@@ -58,10 +58,11 @@ static char *dups(const char *s) {
 }
 static qa_bot_vec3 v3(double x, double y, double z) { return (qa_bot_vec3){x, y, z}; }
 
-/* awareness map (insertion order) */
+/* awareness map (insertion order). The key is kept beside the record: TS keys the Map by the
+   entity id and a restored checkpoint may carry a record whose own id differs from its key. */
 static qa_bot_awareness *awareness_get(qa_bot_brain *brain, int64_t id) {
   for (size_t i = 0; i < brain->state.awareness_count; i++)
-    if (brain->state.awareness[i].id == id) return &brain->state.awareness[i];
+    if (brain->state.awareness_keys[i] == id) return &brain->state.awareness[i];
   return NULL;
 }
 static qa_bot_awareness *awareness_ensure(qa_bot_brain *brain, int64_t id, double now, qa_bot_vec3 origin) {
@@ -71,16 +72,22 @@ static qa_bot_awareness *awareness_ensure(qa_bot_brain *brain, int64_t id, doubl
     size_t c = brain->state.awareness_cap ? brain->state.awareness_cap * 2 : 8;
     qa_bot_awareness *p = realloc(brain->state.awareness, c * sizeof *p);
     if (!p) qa_range_error("Out of memory");
-    brain->state.awareness = p; brain->state.awareness_cap = c;
+    brain->state.awareness = p;
+    int64_t *k = realloc(brain->state.awareness_keys, c * sizeof *k);
+    if (!k) qa_range_error("Out of memory");
+    brain->state.awareness_keys = k; brain->state.awareness_cap = c;
   }
+  brain->state.awareness_keys[brain->state.awareness_count] = id;
   brain->state.awareness[brain->state.awareness_count++] = qa_new_awareness(id, now, origin);
   return &brain->state.awareness[brain->state.awareness_count - 1];
 }
 static void awareness_delete(qa_bot_brain *brain, int64_t id) {
   for (size_t i = 0; i < brain->state.awareness_count; i++)
-    if (brain->state.awareness[i].id == id) {
+    if (brain->state.awareness_keys[i] == id) {
       memmove(&brain->state.awareness[i], &brain->state.awareness[i + 1],
               (brain->state.awareness_count - i - 1) * sizeof *brain->state.awareness);
+      memmove(&brain->state.awareness_keys[i], &brain->state.awareness_keys[i + 1],
+              (brain->state.awareness_count - i - 1) * sizeof *brain->state.awareness_keys);
       brain->state.awareness_count--;
       return;
     }
@@ -168,6 +175,7 @@ static void memory_clear_dynamic(qa_bot_brain_memory *s) {
   s->has_owned_path = false;
   s->path_state.path = NULL;
   free(s->awareness); s->awareness = NULL; s->awareness_count = s->awareness_cap = 0;
+  free(s->awareness_keys); s->awareness_keys = NULL;
   free(s->unreachable_until); s->unreachable_until = NULL; s->unreachable_count = s->unreachable_cap = 0;
   free(s->objective_home); s->objective_home = NULL; s->objective_home_count = s->objective_home_cap = 0;
   for (size_t i = 0; i < s->said_count; i++) free(s->said_this_level[i]);
@@ -191,8 +199,13 @@ bool qa_bot_brain_init(qa_bot_brain *brain, qa_bot_brain_config config) {
   if (!brain->config.skill) { qa_bot_game_mode_destroy(&brain->config.game_mode); return false; }
   const qa_bot_skill_settings *settings = qa_bot_knowledge_get_skill(config.knowledge, brain->config.skill);
   if (!settings && config.knowledge->settings_r.skill_count > 0) settings = &config.knowledge->settings_r.skills[0];
-  if (!settings)
-    qa_range_error("bot_brain: no skill settings available (asked for \"%s\")", brain->config.skill);
+  if (!settings) {
+    /* the copies made above are released before the raise; the message reads the caller's string */
+    free((void *)brain->config.skill);
+    qa_bot_game_mode_destroy(&brain->config.game_mode);
+    memset(brain, 0, sizeof *brain);
+    qa_raise("Error", 0, 0, "bot_brain: no skill settings available (asked for \"%s\")", config.skill ? config.skill : "");
+  }
   brain->settings = settings;
   memory_init(&brain->state);
   if (!brain->state.objective_role) { qa_bot_brain_destroy(brain); return false; }
@@ -272,7 +285,7 @@ bool qa_bot_brain_checkpoint_make(qa_bot_brain *brain, qa_bot_brain_checkpoint *
   m->awareness_count = s->awareness_count;
   if (m->awareness_count) {
     m->awareness = malloc(m->awareness_count * sizeof *m->awareness); if (!m->awareness) goto oom;
-    for (size_t i = 0; i < m->awareness_count; i++) m->awareness[i] = (qa_bot_awareness_entry){s->awareness[i].id, s->awareness[i]};
+    for (size_t i = 0; i < m->awareness_count; i++) m->awareness[i] = (qa_bot_awareness_entry){s->awareness_keys[i], s->awareness[i]};
   }
   m->unreachable_count = s->unreachable_count;
   if (m->unreachable_count) {
@@ -299,7 +312,7 @@ oom:
 }
 bool qa_bot_brain_restore(qa_bot_brain *brain, const qa_bot_brain_checkpoint *checkpoint) {
   if (checkpoint->version != 1 || !checkpoint->skill || strcmp(checkpoint->skill, brain->settings->skill))
-    qa_range_error("Bot behavior checkpoint has another source skill/profile version");
+    qa_raise("Error", 0, 0, "Bot behavior checkpoint has another source skill/profile version");
   const qa_bot_brain_checkpoint_memory *m = &checkpoint->memory;
   brain->has_failed_plan_goal = false;
   brain->has_planned_goal = false;
@@ -457,7 +470,7 @@ void qa_bot_brain_emit_chat(qa_bot_brain *brain, const char *type) {
   if (!candidates) qa_range_error("Out of memory");
   if (count == 0) { free((void *)candidates); return; }
   int64_t index = qa_bot_random_index(brain->config.rng, (int64_t)count);
-  if (index < 0 || index >= (int64_t)count) { free((void *)candidates); qa_range_error("Bot chat selection is outside its source candidates"); }
+  if (index < 0 || index >= (int64_t)count) { free((void *)candidates); qa_raise("Error", 0, 0, "Bot chat selection is outside its source candidates"); }
   const qa_chat_entry *chat = candidates[index];
   qa_bot_chat_event event = {chat->locstring, chat->type, chat->time, chat->team};
   double chance = chat->chance;
@@ -523,7 +536,7 @@ static void update_senses(qa_bot_brain *brain, qa_bot_world *world, qa_bot_self 
   }
   size_t i = 0;
   while (i < brain->state.awareness_count) {
-    if (qa_bot_should_forget(&brain->state.awareness[i], senses, now)) awareness_delete(brain, brain->state.awareness[i].id);
+    if (qa_bot_should_forget(&brain->state.awareness[i], senses, now)) awareness_delete(brain, brain->state.awareness_keys[i]);
     else i++;
   }
 }
@@ -573,7 +586,7 @@ static void update_objectives(qa_bot_brain *brain, const qa_bot_entity *entities
     if (!objhome_get(brain, ent->id, &home)) { objhome_set(brain, ent->id, ent->origin); home = ent->origin; }
     int64_t team = item->entry->has_team ? (int64_t)item->entry->team : ent->team;
     if (team <= 0 || self.team <= 0) continue;
-    if (!objhome_get(brain, ent->id, &home)) qa_range_error("Bot objective lost its remembered home");
+    if (!objhome_get(brain, ent->id, &home)) qa_raise("Error", 0, 0, "Bot objective lost its remembered home");
     if (team == self.team) { s->own_objective_home = home; s->has_own_objective_home = true; }
     else { s->enemy_objective_home = home; s->has_enemy_objective_home = true; }
   }
@@ -737,19 +750,21 @@ static bool hazard_below(qa_bot_world *world, double x, double y, double z) {
 }
 static bool hazard_under_segment(qa_bot_world *world, qa_bot_vec3 a, qa_bot_vec3 b) {
   double len = qa_bvec_distance(a, b);
-  double steps_d = ceil(len / 64);
-  int64_t steps = steps_d > 1 ? (int64_t)steps_d : 1;
-  for (int64_t i = 1; i < steps; i++) {
-    double f = (double)i / (double)steps;
+  /* Math.max(1, Math.ceil(len / 64)) as a JS number: NaN runs no sample, and no int cast. */
+  double steps = qa_js_max(1, ceil(len / 64));
+  for (double i = 1; i < steps; i++) {
+    double f = i / steps;
     if (hazard_below(world, a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f)) return true;
   }
   return false;
 }
 static bool in_hazard(qa_bot_world *world, qa_bot_self self) {
+  /* TS `isBad(a) || isBad(b)`: the feet are sampled only when the origin is not already bad. */
   int64_t c1 = world->point_contents(world->ctx, self.origin);
+  if (c1 == QA_BOT_CONTENTS_LAVA || c1 == QA_BOT_CONTENTS_SLIME) return true;
   qa_bot_vec3 feet = self.origin; feet.z -= 20;
   int64_t c2 = world->point_contents(world->ctx, feet);
-  return c1 == QA_BOT_CONTENTS_LAVA || c1 == QA_BOT_CONTENTS_SLIME || c2 == QA_BOT_CONTENTS_LAVA || c2 == QA_BOT_CONTENTS_SLIME;
+  return c2 == QA_BOT_CONTENTS_LAVA || c2 == QA_BOT_CONTENTS_SLIME;
 }
 static bool hazard_exit(qa_bot_world *world, qa_bot_self self, qa_bot_vec3 *out) {
   for (int i = 0; i < LAVA_EXIT_SAMPLES; i++) {
@@ -772,7 +787,7 @@ static MoveDir move_direction(qa_bot_brain *brain, qa_bot_usercmd cmd) {
   double rx = sin(yaw), ry = -cos(yaw);
   double mx = fx * cmd.forwardmove + rx * cmd.sidemove;
   double my = fy * cmd.forwardmove + ry * cmd.sidemove;
-  double ml = hypot(mx, my);
+  double ml = qa_js_hypot2(mx, my);
   if (ml < 1) return (MoveDir){false, 0, 0};
   return (MoveDir){true, mx / ml, my / ml};
 }
@@ -782,7 +797,7 @@ static GapAhead gap_ahead(qa_bot_brain *brain, qa_bot_world *world, qa_bot_self 
   MoveDir dir = move_direction(brain, cmd);
   if (!dir.has) return (GapAhead){false, 0, false};
   double mx = dir.x, my = dir.y;
-  double speed = hypot(self.velocity.x, self.velocity.y);
+  double speed = qa_js_hypot2(self.velocity.x, self.velocity.y);
   double ahead = EDGE_LOOKAHEAD + speed * EDGE_STOP_SECONDS;
   if (has_steer) {
     double along = (steer_at.x - self.origin.x) * mx + (steer_at.y - self.origin.y) * my;
@@ -821,7 +836,7 @@ static GapAhead gap_ahead(qa_bot_brain *brain, qa_bot_world *world, qa_bot_self 
 }
 static bool jump_lands_in_hazard(qa_bot_brain *brain, qa_bot_world *world, qa_bot_self self, qa_bot_usercmd cmd) {
   double vx = self.velocity.x, vy = self.velocity.y;
-  double speed = hypot(vx, vy);
+  double speed = qa_js_hypot2(vx, vy);
   if (speed < 1) {
     MoveDir dir = move_direction(brain, cmd);
     if (!dir.has) return false;
@@ -1050,7 +1065,8 @@ static bool select_goal(qa_bot_brain *brain, qa_bot_world *world, const qa_bot_e
   if (s->has_explicit_goal && !s->explicit_goal_done && !s->explicit_goal_failed) {
     if (s->explicit_goal.is_entity) {
       const qa_bot_entity *ent = NULL;
-      for (size_t i = 0; i < count; i++) if ((double)entities[i].id == (double)s->explicit_goal.entity_id) ent = &entities[i];
+      /* TS entities.find: the first match. */
+      for (size_t i = 0; i < count && !ent; i++) if ((double)entities[i].id == (double)s->explicit_goal.entity_id) ent = &entities[i];
       if (!ent) s->explicit_goal_failed = true;
       else {
         s->explicit_goal.point = ent->origin;
@@ -1171,8 +1187,9 @@ static void ensure_path(qa_bot_brain *brain, qa_bot_world *world, qa_bot_vec3 go
     }
   }
   /* The hazard memo lives per navigation graph, because every plan asks about every node. */
-  if (brain->hazard_nav != nav->ctx) {
+  if (brain->hazard_nav != nav->ctx || brain->hazard_identity != nav->identity) {
     brain->hazard_nav = nav->ctx;
+    brain->hazard_identity = nav->identity;
     brain->hazard_count = 0;
   }
   CapsCtx caps_ctx; memset(&caps_ctx, 0, sizeof caps_ctx); caps_ctx.world = world;
@@ -1213,7 +1230,8 @@ static qa_bot_vec3 aim_point_for(qa_bot_brain *brain, const qa_bot_entity *targe
     size_t count = 0;
     (void)qa_bot_knowledge_skill_name(brain->config.knowledge, 0, &count);
     int64_t rank = -1;
-    for (size_t i = 0; i < count; i++) {
+    /* TS names.indexOf: the first match. */
+    for (size_t i = 0; i < count && rank < 0; i++) {
       const char *name = qa_bot_knowledge_skill_name(brain->config.knowledge, i, NULL);
       if (name && !strcmp(name, brain->settings->skill)) rank = (int64_t)i;
     }

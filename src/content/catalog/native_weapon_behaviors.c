@@ -1,6 +1,7 @@
 /* Port of src/content/catalog/native-weapon-behaviors.ts.
  * GPL-2.0-or-later. */
 #include "qa/content/catalog/native_weapon_behaviors.h"
+#include "qa/content/json_text.h"
 
 #include "catalog_internal.h"
 
@@ -8,7 +9,7 @@ bool qa_read_native_weapon_behavior_document(
     const uint8_t *bytes, size_t length,
     qa_native_weapon_behavior_document *out) {
   memset(out, 0, sizeof *out);
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (value == NULL) return false;
   qa_save_reader reader = {0};
   if (!qa_save_reader_init(&reader, value, "native-weapon-behaviors.json")) {
@@ -16,10 +17,11 @@ bool qa_read_native_weapon_behavior_document(
     return false;
   }
   qa_save_reader version = {0}, profiles = {0};
-  bool ok = qa_save_reader_field(&reader, "version", &version) &&
-            qa_save_reader_field(&reader, "profiles", &profiles);
+  /* TS order: version is read and checked before profiles is looked up. */
+  bool ok = qa_save_reader_field(&reader, "version", &version);
+  if (ok) (void)qa_save_reader_literal_number(&version, 1);
+  ok = ok && qa_save_reader_field(&reader, "profiles", &profiles);
   if (ok) {
-    (void)qa_save_reader_literal_number(&version, 1);
     out->profile_count = qa_save_reader_list_count(&profiles);
     out->profiles = profiles.value != NULL
                         ? (const qa_save_value *const *)profiles.value->items

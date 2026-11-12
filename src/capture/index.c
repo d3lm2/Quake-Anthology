@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "qa/content/archive/types.h"
 #include "qa/formats/images/jpeg_encoder.h"
 #include "qa/formats/images/png_encoder.h"
 #include "qa/formats/images/tga.h"
@@ -99,17 +100,36 @@ bool qa_make_levelshot(const qa_image_level *image, const uint8_t *gamma,
 
 bool qa_frame_capture_init(qa_frame_capture *capture, const char *root,
                            qa_frame_readback readback) {
+  /* TS Q3_SCREENSHOTS. */
+  const qa_screenshot_naming q3 = {"screenshots", "shot", 4};
+  return qa_frame_capture_init_naming(capture, root, readback, q3);
+}
+
+bool qa_frame_capture_init_naming(qa_frame_capture *capture, const char *root,
+                                  qa_frame_readback readback, qa_screenshot_naming naming) {
+  memset(capture, 0, sizeof *capture);
   capture->root = strdup(root);
-  if (capture->root == NULL) return false;
+  char *directory = strdup(naming.directory);
+  char *prefix = strdup(naming.prefix);
+  if (capture->root == NULL || directory == NULL || prefix == NULL) {
+    free(capture->root);
+    free(directory);
+    free(prefix);
+    capture->root = NULL;
+    return false;
+  }
   capture->readback = readback;
-  for (size_t i = 0; i < sizeof capture->next_shot / sizeof capture->next_shot[0]; i++)
-    capture->next_shot[i] = 0;
+  capture->naming.directory = directory;
+  capture->naming.prefix = prefix;
+  capture->naming.digits = naming.digits;
   return true;
 }
 
 void qa_frame_capture_destroy(qa_frame_capture *capture) {
   if (capture == NULL) return;
   free(capture->root);
+  free((char *)capture->naming.directory);
+  free((char *)capture->naming.prefix);
   memset(capture, 0, sizeof *capture);
 }
 
@@ -128,16 +148,28 @@ static const char *format_extension(qa_screenshot_format format) {
   return "";
 }
 
-/* TS mkdir(dirname, {recursive:true}) for an absolute directory. */
-static bool make_directories(char *dir) {
-  for (size_t i = 1; dir[i] != '\0'; i++) {
-    if (dir[i] != '/') continue;
-    dir[i] = '\0';
-    bool ok = mkdir(dir, 0777) == 0 || errno == EEXIST;
-    dir[i] = '/';
-    if (!ok) return false;
+/* TS mkdir(dirname, { recursive: true }) as Bun runs it: the full path first;
+ * ENOENT walks up to the parent and retries; any other failure raises Bun's
+ * Error naming the path that failed (an existing non-directory is EEXIST). */
+static void make_directories(const char *dir) {
+  if (mkdir(dir, 0777) == 0) return;
+  int error = errno;
+  if (error == EEXIST) {
+    struct stat status;
+    if (stat(dir, &status) == 0 && S_ISDIR(status.st_mode)) return;
+    qa_content_fs_error(EEXIST, "mkdir", dir);
   }
-  return mkdir(dir, 0777) == 0 || errno == EEXIST;
+  if (error != ENOENT) qa_content_fs_error(error, "mkdir", dir);
+  const char *slash = strrchr(dir, '/');
+  if (slash == NULL || slash == dir) qa_content_fs_error(error, "mkdir", dir);
+  char *parent = strndup(dir, (size_t)(slash - dir));
+  if (parent == NULL) capture_error("out of memory");
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, parent);
+  make_directories(parent);
+  qa_cleanup_pop(&guard);
+  free(parent);
+  if (mkdir(dir, 0777) != 0 && errno != EEXIST) qa_content_fs_error(errno, "mkdir", dir);
 }
 
 /* settingsPath(root, relative) with a formatted relative name;
@@ -154,6 +186,30 @@ static char *capture_path(const qa_frame_capture *capture, const char *relative_
   return path;
 }
 
+/* settingsPath(root, joinFolder(naming.directory, `${stem}.${extension}`)). */
+static char *naming_path(const qa_frame_capture *capture, const char *stem, const char *extension) {
+  const char *directory = capture->naming.directory;
+  size_t length = strlen(directory) + 1 + strlen(stem) + 1 + strlen(extension) + 1;
+  char *relative = (char *)malloc(length);
+  if (relative == NULL) return NULL;
+  if (directory[0] == '\0') (void)snprintf(relative, length, "%s.%s", stem, extension);
+  else (void)snprintf(relative, length, "%s/%s.%s", directory, stem, extension);
+  char *path = qa_settings_path(capture->root, relative);
+  free(relative);
+  return path;
+}
+
+typedef struct shot_scratch {
+  uint8_t *bytes;
+  char *candidate;
+} shot_scratch;
+
+static void shot_scratch_release(void *raw) {
+  shot_scratch *scratch = (shot_scratch *)raw;
+  free(scratch->candidate);
+  free(scratch->bytes);
+}
+
 bool qa_frame_capture_screenshot(qa_frame_capture *capture,
                                  qa_screenshot_format format, const char *name,
                                  int64_t quality, qa_capture_result *out) {
@@ -165,65 +221,96 @@ bool qa_frame_capture_screenshot(qa_frame_capture *capture,
   if (bytes == NULL) return false;
   char *path = NULL;
   if (name != NULL) {
-    path = capture_path(capture, "screenshots/%s.%s", name, extension);
-    if (path == NULL || !qa_write_atomic(path, bytes, byte_length)) {
-      free(path);
+    path = naming_path(capture, name, extension);
+    if (path == NULL) {
       free(bytes);
       return false;
+    }
+    if (!qa_write_atomic(path, bytes, byte_length)) {
+      /* TS writeAtomic rejects with the Node fs Error, which the caller sees. */
+      free(path);
+      free(bytes);
+      qa_settings_raise_write_failure();
     }
   } else {
     /* TS nextShot: the first unnamed index to try per format; the directory
      * is made once, on that first index. */
     const int start = (int)capture->next_shot[format];
-    for (int index = start; index < 10000 && path == NULL; index++) {
-      char stem[16];
-      (void)snprintf(stem, sizeof stem, "shot%04d", index);
-      char *candidate = capture_path(capture, "screenshots/%s.%s", stem, extension);
+    /* TS limit: the original Quake 3 stops at shot9999; the Quake and Quake II
+     * names only pad to two digits and keep counting. */
+    int limit = 1000000;
+    if (capture->naming.digits >= 4) {
+      double power = 1;
+      for (int digit = 0; digit < capture->naming.digits; digit++) power *= 10;
+      limit = power > 2147483647.0 ? 2147483647 : (int)power;
+    }
+    for (int index = start; index < limit && path == NULL; index++) {
+      /* `${prefix}${String(index).padStart(digits, "0")}` */
+      size_t stem_length = strlen(capture->naming.prefix) + 16 +
+                           (capture->naming.digits > 0 ? (size_t)capture->naming.digits : 0);
+      char *stem = (char *)malloc(stem_length);
+      if (stem == NULL) {
+        free(bytes);
+        return false;
+      }
+      (void)snprintf(stem, stem_length, "%s%0*d", capture->naming.prefix,
+                     capture->naming.digits > 0 ? capture->naming.digits : 1, index);
+      char *candidate = naming_path(capture, stem, extension);
+      free(stem);
       if (candidate == NULL) {
         free(bytes);
         return false;
       }
+      /* The file-system failures reject with Bun's Error; the buffers are
+       * released on the way out. */
+      shot_scratch scratch = {bytes, candidate};
+      qa_cleanup guard;
+      qa_cleanup_push(&guard, shot_scratch_release, &scratch);
       if (index == start) {
         const char *slash = strrchr(candidate, '/');
         char *dir = strndup(candidate, (size_t)(slash - candidate));
-        bool made = dir != NULL && make_directories(dir);
+        if (dir == NULL) capture_error("out of memory");
+        qa_cleanup dir_guard;
+        qa_cleanup_push(&dir_guard, free, dir);
+        make_directories(dir);
+        qa_cleanup_pop(&dir_guard);
         free(dir);
-        if (!made) {
-          free(candidate);
-          free(bytes);
-          return false;
-        }
       }
-      int fd = open(candidate, O_WRONLY | O_CREAT | O_EXCL, 0666);
+      int fd = open(candidate, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
       if (fd < 0) {
         int error = errno;
+        if (error != EEXIST) qa_content_fs_error(error, "open", candidate);
+        qa_cleanup_pop(&guard);
         free(candidate);
-        if (error == EEXIST) continue;
-        free(bytes);
-        return false;
+        continue;
       }
-      bool ok = true;
       size_t written = 0;
+      int write_error = 0;
       while (written < byte_length) {
         ssize_t chunk = write(fd, bytes + written, byte_length - written);
+        if (chunk < 0 && errno == EINTR) continue;
         if (chunk <= 0) {
-          ok = false;
+          write_error = chunk < 0 ? errno : EIO;
           break;
         }
         written += (size_t)chunk;
       }
-      if (close(fd) != 0) ok = false; /* TS finally close */
-      if (!ok) {
-        free(candidate);
-        free(bytes);
-        return false;
-      }
+      /* TS try { writeFile } finally { close } */
+      int close_error = close(fd) != 0 ? errno : 0;
+      if (write_error != 0) qa_content_fs_error(write_error, "write", NULL);
+      if (close_error != 0) qa_content_fs_error(close_error, "close", NULL);
+      qa_cleanup_pop(&guard);
       path = candidate;
       capture->next_shot[format] = index + 1;
     }
     if (path == NULL) {
       free(bytes);
-      capture_error("No free screenshot filename between shot0000 and shot9999");
+      char nines[128];
+      size_t nine_count = capture->naming.digits > 0 ? (size_t)capture->naming.digits : 0;
+      if (nine_count > sizeof nines - 1) nine_count = sizeof nines - 1;
+      memset(nines, '9', nine_count);
+      nines[nine_count] = '\0';
+      capture_error("No free screenshot filename after %s%s", capture->naming.prefix, nines);
     }
   }
   free(bytes);
@@ -259,10 +346,15 @@ bool qa_frame_capture_levelshot(qa_frame_capture *capture, const char *map_name,
   }
   char *path = capture_path(capture, "levelshots/%s.%s", stripped, "tga");
   free(stripped);
-  if (path == NULL || !qa_write_atomic(path, bytes, byte_length)) {
-    free(path);
+  if (path == NULL) {
     free(bytes);
     return false;
+  }
+  if (!qa_write_atomic(path, bytes, byte_length)) {
+    /* TS writeAtomic rejects with the Node fs Error, which the caller sees. */
+    free(path);
+    free(bytes);
+    qa_settings_raise_write_failure();
   }
   free(bytes);
   out->path = path;

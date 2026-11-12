@@ -1042,10 +1042,14 @@ void qa_ui_menu_token_cursor_dispose(qa_ui_menu_token_cursor *cursor) {
 
 /* ---- UiMenuSourceParser ---- */
 
+typedef struct qa_ui_menu_source_parser parser_t;
 typedef struct parser_catch {
   jmp_buf buf;
   qa_ui_menu_token_cursor *cursor;
   struct parser_catch *prev;
+  parser_t *parser;
+  qa_unwind_mark mark;  /* cleanups and qa_try frames entered since */
+  qa_cleanup restore;   /* catch_top when another error class leaves */
 } parser_catch;
 
 struct qa_ui_menu_source_parser {
@@ -1072,7 +1076,6 @@ struct qa_ui_menu_source_parser {
   size_t bridge_count, bridge_capacity;
 };
 
-typedef qa_ui_menu_source_parser parser_t;
 typedef qa_ui_menu_token_cursor cursor_t;
 
 /** Parser token: token reference + malloc'd tokenValue text. */
@@ -1206,21 +1209,38 @@ _Noreturn static void parser_fail_fmt(parser_t *parser, const char *prefix,
   parser_fail(parser, message != NULL ? message : prefix, at);
 }
 
-/* TS throw new MenuParseFailure(cursor, message). */
+/* TS throw new MenuParseFailure(cursor, message): everything entered since
+   the catching frame (cleanups, qa_try frames) is left as a throw leaves
+   it. */
 _Noreturn static void parse_failure(parser_t *parser) {
-  longjmp(parser->catch_top->buf, 1);
+  parser_catch *target = parser->catch_top;
+  if (target == NULL)
+    qa_ui_script_plain_error("menu parse failure outside a menu definition");
+  qa_unwind_to(target->mark);
+  longjmp(target->buf, 1);
+}
+
+static void parser_catch_restore(void *raw) {
+  parser_catch *frame = raw;
+  frame->parser->catch_top = frame->prev;
 }
 
 /* Usage: PARSER_TRY(p, cur, c) { body; PARSER_TRY_END(p, c); }
- *        PARSER_CATCH(p, c) { handler } */
+ *        PARSER_CATCH(p, c) { handler }
+ * Another error class leaving the body restores catch_top through the
+ * cleanup node (TS rethrows it past the catch). */
 #define PARSER_TRY(parser, cur, catch_var)                                \
   parser_catch catch_var;                                                 \
   catch_var.cursor = (cur);                                               \
   catch_var.prev = (parser)->catch_top;                                   \
+  catch_var.parser = (parser);                                            \
   (parser)->catch_top = &catch_var;                                       \
+  catch_var.mark = qa_unwind_mark_take();                                 \
+  qa_cleanup_push(&catch_var.restore, parser_catch_restore, &catch_var);  \
   if (setjmp(catch_var.buf) == 0)
 
 #define PARSER_TRY_END(parser, catch_var)                                 \
+  qa_cleanup_pop(&catch_var.restore);                                     \
   (parser)->catch_top = catch_var.prev
 
 #define PARSER_CATCH(parser, catch_var)                                   \
@@ -1427,26 +1447,22 @@ static double read_float(parser_t *parser, cursor_t *cursor,
   return negative ? FR(-stored) : stored;
 }
 
+/* TS assigns each component as it is read, so a malformed later component
+   leaves the earlier ones written. */
 static void read_rect_into(parser_t *parser, alloc_t *alloc, int64_t offset,
                            cursor_t *cursor,
                            const qa_ui_script_location *at) {
-  qa_rect value;
-  value.x = read_float(parser, cursor, at);
-  value.y = read_float(parser, cursor, at);
-  value.width = read_float(parser, cursor, at);
-  value.height = read_float(parser, cursor, at);
-  rect_write(alloc, offset, value);
+  for (int component = 0; component < 4; component++)
+    qa_ui_memory_allocation_set_float32(alloc, offset + component * 4,
+                                        read_float(parser, cursor, at));
 }
 
 static void read_color_into(parser_t *parser, alloc_t *alloc, int64_t offset,
                             cursor_t *cursor,
                             const qa_ui_script_location *at) {
-  qa_vec4 value;
-  value.x = read_float(parser, cursor, at);
-  value.y = read_float(parser, cursor, at);
-  value.z = read_float(parser, cursor, at);
-  value.w = read_float(parser, cursor, at);
-  color_write(alloc, offset, value);
+  for (int component = 0; component < 4; component++)
+    qa_ui_memory_allocation_set_float32(alloc, offset + component * 4,
+                                        read_float(parser, cursor, at));
 }
 
 static void read_fore_color(parser_t *parser, qa_ui_window_definition *window,
@@ -1481,6 +1497,19 @@ static qa_ui_font_reference *read_font(parser_t *parser, cursor_t *cursor,
   return reference;
 }
 
+typedef struct script_tokens {
+  qa_ui_menu_script_token *tokens;
+  size_t count;
+} script_tokens;
+static void script_tokens_free(void *raw) {
+  script_tokens *held = raw;
+  for (size_t i = 0; i < held->count; i++)
+    qa_ui_menu_script_token_destroy(&held->tokens[i]);
+  free(held->tokens);
+  held->tokens = NULL;
+  held->count = 0;
+}
+
 static qa_ui_menu_script *read_script(parser_t *parser, cursor_t *cursor,
                                       const qa_ui_script_location *at) {
   expect_token(parser, cursor, "{", "expected { before script", at);
@@ -1488,11 +1517,19 @@ static qa_ui_menu_script *read_script(parser_t *parser, cursor_t *cursor,
   size_t text_length = 0;
   text[0] = '\0';
   bool truncated = false;
+  /* An end of file inside the script fails the keyword; the tokens read so
+     far go with it. */
+  script_tokens held = {NULL, 0};
+  qa_cleanup held_node;
+  qa_cleanup_push(&held_node, script_tokens_free, &held);
   qa_ui_menu_script_token *tokens = NULL;
   size_t count = 0, capacity = 0;
   for (;;) {
+    held.tokens = tokens;
+    held.count = count;
     ptok tok = expect_any(parser, cursor, "end of file inside script", at);
     if (strcmp(tok.value, "}") == 0) {
+      qa_cleanup_pop(&held_node);
       ptok_release(&tok);
       if (truncated) {
         char message[64];
@@ -1784,20 +1821,36 @@ static void publish_number_asset(parser_t *parser,
   publish_asset(parser, publication);
 }
 
+/* One keyword's texts, freed when its value fails to parse. */
+typedef struct keyword_texts {
+  qa_ui_script_location at;
+  char *value;
+  char *keyword;
+} keyword_texts;
+static void keyword_texts_free(void *raw) {
+  keyword_texts *texts = raw;
+  free(texts->value);
+  free(texts->keyword);
+  qa_ui_script_location_destroy(&texts->at);
+}
+
 static void parse_assets(parser_t *parser, cursor_t *cursor,
                          const qa_ui_script_location *start) {
   expect_token(parser, cursor, "{", "expected { after assetGlobalDef", start);
   for (;;) {
     ptok field = expect_any(parser, cursor, "end of file inside assetGlobalDef",
                             start);
-    qa_ui_script_location at = loc_copy(&field.token->location);
-    char *value = dupstr(field.value);
-    char *keyword = lower_dup(field.value);
+    keyword_texts texts = {loc_copy(&field.token->location), dupstr(field.value),
+                           lower_dup(field.value)};
+    qa_cleanup texts_node;
+    qa_cleanup_push(&texts_node, keyword_texts_free, &texts);
+    qa_ui_script_location at = texts.at;
+    char *value = texts.value;
+    char *keyword = texts.keyword;
     ptok_release(&field);
     if (strcmp(value, "}") == 0) {
-      free(value);
-      free(keyword);
-      qa_ui_script_location_destroy(&at);
+      qa_cleanup_pop(&texts_node);
+      keyword_texts_free(&texts);
       return;
     }
     bool has_handle;
@@ -1884,29 +1937,29 @@ static void parse_assets(parser_t *parser, cursor_t *cursor,
       parser->assets.shadow_y = read_float(parser, cursor, &at);
       publish_number_asset(parser, QA_UI_ASSET_SHADOW_Y, parser->assets.shadow_y);
     } else if (strcmp(keyword, "shadowcolor") == 0) {
-      double components[4];
+      /* TS updates assets.shadowColor component by component, so a
+         malformed later component leaves the earlier ones in the assets. */
       for (int component = 0; component < 4; component++) {
-        components[component] = read_float(parser, cursor, &at);
+        double number = read_float(parser, cursor, &at);
+        if (component == 0) parser->assets.shadow_color.x = number;
+        else if (component == 1) parser->assets.shadow_color.y = number;
+        else if (component == 2) parser->assets.shadow_color.z = number;
+        else parser->assets.shadow_color.w = number;
         qa_ui_menu_asset_publication publication;
         memset(&publication, 0, sizeof publication);
         publication.field = QA_UI_ASSET_SHADOW_COLOR_COMPONENT;
         publication.component = component;
-        publication.number = components[component];
+        publication.number = number;
         publish_asset(parser, publication);
       }
-      parser->assets.shadow_color.x = components[0];
-      parser->assets.shadow_color.y = components[1];
-      parser->assets.shadow_color.z = components[2];
-      parser->assets.shadow_color.w = components[3];
       parser->assets.shadow_fade_clamp = parser->assets.shadow_color.w;
       publish_number_asset(parser, QA_UI_ASSET_SHADOW_FADE_CLAMP,
                            parser->assets.shadow_fade_clamp);
     } else {
       warn_fmt(parser, &at, "unknown asset keyword ", value);
     }
-    free(value);
-    free(keyword);
-    qa_ui_script_location_destroy(&at);
+    qa_cleanup_pop(&texts_node);
+    keyword_texts_free(&texts);
   }
 }
 
@@ -1962,12 +2015,9 @@ static void parse_item_field(parser_t *parser, qa_ui_item_definition *item,
                                          handle32);
   } else if (strcmp(keyword, "model_origin") == 0) {
     qa_ui_model_definition model = require_model(parser, item, at);
-    double x = read_float(parser, cursor, at);
-    double y = read_float(parser, cursor, at);
-    double z = read_float(parser, cursor, at);
-    qa_ui_memory_allocation_set_float32(model.alloc, 4, x);
-    qa_ui_memory_allocation_set_float32(model.alloc, 8, y);
-    qa_ui_memory_allocation_set_float32(model.alloc, 12, z);
+    for (int component = 0; component < 3; component++)
+      qa_ui_memory_allocation_set_float32(model.alloc, 4 + component * 4,
+                                          read_float(parser, cursor, at));
   } else if (strcmp(keyword, "model_fovx") == 0) {
     qa_ui_model_definition model = require_model(parser, item, at);
     qa_ui_memory_allocation_set_float32(model.alloc, 16,
@@ -2512,9 +2562,14 @@ static void load_menu_file(parser_t *parser, const char *path) {
   parse_with_cursor(parser, open_source(parser, &file), file.path);
 }
 
-/* TS parseSource. Its `finally { cursor.dispose() }` has no C counterpart on
-   the failure path: a parse failure reaches no catch in C (the fail env has
-   no catch frame), so it aborts like the uncaught TS ScriptLanguageError. */
+static void cursor_release(void *cursor) {
+  qa_ui_menu_token_cursor_dispose(cursor);
+  qa_ui_menu_token_cursor_destroy(cursor);
+}
+
+/* TS parseSource. Its `finally { cursor.dispose() }` runs on every error
+   that leaves the loop (a parser fail, String_Alloc or UI_Alloc running out,
+   a registration callback): the source handle is freed with its owner. */
 static void parse_with_cursor(parser_t *parser, cursor_t *cursor,
                               const char *path) {
   if (path[0] == '\0') {
@@ -2523,6 +2578,8 @@ static void parse_with_cursor(parser_t *parser, cursor_t *cursor,
                 &at);
   }
   push_loaded(parser, path);
+  qa_cleanup cursor_node;
+  qa_cleanup_push(&cursor_node, cursor_release, cursor);
   for (;;) {
     ptok tok;
     if (!cursor_next_ptok(cursor, &tok)) break;
@@ -2582,8 +2639,8 @@ static void parse_with_cursor(parser_t *parser, cursor_t *cursor,
     free(keyword);
     qa_ui_script_location_destroy(&at);
   }
-  qa_ui_menu_token_cursor_dispose(cursor);
-  qa_ui_menu_token_cursor_destroy(cursor);
+  qa_cleanup_pop(&cursor_node);
+  cursor_release(cursor);
 }
 
 static void load_hud_set(parser_t *parser,

@@ -14,7 +14,10 @@ static const size_t WAVE_POOL_SIZES[] = {3, 4, 5, 5, 5};
 struct qa_q2_horde {
   qa_q2_entity *manager;
   double wave;
-  qa_q2_entity **points;
+  /* TS points: Q2Entity[]. TS keeps a released point's object readable; here the actor is kept beside the pointer,
+   * so a released point is never dereferenced (its body read raises as TS game.body does) and a later entity at
+   * the same address is a different point. */
+  struct horde_point { qa_q2_entity *entity; qa_owned_actor actor; } *points;
   size_t point_count, point_cap;
   double spawned_this_wave;
   double intermission_ticks;
@@ -29,6 +32,14 @@ static bool is_point(const char *classname) {
          strcmp(classname, "info_monster_start_ranged") == 0 || strcmp(classname, "info_monster_start_boss") == 0;
 }
 
+static void add_point(qa_q2_horde *h, qa_q2_entity *entity) {
+  if (h->point_count == h->point_cap) {
+    h->point_cap = h->point_cap == 0 ? 8 : h->point_cap * 2;
+    h->points = qa_q2mp_xalloc(realloc(h->points, h->point_cap * sizeof *h->points));
+  }
+  h->points[h->point_count].entity = entity;
+  h->points[h->point_count++].actor = entity->actor;
+}
 static void add_monster(qa_q2_horde *h, qa_actor_id id) {
   for (size_t i = 0; i < h->monster_count; i++)
     if (qa_same_actor(h->wave_monsters[i], id)) return;
@@ -54,7 +65,9 @@ static double alive_count(qa_q2_horde *h, qa_q2_game_services *g) {
   while (i < h->monster_count) {
     qa_combat_state_result r = qa_q2mp_combat_read(g, h->wave_monsters[i]);
     if (!r.has_value || r.value.health <= 0) {
-      h->wave_monsters[i] = h->wave_monsters[--h->monster_count];
+      /* Set.delete keeps the insertion order of the rest, which capture() lists. */
+      memmove(&h->wave_monsters[i], &h->wave_monsters[i + 1], (h->monster_count - i - 1) * sizeof *h->wave_monsters);
+      h->monster_count--;
     } else {
       alive++;
       i++;
@@ -98,14 +111,14 @@ static void tick(qa_q2_horde *h, qa_q2_game_services *g) {
   double spawned = 0;
   for (double index = 0; index < batch; index++) {
     size_t pi = (size_t)h->spawned_this_wave + (size_t)index;
-    qa_q2_entity *point = h->points[pi % h->point_count];
+    const qa_owned_actor point = h->points[pi % h->point_count].actor;
     const char *classname = pool[pi % pool_size];
-    qa_vec3 origin = qa_q2_game_body(g, point).origin;
+    qa_vec3 origin = g->body(g->ctx, point).origin;
     /* A monster or player still standing on the point blocks the rest of this batch. */
     static const qa_bounds monster_bounds = {{-16, -16, -24}, {16, 16, 32}};
     qa_q2_trace_request occupied_request = {0};
     occupied_request.start = origin; occupied_request.end = origin; occupied_request.bounds = &monster_bounds;
-    occupied_request.ignore = &point->actor.id; occupied_request.mask = 0x2020003;
+    occupied_request.ignore = &point.id; occupied_request.mask = 0x2020003;
     qa_trace_result occupied = g->host->trace(g->host->ctx, occupied_request);
     if (occupied.start_solid || occupied.hit.kind == QA_TRACE_HIT_ACTOR) break;
     char ox[64], oy[64], oz[64], origin_text[200];
@@ -177,11 +190,7 @@ bool qa_q2_horde_spawn(qa_q2_horde *h, qa_q2_entity *entity, qa_q2_game_services
     return true;
   }
   if (is_point(entity->classname)) {
-    if (h->point_count == h->point_cap) {
-      h->point_cap = h->point_cap == 0 ? 8 : h->point_cap * 2;
-      h->points = qa_q2mp_xalloc(realloc(h->points, h->point_cap * sizeof *h->points));
-    }
-    h->points[h->point_count++] = entity;
+    add_point(h, entity);
     g->solid(g->ctx, entity, "none");
     return true;
   }
@@ -225,16 +234,10 @@ void qa_q2_horde_restore(qa_q2_horde *h, qa_q2_game_services *g, qa_q2_horde_che
       h->manager = all[i];
       g->schedule(g->ctx, all[i], 1, think);
     } else if (is_point(all[i]->classname)) {
-      bool known = false;
+      bool known = false; /* TS points.includes(entity): the same entity object */
       for (size_t j = 0; j < h->point_count; j++)
-        if (h->points[j] == all[i]) known = true;
-      if (!known) {
-        if (h->point_count == h->point_cap) {
-          h->point_cap = h->point_cap == 0 ? 8 : h->point_cap * 2;
-          h->points = qa_q2mp_xalloc(realloc(h->points, h->point_cap * sizeof *h->points));
-        }
-        h->points[h->point_count++] = all[i];
-      }
+        if (h->points[j].entity == all[i] && qa_same_actor(h->points[j].actor.id, all[i]->actor.id)) known = true;
+      if (!known) add_point(h, all[i]);
     }
   }
 }

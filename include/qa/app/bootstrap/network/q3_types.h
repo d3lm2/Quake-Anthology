@@ -67,6 +67,7 @@ typedef struct qa_app_q3_server_host {
   const void *(*game_state)(void *ctx, qa_app_q3_player player, double server_id);
   qa_app_q3_snapshot (*snapshot)(void *ctx, qa_app_q3_player player);
   void (*begin)(void *ctx, qa_app_q3_player player, const void *command);
+  /* NULL or a qa_actor_command borrowed for the call: the network copies it into its queue. */
   const void *(*input)(void *ctx, qa_app_q3_player player, const void *command, double sequence);
   void (*command)(void *ctx, qa_app_q3_player player, const char *name, const char *const *args, size_t count);
   void (*userinfo)(void *ctx, qa_app_q3_player player, const char *value);

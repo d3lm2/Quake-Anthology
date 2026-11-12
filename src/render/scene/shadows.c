@@ -118,7 +118,7 @@ double qa_shadow_cone_fov(double cos_half) {
   return qa_js_min(acos(c) * 180 / 3.141592653589793 * 2 * 1.15, 175);
 }
 qa_mat4 qa_shadow_cone_matrix(qa_q2_fragment_light light) {
-  if (!light.cone) qa_range_error("A cone projection requires a spotlight direction");
+  if (!light.cone) qa_raise("Error", 0, 0, "A cone projection requires a spotlight direction");
   return qa_shadow_matrix_multiply(perspective(qa_shadow_cone_fov(light.cone->cos_half_angle), light.radius),
                                    view_mat(light.origin, cone_basis(light.cone->direction)));
 }
@@ -353,7 +353,7 @@ static void append_pass(qa_prepared_shadows *out, candidate *cand, qa_rect viewp
   /* TS passes share the cached world draw arrays, which stay alive while any pass references them. C passes own a copy:
    * the cache clears at 256 entries (possibly within this prepare) and on close, while prepared passes live on. */
   static const qa_polygon_offset WORLD_OFF = { 2, 4 };
-  memcpy(draws, world_draws_entry->draws, world_draws_entry->draw_count * sizeof *draws);
+  if (world_draws_entry->draw_count != 0) memcpy(draws, world_draws_entry->draws, world_draws_entry->draw_count * sizeof *draws); /* NULL with an empty world */
   for (size_t i = 0; i < world_draws_entry->draw_count; i++) {
     size_t count = draws[i].position_count;
     positions[i] = xalloc((count ? count : 1) * sizeof(double));

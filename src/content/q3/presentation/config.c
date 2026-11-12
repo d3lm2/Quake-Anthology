@@ -409,7 +409,7 @@ static void changed_snapshot(const qa_cvar_snapshot *engine, qa_cvar_snapshot *o
 bool qa_q3_pres_client_configuration_init(configuration_t **out, qa_q3_base_product product,
     qa_q3_pres_client_configuration_host host) {
   if (host.state->product != product || host.static_state->product != product) {
-    qa_range_error("Client configuration services must share one product");
+    qa_raise("Error", 0, 0, "Client configuration services must share one product");
   }
   configuration_t *configuration = calloc(1, sizeof *configuration);
   if (configuration == NULL) return false;
@@ -449,28 +449,48 @@ void qa_q3_pres_client_configuration_destroy(configuration_t *configuration) {
   free(configuration);
 }
 
+static void free_snapshot(void *arg) { qa_cvar_read_free(arg); }
 static void copy_definition(configuration_t *configuration, const qa_q3_pres_cvar_definition *definition,
     const qa_cvar_snapshot *engine, bool forced) {
   qa_cvar_snapshot *slot = &configuration->cache[definition->symbol];
   bool has_previous = configuration->has_cache[definition->symbol];
   if (!forced && has_previous && slot->modification_count == engine->modification_count) return;
+  /* TS stores `pending` first: the engine snapshot with the retained value fields and the new modification
+   * count. When changedSnapshot then throws (a value of 256 bytes or more), that entry stays, so the same
+   * engine value is not copied (and does not throw) again. */
+  qa_cvar_snapshot pending;
+  if (!snapshot_copy(&pending, engine)) qa_range_error("out of memory");
+  free(pending.value);
+  pending.value = xstrdup(has_previous && slot->value != NULL ? slot->value : "");
+  if (pending.value == NULL) {
+    qa_cvar_read_free(&pending);
+    qa_range_error("out of memory");
+  }
+  pending.numeric_value = has_previous ? slot->numeric_value : 0;
+  pending.integer_value = has_previous ? slot->integer_value : 0;
+  pending.modification_count = engine->modification_count;
+  if (has_previous) qa_cvar_read_free(slot);
+  *slot = pending;
+  configuration->has_cache[definition->symbol] = true;
   qa_cvar_snapshot changed;
   changed_snapshot(engine, &changed);
-  if (has_previous) qa_cvar_read_free(slot);
+  qa_cvar_read_free(slot);
   *slot = changed;
-  configuration->has_cache[definition->symbol] = true;
 }
 
 void qa_q3_pres_client_configuration_register_cvars(configuration_t *configuration) {
-  if (configuration->updating) qa_range_error("Cannot register cvars during a configuration update");
+  if (configuration->updating) qa_raise("Error", 0, 0, "Cannot register cvars during a configuration update");
   for (size_t i = 0; i < configuration->table_count; i++) {
     const qa_q3_pres_cvar_definition *definition = &configuration->table[i];
     qa_cvar_snapshot engine;
     if (!qa_cvar_registry_register(configuration->host.cvars, definition->name,
             definition->default_value, definition->flags, &engine)) {
-      qa_range_error("Cgame cvar registration failed: %s", definition->name);
+      qa_raise("Error", 0, 0, "Cgame cvar registration failed: %s", definition->name);
     }
+    qa_cleanup engine_node; /* the engine snapshot is released when the copy raises */
+    qa_cleanup_push(&engine_node, free_snapshot, &engine);
     copy_definition(configuration, definition, &engine, true);
+    qa_cleanup_pop(&engine_node);
     qa_cvar_read_free(&engine);
   }
   qa_cvar_snapshot running;
@@ -505,7 +525,7 @@ void qa_q3_pres_client_configuration_register_cvars(configuration_t *configurati
 static bool read_effective(configuration_t *configuration, qa_q3_pres_client_vm_cvar_symbol symbol,
     qa_cvar_snapshot *out) {
   if (symbol < 0 || symbol >= QA_Q3_PRES_VM_SYMBOL_COUNT || !configuration->has_cache[symbol]) {
-    qa_range_error("VM cvar %s is not registered for %s",
+    qa_raise("Error", 0, 0, "VM cvar %s is not registered for %s",
         qa_q3_pres_client_vm_cvar_symbol_name(symbol), qa_q3_base_product_name(configuration->product));
   }
   if (!snapshot_copy(out, &configuration->cache[symbol])) return false;
@@ -558,12 +578,14 @@ static bool name_equal_folded(const char *a, const char *b) {
 }
 bool qa_q3_pres_client_configuration_read_vm_cvar(configuration_t *configuration, const char *name,
     qa_cvar_snapshot *out) {
-  for (size_t i = 0; i < configuration->table_count; i++) {
+  /* TS names is a Map filled in table order, so a name the table lists twice (ui_singlePlayerActive) resolves
+   * to its last symbol. */
+  for (size_t i = configuration->table_count; i-- > 0;) {
     if (name_equal_folded(configuration->table[i].name, name)) {
       return read_effective(configuration, configuration->table[i].symbol, out);
     }
   }
-  qa_range_error("Cgame VM cvar %s is not registered for %s", name,
+  qa_raise("Error", 0, 0, "Cgame VM cvar %s is not registered for %s", name,
       qa_q3_base_product_name(configuration->product));
 }
 
@@ -577,25 +599,35 @@ static bool reload_client_info(configuration_t *configuration) {
   return true;
 }
 
+/* TS try/finally: a throw out of the update still clears `updating`. */
+static void clear_updating(void *arg) { ((configuration_t *)arg)->updating = false; }
 bool qa_q3_pres_client_configuration_force_model_change(configuration_t *configuration) {
-  if (!configuration->registered) qa_range_error("Client cvars must be registered before forcing models");
-  if (configuration->updating) qa_range_error("Client configuration update is already active");
+  if (!configuration->registered) qa_raise("Error", 0, 0, "Client cvars must be registered before forcing models");
+  if (configuration->updating) qa_raise("Error", 0, 0, "Client configuration update is already active");
   configuration->updating = true;
+  qa_cleanup updating_node;
+  qa_cleanup_push(&updating_node, clear_updating, configuration);
   bool result = reload_client_info(configuration);
+  qa_cleanup_pop(&updating_node);
   configuration->updating = false;
   return result;
 }
 
 bool qa_q3_pres_client_configuration_update_cvars(configuration_t *configuration) {
-  if (!configuration->registered) qa_range_error("Client cvars must be registered before updating");
-  if (configuration->updating) qa_range_error("Client configuration update is already active");
+  if (!configuration->registered) qa_raise("Error", 0, 0, "Client cvars must be registered before updating");
+  if (configuration->updating) qa_raise("Error", 0, 0, "Client configuration update is already active");
   configuration->updating = true;
+  qa_cleanup updating_node;
+  qa_cleanup_push(&updating_node, clear_updating, configuration);
   bool result = true;
   for (size_t i = 0; i < configuration->table_count; i++) {
     const qa_q3_pres_cvar_definition *definition = &configuration->table[i];
     qa_cvar_snapshot engine;
     if (qa_cvar_registry_get(configuration->host.cvars, definition->name, &engine)) {
+      qa_cleanup engine_node;
+      qa_cleanup_push(&engine_node, free_snapshot, &engine);
       copy_definition(configuration, definition, &engine, false);
+      qa_cleanup_pop(&engine_node);
       qa_cvar_read_free(&engine);
     }
   }
@@ -623,11 +655,15 @@ bool qa_q3_pres_client_configuration_update_cvars(configuration_t *configuration
     } else {
       if (configuration->force_model_modification_count != force_model.modification_count) {
         configuration->force_model_modification_count = force_model.modification_count;
+        qa_cleanup force_node; /* released when the reload raises */
+        qa_cleanup_push(&force_node, free_snapshot, &force_model);
         result = reload_client_info(configuration);
+        qa_cleanup_pop(&force_node);
       }
       qa_cvar_read_free(&force_model);
     }
   }
+  qa_cleanup_pop(&updating_node);
   configuration->updating = false;
   return result;
 }

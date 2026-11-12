@@ -9,6 +9,7 @@
 #include "qa/compat/q2/native_mod_entries.h"
 #include "qa/compat/q2/native_throw.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/js_case.h"
 
 typedef enum { DEBIT_PENDING, DEBIT_ACCEPTED, DEBIT_REFUSED } debit_state;
 typedef struct { qa_guest_address address; uint8_t bytes[8]; size_t length; } saved_field;
@@ -30,6 +31,7 @@ struct qa_compat_q2_native_primary_drop {
   command_entry entries[2];
   qa_compat_q2_native_entry *command_bindings[2], *find_binding, *allocate_binding;
   uint64_t admitted, consumer; uint64_t *callbacks, *debits;
+  size_t callback_count, debit_count; bool has_admitted, has_consumer; /* what the constructor bound so far */
   bool closed;
 };
 static const qa_guest_value_layout pointer_parameters[2] = {{.is_aggregate = false, .storage = "pointer"}, {.is_aggregate = false, .storage = "pointer"}};
@@ -59,18 +61,30 @@ static void save_field(qa_compat_q2_memory *memory, drop_frame *frame, qa_guest_
 static bool source_weapon(const qa_compat_q2_native_primary_drop *s, qa_item_id item, qa_guest_address *out) {
   if (item == NULL) return false;
   qa_compat_q2_native_source_item value;
-  if (!qa_compat_q2_native_primary_commands_source_item(s->commands, item, &value)) qa_range_error("Selected drop weapon has no source descriptor");
+  if (!qa_compat_q2_native_primary_commands_source_item(s->commands, item, &value)) qa_raise("Error", 0, 0, "Selected drop weapon has no source descriptor");
   *out = value.address;
   return true;
 }
+typedef struct { const qa_compat_q2_native_primary_drop *s; const qa_compat_q2_native_inventory_row *row; qa_compat_q2_native_drop_projection projection;
+  qa_guest_address counter, weapon, pending, selection; bool cursor; double index; } project_writes;
+static void project_write_body(void *v) {
+  project_writes *w = v; const qa_compat_q2_native_primary_drop *s = w->s; qa_compat_q2_memory *memory = s->host.memory;
+  qa_compat_q2_mem_write_i32(memory, w->counter, w->row->presence_only ? (w->row->count == 0 ? 0 : 1) : qa_js_to_int32(w->row->count));
+  qa_guest_address value = {0};
+  bool has = source_weapon(s, w->projection.current, &value);
+  qa_compat_q2_mem_write_pointer(memory, w->weapon, has, value);
+  has = source_weapon(s, w->projection.pending, &value);
+  qa_compat_q2_mem_write_pointer(memory, w->pending, has, value);
+  if (w->cursor) qa_compat_q2_mem_write_i32(memory, w->selection, qa_js_to_int32(w->index));
+}
 static qa_guest_address project(const qa_compat_q2_native_primary_drop *s, drop_frame *frame, const qa_compat_q2_native_inventory_row *row, bool cursor) {
-  if (!frame->has_actor || frame->has_restore) qa_range_error("Original drop projection has no unique actor scope");
+  if (!frame->has_actor || frame->has_restore) qa_raise("Error", 0, 0, "Original drop projection has no unique actor scope");
   qa_compat_q2_native_drop_projection projection = s->hooks.projection(s->hooks.ctx, frame->actor, row->item);
   qa_compat_q2_memory *memory = s->host.memory;
   qa_compat_q2_native_source_item descriptor; bool has_descriptor = qa_compat_q2_native_primary_commands_source_item(s->commands, projection.source, &descriptor);
   qa_raw_entity_view record; qa_guest_address client;
   bool has_client = s->host.record_for(s->host.ctx, frame->actor, &record) && qa_compat_q2_mem_read_pointer(memory, qa_compat_q2_mem_offset(memory, record.address, (int64_t)s->profile->client_pointer), &client);
-  if (!has_descriptor || !has_client) qa_range_error("Selected drop has no source item or client");
+  if (!has_descriptor || !has_client) qa_raise("Error", 0, 0, "Selected drop has no source item or client");
   qa_guest_address counter = qa_compat_q2_mem_offset(memory, client, (int64_t)(s->profile->client_inventory + descriptor.index * 4));
   qa_guest_address weapon = qa_compat_q2_mem_offset(memory, client, (int64_t)s->profile->client_weapon);
   qa_guest_address pending = qa_compat_q2_mem_offset(memory, client, (int64_t)s->profile->client_pending);
@@ -83,14 +97,10 @@ static qa_guest_address project(const qa_compat_q2_native_primary_drop *s, drop_
   frame->has_row = true; frame->row = *row;
   frame->has_counter = true; frame->counter = counter;
   frame->has_restore = true; frame->restore_actor = frame->actor;
-  /* A fatal failure in the writes below aborts, so TS catch-restore cannot run. */
-  qa_compat_q2_mem_write_i32(memory, counter, row->presence_only ? (row->count == 0 ? 0 : 1) : qa_js_to_int32(row->count));
-  qa_guest_address value = {0};
-  bool has = source_weapon(s, projection.current, &value);
-  qa_compat_q2_mem_write_pointer(memory, weapon, has, value);
-  has = source_weapon(s, projection.pending, &value);
-  qa_compat_q2_mem_write_pointer(memory, pending, has, value);
-  if (cursor) qa_compat_q2_mem_write_i32(memory, selection, qa_js_to_int32(descriptor.index));
+  /* TS try { writes } catch { frame.restore(); throw }. */
+  project_writes writes = {s, row, projection, counter, weapon, pending, selection, cursor, descriptor.index};
+  qa_caught_error caught;
+  if (!qa_try(project_write_body, &writes, &caught)) { run_restore(s, frame); qa_rethrow(&caught); }
   return descriptor.address;
 }
 typedef struct { qa_compat_q2_native_entry *binding; const qa_guest_call_value *values; size_t count; qa_guest_call_result result; } original_scope;
@@ -112,8 +122,10 @@ static qa_guest_call_result command_execute(void *v, const qa_guest_call_value *
   original_scope scope = {binding, values, count, {0}};
   qa_compat_q2_native_thrown thrown;
   bool completed = qa_compat_q2_native_try(original_body, &scope, &thrown);
-  run_restore(s, &frame);
+  /* TS finally { frame.restore?.(); frames.pop() }. The frame lives on this stack, so it leaves the list first: a
+   * restore that raises would otherwise leave a pointer to a dead frame (TS keeps its frame object pushed). */
   s->frame_count = depth - 1;
+  run_restore(s, &frame);
   if (!completed) qa_compat_q2_native_rethrow(&thrown);
   return scope.result;
 }
@@ -124,17 +136,23 @@ static bool find_accepts(void *v) {
   qa_guest_address_result stack = qa_compat_q2_mem_pointer(memory, (int64_t)raw); qa_guest_address returned;
   return frame != NULL && frame->named && stack.has_value && qa_compat_q2_mem_read_pointer(memory, stack.value, &returned) && returned.byte_offset == at(s, s->profile->lookup_return).byte_offset;
 }
-static char *ascii_lower(char *text) { for (char *c = text; *c != 0; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32); return text; }
+typedef struct { char *text; void *named, *matches; } find_scratch;
+static void release_find(void *v) { find_scratch *f = v; free(f->text); free(f->named); free(f->matches); }
 static qa_guest_call_result find_execute(void *v, const qa_guest_call_value *values, size_t count, qa_compat_q2_native_entry *binding) {
   qa_compat_q2_native_primary_drop *s = v;
   qa_guest_call_result result = qa_compat_q2_native_entry_call_original(binding, values, count);
   drop_frame *frame = top_frame(s);
   if (frame == NULL || !frame->named || !frame->has_actor || count == 0 || values[0].kind != QA_GUEST_VALUE_POINTER || !values[0].pointer_value.has_value || !current(s, frame->actor)) return result;
-  char *text = ascii_lower(qa_compat_q2_read_classic_string(s->host.memory, true, values[0].pointer_value.value, 65536));
+  /* readClassicString(...).toLowerCase() over API 3 text (latin1 capitals fold too). */
+  char *raw = qa_compat_q2_read_classic_string(s->host.memory, true, values[0].pointer_value.value, 65536);
+  char *text = qa_js_latin1_to_lower_case(raw); free(raw);
+  if (text == NULL) qa_range_error("Native drop out of memory");
+  find_scratch scratch = {text, NULL, NULL}; qa_cleanup node; qa_cleanup_push(&node, release_find, &scratch); /* hooks and project can raise */
   const qa_compat_q2_native_inventory_row *rows = NULL; size_t row_count = 0;
   if (!s->hooks.rows(s->hooks.ctx, frame->actor, &rows, &row_count)) { rows = NULL; row_count = 0; }
   qa_source_item_named_entry *named = calloc(row_count ? row_count : 1, sizeof *named);
   size_t *matches = calloc(row_count ? row_count : 1, sizeof *matches);
+  scratch.named = named; scratch.matches = matches;
   if (named == NULL || matches == NULL) qa_range_error("Native drop out of memory");
   for (size_t i = 0; i < row_count; i++) { named[i].item = rows[i].item; named[i].label = rows[i].label; }
   qa_item_id original = result.kind == QA_GUEST_VALUE_POINTER && result.pointer_value.has_value ? qa_compat_q2_native_primary_commands_item_at(s->commands, result.pointer_value.value) : NULL;
@@ -148,13 +166,14 @@ static qa_guest_call_result find_execute(void *v, const qa_guest_call_value *val
       size_t used = (size_t)snprintf(message, length, "Ambiguous item \"%s\"; use ", text);
       for (size_t i = 0; i < choice.match_count; i++) used += (size_t)snprintf(message + used, length - used, "%s%s", i == 0 ? "" : ", ", rows[matches[i]].item);
       snprintf(message + used, length - used, "\n");
+      qa_cleanup message_node; qa_cleanup_push(&message_node, free, message);
       s->hooks.print(s->hooks.ctx, frame->actor, message);
-      free(message);
+      qa_cleanup_pop(&message_node); free(message);
     }
   } else if (choice.kind == QA_SOURCE_ITEM_NAMED_MATCH && rows[choice.item_index].selected) {
     result = qa_compat_q2_call_pointer(true, project(s, frame, &rows[choice.item_index], false));
   }
-  free(named); free(matches); free(text);
+  qa_cleanup_pop(&node); release_find(&scratch);
   return result;
 }
 static void admitted_observed(void *v) {
@@ -193,7 +212,7 @@ static void debit_region(void *v, qa_compat_q2_inline_continuation *continuation
   double count = (double)before - (double)after;
   bool has_pickup = frame->has_pickup; qa_actor_id pickup = frame->pickup;
   run_restore(s, frame);
-  if (count <= 0 || !has_pickup || !current(s, pickup)) qa_range_error("Accepted original drop lacks its source allocation or positive debit");
+  if (count <= 0 || !has_pickup || !current(s, pickup)) qa_raise("Error", 0, 0, "Accepted original drop lacks its source allocation or positive debit");
   frame->debit = s->hooks.dropped(s->hooks.ctx, frame->actor, pickup, frame->row.item, count) ? DEBIT_ACCEPTED : DEBIT_REFUSED;
   if (frame->debit == DEBIT_REFUSED && current(s, pickup)) {
     qa_raw_entity_view record;
@@ -214,49 +233,74 @@ static void consumer_region(void *v, qa_compat_q2_inline_continuation *continuat
   s->hooks.consume(s->hooks.ctx, frame->actor, &scope, consume_execute);
   if (!scope.executed) continuation->skip(continuation->ctx);
 }
-qa_compat_q2_native_primary_drop *qa_compat_q2_native_primary_drop_create(qa_compat_q2_native_primary_weapon_host host, const qa_compat_q2_native_primary_drop_profile *profile, qa_compat_q2_native_primary_commands *commands, qa_compat_q2_native_primary_drop_hooks hooks) {
-  if (strcmp(host.memory->module.digest, profile->digest) != 0) qa_range_error("Native drop profile belongs to another artifact");
-  qa_compat_q2_native_primary_drop *s = calloc(1, sizeof *s);
-  if (s == NULL) qa_range_error("Native drop out of memory");
-  s->host = host; s->profile = profile; s->commands = commands; s->hooks = hooks;
-  qa_compat_q2_runner *runner = host.runner;
+/* `${host.memory.module.id}:${name}` with no length limit; the entry binding copies the id. */
+static qa_compat_q2_native_entry *bind_entry(qa_compat_q2_native_primary_drop *s, double offset, const char *name, qa_compat_q2_guest_call_signature signature,
+                                             void *ctx, qa_compat_q2_native_entry_execute_fn execute, void *accepts_ctx, bool (*accepts)(void *)) {
+  const char *module = s->host.memory->module.id != NULL ? s->host.memory->module.id : "";
+  size_t need = strlen(module) + strlen(name) + 2;
+  char *id = malloc(need); if (id == NULL) qa_range_error("Native drop out of memory");
+  snprintf(id, need, "%s:%s", module, name);
+  qa_cleanup node; qa_cleanup_push(&node, free, id);
+  qa_compat_q2_native_entry *entry = qa_compat_q2_native_entry_bind(s->host.memory, s->host.runner, s->host.ctx, s->host.invoke, at(s, offset), id, signature, ctx, execute, accepts_ctx, accepts);
+  qa_cleanup_pop(&node); free(id);
+  return entry;
+}
+static void create_body(void *v) {
+  qa_compat_q2_native_primary_drop *s = v; const qa_compat_q2_native_primary_drop_profile *profile = s->profile;
+  qa_compat_q2_runner *runner = s->host.runner;
   qa_compat_q2_guest_call_signature command = {profile->abi, pointer_parameters, 1, true, {0}, false};
   qa_compat_q2_guest_call_signature find = {profile->abi, pointer_parameters, 1, false, pointer_layout, false};
   qa_compat_q2_guest_call_signature allocate = {profile->abi, pointer_parameters, 2, false, pointer_layout, false};
-  const char *module = host.memory->module.id; char id[320];
   s->entries[0] = (command_entry){s, true}; s->entries[1] = (command_entry){s, false};
-  snprintf(id, sizeof id, "%s:selected-named-drop", module);
-  s->command_bindings[0] = qa_compat_q2_native_entry_bind(host.memory, runner, host.ctx, host.invoke, at(s, profile->named), id, command, &s->entries[0], command_execute, NULL, NULL);
-  snprintf(id, sizeof id, "%s:selected-inventory-drop", module);
-  s->command_bindings[1] = qa_compat_q2_native_entry_bind(host.memory, runner, host.ctx, host.invoke, at(s, profile->inv_entry), id, command, &s->entries[1], command_execute, NULL, NULL);
-  snprintf(id, sizeof id, "%s:selected-drop-item", module);
-  s->find_binding = qa_compat_q2_native_entry_bind(host.memory, runner, host.ctx, host.invoke, at(s, profile->find), id, find, s, find_execute, s, find_accepts);
-  s->admitted = runner->observe_entry(runner->ctx, at(s, profile->inv_admitted), s, admitted_observed);
-  snprintf(id, sizeof id, "%s:selected-drop-allocation", module);
-  s->allocate_binding = qa_compat_q2_native_entry_bind(host.memory, runner, host.ctx, host.invoke, at(s, profile->allocate), id, allocate, s, allocate_execute, NULL, NULL);
+  s->command_bindings[0] = bind_entry(s, profile->named, "selected-named-drop", command, &s->entries[0], command_execute, NULL, NULL);
+  s->command_bindings[1] = bind_entry(s, profile->inv_entry, "selected-inventory-drop", command, &s->entries[1], command_execute, NULL, NULL);
+  s->find_binding = bind_entry(s, profile->find, "selected-drop-item", find, s, find_execute, s, find_accepts);
+  s->admitted = runner->observe_entry(runner->ctx, at(s, profile->inv_admitted), s, admitted_observed); s->has_admitted = true;
+  s->allocate_binding = bind_entry(s, profile->allocate, "selected-drop-allocation", allocate, s, allocate_execute, NULL, NULL);
   s->callbacks = calloc(profile->callback_count ? profile->callback_count : 1, sizeof *s->callbacks);
   s->debits = calloc(profile->debit_count ? profile->debit_count : 1, sizeof *s->debits);
   if (s->callbacks == NULL || s->debits == NULL) qa_range_error("Native drop out of memory");
-  for (size_t i = 0; i < profile->callback_count; i++)
+  for (size_t i = 0; i < profile->callback_count; i++) {
     s->callbacks[i] = runner->bind_inline_region(runner->ctx, at(s, profile->callbacks[i].entry), at(s, profile->callbacks[i].join), profile->abi, s, callback_region);
-  for (size_t i = 0; i < profile->debit_count; i++)
+    s->callback_count = i + 1;
+  }
+  for (size_t i = 0; i < profile->debit_count; i++) {
     s->debits[i] = runner->bind_inline_region(runner->ctx, at(s, profile->debits[i].entry), at(s, profile->debits[i].join), profile->abi, s, debit_region);
-  if (profile->has_consumer) s->consumer = runner->bind_inline_region(runner->ctx, at(s, profile->consumer_entry), at(s, profile->consumer_join), profile->abi, s, consumer_region);
+    s->debit_count = i + 1;
+  }
+  if (profile->has_consumer) {
+    s->consumer = runner->bind_inline_region(runner->ctx, at(s, profile->consumer_entry), at(s, profile->consumer_join), profile->abi, s, consumer_region);
+    s->has_consumer = true;
+  }
+}
+qa_compat_q2_native_primary_drop *qa_compat_q2_native_primary_drop_create(qa_compat_q2_native_primary_weapon_host host, const qa_compat_q2_native_primary_drop_profile *profile, qa_compat_q2_native_primary_commands *commands, qa_compat_q2_native_primary_drop_hooks hooks) {
+  if (strcmp(host.memory->module.digest, profile->digest) != 0) qa_raise("Error", 0, 0, "Native drop profile belongs to another artifact");
+  qa_compat_q2_native_primary_drop *s = calloc(1, sizeof *s);
+  if (s == NULL) qa_range_error("Native drop out of memory");
+  s->host = host; s->profile = profile; s->commands = commands; s->hooks = hooks;
+  /* TS catch: a bind that throws closes the ones made before it. */
+  qa_caught_error caught;
+  if (!qa_try(create_body, s, &caught)) { qa_compat_q2_native_primary_drop_destroy(s); qa_rethrow(&caught); }
   return s;
 }
 void qa_compat_q2_native_primary_drop_close(qa_compat_q2_native_primary_drop *s) {
   if (s->closed) return;
   for (size_t i = s->frame_count; i-- > 0;) run_restore(s, s->frames[i]);
   s->closed = true;
+  /* removals.runReverse(): the stack is emptied, then whatever was bound is removed, newest first. */
   qa_compat_q2_runner *runner = s->host.runner;
-  if (s->profile->has_consumer) runner->remove_inline_region(runner->ctx, s->consumer);
-  for (size_t i = s->profile->debit_count; i-- > 0;) runner->remove_inline_region(runner->ctx, s->debits[i]);
-  for (size_t i = s->profile->callback_count; i-- > 0;) runner->remove_inline_region(runner->ctx, s->callbacks[i]);
-  qa_compat_q2_native_entry_close(s->allocate_binding);
-  runner->remove_entry(runner->ctx, s->admitted);
-  qa_compat_q2_native_entry_close(s->find_binding);
-  qa_compat_q2_native_entry_close(s->command_bindings[1]);
-  qa_compat_q2_native_entry_close(s->command_bindings[0]);
+  bool consumer = s->has_consumer, admitted = s->has_admitted; size_t debits = s->debit_count, callbacks = s->callback_count;
+  qa_compat_q2_native_entry *allocate = s->allocate_binding, *find = s->find_binding, *inventory = s->command_bindings[1], *named = s->command_bindings[0];
+  s->has_consumer = false; s->has_admitted = false; s->debit_count = 0; s->callback_count = 0;
+  s->allocate_binding = s->find_binding = s->command_bindings[0] = s->command_bindings[1] = NULL;
+  if (consumer) runner->remove_inline_region(runner->ctx, s->consumer);
+  for (size_t i = debits; i-- > 0;) runner->remove_inline_region(runner->ctx, s->debits[i]);
+  for (size_t i = callbacks; i-- > 0;) runner->remove_inline_region(runner->ctx, s->callbacks[i]);
+  if (allocate != NULL) qa_compat_q2_native_entry_close(allocate);
+  if (admitted) runner->remove_entry(runner->ctx, s->admitted);
+  if (find != NULL) qa_compat_q2_native_entry_close(find);
+  if (inventory != NULL) qa_compat_q2_native_entry_close(inventory);
+  if (named != NULL) qa_compat_q2_native_entry_close(named);
 }
 void qa_compat_q2_native_primary_drop_destroy(qa_compat_q2_native_primary_drop *s) {
   if (s == NULL) return;

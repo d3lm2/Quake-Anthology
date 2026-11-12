@@ -55,6 +55,7 @@ struct mnav_install {
   qa_app_sim_application_monster_navigation *navigation;
   qa_app_sim_monster_navigation_simulation simulation;
   qa_q1_monster_movement *movement;
+  qa_q1_services *game; /* simulation.q1Source().game: its registry says which actors are released */
   qa_movement_profile selected;
   mnav_graph **graphs; size_t graph_count, graph_cap;
   mnav_actor **actors; size_t actor_count, actor_cap;
@@ -181,6 +182,10 @@ static bool topology_visible(void *ctx, double a, double b, const char *kind) {
 }
 
 /* TS forActor(actor). */
+static void mnav_actor_free(mnav_actor *entry) {
+  qa_navigation_runtime_destroy(&entry->runtime);
+  free(entry->route); free(entry);
+}
 static qa_navigation_runtime *for_actor(void *ctx, qa_owned_actor actor) {
   mnav_install *install = ctx;
   qa_q1_monster_move_services *services = &install->movement->services;
@@ -226,17 +231,22 @@ static qa_navigation_runtime *for_actor(void *ctx, qa_owned_actor actor) {
     install->graphs[install->graph_count++] = graph;
   }
   if (!qa_navigation_runtime_init(&entry->runtime, &graph->loaded.graph, &entry->world)) qa_range_error("Out of memory");
-  /* actors.set(actor, ...): replaces the actor's previous entry. */
+  /* actors.set(actor, ...) on a WeakMap keyed by the OwnedActor. The
+   * replaced entry is unreachable (the MG3 path asks once per walk or saved
+   * path and keeps no runtime), and an entry whose actor was released dies
+   * with its OwnedActor (a released id never comes back: its generation
+   * moves on). Free both here, so only live actors keep a runtime. */
   bool replaced = false;
-  for (size_t i = 0; i < install->actor_count && !replaced; i++) {
+  size_t kept = 0;
+  for (size_t i = 0; i < install->actor_count; i++) {
     mnav_actor *cached = install->actors[i];
-    if (!qa_same_actor(cached->actor.id, actor.id) || !is(cached->actor.owner, actor.owner)) continue;
-    /* The previous runtime may still be held by the caller for this
-     * think; keep it alive with the install (TS GC keeps it while used). */
-    install->actors = grow(install->actors, &install->actor_cap, install->actor_count, sizeof *install->actors);
-    install->actors[install->actor_count++] = cached;
-    install->actors[i] = entry; replaced = true;
+    if (qa_same_actor(cached->actor.id, actor.id) && is(cached->actor.owner, actor.owner)) {
+      if (!replaced) { install->actors[kept++] = entry; replaced = true; }
+      mnav_actor_free(cached);
+    } else if (!qa_session_actor_registry_is_live(install->game->host.actors, cached->actor.id)) mnav_actor_free(cached);
+    else install->actors[kept++] = cached;
   }
+  install->actor_count = kept;
   if (!replaced) {
     install->actors = grow(install->actors, &install->actor_cap, install->actor_count, sizeof *install->actors);
     install->actors[install->actor_count++] = entry;
@@ -290,7 +300,7 @@ void qa_app_sim_application_monster_navigation_install(qa_app_sim_application_mo
     qa_raise("Error", 0, 0, "%s", "MG3 monsters require Q1 source movement");
   mnav_install *install = calloc(1, sizeof *install);
   if (install == NULL) qa_range_error("Out of memory");
-  install->navigation = navigation; install->simulation = simulation; install->movement = movement; install->selected = selected;
+  install->navigation = navigation; install->simulation = simulation; install->movement = movement; install->game = game; install->selected = selected;
   navigation->installs = grow(navigation->installs, &navigation->install_cap, navigation->install_count, sizeof *navigation->installs);
   navigation->installs[navigation->install_count++] = install;
   qa_q1am_register_mg3_monster_navigation(game, (qa_q1am_nav_host){install, for_actor});
@@ -301,9 +311,7 @@ void qa_app_sim_application_monster_navigation_destroy(qa_app_sim_application_mo
   for (size_t i = 0; i < navigation->install_count; i++) {
     mnav_install *install = navigation->installs[i];
     for (size_t j = 0; j < install->actor_count; j++) {
-      mnav_actor *actor = install->actors[j];
-      qa_navigation_runtime_destroy(&actor->runtime);
-      free(actor->route); free(actor);
+      mnav_actor_free(install->actors[j]);
     }
     for (size_t j = 0; j < install->graph_count; j++) {
       qa_loaded_navigation_destroy(&install->graphs[j]->loaded);

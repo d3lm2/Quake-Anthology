@@ -6,10 +6,10 @@ symbols. This is an upper bound on what runs (taking a function pointer counts
 as a call; pulling one symbol pulls its whole object), so "unreachable" is a
 hard finding: that code cannot execute in the shipped binary.
 
-Usage: tools/reachability.py [--list] [--module PREFIX]
+Usage: [BUILD=build/agents/NAME] tools/reachability.py [--list] [--module PREFIX]
 """
 import collections, os, subprocess, sys
-root = 'build/src'
+root = os.path.join(os.environ.get('BUILD', 'build'), 'src')
 objs = sorted(os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs if f.endswith('.o'))
 defs, undefs = {}, collections.defaultdict(set)
 out = subprocess.run(['nm', '-A', '--no-sort'] + objs, capture_output=True, text=True).stdout

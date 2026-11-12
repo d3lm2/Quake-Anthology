@@ -70,7 +70,7 @@ struct qa_application_open_record {
   qa_app_loaded_content *content;
   qa_app_server_operator_state *operator_state;
   qa_app_image_settings *image_settings;        /* opened by openSource (not the startup's) */
-  qa_cvar_registry *borrowed_source;
+  qa_cvar_registry *borrowed_source; bool owns_borrowed_source;
   qa_app_options options_for_recipe; bool has_options_for_recipe;
   qa_cvar_archive_entry *source_archive; size_t source_archive_count;
   qa_app_sim_saved_settings saved_settings; bool has_saved_settings;
@@ -200,12 +200,14 @@ typedef struct open_scripts_ctx {
   const char **game_roots; char **owned_roots; size_t owned_count;
   char *console_root;
   qa_app_source_script_reader reader;
+  qa_app_configuration_layering layering;
 } open_scripts_ctx;
 static void open_scripts_release(void *object) {
   open_scripts_ctx *ctx = object;
   for (size_t i = 0; i < ctx->owned_count; i++) free(ctx->owned_roots[i]);
   free(ctx->owned_roots); free(ctx->game_roots); free(ctx->console_root);
   qa_app_source_script_reader_destroy(ctx->reader);
+  qa_app_configuration_layering_destroy(&ctx->layering);
   free(ctx);
 }
 static bool open_scripts_mounted(void *raw, const char *name, uint8_t **out_bytes, size_t *out_count) {
@@ -240,6 +242,11 @@ qa_app_console_script_files *qa_app_open_configuration_scripts(const qa_app_opti
   ctx->game_roots = checked(calloc(capacity, sizeof *ctx->game_roots));
   ctx->owned_roots = checked(calloc(capacity + 1, sizeof *ctx->owned_roots));
   ctx->owned_count = capacity + 1;
+  const char *components[QA_APP_SELECTION_COMPONENT_COUNT];
+  qa_app_selection_components(&selection, components);
+  ctx->layering = qa_app_configuration_layering_open(catalog, options, selection.engine_behavior.content, components,
+      QA_APP_SELECTION_COMPONENT_COUNT);
+  qa_app_configuration_layering_apply(&ctx->layering, &files);
   files.has_legacy_config = qa_app_legacy_configuration_options_for_catalog(catalog, options, selection.engine_behavior.content,
       &files.legacy_config, ctx->game_roots, capacity, ctx->owned_roots);
   files.console_root = ctx->console_root;
@@ -286,9 +293,8 @@ static bool open_plan(void *ctx, const qa_resolved_mount_plan *plan, qa_catalog_
 }
 
 /* prepareRereleaseNavigation: simulation => createApplicationBotNavigation({ content, simulation }). */
-static const void *open_rerelease_navigation(void *ctx, qa_app_sim_shared_simulation *opaque) {
+static const void *open_rerelease_navigation(void *ctx, qa_app_shared_simulation *simulation) {
   open_state *state = ctx;
-  qa_app_shared_simulation *simulation = (qa_app_shared_simulation *)(void *)opaque;
   qa_app_sim_application_bot_navigation *navigation = qa_app_sim_create_application_bot_navigation(
       qa_application_navigation_content(state->record->content),
       qa_app_shared_sim_navigation_simulation(simulation, qa_app_loaded_content_recipe(state->record->content)));
@@ -409,6 +415,7 @@ static void open_app_set_connection(qa_application *app, qa_session_client *clie
   app->source_connection_clients[app->source_connection_count] = client;
   app->source_connections[app->source_connection_count++] = connection;
 }
+static void open_request_release(void *request) { qa_application_command_request_free(request); }
 /* requestedCommands.admitAll(requests): ConfigurationCommandRequest rows become owned application requests. */
 static void open_admit_request(qa_application *app, const qa_app_configuration_command_request *source) {
   qa_application_command_request request;
@@ -420,7 +427,10 @@ static void open_admit_request(qa_application *app, const qa_app_configuration_c
   request.argument_count = source->argument_count;
   request.has_seat = source->has_seat; request.seat = source->seat;
   request.has_source = true; request.source = qa_command_context_copy(&source->source);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, open_request_release, &request);
   (void)qa_event_ring_admit(&app->requested_commands, &request);
+  qa_cleanup_pop(&guard);
 }
 static void open_release_view_binding(void *ctx) { qa_app_image_view_binding_release(ctx); }
 static void open_after_dispatch(void *ctx) { qa_application_commands(ctx); }
@@ -587,8 +597,9 @@ static void open_body(void *ctx) {
       if (open_local_seat(s, qa_session_client_id(client->locals[i].client)) == NULL) OPEN_PUSH(s, staged_clients_removed, client->locals[i].client);
     }
   }
-  /* sourceArchive */
-  if (!restored && !s->options.dedicated) {
+  /* sourceArchive: initialSave !== undefined ? [] : preparation.kind !== "restored" ? load : [] (a dedicated server
+   * loads its archive too) */
+  if (!restored) {
     qa_config_store store;
     if (!qa_app_configuration_store_for_catalog(s->catalog, &s->options, selection.source.content, &store)) qa_range_error("Out of memory");
     const char *owner[3] = {"source", selection.source.content, selection.source.provider};
@@ -652,6 +663,7 @@ static void open_body(void *ctx) {
       registry.context = qa_cvar_registry_context(source);
       registry.print = (qa_command_print_fn)open_print; registry.print_ctx = s;
       r->borrowed_source = checked(qa_cvar_registry_create(&registry));
+      r->owns_borrowed_source = true;
       qa_save_value *transfer = checked(qa_cvar_registry_capture_world_transfer_state(source));
       qa_cvar_registry_restore_save_state(r->borrowed_source, transfer);
       qa_save_value_free(transfer);
@@ -699,6 +711,7 @@ static void open_body(void *ctx) {
       args.source_archive = r->source_archive; args.source_archive_count = r->source_archive_count;
       args.default_capacity = s->default_capacity;
       args.next_frame = open_next_frame; args.next_frame_ctx = s;
+      args.pending = &r->profile;
       r->profile = checked(qa_app_prepare_profile_configuration(&s->options, &args));
       free(seats);
       s->options = *qa_app_prepared_profile_options(r->profile);
@@ -717,6 +730,7 @@ static void open_body(void *ctx) {
     args.default_capacity = s->default_capacity;
     args.next_frame = open_next_frame; args.next_frame_ctx = s;
     args.on_prepared = open_on_prepared; args.on_prepared_ctx = s;
+    args.pending = &r->startup;
     r->startup = checked(qa_app_prepare_initial_configuration(&s->options, &args));
     /* prepareInitialConfiguration fills localSeats with the seats it creates. */
     size_t prepared_count = 0;
@@ -737,7 +751,7 @@ static void open_body(void *ctx) {
   }
   open_stage(s, "Loading map...");
   if (!restored) {
-    r->content = qa_app_load_application_content_native((qa_app_content_host){0}, qa_application_options_copy(&s->options), s->recipe,
+    r->content = qa_app_load_application_content_native(qa_application_options_copy(&s->options), s->recipe,
         s->recipe != NULL, NULL, (qa_content_catalog *)s->catalog, NULL);
     if (r->content == NULL) qa_range_error("Out of memory");
   }
@@ -917,6 +931,7 @@ static void open_body(void *ctx) {
   qa_application *application = qa_application_construct(retained, content, s->session, simulation, s->host, s->identity,
       s->seat_clients, s->seats, s->seat_count, s->input_config, s->ownership);
   s->has_input_config = false; /* the application owns inputConfig */
+  application->console_log_attached = true; /* hostWithConsoleLog: `application` is assigned from here on */
   s->application = application;
   application->owns_identity = s->owns_identity;
   s->owns_identity = false;
@@ -1081,9 +1096,15 @@ static void open_cleanup_body(void *ctx) {
   struct qa_application_open_record *r = s->record;
   if (s->has_startup_demos) open_release_startup_demos(s);
   if (s->ownership.borrowed_client == NULL && s->session != NULL) qa_engine_session_close(s->session);
+  /* TS attaches the loaded world to an owned session before the application exists, so session.close() closes it;
+   * the C session attaches it with the application. A borrowed source's world is left to TS GC; C closes it before
+   * freeing it. */
+  if (r != NULL && r->simulation != NULL) qa_app_shared_sim_close(r->simulation);
   for (size_t i = 0; i < s->staged_seats_added_count; i++) qa_session_seat_close(s->staged_seats_added[i]);
   for (size_t i = 0; i < s->staged_clients_added_count; i++) qa_session_client_close(s->staged_clients_added[i]);
-  if (r != NULL && r->profile != NULL) qa_app_console_routing_close(qa_app_prepared_profile_routing(r->profile));
+  /* profileConfiguration?.routing.close(): a configuration a raise left partly built may have no routing yet. */
+  if (r != NULL && r->profile != NULL && qa_app_prepared_profile_routing(r->profile) != NULL)
+    qa_app_console_routing_close(qa_app_prepared_profile_routing(r->profile));
   if (r != NULL && r->profile_scripts != NULL) qa_app_console_script_files_close(r->profile_scripts);
   if (r != NULL && r->startup != NULL && qa_app_prepared_initial_image(r->startup) != NULL)
     qa_app_image_settings_close(qa_app_prepared_initial_image(r->startup));
@@ -1102,14 +1123,12 @@ static void open_close_application_body(void *ctx) {
 static void open_close_configuration_body(void *ctx) { qa_app_configuration_content_close(ctx); }
 static void open_close_content_body(void *ctx) { qa_app_loaded_content_close(ctx); }
 
-qa_application *qa_application_open_source(qa_application_ownership ownership, qa_app_options options, qa_application_host host,
-    const qa_executable_recipe *recipe, const qa_app_frontend_preference_overrides *preferences, const qa_save_image *initial_save) {
-  open_state *s = checked(calloc(1, sizeof *s));
-  s->ownership = ownership; s->options = options; s->recipe = recipe; s->preferences = preferences; s->initial_save = initial_save;
-  s->operator_output = checked(calloc(1, sizeof *s->operator_output));
-  struct qa_application_open_record *r = checked(calloc(1, sizeof *r));
-  s->record = r;
-  s->host = qa_application_operator_host_wrap(host, s->operator_output, &r->operator_host_record);
+/* The part of openSource before its try: the arguments, the saved settings and the preparation content. */
+static void open_prepare(void *ctx) {
+  open_state *s = ctx;
+  struct qa_application_open_record *r = s->record;
+  const qa_app_options options = s->options;
+  const qa_save_image *initial_save = s->initial_save;
   const char *network = options.network_kind;
   if (strcmp(network, "qw-client") == 0 || strcmp(network, "q1-client") == 0 || strcmp(network, "q2-client") == 0
       || strcmp(network, "q3-client") == 0 || strcmp(network, "unified-client") == 0)
@@ -1144,10 +1163,51 @@ qa_application *qa_application_open_source(qa_application_ownership ownership, q
     r->configuration = checked(qa_app_open_initial_configuration_content_native(&s->options, s->recipe, NULL));
     s->catalog = qa_app_configuration_content_catalog(r->configuration);
   } else {
-    r->content = qa_app_load_application_content_native((qa_app_content_host){0}, qa_application_options_copy(&s->options), s->recipe,
+    r->content = qa_app_load_application_content_native(qa_application_options_copy(&s->options), s->recipe,
         true, NULL, NULL, NULL);
     if (r->content == NULL) qa_range_error("Out of memory");
     s->catalog = qa_app_loaded_content_catalog(r->content);
+  }
+}
+
+static void open_record_free(struct qa_application_open_record *r, qa_application *app);
+static void open_state_free(open_state *s);
+/* C-only: what a failed openSource built is freed before the error leaves it (TS GC). The objects were closed by
+ * the TS cleanup steps first; an application that was constructed is closed and destroyed. */
+static void open_release(open_state *s) {
+  if (s->application != NULL) {
+    s->application->open_state = s;
+    qa_application_destroy(s->application);
+    return;
+  }
+  struct qa_application_open_record *r = s->record;
+  /* Before the application was constructed openSource's own locals still hold the owners it created. */
+  if (r != NULL) open_record_free(r, NULL);
+  s->record = NULL;
+  if (s->has_input_config) qa_config_store_destroy(&s->input_config);
+  free(s->candidate_graph);
+  free(s->operator_output);
+  qa_identity_owner *identity = s->owns_identity ? s->identity : NULL;
+  open_state_free(s);
+  if (identity != NULL) { qa_identity_owner_destroy(identity); free(identity); }
+}
+
+qa_application *qa_application_open_source(qa_application_ownership ownership, qa_app_options options, qa_application_host host,
+    const qa_executable_recipe *recipe, const qa_app_frontend_preference_overrides *preferences, const qa_save_image *initial_save) {
+  open_state *s = checked(calloc(1, sizeof *s));
+  s->ownership = ownership; s->options = options; s->recipe = recipe; s->preferences = preferences; s->initial_save = initial_save;
+  s->operator_output = calloc(1, sizeof *s->operator_output);
+  struct qa_application_open_record *r = calloc(1, sizeof *r);
+  if (s->operator_output == NULL || r == NULL) {
+    free(s->operator_output); free(r); free(s);
+    qa_range_error("Out of memory");
+  }
+  s->record = r;
+  s->host = qa_application_operator_host_wrap(host, s->operator_output, &r->operator_host_record);
+  qa_caught_error early;
+  if (!qa_try(open_prepare, s, &early)) {
+    open_release(s);
+    qa_rethrow(&early);
   }
   qa_caught_error error;
   if (!qa_try(open_body, s, &error)) {
@@ -1159,12 +1219,20 @@ qa_application *qa_application_open_source(qa_application_ownership ownership, q
       if (!qa_try(open_close_application_body, &close, &cleanup)) failures++;
       published = s->ownership.borrowed_client != NULL && s->application->source_published;
     } else if (!qa_try(open_cleanup_body, s, &cleanup)) failures++;
+    /* The record moves into the application when it is constructed. */
+    struct qa_application_open_record *owned = s->application != NULL ? s->application->open_record : r;
     qa_caught_error preparation;
-    bool preparation_failed = r->configuration != NULL ? !qa_try(open_close_configuration_body, r->configuration, &preparation)
-        : r->content != NULL && s->application == NULL && !qa_try(open_close_content_body, r->content, &preparation);
+    bool preparation_failed = owned->configuration != NULL ? !qa_try(open_close_configuration_body, owned->configuration, &preparation)
+        : owned->content != NULL && s->application == NULL && !qa_try(open_close_content_body, owned->content, &preparation);
+    open_release(s);
+    /* TS: the inner catch throws (ClientSourcePublicationError, the initialization AggregateError, or the error);
+     * a failed preparation close then wraps whatever it threw. */
+    if (preparation_failed) {
+      if (published) qa_raise("ClientSourcePublicationError", 0, 2, "%s", qa_app_client_source_publication_error);
+      qa_raise("AggregateError", 0, 2, "Application preparation and cleanup failed");
+    }
     if (published) qa_raise("ClientSourcePublicationError", 0, (long long)failures, "%s", qa_app_client_source_publication_error);
     if (failures > 1) qa_raise("AggregateError", 0, (long long)failures, "Application initialization and cleanup failed");
-    if (preparation_failed) qa_raise("AggregateError", 0, 2, "Application preparation and cleanup failed");
     qa_rethrow(&error);
   }
   qa_application *application = s->result;
@@ -1172,83 +1240,101 @@ qa_application *qa_application_open_source(qa_application_ownership ownership, q
   return application;
 }
 
-/* C-only GC of what openSource created (the application is closed). */
+/* C-only GC of what openSource created (the application is closed). `app` NULL: the application was never
+ * constructed. */
+static void open_record_free(struct qa_application_open_record *r, qa_application *app) {
+#define OPEN_APP_FIELD(field, value) do { if (app != NULL && app->field == (value)) app->field = NULL; } while (0)
+  /* The prepared profile (TS GC): a borrowed application's configuration continuation may still be adopted by the
+   * client's prepared startup, which outlives the application; it is taken back first. */
+  if (r->profile != NULL) {
+    OPEN_APP_FIELD(profile_configuration, r->profile);
+    qa_app_prepared_startup *published = qa_app_prepared_profile_published(r->profile);
+    if (published != NULL) (void)qa_app_prepared_startup_retract_configuration_continuation(published, r->profile);
+    qa_app_prepared_profile_destroy(r->profile);
+    r->profile = NULL;
+  }
+  if (r->local_guest != NULL) {
+    OPEN_APP_FIELD(local_guest, r->local_guest);
+    free(r->local_guest->seat_ids);
+    free(r->local_guest->seats);
+    qa_event_ring_destroy(&r->local_guest->pending_commands);
+    free(r->local_guest);
+  }
+  if (r->has_local_authority) qa_app_sim_q3_application_server_authority_destroy(r->local_authority);
+  if (r->has_world_sound_owner) qa_identity_owner_destroy(&r->world_sound_owner);
+  if (r->image_settings != NULL) {
+    OPEN_APP_FIELD(image_settings, r->image_settings);
+    qa_app_image_settings_destroy(r->image_settings);
+  }
+  free(r->frontend_printer);
+  if (r->operator_state != NULL) {
+    OPEN_APP_FIELD(operator_state, r->operator_state);
+    qa_app_server_operator_state_destroy(r->operator_state);
+  }
+  if (r->simulation != NULL) {
+    OPEN_APP_FIELD(world_simulation, r->simulation);
+    qa_app_shared_simulation_destroy(r->simulation);
+  }
+  if (r->owns_borrowed_source && r->borrowed_source != NULL) qa_cvar_registry_destroy(r->borrowed_source);
+  if (r->monster_navigation != NULL) qa_app_sim_application_monster_navigation_destroy(r->monster_navigation);
+  if (r->mod_commands != NULL) qa_mod_commands_destroy(r->mod_commands);
+  if (r->startup != NULL) {
+    OPEN_APP_FIELD(prepared_startup, qa_app_prepared_initial_startup(r->startup));
+    qa_app_prepared_initial_destroy(r->startup);
+  }
+  free(r->startup_demo_record);
+  if (r->startup_scripts != NULL) qa_app_console_script_files_destroy(r->startup_scripts);
+  if (r->profile_scripts != NULL) qa_app_console_script_files_destroy(r->profile_scripts);
+  if (r->restored_scripts != NULL) qa_app_console_script_files_destroy(r->restored_scripts);
+  if (app != NULL && (app->configuration_scripts == r->startup_scripts || app->configuration_scripts == r->restored_scripts))
+    app->configuration_scripts = NULL;
+  if (r->content != NULL) {
+    OPEN_APP_FIELD(loaded_content, r->content);
+    qa_app_loaded_content_destroy(r->content);
+  }
+  if (r->configuration != NULL) qa_app_configuration_content_destroy(r->configuration);
+  if (r->session != NULL) {
+    OPEN_APP_FIELD(session, r->session);
+    qa_engine_session_destroy(r->session);
+  }
+#undef OPEN_APP_FIELD
+  if (r->has_saved_settings) { qa_save_value_free(r->saved_settings.value); free(r->saved_settings.client_slots); }
+  if (r->decoded_bots != NULL) { qa_app_sim_decoded_bots_checkpoint_free(r->decoded_bots); free(r->decoded_bots); }
+  if (r->saved_bots != NULL) { qa_save_value_free(r->saved_bots->value); free(r->saved_bots->connections); free(r->saved_bots); }
+  qa_app_cvar_archive_entries_free(r->source_archive, r->source_archive_count);
+  qa_save_value_free(r->server_profile_value);
+  if (r->has_options_for_recipe) qa_app_options_for_recipe_free(&r->options_for_recipe);
+  if (r->has_authored) qa_authored_start_catalog_free(&r->authored);
+  free(r->q2_next_server);
+  free(r->operator_host_record);
+  /* The application's identity (destroyed after this) frees only its token; the name is no longer read. */
+  free(r->identity_name);
+  free(r);
+}
+static void open_state_free(open_state *s) {
+  free(s->seat_clients); free(s->seats);
+  free(s->restored_slots); free(s->restored_clients);
+  free(s->staged_clients_added); free(s->staged_clients_removed);
+  free(s->staged_seats_added); free(s->staged_seats_removed);
+  for (size_t i = 0; i < s->kept_count; i++) free(s->kept[i]);
+  free(s->kept);
+  free(s->enabled_mods);
+  free(s->weapon_behaviors);
+  free((void *)s->definitions); /* serverDefinitionsForRecipe/Selection's array (the rows are static) */
+  if (s->mod_files != NULL) qa_mod_user_files_destroy(s->mod_files);
+  qa_app_name_values_free(s->q3_cvars, s->q3_cvar_count);
+  if (s->has_borrowed_images) qa_app_image_client_settings_destroy(&s->borrowed_images);
+  /* TS GC of the startup ClientDemoCommands; closeOwned released its startup and source bindings. */
+  if (s->has_startup_demos) qa_app_client_demo_commands_destroy(s->startup_demos);
+  free(s);
+}
 void qa_application_open_free(qa_application *app) {
-  struct qa_application_open_record *r = app->open_record;
-  open_state *s = app->open_state;
-  if (r != NULL) {
-    if (r->local_guest != NULL) {
-      if (app->local_guest == r->local_guest) app->local_guest = NULL;
-      free(r->local_guest->seat_ids);
-      free(r->local_guest->seats);
-      qa_event_ring_destroy(&r->local_guest->pending_commands);
-      free(r->local_guest);
-    }
-    if (r->has_local_authority) qa_app_sim_q3_application_server_authority_destroy(r->local_authority);
-    if (r->has_world_sound_owner) qa_identity_owner_destroy(&r->world_sound_owner);
-    if (r->image_settings != NULL) {
-      if (app->image_settings == r->image_settings) app->image_settings = NULL;
-      qa_app_image_settings_destroy(r->image_settings);
-    }
-    free(r->frontend_printer);
-    if (r->operator_state != NULL) {
-      if (app->operator_state == r->operator_state) app->operator_state = NULL;
-      qa_app_server_operator_state_destroy(r->operator_state);
-    }
-    if (r->simulation != NULL) {
-      if (app->world_simulation == r->simulation) app->world_simulation = NULL;
-      qa_app_shared_simulation_destroy(r->simulation);
-    }
-    if (r->monster_navigation != NULL) qa_app_sim_application_monster_navigation_destroy(r->monster_navigation);
-    if (r->mod_commands != NULL) qa_mod_commands_destroy(r->mod_commands);
-    if (r->startup != NULL) {
-      if (app->prepared_startup == qa_app_prepared_initial_startup(r->startup)) app->prepared_startup = NULL;
-      qa_app_prepared_initial_destroy(r->startup);
-    }
-    free(r->startup_demo_record);
-    if (r->startup_scripts != NULL) qa_app_console_script_files_destroy(r->startup_scripts);
-    if (r->profile_scripts != NULL) qa_app_console_script_files_destroy(r->profile_scripts);
-    if (r->restored_scripts != NULL) qa_app_console_script_files_destroy(r->restored_scripts);
-    if (app->configuration_scripts == r->startup_scripts || app->configuration_scripts == r->restored_scripts) app->configuration_scripts = NULL;
-    if (r->content != NULL) {
-      if (app->loaded_content == r->content) app->loaded_content = NULL;
-      qa_app_loaded_content_destroy(r->content);
-    }
-    if (r->configuration != NULL) qa_app_configuration_content_destroy(r->configuration);
-    if (r->session != NULL) {
-      if (app->session == r->session) app->session = NULL;
-      qa_engine_session_destroy(r->session);
-    }
-    if (r->has_saved_settings) { qa_save_value_free(r->saved_settings.value); free(r->saved_settings.client_slots); }
-    if (r->decoded_bots != NULL) { qa_app_sim_decoded_bots_checkpoint_free(r->decoded_bots); free(r->decoded_bots); }
-    if (r->saved_bots != NULL) { qa_save_value_free(r->saved_bots->value); free(r->saved_bots->connections); free(r->saved_bots); }
-    qa_app_cvar_archive_entries_free(r->source_archive, r->source_archive_count);
-    qa_save_value_free(r->server_profile_value);
-    if (r->has_options_for_recipe) qa_app_options_for_recipe_free(&r->options_for_recipe);
-    if (r->has_authored) qa_authored_start_catalog_free(&r->authored);
-    free(r->q2_next_server);
-    free(r->operator_host_record);
-    /* The application's identity (destroyed after this) frees only its token; the name is no longer read. */
-    free(r->identity_name);
-    free(r);
+  if (app->open_record != NULL) {
+    open_record_free(app->open_record, app);
     app->open_record = NULL;
   }
-  if (s != NULL) {
-    free(s->seat_clients); free(s->seats);
-    free(s->restored_slots); free(s->restored_clients);
-    free(s->staged_clients_added); free(s->staged_clients_removed);
-    free(s->staged_seats_added); free(s->staged_seats_removed);
-    for (size_t i = 0; i < s->kept_count; i++) free(s->kept[i]);
-    free(s->kept);
-    free(s->enabled_mods);
-    free(s->weapon_behaviors);
-    free((void *)s->definitions); /* serverDefinitionsForRecipe/Selection's array (the rows are static) */
-    if (s->mod_files != NULL) qa_mod_user_files_destroy(s->mod_files);
-    qa_app_name_values_free(s->q3_cvars, s->q3_cvar_count);
-    if (s->has_borrowed_images) qa_app_image_client_settings_destroy(&s->borrowed_images);
-    /* TS GC of the startup ClientDemoCommands; closeOwned released its startup and source bindings. */
-    if (s->has_startup_demos) qa_app_client_demo_commands_destroy(s->startup_demos);
-    free(s);
+  if (app->open_state != NULL) {
+    open_state_free(app->open_state);
     app->open_state = NULL;
   }
 }

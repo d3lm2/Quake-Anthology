@@ -27,6 +27,8 @@
 #include "qa/app/bootstrap/component_drawings.h"
 #include "qa/app/bootstrap/config_scripts.h"
 #include "qa/app/bootstrap/configuration.h"
+#include "qa/app/bootstrap/console_log.h"
+#include "qa/app/bootstrap/native_settings.h"
 #include "qa/app/bootstrap/demo_commands.h"
 #include "qa/app/bootstrap/demo_local_recording.h"
 #include "qa/app/bootstrap/demo_recording_commands.h"
@@ -272,12 +274,6 @@ typedef struct qa_application_save_operation {
   void *ctx;
 } qa_application_save_operation;
 
-/* TS gameLog. */
-typedef struct qa_application_game_log {
-  char *name;
-  bool sync;
-  qa_writable_binary_file *file;
-} qa_application_game_log;
 
 /* TS operatorOutput box: write NULL is TS null. */
 typedef struct qa_application_operator_output {
@@ -329,7 +325,10 @@ struct qa_application {
   qa_cvar_registry **published_userinfo_cvars; char **published_userinfo; size_t published_userinfo_count, published_userinfo_capacity;
   qa_app_team_arena_overrides *team_arena_overrides;
   bool archive_persistence;
-  qa_application_game_log *game_log;
+  qa_app_console_log console_log;                     /* TS consoleLog */
+  bool console_log_attached;                          /* the TS `application` of hostWithConsoleLog's closure is assigned */
+  qa_application_host unlogged_host;                  /* the host hostWithConsoleLog wraps */
+  qa_app_append_log game_log;                         /* TS gameLog (AppendLog) */
   qa_dedicated_console *dedicated_console;
   qa_command_buffer *dedicated_commands;
   qa_event_ring requested_commands;                   /* qa_application_command_request records */
@@ -431,6 +430,10 @@ struct qa_application {
   char *save_directory_text;                          /* saveDirectory getter result */
   char **external_save_roots; size_t external_save_root_count; /* externalSaveDirectories getter result */
   qa_application_prepared_source_commands *published_source_commands; /* owns sourceCommandBinding.options and q2Console */
+  /* Preparations a later publish replaced. Input actions created before the replacement captured their Q2 console
+   * (TS inputActions' `q2Console = this.q2Console`) and keep routing through it, so they live until the
+   * application is destroyed (TS GC). */
+  qa_application_prepared_source_commands **retired_source_commands; size_t retired_source_command_count;
   void **ranking_account_records; size_t ranking_account_record_count, ranking_account_record_capacity; /* rankingAccountActions results */
   void **guest_output_records; size_t guest_output_record_count, guest_output_record_capacity;       /* guestOutput closures */
   qa_application_dedicated_queue dedicated_queues[7];                                               /* openDedicatedConsole handlers */
@@ -509,6 +512,14 @@ void qa_application_ui_source_options(qa_application *app, qa_app_shared_simulat
     qa_seat_id seat, const qa_seat_id *client_seats, qa_cvar_registry *const *client_cvars, size_t client_count,
     qa_app_seat_ui_options *out);
 qa_config_store qa_application_source_config(const qa_app_options *options, qa_app_loaded_content *content);
+/* TS static gameFilesRoot: where the original keeps the files its game writes itself (games.log, listip.cfg): its
+ * own folder when stock. Malloc'd. */
+char *qa_application_game_files_root(const qa_app_options *options, qa_app_loaded_content *content);
+/* TS stockGameDirectory(content, options, fallback). Malloc'd. */
+char *qa_application_stock_game_directory(qa_app_loaded_content *content, const qa_app_options *options, const char *fallback);
+/* TS nativeSaves(): the stock game's own save folder; false for a mixed combination, which keeps to the user
+ * store. On true the caller destroys `out` (qa_native_save_layout_destroy). */
+bool qa_application_native_saves(qa_application *app, qa_native_save_layout *out);
 qa_config_store qa_application_client_config(const qa_app_options *options, qa_app_loaded_content *content);
 void qa_application_enable_startup_persistence(qa_application *app);
 void qa_application_save_source_archive(qa_application *app, const qa_app_options *options, qa_app_loaded_content *content,
@@ -553,6 +564,9 @@ typedef struct qa_application_create_bots_setup {
   qa_session_client *(*resolve_client)(void *ctx, double slot, double generation); void *resolve_ctx;
   bool requested;
   bool has_commands; qa_command_buffer *commands;
+  /* TS commands: { insert: text => guestCommands().insert(text) }: when set, each insert resolves its buffer here
+   * (a world transition's candidate buffer until publication, then the source buffer). */
+  qa_command_buffer *(*commands_fn)(void *ctx); void *commands_ctx;
 } qa_application_create_bots_setup;
 qa_app_sim_bot_service *qa_application_create_bots(qa_application *app, qa_app_loaded_content *content,
     qa_app_shared_simulation *simulation, const qa_application_create_bots_setup *setup);
@@ -578,6 +592,8 @@ qa_sdl_window *qa_application_window(qa_application *app);
 qa_app_network_player *qa_application_network_clients(qa_application *app, size_t *out_count);
 bool qa_application_input(qa_application *app, const qa_seat_input_event *event);
 void qa_application_resume_input(qa_application *app);
+/* C-only: frees the text a deferred input event owns. */
+void qa_application_deferred_input_release(qa_seat_input_event *event);
 void qa_application_open_dedicated_console(qa_application *app);
 
 /* ---- application_commands.c: 1302-1750 ---- */
@@ -654,6 +670,8 @@ void qa_application_request_restart(qa_application *app, const char *const *args
 void qa_application_append_q1_commands(qa_application *app, const qa_app_sim_presentation_event *const *events, size_t count);
 void qa_application_write_game_log(qa_application *app, qa_app_shared_simulation *simulation, const char *text);
 void qa_application_close_game_log(qa_application *app);
+void qa_application_log_console(qa_application *app, const char *text);
+void qa_application_close_console_log(qa_application *app);
 
 /* ---- application_services.c: 1751-2308 ---- */
 /* TS sourceActions(events = this.sourceEvents): callers pass app->source_events for the default. */
@@ -862,6 +880,14 @@ qa_cvar_snapshot *qa_application_round_server_settings(void *ctx, size_t *out_co
 void qa_application_round_binding_release(void *record);
 /* TS saveGame(path, format = "shared"): format NULL is the default. */
 void qa_application_save_game(qa_application *app, const char *path, qa_app_save_format format);
+/* TS saveGame(path, format, saving): answers the path the save was written to (malloc'd); a stock game's native
+ * location may be written in the original format at the slot's own path. */
+char *qa_application_save_game_at(qa_application *app, const char *path, qa_app_save_format format, bool autosave);
+/* TS savePath(name) / nativeQ2Original(native). */
+char *qa_application_save_path(qa_application *app, const char *name);
+bool qa_application_native_q2_original(qa_application *app, const qa_native_save_layout *native);
+/* this.simulation.options.mode */
+const char *qa_application_simulation_mode(qa_app_shared_simulation *simulation);
 /* TS loadGame(path, sourceProduct?) / restoreSavedGame: source_product NULL is TS undefined. */
 void qa_application_load_game(qa_application *app, const char *path, const char *source_product);
 void qa_application_restore_saved_game(qa_application *app, const char *path, const char *source_product);

@@ -21,7 +21,7 @@ typedef struct qa_row_control {
   uint64_t generation;
   bool shutdown;
   bool failed;                     /* CONTROL_ERROR */
-  char error[1024];                /* the TS error buffer and CONTROL_ERROR_LENGTH */
+  char error[1025];                /* the TS error buffer: text.slice(0, 1024) and its terminator */
   qa_row_job_message message;      /* the current postMessage payload */
 } qa_row_control;
 bool qa_row_control_init(qa_row_control *control);

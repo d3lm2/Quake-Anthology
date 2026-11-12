@@ -103,9 +103,14 @@ static void activate_body(void *ctx) {
     app->cinematic = NULL;
     qa_remote_application_close_cinematic(app, previous);
   }
-  if (call->movie->owned_audio != NULL
-      && qa_unified_audio_open_device(call->movie->owned_audio, NULL, 0) != QA_SDL_AUDIO_OPEN_OK)
-    qa_raise("Error", 0, 0, "Audio output is unavailable");
+  if (call->movie->owned_audio != NULL) {
+    /* movie.ownedAudio?.openDevice(): it throws what the open threw (the engine keeps that SDL text; an allocation
+     * failure inside the open has none). */
+    qa_sdl_audio_open_result result = qa_unified_audio_open_device(call->movie->owned_audio, NULL, 0);
+    if (result != QA_SDL_AUDIO_OPEN_OK)
+      qa_raise("Error", 0, 0, "%s",
+               result == QA_SDL_AUDIO_OPEN_FAILED ? "Out of memory" : qa_unified_audio_open_error(call->movie->owned_audio));
+  }
   qa_app_campaign_cinematic_activate(call->movie->movie);
   app->cinematic = call->movie;
   app->reset_frame_elapsed = true;
@@ -143,6 +148,7 @@ typedef struct cinematic_captions {
 static void release_captions(void *object) {
   cinematic_captions *captions = object;
   qa_seat_media_captions_destroy(&captions->captions);
+  qa_ui_seat_preferences_destroy(&captions->preferences);
   free(captions->language);
   free(captions);
 }

@@ -15,7 +15,7 @@ static qa_compat_qc_mod_client_entry *require_entry(B *b, qa_actor_id actor) {
   qa_client_id client; bool has_client = svc(b)->for_actor(svc(b)->ctx, actor, &client);
   qa_actor_id back; bool has_back = has_client && svc(b)->actor(svc(b)->ctx, client, &back);
   if (!entry || !has_client || (entry->has_client && !client_eq(entry->client, client)) || !has_back || !actor_eq(back, actor))
-    qa_range_error("QuakeC component client identity is no longer live");
+    qa_raise("Error", 0, 0, "QuakeC component client identity is no longer live");
   if (entry->has_client) return entry;
   /* TS replaces the Map value, which ends any frame holding the old object. */
   entry->has_client = true; entry->client = client; entry->generation = ++b->next_generation; return entry;
@@ -40,7 +40,7 @@ bool qa_compat_qc_mod_client_bindings_slot(B *b, qa_actor_id actor, int64_t *out
   if (entry) { *out = require_entry(b, actor)->slot; return true; }
   int64_t slot = 1;
   for (;;) { bool used=false; for(size_t i=0;i<b->entry_count;i++) if(b->entries[i].slot==slot) used=true; if(!used) break; slot++; }
-  if (slot > (int64_t)b->operations.declaration->maximum) qa_range_error("QuakeC component source client capacity exceeded");
+  if (slot > (int64_t)b->operations.declaration->maximum) qa_raise("Error", 0, 0, "QuakeC component source client capacity exceeded");
   store_entry(b, (qa_compat_qc_mod_client_entry){actor, true, client, slot, false, 0});
   *out = slot; return true;
 }
@@ -48,7 +48,7 @@ static void delete_entry(B *b, qa_actor_id actor) {
   for(size_t i=0;i<b->entry_count;i++) if(actor_eq(b->entries[i].actor,actor)){ memmove(&b->entries[i],&b->entries[i+1],(b->entry_count-i-1)*sizeof *b->entries); b->entry_count--; return; }
 }
 static void admit(B *b, qa_actor_id actor) {
-  int64_t slot; if (!qa_compat_qc_mod_client_bindings_slot(b, actor, &slot)) qa_range_error("QuakeC component admission requires a live client");
+  int64_t slot; if (!qa_compat_qc_mod_client_bindings_slot(b, actor, &slot)) qa_raise("Error", 0, 0, "QuakeC component admission requires a live client");
   qa_compat_qc_mod_client_entry entry = *require_entry(b, actor); /* TS keeps this object across reserve/project */
   if (b->operations.reserve) b->operations.reserve(b->operations.ctx, actor);
   b->operations.project(b->operations.ctx, actor);
@@ -66,7 +66,7 @@ static void on_event(void *ctx, qa_mod_client_event event) {
 }
 static void in_open(void *ctx, qa_mod_client_application *app, void (**cleanup)(void *), void **cleanup_ctx) {
   B *b = ctx;
-  if (!require_entry(b, app->identity.actor)->admitted) qa_range_error("QuakeC client input requires source admission");
+  if (!require_entry(b, app->identity.actor)->admitted) qa_raise("Error", 0, 0, "QuakeC client input requires source admission");
   b->operations.input->open(b->operations.input->ctx, app, cleanup, cleanup_ctx);
 }
 static void in_invoke(void *ctx, const void *call, qa_mod_client_application *app) {
@@ -84,7 +84,7 @@ void qa_compat_qc_mod_client_bindings_start(B *b) {
   for (size_t i = 0; i < count; i++) admit(b, clients[i].actor);
   size_t binding_count = b->operations.declaration->input_count;
   if (binding_count) {
-    if (!b->operations.input) qa_range_error("QuakeC client input requires a source application owner");
+    if (!b->operations.input) qa_raise("Error", 0, 0, "QuakeC client input requires a source application owner");
     qa_mod_client_input_operations ops = {b, in_open, in_invoke, in_output};
     b->unsubscribe_input = qa_subscribe_mod_client_input(svc(b), b->operations.declaration->input, binding_count, ops);
     b->has_unsubscribe_input = true;
@@ -92,7 +92,7 @@ void qa_compat_qc_mod_client_bindings_start(B *b) {
 }
 char *qa_compat_qc_mod_client_bindings_userinfo(B *b, qa_actor_id actor, const char *key) {
   qa_compat_qc_mod_client_entry *entry = require_entry(b, actor);
-  if (!entry->has_client) qa_range_error("QuakeC component userinfo requires a restored client");
+  if (!entry->has_client) qa_raise("Error", 0, 0, "QuakeC component userinfo requires a restored client");
   return qa_info_value_for_key(svc(b)->userinfo(svc(b)->ctx, entry->client), key);
 }
 typedef struct { B *b; qa_compat_qc_mod_client_entry entry; } LiveCtx;
@@ -118,9 +118,9 @@ bool qa_compat_qc_mod_client_bindings_frame(B *b, int64_t slot, qa_frame_context
   return true;
 }
 void qa_compat_qc_mod_client_bindings_set_userinfo(B *b, qa_actor_id actor, const char *key, const char *value) {
-  if (strchr(value, '\\')) qa_range_error("QuakeC component userinfo field cannot contain a delimiter or NUL");
+  if (strchr(value, '\\')) qa_raise("Error", 0, 0, "QuakeC component userinfo field cannot contain a delimiter or NUL");
   qa_compat_qc_mod_client_entry *entry = require_entry(b, actor);
-  if (!entry->has_client) qa_range_error("QuakeC component userinfo requires a restored client");
+  if (!entry->has_client) qa_raise("Error", 0, 0, "QuakeC component userinfo requires a restored client");
   const char *source = svc(b)->userinfo(svc(b)->ctx, entry->client);
   /* split on backslash into pairs */
   char *copy = strdup(source), *result = malloc(strlen(source) + strlen(key) + strlen(value) + 4);
@@ -148,7 +148,7 @@ void qa_compat_qc_mod_client_bindings_restore(B *b, const qa_compat_qc_mod_clien
   for (size_t i = 0; i < count; i++) {
     bool bad = entries[i].slot < 1 || entries[i].slot > (int64_t)b->operations.declaration->maximum;
     for (size_t j = 0; j < b->entry_count; j++) if (b->entries[j].slot == entries[i].slot || actor_eq(b->entries[j].actor, entries[i].actor)) bad = true;
-    if (bad) qa_range_error("Invalid saved QuakeC component client mapping");
+    if (bad) qa_raise("Error", 0, 0, "Invalid saved QuakeC component client mapping");
     if (b->entry_count==b->entry_capacity){ size_t c=b->entry_capacity?b->entry_capacity*2:8; b->entries=realloc(b->entries,c*sizeof *b->entries); if(!b->entries) qa_range_error("mod client allocation failed"); b->entry_capacity=c; }
     qa_client_id client; bool has = svc(b)->for_actor(svc(b)->ctx, entries[i].actor, &client);
     qa_compat_qc_mod_client_entry restored; memset(&restored, 0, sizeof restored);

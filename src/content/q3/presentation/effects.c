@@ -27,14 +27,14 @@ static double fx_random(qa_q3_pres_client_effects *fx) { return f32((fx_rand(fx)
 static double fx_crandom(qa_q3_pres_client_effects *fx) { return f32(2 * f32(fx_random(fx) - 0.5)); }
 static const qa_q3_pres_mission_effect_media *mission_of(qa_q3_pres_client_effects *fx) {
   if (fx->media.product != QA_Q3_BASE_PRODUCT_MISSIONPACK)
-    qa_range_error("Missionpack effect requested in baseq3");
+    qa_raise("Error", 0, 0, "Missionpack effect requested in baseq3");
   return &fx->media.mission;
 }
 void qa_q3_pres_client_effects_init(qa_q3_pres_client_effects *fx, qa_q3_pres_client_game_state *state,
     qa_q3_pres_local_entity_pool *pool, qa_q3_base_product pool_product,
     qa_q3_pres_effect_media media, qa_q3_pres_effect_options options, qa_q3_pres_effect_imports imports) {
-  if (state->product != media.product) qa_range_error("Effect media product differs from cgame product");
-  if (state->product != pool_product) qa_range_error("Effect pool product differs from cgame product");
+  if (state->product != media.product) qa_raise("Error", 0, 0, "Effect media product differs from cgame product");
+  if (state->product != pool_product) qa_raise("Error", 0, 0, "Effect pool product differs from cgame product");
   fx->state = state;
   fx->pool = pool;
   fx->media = media;
@@ -132,7 +132,7 @@ qa_q3_pres_local_entity *qa_q3_pres_client_effects_make_explosion(qa_q3_pres_cli
                                                                   qa_q3_pres_explosion_options options) {
   int32_t duration = qa_int32(options.duration);
   if (duration <= 0) qa_range_error("CG_MakeExplosion: msec = %d", duration);
-  if (options.sprite && !options.direction) qa_range_error("Sprite explosion requires a direction vector");
+  if (options.sprite && !options.direction) qa_raise("Error", 0, 0, "Sprite explosion requires a direction vector");
   double offset = (double)(qa_js_to_int32(fx_rand(fx)) & 63);
   qa_q3_pres_local_entity *le = NULL;
   if (options.sprite) {
@@ -174,7 +174,7 @@ qa_q3_pres_local_entity *qa_q3_pres_client_effects_make_explosion(qa_q3_pres_cli
 }
 void qa_q3_pres_client_effects_bleed(qa_q3_pres_client_effects *fx, qa_vec3 origin, double entity_num) {
   if (!fx->options.blood) return;
-  if (!fx->state->snap) qa_range_error("CG_Bleed requires a current snapshot");
+  if (!fx->state->snap) qa_raise("Error", 0, 0, "CG_Bleed requires a current snapshot");
   qa_q3_pres_ref_sprite_entity *out = NULL;
   (void)qa_q3_pres_client_effects_bleed_at(fx, origin,
       entity_num == fx->state->snap->player_state.client_num, &out);

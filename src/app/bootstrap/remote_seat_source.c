@@ -261,6 +261,7 @@ struct qa_app_remote_seat_source {
   char *all_skins;
   qa_collision_map_settings collision;
   char *userinfo; char *seat_name;
+  char *baseskin; /* the last baseskin() result: its own slot, so a userinfo() read cannot free it */
   qa_app_client_download_progress *progress; size_t progress_capacity;
 };
 
@@ -476,7 +477,11 @@ static bool qw_skin_read(void *ctx, const char *path, uint8_t **out_bytes, size_
 static double qw_skin_noskins(void *ctx) { return qa_cvar_registry_variable_value(cvars(ctx), "noskins"); }
 static const char *qw_skin_baseskin(void *ctx) {
   qa_app_remote_seat_source *s = ctx;
-  return keep_userinfo(s, qa_cvar_registry_variable_string(cvars(s), "baseskin"));
+  char *value = qa_cvar_registry_variable_string(cvars(s), "baseskin");
+  if (value == NULL) qa_range_error("Out of memory");
+  free(s->baseskin);
+  s->baseskin = value;
+  return value;
 }
 static const char *qw_skin_allskins(void *ctx) {
   qa_app_remote_seat_source *s = ctx;
@@ -774,7 +779,7 @@ static void *q3c_load(void *ctx, const qa_pure_mount_policy *policy) {
   q3_content_host *host = ctx;
   qa_app_options options;
   qa_app_startup_options_copy(&options, &host->options);
-  qa_app_loaded_content *content = qa_app_load_application_content_native((qa_app_content_host){0}, options, NULL,
+  qa_app_loaded_content *content = qa_app_load_application_content_native(options, NULL,
       false, policy, NULL, NULL);
   if (content == NULL) qa_range_error("Out of memory");
   return content;
@@ -863,6 +868,9 @@ static void *q3_load_content(void *ctx, const char *map, const char *const *mode
   q3_content_host *host = xcalloc(1, sizeof *host);
   host->source = s;
   qa_app_startup_options_copy(&host->options, hooks->options(hooks->ctx));
+  /* the host (and the game-state text below) is released whatever raises before it is kept */
+  qa_cleanup host_guard;
+  qa_cleanup_push(&host_guard, q3_content_host_release, host);
   char *map_path = qa_app_server_map_path(map);
   free(host->options.map);
   host->options.map = map_path;
@@ -881,10 +889,11 @@ static void *q3_load_content(void *ctx, const char *map, const char *const *mode
   content_host.collect_opened = q3c_collect;
   content_host.close_content = q3c_close;
   state.info = game_state_text(connection, 1);
-  qa_cleanup host_guard;
-  qa_cleanup_push(&host_guard, q3_content_host_release, host);
+  qa_cleanup info_guard;
+  qa_cleanup_push(&info_guard, free, state.info);
   state.prepared = qa_app_q3_client_content_open(content_host, state.info,
       (double)qa_q3_client_connection_checksum_feed(connection));
+  qa_cleanup_pop(&info_guard);
   free(state.info);
   state.info = NULL;
   if (state.prepared == NULL) qa_range_error("Out of memory");
@@ -1167,7 +1176,7 @@ static void release(qa_app_remote_seat_source *s) {
   qa_app_remote_seat_presentation_destroy(&s->remote);
   qa_app_remote_access_release(&s->access);
   qa_net_address_destroy(&s->owner.address);
-  free(s->all_skins); free(s->userinfo); free(s->seat_name); free(s->progress);
+  free(s->all_skins); free(s->userinfo); free(s->seat_name); free(s->baseskin); free(s->progress);
   free(s);
 }
 static void construct_body(void *ctx) { construct(ctx); }

@@ -18,6 +18,51 @@ char *qa_source_command_text(const char *input) {
   return copy_range(input, 0, strlen(input));
 }
 
+bool qa_command_text_from_utf8(const char *utf8, char **out) {
+  size_t length = strlen(utf8);
+  char *bytes = (char *)malloc(length + 1);
+  if (bytes == NULL) qa_range_error("Out of memory");
+  size_t at = 0;
+  for (size_t i = 0; i < length;) {
+    uint8_t lead = (uint8_t)utf8[i];
+    if (lead < 0x80) {
+      bytes[at++] = (char)lead;
+      i++;
+      continue;
+    }
+    /* U+0080..U+00FF are C2 80..C3 BF; anything else is not one source byte. */
+    uint8_t next = (uint8_t)utf8[i + 1];
+    if ((lead != 0xc2 && lead != 0xc3) || (next & 0xc0) != 0x80) {
+      free(bytes);
+      *out = NULL;
+      return false;
+    }
+    bytes[at++] = (char)(((lead & 0x03) << 6) | (next & 0x3f));
+    i += 2;
+  }
+  bytes[at] = '\0';
+  *out = bytes;
+  return true;
+}
+
+char *qa_command_text_to_utf8(const char *bytes) {
+  size_t length = strlen(bytes);
+  char *text = (char *)malloc(length * 2 + 1);
+  if (text == NULL) qa_range_error("Out of memory");
+  size_t at = 0;
+  for (size_t i = 0; i < length; i++) {
+    uint8_t byte = (uint8_t)bytes[i];
+    if (byte < 0x80) {
+      text[at++] = (char)byte;
+    } else {
+      text[at++] = (char)(0xc0 | (byte >> 6));
+      text[at++] = (char)(0x80 | (byte & 0x3f));
+    }
+  }
+  text[at] = '\0';
+  return text;
+}
+
 char *qa_ascii_fold(const char *text) {
   size_t length = strlen(text);
   char *copy = copy_range(text, 0, length);

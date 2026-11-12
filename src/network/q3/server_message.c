@@ -2,6 +2,7 @@
 #include "qa/network/q3/server_message.h"
 #include "qa/core/binary/index.h"
 #include "qa/foundation/support.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,9 +60,10 @@ static void validate_entities(const qa_q3_entity_state_record *entities, size_t 
   if (count > ENTITY_SENTINEL) qa_range_error("Too many snapshot entities");
   int64_t previous = -1;
   for (size_t i = 0; i < count; i++) {
-    if (entities[i].number <= previous || entities[i].number >= ENTITY_SENTINEL)
+    double number = entities[i].number; /* !Number.isInteger(number) also refuses NaN */
+    if (!(number == trunc(number)) || isinf(number) || number <= (double)previous || number >= ENTITY_SENTINEL)
       qa_range_error("Snapshot entities must have sorted unique numbers below 1023");
-    previous = entities[i].number;
+    previous = (int64_t)number;
   }
 }
 typedef struct { qa_q3_entity_state_record *items; size_t count, cap; } ent_list_t;
@@ -118,7 +120,9 @@ static bool read_packet_entities(qa_q3_message_reader *r, const qa_q3_wire_snaps
         qa_q3_read_delta_entity(r, &from_copy, number, diag, cell);
         if (cell->number != ENTITY_SENTINEL) { qa_q3_source_parse_entities_advance(pe); ok = ent_push(out, cell); }
       } else {
+        /* TS new EntityStateRecord(0): its number 0 is what the shownet line prints. */
         qa_q3_entity_state_record target, from_copy = *old_ptr;
+        qa_q3_entity_state_record_init(&target, 0);
         qa_q3_read_delta_entity(r, &from_copy, number, diag, &target);
         if (target.number != ENTITY_SENTINEL) ok = ent_push(out, &target);
       }
@@ -134,6 +138,7 @@ static bool read_packet_entities(qa_q3_message_reader *r, const qa_q3_wire_snaps
         if (cell->number != ENTITY_SENTINEL) { qa_q3_source_parse_entities_advance(pe); ok = ent_push(out, cell); }
       } else {
         qa_q3_entity_state_record target;
+        qa_q3_entity_state_record_init(&target, 0);
         qa_q3_read_delta_entity(r, &from_copy, number, diag, &target);
         if (target.number != ENTITY_SENTINEL) ok = ent_push(out, &target);
       }
@@ -167,7 +172,7 @@ static void write_packet_entities(qa_q3_message_writer *w, const qa_q3_entity_st
       qa_q3_write_delta_entity(w, base, &current[ni], true); ni++;
     } else if (has_old) {
       qa_q3_write_delta_entity(w, &previous[oi], NULL, true); oi++;
-    } else qa_range_error("Missing packet entity during merge");
+    } else qa_raise("Error", 0, 0, "Missing packet entity during merge");
   }
   qa_q3_message_writer_write_bits(w, ENTITY_SENTINEL, 10);
 }
@@ -175,7 +180,8 @@ typedef struct { const qa_q3_gamestate *gs; } gs_baseline_t;
 static qa_q3_entity_state_record *gs_baseline_fn(void *ctx, int64_t number) {
   gs_baseline_t *g = ctx;
   if (!g->gs) return NULL;
-  for (size_t i = 0; i < g->gs->entry_count; i++)
+  /* TS gamestateBaselines fills a Map in entry order, so a repeated number keeps its last entry. */
+  for (size_t i = g->gs->entry_count; i-- > 0;)
     if (g->gs->entries[i].kind == QA_Q3_GS_BASELINE && g->gs->entries[i].number == number)
       return (qa_q3_entity_state_record *)&g->gs->entries[i].entity;
   return NULL;
@@ -437,6 +443,7 @@ bool qa_q3_server_message_cursor_next(qa_q3_server_message_cursor *c, const qa_q
   }
 }
 static void cursor_cleanup(void *c) { qa_q3_server_message_cursor_destroy(c); }
+static void writer_cleanup(void *w) { qa_q3_message_writer_destroy(w); }
 static void message_cleanup(void *m) { qa_q3_server_message_destroy(m); }
 static void gamestate_cleanup(void *g) { qa_q3_gamestate_destroy(g); }
 static qa_q3_entity_state_record *null_baseline(void *ctx, int64_t n) { (void)ctx; (void)n; return NULL; }
@@ -648,9 +655,13 @@ bool qa_q3_encode_server_message(int64_t reliable_acknowledge, const qa_q3_serve
                                  uint8_t **out, size_t *out_len) {
   qa_q3_message_writer *w = NULL;
   if (!qa_q3_message_writer_init(&w, QA_Q3_MESSAGE_BITSTREAM, QA_Q3_MAX_MESSAGE_LENGTH, source_state)) return false;
+  /* writeServerMessage validates as it writes (entity order, sizes, indexes) and raises. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, writer_cleanup, w);
   qa_q3_write_server_message(w, reliable_acknowledge, operations, operation_count, context);
   qa_q3_message_writer_write_byte(w, QA_Q3_SVC_EOF);
-  if (qa_q3_message_writer_overflowed(w)) { qa_q3_message_writer_destroy(w); qa_range_error("Server message exceeds MAX_MSGLEN"); }
+  if (qa_q3_message_writer_overflowed(w)) qa_range_error("Server message exceeds MAX_MSGLEN");
+  qa_cleanup_pop(&guard);
   bool ok = qa_q3_message_writer_to_bytes(w, out, out_len);
   qa_q3_message_writer_destroy(w);
   return ok;

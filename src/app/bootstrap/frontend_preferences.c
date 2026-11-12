@@ -48,9 +48,18 @@ qa_mouse_tuning qa_app_frontend_mouse_tuning(qa_app_frontend_preference_override
 qa_seat_settings qa_app_frontend_seat_settings(qa_app_frontend_preference_overrides values, const qa_seat_settings *saved) {
   qa_seat_settings out = *saved;
   out.mouse = qa_app_frontend_mouse_tuning(values, saved->mouse);
-  if (values.has_always_run) { out.has_always_run = true; out.always_run = values.always_run; }
+  /* { ...saved, mouse, alwaysRun?, rumble?, rumbleStrength? }: a key saved lacks is appended in that order. */
+  if (values.has_always_run) {
+    qa_seat_settings_note_key(&out, QA_SEAT_KEY_ALWAYS_RUN);
+    out.has_always_run = true;
+    out.always_run = values.always_run;
+  }
   if (values.has_controller_vibration) out.rumble = values.controller_vibration;
-  if (values.has_controller_vibration_strength) out.rumble_strength = values.controller_vibration_strength;
+  if (values.has_controller_vibration_strength) {
+    qa_seat_settings_note_key(&out, QA_SEAT_KEY_RUMBLE_STRENGTH);
+    out.rumble_strength_absent = false;
+    out.rumble_strength = values.controller_vibration_strength;
+  }
   return out;
 }
 
@@ -181,7 +190,7 @@ void qa_app_frontend_preferences_save_global(qa_app_frontend_preferences *p) {
   if (!p->has_shared_settings) return;
   qa_global_input_tuning tuning = effective_tuning(p);
   if (!qa_config_store_save_global_tuning(&p->shared_settings, "input/global-tuning.json", &tuning))
-    qa_raise("Error", 0, 0, "Could not write input/global-tuning.json");
+    qa_settings_raise_write_failure();
   p->mouse_baseline = tuning.mouse;
   p->has_always_run_baseline = tuning.has_always_run;
   p->always_run_baseline = tuning.always_run;

@@ -11,6 +11,8 @@ typedef struct qa_app_selected_movement_prediction qa_app_selected_movement_pred
 qa_app_selected_movement_prediction *qa_app_selected_movement_prediction_create(
     qa_app_movement_prediction_options options, qa_app_movement_prediction_snapshot initial);
 void qa_app_selected_movement_prediction_destroy(qa_app_selected_movement_prediction *prediction);
+/* For an owner whose options expose `get profile()` (QuakeWorldPrediction): the profile later replays use. */
+void qa_app_selected_movement_prediction_set_profile(qa_app_selected_movement_prediction *prediction, qa_movement_profile profile);
 const qa_app_movement_prediction_options *qa_app_selected_movement_prediction_options(
     const qa_app_selected_movement_prediction *prediction);
 void qa_app_selected_movement_prediction_receive(qa_app_selected_movement_prediction *prediction,

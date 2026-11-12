@@ -7,6 +7,12 @@
 #include "qa/persistence/execution.h"
 #include "qa/persistence/provider_ownership.h"
 #include "qa/persistence/save_image.h"
+#include "qa/app/bootstrap/simulation/bots.h"
+#include "qa/app/bootstrap/simulation/native_q2_rerelease_save.h"
+#include "qa/app/bootstrap/simulation/q3/engine.h"
+#include "qa/app/bootstrap/simulation/q3/guest_runtime.h"
+/* save.ts throws plain Error everywhere (RangeError only for out of memory here). */
+#define sv_error(...) qa_raise("Error", 0, 0, __VA_ARGS__)
 static bool is(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 static qa_save_reader fld(const qa_save_reader *r, const char *n) {
   qa_save_reader o; if (!qa_save_reader_field(r, n, &o)) qa_save_reader_fail(r, "out of memory"); return o;
@@ -25,14 +31,14 @@ qa_provider_checkpoint qa_app_sim_simulation_provider_checkpoint(qa_save_image i
   for (size_t i = 0; i < image.provider_count; i++)
     if (is(image.providers[i].schema, schema)) { if (!value) value = &image.providers[i]; matches++; }
   qa_provider_checkpoint_ref expected = qa_save_provider_contract(schema, image.recipe.map.entities.provider);
-  if (value == NULL || matches != 1 || !is(value->provider, expected.provider) || value->version != expected.version)
-    qa_range_error("Missing or unsupported saved provider %s", schema);
+  if (value == NULL || matches != 1 || !is(value->provider, expected.provider) || !qa_save_provider_version_supported(schema, value->version, expected.version))
+    sv_error("Missing or unsupported saved provider %s", schema);
   return *value;
 }
 static qa_module_identity saved_native_module(qa_save_image image, const char *schema) {
   const qa_execution_module *execution = server_execution(image);
   if (execution == NULL || execution->kind != QA_EXECUTION_MODULE_NATIVE)
-    qa_range_error("Native saved identity has no source execution");
+    sv_error("Native saved identity has no source execution");
   qa_provider_checkpoint record = qa_app_sim_simulation_provider_checkpoint(image, schema);
   qa_save_value *tree = qa_decode_checkpoint_value(record.bytes.bytes, record.bytes.length);
   qa_save_reader reader; qa_save_reader_init(&reader, tree, schema);
@@ -51,7 +57,7 @@ static qa_module_identity saved_native_module(qa_save_image image, const char *s
   if (!is(module.id, execution->owner.provider) || !is(module.artifact_path, artifact->requested_path)
       || !is(module.digest, artifact->digest) || (!is(module.revision, artifact->digest) && !declared)) {
     qa_save_value_free(tree);
-    qa_range_error("Native saved identity differs from the selected artifact");
+    sv_error("Native saved identity differs from the selected artifact");
   }
   (void)tree; /* identity strings borrow the tree; leak-free callers use short-lived images */
   return module;
@@ -59,16 +65,16 @@ static qa_module_identity saved_native_module(qa_save_image image, const char *s
 bool qa_app_sim_native_q2_original_save(qa_save_image image, const qa_module_identity *expected, qa_q2_classic_original_save *out) {
   const qa_execution_module *execution = server_execution(image);
   if (execution == NULL || execution->kind != QA_EXECUTION_MODULE_NATIVE) {
-    if (has_schema(image, "q2:classic-native-original")) qa_range_error("Original API 3 save has no matching native execution");
+    if (has_schema(image, "q2:classic-native-original")) sv_error("Original API 3 save has no matching native execution");
     return false;
   }
   if (execution->api.kind == QA_GAME_API_Q2_GAME && execution->api.as.q2_game.kind == QA_Q2_GAME_API_RERELEASE) {
-    if (has_schema(image, "q2:classic-native-original")) qa_range_error("Classic native save has a rerelease execution");
+    if (has_schema(image, "q2:classic-native-original")) sv_error("Classic native save has a rerelease execution");
     return false;
   }
   if (execution->api.kind != QA_GAME_API_Q2_GAME || execution->api.as.q2_game.kind != QA_Q2_GAME_API_CLASSIC || execution->api.as.q2_game.version != 3 || !is(execution->profile.kind, "windows-i386"))
-    qa_range_error("Unsupported native original-save execution");
-  if (has_schema(image, "q2:rerelease-native-original")) qa_range_error("Rerelease native save has a classic execution");
+    sv_error("Unsupported native original-save execution");
+  if (has_schema(image, "q2:rerelease-native-original")) sv_error("Rerelease native save has a classic execution");
   qa_provider_checkpoint record = qa_app_sim_simulation_provider_checkpoint(image, "q2:classic-native-original");
   qa_q2_classic_original_identity identity;
   identity.module = expected ? *expected : saved_native_module(image, "q2:classic-native-original");
@@ -79,15 +85,19 @@ bool qa_app_sim_native_q2_original_save(qa_save_image image, const qa_module_ide
 bool qa_app_sim_native_q2_rerelease_save(qa_save_image image, const qa_module_identity *expected, qa_app_sim_rerelease_native_save_view *out) {
   const qa_execution_module *execution = server_execution(image);
   if (execution == NULL || execution->kind != QA_EXECUTION_MODULE_NATIVE || execution->api.kind != QA_GAME_API_Q2_GAME || execution->api.as.q2_game.kind != QA_Q2_GAME_API_RERELEASE) {
-    if (has_schema(image, "q2:rerelease-native-original")) qa_range_error("Rerelease native save has no matching execution");
+    if (has_schema(image, "q2:rerelease-native-original")) sv_error("Rerelease native save has no matching execution");
     return false;
   }
   if (execution->api.as.q2_game.version != 2023 || !is(execution->profile.kind, "windows-x86-64"))
-    qa_range_error("Unsupported rerelease native save execution");
-  if (has_schema(image, "q2:classic-native-original")) qa_range_error("Classic native save has a rerelease execution");
+    sv_error("Unsupported rerelease native save execution");
+  if (has_schema(image, "q2:classic-native-original")) sv_error("Classic native save has a rerelease execution");
   qa_module_identity module = expected ? *expected : saved_native_module(image, "q2:rerelease-native-original");
-  (void)module;
   qa_provider_checkpoint record = qa_app_sim_simulation_provider_checkpoint(image, "q2:rerelease-native-original");
+  /* TS returns decodeQ2RereleaseNativeSave(record, { module, map }): every caller of this view gets its checks. */
+  qa_app_sim_q2_rerelease_native_save decoded; memset(&decoded, 0, sizeof decoded);
+  qa_app_sim_decode_q2_rerelease_native_save(&record, (qa_app_sim_q2_rerelease_native_identity){module, image.recipe.map.geometry.requested_path},
+      &decoded);
+  qa_app_sim_q2_rerelease_native_save_free(&decoded);
   out->value = qa_decode_checkpoint_value(record.bytes.bytes, record.bytes.length);
   /* server.cvars borrowed from the decoded tree. */
   const qa_save_value *server = qa_save_value_get(out->value, "server");
@@ -95,24 +105,42 @@ bool qa_app_sim_native_q2_rerelease_save(qa_save_image image, const qa_module_id
   out->cvars.bytes = cvars ? cvars->bytes : NULL; out->cvars.length = cvars ? cvars->byte_length : 0;
   return true;
 }
-qa_save_value *qa_app_sim_saved_source_cvars(qa_save_image image) {
+/* TS nativeQ2RereleaseSave's result as the decoded save (the view above keeps only the cvars): the same execution
+ * checks, then decodeQ2RereleaseNativeSave. False when TS returns null. */
+bool qa_app_sim_native_q2_rerelease_save_decoded(qa_save_image image, const qa_module_identity *expected,
+    qa_app_sim_q2_rerelease_native_save *out) {
+  qa_app_sim_rerelease_native_save_view view;
+  memset(&view, 0, sizeof view);
+  if (!qa_app_sim_native_q2_rerelease_save(image, expected, &view)) return false;
+  qa_save_value_free(view.value);
+  qa_app_sim_q2_rerelease_native_identity identity;
+  identity.module = expected ? *expected : saved_native_module(image, "q2:rerelease-native-original");
+  identity.map = image.recipe.map.geometry.requested_path;
+  qa_provider_checkpoint record = qa_app_sim_simulation_provider_checkpoint(image, "q2:rerelease-native-original");
+  qa_app_sim_decode_q2_rerelease_native_save(&record, identity, out);
+  return true;
+}
+/* TS `nativeQ2OriginalSave(image) ?? nativeQ2RereleaseSave(image)`, with both checks run exactly as TS runs them
+ * (a native execution without its original record throws). With `cvars`, the decoded server cvars are returned
+ * (owned) when a native save is present. */
+static bool native_q2_save(qa_save_image image, qa_save_value **cvars) {
   qa_q2_classic_original_save classic; memset(&classic, 0, sizeof classic);
-  qa_app_sim_rerelease_native_save_view rerelease; memset(&rerelease, 0, sizeof rerelease);
-  bool has_classic = false, has_rerelease = false;
-  /* nativeQ2OriginalSave(image) ?? nativeQ2RereleaseSave(image): only
-   * probe when a native schema exists to avoid double decode errors. */
-  if (has_schema(image, "q2:classic-native-original")) has_classic = qa_app_sim_native_q2_original_save(image, NULL, &classic);
-  else if (has_schema(image, "q2:rerelease-native-original")) has_rerelease = qa_app_sim_native_q2_rerelease_save(image, NULL, &rerelease);
-  if (has_classic) {
-    qa_save_value *out = qa_decode_checkpoint_value(classic.server.cvars.bytes, classic.server.cvars.length);
+  if (qa_app_sim_native_q2_original_save(image, NULL, &classic)) {
+    if (cvars) *cvars = qa_decode_checkpoint_value(classic.server.cvars.bytes, classic.server.cvars.length);
     qa_q2_classic_original_save_free(&classic);
-    return out;
+    return true;
   }
-  if (has_rerelease) {
-    qa_save_value *out = qa_decode_checkpoint_value(rerelease.cvars.bytes, rerelease.cvars.length);
+  qa_app_sim_rerelease_native_save_view rerelease; memset(&rerelease, 0, sizeof rerelease);
+  if (qa_app_sim_native_q2_rerelease_save(image, NULL, &rerelease)) {
+    if (cvars) *cvars = qa_decode_checkpoint_value(rerelease.cvars.bytes, rerelease.cvars.length);
     qa_save_value_free(rerelease.value);
-    return out;
+    return true;
   }
+  return false;
+}
+qa_save_value *qa_app_sim_saved_source_cvars(qa_save_image image) {
+  qa_save_value *native = NULL;
+  if (native_q2_save(image, &native)) return native;
   if (!has_schema(image, "world:source-cvars")) return NULL;
   qa_provider_checkpoint record = qa_app_sim_simulation_provider_checkpoint(image, "world:source-cvars");
   return qa_decode_checkpoint_value(record.bytes.bytes, record.bytes.length);
@@ -137,25 +165,21 @@ qa_app_sim_saved_bots *qa_app_sim_saved_bot_checkpoint(qa_save_image image) {
   qa_app_sim_saved_bots *bots = calloc(1, sizeof *bots);
   if (!bots) qa_range_error("Out of memory");
   bots->value = qa_decode_checkpoint_value(record.bytes.bytes, record.bytes.length);
-  /* Read transport.connections[{client.slot, actor}] from the tree. */
-  const qa_save_value *transport = qa_save_value_get(bots->value, "transport");
-  const qa_save_value *connections = transport ? qa_save_value_get(transport, "connections") : NULL;
-  size_t count = connections && connections->kind == QA_SAVE_ARRAY ? connections->item_count : 0;
+  /* decodeApplicationBotsCheckpoint(...): the full decode (it throws on a malformed image), then the
+   * transport connections it returns. */
+  qa_app_sim_decoded_bots_checkpoint decoded; memset(&decoded, 0, sizeof decoded);
+  qa_app_sim_decode_application_bots_checkpoint(bots->value, &decoded);
+  size_t count = decoded.transport.connection_count;
   bots->connections = count ? malloc(count * sizeof *bots->connections) : NULL;
+  if (count != 0 && bots->connections == NULL) qa_range_error("Out of memory");
   bots->connection_count = count;
   for (size_t i = 0; i < count; i++) {
-    const qa_save_value *c = connections->items[i];
-    const qa_save_value *client = qa_save_value_get(c, "client");
-    const qa_save_value *slot = client ? qa_save_value_get(client, "slot") : NULL;
-    const qa_save_value *actor = qa_save_value_get(c, "actor");
-    const qa_save_value *generation = client ? qa_save_value_get(client, "generation") : NULL;
-    bots->connections[i].client_slot = slot ? slot->number : 0;
-    bots->connections[i].client_generation = generation ? generation->number : 0;
-    const qa_save_value *as = actor ? qa_save_value_get(actor, "slot") : NULL;
-    const qa_save_value *ag = actor ? qa_save_value_get(actor, "generation") : NULL;
-    bots->connections[i].actor.slot = as ? as->number : 0;
-    bots->connections[i].actor.generation = ag ? ag->number : 0;
+    const qa_app_sim_bot_transport_connection *connection = &decoded.transport.connections[i];
+    bots->connections[i].client_slot = connection->client_slot;
+    bots->connections[i].client_generation = connection->client_generation;
+    bots->connections[i].actor = connection->actor;
   }
+  qa_app_sim_decoded_bots_checkpoint_free(&decoded);
   /* Validate against saved players. */
   qa_save_value *keep = NULL;
   qa_save_reader reader = qa_app_sim_simulation_save_reader(image, &keep);
@@ -174,13 +198,13 @@ qa_app_sim_saved_bots *qa_app_sim_saved_bot_checkpoint(qa_save_image image) {
   for (size_t i = 0; i < count; i++) {
     for (size_t j = 0; j < i; j++)
       if (bots->connections[j].client_slot == bots->connections[i].client_slot)
-        qa_range_error("Duplicate saved bot client slot");
-    bool owned = false;
-    for (size_t k = 0; k < player_count; k++)
-      if (saved[k].slot == bots->connections[i].client_slot
-          && saved[k].actor.slot == bots->connections[i].actor.slot
-          && saved[k].actor.generation == bots->connections[i].actor.generation) owned = true;
-    if (!owned) qa_range_error("Saved bot connection does not own its shared player");
+        sv_error("Duplicate saved bot client slot");
+    /* players.find(player => player.slot === connection.client.slot): the first saved player of that slot. */
+    const saved_player *player = NULL;
+    for (size_t k = 0; k < player_count && player == NULL; k++)
+      if (saved[k].slot == bots->connections[i].client_slot) player = &saved[k];
+    if (player == NULL || player->actor.slot != bots->connections[i].actor.slot
+        || player->actor.generation != bots->connections[i].actor.generation) sv_error("Saved bot connection does not own its shared player");
   }
   free(saved); qa_save_value_free(keep);
   return bots;
@@ -210,10 +234,10 @@ const qa_guest_checkpoint *qa_app_sim_simulation_guest_checkpoint(qa_save_image 
   const qa_execution_module *execution = NULL; size_t count = 0;
   for (size_t i = 0; i < image.recipe.execution_count; i++)
     if (is(image.recipe.execution[i].role, "server-game")) { execution = &image.recipe.execution[i]; count++; }
-  if (count != 1 || execution == NULL) qa_range_error("Save requires exactly one selected server execution");
+  if (count != 1 || execution == NULL) sv_error("Save requires exactly one selected server execution");
   bool q3_native = execution->kind == QA_EXECUTION_MODULE_NATIVE && api_is(execution->api, "q3-qagame");
   if (execution->kind != QA_EXECUTION_MODULE_QUAKEC && execution->kind != QA_EXECUTION_MODULE_QVM && !q3_native) {
-    if (image.guest_count != 0) qa_range_error("Selected source cannot restore guest memory providers");
+    if (image.guest_count != 0) sv_error("Selected source cannot restore guest memory providers");
     return NULL;
   }
   const char *name = execution->kind == QA_EXECUTION_MODULE_QUAKEC ? "QuakeC" : q3_native ? "Native Q3" : "QVM";
@@ -221,14 +245,14 @@ const qa_guest_checkpoint *qa_app_sim_simulation_guest_checkpoint(qa_save_image 
   qa_guest_checkpoint_kind want = q3_native ? QA_GUEST_CHECKPOINT_NATIVE_GUEST
       : execution->kind == QA_EXECUTION_MODULE_QUAKEC ? QA_GUEST_CHECKPOINT_QUAKEC : QA_GUEST_CHECKPOINT_QVM;
   if (image.guest_count != 1 || checkpoint == NULL || checkpoint->kind != want)
-    qa_range_error("%s save requires exactly one complete guest checkpoint", name);
+    sv_error("%s save requires exactly one complete guest checkpoint", name);
   if (execution->kind == QA_EXECUTION_MODULE_QVM) {
     double want_version = (!checkpoint->has_abi_profile || is(checkpoint->abi_profile, "q3-modern")) ? 8 : 7;
     if (execution->api.kind != QA_GAME_API_Q3 || execution->api.as.q3.kind != QA_Q3_API_QAGAME || execution->api.as.q3.version != want_version)
-      qa_range_error("QVM save requires matching selected qagame API and ABI profile");
+      sv_error("QVM save requires matching selected qagame API and ABI profile");
   }
   const qa_resolved_resource_reference *artifact = execution->artifact;
-  char revision[1024];
+  char *revision = NULL; /* `${mount.id}:${mount.generation}`, whole */
   qa_module_identity expected;
   expected.id = execution->owner.provider;
   expected.artifact_path = artifact->requested_path;
@@ -237,39 +261,38 @@ const qa_guest_checkpoint *qa_app_sim_simulation_guest_checkpoint(qa_save_image 
   else {
     qa_mount_identity mount = artifact->provenance.archive_mount ? artifact->provenance.archive_mount->identity
         : artifact->provenance.loose_mount ? artifact->provenance.loose_mount->identity : (qa_mount_identity){0};
-    snprintf(revision, sizeof revision, "%s:%lld", mount.id ? mount.id : "", (long long)mount.generation);
+    const char *id = mount.id ? mount.id : "";
+    int length = snprintf(NULL, 0, "%s:%lld", id, (long long)mount.generation);
+    revision = length < 0 ? NULL : malloc((size_t)length + 1);
+    if (revision == NULL) qa_range_error("Out of memory");
+    snprintf(revision, (size_t)length + 1, "%s:%lld", id, (long long)mount.generation);
     expected.revision = revision;
   }
+  bool matches;
   if (checkpoint->kind == QA_GUEST_CHECKPOINT_NATIVE_GUEST) {
     const qa_native_abi *abi = &checkpoint->abi, *profile = &execution->profile;
-    if (execution->kind != QA_EXECUTION_MODULE_NATIVE || !is(execution->owner.provider, image.recipe.map.entities.provider)
+    matches = !(execution->kind != QA_EXECUTION_MODULE_NATIVE || !is(execution->owner.provider, image.recipe.map.entities.provider)
         || !same_module(checkpoint->module, expected) || !same_module(checkpoint->runtime_state.module, expected)
         || !is(abi->kind, profile->kind) || !is(abi->image, profile->image) || abi->pointer_bytes != profile->pointer_bytes
-        || !is(abi->call, profile->call))
-      qa_range_error("Native Q3 checkpoint differs from the selected artifact and profile");
+        || !is(abi->call, profile->call));
+    free(revision);
+    if (!matches) sv_error("Native Q3 checkpoint differs from the selected artifact and profile");
     return checkpoint;
   }
   qa_game_api_identity api; memset(&api, 0, sizeof api);
   if (checkpoint->kind == QA_GUEST_CHECKPOINT_QUAKEC) { api.kind = QA_GAME_API_QUAKEC; api.as.quakec = checkpoint->quakec_api; }
   else { api.kind = QA_GAME_API_Q3; api.as.q3 = checkpoint->q3_api; }
-  if (!is(execution->owner.provider, image.recipe.map.entities.provider)
+  matches = !(!is(execution->owner.provider, image.recipe.map.entities.provider)
       || !same_module(checkpoint->module, expected) || !same_module(checkpoint->host_state.module, expected)
-      || !same_api(api, execution->api))
-    qa_range_error("%s checkpoint differs from the selected artifact and API", name);
+      || !same_api(api, execution->api));
+  free(revision);
+  if (!matches) sv_error("%s checkpoint differs from the selected artifact and API", name);
   return checkpoint;
 }
 qa_app_sim_native_saved_client *qa_app_sim_native_q2_saved_clients(qa_save_image image, size_t *out_count, qa_save_value **keep_alive) {
   *out_count = 0; *keep_alive = NULL;
-  bool any = has_schema(image, "q2:classic-native-original") || has_schema(image, "q2:rerelease-native-original");
-  if (!any) {
-    /* TS still calls the decoders (they validate execution match). */
-    qa_q2_classic_original_save tmp; qa_app_sim_rerelease_native_save_view tmp2;
-    bool a = qa_app_sim_native_q2_original_save(image, NULL, &tmp);
-    if (a) qa_q2_classic_original_save_free(&tmp);
-    bool b = qa_app_sim_native_q2_rerelease_save(image, NULL, &tmp2);
-    if (b) qa_save_value_free(tmp2.value);
-    if (!a && !b) return NULL;
-  }
+  /* if (nativeQ2OriginalSave(image) === null && nativeQ2RereleaseSave(image) === null) return [] */
+  if (!native_q2_save(image, NULL)) return NULL;
   qa_save_reader reader = qa_app_sim_simulation_save_reader(image, keep_alive);
   qa_save_reader clients = fld(&reader, "nativeClients");
   size_t count = qa_save_reader_list_count(&clients);
@@ -282,7 +305,7 @@ qa_app_sim_native_saved_client *qa_app_sim_native_q2_saved_clients(qa_save_image
     f = fld(&entry, "phase"); out[i].phase = qa_save_reader_choice_string(&f, phases, 2); qa_save_reader_destroy(&f);
     f = fld(&entry, "userinfo"); out[i].userinfo = qa_save_reader_string(&f); qa_save_reader_destroy(&f);
     qa_save_reader_destroy(&entry);
-    for (size_t j = 0; j < i; j++) if (out[j].client_slot == out[i].client_slot) qa_range_error("Duplicate native saved client slot");
+    for (size_t j = 0; j < i; j++) if (out[j].client_slot == out[i].client_slot) sv_error("Duplicate native saved client slot");
   }
   qa_save_reader_destroy(&clients); qa_save_reader_destroy(&reader);
   *out_count = count;
@@ -300,31 +323,25 @@ void qa_app_sim_validate_simulation_save(qa_save_image image) {
   for (size_t i = 0; i < image.provider_count; i++) {
     for (size_t j = 0; j < i; j++)
       if (is(image.providers[j].provider, image.providers[i].provider) && is(image.providers[j].schema, image.providers[i].schema))
-        qa_range_error("Duplicate saved provider %s", image.providers[i].schema);
+        sv_error("Duplicate saved provider %s", image.providers[i].schema);
     qa_validate_save_provider_owner(image.providers[i], image.recipe.map.entities.provider);
   }
   qa_app_sim_simulation_provider_checkpoint(image, "world:simulation");
   qa_app_sim_simulation_provider_checkpoint(image, "world:source-slots");
   const qa_guest_checkpoint *guest = qa_app_sim_simulation_guest_checkpoint(image);
-  bool native = has_schema(image, "q2:classic-native-original") || has_schema(image, "q2:rerelease-native-original");
-  if (native) {
-    /* decode to validate execution match */
-    qa_q2_classic_original_save a; qa_app_sim_rerelease_native_save_view b;
-    if (has_schema(image, "q2:classic-native-original")) { qa_app_sim_native_q2_original_save(image, NULL, &a); qa_q2_classic_original_save_free(&a); }
-    else { qa_app_sim_native_q2_rerelease_save(image, NULL, &b); qa_save_value_free(b.value); }
-  }
+  bool native = native_q2_save(image, NULL);
   qa_save_value *keep = NULL;
   bool q3_guest = guest && (guest->kind == QA_GUEST_CHECKPOINT_QVM || guest->kind == QA_GUEST_CHECKPOINT_NATIVE_GUEST);
   size_t np = (native || q3_guest) ? players_count(image, &keep) : 0;
-  if (native && np != 0) qa_range_error("Native Q2 players must remain source-owned");
+  if (native && np != 0) sv_error("Native Q2 players must remain source-owned");
   if (q3_guest && np != 0)
-    qa_range_error("Q3 guest players must remain owned by the saved guest client records");
+    sv_error("Q3 guest players must remain owned by the saved guest client records");
   qa_save_value_free(keep);
   const qa_execution_module *execution = server_execution(image);
   qa_app_sim_saved_bots *bots = qa_app_sim_saved_bot_checkpoint(image);
   if (bots) {
     if (execution == NULL || execution->kind != QA_EXECUTION_MODULE_TYPESCRIPT)
-      qa_range_error("Saved bot services have no supported source owner");
+      sv_error("Saved bot services have no supported source owner");
     if (!api_is(execution->api, "q3-qagame")) qa_app_sim_simulation_provider_checkpoint(image, "world:source-cvars");
     qa_save_value_free(bots->value); free(bots->connections); free(bots);
   }
@@ -332,7 +349,7 @@ void qa_app_sim_validate_simulation_save(qa_save_image image) {
     if (execution == NULL || execution->kind != QA_EXECUTION_MODULE_TYPESCRIPT
         || (!api_is(execution->api, "q1-netquake") && !api_is(execution->api, "q1-quakeworld")
             && !api_is(execution->api, "q2-classic-game") && !api_is(execution->api, "q2-rerelease-game")))
-      qa_range_error("Saved common cvars have no matching source owner");
+      sv_error("Saved common cvars have no matching source owner");
     qa_app_sim_simulation_provider_checkpoint(image, "world:source-cvars");
   }
   if (guest == NULL && execution && execution->kind == QA_EXECUTION_MODULE_TYPESCRIPT) {
@@ -350,22 +367,22 @@ void qa_app_sim_validate_simulation_save(qa_save_image image) {
   for (size_t i = 0; i < image.clock_count; i++)
     if (is(image.clocks[i].provider, image.recipe.map.entities.provider)) { clock = &image.clocks[i]; clocks++; }
   if (clocks != 1 || clock->time.kind != image.frame.time.kind || clock->time.value != image.frame.time.value)
-    qa_range_error("Saved source clock disagrees with its frame");
+    sv_error("Saved source clock disagrees with its frame");
   size_t randoms = 0;
   for (size_t i = 0; i < image.random_count; i++)
     if (is(image.random[i].provider, image.recipe.map.entities.provider)) randoms++;
-  if (randoms != 1) qa_range_error("Save requires one matching source random stream");
+  if (randoms != 1) sv_error("Save requires one matching source random stream");
   /* duplicate actor state across bodies/combat/inventories/configurations/thinks */
   for (size_t i = 0; i < image.body_count; i++) for (size_t j = 0; j < i; j++)
-    if (image.bodies[i].actor.slot == image.bodies[j].actor.slot && image.bodies[i].actor.generation == image.bodies[j].actor.generation) qa_range_error("Duplicate saved actor state");
+    if (image.bodies[i].actor.slot == image.bodies[j].actor.slot && image.bodies[i].actor.generation == image.bodies[j].actor.generation) sv_error("Duplicate saved actor state");
   for (size_t i = 0; i < image.combat_count; i++) for (size_t j = 0; j < i; j++)
-    if (image.combat[i].actor.slot == image.combat[j].actor.slot && image.combat[i].actor.generation == image.combat[j].actor.generation) qa_range_error("Duplicate saved actor state");
+    if (image.combat[i].actor.slot == image.combat[j].actor.slot && image.combat[i].actor.generation == image.combat[j].actor.generation) sv_error("Duplicate saved actor state");
   for (size_t i = 0; i < image.inventory_count; i++) for (size_t j = 0; j < i; j++)
-    if (image.inventories[i].actor.slot == image.inventories[j].actor.slot && image.inventories[i].actor.generation == image.inventories[j].actor.generation) qa_range_error("Duplicate saved actor state");
+    if (image.inventories[i].actor.slot == image.inventories[j].actor.slot && image.inventories[i].actor.generation == image.inventories[j].actor.generation) sv_error("Duplicate saved actor state");
   for (size_t i = 0; i < image.configuration_count; i++) for (size_t j = 0; j < i; j++)
-    if (image.configurations[i].actor.slot == image.configurations[j].actor.slot && image.configurations[i].actor.generation == image.configurations[j].actor.generation) qa_range_error("Duplicate saved actor state");
+    if (image.configurations[i].actor.slot == image.configurations[j].actor.slot && image.configurations[i].actor.generation == image.configurations[j].actor.generation) sv_error("Duplicate saved actor state");
   for (size_t i = 0; i < image.think_count; i++) for (size_t j = 0; j < i; j++)
-    if (image.thinks[i].actor.slot == image.thinks[j].actor.slot && image.thinks[i].actor.generation == image.thinks[j].actor.generation) qa_range_error("Duplicate saved actor state");
+    if (image.thinks[i].actor.slot == image.thinks[j].actor.slot && image.thinks[i].actor.generation == image.thinks[j].actor.generation) sv_error("Duplicate saved actor state");
 }
 qa_app_sim_native_q3_runtime qa_app_sim_native_q3_runtime_reader(qa_save_image image) {
   qa_provider_checkpoint record = qa_app_sim_simulation_provider_checkpoint(image, "world:q3-runtime");
@@ -447,6 +464,7 @@ qa_app_sim_saved_settings qa_app_sim_saved_simulation_settings(qa_save_image ima
   qa_save_reader settings = fld(&reader, "settings"), f;
   qa_app_sim_saved_settings out; memset(&out, 0, sizeof out);
   out.value = keep;
+  const qa_guest_checkpoint *guest = qa_app_sim_simulation_q3_guest_checkpoint(image);
   static const double skills[] = {0, 1, 2, 3};
   static const char *const modes[] = {"singleplayer", "coop", "deathmatch"};
   f = fld(&settings, "skill"); out.skill = qa_save_reader_choice_number(&f, skills, 4); qa_save_reader_destroy(&f);
@@ -456,7 +474,7 @@ qa_app_sim_saved_settings qa_app_sim_saved_simulation_settings(qa_save_image ima
   f = fld(&settings, "initialSpawnPoint"); out.initial_spawn_point = qa_save_reader_is_undefined(&f) ? "" : qa_save_reader_string(&f); qa_save_reader_destroy(&f);
   f = fld(&settings, "startItems"); out.start_items = qa_save_reader_is_undefined(&f) ? "" : qa_save_reader_string(&f); qa_save_reader_destroy(&f);
   f = fld(&reader, "hostMilliseconds"); out.host_milliseconds = qa_save_reader_finite(&f); qa_save_reader_destroy(&f);
-  bool native = has_schema(image, "q2:classic-native-original") || has_schema(image, "q2:rerelease-native-original");
+  bool native = native_q2_save(image, NULL);
   if (native) {
     qa_save_value *clients_keep = NULL; size_t count = 0;
     qa_app_sim_native_saved_client *clients = qa_app_sim_native_q2_saved_clients(image, &count, &clients_keep);
@@ -464,10 +482,17 @@ qa_app_sim_saved_settings qa_app_sim_saved_simulation_settings(qa_save_image ima
     for (size_t i = 0; i < count; i++) out.client_slots[i] = clients[i].client_slot;
     out.client_slot_count = count;
     free(clients); qa_save_value_free(clients_keep);
+  } else if (guest != NULL) {
+    /* savedQ3GuestClients(guest).map(player => player.client.slot) */
+    const qa_guest_private_state *host = qa_app_q3_guest_host_state(guest);
+    size_t count = 0;
+    qa_app_q3_saved_guest_client *clients = qa_app_saved_q3_guest_clients(host->bytes.bytes, host->bytes.length, host->format, &count);
+    out.client_slots = count ? malloc(count * sizeof(double)) : NULL;
+    if (count != 0 && out.client_slots == NULL) qa_range_error("Out of memory");
+    for (size_t i = 0; i < count; i++) out.client_slots[i] = clients[i].client.slot;
+    out.client_slot_count = count;
+    free(clients);
   } else {
-    /* guest === null path reads players; QVM guest clients come from
-     * the sibling q3 guest-runtime slice (no C export yet): fall back
-     * to players list which is empty for QVM saves. */
     qa_save_reader players = fld(&reader, "players");
     size_t count = qa_save_reader_list_count(&players);
     out.client_slots = count ? malloc(count * sizeof(double)) : NULL;

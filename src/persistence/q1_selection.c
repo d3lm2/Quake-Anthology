@@ -16,8 +16,12 @@ typedef struct view {
   size_t length;
 } view;
 
+/* String.prototype.toLowerCase over a byte string: the save's map name and a pak member's path
+ * are one character per byte in TS (U+0000..U+00FF), where toLowerCase also lowers U+00C0..U+00DE
+ * except U+00D7. */
 static char lower_char(char c) {
-  return c >= 'A' && c <= 'Z' ? (char)(c + ('a' - 'A')) : c;
+  unsigned char u = (unsigned char)c;
+  return (u >= 'A' && u <= 'Z') || (u >= 0xc0 && u <= 0xde && u != 0xd7) ? (char)(u + 0x20) : c;
 }
 static bool view_eq_lower(view left, const char *right, size_t right_length) {
   if (left.length != right_length) return false;

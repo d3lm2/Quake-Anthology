@@ -1,6 +1,4 @@
-/* Port of src/render/gl/programs.ts. Uniform value caching from the TS
- * is dropped (values are always uploaded; observable GL state matches).
- * GPL-2.0-or-later. */
+/* Port of src/render/gl/programs.ts. GPL-2.0-or-later. */
 #ifndef QA_RENDER_GL_PROGRAMS_H
 #define QA_RENDER_GL_PROGRAMS_H
 #include <stdbool.h>

@@ -45,9 +45,16 @@ static void engine_drop(void *v, double client, const char *reason) {
 static char *engine_userinfo(void *v, double client) {
   qa_app_q3_created_source_host *created = (qa_app_q3_created_source_host *)v;
   const char *stored = qa_app_q3_server_state_get_userinfo(created->server_state, client);
+  /* The stored userinfo whole (TS returns it as set; it was cut at 255 bytes here). */
+  if (stored) {
+    size_t length = strlen(stored) + 1;
+    char *copy = malloc(length);
+    if (!copy) qa_range_error("Out of memory");
+    memcpy(copy, stored, length);
+    return copy;
+  }
   char buffer[256];
-  if (!stored) snprintf(buffer, sizeof buffer, "\\name\\Player %lld\\ip\\localhost\\handicap\\100\\model\\sarge/default\\team_model\\sarge/default", (long long)client + 1);
-  else snprintf(buffer, sizeof buffer, "%s", stored);
+  snprintf(buffer, sizeof buffer, "\\name\\Player %s\\ip\\localhost\\handicap\\100\\model\\sarge/default\\team_model\\sarge/default", QA_JS_NUMBER(client + 1));
   size_t length = strlen(buffer) + 1;
   char *copy = malloc(length);
   if (!copy) qa_range_error("Out of memory");

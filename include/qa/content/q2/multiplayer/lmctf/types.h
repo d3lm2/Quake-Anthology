@@ -40,7 +40,7 @@ typedef struct qa_lmctf_score_row {
   qa_actor_id actor; double slot; const char *name; qa_lmctf_team team; double score, ping;
 } qa_lmctf_score_row;
 typedef struct qa_lmctf_menu_entry {
-  const char *label;   /* borrowed (static in this slice) */
+  const char *label;   /* borrowed (static storage) */
   const char *command; /* nullable */
 } qa_lmctf_menu_entry;
 /* TS LmctfEvent union on kind (exact strings). Arrays borrowed. */

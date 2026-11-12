@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/app/bootstrap/network/unified_frame_values.h"
+#include "qa/app/bootstrap/simulation/qvm_component_state.h"
 #include "qa/app/bootstrap/simulation/qvm_weapon_behavior.h"
 #include "qa/compat/qvm/abi.h"
 #include "qa/compat/qvm/file_syscalls.h"
@@ -15,6 +16,7 @@
 #include "qa/core/math.h"
 #include "qa/core/numeric.h"
 #include "qa/foundation/js.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/foundation/support.h"
 #include "qa/network/common/js_number.h"
 #include "qa/persistence/execution.h"
@@ -30,13 +32,6 @@ static void *xrealloc(void *p, size_t size) {
   void *grown = realloc(p, size == 0 ? 1 : size);
   if (grown == NULL) qa_range_error("Out of memory");
   return grown;
-}
-static char *xstrdup(const char *text) {
-  size_t length = strlen(text);
-  char *copy = malloc(length + 1);
-  if (copy == NULL) qa_range_error("Out of memory");
-  memcpy(copy, text, length + 1);
-  return copy;
 }
 static bool is(const char *a, const char *b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
 
@@ -119,7 +114,6 @@ qa_app_sim_qvm_grapple_source_checkpoint qa_app_sim_read_qvm_grapple_source_chec
 /* ---------------- source state ---------------- */
 typedef struct binding { qa_actor_id actor; double pointer; bool client; qa_vec3 origin; } binding;
 typedef struct tether { qa_actor_id owner; qa_owned_actor actor; qa_qvm_grapple_projection projection; } tether;
-typedef struct indexed_text { int64_t index; char *value; } indexed_text;
 typedef struct restored_tether { qa_actor_id owner; qa_owned_actor actor; } restored_tether;
 
 struct qa_app_sim_qvm_grapple_source {
@@ -130,14 +124,10 @@ struct qa_app_sim_qvm_grapple_source {
   qa_cvar_registry *cvars;
   qa_qvm_files *files;
   qa_command_buffer *commands;
-  indexed_text *configstrings; size_t configstring_count, configstring_capacity;
-  indexed_text *userinfo; size_t userinfo_count, userinfo_capacity;
+  qa_app_sim_qvm_component_state state; /* TS QvmComponentState: configstrings, userinfo, parser, cursor */
   binding *bindings; size_t binding_count, binding_capacity;
   tether *tethers; size_t tether_count, tether_capacity;
-  qa_common_parse_state parser;
-  qa_common_parse_cursor cursor;
-  bool cursor_ready;
-  qa_qvm_server_spatial_operations spatial;
+  qa_app_sim_qvm_component_spatial spatial; /* qvmComponentSpatial(...) */
   qa_qvm_server_game_services services;
   qa_qvm_host_state host_state;
   int64_t release_subscription;
@@ -161,39 +151,6 @@ static void print_event(qa_app_sim_qvm_grapple_source *s, const char *text) {
   event.kind = QA_APP_Q3_EVENT_PRINT;
   event.text = text;
   s->options.event(s->options.ctx, event);
-}
-static const char *indexed_get(const indexed_text *list, size_t count, int64_t index) {
-  for (size_t i = 0; i < count; i++) if (list[i].index == index) return list[i].value;
-  return NULL;
-}
-static void indexed_set(indexed_text **list, size_t *count, size_t *capacity, int64_t index, const char *value) {
-  for (size_t i = 0; i < *count; i++)
-    if ((*list)[i].index == index) {
-      char *copy = xstrdup(value);
-      free((*list)[i].value);
-      (*list)[i].value = copy;
-      return;
-    }
-  if (*count == *capacity) {
-    *capacity = *capacity ? *capacity * 2 : 8;
-    *list = xrealloc(*list, *capacity * sizeof **list);
-  }
-  (*list)[*count].index = index;
-  (*list)[*count].value = xstrdup(value);
-  (*count)++;
-}
-static void indexed_delete(indexed_text *list, size_t *count, int64_t index) {
-  for (size_t i = 0; i < *count; i++)
-    if (list[i].index == index) {
-      free(list[i].value);
-      memmove(&list[i], &list[i + 1], (*count - i - 1) * sizeof *list);
-      (*count)--;
-      return;
-    }
-}
-static void indexed_clear(indexed_text *list, size_t *count) {
-  for (size_t i = 0; i < *count; i++) free(list[i].value);
-  *count = 0;
 }
 static binding *find_binding(qa_app_sim_qvm_grapple_source *s, qa_actor_id actor) {
   for (size_t i = 0; i < s->binding_count; i++) if (qa_same_actor(s->bindings[i].actor, actor)) return &s->bindings[i];
@@ -234,7 +191,7 @@ static const qa_app_sim_qvm_grapple_target *find_target(qa_app_sim_qvm_grapple_s
   return NULL;
 }
 static int32_t word_at(const uint8_t *bytes, size_t length, size_t offset) {
-  if (offset + 4 > length) qa_range_error("Offset is outside the bounds of the DataView");
+  if (offset + 4 > length) qa_range_error("Out of bounds access"); /* TS call.words.getInt32: a native DataView read */
   uint32_t bits = (uint32_t)bytes[offset] | ((uint32_t)bytes[offset + 1] << 8) | ((uint32_t)bytes[offset + 2] << 16)
                   | ((uint32_t)bytes[offset + 3] << 24);
   return (int32_t)bits;
@@ -288,17 +245,16 @@ static double mirror(qa_app_sim_qvm_grapple_source *s, qa_actor_id actor, const 
   if (b == NULL) {
     if (target.is_player) {
       double slot = 0;
-      while (slot < 64 && indexed_get(s->userinfo, s->userinfo_count, (int64_t)slot) != NULL) slot++;
+      while (slot < 64 && qa_app_sim_qvm_component_texts_get(&s->state.userinfo, slot) != NULL) slot++;
       if (slot == 64) qa_raise("Error", 0, 0, "Grapple source exhausted its client capacity");
       binding value = {target.actor, entity_pointer(s, slot), true, target.body.origin};
       add_binding(s, value);
-      indexed_set(&s->userinfo, &s->userinfo_count, &s->userinfo_capacity, (int64_t)slot, target.userinfo);
+      qa_app_sim_qvm_component_texts_set(&s->state.userinfo, slot, target.userinfo);
       char *denial = qa_qvm_game_client_connect(&s->vm, slot, true, false);
       if (denial != NULL) {
-        char message[512];
-        snprintf(message, sizeof message, "Grapple source rejected client: %s", denial);
-        free(denial);
-        qa_raise("Error", 0, 0, "%s", message);
+        /* The whole guest denial text; the raise formats it before the cleanup frees it. */
+        qa_cleanup denial_node; qa_cleanup_push(&denial_node, free, denial);
+        qa_raise("Error", 0, 0, "Grapple source rejected client: %s", denial);
       }
       qa_qvm_game_client_begin(&s->vm, slot);
     } else {
@@ -318,9 +274,9 @@ static double mirror(qa_app_sim_qvm_grapple_source *s, qa_actor_id actor, const 
     double slot = slot_of(s, pointer);
     qa_qvm_writable_view ps;
     qa_qvm_game_data_public_player_bytes(&s->vm.data, slot, &ps);
-    const char *userinfo = indexed_get(s->userinfo, s->userinfo_count, (int64_t)slot);
+    const char *userinfo = qa_app_sim_qvm_component_texts_get(&s->state.userinfo, slot);
     if (userinfo == NULL || strcmp(userinfo, target.userinfo) != 0) {
-      indexed_set(&s->userinfo, &s->userinfo_count, &s->userinfo_capacity, (int64_t)slot, target.userinfo);
+      qa_app_sim_qvm_component_texts_set(&s->state.userinfo, slot, target.userinfo);
       qa_qvm_game_client_userinfo_changed(&s->vm, slot);
     }
     const struct { int64_t offset; qa_vec3 vector; } vectors[] = {{20, body.origin}, {32, body.velocity}, {152, body.angles}};
@@ -374,38 +330,38 @@ static void remove_actor(qa_app_sim_qvm_grapple_source *s, qa_actor_id actor) {
   if (value.client) {
     double slot = slot_of(s, value.pointer);
     qa_qvm_game_client_disconnect(&s->vm, slot);
-    indexed_delete(s->userinfo, &s->userinfo_count, (int64_t)slot);
+    qa_app_sim_qvm_component_texts_delete(&s->state.userinfo, slot);
   } else {
     int32_t word = (int32_t)value.pointer;
     (void)qa_qvm_module_call(&s->vm.module, &word, 1, (int64_t)s->options.profile->callbacks.free);
   }
   delete_binding(s, actor);
 }
-typedef struct sync_scope { qa_app_sim_qvm_grapple_source *source; qa_app_sim_qvm_grapple_target *targets; } sync_scope;
+typedef struct sync_scope { qa_app_sim_qvm_grapple_source *source; qa_app_sim_qvm_grapple_target *targets; qa_actor_id *keys; } sync_scope;
 static void sync_finally(void *arg) {
   sync_scope *scope = arg;
   scope->source->synchronizing = false;
-  free(scope->targets);
+  free(scope->targets); free(scope->keys);
+  scope->targets = NULL; scope->keys = NULL;
 }
 static void synchronize(qa_app_sim_qvm_grapple_source *s) {
   if (s->synchronizing) return;
   s->synchronizing = true;
   size_t count = 0;
-  sync_scope scope = {s, NULL};
+  sync_scope scope = {s, NULL, NULL};
   qa_cleanup cleanup;
   qa_cleanup_push(&cleanup, sync_finally, &scope);
   const qa_app_sim_qvm_grapple_target *targets = s->options.targets(s->options.ctx, &count);
   scope.targets = xcalloc(count, sizeof *scope.targets);
   memcpy(scope.targets, targets, count * sizeof *scope.targets);
   size_t bound = s->binding_count;
-  qa_actor_id *keys = xcalloc(bound, sizeof *keys);
+  qa_actor_id *keys = scope.keys = xcalloc(bound, sizeof *keys);
   for (size_t i = 0; i < bound; i++) keys[i] = s->bindings[i].actor;
   for (size_t i = 0; i < bound; i++) {
     bool present = false;
     for (size_t j = 0; j < count; j++) if (qa_same_actor(scope.targets[j].actor, keys[i])) present = true;
     if (!present) remove_actor(s, keys[i]);
   }
-  free(keys);
   for (size_t j = 0; j < count; j++) (void)mirror(s, scope.targets[j].actor, &scope.targets[j]);
   qa_cleanup_pop(&cleanup);
   sync_finally(&scope);
@@ -524,27 +480,27 @@ static qa_qvm_host_result syscall(void *ctx, const qa_qvm_host_call *call) {
 }
 static const char *cs_get(void *ctx, int32_t index) {
   qa_app_sim_qvm_grapple_source *s = ctx;
-  const char *value = indexed_get(s->configstrings, s->configstring_count, index);
+  const char *value = qa_app_sim_qvm_component_texts_get(&s->state.configstrings, index);
   return value == NULL ? "" : value;
 }
 static void cs_set(void *ctx, int32_t index, const char *value) {
   qa_app_sim_qvm_grapple_source *s = ctx;
-  indexed_set(&s->configstrings, &s->configstring_count, &s->configstring_capacity, index, value);
+  qa_app_sim_qvm_component_texts_set(&s->state.configstrings, index, value);
   qa_app_q3_source_event event;
   memset(&event, 0, sizeof event);
   event.kind = QA_APP_Q3_EVENT_CONFIGSTRING;
   event.index = index;
-  event.value = indexed_get(s->configstrings, s->configstring_count, index);
+  event.value = qa_app_sim_qvm_component_texts_get(&s->state.configstrings, index);
   s->options.event(s->options.ctx, event);
 }
 static const char *ui_get(void *ctx, double slot) {
   qa_app_sim_qvm_grapple_source *s = ctx;
-  const char *value = indexed_get(s->userinfo, s->userinfo_count, (int64_t)slot);
+  const char *value = qa_app_sim_qvm_component_texts_get(&s->state.userinfo, slot);
   return value == NULL ? "" : value;
 }
 static void ui_set(void *ctx, double slot, const char *value) {
   qa_app_sim_qvm_grapple_source *s = ctx;
-  indexed_set(&s->userinfo, &s->userinfo_count, &s->userinfo_capacity, (int64_t)slot, value);
+  qa_app_sim_qvm_component_texts_set(&s->state.userinfo, slot, value);
 }
 static qa_qvmx_wire_user_command user_command(void *ctx, double slot) {
   (void)slot;
@@ -569,121 +525,25 @@ static void send_server_command(void *ctx, double slot, const char *text) {
 static qa_qvm_entity_token_result entity_token(void *ctx) {
   qa_app_sim_qvm_grapple_source *s = ctx;
   qa_qvm_entity_token_result result;
-  result.token = qa_common_parse_state_parse(&s->parser, &s->cursor, true);
-  result.ended = !s->cursor.has_offset;
+  result.token = qa_common_parse_state_parse(&s->state.parser, &s->state.cursor, true);
+  result.ended = !s->state.cursor.has_offset;
   return result;
 }
-static qa_trace_policy q3_policy(double mask, bool curves, bool player_curve_clip) {
-  qa_trace_policy policy;
-  memset(&policy, 0, sizeof policy);
-  policy.kind = "q3";
-  policy.contents_mask = mask;
-  policy.curves = curves;
-  policy.player_curve_clip = player_curve_clip;
-  return policy;
-}
-static qa_qvm_trace_record sp_trace(void *ctx, const qa_qvm_server_trace_query *input) {
+/* qvmComponentSpatial options: actorForSlot, slotOf(actor) = slot(mirror(actor)), hidden(actor) = a tether actor,
+ * reject(operation) = throw new Error(`Grapple source cannot ${operation}`). */
+static bool component_actor_for_slot(void *ctx, double slot, qa_actor_id *out) { return actor_for_slot(ctx, slot, out); }
+static double component_slot_of(void *ctx, qa_actor_id actor) {
   qa_app_sim_qvm_grapple_source *s = ctx;
-  qa_trace_query query;
-  memset(&query, 0, sizeof query);
-  query.start = input->start;
-  query.end = input->end;
-  query.shape.kind = input->shape_kind;
-  query.shape.bounds = input->shape_bounds;
-  query.target.is_model = false;
-  query.numeric = qa_q3_binary32_profile;
-  qa_actor_id pass;
-  query.pass_actor = actor_for_slot(s, input->pass_entity_num, &pass) ? &pass : NULL;
-  bool curves = qa_cvar_registry_variable_value(s->cvars, "cm_noCurves") == 0;
-  bool player_curve_clip = qa_cvar_registry_variable_value(s->cvars, "cm_playerCurveClip") != 0;
-  query.policy = q3_policy(input->mask, curves, player_curve_clip);
-  qa_trace_result trace = qa_shared_trace(s->options.scene, query);
-  if (!is(trace.kind, "q3")) qa_raise("Error", 0, 0, "Grapple collision lost its source policy");
-  qa_qvm_trace_record record;
-  memset(&record, 0, sizeof record);
-  record.result.fraction = trace.fraction;
-  record.result.end = trace.end;
-  record.result.all_solid = trace.all_solid;
-  record.result.start_solid = trace.start_solid;
-  record.result.contents = trace.contents;
-  record.result.surface_flags = trace.surface_flags;
-  record.result.plane.plane = trace.source_plane.plane;
-  record.result.plane.type = trace.source_plane.type;
-  record.result.plane.signbits = trace.source_plane.signbits;
-  record.entity_num = trace.hit.kind == QA_TRACE_HIT_ACTOR ? (int32_t)slot_of(s, mirror(s, trace.hit.actor, NULL))
-                      : trace.fraction == 1 ? 1023 : 1022;
-  return record;
+  return slot_of(s, mirror(s, actor, NULL));
 }
-static int32_t sp_point_contents(void *ctx, qa_vec3 point, int32_t pass) {
+static bool component_hidden(void *ctx, qa_actor_id actor) {
   qa_app_sim_qvm_grapple_source *s = ctx;
-  qa_point_contents_query query;
-  memset(&query, 0, sizeof query);
-  query.point = point;
-  query.target.is_model = false;
-  qa_actor_id pass_actor;
-  query.pass_actor = actor_for_slot(s, pass, &pass_actor) ? &pass_actor : NULL;
-  query.numeric = qa_q3_binary32_profile;
-  query.policy = q3_policy(-1, true, true);
-  qa_point_contents_result sample = qa_shared_point_contents(s->options.scene, query);
-  if (!is(sample.kind, "q3")) qa_raise("Error", 0, 0, "Grapple contents lost its source policy");
-  return qa_js_to_int32(sample.contents);
+  for (size_t i = 0; i < s->tether_count; i++) if (qa_same_actor(s->tethers[i].actor.id, actor)) return true;
+  return false;
 }
-static size_t sp_area_entities(void *ctx, qa_bounds bounds, int32_t maximum, int32_t *out, size_t capacity) {
-  qa_app_sim_qvm_grapple_source *s = ctx;
-  size_t count = 0;
-  const qa_spatial_actor *found = qa_shared_query_actors(s->options.scene, bounds, NULL, &count);
-  qa_actor_id *actors = xcalloc(count, sizeof *actors);
-  size_t kept = 0;
-  for (size_t i = 0; i < count; i++) {
-    bool tethered = false;
-    for (size_t j = 0; j < s->tether_count; j++) if (qa_same_actor(s->tethers[j].actor.id, found[i].body.actor)) tethered = true;
-    if (!tethered) actors[kept++] = found[i].body.actor;
-  }
-  size_t limit = maximum < 0 ? kept : kept < (size_t)maximum ? kept : (size_t)maximum;
-  for (size_t i = 0; i < limit; i++) {
-    int32_t slot = (int32_t)slot_of(s, mirror(s, actors[i], NULL));
-    if (i < capacity) out[i] = slot;
-  }
-  free(actors);
-  return limit;
-}
-static bool sp_entity_contact(void *ctx, qa_bounds bounds, int32_t slot, bool capsule) {
-  (void)ctx; (void)bounds; (void)slot; (void)capsule;
-  qa_raise("Error", 0, 0, "Grapple source requested undeclared brush contact");
-}
-static void sp_set_brush_model(void *ctx, int32_t slot, const char *name) {
-  (void)ctx; (void)slot; (void)name;
-  qa_raise("Error", 0, 0, "Grapple source attempted to own a map brush");
-}
-static void sp_adjust_area_portal_state(void *ctx, int32_t slot, bool open) {
-  (void)ctx; (void)slot; (void)open;
-  qa_raise("Error", 0, 0, "Grapple source attempted to change map portals");
-}
-static bool sp_in_pvs(void *ctx, qa_vec3 first, qa_vec3 second, bool ignore) {
-  qa_app_sim_qvm_grapple_source *s = ctx;
-  double a = qa_shared_point_leaf(s->options.scene, first), b = qa_shared_point_leaf(s->options.scene, second);
-  double ca = qa_shared_leaf_cluster(s->options.scene, a), cb = qa_shared_leaf_cluster(s->options.scene, b);
-  if (!qa_shared_cluster_visible(s->options.scene, ca, cb, "pvs")) return false;
-  if (ignore) return true;
-  double aa = qa_shared_leaf_area(s->options.scene, a), ab = qa_shared_leaf_area(s->options.scene, b);
-  return qa_shared_areas_connected(s->options.scene, aa, ab);
-}
-static bool sp_areas_connected(void *ctx, int32_t first, int32_t second) {
-  return qa_shared_areas_connected(((qa_app_sim_qvm_grapple_source *)ctx)->options.scene, first, second);
-}
-static void sp_link(void *ctx, int32_t slot) {
-  qa_app_sim_qvm_grapple_source *s = ctx;
-  qa_qvm_shared_entity *r = qa_qvm_game_data_entity(&s->vm.data, slot);
-  qa_qvm_shared_entity_set_linked(r, true);
-  qa_vec3 origin = qa_qvm_shared_entity_get_current_origin(r), mins = qa_qvm_shared_entity_get_mins(r);
-  qa_vec3 maxs = qa_qvm_shared_entity_get_maxs(r);
-  qa_vec3 absmin = {origin.x + mins.x - 1, origin.y + mins.y - 1, origin.z + mins.z - 1};
-  qa_vec3 absmax = {origin.x + maxs.x + 1, origin.y + maxs.y + 1, origin.z + maxs.z + 1};
-  qa_qvm_shared_entity_set_absmin(r, absmin);
-  qa_qvm_shared_entity_set_absmax(r, absmax);
-}
-static void sp_unlink(void *ctx, int32_t slot) {
-  qa_qvm_shared_entity_set_linked(qa_qvm_game_data_entity(&((qa_app_sim_qvm_grapple_source *)ctx)->vm.data, slot), false);
+static void component_reject(void *ctx, const char *operation) {
+  (void)ctx;
+  qa_raise("Error", 0, 0, "Grapple source cannot %s", operation);
 }
 
 /* ---------------- bound VM functions ---------------- */
@@ -743,138 +603,17 @@ static int32_t damage(void *ctx, qa_qvm_module_function_call *call) {
 static void put(qa_save_value *object, const char *key, qa_save_value *child) {
   if (child == NULL || !qa_save_value_set(object, key, child)) qa_range_error("Out of memory");
 }
-static void push(qa_save_value *array, qa_save_value *child) {
-  if (child == NULL || !qa_save_value_push(array, child)) qa_range_error("Out of memory");
-}
 static qa_save_value *object(void) {
   qa_save_value *o = qa_save_value_object();
   if (o == NULL) qa_range_error("Out of memory");
   return o;
-}
-static qa_save_value *array(void) {
-  qa_save_value *a = qa_save_value_array();
-  if (a == NULL) qa_range_error("Out of memory");
-  return a;
-}
-/* TS QvmFiles.captureCheckpoint value form (see compat/qvm/mod_provider.c). */
-static qa_save_value *mount_value(const qa_mount_identity *identity, bool archive, qa_archive_format format,
-                                  const char *path, qa_content_digest digest) {
-  qa_save_value *value = object(), *identity_value = object();
-  put(identity_value, "id", qa_save_value_string(identity->id));
-  put(identity_value, "content", qa_save_value_string(identity->content));
-  put(identity_value, "generation", qa_save_value_number((double)identity->generation));
-  put(value, "identity", identity_value);
-  put(value, "kind", qa_save_value_string(archive ? "archive" : "loose"));
-  if (archive) {
-    static const char *const formats[] = {"pak", "pk3", "kpf", "zip"};
-    put(value, "format", qa_save_value_string(formats[format]));
-    put(value, "archivePath", qa_save_value_string(path));
-    put(value, "archiveDigest", qa_save_value_string(digest));
-  } else put(value, "rootPath", qa_save_value_string(path));
-  return value;
-}
-static qa_save_value *resource_value(const qa_resolved_resource_reference *resource) {
-  qa_save_value *value = object(), *provenance = object(), *resolution = object();
-  put(value, "id", qa_save_value_string(resource->id));
-  put(value, "requestedPath", qa_save_value_string(resource->requested_path));
-  put(provenance, "memberPath", qa_save_value_string(resource->provenance.member_path));
-  if (resource->provenance.kind == QA_CONTENT_MOUNT_ARCHIVE) {
-    const qa_archive_mount *mount = resource->provenance.archive_mount;
-    put(provenance, "kind", qa_save_value_string("archive"));
-    put(provenance, "mount", mount_value(&mount->identity, true, mount->format, mount->archive_path, mount->archive_digest));
-    put(provenance, "memberIndex", qa_save_value_number((double)resource->provenance.member_index));
-  } else {
-    const qa_loose_mount *mount = resource->provenance.loose_mount;
-    put(provenance, "kind", qa_save_value_string("loose"));
-    put(provenance, "mount", mount_value(&mount->identity, false, QA_ARCHIVE_FORMAT_PAK, mount->root_path, NULL));
-  }
-  put(value, "provenance", provenance);
-  put(value, "digest", qa_save_value_string(resource->digest));
-  put(value, "byteLength", qa_save_value_number((double)resource->byte_length));
-  put(resolution, "plan", qa_save_value_string(resource->resolution.plan));
-  switch (resource->resolution.kind) {
-    case QA_RESOURCE_RESOLUTION_DEFAULT_ORDER:
-      put(resolution, "kind", qa_save_value_string("default-order"));
-      put(resolution, "rank", qa_save_value_number((double)resource->resolution.rank));
-      break;
-    case QA_RESOURCE_RESOLUTION_PREFIX_ORDER:
-      put(resolution, "kind", qa_save_value_string("prefix-order"));
-      put(resolution, "rank", qa_save_value_number((double)resource->resolution.rank));
-      put(resolution, "prefix", qa_save_value_string(resource->resolution.prefix));
-      break;
-    case QA_RESOURCE_RESOLUTION_LINK:
-      put(resolution, "kind", qa_save_value_string("link"));
-      put(resolution, "sourcePrefix", qa_save_value_string(resource->resolution.source_prefix));
-      put(resolution, "targetPath", qa_save_value_string(resource->resolution.target_path));
-      break;
-  }
-  put(value, "resolution", resolution);
-  return value;
-}
-static qa_save_value *files_value(qa_qvm_files *files) {
-  qa_qvm_files_checkpoint checkpoint;
-  if (!qa_qvm_files_capture_checkpoint(files, &checkpoint)) qa_range_error("Out of memory");
-  qa_save_value *value = object(), *handles = array();
-  for (size_t i = 0; i < checkpoint.handle_count; i++) {
-    const qa_qvm_file_handle_checkpoint *entry = &checkpoint.handles[i];
-    qa_save_value *handle = object();
-    put(handle, "slot", qa_save_value_number(entry->slot));
-    put(handle, "kind", qa_save_value_string(entry->is_write ? "write" : "read"));
-    if (entry->is_write) {
-      qa_save_value *file = object();
-      put(file, "path", qa_save_value_string(entry->file.path));
-      const char *mode = entry->file.mode == QA_WRITABLE_WRITE ? "write"
-                         : entry->file.mode == QA_WRITABLE_APPEND ? "append" : "append-sync";
-      put(file, "mode", qa_save_value_string(mode));
-      put(file, "position", qa_save_value_number((double)entry->file.position));
-      put(handle, "file", file);
-    } else {
-      qa_save_value *resource = object();
-      put(resource, "reference", resource_value(&entry->reference));
-      put(resource, "bytes", qa_save_value_bytes(entry->bytes, entry->byte_length));
-      put(handle, "resource", resource);
-      put(handle, "position", qa_save_value_number(entry->position));
-    }
-    push(handles, handle);
-  }
-  put(value, "handles", handles);
-  qa_qvm_files_checkpoint_destroy(&checkpoint);
-  return value;
 }
 static qa_qvm_host_checkpoint host_checkpoint(void *ctx) {
   qa_app_sim_qvm_grapple_source *s = ctx;
   qa_save_value *value = object();
   put(value, "version", qa_save_value_number(1));
   put(value, "milliseconds", qa_save_value_number(s->milliseconds));
-  qa_qvm_game_data_state layout = qa_qvm_game_data_checkpoint(&s->vm.data);
-  qa_save_value *data = object();
-  put(data, "entitiesWord", qa_save_value_number(layout.entities_word));
-  put(data, "numEntities", qa_save_value_number(layout.num_entities));
-  put(data, "entityStride", qa_save_value_number(layout.entity_stride));
-  put(data, "clientsWord", qa_save_value_number(layout.clients_word));
-  put(data, "clientStride", qa_save_value_number(layout.client_stride));
-  put(value, "data", data);
-  put(value, "cvars", qa_cvar_registry_capture_save_state(s->cvars));
-  qa_save_value *configstrings = array();
-  for (size_t i = 0; i < s->configstring_count; i++) {
-    qa_save_value *cell = object();
-    put(cell, "index", qa_save_value_number((double)s->configstrings[i].index));
-    put(cell, "value", qa_save_value_string(s->configstrings[i].value));
-    push(configstrings, cell);
-  }
-  put(value, "configstrings", configstrings);
-  qa_save_value *userinfo = array();
-  for (size_t i = 0; i < s->userinfo_count; i++) {
-    qa_save_value *cell = object();
-    put(cell, "slot", qa_save_value_number((double)s->userinfo[i].index));
-    put(cell, "value", qa_save_value_string(s->userinfo[i].value));
-    push(userinfo, cell);
-  }
-  put(value, "userinfo", userinfo);
-  put(value, "files", files_value(s->files));
-  put(value, "entityText", qa_save_value_string(s->cursor.source));
-  put(value, "cursor", s->cursor.has_offset ? qa_save_value_number((double)s->cursor.offset) : qa_save_value_null());
-  put(value, "parser", qa_common_parse_state_capture(&s->parser));
+  qa_app_sim_qvm_component_state_capture(&s->state, &s->vm.data, s->files, value);
   size_t length = 0;
   uint8_t *bytes = qa_encode_checkpoint_value(value, &length);
   qa_save_value_free(value);
@@ -908,54 +647,8 @@ static void host_restore(void *ctx, const qa_qvm_host_checkpoint *checkpoint) {
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, scope.value, "qvm.grapple.host")) qa_range_error("Out of memory");
   qa_save_reader f = fld(&reader, "version"); (void)qa_save_reader_literal_number(&f, 1); qa_save_reader_destroy(&f);
-  f = fld(&reader, "entityText"); (void)qa_save_reader_literal_string(&f, s->cursor.source); qa_save_reader_destroy(&f);
   s->milliseconds = int_field(&reader, "milliseconds", true);
-  qa_save_reader data = fld(&reader, "data");
-  qa_qvm_game_data_state layout;
-  layout.entities_word = int_field(&data, "entitiesWord", false);
-  layout.num_entities = int_field(&data, "numEntities", true);
-  layout.entity_stride = int_field(&data, "entityStride", true);
-  layout.clients_word = int_field(&data, "clientsWord", false);
-  layout.client_stride = int_field(&data, "clientStride", true);
-  qa_save_reader_destroy(&data);
-  qa_qvm_game_data_restore(&s->vm.data, layout);
-  f = fld(&reader, "cvars"); qa_cvar_registry_restore_save_state(s->cvars, f.value); qa_save_reader_destroy(&f);
-  indexed_clear(s->configstrings, &s->configstring_count);
-  indexed_clear(s->userinfo, &s->userinfo_count);
-  qa_save_reader list = fld(&reader, "userinfo");
-  size_t count = qa_save_reader_list_count(&list);
-  for (size_t i = 0; i < count; i++) {
-    qa_save_reader cell = itm(&list, i);
-    double slot = int_field(&cell, "slot", true);
-    qa_save_reader v = fld(&cell, "value");
-    const char *text = qa_save_reader_string(&v);
-    qa_save_reader_destroy(&v);
-    if (slot >= 64 || indexed_get(s->userinfo, s->userinfo_count, (int64_t)slot) != NULL)
-      qa_raise("Error", 0, 0, "Invalid saved grapple client");
-    indexed_set(&s->userinfo, &s->userinfo_count, &s->userinfo_capacity, (int64_t)slot, text);
-    qa_save_reader_destroy(&cell);
-  }
-  qa_save_reader_destroy(&list);
-  list = fld(&reader, "configstrings");
-  count = qa_save_reader_list_count(&list);
-  for (size_t i = 0; i < count; i++) {
-    qa_save_reader cell = itm(&list, i);
-    double index = int_field(&cell, "index", true);
-    qa_save_reader v = fld(&cell, "value");
-    const char *text = qa_save_reader_string(&v);
-    qa_save_reader_destroy(&v);
-    if (index >= 1024 || indexed_get(s->configstrings, s->configstring_count, (int64_t)index) != NULL)
-      qa_raise("Error", 0, 0, "Invalid saved grapple configstring");
-    indexed_set(&s->configstrings, &s->configstring_count, &s->configstring_capacity, (int64_t)index, text);
-    qa_save_reader_destroy(&cell);
-  }
-  qa_save_reader_destroy(&list);
-  f = fld(&reader, "cursor");
-  if (qa_save_reader_is_null(&f)) qa_common_parse_cursor_set_null(&s->cursor);
-  else qa_common_parse_cursor_set_offset(&s->cursor, (size_t)qa_save_reader_integer_min(&f, 0));
-  qa_save_reader_destroy(&f);
-  f = fld(&reader, "parser"); qa_common_parse_state_restore(&s->parser, f.value); qa_save_reader_destroy(&f);
-  f = fld(&reader, "files"); qa_qvm_files_restore_checkpoint(s->files, f.value); qa_save_reader_destroy(&f);
+  qa_app_sim_qvm_component_state_restore(&s->state, &reader, &s->vm.data, s->files, "grapple");
   qa_save_reader_destroy(&reader);
   qa_cleanup_pop(&cleanup);
   host_restore_release(&scope);
@@ -975,11 +668,10 @@ static qa_script_read_result read_script(void *ctx, const char *name, qa_command
   result.kind = QA_SCRIPT_READ_READY;
   qa_content_opened_resource resource;
   if (!qa_content_mounted_open(s->options.mounts, name, NULL, NULL, &resource)) return result;
-  char *text = malloc(resource.byte_length + 1);
-  if (text == NULL) { free(resource.bytes); qa_range_error("Out of memory"); }
-  memcpy(text, resource.bytes, resource.byte_length);
-  text[resource.byte_length] = '\0';
+  /* new TextDecoder().decode(resource.bytes) */
+  char *text = qa_text_decoder_decode(resource.bytes, resource.byte_length, NULL);
   free(resource.bytes);
+  if (text == NULL) qa_range_error("Out of memory");
   result.has_text = true;
   result.text = text;
   return result;
@@ -995,12 +687,6 @@ static void register_cvar(qa_cvar_registry *cvars, const char *name, const char 
 }
 static void construct(qa_app_sim_qvm_grapple_source *s) {
   const qa_app_sim_qvm_grapple_source_options *options = &s->options;
-  char *entities = qa_app_sim_qvm_weapon_initialization_entities(options->entity_text);
-  bool cursor_ok = qa_common_parse_cursor_init(&s->cursor, entities, strlen(entities), false);
-  free(entities);
-  if (!cursor_ok) qa_range_error("Out of memory");
-  s->cursor_ready = true;
-  qa_common_parse_state_init(&s->parser);
   qa_cvar_registry_options cvar_options;
   memset(&cvar_options, 0, sizeof cvar_options);
   cvar_options.dialect = QA_COMMAND_DIALECT_Q3;
@@ -1009,6 +695,7 @@ static void construct(qa_app_sim_qvm_grapple_source *s) {
   cvar_options.print_ctx = s;
   s->cvars = qa_cvar_registry_create(&cvar_options);
   if (s->cvars == NULL) qa_range_error("Out of memory");
+  qa_app_sim_qvm_component_state_init(&s->state, options->entity_text, s->cvars);
   static const char *const defaults[][2] = {{"g_log", ""}, {"cm_noCurves", "0"}, {"cm_playerCurveClip", "1"},
       {"bot_enable", "0"}, {"sv_maxclients", "64"}, {"dedicated", "1"}, {"g_gametype", "0"}};
   for (size_t i = 0; i < sizeof defaults / sizeof defaults[0]; i++) register_cvar(s->cvars, defaults[i][0], defaults[i][1], false);
@@ -1049,9 +736,12 @@ static void construct(qa_app_sim_qvm_grapple_source *s) {
   (void)qa_qvm_module_bind_function(&s->vm.module, &reference, same_team, s);
   reference.instruction_index = options->profile->callbacks.damage;
   (void)qa_qvm_module_bind_function(&s->vm.module, &reference, damage, s);
-  qa_qvm_server_spatial_operations spatial = {s, sp_trace, sp_point_contents, sp_area_entities, sp_entity_contact,
-      sp_set_brush_model, sp_adjust_area_portal_state, sp_in_pvs, sp_areas_connected, sp_link, sp_unlink};
-  s->spatial = spatial;
+  qa_app_sim_qvm_component_spatial_options spatial;
+  memset(&spatial, 0, sizeof spatial);
+  spatial.scene = options->scene; spatial.cvars = s->cvars; spatial.data = &s->vm.data; spatial.label = "Grapple";
+  spatial.ctx = s; spatial.actor_for_slot = component_actor_for_slot; spatial.slot_of = component_slot_of;
+  spatial.hidden = component_hidden; spatial.reject = component_reject;
+  qa_app_sim_qvm_component_spatial_init(&s->spatial, spatial);
   memset(&s->services, 0, sizeof s->services);
   s->services.data = &s->vm.data;
   s->services.cvars = s->cvars;
@@ -1059,7 +749,7 @@ static void construct(qa_app_sim_qvm_grapple_source *s) {
   s->services.configstring_get = cs_get;
   s->services.configstring_set = cs_set;
   s->services.max_clients = 64;
-  s->services.spatial = &s->spatial;
+  s->services.spatial = &s->spatial.operations;
   s->services.ctx = s;
   s->services.get_userinfo = ui_get;
   s->services.set_userinfo = ui_set;
@@ -1356,10 +1046,8 @@ void qa_app_sim_qvm_grapple_source_destroy(qa_app_sim_qvm_grapple_source *s) {
   if (s->files != NULL) qa_qvm_files_destroy(s->files);
   if (s->commands != NULL) qa_command_buffer_destroy(s->commands);
   if (s->cvars != NULL) qa_cvar_registry_destroy(s->cvars);
-  if (s->cursor_ready) qa_common_parse_cursor_destroy(&s->cursor);
-  indexed_clear(s->configstrings, &s->configstring_count);
-  indexed_clear(s->userinfo, &s->userinfo_count);
-  free(s->configstrings); free(s->userinfo); free(s->bindings); free(s->tethers);
+  qa_app_sim_qvm_component_state_destroy(&s->state);
+  free(s->bindings); free(s->tethers);
   free(s->host_bytes); free(s->presentations); free(s->cables);
   free(s);
 }

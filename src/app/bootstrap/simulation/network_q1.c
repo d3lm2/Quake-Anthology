@@ -106,7 +106,7 @@ typedef struct q1_host {
   qa_actor_id *muzzle_flashes; size_t muzzle_flash_count;
   per_player *players; size_t player_count;
   qa_wire_admission support;
-  qa_actor_command **inputs; size_t input_count;
+  qa_actor_command input; /* host input() scratch: the network copies each command */
 } q1_host;
 
 void qa_app_sim_q1_application_server_host_destroy(qa_app_q1_server_host host) {
@@ -341,6 +341,18 @@ static void send(q1_host *h, qa_netquake_message message, bool reliable, const q
   if (recipient) { value.has_recipient = true; value.recipient = *recipient; }
   routed_push(&h->routed, value);
 }
+/* options.print(`${prefix}${value}${suffix}`): the whole text, any length. */
+static void print_text(q1_host *h, const char *prefix, const char *value, const char *suffix) {
+  size_t length = strlen(prefix) + strlen(value) + strlen(suffix) + 1;
+  char *text = malloc(length);
+  if (text == NULL) qa_range_error("Out of memory");
+  snprintf(text, length, "%s%s%s", prefix, value, suffix);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, text);
+  h->options.print(h->options.print_ctx, text);
+  qa_cleanup_pop(&guard);
+  free(text);
+}
 static double sound_channel(const qa_q1_event *event) {
   if (event->sound_channel == NULL) return event->channel;
   const char *name = event->sound_channel;
@@ -351,8 +363,6 @@ static void host_observe(void *ctx, const void *output_value, const void *const 
   const qa_app_sim_network_simulation *s = h->simulation;
   const qa_simulation_output *output = output_value;
   const qa_app_sim_presentation_event *const *events = (const qa_app_sim_presentation_event *const *)events_value;
-  for (size_t i = 0; i < h->input_count; i++) free(h->inputs[i]);
-  h->input_count = 0;
   routed_clear(&h->routed);
   h->routed = h->operators; /* routed = operatorMessages.drainAll() */
   memset(&h->operators, 0, sizeof h->operators);
@@ -419,9 +429,7 @@ static void host_observe(void *ctx, const void *output_value, const void *const 
       if (!is(record->content, s->recipe->map.entities.content)) qa_raise("Error", 0, 0, "Native Q1 sound belongs to another content provider");
       double sound;
       if (!table_get(h->sounds, h->sound_count, event->path, &sound)) {
-        char text[512];
-        snprintf(text, sizeof text, "SV_StartSound: %s not precached\n", event->path);
-        h->options.print(h->options.print_ctx, text);
+        print_text(h, "SV_StartSound: ", event->path, " not precached\n");
         continue;
       }
       double channel = sound_channel(event);
@@ -441,9 +449,7 @@ static void host_observe(void *ctx, const void *output_value, const void *const 
         if (address.has_value) { has_entity = true; entity = (double)address.slot; }
       }
       if (captured == NULL || !has_entity) {
-        char text[512];
-        snprintf(text, sizeof text, "Q1 sound has no emission-time origin: %s\n", event->path);
-        h->options.print(h->options.print_ctx, text);
+        print_text(h, "Q1 sound has no emission-time origin: ", event->path, "\n");
         continue;
       }
       qa_netquake_message message = blank("sound");
@@ -735,13 +741,12 @@ static qa_app_q1_frame host_frame(void *ctx, qa_app_q1_player player, const void
 }
 static const void *host_input(void *ctx, qa_app_q1_player player, const qa_q1_user_command *command, double sequence) {
   q1_host *h = ctx;
-  qa_actor_command *out = xcalloc(1, sizeof *out);
+  qa_actor_command *out = &h->input;
+  memset(out, 0, sizeof *out);
   out->actor = player.actor;
   out->source.kind = QA_COMMAND_SOURCE_REMOTE_CLIENT; out->source.client = player.client;
   out->sequence = sequence;
   out->command.kind = QA_USER_COMMAND_Q1; out->command.as.q1 = *command;
-  h->inputs = xrealloc(h->inputs, (h->input_count + 1) * sizeof *h->inputs);
-  h->inputs[h->input_count++] = out;
   return out;
 }
 static void host_command(void *ctx, qa_app_q1_player player, const char *name, const char *const *args, size_t count) {
@@ -782,9 +787,7 @@ static void host_command(void *ctx, qa_app_q1_player player, const char *name, c
       || is(name, "notarget") || is(name, "noclip") || is(name, "fly") || is(name, "kill"))
     s->player_command(s->ctx, player.actor, name, args, count);
   else {
-    char text[512];
-    snprintf(text, sizeof text, "Unsupported native Q1 client command: %s", name);
-    h->options.print(h->options.print_ctx, text);
+    print_text(h, "Unsupported native Q1 client command: ", name, "");
   }
 }
 static bool host_rejects(void *ctx, const void *address) { q1_host *h = ctx; return h->options.rejects(h->options.rejects_ctx, address); }
@@ -796,8 +799,6 @@ static void host_destroy(void *ctx) {
   for (size_t i = 0; i < h->board_count; i++) free(h->board[i].name);
   free(h->board); free(h->board_order);
   routed_clear(&h->routed); routed_clear(&h->operators);
-  for (size_t i = 0; i < h->input_count; i++) free(h->inputs[i]);
-  free(h->inputs);
   free(h->muzzle_flashes);
   for (size_t i = 0; i < h->sound_count; i++) free((void *)h->sound_resources[i]);
   free(h->sound_resources); free(h->models); free(h->sounds);

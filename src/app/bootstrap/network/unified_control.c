@@ -35,9 +35,17 @@ static double bounded(const qa_save_reader *reader, double minimum, double maxim
     qa_save_reader_fail(reader, "number exceeds protocol limit");
   return value;
 }
+/* TS string(): value.length (UTF-16 units) <= maximum and no NUL. A four-byte UTF-8
+ * character is two units; a held NUL makes the whole length exceed strlen. */
 static const char *protocol_string(const qa_save_reader *reader, size_t maximum) {
-  const char *value = qa_save_reader_string(reader);
-  if (strlen(value) > maximum) qa_save_reader_fail(reader, "invalid protocol string");
+  size_t length = 0;
+  const char *value = qa_save_reader_string_length(reader, &length);
+  size_t units = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)value[i];
+    if ((c & 0xc0) != 0x80) units += c >= 0xf0 ? 2 : 1;
+  }
+  if (units > maximum || length != strlen(value)) qa_save_reader_fail(reader, "invalid protocol string");
   return value;
 }
 static const char *field_string(const qa_save_reader *reader, const char *name, size_t maximum) {
@@ -48,8 +56,9 @@ static const char *field_string(const qa_save_reader *reader, const char *name, 
 }
 static qa_app_unified_actor_reference read_actor_ref(const qa_save_reader *reader) {
   qa_save_reader slot = field_of(reader, "slot"), generation = field_of(reader, "generation");
-  qa_app_unified_actor_reference out = {bounded(&slot, 0, 1048575),
-      (double)qa_save_reader_integer_min(&generation, 0)};
+  qa_app_unified_actor_reference out;
+  out.slot = bounded(&slot, 0, 1048575); /* TS reads slot, then generation */
+  out.generation = (double)qa_save_reader_integer_min(&generation, 0);
   qa_save_reader_destroy(&slot);
   qa_save_reader_destroy(&generation);
   return out;
@@ -86,10 +95,12 @@ static qa_save_value *write_angles(const double values[3]) {
 static void read_angles(const qa_save_reader *reader, double out[3]) {
   size_t count = qa_save_reader_list_count(reader);
   double values[3] = {0, 0, 0};
-  for (size_t i = 0; i < count && i < 3; i++) {
+  /* TS r.list(bounded) reads every item before the length check. */
+  for (size_t i = 0; i < count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(reader, i, &item)) qa_range_error("out of memory");
-    values[i] = bounded(&item, -2147483648.0, 2147483647);
+    double value = bounded(&item, -2147483648.0, 2147483647);
+    if (i < 3) values[i] = value;
     qa_save_reader_destroy(&item);
   }
   if (count != 3) qa_save_reader_fail(reader, "expected three command angles");
@@ -532,7 +543,7 @@ void qa_app_unified_decode_control_into(qa_app_unified_control *target, const ui
       resources[i] = read_key(&item);
       qa_save_reader_destroy(&item);
     }
-    if (count > 32768) qa_save_reader_fail(&resources_reader, "too many resource declarations");
+    if (count > 32768) qa_save_reader_fail(&r, "too many resource declarations");
     out.resource_count = count;
     qa_save_reader_destroy(&resources_reader);
   } else if (strcmp(kind, "events") == 0) {
@@ -568,7 +579,7 @@ void qa_app_unified_decode_control_into(qa_app_unified_control *target, const ui
       args[i] = protocol_string(&item, 8192);
       qa_save_reader_destroy(&item);
     }
-    if (count < 1 || count > 128) qa_save_reader_fail(&args_reader, "invalid component command");
+    if (count < 1 || count > 128) qa_save_reader_fail(&r, "invalid component command");
     out.arg_count = count;
     qa_save_reader_destroy(&args_reader);
     qa_save_reader owner = field_of(&r, "owner");
@@ -660,7 +671,7 @@ void qa_app_unified_decode_inputs_into(qa_app_unified_input_batch *batch, const 
     qa_save_reader_destroy(&arsenal);
     qa_save_reader_destroy(&item);
   }
-  if (count > 64) qa_save_reader_fail(&commands_reader, "too many input commands");
+  if (count > 64) qa_save_reader_fail(&r, "too many input commands");
   qa_save_reader_destroy(&commands_reader);
   qa_save_reader epoch_reader = field_of(&r, "epoch");
   batch->epoch = bounded(&epoch_reader, 1, 4294967295.0);

@@ -55,15 +55,22 @@ void qa_q3_base_entity_shared_set_current_origin(qa_q3_base_entity_shared *r, qa
   r->body.write(r->body.ctx, state);
   if (r->has_current_origin_view) r->current_origin_view = value;
 }
+typedef struct origin_view_restore { qa_q3_base_entity_shared *r; bool has; qa_vec3 origin; } origin_view_restore;
+static void restore_origin_view(void *arg) {
+  origin_view_restore *saved = arg;
+  saved->r->has_current_origin_view = saved->has;
+  saved->r->current_origin_view = saved->origin;
+}
 void qa_q3_base_entity_shared_with_current_origin(qa_q3_base_entity_shared *r, qa_vec3 origin,
     void *call_ctx, void (*call)(void *ctx)) {
-  bool prev_has = r->has_current_origin_view;
-  qa_vec3 prev = r->current_origin_view;
+  origin_view_restore saved = {r, r->has_current_origin_view, r->current_origin_view};
   r->current_origin_view = (qa_vec3){origin.x, origin.y, origin.z};
   r->has_current_origin_view = true;
-  call(call_ctx); /* TS try/finally: aborts do not return in C either. */
-  r->has_current_origin_view = prev_has;
-  r->current_origin_view = prev;
+  /* TS try/finally: a raise caught further up still restores the previous view. */
+  qa_cleanup node; qa_cleanup_push(&node, restore_origin_view, &saved);
+  call(call_ctx);
+  qa_cleanup_pop(&node);
+  restore_origin_view(&saved);
 }
 qa_vec3 qa_q3_base_entity_shared_current_angles(const qa_q3_base_entity_shared *r) {
   return r->body.read(r->body.ctx).angles;
@@ -74,7 +81,7 @@ void qa_q3_base_entity_shared_set_current_angles(qa_q3_base_entity_shared *r, qa
   r->body.write(r->body.ctx, state);
 }
 qa_q3_base_entity_shared_private_state qa_q3_base_entity_shared_capture_private_state(const qa_q3_base_entity_shared *r) {
-  if (r->has_current_origin_view) qa_range_error("Cannot save inside a Q3 temporary origin view");
+  if (r->has_current_origin_view) qa_raise("Error", 0, 0, "Cannot save inside a Q3 temporary origin view");
   qa_q3_base_entity_shared_private_state out;
   out.has_previous_link = r->has_previous_link; out.previous_link = r->previous_link;
   out.has_abs_min_override = r->has_abs_min_override; out.abs_min_override = r->abs_min_override;
@@ -83,7 +90,7 @@ qa_q3_base_entity_shared_private_state qa_q3_base_entity_shared_capture_private_
 }
 void qa_q3_base_entity_shared_restore_private_state(qa_q3_base_entity_shared *r,
     qa_q3_base_entity_shared_private_state state) {
-  if (r->has_current_origin_view) qa_range_error("Cannot restore inside a Q3 temporary origin view");
+  if (r->has_current_origin_view) qa_raise("Error", 0, 0, "Cannot restore inside a Q3 temporary origin view");
   r->has_previous_link = state.has_previous_link;
   if (state.has_previous_link) retain_previous_link(r, state.previous_link);
   r->has_abs_min_override = state.has_abs_min_override;

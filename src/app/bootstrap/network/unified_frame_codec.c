@@ -797,8 +797,10 @@ static bool unsafe_path(const char *path) {
 }
 static qa_app_unified_resource_key read_key(const qa_save_reader *reader) {
   qa_save_reader path_reader = field_of(reader, "path");
-  const char *path = qa_save_reader_string(&path_reader);
-  if (unsafe_path(path))
+  size_t path_length = 0;
+  const char *path = qa_save_reader_string_length(&path_reader, &path_length);
+  /* TS also refuses path.includes("\0"): a held NUL makes the whole length exceed strlen. */
+  if (path_length != strlen(path) || unsafe_path(path))
     qa_save_reader_fail(reader, "invalid relative resource path");
   qa_app_unified_resource_key key;
   qa_save_reader f = field_of(reader, "content");
@@ -828,48 +830,199 @@ static void entity_free(qa_scene_entity *entity) {
   free((void *)entity->attachments);
   memset(entity, 0, sizeof *entity);
 }
-/* Fills a zeroed entity reachable from the frame; each allocation lands in it before the next
- * read. */
-static void read_entity(const qa_save_reader *r, const qa_app_unified_frame_decoder *context,
-    int depth, qa_scene_entity *entity) {
-  if (depth > 32) qa_save_reader_fail(r, "scene attachment nesting exceeds limit");
-  const qa_app_unified_identity_decoder *identity = &context->identity;
-  qa_save_reader key_reader = field_of(r, "resource");
-  qa_app_unified_resource_key key = read_key(&key_reader);
-  entity->resource = context->resource(context->ctx, &key);
-  match_resource(&key, &entity->resource);
-  qa_save_reader brush_reader = field_of(r, "brushModel");
-  bool has_brush = !qa_save_reader_is_null(&brush_reader);
-  double brush_model = has_brush ? qa_save_reader_integer_min(&brush_reader, 0) : 0;
-  entity->model = context->model(context->ctx, &key, has_brush, brush_model);
-  if (has_brush && (entity->model.kind != QA_DECODED_MODEL_BRUSH_MODEL
-      || entity->model.brush_model_index != brush_model || !context->world
-      || !same_world(&entity->model.brush_world, &context->world->geometry)))
-    qa_save_reader_fail(r, "brush model differs from local world");
-  if (!has_brush && entity->model.kind == QA_DECODED_MODEL_BRUSH_MODEL)
-    qa_save_reader_fail(r, "unexpected brush model");
-  qa_save_reader transform = field_of(r, "transform"), flags = field_of(r, "flags"), opacity = field_of(r, "opacity");
-  qa_save_reader attachments = field_of(r, "attachments");
-  size_t attachment_count = qa_save_reader_list_count(&attachments);
-  qa_scene_entity_attachment *items = xcalloc(attachment_count, sizeof *items);
-  entity->attachments = items;
-  for (size_t i = 0; i < attachment_count; i++) {
-    qa_save_reader row = item_of(&attachments, i);
-    entity->attachment_count = i + 1;
-    qa_save_reader tag = field_of(&row, "tag");
-    items[i].tag = qa_save_reader_string(&tag);
-    qa_scene_entity *child = xcalloc(1, sizeof *child);
-    items[i].entity = child;
-    qa_save_reader child_reader = field_of(&row, "entity");
-    read_entity(&child_reader, context, depth + 1, child);
+/* TS readEntity is async and the entities (and each entity's attachments) resolve through
+ * Promise.all, so with several bad entities the error reported is the first rejection to
+ * settle, not the first entity in order. The decoder replays the microtask schedule: each
+ * entity runs as the TS async function does, in four steps separated by its awaits
+ *   S0 (when called): depth check, readKey, context.resource(key)
+ *   S1 (after the resource): matchResource, brushModel, context.model(key, brushModel)
+ *   S2 (after the model): brush checks, the attachments list and their callbacks
+ *   S3 (after Promise.all of the attachments): every remaining field
+ * and promises settle and run their reactions in the order the spec gives (FIFO jobs). The
+ * context callbacks are synchronous here; each is taken to settle as an async function that
+ * returns a value does (one job), as the remote-unified resource cache and brush models do. */
+enum { JS_PENDING, JS_FULFILLED, JS_REJECTED };
+enum { REACT_ENTITY, REACT_CALLBACK, REACT_ALL };
+typedef struct js_reaction { int kind; void *target; } js_reaction;
+typedef struct js_promise {
+  int state;
+  const qa_caught_error *error;
+  js_reaction *reactions; size_t reaction_count, reaction_cap;
+} js_promise;
+typedef struct js_all { js_promise promise; size_t remaining; } js_all;
+typedef struct entity_task {
+  qa_save_reader r;
+  int depth, step;
+  qa_scene_entity *entity;
+  qa_app_unified_resource_key key;
+  bool has_brush; double brush_model;
+  qa_resolved_resource_reference resource;
+  qa_decoded_model model;
+  qa_save_reader transform, flags, opacity;
+  js_all *all;
+  js_promise promise;
+} entity_task;
+typedef struct callback_task { entity_task *child; js_promise promise; } callback_task;
+typedef struct js_job { int kind; void *target; int state; const qa_caught_error *error; } js_job;
+typedef struct js_scheduler {
+  const qa_app_unified_frame_decoder *context;
+  js_job *jobs; size_t head, count, cap;
+  void **owned; size_t owned_count, owned_cap;
+} js_scheduler;
+static void *scheduler_own(js_scheduler *s, size_t size) {
+  if (s->owned_count == s->owned_cap) {
+    size_t cap = s->owned_cap ? s->owned_cap * 2 : 64;
+    void **owned = realloc(s->owned, cap * sizeof *owned);
+    if (!owned) qa_range_error("out of memory");
+    s->owned = owned;
+    s->owned_cap = cap;
   }
+  void *block = xcalloc(1, size);
+  s->owned[s->owned_count++] = block;
+  return block;
+}
+static void scheduler_free(void *arg) {
+  js_scheduler *s = arg;
+  /* Tasks, promises' reaction lists, kept errors and element lists; the entities themselves
+   * belong to the frame. */
+  for (size_t i = 0; i < s->owned_count; i++) free(s->owned[i]);
+  free(s->owned);
+  free(s->jobs);
+  memset(s, 0, sizeof *s);
+}
+static void enqueue(js_scheduler *s, int kind, void *target, int state, const qa_caught_error *error) {
+  if (s->count == s->cap) {
+    size_t cap = s->cap ? s->cap * 2 : 64;
+    js_job *jobs = xcalloc(cap, sizeof *jobs);
+    for (size_t i = 0; i < s->count; i++) jobs[i] = s->jobs[(s->head + i) % s->cap];
+    free(s->jobs);
+    s->jobs = jobs;
+    s->head = 0;
+    s->cap = cap;
+  }
+  s->jobs[(s->head + s->count++) % s->cap] = (js_job){kind, target, state, error};
+}
+/* promise.then(reaction): a settled promise queues the reaction at once. */
+static void subscribe(js_scheduler *s, js_promise *promise, int kind, void *target) {
+  if (promise->state != JS_PENDING) { enqueue(s, kind, target, promise->state, promise->error); return; }
+  if (promise->reaction_count == promise->reaction_cap) {
+    size_t cap = promise->reaction_cap ? promise->reaction_cap * 2 : 2;
+    js_reaction *reactions = scheduler_own(s, cap * sizeof *reactions);
+    if (promise->reaction_count) memcpy(reactions, promise->reactions, promise->reaction_count * sizeof *reactions);
+    promise->reactions = reactions;
+    promise->reaction_cap = cap;
+  }
+  promise->reactions[promise->reaction_count++] = (js_reaction){kind, target};
+}
+static void settle(js_scheduler *s, js_promise *promise, int state, const qa_caught_error *error) {
+  if (promise->state != JS_PENDING) return;
+  promise->state = state;
+  promise->error = error;
+  for (size_t i = 0; i < promise->reaction_count; i++)
+    enqueue(s, promise->reactions[i].kind, promise->reactions[i].target, state, error);
+}
+static const qa_caught_error *kept_error(js_scheduler *s, const qa_caught_error *caught) {
+  qa_caught_error *error = scheduler_own(s, sizeof *error);
+  *error = *caught;
+  return error;
+}
+static void all_subscribe(js_scheduler *s, js_all *all, js_promise *const *elements, size_t count) {
+  /* PerformPromiseAll: remaining starts at one, each element adds one, the end takes one. */
+  all->remaining = 1;
+  for (size_t i = 0; i < count; i++) {
+    all->remaining++;
+    subscribe(s, elements[i], REACT_ALL, all);
+  }
+  if (--all->remaining == 0) settle(s, &all->promise, JS_FULFILLED, NULL);
+}
+typedef struct step_scope { js_scheduler *s; entity_task *task; } step_scope;
+static void context_resource_body(void *ctx) {
+  step_scope *scope = ctx;
+  scope->task->resource = scope->s->context->resource(scope->s->context->ctx, &scope->task->key);
+}
+static void context_model_body(void *ctx) {
+  step_scope *scope = ctx;
+  scope->task->model = scope->s->context->model(scope->s->context->ctx, &scope->task->key,
+      scope->task->has_brush, scope->task->brush_model);
+}
+/* `await context.x(...)`: the call runs now; its settlement resumes the task one job later. */
+static void await_call(js_scheduler *s, entity_task *task, void (*body)(void *)) {
+  step_scope scope = {s, task};
+  qa_caught_error caught;
+  if (qa_try(body, &scope, &caught)) enqueue(s, REACT_ENTITY, task, JS_FULFILLED, NULL);
+  else enqueue(s, REACT_ENTITY, task, JS_REJECTED, kept_error(s, &caught));
+}
+static entity_task *start_entity(js_scheduler *s, const qa_save_reader *r, int depth, qa_scene_entity *entity);
+static void step_s0(js_scheduler *s, entity_task *task) {
+  if (task->depth > 32) qa_save_reader_fail(&task->r, "scene attachment nesting exceeds limit");
+  qa_save_reader key_reader = field_of(&task->r, "resource");
+  task->key = read_key(&key_reader);
+  task->step = 1;
+  await_call(s, task, context_resource_body);
+}
+static void step_s1(js_scheduler *s, entity_task *task) {
+  task->entity->resource = task->resource;
+  match_resource(&task->key, &task->entity->resource);
+  qa_save_reader brush_reader = field_of(&task->r, "brushModel");
+  task->has_brush = !qa_save_reader_is_null(&brush_reader);
+  task->brush_model = task->has_brush ? qa_save_reader_integer_min(&brush_reader, 0) : 0;
+  task->step = 2;
+  await_call(s, task, context_model_body);
+}
+typedef struct callback_scope { js_scheduler *s; const qa_save_reader *row; qa_scene_entity_attachment *item; int depth; callback_task *callback; } callback_scope;
+/* The attachment callback up to its await: the tag, then readEntity (its S0 runs now). */
+static void callback_body(void *ctx) {
+  callback_scope *scope = ctx;
+  qa_save_reader tag = field_of(scope->row, "tag");
+  scope->item->tag = qa_save_reader_string(&tag);
+  qa_scene_entity *child = xcalloc(1, sizeof *child);
+  scope->item->entity = child;
+  qa_save_reader child_reader = field_of(scope->row, "entity");
+  scope->callback->child = start_entity(scope->s, &child_reader, scope->depth, child);
+}
+static void step_s2(js_scheduler *s, entity_task *task) {
+  qa_scene_entity *entity = task->entity;
+  entity->model = task->model;
+  const qa_app_unified_frame_decoder *context = s->context;
+  if (task->has_brush && (entity->model.kind != QA_DECODED_MODEL_BRUSH_MODEL
+      || entity->model.brush_model_index != task->brush_model || !context->world
+      || !same_world(&entity->model.brush_world, &context->world->geometry)))
+    qa_save_reader_fail(&task->r, "brush model differs from local world");
+  if (!task->has_brush && entity->model.kind == QA_DECODED_MODEL_BRUSH_MODEL)
+    qa_save_reader_fail(&task->r, "unexpected brush model");
+  task->transform = field_of(&task->r, "transform");
+  task->flags = field_of(&task->r, "flags");
+  task->opacity = field_of(&task->r, "opacity");
+  qa_save_reader attachments = field_of(&task->r, "attachments");
+  size_t count = qa_save_reader_list_count(&attachments);
+  qa_scene_entity_attachment *items = xcalloc(count, sizeof *items);
+  entity->attachments = items;
+  entity->attachment_count = count;
+  js_promise **elements = scheduler_own(s, (count ? count : 1) * sizeof *elements);
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader row = item_of(&attachments, i);
+    callback_task *callback = scheduler_own(s, sizeof *callback);
+    elements[i] = &callback->promise;
+    callback_scope scope = {s, &row, &items[i], task->depth + 1, callback};
+    qa_caught_error caught;
+    if (!qa_try(callback_body, &scope, &caught)) settle(s, &callback->promise, JS_REJECTED, kept_error(s, &caught));
+    else subscribe(s, &callback->child->promise, REACT_CALLBACK, callback);
+  }
+  task->all = scheduler_own(s, sizeof *task->all);
+  all_subscribe(s, task->all, elements, count);
+  task->step = 3;
+  subscribe(s, &task->all->promise, REACT_ENTITY, task);
+}
+static void step_s3(js_scheduler *s, entity_task *task) {
+  qa_scene_entity *entity = task->entity;
+  const qa_save_reader *r = &task->r;
   qa_save_reader actor_reader = field_of(r, "actor");
   if (!qa_save_reader_is_null(&actor_reader))
-    entity->actor = owned_actor(qa_app_unified_read_actor(&actor_reader, identity));
-  entity->transform.origin = vec_field(&transform, "origin");
-  qa_save_reader axis = field_of(&transform, "axis");
+    entity->actor = owned_actor(qa_app_unified_read_actor(&actor_reader, &s->context->identity));
+  entity->transform.origin = vec_field(&task->transform, "origin");
+  qa_save_reader axis = field_of(&task->transform, "axis");
   qa_app_unified_read_axis(&axis, entity->transform.axis.vectors);
-  entity->transform.scale = vec_field(&transform, "scale");
+  entity->transform.scale = vec_field(&task->transform, "scale");
   entity->previous_origin = vec_field(r, "previousOrigin");
   qa_save_reader pose = field_of(r, "pose");
   static const char *const pose_kinds[] = {"frame", "skeleton"};
@@ -896,14 +1049,85 @@ static void read_entity(const qa_save_reader *r, const qa_app_unified_frame_deco
   qa_save_reader shader_time = field_of(r, "shaderTime");
   entity->shader_time = qa_read_time(&shader_time);
   static const char *const flag_kinds[] = {"q1", "q2", "q3"};
-  entity->flags_kind = choice_field(&flags, "kind", flag_kinds, 3);
-  entity->flags_bits = integer_field(&flags, "bits");
+  entity->flags_kind = choice_field(&task->flags, "kind", flag_kinds, 3);
+  entity->flags_bits = integer_field(&task->flags, "bits");
   entity->lighting_origin = vec_field(r, "lightingOrigin");
   entity->shadow_plane = finite_field(r, "shadowPlane");
-  if (!absent(&opacity)) {
-    entity->opacity = qa_save_reader_finite(&opacity);
+  if (!absent(&task->opacity)) {
+    entity->opacity = qa_save_reader_finite(&task->opacity);
     entity->has_opacity = true;
   }
+}
+static void step_body(void *ctx) {
+  step_scope *scope = ctx;
+  switch (scope->task->step) {
+    case 0: step_s0(scope->s, scope->task); break;
+    case 1: step_s1(scope->s, scope->task); break;
+    case 2: step_s2(scope->s, scope->task); break;
+    default: step_s3(scope->s, scope->task); scope->task->step = 4; break;
+  }
+}
+/* Runs one step of the async function; a throw rejects its promise, the return fulfills it. */
+static void run_step(js_scheduler *s, entity_task *task) {
+  step_scope scope = {s, task};
+  qa_caught_error caught;
+  if (!qa_try(step_body, &scope, &caught)) settle(s, &task->promise, JS_REJECTED, kept_error(s, &caught));
+  else if (task->step == 4) settle(s, &task->promise, JS_FULFILLED, NULL);
+}
+/* Calling readEntity: its synchronous part (S0) runs now. */
+static entity_task *start_entity(js_scheduler *s, const qa_save_reader *r, int depth, qa_scene_entity *entity) {
+  entity_task *task = scheduler_own(s, sizeof *task);
+  task->r = *r;
+  task->depth = depth;
+  task->entity = entity;
+  run_step(s, task);
+  return task;
+}
+/* `await Promise.all(entities.list(e => readEntity(e, context)))`. */
+static void read_entities(const qa_save_reader *list_reader, const qa_app_unified_frame_decoder *context,
+    qa_scene_entity *list, size_t count) {
+  js_scheduler s;
+  memset(&s, 0, sizeof s);
+  s.context = context;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, scheduler_free, &s);
+  js_promise **elements = scheduler_own(&s, (count ? count : 1) * sizeof *elements);
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader row = item_of(list_reader, i);
+    elements[i] = &start_entity(&s, &row, 0, &list[i])->promise;
+  }
+  js_all *all = scheduler_own(&s, sizeof *all);
+  all_subscribe(&s, all, elements, count);
+  while (all->promise.state == JS_PENDING && s.count > 0) {
+    js_job job = s.jobs[s.head];
+    s.head = (s.head + 1) % s.cap;
+    s.count--;
+    if (job.kind == REACT_ENTITY) {
+      entity_task *task = job.target;
+      if (job.state == JS_REJECTED) settle(&s, &task->promise, JS_REJECTED, job.error);
+      else run_step(&s, task);
+    } else if (job.kind == REACT_CALLBACK) {
+      /* `entity: await readEntity(...)` resumed: the callback returns or rethrows. */
+      callback_task *callback = job.target;
+      settle(&s, &callback->promise, job.state, job.error);
+    } else {
+      js_all *target = job.target;
+      if (job.state == JS_REJECTED) settle(&s, &target->promise, JS_REJECTED, job.error);
+      else if (--target->remaining == 0) settle(&s, &target->promise, JS_FULFILLED, NULL);
+    }
+  }
+  int state = all->promise.state;
+  if (state != JS_FULFILLED) {
+    qa_caught_error error;
+    memset(&error, 0, sizeof error);
+    if (state == JS_REJECTED) error = *all->promise.error;
+    qa_cleanup_pop(&guard);
+    scheduler_free(&s);
+    if (state == JS_REJECTED) qa_rethrow(&error);
+    qa_range_error("unified frame entity decode did not settle");
+  }
+  qa_cleanup_pop(&guard);
+  scheduler_free(&s);
 }
 static qa_scene_light read_light(const qa_save_reader *r) {
   qa_scene_light light;
@@ -1112,10 +1336,7 @@ static void decode_frame_value(const qa_save_reader *r, const qa_app_unified_fra
   qa_world_snapshot *snapshot = &out->output.snapshot;
   {
     READ_LIST(field_of(&scene, "entities"), snapshot->scene.entities, snapshot->scene.entity_count, qa_scene_entity);
-    for (size_t i = 0; i < list_count; i++) {
-      qa_save_reader row = item_of(&list_reader, i);
-      read_entity(&row, context, 0, &list[i]);
-    }
+    read_entities(&list_reader, context, list, list_count);
   }
   qa_save_reader player = field_of(r, "player");
   qa_save_reader camera = field_of(r, "nativeCamera");

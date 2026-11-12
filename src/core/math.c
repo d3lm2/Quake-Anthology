@@ -6,6 +6,7 @@
 
 #include "qa/core/numeric.h"
 #include "qa/foundation/binary.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 
 /* Math.fround: round a binary64 to the nearest binary32 value. */
@@ -21,6 +22,9 @@ qa_vec3 qa_math_vec3(double x, double y, double z) {
   qa_vec3 v = {(double)fr(x), (double)fr(y), (double)fr(z)};
   return v;
 }
+/* TS zeroVec3: the one zero vector every module reads. */
+const qa_vec3 qa_zero_vec3 = {0, 0, 0};
+
 qa_vec4 qa_math_vec4(double x, double y, double z, double w) {
   qa_vec4 v = {(double)fr(x), (double)fr(y), (double)fr(z), (double)fr(w)};
   return v;
@@ -196,17 +200,9 @@ qa_vec3 qa_normalize3_stored_or_zero(qa_vec3 value) {
   double length = sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
   return length == 0 ? qa_math_vec3(0, 0, 0) : qa_scale3(value, 1.0 / length);
 }
-/* Math.hypot(x,y,z): scaled hypotenuse, max component factored out. */
-double qa_hypot3(qa_vec3 value) {
-  double ax = fabs(value.x), ay = fabs(value.y), az = fabs(value.z);
-  if (isinf(ax) || isinf(ay) || isinf(az)) return INFINITY;
-  double max = ax;
-  if (ay > max) max = ay;
-  if (az > max) max = az;
-  if (max == 0) return 0;
-  double sx = ax / max, sy = ay / max, sz = az / max;
-  return max * sqrt(sx * sx + sy * sy + sz * sz);
-}
+/* Math.hypot(x,y,z) (qa_js_hypot3: an infinite component wins over NaN, then NaN; a NaN
+ * beside zeros is NaN, not the zero a NaN maximum would miss). */
+double qa_hypot3(qa_vec3 value) { return qa_js_hypot3(value.x, value.y, value.z); }
 double qa_distance3_double(qa_vec3 a, qa_vec3 b) {
   return qa_length3_double(qa_sub3_double(a, b));
 }

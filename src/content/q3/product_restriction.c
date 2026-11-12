@@ -23,7 +23,7 @@ qa_q3_mount_restriction qa_q3_resolve_mount_restriction(qa_q3_product_policy pol
   for(size_t i=0;i<sizeof SCRAMBLED;i++){
     uint8_t expected=(uint8_t)(SCRAMBLED[i]^(seed&255));
     uint8_t actual=i<length?product_id[i]:0;
-    if(expected!=actual) qa_range_error("Invalid product identification");
+    if(expected!=actual) qa_raise("Error",0,0,"%s","Invalid product identification");
     seed=(int32_t)((uint32_t)69069*(uint32_t)seed+1u);
   }
   return forced;

@@ -427,11 +427,14 @@ static void read_server_data(qa_q2_protocol_codec *self,
   qa_q2pro_context *ctx = ctx_of(self);
   qa_q2_sizebuf *m = self->net_message;
   memset(out, 0, sizeof *out);
+  /* MSG_ReadString stops at 2047 characters; the result owns copies (set last, so a raise
+   * part way leaves nothing to free). */
+  char gamedir[2048], levelname[2048];
   out->servercount = (double)qa_q2_msg_read_long(m);
   out->attractloop = qa_q2_msg_read_byte(m) != 0;
-  qa_q2_msg_read_string(m, out->gamedir, sizeof out->gamedir);
+  qa_q2_msg_read_string(m, gamedir, sizeof gamedir);
   out->clientnum = (double)qa_q2_msg_read_short(m);
-  qa_q2_msg_read_string(m, out->levelname, sizeof out->levelname);
+  qa_q2_msg_read_string(m, levelname, sizeof levelname);
   int32_t version = qa_q2_msg_read_word(m);
   ctx->features.revision = version != 0 ? (double)version : ctx->minor_version;
   out->server_state = (double)qa_q2_msg_read_byte(m);
@@ -454,6 +457,7 @@ static void read_server_data(qa_q2_protocol_codec *self,
   out->q2pro_qw_mode = (f & 2) != 0;
   out->has_q2pro_waterjump_hack = true;
   out->q2pro_waterjump_hack = (f & 4) != 0;
+  qa_q2_server_data_result_set_strings(out, gamedir, levelname);
 }
 
 static void read_entity_bits(qa_q2_protocol_codec *self, qa_q2_entity_bits *out) {

@@ -7,6 +7,7 @@
 #define QA_Q1MP_MISSIONPACKS_INTERNAL_H
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -94,6 +95,23 @@ static inline qa_q1_actor *qa_q1mp_entity_walk_next(qa_q1_services *game, qa_q1m
   return NULL;
 }
 static inline void qa_q1mp_entity_walk_free(qa_q1mp_entity_walk *walk) { free(walk->visited); walk->visited = NULL; }
+/* qa_cleanup form of the walk free: the body of a walk runs game callbacks that can raise. */
+static inline void qa_q1mp_entity_walk_cleanup(void *walk) { qa_q1mp_entity_walk_free(walk); }
+/* A TS template literal over parts TS does not bound (player names, map
+ * classnames): an owned string the caller frees. Emitted event strings are
+ * interned by qa_q1_emit, so the copy can be freed right after the emit. */
+static inline char *qa_q1mp_format(const char *format, ...) {
+  va_list args, measure;
+  va_start(args, format);
+  va_copy(measure, args);
+  const int length = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  char *text = length < 0 ? NULL : malloc((size_t)length + 1);
+  if (text == NULL) qa_range_error("Out of memory");
+  (void)vsnprintf(text, (size_t)length + 1, format, args);
+  va_end(args);
+  return text;
+}
 /* game.options.teamplay ?? 0 */
 static inline double qa_q1mp_teamplay(const qa_q1_services *game) {
   return qa_q1_option_teamplay(game);

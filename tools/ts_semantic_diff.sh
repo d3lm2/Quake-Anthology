@@ -10,7 +10,7 @@ BASE=${TS_BASELINE:-53ad56d327a8197994ff01b6852db86e27aa6bf9}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 files=()
 if [[ ${1:-} == --module ]]; then
-  mapfile -t files < <(awk -F'\t' -v m="src/$2/" '($1=="code"||$1=="added"||$1=="types-only") && index($2,m)==1 {print $2}' "$HERE/docs/ts_semantic_drift.tsv")
+  mapfile -t files < <(awk -F'\t' -v m="src/$2/" '($1=="code"||$1=="added"||$1=="types-only") && index($2,m)==1 {print $2}' "${TS_DRIFT_TSV:-$HERE/docs/ts_semantic_drift.tsv}")
 else files=("$@"); fi
 for f in "${files[@]}"; do
   echo "=== $f"

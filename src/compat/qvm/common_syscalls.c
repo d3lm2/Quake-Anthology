@@ -1,6 +1,7 @@
 /* Port of src/compat/qvm/common-syscalls.ts. GPL-2.0-or-later. */
 #include "qa/compat/qvm/common_syscalls.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,7 +31,10 @@ bool qa_qvm_common_syscall(const qa_qvm_host_call *call, qa_qvm_common_services 
   if (trap == (ui ? QA_QVM_UI_IMPORT_UI_PRINT
                   : game ? QA_QVM_GAME_IMPORT_G_PRINT : QA_QVM_CGAME_IMPORT_CG_PRINT)) {
     char *text = read_string(call, 1);
+    qa_cleanup text_guard;
+    qa_cleanup_push(&text_guard, free, text); /* the service may raise */
     services.print(services.ctx, text);
+    qa_cleanup_pop(&text_guard);
     free(text);
     *out = 0;
     return true;
@@ -38,9 +42,12 @@ bool qa_qvm_common_syscall(const qa_qvm_host_call *call, qa_qvm_common_services 
   if (trap == (ui ? QA_QVM_UI_IMPORT_UI_ERROR
                   : game ? QA_QVM_GAME_IMPORT_G_ERROR : QA_QVM_CGAME_IMPORT_CG_ERROR)) {
     char *text = read_string(call, 1);
-    if (strlen(text) > 4095) text[4095] = '\0';
-    /* TS throws CommonError("drop", text); the C raise aborts. */
-    qa_common_error(QA_COMMON_ERROR_DROP, text);
+    /* TS throws CommonError("drop", text.slice(0, 4095)). The copy is released
+     * before the raise, which abandons this frame. */
+    char message[4096];
+    snprintf(message, sizeof message, "%s", text);
+    free(text);
+    qa_common_error(QA_COMMON_ERROR_DROP, message);
   }
   if (trap == (ui ? QA_QVM_UI_IMPORT_UI_MILLISECONDS
                   : game ? QA_QVM_GAME_IMPORT_G_MILLISECONDS
@@ -98,28 +105,40 @@ bool qa_qvm_common_syscall(const qa_qvm_host_call *call, qa_qvm_common_services 
       }
       case QA_QVM_CGAME_IMPORT_CG_SENDCONSOLECOMMAND: {
         char *text = read_string(call, 1);
+        qa_cleanup text_guard;
+        qa_cleanup_push(&text_guard, free, text); /* the service may raise */
         services.commands.append(services.commands.ctx, text);
+        qa_cleanup_pop(&text_guard);
         free(text);
         *out = 0;
         return true;
       }
       case QA_QVM_CGAME_IMPORT_CG_ADDCOMMAND: {
         char *text = read_string(call, 1);
+        qa_cleanup text_guard;
+        qa_cleanup_push(&text_guard, free, text); /* the service may raise */
         services.commands.register_command(services.commands.ctx, text);
+        qa_cleanup_pop(&text_guard);
         free(text);
         *out = 0;
         return true;
       }
       case QA_QVM_CGAME_IMPORT_CG_REMOVECOMMAND: {
         char *text = read_string(call, 1);
+        qa_cleanup text_guard;
+        qa_cleanup_push(&text_guard, free, text); /* the service may raise */
         services.commands.remove_command(services.commands.ctx, text);
+        qa_cleanup_pop(&text_guard);
         free(text);
         *out = 0;
         return true;
       }
       case QA_QVM_CGAME_IMPORT_CG_SENDCLIENTCOMMAND: {
         char *text = read_string(call, 1);
+        qa_cleanup text_guard;
+        qa_cleanup_push(&text_guard, free, text); /* the service may raise */
         services.commands.reliable(services.commands.ctx, text);
+        qa_cleanup_pop(&text_guard);
         free(text);
         *out = 0;
         return true;
@@ -141,7 +160,9 @@ bool qa_qvm_common_syscall(const qa_qvm_host_call *call, qa_qvm_common_services 
       for (int i = 0; i < 9; i++)
         qa_qvm_writable_view_set_int32(&output, i * 4, qa_int32(values[i]), true);
     }
-    *out = qa_int32(result);
+    /* TS returns the service's number as it is: one that is not an int32 word
+     * fails the interpreter's host-value check instead of wrapping. */
+    *out = qa_qvm_host_word(result);
     return true;
   }
   if (trap != (game ? QA_QVM_GAME_IMPORT_G_SEND_CONSOLE_COMMAND
@@ -155,7 +176,10 @@ bool qa_qvm_common_syscall(const qa_qvm_host_call *call, qa_qvm_common_services 
         services.commands.execute_now(services.commands.ctx, NULL);
       } else {
         char *text = read_string(call, 2);
+        qa_cleanup text_guard;
+        qa_cleanup_push(&text_guard, free, text); /* the service may raise */
         services.commands.execute_now(services.commands.ctx, text);
+        qa_cleanup_pop(&text_guard);
         free(text);
       }
       *out = 0;
@@ -163,14 +187,20 @@ bool qa_qvm_common_syscall(const qa_qvm_host_call *call, qa_qvm_common_services 
     }
     case 1: {
       char *text = read_string(call, 2);
+      qa_cleanup text_guard;
+      qa_cleanup_push(&text_guard, free, text); /* the service may raise */
       services.commands.insert(services.commands.ctx, text);
+      qa_cleanup_pop(&text_guard);
       free(text);
       *out = 0;
       return true;
     }
     case 2: {
       char *text = read_string(call, 2);
+      qa_cleanup text_guard;
+      qa_cleanup_push(&text_guard, free, text); /* the service may raise */
       services.commands.append(services.commands.ctx, text);
+      qa_cleanup_pop(&text_guard);
       free(text);
       *out = 0;
       return true;

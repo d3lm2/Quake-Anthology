@@ -22,9 +22,11 @@ static char *xstrdup(const char *text) {
   strcpy(copy, text);
   return copy;
 }
+static void free_state(void *resource) { cxx_state *state = resource; free(state->name); free(state); }
 static cxx_state *new_state(qa_system_v_service_host *host) {
   cxx_state *state = xmalloc(sizeof *state);
   state->host = host; state->name = NULL;
+  qa_system_v_own(host, state, free_state);
   return state;
 }
 static void reg(qa_system_v_service_host *host, const char *library, const char *name,

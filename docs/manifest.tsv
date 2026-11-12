@@ -1,7 +1,7 @@
 ts_source	c_source	header	status
 src/app/bootstrap/addon-library.ts	src/app/bootstrap/addon_library.c	include/qa/app/bootstrap/addon_library.h	ported
 src/app/bootstrap/application-tools.ts	src/app/bootstrap/application_tools.c	include/qa/app/bootstrap/application_tools.h	ported
-src/app/bootstrap/application.ts	src/app/bootstrap/application.c	include/qa/app/bootstrap/application.h	ported
+src/app/bootstrap/application.ts	src/app/bootstrap/application_[abcdgops]*.c src/app/bootstrap/application_travel.c src/app/bootstrap/application_internal.h	include/qa/app/bootstrap/application_class.h	ported
 src/app/bootstrap/assets.ts	src/app/bootstrap/assets.c	include/qa/app/bootstrap/assets.h	ported
 src/app/bootstrap/audio/commands.ts	src/app/bootstrap/audio/commands.c	include/qa/app/bootstrap/audio/commands.h	ported
 src/app/bootstrap/audio/menu.ts	src/app/bootstrap/audio/menu.c	include/qa/app/bootstrap/audio/menu.h	ported
@@ -34,6 +34,7 @@ src/app/bootstrap/component-media.ts	src/app/bootstrap/component_media.c	include
 src/app/bootstrap/component-scene.ts	src/app/bootstrap/component_scene.c	include/qa/app/bootstrap/component_scene.h	ported
 src/app/bootstrap/config-scripts.ts	src/app/bootstrap/config_scripts.c	include/qa/app/bootstrap/config_scripts.h	ported
 src/app/bootstrap/configuration.ts	src/app/bootstrap/configuration.c	include/qa/app/bootstrap/configuration.h	ported
+src/app/bootstrap/console-log.ts	src/app/bootstrap/console_log.c	include/qa/app/bootstrap/console_log.h	ported
 src/app/bootstrap/console.ts	src/app/bootstrap/console.c	include/qa/app/bootstrap/console.h	ported
 src/app/bootstrap/content.ts	src/app/bootstrap/content.c	include/qa/app/bootstrap/content.h	ported
 src/app/bootstrap/controller-settings.ts	src/app/bootstrap/controller_settings.c	include/qa/app/bootstrap/controller_settings.h	ported
@@ -77,7 +78,9 @@ src/app/bootstrap/mod-presentations.ts	src/app/bootstrap/mod_presentations.c	inc
 src/app/bootstrap/mod-presentation.ts	src/app/bootstrap/mod_presentation.c	include/qa/app/bootstrap/mod_presentation.h	ported
 src/app/bootstrap/mod-selection.ts	src/app/bootstrap/mod_selection.c	include/qa/app/bootstrap/mod_selection.h	ported
 src/app/bootstrap/native-held-weapon.ts	src/app/bootstrap/native_held_weapon.c	include/qa/app/bootstrap/native_held_weapon.h	ported
+src/app/bootstrap/native-migration.ts	src/app/bootstrap/native_migration.c	include/qa/app/bootstrap/native_migration.h	ported
 src/app/bootstrap/native-q2-client.ts	src/app/bootstrap/native_q2_client.c	include/qa/app/bootstrap/native_q2_client.h	ported
+src/app/bootstrap/native-settings.ts	src/app/bootstrap/native_settings.c	include/qa/app/bootstrap/native_settings.h	ported
 src/app/bootstrap/network/client-download-policy.ts	src/app/bootstrap/network/client_download_policy.c	include/qa/app/bootstrap/network/client_download_policy.h	ported
 src/app/bootstrap/network/gtv-source.ts	src/app/bootstrap/network/gtv_source.c	include/qa/app/bootstrap/network/gtv_source.h	ported
 src/app/bootstrap/network/index.ts	-	-	removed-in-ts
@@ -161,6 +164,7 @@ src/app/bootstrap/q2-localization.ts	src/app/bootstrap/q2_localization.c	include
 src/app/bootstrap/q2-match-reports.ts	src/app/bootstrap/q2_match_reports.c	include/qa/app/bootstrap/q2_match_reports.h	ported
 src/app/bootstrap/q2-match-ui.ts	src/app/bootstrap/q2_match_ui.c	include/qa/app/bootstrap/q2_match_ui.h	ported
 src/app/bootstrap/q2-native-hud.ts	src/app/bootstrap/q2_native_hud.c	include/qa/app/bootstrap/q2_native_hud.h	ported
+src/app/bootstrap/q2-native-saves.ts	src/app/bootstrap/q2_native_saves.c	include/qa/app/bootstrap/q2_native_saves.h	ported
 src/app/bootstrap/q2-travel.ts	src/app/bootstrap/q2_travel.c	include/qa/app/bootstrap/q2_travel.h	ported
 src/app/bootstrap/q3-client/assets.ts	src/app/bootstrap/q3_client/assets.c	include/qa/app/bootstrap/q3_client/assets.h	ported
 src/app/bootstrap/q3-client/cinematics.ts	src/app/bootstrap/q3_client/cinematics.c	include/qa/app/bootstrap/q3_client/cinematics.h	ported
@@ -188,7 +192,7 @@ src/app/bootstrap/q3-rankings.ts	src/app/bootstrap/q3_rankings.c	include/qa/app/
 src/app/bootstrap/q3-selected-weapon.ts	src/app/bootstrap/q3_selected_weapon.c	include/qa/app/bootstrap/q3_selected_weapon.h	ported
 src/app/bootstrap/qvm-grapple-selection.ts	src/app/bootstrap/qvm_grapple_selection.c	include/qa/app/bootstrap/qvm_grapple_selection.h	ported
 src/app/bootstrap/README.md	-	-	non-ts
-src/app/bootstrap/remote-application.ts	src/app/bootstrap/remote_application.c	include/qa/app/bootstrap/remote_application.h	ported
+src/app/bootstrap/remote-application.ts	src/app/bootstrap/remote_application_*.c src/app/bootstrap/remote_application_internal.h	include/qa/app/bootstrap/remote_application_class.h	ported
 src/app/bootstrap/remote-components.ts	src/app/bootstrap/remote_components.c	include/qa/app/bootstrap/remote_components.h	ported
 src/app/bootstrap/remote-seat-identities.ts	src/app/bootstrap/remote_seat_identities.c	include/qa/app/bootstrap/remote_seat_identities.h	ported
 src/app/bootstrap/remote-seat-pump.ts	src/app/bootstrap/remote_seat_pump.c	include/qa/app/bootstrap/remote_seat_pump.h	ported
@@ -203,6 +207,7 @@ src/app/bootstrap/rerelease-presentation.ts	src/app/bootstrap/rerelease_presenta
 src/app/bootstrap/save-requests.ts	src/app/bootstrap/save_requests.c	include/qa/app/bootstrap/save_requests.h	ported
 src/app/bootstrap/seat-factory.ts	src/app/bootstrap/presentation.c	include/qa/app/bootstrap/presentation.h	ported
 src/app/bootstrap/seat-hud-state.ts	src/app/bootstrap/seat_hud_state.c	include/qa/app/bootstrap/seat_hud_state.h	ported
+src/app/bootstrap/seat-profile.ts	src/app/bootstrap/seat_profile.c	include/qa/app/bootstrap/seat_profile.h	ported
 src/app/bootstrap/selected-q3-presentation.ts	src/app/bootstrap/selected_q3_presentation.c	include/qa/app/bootstrap/selected_q3_presentation.h	ported
 src/app/bootstrap/server-administration.ts	src/app/bootstrap/server_administration.c	include/qa/app/bootstrap/server_administration.h	ported
 src/app/bootstrap/server-browser-addresses.ts	src/app/bootstrap/server_browser_addresses.c	include/qa/app/bootstrap/server_browser_addresses.h	ported
@@ -242,26 +247,26 @@ src/app/bootstrap/simulation/classic-guest-player.ts	src/app/bootstrap/simulatio
 src/app/bootstrap/simulation/classic-guest-services.ts	src/app/bootstrap/simulation/classic_guest_services.c	include/qa/app/bootstrap/simulation/classic_guest_services.h	ported
 src/app/bootstrap/simulation/classic-guest-source.ts	src/app/bootstrap/simulation/classic_guest_source.c	include/qa/app/bootstrap/simulation/classic_guest_source.h	ported
 src/app/bootstrap/simulation/classic-guest-world.ts	src/app/bootstrap/simulation/classic_guest_world.c	include/qa/app/bootstrap/simulation/classic_guest_world.h	ported
-src/app/bootstrap/simulation/diagnostics.ts	src/app/bootstrap/simulation/shared_simulation_worlds.c	src/app/bootstrap/simulation/shared_simulation_internal.h	partial
+src/app/bootstrap/simulation/diagnostics.ts	src/app/bootstrap/simulation/diagnostics.c	include/qa/app/bootstrap/simulation/diagnostics.h	ported
 src/app/bootstrap/simulation/dropped-pickups.ts	src/app/bootstrap/simulation/dropped_pickups.c	include/qa/app/bootstrap/simulation/dropped_pickups.h	ported
 src/app/bootstrap/simulation/equipment-checkpoint.ts	src/app/bootstrap/simulation/equipment_checkpoint.c	include/qa/app/bootstrap/simulation/equipment_checkpoint.h	ported
 src/app/bootstrap/simulation/equipment-runtime.ts	src/app/bootstrap/simulation/equipment_runtime.c	include/qa/app/bootstrap/simulation/equipment_runtime.h	ported
 src/app/bootstrap/simulation/events.ts	src/app/bootstrap/simulation/events.c	include/qa/app/bootstrap/simulation/events.h	ported
-src/app/bootstrap/simulation/foreign-deathball-rules.ts	src/app/bootstrap/simulation/foreign_deathball_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	partial
-src/app/bootstrap/simulation/foreign-horde-rules.ts	src/app/bootstrap/simulation/foreign_horde_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	partial
-src/app/bootstrap/simulation/foreign-lmctf-rules.ts	src/app/bootstrap/simulation/foreign_lmctf_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	partial
-src/app/bootstrap/simulation/foreign-match-host.ts	src/app/bootstrap/simulation/foreign_match_host.c	src/app/bootstrap/simulation/foreign_match_host.h	partial
-src/app/bootstrap/simulation/foreign-match-rules.ts	src/app/bootstrap/simulation/shared_simulation_worlds.c	src/app/bootstrap/simulation/shared_simulation_internal.h	partial
+src/app/bootstrap/simulation/foreign-deathball-rules.ts	src/app/bootstrap/simulation/foreign_deathball_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	ported
+src/app/bootstrap/simulation/foreign-horde-rules.ts	src/app/bootstrap/simulation/foreign_horde_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	ported
+src/app/bootstrap/simulation/foreign-lmctf-rules.ts	src/app/bootstrap/simulation/foreign_lmctf_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	ported
+src/app/bootstrap/simulation/foreign-match-host.ts	src/app/bootstrap/simulation/foreign_match_host.c	src/app/bootstrap/simulation/foreign_match_host.h	ported
+src/app/bootstrap/simulation/foreign-match-rules.ts	src/app/bootstrap/simulation/foreign_match_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	ported
 src/app/bootstrap/simulation/foreign-q1-world.ts	src/app/bootstrap/simulation/foreign_q1_world.c	include/qa/app/bootstrap/simulation/foreign_q1_world.h	ported
 src/app/bootstrap/simulation/foreign-q2-world.ts	src/app/bootstrap/simulation/foreign_q2_world.c	include/qa/app/bootstrap/simulation/foreign_q2_world.h	ported
-src/app/bootstrap/simulation/foreign-tag-rules.ts	src/app/bootstrap/simulation/foreign_tag_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	partial
+src/app/bootstrap/simulation/foreign-tag-rules.ts	src/app/bootstrap/simulation/foreign_tag_rules.c	src/app/bootstrap/simulation/foreign_match_host.h	ported
 src/app/bootstrap/simulation/grapple-checkpoint.ts	src/app/bootstrap/simulation/grapple_checkpoint.c	include/qa/app/bootstrap/simulation/grapple_checkpoint.h	ported
 src/app/bootstrap/simulation/grapple-runtime.ts	src/app/bootstrap/simulation/grapple_runtime.c	include/qa/app/bootstrap/simulation/grapple_runtime.h	ported
 src/app/bootstrap/simulation/guest-monsters.ts	src/app/bootstrap/simulation/guest_monsters.c	include/qa/app/bootstrap/simulation/guest_monsters.h	ported
 src/app/bootstrap/simulation/index.ts	src/app/bootstrap/simulation/index.c	include/qa/app/bootstrap/simulation/index.h	ported
 src/app/bootstrap/simulation/mod-callbacks.ts	src/app/bootstrap/simulation/mod_callbacks.c	include/qa/app/bootstrap/simulation/mod_callbacks.h	ported
 src/app/bootstrap/simulation/mod-client-checkpoint.ts	src/app/bootstrap/simulation/mod_client_checkpoint.c	include/qa/app/bootstrap/simulation/mod_client_checkpoint.h	ported
-src/app/bootstrap/simulation/monster-admission.ts	src/app/bootstrap/simulation/shared_simulation_worlds.c	src/app/bootstrap/simulation/shared_simulation_internal.h	partial
+src/app/bootstrap/simulation/monster-admission.ts	src/app/bootstrap/simulation/monster_admission.c	include/qa/app/bootstrap/simulation/monster_admission.h	ported
 src/app/bootstrap/simulation/monster-checkpoint.ts	src/app/bootstrap/simulation/monster_checkpoint.c	include/qa/app/bootstrap/simulation/monster_checkpoint.h	ported
 src/app/bootstrap/simulation/monster-navigation.ts	src/app/bootstrap/simulation/monster_navigation.c	include/qa/app/bootstrap/simulation/monster_navigation.h	ported
 src/app/bootstrap/simulation/monster-placement.ts	src/app/bootstrap/simulation/monster_placement.c	include/qa/app/bootstrap/simulation/monster_placement.h	ported
@@ -277,12 +282,13 @@ src/app/bootstrap/simulation/native-pmove-contacts.ts	src/app/bootstrap/simulati
 src/app/bootstrap/simulation/native-primary-weapons.ts	src/app/bootstrap/simulation/native_primary_weapons.c	include/qa/app/bootstrap/simulation/native_primary_weapons.h	ported
 src/app/bootstrap/simulation/native-q1-pusher.ts	src/app/bootstrap/simulation/native_q1_pusher.c	include/qa/app/bootstrap/simulation/native_q1_pusher.h	ported
 src/app/bootstrap/simulation/native-q2-map.ts	src/app/bootstrap/simulation/native_q2_map.c	include/qa/app/bootstrap/simulation/native_q2_map.h	ported
+src/app/bootstrap/simulation/native-q2-rerelease-pak.ts	src/app/bootstrap/simulation/native_q2_rerelease_pak.c	include/qa/app/bootstrap/simulation/native_q2_rerelease_pak.h	ported
 src/app/bootstrap/simulation/native-q2-rerelease-save.ts	src/app/bootstrap/simulation/native_q2_rerelease_save.c	include/qa/app/bootstrap/simulation/native_q2_rerelease_save.h	ported
 src/app/bootstrap/simulation/native-q2-travel.ts	src/app/bootstrap/simulation/native_q2_travel.c	include/qa/app/bootstrap/simulation/native_q2_travel.h	ported
 src/app/bootstrap/simulation/navigation.ts	src/app/bootstrap/simulation/navigation.c	include/qa/app/bootstrap/simulation/navigation.h	ported
 src/app/bootstrap/simulation/network-q1-quakec.ts	src/app/bootstrap/simulation/network_q1_quakec.c	include/qa/app/bootstrap/simulation/network_q1_quakec.h	ported
 src/app/bootstrap/simulation/network-q1.ts	src/app/bootstrap/simulation/network_q1.c	include/qa/app/bootstrap/simulation/network_q1.h	ported
-src/app/bootstrap/simulation/network-q2-guest-core.ts	src/app/bootstrap/simulation/network_q2_guest.c	include/qa/app/bootstrap/simulation/network_q2_guest.h	partial
+src/app/bootstrap/simulation/network-q2-guest-core.ts	src/app/bootstrap/simulation/network_q2_guest_core.c	include/qa/app/bootstrap/simulation/network_q2_guest_core.h	ported
 src/app/bootstrap/simulation/network-q2-guest.ts	src/app/bootstrap/simulation/network_q2_guest.c	include/qa/app/bootstrap/simulation/network_q2_guest.h	ported
 src/app/bootstrap/simulation/network-q2-rerelease-native.ts	src/app/bootstrap/simulation/network_q2_rerelease_native.c	include/qa/app/bootstrap/simulation/network_q2_rerelease_native.h	ported
 src/app/bootstrap/simulation/network-q3.ts	src/app/bootstrap/simulation/network_q3.c	include/qa/app/bootstrap/simulation/network_q3.h	ported
@@ -341,7 +347,7 @@ src/app/bootstrap/simulation/quakec-player-ui.ts	src/app/bootstrap/simulation/qu
 src/app/bootstrap/simulation/quakec-source.ts	src/app/bootstrap/simulation/quakec_source.c	include/qa/app/bootstrap/simulation/quakec_source.h	ported
 src/app/bootstrap/simulation/quakec-weapon-behavior.ts	src/app/bootstrap/simulation/quakec_weapon_behavior.c	include/qa/app/bootstrap/simulation/quakec_weapon_behavior.h	ported
 src/app/bootstrap/simulation/quakeworld-cvars.ts	src/app/bootstrap/simulation/quakeworld_cvars.c	include/qa/app/bootstrap/simulation/quakeworld_cvars.h	ported
-src/app/bootstrap/simulation/qvm-component-state.ts	src/app/bootstrap/simulation/qvm_grapple_source.c	include/qa/app/bootstrap/simulation/qvm_grapple_source.h	partial
+src/app/bootstrap/simulation/qvm-component-state.ts	src/app/bootstrap/simulation/qvm_component_state.c	include/qa/app/bootstrap/simulation/qvm_component_state.h	ported
 src/app/bootstrap/simulation/qvm-grapple-source.ts	src/app/bootstrap/simulation/qvm_grapple_source.c	include/qa/app/bootstrap/simulation/qvm_grapple_source.h	ported
 src/app/bootstrap/simulation/qvm-mod.ts	src/app/bootstrap/simulation/qvm_mod.c	include/qa/app/bootstrap/simulation/qvm_mod.h	ported
 src/app/bootstrap/simulation/qvm-weapon-behavior.ts	src/app/bootstrap/simulation/qvm_weapon_behavior.c	include/qa/app/bootstrap/simulation/qvm_weapon_behavior.h	ported
@@ -360,7 +366,6 @@ src/app/bootstrap/simulation/source-hosts.ts	src/app/bootstrap/simulation/source
 src/app/bootstrap/simulation/source-strategy.ts	src/app/bootstrap/simulation/source_strategy.c	src/app/bootstrap/simulation/source_strategy.h	partial
 src/app/bootstrap/simulation/source-transition.ts	src/app/bootstrap/simulation/source_transition.c	include/qa/app/bootstrap/simulation/source_transition.h	ported
 src/app/bootstrap/simulation/types.ts	src/app/bootstrap/simulation/types.c	include/qa/app/bootstrap/simulation/types.h	ported
-src/app/bootstrap/simulation/vec.ts	src/app/bootstrap/simulation/shared_simulation_support.c	src/app/bootstrap/simulation/shared_simulation_internal.h	ported
 src/app/bootstrap/simulation/weapon-behavior-runtime.ts	src/app/bootstrap/simulation/weapon_behavior_runtime.c	include/qa/app/bootstrap/simulation/weapon_behavior_runtime.h	ported
 src/app/bootstrap/simulation/weapon-slot-checkpoint.ts	src/app/bootstrap/simulation/weapon_slot_checkpoint.c	include/qa/app/bootstrap/simulation/weapon_slot_checkpoint.h	ported
 src/app/bootstrap/simulation/weapon-slot-projection.ts	src/app/bootstrap/simulation/weapon_slot_projection.c	include/qa/app/bootstrap/simulation/weapon_slot_projection.h	ported
@@ -376,7 +381,7 @@ src/app/bootstrap/startup-saves.ts	src/app/bootstrap/startup_saves.c	include/qa/
 src/app/bootstrap/startup-selection.ts	src/app/bootstrap/startup_selection.c	include/qa/app/bootstrap/startup_selection.h	ported
 src/app/bootstrap/startup-source.ts	src/app/bootstrap/startup_source.c	include/qa/app/bootstrap/startup_source.h	ported
 src/app/bootstrap/startup-timing.ts	src/app/bootstrap/startup_timing.c	include/qa/app/bootstrap/startup_timing.h	ported
-src/app/bootstrap/startup.ts	src/app/bootstrap/startup.c	include/qa/app/bootstrap/startup.h	ported: StartupApplication in startup_application*.c (openGraphics/graphics.draw in startup_application_graphics.c); startup.c remains the temporary concrete-host shell
+src/app/bootstrap/startup.ts	src/app/bootstrap/startup_application*.c src/app/bootstrap/startup_application_internal.h	include/qa/app/bootstrap/startup_application.h	ported: StartupApplication in startup_application*.c (openGraphics/graphics.draw in startup_application_graphics.c)
 src/app/bootstrap/team-arena-demo.ts	src/app/bootstrap/team_arena_demo.c	include/qa/app/bootstrap/team_arena_demo.h	ported
 src/app/bootstrap/team-arena-overrides.ts	src/app/bootstrap/team_arena_overrides.c	include/qa/app/bootstrap/team_arena_overrides.h	ported
 src/app/bootstrap/team-arena-results.ts	src/app/bootstrap/team_arena_results.c	include/qa/app/bootstrap/team_arena_results.h	ported
@@ -490,7 +495,7 @@ src/bots/navigation/aas-write.ts	src/bots/navigation/aas_write.c	include/qa/bots
 src/bots/navigation/construct.ts	src/bots/navigation/construct.c	include/qa/bots/navigation/construct.h	ported
 src/bots/navigation/entity-binding.ts	src/bots/navigation/entity_binding.c	include/qa/bots/navigation/entity_binding.h	ported
 src/bots/navigation/estimate-aas.ts	src/bots/navigation/estimate_aas.c	include/qa/bots/navigation/estimate_aas.h	ported
-src/bots/navigation/estimate-store.ts	src/bots/navigation/estimates.c	include/qa/bots/navigation/estimates.h	partial
+src/bots/navigation/estimate-store.ts	src/bots/navigation/estimate_store.c	include/qa/bots/navigation/estimate_store.h	ported
 src/bots/navigation/estimates.ts	src/bots/navigation/estimates.c	include/qa/bots/navigation/estimates.h	ported
 src/bots/navigation/graph.ts	src/bots/navigation/graph.c	include/qa/bots/navigation/graph.h	ported
 src/bots/navigation/heap.ts	src/bots/navigation/heap.c	include/qa/bots/navigation/heap.h	ported
@@ -1511,6 +1516,7 @@ src/core/cvars/index.ts	src/core/cvars/index.c	include/qa/core/cvars/index.h	por
 src/core/cvars/info.ts	src/core/cvars/info.c	include/qa/core/cvars/info.h	ported
 src/core/cvars/mirror.ts	src/core/cvars/mirror.c	include/qa/core/cvars/mirror.h	ported
 src/core/cvars/numbers.ts	src/core/cvars/numbers.c	include/qa/core/cvars/numbers.h	ported
+src/core/cvars/setting-declarations.ts	src/core/cvars/setting_declarations.c	include/qa/core/cvars/setting_declarations.h	ported
 src/core/files/atomic.ts	src/settings/config.c	include/qa/settings/config.h	ported
 src/core/files/contained.ts	src/platform/files/contained.c	include/qa/platform/files/contained.h	ported
 src/core/files/writable.ts	src/platform/files/writable.c	include/qa/platform/files/writable.h	ported
@@ -1686,7 +1692,7 @@ src/llm/responses.ts	src/llm/responses.c	include/qa/llm/responses.h	ported
 src/llm/session.ts	src/llm/session.c	include/qa/llm/session.h	ported
 src/llm/settings.ts	src/llm/settings.c	include/qa/llm/settings.h	ported
 src/llm/sse.ts	src/llm/sse.c	include/qa/llm/sse.h	ported
-src/main.ts	src/main.c	include/qa/main.h	ported: graphical run/menu open StartupApplication (qa_startup_application_open, run, close) as TS main; dedicated keeps the concrete Application host
+src/main.ts	src/main.c src/main_redaction.c	include/qa/main_redaction.h	ported: graphical run/menu open StartupApplication (qa_startup_application_open, run, close) as TS main; dedicated keeps the concrete Application host
 src/materials/cinematic.ts	src/materials/cinematic.c	include/qa/materials/cinematic.h	ported
 src/materials/color.ts	src/materials/color.c	include/qa/materials/color.h	ported
 src/materials/compile.ts	src/materials/compile.c	include/qa/materials/compile.h	ported
@@ -1917,6 +1923,9 @@ src/persistence/q2-movers.ts	src/persistence/q2_movers.c	include/qa/persistence/
 src/persistence/q2-players.ts	src/persistence/q2_players.c	include/qa/persistence/q2_players.h	ported
 src/persistence/q2-rerelease-state.ts	src/persistence/q2_rerelease_state.c	include/qa/persistence/q2_rerelease_state.h	ported
 src/persistence/q2-rerelease.ts	src/persistence/q2_rerelease.c	include/qa/persistence/q2_rerelease.h	ported
+src/persistence/q2-save-folder.ts	src/persistence/q2_save_folder.c	include/qa/persistence/q2_save_folder.h	ported
+src/persistence/q2-save-store.ts	src/persistence/q2_save_store.c	include/qa/persistence/q2_save_store.h	ported
+src/persistence/q2-selection.ts	src/persistence/q2_selection.c	include/qa/persistence/q2_selection.h	ported
 src/persistence/q2-typescript.ts	src/persistence/q2_typescript.c	include/qa/persistence/q2_typescript.h	ported
 src/persistence/q2-weapons.ts	src/persistence/q2_weapons.c	include/qa/persistence/q2_weapons.h	ported
 src/persistence/q3.ts	-	-	removed-in-ts
@@ -2031,6 +2040,9 @@ src/render/worker-transport.ts	src/render/worker_transport.c	include/qa/render/w
 src/render/worker.ts	src/render/worker.c	include/qa/render/worker.h	ported
 src/settings/config.ts	src/settings/config.c	include/qa/settings/config.h	ported
 src/settings/index.ts	-	-	removed-in-ts
+src/settings/layers.ts	src/settings/layers.c	include/qa/settings/layers.h	ported
+src/settings/native-config.ts	src/settings/native_config.c	include/qa/settings/native_config.h	ported
+src/settings/native-saves.ts	src/settings/native_saves.c	include/qa/settings/native_saves.h	ported
 src/settings/restart.ts	src/settings/restart.c	include/qa/settings/restart.h	ported
 src/settings/server/common.ts	src/settings/server/common.c	include/qa/settings/server/common.h	ported
 src/settings/server/cvars.ts	src/settings/server/cvars.c	include/qa/settings/server/cvars.h	ported
@@ -2046,6 +2058,7 @@ src/settings/server/q3.ts	src/settings/server/q3.c	include/qa/settings/server/q3
 src/settings/server/rotation.ts	src/settings/server/rotation.c	include/qa/settings/server/rotation.h	ported
 src/settings/server/selection.ts	src/settings/server/selection.c	include/qa/settings/server/selection.h	ported
 src/settings/server/types.ts	src/settings/server/types.c	include/qa/settings/server/types.h	ported
+src/settings/setting-spellings.ts	src/settings/setting_spellings.c	include/qa/settings/setting_spellings.h	ported
 src/settings/setting-spec.ts	-	include/qa/settings/setting_spec.h	ported
 src/text/atlas.ts	src/text/atlas.c	include/qa/text/atlas.h	ported
 src/text/captions.ts	src/text/captions.c	include/qa/text/captions.h	ported
@@ -2063,7 +2076,7 @@ src/text/q3-font.ts	src/text/q3_font.c	include/qa/text/q3_font.h	ported
 src/text/truetype.ts	src/text/truetype.c	include/qa/text/truetype.h	ported
 src/text/ui.ts	src/text/ui.c	include/qa/text/ui.h	ported
 src/text/world.ts	src/text/world.c	include/qa/text/world.h	ported
-src/types/png.d.ts	src/types/png.d.c	include/qa/types/png.d.h	header-only
+src/types/png.d.ts	-	-	removed-in-ts
 src/ui/common/accessibility.ts	src/ui/common/accessibility.c	include/qa/ui/common/accessibility.h	ported
 src/ui/common/art-manifest.ts	src/ui/common/art_manifest.c	include/qa/ui/common/art_manifest.h	ported
 src/ui/common/assets.ts	src/ui/common/assets.c	include/qa/ui/common/assets.h	ported

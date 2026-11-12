@@ -8,6 +8,19 @@
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 
+/* One binding's read and choices results. A settings page builds the three
+ * controls together and each keeps its selected id and choices until the next
+ * build, so the bindings must not share storage. */
+typedef struct routing_pool {
+  qa_ui_choice *choices;
+  size_t choice_capacity;
+  char **strings;
+  size_t string_count, string_capacity;
+  char read_buffer[1024];
+} routing_pool;
+
+enum { POOL_KEYBOARD, POOL_PLAYER, POOL_DEVICE };
+
 typedef struct routing_state {
   qa_input_router *(*router)(void *);
   void *router_ctx;
@@ -15,15 +28,11 @@ typedef struct routing_state {
   void *devices_ctx;
   int64_t selected_seat;
   qa_ui_setting_binding items[3];
-  qa_ui_choice *choices;
-  size_t choice_capacity;
-  char **strings;
-  size_t string_count, string_capacity;
-  char read_buffer[1024];
+  routing_pool pools[3];
 } routing_state;
 
 static void oom(void) { qa_range_error("Out of memory"); }
-static char *pool(routing_state *s, const char *text) {
+static char *pool(routing_pool *s, const char *text) {
   if (s->string_count == s->string_capacity) {
     size_t cap = s->string_capacity == 0 ? 16 : s->string_capacity * 2;
     char **next = realloc(s->strings, cap * sizeof *next);
@@ -36,11 +45,11 @@ static char *pool(routing_state *s, const char *text) {
   s->strings[s->string_count++] = copy;
   return copy;
 }
-static void pool_clear(routing_state *s) {
+static void pool_clear(routing_pool *s) {
   for (size_t i = 0; i < s->string_count; i++) free(s->strings[i]);
   s->string_count = 0;
 }
-static qa_ui_choice *choice_pool(routing_state *s, size_t count) {
+static qa_ui_choice *choice_pool(routing_pool *s, size_t count) {
   if (s->choice_capacity < count) {
     qa_ui_choice *next = realloc(s->choices, count * sizeof *next);
     if (next == NULL) oom();
@@ -96,11 +105,12 @@ static qa_seat_input *selected_input(routing_state *s) {
 }
 static const qa_ui_choice *seat_choices(routing_state *s, bool with_none,
                                         size_t *out_count) {
-  pool_clear(s);
+  routing_pool *p = &s->pools[with_none ? POOL_KEYBOARD : POOL_PLAYER];
+  pool_clear(p);
   size_t count = 0;
   qa_seat_input **inputs =
       qa_input_router_inputs(s->router(s->router_ctx), &count);
-  qa_ui_choice *pool_items = choice_pool(s, count + 1);
+  qa_ui_choice *pool_items = choice_pool(p, count + 1);
   size_t at = 0;
   for (size_t i = 0; i < count; i++) {
     const char * id2;
@@ -115,7 +125,7 @@ static const qa_ui_choice *seat_choices(routing_state *s, bool with_none,
     if (plus == NULL) oom();
     snprintf(label, sizeof label, "Player %s", plus);
     free(plus);
-    pool_items[at++] = (id2 = pool(s, id), label2 = pool(s, label), (qa_ui_choice){ id2, label2 });
+    pool_items[at++] = (id2 = pool(p, id), label2 = pool(p, label), (qa_ui_choice){ id2, label2 });
   }
   if (with_none) pool_items[at++] = (qa_ui_choice){ "none", "None" };
   *out_count = at;
@@ -130,9 +140,9 @@ static const char *keyboard_read(void *v) {
     return "none";
   char *num = qa_input_js_number((double)seat.index);
   if (num == NULL) oom();
-  snprintf(s->read_buffer, sizeof s->read_buffer, "%s", num);
+  snprintf(s->pools[POOL_KEYBOARD].read_buffer, sizeof s->pools[POOL_KEYBOARD].read_buffer, "%s", num);
   free(num);
-  return s->read_buffer;
+  return s->pools[POOL_KEYBOARD].read_buffer;
 }
 static const qa_ui_choice *keyboard_choices(void *v, size_t *out_count) {
   return seat_choices(v, true, out_count);
@@ -149,10 +159,10 @@ static void keyboard_write(void *v, const char *value) {
     if (num == NULL) oom();
     bool equal = strcmp(num, value) == 0;
     free(num);
-    if (equal) found = inputs[i];
+    if (equal) { found = inputs[i]; break; }
   }
   if (strcmp(value, "none") != 0 && found == NULL)
-    qa_range_error("Unknown keyboard player");
+    qa_raise("Error", 0, 0, "Unknown keyboard player");
   qa_seat_id none;
   memset(&none, 0, sizeof none);
   qa_input_router_set_keyboard_seat(
@@ -173,9 +183,9 @@ static const char *player_read(void *v) {
   char *num = qa_input_js_number(
       input != NULL ? (double)qa_seat_input_seat(input).index : 0);
   if (num == NULL) oom();
-  snprintf(s->read_buffer, sizeof s->read_buffer, "%s", num);
+  snprintf(s->pools[POOL_PLAYER].read_buffer, sizeof s->pools[POOL_PLAYER].read_buffer, "%s", num);
   free(num);
-  return s->read_buffer;
+  return s->pools[POOL_PLAYER].read_buffer;
 }
 static const qa_ui_choice *player_choices(void *v, size_t *out_count) {
   return seat_choices(v, false, out_count);
@@ -196,7 +206,7 @@ static void player_write(void *v, const char *value) {
       return;
     }
   }
-  qa_range_error("Unknown controller player");
+  qa_raise("Error", 0, 0, "Unknown controller player");
 }
 
 static bool device_enabled(void *v) {
@@ -210,16 +220,18 @@ static const char *device_read(void *v) {
   qa_seat_id seat = qa_seat_input_seat(input);
   qa_controller_selection selection = qa_input_router_controller_selection(
       router2, seat);
-  selection_key(selection, s->read_buffer, sizeof s->read_buffer);
-  return s->read_buffer;
+  routing_pool *p = &s->pools[POOL_DEVICE];
+  selection_key(selection, p->read_buffer, sizeof p->read_buffer);
+  return p->read_buffer;
 }
 static const qa_ui_choice *device_choices(void *v, size_t *out_count) {
   routing_state *s = v;
-  pool_clear(s);
+  routing_pool *p = &s->pools[POOL_DEVICE];
+  pool_clear(p);
   size_t device_count = 0;
   const qa_controller_device *devices =
       s->devices(s->devices_ctx, &device_count);
-  qa_ui_choice *items = choice_pool(s, device_count + 3);
+  qa_ui_choice *items = choice_pool(p, device_count + 3);
   size_t at = 0;
   items[at++] = (qa_ui_choice){ "automatic", "Automatic" };
   items[at++] = (qa_ui_choice){ "none", "None" };
@@ -235,7 +247,7 @@ static const qa_ui_choice *device_choices(void *v, size_t *out_count) {
     if (ordinal == NULL) oom();
     snprintf(label, sizeof label, "%s (%s)", devices[i].name, ordinal);
     free(ordinal);
-    items[at++] = (id2 = pool(s, key), label2 = pool(s, label), (qa_ui_choice){ id2, label2 });
+    items[at++] = (id2 = pool(p, key), label2 = pool(p, label), (qa_ui_choice){ id2, label2 });
   }
   qa_seat_input *input = selected_input(s);
   char current[1024];
@@ -252,7 +264,7 @@ static const qa_ui_choice *device_choices(void *v, size_t *out_count) {
   for (size_t i = 0; i < at; i++)
     if (strcmp(items[i].id, current) == 0) seen = true;
   if (!seen)
-    items[at++] = (qa_ui_choice){ pool(s, current),
+    items[at++] = (qa_ui_choice){ pool(p, current),
                                   "Saved controller (disconnected)" };
   *out_count = at;
   return items;
@@ -261,7 +273,7 @@ static void device_write(void *v, const char *value) {
   routing_state *s = v;
   qa_input_router *router = s->router(s->router_ctx);
   qa_seat_input *input = selected_input(s);
-  if (input == NULL) qa_range_error("No local player");
+  if (input == NULL) qa_raise("Error", 0, 0, "No local player");
   size_t device_count = 0;
   const qa_controller_device *devices =
       s->devices(s->devices_ctx, &device_count);
@@ -297,7 +309,7 @@ static void device_write(void *v, const char *value) {
     selection_key(qa_input_router_controller_selection(router, seat),
                   current, sizeof current);
     if (strcmp(current, value) == 0) return;
-    qa_range_error("Controller is no longer available");
+    qa_raise("Error", 0, 0, "Controller is no longer available");
   }
   if (target.kind != QA_CONTROLLER_SELECTION_AUTOMATIC
       && target.kind != QA_CONTROLLER_SELECTION_NONE) {
@@ -315,7 +327,7 @@ static void device_write(void *v, const char *value) {
           qa_input_router_controller_for(router, previous_seat, &instance);
       if (strcmp(key, value) == 0
           || (device != NULL && has_instance
-              && (int32_t)instance == device->instance)) {
+              && instance == (double)device->instance)) {
         qa_controller_selection none;
         memset(&none, 0, sizeof none);
         none.kind = QA_CONTROLLER_SELECTION_NONE;
@@ -329,9 +341,11 @@ static void device_write(void *v, const char *value) {
 
 static void routing_teardown(void *v) {
   routing_state *s = v;
-  pool_clear(s);
-  free(s->strings);
-  free(s->choices);
+  for (int i = 0; i < 3; i++) {
+    pool_clear(&s->pools[i]);
+    free(s->pools[i].strings);
+    free(s->pools[i].choices);
+  }
   free(s);
 }
 

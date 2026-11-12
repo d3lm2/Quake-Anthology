@@ -25,7 +25,7 @@ static void check_owners(qa_q3_pres_presentation_frame_runtime *runtime,
     ok = ok && host->hud && host->hud->state == state;
     ok = ok && host->status && host->status->state == state;
   }
-  if (!ok) qa_range_error("Q3 frame owners must share one seat's cgame state");
+  if (!ok) qa_raise("Error", 0, 0, "Q3 frame owners must share one seat's cgame state");
 }
 void qa_q3_pres_presentation_frame_runtime_init(qa_q3_pres_presentation_frame_runtime *runtime,
     qa_q3_pres_client_game_state *state, qa_q3_pres_presentation_frame_host host) {
@@ -44,7 +44,7 @@ void qa_q3_pres_presentation_frame_runtime_init_scene(qa_q3_pres_presentation_fr
   check_owners(runtime, state, true);
 }
 void qa_q3_pres_presentation_frame_runtime_close(qa_q3_pres_presentation_frame_runtime *runtime) {
-  if (runtime->drawing && !runtime->scene_drawing) qa_range_error("Cannot retire cgame during a frame");
+  if (runtime->drawing && !runtime->scene_drawing) qa_raise("Error", 0, 0, "Cannot retire cgame during a frame");
   runtime->closed = true;
   qa_q3_pres_scene_recorder_clear_scene(runtime->host.scene);
 }
@@ -99,7 +99,7 @@ static void add_local_entities(qa_q3_pres_presentation_frame_runtime *runtime) {
   qa_q3_pres_local_entity_system_add_entities(runtime->host.local_entities, frame, sink);
 }
 static void fade_timescale(qa_q3_pres_presentation_frame_runtime *runtime) {
-  if (runtime->scene_scope) qa_range_error("Supplemental cgame cannot control primary timescale");
+  if (runtime->scene_scope) qa_raise("Error", 0, 0, "Supplemental cgame cannot control primary timescale");
   qa_q3_pres_client_configuration *configuration = runtime->host.configuration;
   qa_cvar_snapshot end_snapshot, speed_snapshot, current_snapshot;
   if (!qa_q3_pres_client_configuration_read_vm_symbol(configuration, QA_Q3_PRES_VM_CG_TIMESCALE_FADE_END, &end_snapshot))
@@ -129,26 +129,38 @@ static void run_view_weapon(void *ctx) {
   view_weapon_source *source = ctx;
   qa_q3_pres_client_weapon_runtime_add_view_weapon(source->weapons, source->ps);
 }
+/* TS try/finally: a throw out of the frame still clears the drawing flags. */
+static void clear_drawing(void *arg) {
+  qa_q3_pres_presentation_frame_runtime *runtime = arg;
+  runtime->drawing = false;
+}
+static void clear_scene_drawing(void *arg) {
+  qa_q3_pres_presentation_frame_runtime *runtime = arg;
+  runtime->drawing = false;
+  runtime->scene_drawing = false;
+}
 bool qa_q3_pres_presentation_frame_runtime_draw_scene_frame(qa_q3_pres_presentation_frame_runtime *runtime,
     qa_q3_pres_presentation_frame input, qa_scene_camera camera) {
-  if (!runtime->scene_scope) qa_range_error("Primary cgame requires its full frame");
-  if (runtime->closed || runtime->drawing) qa_range_error("Cgame frame is closed or already drawing");
+  if (!runtime->scene_scope) qa_raise("Error", 0, 0, "Primary cgame requires its full frame");
+  if (runtime->closed || runtime->drawing) qa_raise("Error", 0, 0, "Cgame frame is closed or already drawing");
   runtime->drawing = true;
   runtime->scene_drawing = true;
+  qa_cleanup drawing_node;
+  qa_cleanup_push(&drawing_node, clear_scene_drawing, runtime);
   bool ok = false;
   qa_q3_pres_presentation_frame_host *host = &runtime->host;
   qa_q3_pres_client_game_state *state = runtime->state;
   check_clock(input.server_time);
   check_clock(input.engine_frame_number);
-  if (input.server_time < state->old_time) qa_range_error("Supplemental cgame source time moved backward");
+  if (input.server_time < state->old_time) qa_raise("Error", 0, 0, "Supplemental cgame source time moved backward");
   state->time = input.server_time;
   host->enter_frame(host->ctx, input);
   if (!qa_q3_pres_client_configuration_update_cvars(host->configuration)) goto done;
-  if (runtime->closed) qa_range_error("Supplemental cgame retired during its frame");
+  if (runtime->closed) qa_raise("Error", 0, 0, "Supplemental cgame retired during its frame");
   host->clear_looping_sounds(host->ctx, false);
   qa_q3_pres_scene_recorder_clear_scene(host->scene);
   if (!qa_q3_pres_snapshot_runtime_process_snapshots(host->snapshots)) goto done;
-  if (runtime->closed) qa_range_error("Supplemental cgame retired during its frame");
+  if (runtime->closed) qa_raise("Error", 0, 0, "Supplemental cgame retired during its frame");
   if (!state->snap || (state->snap->flags & 2) != 0) { ok = true; goto done; }
   if (!qa_q3_base_player_state_copy(&state->predicted_player_state, &state->snap->player_state)) goto done;
   state->physics_time = state->snap->server_time;
@@ -178,7 +190,7 @@ bool qa_q3_pres_presentation_frame_runtime_draw_scene_frame(qa_q3_pres_presentat
     bool registered = true;
     for (size_t i = 0; registered && i < required.count; i++) {
       registered = qa_q3_pres_client_weapon_media_registry_register_weapon(host->weapon_registry, required.values[i]);
-      if (registered && runtime->closed) qa_range_error("Supplemental cgame retired during its frame");
+      if (registered && runtime->closed) qa_raise("Error", 0, 0, "Supplemental cgame retired during its frame");
     }
     free(required.values);
     if (!registered) goto done;
@@ -188,18 +200,21 @@ bool qa_q3_pres_presentation_frame_runtime_draw_scene_frame(qa_q3_pres_presentat
   add_local_entities(runtime);
   qa_q3_pres_client_frame_audio_play_buffered_sounds(host->frame_audio);
   if (!qa_q3_pres_client_server_command_runtime_play_buffered_voice_chats(host->server_commands)) goto done;
-  if (runtime->closed) qa_range_error("Supplemental cgame retired during its frame");
+  if (runtime->closed) qa_raise("Error", 0, 0, "Supplemental cgame retired during its frame");
   ok = true;
 done:
+  qa_cleanup_pop(&drawing_node);
   runtime->drawing = false;
   runtime->scene_drawing = false;
   return ok;
 }
 bool qa_q3_pres_presentation_frame_runtime_draw_active_frame(qa_q3_pres_presentation_frame_runtime *runtime,
                                                              qa_q3_pres_presentation_frame input) {
-  if (runtime->scene_scope) qa_range_error("Supplemental cgame cannot draw the primary frame");
-  if (runtime->closed || runtime->drawing) qa_range_error("Cgame frame is closed or already drawing");
+  if (runtime->scene_scope) qa_raise("Error", 0, 0, "Supplemental cgame cannot draw the primary frame");
+  if (runtime->closed || runtime->drawing) qa_raise("Error", 0, 0, "Cgame frame is closed or already drawing");
   runtime->drawing = true;
+  qa_cleanup drawing_node;
+  qa_cleanup_push(&drawing_node, clear_drawing, runtime);
   bool ok = false;
   qa_q3_pres_presentation_frame_host *host = &runtime->host;
   qa_q3_pres_client_game_state *state = runtime->state;
@@ -324,6 +339,7 @@ bool qa_q3_pres_presentation_frame_runtime_draw_active_frame(qa_q3_pres_presenta
   }
   ok = true;
 done:
+  qa_cleanup_pop(&drawing_node);
   runtime->drawing = false;
   return ok;
 }

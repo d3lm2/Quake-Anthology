@@ -4,9 +4,12 @@
  * is qa_raise, a TS catch qa_try. GPL-2.0-or-later. */
 #include "application_internal.h"
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include "qa/formats/text_decoder.h"
 #include "qa/app/bootstrap/audio/commands.h"
 #include "qa/app/bootstrap/local_seat_change.h"
 #include "qa/app/bootstrap/match_results.h"
@@ -560,6 +563,23 @@ static void raise_text(const char *error) {
   if (error != NULL) qa_raise("Error", 0, 0, "%s", error);
 }
 
+/* print(`...`) of a formatted line, without a fixed-size buffer (TS strings have no cap). */
+static void print_formatted(void (*print)(void *ctx, const char *text), void *print_ctx, const char *format, ...) {
+  va_list args, copy;
+  va_start(args, format);
+  va_copy(copy, args);
+  int length = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *line = checked(malloc((size_t)(length < 0 ? 0 : length) + 1));
+  (void)vsnprintf(line, (size_t)(length < 0 ? 0 : length) + 1, format, args);
+  va_end(args);
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, free, line);
+  print(print_ctx, line);
+  qa_cleanup_pop(&cleanup);
+  free(line);
+}
+
 /* ---- applicationCommand (TS 7283-7447) ---- */
 static bool always_current(void *ctx) { (void)ctx; return true; } /* TS () => true */
 static qa_application_base_arena_progress *base_arena_progress_of(qa_application *app, qa_app_shared_simulation *simulation) {
@@ -851,10 +871,11 @@ static void guest_bot_command(qa_app_q3_qvm_server_game *guest, const qa_applica
   if (is(command->name, "botlist")) {
     for (size_t i = 0; i < bot_count; i++) {
       char *name = guest_player_name(guest, all[i].source_entity);
-      char line[1024];
-      (void)snprintf(line, sizeof line, "%s: %s\n", QA_JS_NUMBER(all[i].source_entity), name != NULL ? name : "");
+      qa_cleanup name_cleanup;
+      qa_cleanup_push(&name_cleanup, free, name);
+      print_formatted(print, print_ctx, "%s: %s\n", QA_JS_NUMBER(all[i].source_entity), name != NULL ? name : "");
+      qa_cleanup_pop(&name_cleanup);
       free(name);
-      print(print_ctx, line);
     }
     char line[64];
     (void)snprintf(line, sizeof line, "%zu bot(s).\n", bot_count);
@@ -894,16 +915,19 @@ static void guest_exec(qa_application *app, const qa_application_command_request
   qa_cleanup_push(&cleanup, free, path);
   qa_content_opened_resource script;
   memset(&script, 0, sizeof script);
-  char line[4200];
+  size_t line_length = strlen(path) + sizeof "couldn't exec \n";
+  char *line = checked(malloc(line_length));
+  qa_cleanup line_cleanup;
+  qa_cleanup_push(&line_cleanup, free, line);
   if (!qa_content_mounted_open((qa_content_mounted *)qa_app_loaded_content_mounts(app->loaded_content), path, NULL, NULL, &script)) {
-    (void)snprintf(line, sizeof line, "couldn't exec %s\n", path);
+    (void)snprintf(line, line_length, "couldn't exec %s\n", path);
     print(print_ctx, line);
   } else {
-    char *text = checked(malloc(script.byte_length + 1));
-    memcpy(text, script.bytes, script.byte_length);
-    text[script.byte_length] = '\0';
+    /* new TextDecoder().decode(script.bytes): the TS string, inserted through sourceText (console text). */
+    char *text = qa_text_decoder_decode(script.bytes, script.byte_length, NULL);
     free(script.bytes);
-    (void)snprintf(line, sizeof line, "execing %s\n", path);
+    if (text == NULL) qa_range_error("Out of memory");
+    (void)snprintf(line, line_length, "execing %s\n", path);
     qa_cleanup text_cleanup;
     qa_cleanup_push(&text_cleanup, free, text);
     print(print_ctx, line);
@@ -915,10 +939,12 @@ static void guest_exec(qa_application *app, const qa_application_command_request
     context.origin.kind = QA_COMMAND_ORIGIN_SCRIPT;
     context.origin.name = path;
     context.origin.caller = &caller_origin;
-    if (app->source_commands != NULL) qa_command_buffer_insert(app->source_commands, text, &context, -1);
+    if (app->source_commands != NULL) qa_command_buffer_insert_decoded(app->source_commands, text, &context, -1);
     qa_cleanup_pop(&text_cleanup);
     free(text);
   }
+  qa_cleanup_pop(&line_cleanup);
+  free(line);
   qa_cleanup_pop(&cleanup);
   free(path);
 }
@@ -954,9 +980,7 @@ static void guest_server_command(qa_application *app, qa_app_q3_qvm_server_game 
     qa_cleanup_pop(&cleanup);
     free(players);
   } else if (!guest_console_command(guest, command)) {
-    char line[1100];
-    (void)snprintf(line, sizeof line, "Unknown game command: %s\n", command->name);
-    print(print_ctx, line);
+    print_formatted(print, print_ctx, "Unknown game command: %s\n", command->name);
   }
 }
 static bool guest_command(qa_application *app, qa_application_command_request *command, const qa_command_context *source,
@@ -1051,11 +1075,10 @@ static bool guest_command(qa_application *app, qa_application_command_request *c
 }
 
 /* ---- sourceCommand (TS 7570-7740) ---- */
+/* Bun.file(path).exists(): false for a folder (fopen opens one). */
 static bool file_exists(const char *path) {
-  FILE *file = fopen(path, "rb");
-  if (file == NULL) return false;
-  fclose(file);
-  return true;
+  struct stat info;
+  return stat(path, &info) == 0 && !S_ISDIR(info.st_mode);
 }
 /* The rewritten request of sourceCommand: borrows the original's strings. */
 typedef struct source_request {
@@ -1083,8 +1106,8 @@ static bool source_arsenal_command(qa_application *app, const source_request *co
   bool q3 = player != NULL && is(player->arsenal.state.kind, "q3");
   if (q3 && qa_app_shared_sim_has_weapon_slot(simulation, actor)) {
     qa_app_shared_sim_player_command(simulation, actor, command->name, command->arguments, command->argument_count);
+    /* The projection's items belong to the simulation's projection ring (freed when the ring slot is reused). */
     qa_app_sim_weapon_slot_projection slot = qa_app_shared_sim_weapon_slot(simulation, actor);
-    free((void *)slot.ui.items);
     const qa_weapon_reference *selected = slot.pending != NULL ? slot.pending : slot.active;
     /* The player record may have moved during the command: read it again. */
     player = qa_app_shared_sim_movement_player(simulation, actor);
@@ -1130,12 +1153,41 @@ static bool source_use_command(qa_application *app, const source_request *comman
   }
   return false;
 }
+static void native_layout_cleanup(void *layout) { qa_native_save_layout_destroy(layout); }
 static void source_load(qa_application *app, const source_request *command) {
   qa_app_load_request load = qa_app_parse_load_request(command->arguments, command->argument_count);
   const char *directory = qa_application_save_directory(app);
-  char *path = checked(qa_save_command_path(directory, load.name));
+  qa_native_save_layout native;
+  bool has_native = qa_application_native_saves(app, &native);
+  qa_cleanup native_guard;
+  if (has_native) qa_cleanup_push(&native_guard, native_layout_cleanup, &native);
+  char *path = qa_application_save_path(app, load.name);
   qa_cleanup cleanup;
   qa_cleanup_push(&cleanup, free, path);
+  /* A stock game finds its slot the way the original does: the original format first, then the engine's, in every
+   * folder it reads. */
+  if (has_native && strpbrk(load.name, "\\/") == NULL) {
+    size_t candidate_count = 0;
+    char **candidates = qa_native_save_layout_candidates(&native, load.name, &candidate_count);
+    char *chosen = NULL;
+    for (size_t i = 0; i < candidate_count; i++) {
+      if (chosen == NULL && file_exists(candidates[i])) chosen = candidates[i];
+      else free(candidates[i]);
+    }
+    free((void *)candidates);
+    if (chosen != NULL) {
+      qa_cleanup_pop(&cleanup);
+      free(path);
+      path = chosen;
+      qa_cleanup_push(&cleanup, free, path);
+    }
+  }
+  if (!file_exists(path) && has_native) {
+    qa_cleanup_pop(&cleanup);
+    free(path);
+    path = checked(qa_save_command_path(directory, load.name));
+    qa_cleanup_push(&cleanup, free, path);
+  }
   size_t external_count = 0;
   const char *const *external = qa_application_external_save_directories(app, &external_count);
   if (!file_exists(path)) {
@@ -1147,10 +1199,20 @@ static void source_load(qa_application *app, const source_request *command) {
       qa_cleanup_push(&cleanup, free, path);
     }
   }
+  /* trustedDirectories: [...this.externalSaveDirectories, ...(native === null ? [] : native.scan)] */
+  size_t trusted_count = external_count + (has_native ? native.scan_count : 0);
+  const char **trusted = checked(calloc(trusted_count + 1, sizeof *trusted));
+  for (size_t i = 0; i < external_count; i++) trusted[i] = external[i];
+  for (size_t i = 0; has_native && i < native.scan_count; i++) trusted[external_count + i] = native.scan[i];
+  qa_cleanup trusted_guard;
+  qa_cleanup_push(&trusted_guard, free, (void *)trusted);
   qa_assert_load_path_allowed(directory, path, command->original->has_source ? &command->original->source : NULL,
-      app->launch_options.allow_load_paths, external, external_count);
+      app->launch_options.allow_load_paths, trusted, trusted_count);
+  qa_cleanup_pop(&trusted_guard);
+  free((void *)trusted);
   if (app->network != NULL) qa_raise("Error", 0, 0, "Save/load unavailable while hosting a network game.");
   qa_cleanup_pop(&cleanup);
+  if (has_native) { qa_cleanup_pop(&native_guard); qa_native_save_layout_destroy(&native); }
   if (app->has_pending_save) { free(app->pending_save_path); free(app->pending_save_source_product); }
   app->has_pending_save = true;
   app->pending_save_path = path;
@@ -1191,7 +1253,6 @@ static void source_q1_status(qa_application *app, const source_request *command,
   qa_cleanup_push(&clients_cleanup, free, ping_clients);
   qa_cleanup_push(&values_cleanup, free, ping_values);
   bool ping = is(command->name, "ping");
-  char line[4200];
   size_t player_count = 0;
   const qa_actor_id *listed = qa_app_shared_sim_players(simulation, &player_count);
   qa_actor_id *players = checked(calloc(player_count + 1, sizeof *players));
@@ -1203,8 +1264,7 @@ static void source_q1_status(qa_application *app, const source_request *command,
     char count_text[32], max_text[32];
     (void)snprintf(count_text, sizeof count_text, "%zu", player_count);
     (void)snprintf(max_text, sizeof max_text, "%s", QA_JS_NUMBER(simulation->options.max_clients));
-    (void)snprintf(line, sizeof line, "map: %s\nplayers: %s active (%s max)\n", app->launch_options.map, count_text, max_text);
-    print(print_ctx, line);
+    print_formatted(print, print_ctx, "map: %s\nplayers: %s active (%s max)\n", app->launch_options.map, count_text, max_text);
   }
   for (size_t i = 0; i < player_count; i++) {
     qa_client_id client;
@@ -1213,9 +1273,8 @@ static void source_q1_status(qa_application *app, const source_request *command,
     if (ping) {
       double value = 0;
       for (size_t p = 0; p < ping_count; p++) if (qa_same_client(ping_clients[p], client)) { value = ping_values[p]; break; }
-      (void)snprintf(line, sizeof line, "%s %s\n", QA_JS_NUMBER(value), name != NULL ? name : "");
-    } else (void)snprintf(line, sizeof line, "#%s %s\n", QA_JS_NUMBER((double)client.slot + 1), name != NULL ? name : "");
-    print(print_ctx, line);
+      print_formatted(print, print_ctx, "%s %s\n", QA_JS_NUMBER(value), name != NULL ? name : "");
+    } else print_formatted(print, print_ctx, "#%s %s\n", QA_JS_NUMBER((double)client.slot + 1), name != NULL ? name : "");
   }
   qa_cleanup_pop(&players_cleanup);
   qa_cleanup_pop(&values_cleanup);
@@ -1320,14 +1379,16 @@ static void source_command(qa_application *app, qa_application_command_request *
     }
   } else if (is(name, "save")) {
     qa_app_save_request save = qa_app_parse_save_request(command.arguments, command.argument_count);
-    char *path = checked(qa_save_command_path(qa_application_save_directory(app), save.name));
+    /* print(`Saved ${await this.saveGame(this.savePath(name), format)}.\n`) */
+    char *requested = qa_application_save_path(app, save.name);
     qa_cleanup cleanup;
-    qa_cleanup_push(&cleanup, free, path);
-    qa_application_save_game(app, path, save.format);
+    qa_cleanup_push(&cleanup, free, requested);
+    char *path = qa_application_save_game_at(app, requested, save.format, false);
+    qa_cleanup_pop(&cleanup);
+    free(requested);
     size_t length = strlen(path) + 16;
     char *line = checked(malloc(length));
     (void)snprintf(line, length, "Saved %s.\n", path);
-    qa_cleanup_pop(&cleanup);
     free(path);
     qa_cleanup_push(&cleanup, free, line);
     print(print_ctx, line);
@@ -1461,6 +1522,7 @@ static void q3_client_set(qa_application_graphical *graphical, qa_seat_id seat, 
   repoint_q3_clients(graphical);
 }
 static void native_q2_delete_at(qa_application_graphical *graphical, size_t index) {
+  free(graphical->native_q2[index].userinfo); /* the seat client owns its published userinfo (application_step.c) */
   memmove(&graphical->native_q2_seats[index], &graphical->native_q2_seats[index + 1],
       (graphical->native_q2_count - index - 1) * sizeof *graphical->native_q2_seats);
   memmove(&graphical->native_q2[index], &graphical->native_q2[index + 1], (graphical->native_q2_count - index - 1) * sizeof *graphical->native_q2);
@@ -1664,8 +1726,10 @@ static void drop_removed(local_change *c, const qa_app_local_seat_identity *remo
   source_connection_delete(app, removed_identity->client);
   qa_event_ring_filter_live(&app->requested_commands, request_not_for_seat, &seat);
   size_t kept = 0;
-  for (size_t i = 0; i < app->client_input_count; i++)
+  for (size_t i = 0; i < app->client_input_count; i++) {
     if (!qa_same_seat(app->client_inputs[i].seat, seat)) app->client_inputs[kept++] = app->client_inputs[i];
+    else qa_application_deferred_input_release(&app->client_inputs[i]); /* queued inputs own their text */
+  }
   app->client_input_count = kept;
 }
 static void publish_local_guest_snapshots_run(void *ctx) { qa_application_publish_local_guest_snapshots(ctx); }
@@ -2205,9 +2269,11 @@ void qa_application_present_output(qa_application *app, qa_simulation_output out
         qa_app_q2_player player = host->q2.carried_player(host->q2.ctx, qa_session_client_id(qa_session_seat_client(local->player.seat)));
         size_t message_count = 0;
         const qa_app_q2_raw_message *messages = NULL;
+        /* localMessages?.(player) ?? sourceMessages?.(player) ?? rawMessages(player): only an absent function falls
+         * through; a host answers [] (NULL here) once a recipient has its local messages. */
         if (host->q2.local_messages != NULL) messages = host->q2.local_messages(host->q2.ctx, player, &message_count);
-        if (messages == NULL && host->q2.source_messages != NULL) messages = host->q2.source_messages(host->q2.ctx, player, &message_count);
-        if (messages == NULL) messages = host->q2.raw_messages(host->q2.ctx, player, &message_count);
+        else if (host->q2.source_messages != NULL) messages = host->q2.source_messages(host->q2.ctx, player, &message_count);
+        else messages = host->q2.raw_messages(host->q2.ctx, player, &message_count);
         qa_app_native_q2_message *rows = scratch_block(&s, checked(calloc(message_count + 1, sizeof *rows)));
         for (size_t m = 0; m < message_count; m++) {
           rows[m].bytes = messages[m].bytes;

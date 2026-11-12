@@ -425,9 +425,10 @@ bool qa_resolve_weapon_selection(const char *command, const char *const *args,
   return false;
 }
 
-static bool space_byte(unsigned char byte) {
-  return byte == ' ' || byte == '\t' || byte == '\n' || byte == '\v' ||
-         byte == '\f' || byte == '\r' || byte == 160;
+/* JS `\s` by code point over UTF-8 (U+00A0 is C2 A0, never a lone A0 byte). */
+static const unsigned char *skip_space(const unsigned char *at) {
+  for (size_t n; (n = qa_input_js_space_length((const char *)at)) > 0;) at += n;
+  return at;
 }
 
 const char *qa_weapon_binding_item_for_text(const char *text,
@@ -437,15 +438,15 @@ const char *qa_weapon_binding_item_for_text(const char *text,
   for (const char *at = text; *at != '\0'; at++) {
     if (*at == ';' || *at == '\r' || *at == '\n' || *at == '\\') return NULL;
   }
-  const unsigned char *at = (const unsigned char *)text;
-  while (space_byte(*at)) at++;
+  const unsigned char *at = skip_space((const unsigned char *)text);
   static const char *const names[3] = {"use", "weapon", "impulse"};
   const char *matched = NULL;
   size_t name_length = 0;
   for (int i = 0; i < 3; i++) {
     size_t length = strlen(names[i]);
     bool equal = true;
-    for (size_t j = 0; j < length; j++) {
+    /* Stop at the first difference: a shorter text ends at its NUL. */
+    for (size_t j = 0; j < length && equal; j++) {
       unsigned char c = at[j];
       if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
       if (c != (unsigned char)names[i][j]) equal = false;
@@ -458,24 +459,22 @@ const char *qa_weapon_binding_item_for_text(const char *text,
   }
   if (matched == NULL) return NULL;
   at += name_length;
-  if (!space_byte(*at)) return NULL;
-  while (space_byte(*at)) at++;
+  if (qa_input_js_space_length((const char *)at) == 0) return NULL;
+  at = skip_space(at);
   char *argument = NULL;
   if (*at == '"') {
     const unsigned char *start = ++at;
     while (*at != '\0' && *at != '"' && *at != '\r' && *at != '\n') at++;
     if (*at != '"' || at == start) return NULL;
     argument = qa_input_dup_range((const char *)start, (size_t)(at - start));
-    at++;
-    while (space_byte(*at)) at++;
+    at = skip_space(at + 1);
     if (*at != '\0') {
       free(argument);
       return NULL;
     }
   } else {
     const unsigned char *start = at;
-    const unsigned char *end = at + strlen((const char *)at);
-    while (end > start && space_byte(end[-1])) end--;
+    const unsigned char *end = (const unsigned char *)qa_input_js_trim_end((const char *)start);
     if (end == start) return NULL;
     for (const unsigned char *scan = start; scan < end; scan++) {
       if (*scan == '"' || *scan == '\r' || *scan == '\n') return NULL;

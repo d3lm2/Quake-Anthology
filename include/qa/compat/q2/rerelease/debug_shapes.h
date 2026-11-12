@@ -1,6 +1,6 @@
 /* Port of src/compat/q2/rerelease/debug-shapes.ts. GPL-2.0-or-later.
- * rereleaseDebugLifetime is re-exported from content (not landed on
- * the contracts side); mirrored here from its TS formula. */
+ * rereleaseDebugLifetime (content/q2/rerelease/debug-shapes.ts, re-exported
+ * by the TS) has a local copy here with the same formula. */
 #ifndef QA_COMPAT_Q2_RERELEASE_DEBUG_SHAPES_H
 #define QA_COMPAT_Q2_RERELEASE_DEBUG_SHAPES_H
 #include <stdbool.h>

@@ -3,7 +3,9 @@
 
 #include <ctype.h>
 #include <stdbool.h>
+#include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,7 +55,14 @@ qa_q2_start_item *qa_q2_parse_start_items(const char *expression, size_t *out_co
         if (classname[0] == '\0') ok = false;
         if (count_value < -9007199254740991.0 || count_value > 9007199254740991.0) ok = false;
       }
-      if (!ok) qa_range_error("Invalid Q2 starting item: %s", value);
+      if (!ok) {
+        /* TS throws a plain Error; nothing parsed so far is kept. */
+        char message[1024];
+        snprintf(message, sizeof message, "Invalid Q2 starting item: %s", value);
+        free(value); free(classname);
+        qa_q2_start_items_free(list, count);
+        qa_raise("Error", 0, 0, "%s", message);
+      }
       free(value);
       if (count == cap) {
         size_t ncap = cap ? cap * 2 : 8;

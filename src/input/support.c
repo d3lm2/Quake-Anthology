@@ -11,7 +11,7 @@
 #include "qa/foundation/js.h"
 
 noreturn void qa_input_error(const char *format, ...) {
-  char text[1536];
+  char text[QA_CAUGHT_MESSAGE_CAPACITY]; /* qa_raise keeps no more */
   va_list args;
   va_start(args, format);
   vsnprintf(text, sizeof text, format, args);
@@ -24,6 +24,19 @@ char *qa_input_dup(const char *text) {
   size_t length = strlen(text);
   char *out = (char *)malloc(length + 1);
   if (out != NULL) memcpy(out, text, length + 1);
+  return out;
+}
+
+char *qa_input_format(const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  va_list copy;
+  va_copy(copy, args);
+  int length = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *out = length < 0 ? NULL : (char *)malloc((size_t)length + 1);
+  if (out != NULL) vsnprintf(out, (size_t)length + 1, format, args);
+  va_end(args);
   return out;
 }
 
@@ -54,17 +67,35 @@ char *qa_input_js_number(double value) {
 }
 
 bool qa_input_js_space(unsigned char byte) {
-  /* White_Space + line terminators representable in one byte. */
+  /* ASCII white space only: a byte above 0x7f is part of a UTF-8 sequence, and
+     U+00A0 is the two bytes C2 A0 (qa_input_js_space_length). */
   return byte == '\t' || byte == '\n' || byte == '\v' || byte == '\f' ||
-         byte == '\r' || byte == ' ' || byte == 160;
+         byte == '\r' || byte == ' ';
+}
+
+size_t qa_input_js_space_length(const char *text) { return qa_js_white_space_length(text); }
+
+const char *qa_input_js_trim_end(const char *start) {
+  const char *end = start;
+  for (const char *p = start; *p != '\0';) {
+    size_t space = qa_js_white_space_length(p);
+    if (space > 0) {
+      p += space;
+      continue;
+    }
+    p++;
+    while ((*p & 0xc0) == 0x80) p++; /* the rest of this character */
+    end = p;
+  }
+  return end;
 }
 
 char *qa_input_js_trim(const char *text) {
-  const unsigned char *start = (const unsigned char *)text;
-  while (*start != '\0' && qa_input_js_space(*start)) start++;
-  size_t length = strlen((const char *)start);
-  while (length > 0 && qa_input_js_space(start[length - 1])) length--;
-  return qa_input_dup_range((const char *)start, length);
+  /* String.prototype.trim over UTF-8: white space is matched by code point, so
+     the 0xA0 that ends a character such as U+00E0 (C3 A0) is not U+00A0. */
+  const char *start = text;
+  for (size_t space; (space = qa_js_white_space_length(start)) > 0;) start += space;
+  return qa_input_dup_range(start, (size_t)(qa_input_js_trim_end(start) - start));
 }
 
 double qa_input_js_parse_number(const char *text) { return qa_js_string_to_number(text); }

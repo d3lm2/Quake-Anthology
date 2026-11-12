@@ -22,7 +22,7 @@ static qa_qvm_host_result game_host(void *ctx, const qa_qvm_host_call *call) {
 
 void qa_qvm_game_init(qa_qvm_game *game, const qa_qvm_module_options *options) {
   if (strcmp(options->artifact->role, "qagame") != 0)
-    qa_range_error("QvmGame requires a qagame artifact");
+    qa_raise("Error", 0, 0, "QvmGame requires a qagame artifact");
   game->host = options->host;
   game->host_ctx = options->host_ctx;
   qa_qvm_module_options wrapped = *options;

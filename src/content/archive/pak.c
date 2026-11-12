@@ -15,6 +15,24 @@ static void reader_or_oom(qa_binary_reader *reader, const uint8_t *bytes,
     qa_range_error("out of memory");
 }
 
+/* Entries built so far, released when a malformed record raises. */
+typedef struct partial_entries {
+  qa_archive_entry *entries;
+  size_t count;
+  qa_binary_reader *reader;
+  char *raw_path;
+} partial_entries;
+static void partial_entries_release(void *arg) {
+  partial_entries *partial = (partial_entries *)arg;
+  for (size_t i = 0; i < partial->count; i++) {
+    free(partial->entries[i].path);
+    free(partial->entries[i].raw_path);
+  }
+  free(partial->entries);
+  free(partial->raw_path);
+  qa_binary_reader_destroy(partial->reader);
+}
+
 qa_pak_header qa_read_pak_header(const uint8_t *bytes, size_t length,
                                  const char *source, int64_t file_size) {
   qa_binary_reader reader;
@@ -37,12 +55,20 @@ bool qa_read_pak_directory(const uint8_t *bytes, size_t length,
   reader_or_oom(&reader, bytes, length, source);
   qa_archive_entry *entries = NULL;
   size_t count = 0, capacity = 0;
+  partial_entries partial = {NULL, 0, &reader, NULL};
+  qa_cleanup partial_node;
+  qa_cleanup_push(&partial_node, partial_entries_release, &partial);
   while (qa_binary_reader_remaining(&reader) > 0) {
+    partial.entries = entries;
+    partial.count = count;
+    partial.raw_path = NULL;
     char *raw_path = qa_binary_reader_fixed_byte_string(&reader, 56);
+    partial.raw_path = raw_path;
     int64_t data_offset = qa_binary_reader_i32(&reader);
     int64_t byte_length = qa_binary_reader_i32(&reader);
     if (raw_path == NULL) goto oom;
     qa_archive_check_range(source, file_size, data_offset, byte_length);
+    partial.raw_path = NULL;
     bool unsafe = false;
     char *path = qa_try_normalize_entry_path(raw_path, &unsafe);
     if (path == NULL && !unsafe) { free(raw_path); goto oom; }
@@ -70,11 +96,13 @@ bool qa_read_pak_directory(const uint8_t *bytes, size_t length,
     entry->is_directory = path_length > 0 && path[path_length - 1] == '/';
     count++;
   }
+  qa_cleanup_pop(&partial_node);
   qa_binary_reader_destroy(&reader);
   *out_entries = entries;
   *out_count = count;
   return true;
 oom:
+  qa_cleanup_pop(&partial_node);
   for (size_t i = 0; i < count; i++) {
     free(entries[i].path);
     free(entries[i].raw_path);

@@ -7,6 +7,7 @@
 #include "qa/llm/codex.h"
 #include "qa/llm/session.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -148,7 +150,7 @@ static bool settings_model_text(const char *value, char **out, qa_llm_error *err
   bool bad = value == NULL || qa_llm_utf16_length(value) > 256; /* JS length: UTF-16 units */
   if (!bad) {
     for (const uint8_t *p = (const uint8_t *)value; *p != '\0'; p++) {
-      if (*p <= 0x1f || *p == 0x7f) bad = true;
+      if (*p <= 0x1f || *p == 0x7f || (p[0] == 0xc0 && p[1] == 0x80)) bad = true; /* C0 80: U+0000 */
     }
   }
   if (bad) {
@@ -193,17 +195,33 @@ static bool settings_api_key(const qa_llm_json *value, char **out, qa_llm_error 
   return settings_api_key_text(value->string, out, error);
 }
 
-/* Minimal URL equivalent for otherService: enough of WHATWG URL to
- * reproduce protocol/hostname/username/search/hash and toString for
- * the http(s) forms this setting admits. */
+static char *lower_dup_n(const char *text, size_t length) {
+  char *out = qa_llm_strndup(text, length);
+  for (size_t i = 0; i < length; i++) {
+    if (out[i] >= 'A' && out[i] <= 'Z') out[i] = (char)(out[i] - 'A' + 'a');
+  }
+  return out;
+}
+
+/* `new URL(text)` for otherService (WHATWG URL as Bun runs it): leading and
+ * trailing C0 controls and spaces are dropped, tabs and newlines removed
+ * everywhere; special schemes take any run of '/' or '\' before the host; the
+ * host is percent-decoded, lowercased, checked for forbidden code points and
+ * read as IPv4 (0x/octal/short forms) or bracketed IPv6 and re-serialized;
+ * default ports drop; the path folds "." and ".." segments (also %2e) and
+ * percent-encodes the path set. A non-special scheme parses (protocol only).
+ * Not reproduced: IDNA (a non-ASCII host is kept lowercased, where Bun
+ * writes punycode) and opaque paths of non-special schemes. */
 typedef struct parsed_url {
   char *protocol; /* with trailing ':', lowercased */
-  char *hostname; /* lowercased, brackets kept for IPv6 */
-  char *port; /* "" when absent */
+  char *hostname; /* serialized host, brackets kept for IPv6 */
+  char *port; /* "" when absent or default */
   char *path;
   bool has_username_or_password;
   bool has_search;
   bool has_hash;
+  bool query_marker; /* an empty query ("?") still serializes */
+  bool fragment_marker; /* an empty fragment ("#") still serializes */
 } parsed_url;
 
 static void parsed_url_clear(parsed_url *url) {
@@ -214,86 +232,247 @@ static void parsed_url_clear(parsed_url *url) {
   memset(url, 0, sizeof *url);
 }
 
-static char *lower_dup_n(const char *text, size_t length) {
-  char *out = qa_llm_strndup(text, length);
-  for (size_t i = 0; i < length; i++) {
-    if (out[i] >= 'A' && out[i] <= 'Z') out[i] = (char)(out[i] - 'A' + 'a');
-  }
-  return out;
+static int hex_digit(char c) {
+  return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
 }
 
-static bool parse_url(const char *text, parsed_url *out) {
+/* WHATWG IPv4 number: 0x/0X hex (empty is 0), leading 0 octal, else decimal. */
+static bool ipv4_number(const char *text, size_t length, double *out) {
+  int radix = 10;
+  if (length >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) { radix = 16; text += 2; length -= 2; }
+  else if (length >= 2 && text[0] == '0') { radix = 8; text++; length--; }
+  double value = 0;
+  for (size_t i = 0; i < length; i++) {
+    int digit = hex_digit(text[i]);
+    if (digit < 0 || digit >= radix) return false;
+    value = value * radix + digit;
+  }
+  *out = value;
+  return true;
+}
+
+static bool ascii_digits_or_hex_number(const char *text, size_t length) {
+  if (length == 0) return false;
+  bool digits = true;
+  for (size_t i = 0; i < length; i++) if (text[i] < '0' || text[i] > '9') digits = false;
+  if (digits) return true;
+  if (length < 2 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X')) return false;
+  for (size_t i = 2; i < length; i++) if (hex_digit(text[i]) < 0) return false;
+  return true;
+}
+
+/* The host parser for a special scheme: NULL when new URL throws. */
+static char *url_host(const char *raw, size_t raw_length) {
+  if (raw_length == 0) return NULL;
+  if (raw[0] == '[') {
+    if (raw[raw_length - 1] != ']') return NULL;
+    char *inner = qa_llm_strndup(raw + 1, raw_length - 2);
+    struct in6_addr address;
+    int parsed = inet_pton(AF_INET6, inner, &address);
+    free(inner);
+    if (parsed != 1) return NULL;
+    uint16_t pieces[8];
+    for (int i = 0; i < 8; i++) pieces[i] = (uint16_t)(address.s6_addr[i * 2] << 8 | address.s6_addr[i * 2 + 1]);
+    int best = -1, best_length = 1;
+    for (int i = 0; i < 8;) {
+      if (pieces[i] != 0) { i++; continue; }
+      int run = i;
+      while (i < 8 && pieces[i] == 0) i++;
+      if (i - run > best_length) { best = run; best_length = i - run; }
+    }
+    qa_llm_strbuf out;
+    qa_llm_strbuf_init(&out);
+    qa_llm_strbuf_append_char(&out, '[');
+    for (int i = 0; i < 8; i++) {
+      if (i == best) {
+        qa_llm_strbuf_append(&out, i == 0 ? "::" : ":");
+        i += best_length - 1;
+        continue;
+      }
+      qa_llm_strbuf_appendf(&out, "%x", pieces[i]);
+      if (i < 7) qa_llm_strbuf_append_char(&out, ':');
+    }
+    qa_llm_strbuf_append_char(&out, ']');
+    return qa_llm_strbuf_steal(&out);
+  }
+  /* Percent-decode, then the ASCII lowercase of domainToASCII. */
+  qa_llm_strbuf decoded;
+  qa_llm_strbuf_init(&decoded);
+  for (size_t i = 0; i < raw_length; i++) {
+    if (raw[i] == '%' && i + 2 < raw_length + 0 && hex_digit(raw[i + 1]) >= 0 && hex_digit(raw[i + 2]) >= 0) {
+      char c = (char)(hex_digit(raw[i + 1]) * 16 + hex_digit(raw[i + 2]));
+      qa_llm_strbuf_append_char(&decoded, c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c);
+      i += 2;
+    } else {
+      char c = raw[i];
+      qa_llm_strbuf_append_char(&decoded, c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c);
+    }
+  }
+  char *host = qa_llm_strbuf_steal(&decoded);
+  size_t length = strlen(host);
+  if (length == 0) { free(host); return NULL; }
+  for (size_t i = 0; i < length; i++) {
+    uint8_t c = (uint8_t)host[i];
+    if (c <= 0x20 || c == 0x7f || strchr("#%/:<>?@[\\]^|", c) != NULL) { free(host); return NULL; }
+  }
+  /* "Ends in a number": the last label (a trailing empty one dropped). */
+  size_t end = length;
+  if (host[end - 1] == '.' && end > 1) end--;
+  size_t last = end;
+  while (last > 0 && host[last - 1] != '.') last--;
+  if (!ascii_digits_or_hex_number(host + last, end - last)) return host;
+  double parts[4];
+  size_t count = 0;
+  for (size_t begin = 0; begin <= end;) {
+    size_t stop = begin;
+    while (stop < end && host[stop] != '.') stop++;
+    if (count == 4 || !ipv4_number(host + begin, stop - begin, &parts[count]) || stop == begin) { free(host); return NULL; }
+    count++;
+    begin = stop + 1;
+    if (stop == end) break;
+  }
+  double limit = 1;
+  for (size_t i = 0; i < 5 - count; i++) limit *= 256;
+  if (parts[count - 1] >= limit) { free(host); return NULL; }
+  double ipv4 = parts[count - 1];
+  for (size_t i = 0; i + 1 < count; i++) {
+    if (parts[i] > 255) { free(host); return NULL; }
+    double scale = 1;
+    for (size_t k = i; k < 3; k++) scale *= 256;
+    ipv4 += parts[i] * scale;
+  }
+  free(host);
+  uint32_t value = (uint32_t)ipv4;
+  qa_llm_strbuf out;
+  qa_llm_strbuf_init(&out);
+  qa_llm_strbuf_appendf(&out, "%u.%u.%u.%u", value >> 24, (value >> 16) & 255, (value >> 8) & 255, value & 255);
+  return qa_llm_strbuf_steal(&out);
+}
+
+static bool url_dot_segment(const char *segment, size_t length) {
+  return (length == 1 && segment[0] == '.') || (length == 3 && strncasecmp(segment, "%2e", 3) == 0);
+}
+
+static bool url_dot_dot_segment(const char *segment, size_t length) {
+  if (length == 2) return segment[0] == '.' && segment[1] == '.';
+  if (length == 4) return (segment[0] == '.' && strncasecmp(segment + 1, "%2e", 3) == 0) ||
+                          (strncasecmp(segment, "%2e", 3) == 0 && segment[3] == '.');
+  return length == 6 && strncasecmp(segment, "%2e%2e", 6) == 0;
+}
+
+static bool parse_url(const char *input, parsed_url *out) {
   memset(out, 0, sizeof *out);
-  const char *scheme_end = strstr(text, "://");
-  if (scheme_end == NULL || scheme_end == text) return false;
-  for (const char *p = text; p < scheme_end; p++) {
-    bool valid = isalpha((uint8_t)*p) || (p > text && (isdigit((uint8_t)*p) || *p == '+' || *p == '-' || *p == '.'));
-    if (!valid) return false;
+  size_t begin = 0, finish = strlen(input);
+  while (begin < finish && (uint8_t)input[begin] <= 0x20) begin++;
+  while (finish > begin && (uint8_t)input[finish - 1] <= 0x20) finish--;
+  qa_llm_strbuf cleaned;
+  qa_llm_strbuf_init(&cleaned);
+  for (size_t i = begin; i < finish; i++) {
+    if (input[i] != '\t' && input[i] != '\n' && input[i] != '\r') qa_llm_strbuf_append_char(&cleaned, input[i]);
   }
-  if (!isalpha((uint8_t)text[0])) return false;
-  out->protocol = lower_dup_n(text, (size_t)(scheme_end - text) + 1); /* includes ':' */
-  const char *rest = scheme_end + 3;
-  const char *authority_end = rest;
-  while (*authority_end != '\0' && *authority_end != '/' && *authority_end != '?' && *authority_end != '#') authority_end++;
-  const char *host_begin = rest;
-  const char *at = NULL;
-  for (const char *p = rest; p < authority_end; p++) {
-    if (*p == '@') at = p;
+  char *text = qa_llm_strbuf_steal(&cleaned);
+  size_t scheme_length = 0;
+  if ((text[0] >= 'a' && text[0] <= 'z') || (text[0] >= 'A' && text[0] <= 'Z')) {
+    scheme_length = 1;
+    while (isalnum((uint8_t)text[scheme_length]) && (uint8_t)text[scheme_length] < 0x80) scheme_length++;
+    while (text[scheme_length] == '+' || text[scheme_length] == '-' || text[scheme_length] == '.' ||
+           (isalnum((uint8_t)text[scheme_length]) && (uint8_t)text[scheme_length] < 0x80)) scheme_length++;
   }
-  if (at != NULL) {
-    /* username[:password]@ — truthy when either side is nonempty. */
-    out->has_username_or_password = at > rest;
-    host_begin = at + 1;
+  if (scheme_length == 0 || text[scheme_length] != ':') { free(text); return false; }
+  out->protocol = lower_dup_n(text, scheme_length + 1); /* includes ':' */
+  bool special = strcmp(out->protocol, "http:") == 0 || strcmp(out->protocol, "https:") == 0 ||
+                 strcmp(out->protocol, "ws:") == 0 || strcmp(out->protocol, "wss:") == 0 ||
+                 strcmp(out->protocol, "ftp:") == 0 || strcmp(out->protocol, "file:") == 0;
+  if (!special || strcmp(out->protocol, "file:") == 0) {
+    /* Parses; otherService refuses the protocol before reading anything else. */
+    out->hostname = qa_llm_strdup("");
+    out->port = qa_llm_strdup("");
+    out->path = qa_llm_strdup("");
+    free(text);
+    return true;
   }
-  if (host_begin >= authority_end) { parsed_url_clear(out); return false; }
-  const char *port_begin = NULL;
-  const char *host_end = authority_end;
-  if (*host_begin == '[') {
-    const char *close_bracket = memchr(host_begin, ']', (size_t)(authority_end - host_begin));
-    if (close_bracket == NULL) { parsed_url_clear(out); return false; }
-    host_end = close_bracket + 1;
-    if (host_end < authority_end) {
-      if (*host_end != ':') { parsed_url_clear(out); return false; }
-      port_begin = host_end + 1;
+  const char *cursor = text + scheme_length + 1;
+  while (*cursor == '/' || *cursor == '\\') cursor++;
+  size_t authority_length = strcspn(cursor, "/\\?#");
+  const char *host = cursor;
+  size_t host_length = authority_length;
+  for (size_t i = authority_length; i-- > 0;) {
+    if (cursor[i] != '@') continue;
+    /* username or password nonempty: the userinfo is neither "" nor ":". */
+    out->has_username_or_password = i != 0 && !(i == 1 && cursor[0] == ':');
+    host = cursor + i + 1;
+    host_length = authority_length - i - 1;
+    break;
+  }
+  long port = -1;
+  bool in_brackets = false;
+  for (size_t i = 0; i < host_length; i++) {
+    if (host[i] == '[') in_brackets = true;
+    else if (host[i] == ']') in_brackets = false;
+    else if (host[i] == ':' && !in_brackets) {
+      port = 0;
+      bool any = false;
+      for (size_t k = i + 1; k < host_length; k++) {
+        if (!isdigit((uint8_t)host[k])) { free(text); parsed_url_clear(out); return false; }
+        any = true;
+        if (port <= 65535) port = port * 10 + (host[k] - '0');
+      }
+      if (port > 65535) { free(text); parsed_url_clear(out); return false; }
+      if (!any) port = -1;
+      host_length = i;
+      break;
     }
-  } else {
-    for (const char *p = host_begin; p < authority_end; p++) {
-      if (*p == ':') { host_end = p; port_begin = p + 1; break; }
-    }
   }
-  if (host_end == host_begin) { parsed_url_clear(out); return false; }
-  out->hostname = lower_dup_n(host_begin, (size_t)(host_end - host_begin));
-  out->port = qa_llm_strdup("");
-  if (port_begin != NULL && port_begin < authority_end) {
-    for (const char *p = port_begin; p < authority_end; p++) {
-      if (!isdigit((uint8_t)*p)) { parsed_url_clear(out); return false; }
+  out->hostname = url_host(host, host_length);
+  if (out->hostname == NULL) { free(text); parsed_url_clear(out); return false; }
+  int default_port = strcmp(out->protocol, "https:") == 0 || strcmp(out->protocol, "wss:") == 0 ? 443
+                     : strcmp(out->protocol, "ftp:") == 0 ? 21 : 80;
+  qa_llm_strbuf port_text;
+  qa_llm_strbuf_init(&port_text);
+  if (port >= 0 && port != default_port) qa_llm_strbuf_appendf(&port_text, "%ld", port);
+  out->port = qa_llm_strbuf_steal(&port_text);
+  /* Path: '\' is '/', dot segments fold, the path percent-encode set. */
+  const char *path = cursor + authority_length;
+  size_t path_length = strcspn(path, "?#");
+  qa_llm_strbuf pathname;
+  qa_llm_strbuf_init(&pathname);
+  size_t i = path_length != 0 ? 1 : 0;
+  for (;;) {
+    size_t segment = i;
+    while (i < path_length && path[i] != '/' && path[i] != '\\') i++;
+    bool last = i >= path_length;
+    if (url_dot_dot_segment(path + segment, i - segment)) {
+      while (pathname.length > 0 && pathname.data[pathname.length - 1] != '/') pathname.length--;
+      if (pathname.length > 0) pathname.length--;
+      if (pathname.data != NULL) pathname.data[pathname.length] = '\0';
+      if (last) qa_llm_strbuf_append_char(&pathname, '/');
+    } else if (url_dot_segment(path + segment, i - segment)) {
+      if (last) qa_llm_strbuf_append_char(&pathname, '/');
+    } else {
+      qa_llm_strbuf_append_char(&pathname, '/');
+      for (size_t k = segment; k < i; k++) {
+        uint8_t c = (uint8_t)path[k];
+        if (c <= 0x20 || c >= 0x7f || strchr("\"#<>?`{}", c) != NULL) qa_llm_strbuf_appendf(&pathname, "%%%02X", c);
+        else qa_llm_strbuf_append_char(&pathname, (char)c);
+      }
     }
-    char *port = qa_llm_strndup(port_begin, (size_t)(authority_end - port_begin));
-    long value = strtol(port, NULL, 10);
-    free(port);
-    if (value > 65535) { parsed_url_clear(out); return false; }
-    /* Default ports serialize to "" in WHATWG URL. */
-    bool is_default = (strcmp(out->protocol, "https:") == 0 && value == 443) ||
-                      (strcmp(out->protocol, "http:") == 0 && value == 80);
-    if (!is_default) {
-      free(out->port);
-      qa_llm_strbuf buffer;
-      qa_llm_strbuf_init(&buffer);
-      qa_llm_strbuf_appendf(&buffer, "%ld", value);
-      out->port = qa_llm_strbuf_steal(&buffer);
-    }
+    if (last) break;
+    i++;
   }
-  const char *path_begin = authority_end;
-  const char *path_end = path_begin;
-  while (*path_end != '\0' && *path_end != '?' && *path_end != '#') path_end++;
-  out->path = qa_llm_strndup(path_begin, (size_t)(path_end - path_begin));
-  if (*path_end == '?') {
-    const char *query_end = path_end + 1;
-    while (*query_end != '\0' && *query_end != '#') query_end++;
-    out->has_search = query_end > path_end + 1; /* url.search w/o bare '?' */
-    path_end = query_end;
+  if (pathname.length == 0) qa_llm_strbuf_append_char(&pathname, '/');
+  out->path = qa_llm_strbuf_steal(&pathname);
+  const char *rest = path + path_length;
+  if (*rest == '?') {
+    size_t query_length = strcspn(rest + 1, "#");
+    out->has_search = query_length > 0; /* url.search is "" for a bare '?' */
+    out->query_marker = true;
+    rest += 1 + query_length;
   }
-  if (*path_end == '#') out->has_hash = path_end[1] != '\0';
+  if (*rest == '#') {
+    out->has_hash = rest[1] != '\0';
+    out->fragment_marker = true;
+  }
+  free(text);
   return true;
 }
 
@@ -303,6 +482,9 @@ static char *url_to_string(const parsed_url *url) {
   qa_llm_strbuf_appendf(&out, "%s//%s", url->protocol, url->hostname);
   if (url->port[0] != '\0') qa_llm_strbuf_appendf(&out, ":%s", url->port);
   qa_llm_strbuf_append(&out, url->path[0] != '\0' ? url->path : "/");
+  /* Only empty ones reach here (a query or fragment is refused). */
+  if (url->query_marker) qa_llm_strbuf_append_char(&out, '?');
+  if (url->fragment_marker) qa_llm_strbuf_append_char(&out, '#');
   return qa_llm_strbuf_steal(&out);
 }
 
@@ -585,10 +767,20 @@ static bool service_load(qa_llm_settings_service *service, const char *name, cha
   /* Credentials copied in by older versions may be group- or world-readable. */
   (void)chmod(path, 0600);
   free(path);
-  /* readFile utf8: invalid sequences become U+FFFD in Node; settings
-   * files are ASCII JSON here, so bytes pass through as-is. */
-  qa_llm_bytes_append(&bytes, "", 1);
-  *out_text = (char *)bytes.data;
+  /* readFile(path, "utf8"): each invalid sequence becomes U+FFFD, a byte order
+   * mark stays (U+FEFF), and U+0000 is kept (as C0 80, the decoded-text form). */
+  qa_llm_bytes decoded;
+  qa_llm_bytes_init(&decoded);
+  qa_llm_utf8_decode_lossy(bytes.data, bytes.length, &decoded);
+  qa_llm_bytes_free(&bytes);
+  qa_llm_strbuf text;
+  qa_llm_strbuf_init(&text);
+  for (size_t i = 0; i < decoded.length; i++) {
+    if (decoded.data[i] == 0) qa_llm_strbuf_append_n(&text, "\xc0\x80", 2);
+    else qa_llm_strbuf_append_char(&text, (char)decoded.data[i]);
+  }
+  qa_llm_bytes_free(&decoded);
+  *out_text = qa_llm_strbuf_steal(&text);
   return true;
 }
 
@@ -1380,10 +1572,14 @@ bool qa_llm_settings_refresh_models(qa_llm_settings_service *service, qa_llm_pro
   service->catalogs[selected].status = QA_LLM_CATALOG_LOADING;
   free(service->catalogs[selected].message);
   service->catalogs[selected].message = NULL;
+  /* `previous` is what a failure restores, even after the ready list was set. */
+  qa_llm_model_list previous;
+  qa_llm_model_list_copy(&service->catalogs[selected].models, &previous);
 
   qa_llm_abort_signal controller;
   double requested_timeout = service->request_options.has_timeout ? service->request_options.timeout_ms : 30000;
-  double timeout = requested_timeout < 30000 ? requested_timeout : 30000;
+  /* Math.min(timeoutMs ?? 30_000, 30_000): NaN stays NaN (setTimeout then fires after 1 ms). */
+  double timeout = requested_timeout != requested_timeout ? requested_timeout : requested_timeout < 30000 ? requested_timeout : 30000;
   qa_llm_model_list models;
   memset(&models, 0, sizeof models);
   bool ok = run_request_begin(service, caller, timeout, &controller, error);
@@ -1465,16 +1661,20 @@ bool qa_llm_settings_refresh_models(qa_llm_settings_service *service, qa_llm_pro
       if (!service->has_catalog_generation[selected] || service->catalog_generations[selected] != generation) {
         /* Superseded: return models without touching the catalog. */
         run_request_end(service, &controller);
+        qa_llm_model_list_free(&previous);
         *out_models = models;
         return true;
       }
       qa_llm_model_list_free(&service->catalogs[selected].models);
       qa_llm_model_list_copy(&models, &service->catalogs[selected].models);
       service->catalogs[selected].status = QA_LLM_CATALOG_READY;
-      /* mutate(): persist the recommended default / drop stale effort. */
-      if (check_mutable(service, error) &&
-          service->has_catalog_generation[selected] && service->catalog_generations[selected] == generation &&
-          qa_llm_check_request_abort(&controller, error)) {
+      /* mutate(): persist the recommended default / drop stale effort. A closed
+       * service rejects the mutation and a cancelled signal throws inside it;
+       * a superseded generation returns quietly. */
+      if (!check_mutable(service, error)) ok = false;
+      else if (service->has_catalog_generation[selected] && service->catalog_generations[selected] == generation &&
+               !qa_llm_check_request_abort(&controller, error)) ok = false;
+      if (ok && service->has_catalog_generation[selected] && service->catalog_generations[selected] == generation) {
         preferences current;
         if (editable_preferences(service, &current, error)) {
           {
@@ -1482,11 +1682,11 @@ bool qa_llm_settings_refresh_models(qa_llm_settings_service *service, qa_llm_pro
                 : current.models[selected == QA_LLM_PROVIDER_SUBSCRIPTION ? 0 : 1];
             const qa_llm_model *selected_model = NULL;
             const qa_llm_model *default_model = NULL;
-            for (size_t i = 0; i < models.count; i++) {
+            for (size_t i = 0; selected_model == NULL && i < models.count; i++) { /* find: first match */
               if (strcmp(models.items[i].id, name) == 0) selected_model = &models.items[i];
             }
             if (selected_model == NULL && name[0] == '\0') {
-              for (size_t i = 0; i < models.count; i++) {
+              for (size_t i = 0; selected_model == NULL && i < models.count; i++) {
                 if (models.items[i].recommended) selected_model = &models.items[i];
               }
             }
@@ -1542,6 +1742,9 @@ bool qa_llm_settings_refresh_models(qa_llm_settings_service *service, qa_llm_pro
     qa_llm_model_list_free(&models);
     run_request_map_error(&controller, error);
     if (service->has_catalog_generation[selected] && service->catalog_generations[selected] == generation) {
+      qa_llm_model_list_free(&service->catalogs[selected].models);
+      service->catalogs[selected].models = previous;
+      memset(&previous, 0, sizeof previous);
       if (qa_llm_signal_is_aborted(caller) || service->closed) {
         service->catalogs[selected].status = QA_LLM_CATALOG_IDLE;
       } else {
@@ -1550,8 +1753,10 @@ bool qa_llm_settings_refresh_models(qa_llm_settings_service *service, qa_llm_pro
         service->catalogs[selected].message = qa_llm_strdup(error->message[0] != '\0' ? error->message : "Could not load models. Try Refresh models.");
       }
     }
+    qa_llm_model_list_free(&previous);
     return false;
   }
+  qa_llm_model_list_free(&previous);
   qa_llm_model_list_copy(&service->catalogs[selected].models, out_models);
   qa_llm_model_list_free(&models);
   return true;

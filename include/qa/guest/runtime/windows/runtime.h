@@ -92,7 +92,5 @@ void qa_windows_guest_runtime_heap_state(qa_windows_guest_runtime *runtime, qa_n
 /* TS restoreHeapState: every block must lie in a mapping already restored. */
 void qa_windows_guest_runtime_restore_heap_state(qa_windows_guest_runtime *runtime, const qa_native_heap_block *blocks,
                                                  size_t block_count, const qa_windows_heap_tables *tables);
-/* TS chargeBytes: forwards to the attached runner, if any. */
-void qa_windows_guest_runtime_charge_bytes(qa_windows_guest_runtime *runtime, size_t byte_length);
 
 #endif

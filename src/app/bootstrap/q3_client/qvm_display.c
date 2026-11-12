@@ -7,6 +7,7 @@
 #include "qa/compat/qvm/memory.h"
 #include "qa/render/q3_hardware.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 static int32_t word_i32(const qa_qvm_host_call *call, size_t offset) {
   int32_t v;
@@ -51,10 +52,11 @@ bool qa_app_qvm_display_syscall(const qa_qvm_host_call *call, qa_app_qvm_display
     bool legacy = !is(profile, "q3-modern");
     int64_t bytes = legacy ? 4164 : 11332;
     int64_t shift = legacy ? 7168 : 0;
-    int32_t pointer = word_i32(call, 4);
+    int64_t pointer = word_i32(call, 4); /* pointer + offset in doubles, as TS: never an int32 overflow */
+    /* guest.view(pointer, bytes) checks the record before o.viewport() runs */
+    qa_qvm_memory_span span = qa_qvm_memory_get_span(guest, pointer, bytes, 0);
     double width = 0, height = 0;
     options.viewport(options.viewport_ctx, &width, &height);
-    qa_qvm_memory_span span = qa_qvm_memory_get_span(guest, pointer, bytes, 0);
     qa_qvm_memory_fill_bytes(guest, span.byte_offset, span.byte_length, 0);
     const qa_app_gl_config *gl = options.gl_config;
     const qa_app_gl_driver *driver = options.driver;
@@ -79,17 +81,22 @@ bool qa_app_qvm_display_syscall(const qa_qvm_host_call *call, qa_app_qvm_display
   if (call->code == register_font) {
     int32_t name_word = word_i32(call, 4);
     int32_t size = word_i32(call, 8);
-    int32_t pointer = word_i32(call, 12);
+    int64_t pointer = word_i32(call, 12);
     char *name = name_word == 0 ? NULL : qa_qvm_memory_read_string(guest, name_word);
-    font_destination_ctx destination = {&options, guest, pointer};
+    font_destination_ctx destination = {&options, guest, (int32_t)pointer};
+    qa_cleanup name_guard;
+    qa_cleanup_push(&name_guard, free, name);
     const qa_q3_registered_font *font = qa_q3_renderer_font_registry_register_font(
         qa_app_application_q3_assets_fonts(options.media), name, size,
         font_print_bridge, options.media, font_destination, &destination);
+    qa_cleanup_pop(&name_guard);
     free(name);
     options.assert_current(options.assert_ctx);
     if (font == NULL) { *out = 0; return true; }
     for (int index = 0; index < 255; index++) {
       char *path = qa_qvm_memory_read_string(guest, pointer + index * 80 + 48);
+      qa_cleanup path_guard;
+      qa_cleanup_push(&path_guard, free, path);
       const qa_q3_pres_scene_shader *shader = NULL;
       qa_q3_pres_q3_renderer_resources_register_shader_no_mip(options.resources, path, &shader);
       options.assert_current(options.assert_ctx);
@@ -97,6 +104,7 @@ bool qa_app_qvm_display_syscall(const qa_qvm_host_call *call, qa_app_qvm_display
       qa_qvm_writable_view view;
       qa_qvm_memory_view(guest, pointer + index * 80 + 44, 4, 0, &view);
       qa_qvm_writable_view_set_int32(&view, 0, qa_js_to_int32(handle), true);
+      qa_cleanup_pop(&path_guard);
       free(path);
     }
     *out = 0;

@@ -34,7 +34,7 @@ qa_q3_arsenal_runtime_state qa_q3_request_weapon(qa_q3_arsenal_runtime_state r, 
   bool ok=false;
   for(size_t i=0;i<QA_Q3_WEAPON_ITEM_COUNT;i++)
     if(qa_q3_weapon_items[i].weapon==weapon&&(strcmp(r.product,"missionpack")==0||weapon<=10)) ok=true;
-  if(!ok) qa_range_error("Requested weapon does not belong to the Q3 product");
+  if(!ok) qa_raise("Error", 0, 0, "Requested weapon does not belong to the Q3 product");
   r.has_requested_weapon=true; r.requested_weapon=weapon; return r;
 }
 qa_q3_arsenal_runtime_state qa_q3_request_weapon_holster(qa_q3_arsenal_runtime_state r){
@@ -44,7 +44,7 @@ qa_q3_arsenal_runtime_state qa_q3_request_weapon_holster(qa_q3_arsenal_runtime_s
 }
 qa_q3_arsenal_runtime_state qa_q3_request_weapon_resume(qa_q3_arsenal_runtime_state r){
   if(r.external_slot==QA_Q3_WEAPON_SLOT_ACTIVE||r.external_slot==QA_Q3_WEAPON_SLOT_RESUME_REQUESTED) return r;
-  if(r.external_slot!=QA_Q3_WEAPON_SLOT_HOLSTERED) qa_range_error("Q3 primary must finish its source drop before resuming");
+  if(r.external_slot!=QA_Q3_WEAPON_SLOT_HOLSTERED) qa_raise("Error", 0, 0, "Q3 primary must finish its source drop before resuming");
   r.external_slot=QA_Q3_WEAPON_SLOT_RESUME_REQUESTED; return r;
 }
 
@@ -101,9 +101,9 @@ static double ammo_get(void*ctx,double weapon){
 }
 static void ammo_set(void*ctx,double weapon,double count){
   step_ctx*c=ctx; const qa_q3_weapon_item*item=qa_q3_get_weapon_item(weapon);
-  if(!item||!item->ammo) qa_range_error("Q3 weapon has no consumable ammo slot: %s",QA_JS_NUMBER(weapon));
+  if(!item||!item->ammo) qa_raise("Error", 0, 0, "Q3 weapon has no consumable ammo slot: %s",QA_JS_NUMBER(weapon));
   qa_inventory_entry*e=find_entry(c,item->ammo);
-  if(!e) qa_range_error("Missing Q3 ammo inventory entry: %s",item->ammo);
+  if(!e) qa_raise("Error", 0, 0, "Missing Q3 ammo inventory entry: %s",item->ammo);
   double before=e->count; e->count=count;
   qa_movement_effect eff={0}; eff.kind=QA_MOVEMENT_EFFECT_AMMO; eff.item=item->ammo;
   eff.ammo_before=before; eff.ammo_after=count; push_effect(c,eff);
@@ -134,7 +134,7 @@ static double firing_trampoline(void*ctx,double ms){
 qa_q3_arsenal_step qa_q3_step_arsenal(qa_weapon_step_input input, qa_q3_arsenal_runtime_state runtime,
     qa_q3_arsenal_controls controls, qa_q3_firing_delay_fn firing_delay, void *firing_delay_ctx){
   if(!input.arsenal.state.kind||strcmp(input.arsenal.state.kind,"q3")!=0)
-    qa_range_error("Q3 arsenal adapter requires Q3 weapon state");
+    qa_raise("TypeError", 0, 0, "Q3 arsenal adapter requires Q3 weapon state");
   double elapsed=input.frame.elapsed.kind==QA_SOURCE_TIME_MILLISECONDS?input.frame.elapsed.value:input.frame.elapsed.value*1000;
   double clockv=elapsed+runtime.fractional_milliseconds;
   double msec=trunc(clockv);

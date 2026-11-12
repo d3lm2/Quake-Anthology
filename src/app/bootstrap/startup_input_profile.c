@@ -2,6 +2,7 @@
 #include "qa/app/bootstrap/startup_input_profile.h"
 #include <stdlib.h>
 #include <string.h>
+#include "qa/app/bootstrap/native_settings.h"
 #include "qa/foundation/support.h"
 #include "qa/input/bindings.h"
 #include "qa/input/gamepad.h"
@@ -13,6 +14,8 @@ struct qa_app_startup_input_profile {
   qa_seat_input *input;
   char *baseline;
   char *gamepad_baseline;
+  qa_app_stock_native *native; /* owned; NULL = TS null */
+  bool bind_local;
 };
 static char *checked(char *text) {
   if (text == NULL) qa_range_error("Out of memory");
@@ -32,8 +35,38 @@ static qa_app_startup_input_profile *make_profile(const qa_config_store *setting
   p->input = input;
   return p;
 }
+/* archivedBindingPairs over a binding list, as a borrowed-pair view. The caller frees both. */
+static qa_layer_pair *archived_pairs(const qa_input_binding *bindings, size_t count, qa_binding_pair **out_pairs, size_t *out_count) {
+  *out_pairs = qa_archived_binding_pairs(bindings, count, false, out_count);
+  if (*out_pairs == NULL && *out_count > 0) qa_range_error("Out of memory");
+  qa_layer_pair *view = calloc(*out_count + 1, sizeof *view);
+  if (view == NULL) qa_range_error("Out of memory");
+  for (size_t i = 0; i < *out_count; i++) view[i] = (qa_layer_pair){(*out_pairs)[i].key, (*out_pairs)[i].command};
+  return view;
+}
+/* native?.layers?.noteDefaultBinds(archivedBindingPairs({ bindings: defaults })) */
+static void note_defaults(qa_app_stock_native *native, const qa_input_binding *defaults, size_t count) {
+  if (native == NULL || native->config.layers == NULL) return;
+  qa_binding_pair *pairs = NULL;
+  size_t pair_count = 0;
+  qa_layer_pair *view = archived_pairs(defaults, count, &pairs, &pair_count);
+  qa_game_layers_note_default_binds(native->config.layers, view, pair_count);
+  free(view);
+  qa_binding_pairs_free(pairs, pair_count);
+}
 qa_app_startup_input_profile *qa_app_startup_input_profile_retained(const qa_config_store *settings, qa_seat_input *input) {
+  return qa_app_startup_input_profile_retained_native(settings, input, NULL, NULL, 0);
+}
+bool qa_app_startup_input_profile_bind_local(const qa_app_startup_input_profile *p) { return p->bind_local; }
+void qa_app_startup_input_profile_set_bind_local(qa_app_startup_input_profile *p, bool local) { p->bind_local = local; }
+bool qa_app_startup_input_profile_layered(const qa_app_startup_input_profile *p) {
+  return p->native != NULL && p->native->config.layers != NULL;
+}
+qa_app_startup_input_profile *qa_app_startup_input_profile_retained_native(const qa_config_store *settings, qa_seat_input *input,
+    qa_app_stock_native *native, const qa_input_binding *defaults, size_t default_count) {
   qa_app_startup_input_profile *p = make_profile(settings, input);
+  p->native = native;
+  note_defaults(native, defaults, default_count);
   p->baseline = bindings_text(input);
   p->gamepad_baseline = gamepad_text(input);
   return p;
@@ -42,25 +75,50 @@ static void seat_settings_cleanup(void *arg) { qa_seat_settings_free(arg); }
 static void profile_cleanup(void *arg) { qa_app_startup_input_profile_destroy(arg); }
 qa_app_startup_input_profile *qa_app_startup_input_profile_open(const qa_config_store *settings, qa_seat_input *input, qa_command_dialect dialect,
                                                                 const qa_weapon_binding_item *items, size_t item_count) {
+  return qa_app_startup_input_profile_open_native(settings, input, dialect, items, item_count, NULL);
+}
+static void bindings_cleanup(void *arg) { qa_native_bindings_free(arg); }
+qa_app_startup_input_profile *qa_app_startup_input_profile_open_native(const qa_config_store *settings, qa_seat_input *input,
+    qa_command_dialect dialect, const qa_weapon_binding_item *items, size_t item_count, qa_app_stock_native *native) {
   qa_app_startup_input_profile *p = make_profile(settings, input);
+  p->native = native;
   qa_cleanup profile_guard;
   qa_cleanup_push(&profile_guard, profile_cleanup, p);
+  size_t default_count = 0;
+  qa_input_binding *defaults = qa_default_bindings(0, dialect, items, item_count, &default_count);
+  if (defaults == NULL) qa_range_error("Out of memory");
+  note_defaults(native, defaults, default_count);
   qa_seat_settings saved;
   memset(&saved, 0, sizeof saved);
   bool has_saved = qa_config_store_load_seat(settings, "input/seat-1.json", &saved);
   qa_cleanup saved_guard;
   qa_cleanup_push(&saved_guard, seat_settings_cleanup, &saved);
+  qa_native_bindings own = {NULL, 0};
+  bool has_own = native != NULL && qa_native_config_read_bindings(&native->config, &own);
+  qa_cleanup own_guard;
+  qa_cleanup_push(&own_guard, bindings_cleanup, &own);
   qa_seat_input_unbind_all(input);
-  if (has_saved) {
+  if (has_own) {
+    /* A stock game's own file outranks the user store. */
+    for (size_t i = 0; i < default_count; i++) qa_seat_input_bind(input, &defaults[i]);
+    for (size_t i = 0; i < own.count; i++) {
+      qa_input_binding binding;
+      memset(&binding, 0, sizeof binding);
+      if (!qa_named_physical_input(own.pairs[i].key, 0, &binding.input)) continue;
+      binding.target.is_action = false;
+      binding.target.text = own.pairs[i].command;
+      qa_seat_input_bind(input, &binding);
+    }
+  } else if (has_saved) {
     for (size_t i = 0; i < saved.binding_count; i++) qa_seat_input_bind(input, &saved.bindings[i]);
-    qa_seat_input_gamepad(input)->tuning = saved.gamepad;
   } else {
-    size_t count = 0;
-    qa_input_binding *defaults = qa_default_bindings(0, dialect, items, item_count, &count);
-    for (size_t i = 0; i < count; i++) qa_seat_input_bind(input, &defaults[i]);
-    for (size_t i = 0; i < count; i++) qa_input_binding_dispose(&defaults[i]);
-    free(defaults);
+    for (size_t i = 0; i < default_count; i++) qa_seat_input_bind(input, &defaults[i]);
   }
+  if (has_saved) qa_seat_input_gamepad(input)->tuning = saved.gamepad;
+  qa_cleanup_pop(&own_guard);
+  qa_native_bindings_free(&own);
+  for (size_t i = 0; i < default_count; i++) qa_input_binding_dispose(&defaults[i]);
+  free(defaults);
   qa_cleanup_pop(&saved_guard);
   qa_seat_settings_free(&saved);
   p->baseline = bindings_text(input);
@@ -71,6 +129,7 @@ qa_app_startup_input_profile *qa_app_startup_input_profile_open(const qa_config_
 void qa_app_startup_input_profile_destroy(qa_app_startup_input_profile *p) {
   if (p == NULL) return;
   qa_config_store_destroy(&p->settings);
+  qa_app_stock_native_destroy(p->native);
   free(p->baseline);
   free(p->gamepad_baseline);
   free(p);
@@ -139,10 +198,16 @@ void qa_app_startup_input_profile_save(qa_app_startup_input_profile *p, const qa
     baseline.gamepad = qa_seat_input_gamepad(p->input)->tuning;
     baseline.mouse = qa_default_mouse_tuning;
     baseline.rumble = true;
-    baseline.rumble_strength = 1; /* TS absent; the parser and writer resolve it to 1 */
+    baseline.rumble_strength = 1;
+    baseline.rumble_strength_absent = true; /* the literal has no rumbleStrength; JSON.stringify leaves it out */
     baseline.controller.kind = QA_CONTROLLER_AUTOMATIC;
     baseline.bindings = scope.bindings;
     baseline.binding_count = scope.binding_count;
+    /* The literal's key order: version, gamepad, mouse, history, rumble, controller, bindings. */
+    static const uint8_t literal_keys[] = {QA_SEAT_KEY_VERSION, QA_SEAT_KEY_GAMEPAD, QA_SEAT_KEY_MOUSE, QA_SEAT_KEY_HISTORY,
+                                           QA_SEAT_KEY_RUMBLE, QA_SEAT_KEY_CONTROLLER, QA_SEAT_KEY_BINDINGS};
+    memcpy(baseline.key_order, literal_keys, sizeof literal_keys);
+    baseline.key_count = (uint8_t)sizeof literal_keys;
   }
   qa_seat_settings merged = baseline;
   if (bindings_changed) { merged.bindings = scope.bindings; merged.binding_count = scope.binding_count; }
@@ -161,7 +226,16 @@ void qa_app_startup_input_profile_save(qa_app_startup_input_profile *p, const qa
     differs = strcmp(scope.selected_text, scope.baseline_text) != 0;
   }
   if ((bindings_changed || gamepad_changed || differs) && !qa_config_store_save_seat(&p->settings, "input/seat-1.json", &selected))
-    qa_raise("Error", 0, 0, "Could not write input/seat-1.json");
+    qa_settings_raise_write_failure();
+  if (bindings_changed && p->native != NULL) {
+    /* await this.native.writeBindings(archivedBindingPairs(this.input), { local: this.bindLocal }) */
+    qa_binding_pair *pairs = NULL;
+    size_t pair_count = 0;
+    qa_layer_pair *view = archived_pairs(current_bindings, count, &pairs, &pair_count);
+    qa_native_config_write_bindings(&p->native->config, view, pair_count, NULL, p->bind_local);
+    free(view);
+    qa_binding_pairs_free(pairs, pair_count);
+  }
   free(p->baseline);
   p->baseline = scope.current;
   scope.current = NULL;

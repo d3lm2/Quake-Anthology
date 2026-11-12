@@ -65,9 +65,12 @@ static void grip_run(void *ctx) {
   char *path = malloc(length);
   if (path == NULL) qa_range_error("Out of memory");
   snprintf(path, length, "%s.attachment.json", job->entity->resource.requested_path);
+  qa_cleanup path_guard;
+  qa_cleanup_push(&path_guard, free, path);
   qa_content_mounted *mounts = job->weapons->assets.mounts(job->weapons->assets.ctx, job->content);
   qa_content_opened_resource file;
   bool opened = qa_content_mounted_open(mounts, path, NULL, NULL, &file);
+  qa_cleanup_pop(&path_guard);
   free(path);
   const qa_model_attachment_definition *definition;
   if (!opened) definition = qa_q2_weapon_attachment(job->entity->resource.digest);

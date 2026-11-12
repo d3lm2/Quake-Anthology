@@ -8,6 +8,10 @@
 #define qa_compat_q2_rerelease_mod_layout qa_compat_q2_native_rerelease_mod_layout
 qa_compat_q2_guest_call_signature qa_compat_q2_rerelease_get_spawn_signature(void);
 qa_compat_q2_guest_call_signature qa_compat_q2_rerelease_get_free_signature(void);
+/* TS rereleaseDamageSignature / rereleasePowerArmorSignature: the signature of the stock call. `storage` receives
+ * its parameter layouts and must hold the stock call's argument count (10 for damage, 5 for power armor); the
+ * returned signature points into it. A declared call (world profile) has no such bound: its callers size the
+ * storage by call->argument_count. */
 qa_compat_q2_guest_call_signature qa_compat_q2_rerelease_get_damage_signature(qa_guest_value_layout *storage);
 qa_compat_q2_guest_call_signature qa_compat_q2_rerelease_get_power_armor_signature(qa_guest_value_layout *storage);
 typedef struct qa_compat_q2_rerelease_native_entries {

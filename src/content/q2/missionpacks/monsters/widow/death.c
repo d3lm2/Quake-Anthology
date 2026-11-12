@@ -155,14 +155,11 @@ static void legs_think_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services *
       qa_vec3 point = qa_q2mpm_widow_project(entity, game, offsets[part]);
       qa_q2mpm_widow_effect_default(game, point);
       small_gibs(entity, game, point);
-      for (double i = 1; i <= pieces[part]; i++) {
-        char model[64];
-        snprintf(model, sizeof model, "models/monsters/blackwidow/gib%d/tris.md2", (int)i);
-        char *copy = malloc(strlen(model) + 1);
-        if (!copy) qa_raise("Error", 0, 0, "Out of memory in widow legs");
-        strcpy(copy, model);
-        (void)qa_q2mpm_widow_gib(entity, game, copy, 80 + trunc(q2mpm_rnd(game) * 20), false, &point, true, "", true);
-      }
+      /* The gib borrows its model name: static text, not a copy that nothing frees. */
+      static const char *const models[3] = {"models/monsters/blackwidow/gib1/tris.md2", "models/monsters/blackwidow/gib2/tris.md2",
+                                            "models/monsters/blackwidow/gib3/tris.md2"};
+      for (int i = 1; i <= (int)pieces[part]; i++)
+        (void)qa_q2mpm_widow_gib(entity, game, models[i - 1], 80 + trunc(q2mpm_rnd(game) * 20), false, &point, true, "", true);
     }
     game->remove(game->ctx, entity);
     return;
@@ -238,12 +235,9 @@ void qa_q2mpm_widow_explosion_leg(qa_q2m_context *context) {
   for (int i = 0; i < 2; i++) {
     qa_vec3 point = qa_q2mpm_widow_project(entity, game, offsets[i]);
     qa_q2mpm_widow_effect(game, point, pieces[i] == 2 ? "q2:explosion1_big" : "q2:explosion1", 1);
-    char model[64];
-    snprintf(model, sizeof model, "models/monsters/blackwidow2/gib%d/tris.md2", (int)pieces[i]);
-    char *copy = malloc(strlen(model) + 1);
-    if (!copy) qa_raise("Error", 0, 0, "Out of memory in widow explosion leg");
-    strcpy(copy, model);
-    (void)qa_q2mpm_widow_gib(entity, game, copy, damages[i], false, &point, true, "misc/fhit3.wav", false);
+    /* The gib borrows its model name: static text, not a copy that nothing frees. */
+    const char *model = pieces[i] == 2 ? "models/monsters/blackwidow2/gib2/tris.md2" : "models/monsters/blackwidow2/gib1/tris.md2";
+    (void)qa_q2mpm_widow_gib(entity, game, model, damages[i], false, &point, true, "misc/fhit3.wav", false);
     (void)qa_q2mpm_widow_gib(entity, game, MEAT, 300, true, &point, false, "", false);
     (void)qa_q2mpm_widow_gib(entity, game, METAL, 100, false, &point, false, "", false);
   }
@@ -263,7 +257,8 @@ static void explode_fn(void *ctx, qa_q2_entity *entity, qa_q2_game_services *gam
   qa_vec3 point = origin;
   point.z += 24 + (double)(qa_js_to_int32(qa_js_to_uint32(floor(q2mpm_rnd(game) * 2147483648.0)) & 15u));
   if (entity->count < 8) point.z += 24 + (double)(qa_js_to_int32(qa_js_to_uint32(floor(q2mpm_rnd(game) * 2147483648.0)) & 31u));
-  int count = (int)entity->count;
+  /* JS switch compares with ===: only the integers 0..12 match a case. */
+  int count = entity->count >= 0 && entity->count <= 12 && entity->count == trunc(entity->count) ? (int)entity->count : -1;
   switch (count) {
     case 0: point = qa_add3_double(point, q2mpm_v3(-24, -24, 0)); break;
     case 1: point = qa_add3_double(point, q2mpm_v3(24, 24, 0)); small_gibs(entity, game, point); break;

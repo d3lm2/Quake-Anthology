@@ -40,9 +40,8 @@ typedef struct qa_compat_q2_rerelease_weapon_profile {
 /* False is the TS null. On true, out owns malloc'd copies; release
  * with qa_compat_q2_native_weapon_declaration_free. */
 bool qa_compat_q2_built_in_rerelease_weapon_declaration(qa_module_identity module, qa_native_weapon_behavior_declaration *out);
-/* False is the TS null. declaration NULL is TS undefined. The
- * definition borrows strings from process-retained scratch that the
- * next call here replaces (the TS definition shares the profile). */
+/* False is the TS null. declaration NULL is TS undefined. The definition's id and title are kept for the life of
+ * the process, one copy per distinct text, so a definition stays readable after later calls. */
 bool qa_compat_q2_rerelease_weapon_definition(qa_module_identity module, const qa_native_weapon_behavior_declaration *declaration,
                                               qa_weapon_behavior_definition *out);
 /* TS rereleaseWeaponProfile; declaration NULL is TS undefined. NULL only on OOM. */

@@ -88,13 +88,14 @@ bool qa_qvm_server_game_syscall(const qa_qvm_host_call *call,
       if (qa_qvm_host_call_word(call, 2) == 0)
         qa_common_error(QA_COMMON_ERROR_DROP, "SV_SetBrushModel: NULL");
       char *name = qa_qvm_game_memory_read_string(QA_SHARED_GUEST(call), qa_qvm_host_call_word(call, 2));
-      if (name[0] != '*') {
-        char message[1200];
-        snprintf(message, sizeof message, "SV_SetBrushModel: %s isn't a brush model", name);
-        free(name);
-        qa_common_error(QA_COMMON_ERROR_DROP, message);
-      }
+      /* The name is the guest's and has no length limit; it is released when
+       * the raise (or a refusing owner) abandons this frame. */
+      qa_cleanup name_cleanup;
+      qa_cleanup_push(&name_cleanup, free, name);
+      if (name[0] != '*')
+        qa_raise("CommonError", (int)QA_COMMON_ERROR_DROP, 0, "SV_SetBrushModel: %s isn't a brush model", name);
       spatial->set_brush_model(spatial->ctx, slot(call, services, 1), name);
+      qa_cleanup_pop(&name_cleanup);
       free(name);
       *out = 0;
       return true;

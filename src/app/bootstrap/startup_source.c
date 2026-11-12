@@ -9,6 +9,7 @@
 #include "qa/app/bootstrap/simulation/quakeworld_cvars.h"
 #include "qa/content/q3/base/settings.h"
 #include "qa/core/q3_product_policy.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/settings/server/cvars.h"
@@ -146,11 +147,9 @@ qa_app_startup_rules qa_app_resolve_startup_rules(qa_app_options options, qa_cva
     free(owners); free(targets);
   }
   apply_latched_all(cvars);
-  double skill_value = floor(qa_cvar_registry_variable_value(cvars, "skill"));
-  if (skill_value < 0) skill_value = 0;
-  if (skill_value > 3) skill_value = 3;
+  double skill_value = qa_js_max(0, qa_js_min(3, floor(qa_cvar_registry_variable_value(cvars, "skill"))));
   if (skill_value != 0 && skill_value != 1 && skill_value != 2 && skill_value != 3)
-    qa_range_error("Invalid source startup difficulty");
+    qa_raise("Error", 0, 0, "Invalid source startup difficulty");
   const char *mode;
   if (apply_explicit && options.explicit_mode) mode = options.mode;
   else if (qa_cvar_registry_dialect(cvars) == QA_COMMAND_DIALECT_Q3)
@@ -164,11 +163,9 @@ qa_app_startup_rules qa_app_resolve_startup_rules(qa_app_options options, qa_cva
   double native_capacity = (is_q2(qa_cvar_registry_dialect(cvars)) && requested <= 1)
                                ? (strcmp(mode, "deathmatch") == 0 ? 8 : strcmp(mode, "coop") == 0 ? 4 : requested)
                                : requested;
-  double floor_clients = options.dedicated ? 1 : options.seats;
-  double truncated = trunc(native_capacity);
-  double max_clients = floor_clients > truncated ? floor_clients : truncated;
+  double max_clients = qa_js_max(options.dedicated ? 1 : options.seats, trunc(native_capacity));
   if (max_clients != trunc(max_clients) || max_clients < 1 || max_clients > 64)
-    qa_range_error("Source startup client capacity must be between 1 and 64");
+    qa_raise("Error", 0, 0, "Source startup client capacity must be between 1 and 64");
   char *clients = num(max_clients);
   cvar_set_(cvars, capacity_name, clients, true);
   free(clients);

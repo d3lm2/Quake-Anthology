@@ -10,8 +10,11 @@
  *  - Uint8Array copies become malloc'd buffers the caller frees;
  *    dataView becomes a borrowed pointer into the reader's storage
  *    (sections share storage, byte reads copy, as in the TS).
- *  - The reader borrows its byte storage (mutable, like a Uint8Array)
- *    and owns a copy of its source name; destroy frees only the name.
+ *  - The reader borrows its byte storage (mutable, like a Uint8Array).
+ *    Its source name is interned (one process-lifetime copy per distinct
+ *    name, as TS shares the immutable string), so a reader abandoned by a
+ *    raise owns nothing; destroy only clears the fields. The caller's
+ *    name argument may be freed right after init.
  *  - fixedString validates UTF-8 like the TS fatal TextDecoder; the
  *    decoder's TypeError aborts with the oracle runtime's message.
  * GPL-2.0-or-later.
@@ -29,7 +32,7 @@ noreturn void qa_binary_error(const char *source, int64_t offset,
 typedef struct qa_binary_reader {
   uint8_t *data; /* borrowed */
   size_t length;
-  char *source; /* owned */
+  char *source; /* interned: never freed or written */
   size_t cursor;
 } qa_binary_reader;
 

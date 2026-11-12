@@ -13,18 +13,46 @@
 #include "qa/foundation/support.h"
 #include "qa/movement/q3/constants.h"
 
-/* TS primaryWeaponHandoff(actor)'s closure state (one record per actor, kept until destroy). */
+/* TS primaryWeaponHandoff(actor)'s closure state (one record per actor slot; see handoff()). */
 typedef struct q1_handoff { qa_q1_services *game; qa_owned_actor actor; } q1_handoff;
 struct qa_app_q1_selected_arsenal {
   qa_app_q1_selected_arsenal_options options;
   qa_q1_weapon *weapons; size_t weapon_count;
   qa_item_id *replaced; size_t replaced_count;
   q1_handoff **handoffs; size_t handoff_count;
+  /* ui()'s labels (q1WeaponDisplayName), whole, one per distinct weapon and kept until destroy: a nested ui() read
+   * cannot release a label an outer read still holds. */
+  char **label_weapons, **labels; size_t label_count;
 };
+static const char *q1_label(qa_app_q1_selected_arsenal *arsenal, qa_q1_weapon weapon) {
+  const char *key = weapon != NULL ? weapon : "";
+  for (size_t i = 0; i < arsenal->label_count; i++) if (strcmp(arsenal->label_weapons[i], key) == 0) return arsenal->labels[i];
+  size_t size = qa_app_q1_weapon_label_size(weapon);
+  char *label = calloc(size, 1), *copy = malloc(strlen(key) + 1);
+  char **weapons = realloc(arsenal->label_weapons, (arsenal->label_count + 1) * sizeof *weapons);
+  if (weapons != NULL) arsenal->label_weapons = weapons;
+  char **labels = weapons == NULL ? NULL : realloc(arsenal->labels, (arsenal->label_count + 1) * sizeof *labels);
+  if (labels != NULL) arsenal->labels = labels;
+  if (label == NULL || copy == NULL || labels == NULL) { free(label); free(copy); qa_range_error("Out of memory"); }
+  qa_app_q1_weapon_display_name(weapon, label, size);
+  memcpy(copy, key, strlen(key) + 1);
+  arsenal->label_weapons[arsenal->label_count] = copy;
+  arsenal->labels[arsenal->label_count++] = label;
+  return label;
+}
 
 static noreturn void q1_fail(const char *format, ...) {
-  char message[512];
-  va_list args; va_start(args, format); vsnprintf(message, sizeof message, format, args); va_end(args);
+  va_list args, copy;
+  va_start(args, format);
+  va_copy(copy, args);
+  int length = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *message = length < 0 ? NULL : malloc((size_t)length + 1);
+  if (message == NULL) { va_end(args); qa_range_error("Out of memory"); }
+  vsnprintf(message, (size_t)length + 1, format, args);
+  va_end(args);
+  qa_cleanup message_cleanup;
+  qa_cleanup_push(&message_cleanup, free, message);
   qa_raise("Error", 0, 0, "%s", message);
 }
 static bool item_eq(qa_item_id a, qa_item_id b) { return a != NULL && b != NULL && strcmp(a, b) == 0; }
@@ -68,7 +96,9 @@ qa_app_q1_selected_arsenal *qa_app_q1_selected_arsenal_create(qa_app_q1_selected
 void qa_app_q1_selected_arsenal_destroy(qa_app_q1_selected_arsenal *arsenal) {
   if (arsenal == NULL) return;
   for (size_t i = 0; i < arsenal->handoff_count; i++) free(arsenal->handoffs[i]);
-  free(arsenal->handoffs); free(arsenal->weapons); free(arsenal->replaced); free(arsenal);
+  free(arsenal->handoffs); free(arsenal->weapons); free(arsenal->replaced);
+  for (size_t i = 0; i < arsenal->label_count; i++) { free(arsenal->label_weapons[i]); free(arsenal->labels[i]); }
+  free(arsenal->label_weapons); free(arsenal->labels); free(arsenal);
 }
 qa_q1_services *qa_app_q1_selected_arsenal_game(const qa_app_q1_selected_arsenal *arsenal) { return arsenal->options.game; }
 const qa_q1_weapon *qa_app_q1_selected_arsenal_weapons(const qa_app_q1_selected_arsenal *arsenal, size_t *out_count) {
@@ -266,6 +296,13 @@ qa_app_primary_weapon_handoff qa_app_q1_selected_arsenal_handoff(qa_app_q1_selec
   q1_handoff *handoff = NULL;
   for (size_t i = 0; i < arsenal->handoff_count && handoff == NULL; i++)
     if (qa_same_owned_actor(arsenal->handoffs[i]->actor, player->actor)) handoff = arsenal->handoffs[i];
+  /* A record whose actor slot now holds a newer generation belonged to a released actor (its weapon
+   * slot went with it): reuse it, so the records stay one per live actor slot. */
+  for (size_t i = 0; i < arsenal->handoff_count && handoff == NULL; i++)
+    if (arsenal->handoffs[i]->actor.id.token == player->actor.id.token && arsenal->handoffs[i]->actor.id.slot == player->actor.id.slot) {
+      handoff = arsenal->handoffs[i];
+      handoff->game = arsenal->options.game; handoff->actor = player->actor;
+    }
   if (handoff == NULL) {
     q1_handoff **grown = realloc(arsenal->handoffs, (arsenal->handoff_count + 1) * sizeof *grown);
     handoff = calloc(1, sizeof *handoff);
@@ -399,10 +436,10 @@ qa_app_arsenal_ui qa_app_q1_selected_arsenal_ui(qa_app_q1_selected_arsenal *arse
   qa_shared_inventory_table *inventory = inventory_of(arsenal);
   qa_app_arsenal_ui ui; memset(&ui, 0, sizeof ui);
   qa_app_q1_status_host host = {game, status_weapon_item, status_weapon_ammo, status_count, status_available};
-  char label[64] = {0};
-  ui.weapon_status = qa_app_q1_weapon_status(host, player, source, label, sizeof label);
+  (void)labels; (void)label_capacity; /* the labels are whole and owned by the arsenal (q1_label) */
+  ui.weapon_status = qa_app_q1_weapon_status(host, player, source, NULL, 0);
+  ui.weapon_status.label = q1_label(arsenal, player->weapon);
   ui.has_weapon_status = true;
-  if (labels != NULL && label_capacity != 0) { memcpy(labels[0], label, strlen(label) + 1); ui.weapon_status.label = labels[0]; }
   ui.arsenal_warning = "none";
   ui.active_weapon = qa_q1_services_weapon_item(game, player->weapon);
   qa_item_id ammo = qa_q1_services_weapon_ammo(game, player->weapon);
@@ -415,10 +452,7 @@ qa_app_arsenal_ui qa_app_q1_selected_arsenal_ui(qa_app_q1_selected_arsenal *arse
     qa_app_player_ui_item *entry = &items[ui.item_count];
     memset(entry, 0, sizeof *entry);
     entry->id = item; entry->kind = "weapon"; entry->source_ordinal = (double)(i + 1);
-    if (labels != NULL && ui.item_count + 1 < label_capacity) {
-      qa_app_q1_weapon_display_name(weapon, labels[ui.item_count + 1], 64);
-      entry->label = labels[ui.item_count + 1];
-    }
+    entry->label = q1_label(arsenal, weapon);
     entry->owned = qa_shared_inventory_table_count(inventory, actor, item) > 0;
     entry->has_ammo = qa_q1_weapon_available(game, player, weapon, "best");
     entry->has_count = weapon_ammo != NULL;

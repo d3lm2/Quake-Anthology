@@ -21,7 +21,7 @@ typedef struct client_entry {
   qa_app_q3_player player;
   bool disconnect_notified;
   phase_kind phase;
-  char drop_reason[256];
+  char *drop_reason; /* owned; any length (it was cut at 255 bytes) */
 } client_entry;
 typedef struct message_queue { char *items[64]; size_t head, count; } message_queue;
 typedef struct pending_command { double slot; char **argv; size_t argc; } pending_command;
@@ -64,6 +64,8 @@ struct qa_app_q3_qvm_server_game {
   qa_qvm_input_definition input_definition;
   uint8_t *host_bytes;
   char *denied;
+  char *admission_reason; /* the last refused admission's drop reason, owned */
+  qa_save_value *host_decoded; /* the restored host record; saved_bots borrows from it until the bots restore */
 };
 
 static bool client_eq(qa_client_id a, qa_client_id b) {
@@ -88,23 +90,33 @@ static client_entry *find_client(qa_app_q3_qvm_server_game *game, double slot) {
   for (size_t i = 0; i < game->client_count; i++) if (game->clients[i].player.source_entity == slot) return &game->clients[i];
   return NULL;
 }
+static void set_drop_reason(client_entry *entry, const char *reason) {
+  size_t length = strlen(reason) + 1; char *copy = malloc(length);
+  if (!copy) qa_range_error("Out of memory");
+  memcpy(copy, reason, length); free(entry->drop_reason); entry->drop_reason = copy;
+}
+static void clear_client_entries(qa_app_q3_qvm_server_game *game) {
+  for (size_t i = 0; i < game->client_count; i++) { free(game->clients[i].drop_reason); game->clients[i].drop_reason = NULL; }
+  game->client_count = 0;
+}
 static void remove_client_entry(qa_app_q3_qvm_server_game *game, client_entry *entry) {
   size_t index = (size_t)(entry - game->clients);
+  free(entry->drop_reason);
   memmove(game->clients + index, game->clients + index + 1, (game->client_count - index - 1) * sizeof *game->clients);
   game->client_count--;
 }
 static void current(qa_app_q3_qvm_server_game *game) {
-  if (game->lifecycle == LC_RETIRED) qa_range_error("Q3 guest is retired");
+  if (game->lifecycle == LC_RETIRED) qa_raise("Error", 0, 0, "%s", "Q3 guest is retired");
   game->options.assert_current(game->options.ctx);
 }
 static void running(qa_app_q3_qvm_server_game *game) {
   current(game);
-  if (game->lifecycle != LC_RUNNING) qa_range_error("Q3 guest is not running");
-  if (module_active(game)) qa_range_error("Q3 guest already has an active external operation");
+  if (game->lifecycle != LC_RUNNING) qa_raise("Error", 0, 0, "%s", "Q3 guest is not running");
+  if (module_active(game)) qa_raise("Error", 0, 0, "%s", "Q3 guest already has an active external operation");
 }
 static qa_app_q3_guest_output output_of(qa_app_q3_qvm_server_game *game) {
   if (!(game->lifecycle == LC_INITIALIZING || game->lifecycle == LC_RUNNING || game->lifecycle == LC_SHUTTING_DOWN))
-    qa_range_error("Q3 guest output is unavailable");
+    qa_raise("Error", 0, 0, "%s", "Q3 guest output is unavailable");
   return game->output;
 }
 static message_queue *find_messages(qa_app_q3_qvm_server_game *game, double slot) {
@@ -119,6 +131,16 @@ static message_queue *add_messages(qa_app_q3_qvm_server_game *game, double slot)
     memset(queue, 0, sizeof *queue);
   }
   return queue;
+}
+/* botMessages.delete(slot): the slot's queue goes, so later server commands no longer queue for it. */
+static void remove_messages(qa_app_q3_qvm_server_game *game, double slot) {
+  message_queue *queue = find_messages(game, slot);
+  if (!queue) return;
+  for (size_t j = 0; j < queue->count; j++) free(queue->items[(queue->head + j) % 64]);
+  size_t index = (size_t)(queue - game->bot_messages);
+  memmove(game->bot_messages + index, game->bot_messages + index + 1, (game->bot_message_count - index - 1) * sizeof *game->bot_messages);
+  memmove(game->bot_message_slots + index, game->bot_message_slots + index + 1, (game->bot_message_count - index - 1) * sizeof *game->bot_message_slots);
+  game->bot_message_count--;
 }
 static void queue_push(message_queue *queue, const char *text) {
   if (!queue) return;
@@ -156,28 +178,40 @@ static void finish_operation(qa_app_q3_qvm_server_game *game) {
     if (slot_remove(game->bot_clients, &game->bot_client_count, slot) && game->has_bots)
       game->bot_preparation.free_client(game->bot_preparation.ctx, item->identity.client);
     slot = item->slot;
-    message_queue *queue = find_messages(game, slot);
-    if (queue) { for (size_t j = 0; j < queue->count; j++) free(queue->items[(queue->head + j) % 64]); queue->count = 0; }
+    remove_messages(game, slot);
     slot_remove(game->pending_admissions, &game->pending_admission_count, slot);
     qa_app_q3_guest_records_finish_input_retirement(game->records, slot);
     memmove(game->retirements + i, game->retirements + i + 1, (game->retirement_count - i - 1) * sizeof *game->retirements);
     game->retirement_count--;
   }
 }
+/* TS externalOperations++ ... finally finishExternalOperation(): a raise inside the operation still ends it. A failure
+ * of the finishing step during that raise is dropped (TS's finally would replace the error). */
+typedef struct operation_scope { qa_app_q3_qvm_server_game *game; qa_cleanup node; } operation_scope;
+static void finish_operation_step(void *arg) { finish_operation(arg); }
+static void operation_abort(void *arg) {
+  qa_caught_error ignored;
+  (void)qa_try(finish_operation_step, arg, &ignored);
+}
+static void operation_begin(qa_app_q3_qvm_server_game *game, operation_scope *scope) {
+  game->external_operations++;
+  scope->game = game;
+  qa_cleanup_push(&scope->node, operation_abort, game);
+}
+static void operation_end(operation_scope *scope) {
+  qa_cleanup_pop(&scope->node);
+  finish_operation(scope->game);
+}
+/* validateClient: the client's session is the actors' session and its slot is inside the capacity. */
 static void validate_client(qa_app_q3_qvm_server_game *game, qa_client_id client) {
-  qa_session_id session = client.session;
-  size_t observations = 0;
-  (void)qa_session_actor_registry_observations(game->options.records.actors, &observations);
-  if (observations == (size_t)-1) return;
-  /* session equality via registry checkpoint session is enforced by caller ids */
-  if (client.slot < 0 || /* client.slot is an int64_t: always integral */ (double)client.slot >= game->options.max_clients
-      || session.token == 0)
+  qa_session_id session = qa_session_actor_registry_session(game->options.records.actors);
+  if (client.session.token != session.token || client.slot < 0 || (double)client.slot >= game->options.max_clients)
     qa_range_error("Q3 client slot belongs to another server or is outside its capacity");
 }
 static client_entry *entry_of(qa_app_q3_qvm_server_game *game, qa_app_q3_player player) {
   client_entry *entry = find_client(game, player.source_entity);
   if (!entry || !client_eq(entry->player.client, player.client) || !qa_same_actor(entry->player.actor, player.actor))
-    qa_range_error("Q3 player is no longer admitted");
+    qa_raise("Error", 0, 0, "%s", "Q3 player is no longer admitted");
   return entry;
 }
 static void release_entry(qa_app_q3_qvm_server_game *game, client_entry *entry) {
@@ -388,7 +422,9 @@ void qa_app_q3_qvm_server_game_destroy(qa_app_q3_qvm_server_game *game) {
   if (game->has_cursor) qa_common_parse_cursor_destroy(&game->cursor);
   if (game->files) qa_qvm_files_destroy(game->files);
   if (game->engine) game->engine->ops->destroy(game->engine);
-  free(game->host_bytes); free(game->denied);
+  clear_client_entries(game);
+  free(game->host_bytes); free(game->denied); free(game->admission_reason);
+  qa_save_value_free(game->host_decoded);
   free(game);
 }
 qa_qvm_game *qa_app_q3_qvm_server_game_game(qa_app_q3_qvm_server_game *game) {
@@ -410,12 +446,12 @@ static void retire_input(qa_app_q3_qvm_server_game *game, double slot, qa_mod_cl
     retirement *existing = &game->retirements[i];
     if (existing->slot != slot) continue;
     if (!qa_same_actor(existing->identity.actor, identity.actor) || !client_eq(existing->identity.client, identity.client))
-      qa_range_error("QVM input retirement changed client generation");
+      qa_raise("Error", 0, 0, "%s", "QVM input retirement changed client generation");
     return;
   }
   client_entry *entry = find_client(game, slot);
   if (entry && (!qa_same_actor(entry->player.actor, identity.actor) || !client_eq(entry->player.client, identity.client)))
-    qa_range_error("QVM input retirement does not own its source client");
+    qa_raise("Error", 0, 0, "%s", "QVM input retirement does not own its source client");
   qa_app_q3_guest_records_retire_input_client(game->records, slot);
   if (game->retirement_count >= 64) qa_range_error("QVM input retirement capacity exceeded");
   retirement *item = &game->retirements[game->retirement_count++];
@@ -434,14 +470,14 @@ static int32_t input_disconnect(void *ctx, double slot, qa_mod_client_identity i
   retire_input(game, slot, identity);
   retirement *item = NULL;
   for (size_t i = 0; i < game->retirement_count; i++) if (game->retirements[i].slot == slot) item = &game->retirements[i];
-  if (!item) qa_range_error("QVM input retirement was lost");
+  if (!item) qa_raise("Error", 0, 0, "%s", "QVM input retirement was lost");
   if (item->phase != 0) return 0;
   item->phase = 1; /* disconnecting */
   if (item->has_entry) {
     client_entry *entry = find_client(game, slot);
     if (entry && client_eq(entry->player.client, item->entry.client)) {
       notify_disconnect(game, entry); entry->phase = PH_DROPPING;
-      snprintf(entry->drop_reason, sizeof entry->drop_reason, "%s", "Client input actor was removed.");
+      set_drop_reason(entry, "Client input actor was removed.");
     }
   }
   int32_t args[10] = {QA_QVM_GAME_EXPORT_GAME_CLIENT_DISCONNECT, (int32_t)slot, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -567,8 +603,7 @@ static void bot_free(void *v, double slot) {
     game->bot_preparation.free_client(game->bot_preparation.ctx, player.client);
   }
   slot_remove(game->pending_admissions, &game->pending_admission_count, slot);
-  message_queue *queue = find_messages(game, slot);
-  if (queue) { for (size_t i = 0; i < queue->count; i++) free(queue->items[(queue->head + i) % 64]); queue->count = 0; }
+  remove_messages(game, slot);
 }
 static double bot_snapshot(void *v, double slot, double sequence) {
   qa_app_q3_qvm_server_game *game = (qa_app_q3_qvm_server_game *)v;
@@ -611,7 +646,7 @@ static qa_save_value *capture_host_value(qa_app_q3_qvm_server_game *game) {
   bool busy = game->external_operations != 0 || module_active(game) || game->reconnecting_count != 0 || game->retirement_count != 0;
   for (size_t i = 0; i < game->client_count; i++)
     if (game->clients[i].phase != PH_CONNECTED && game->clients[i].phase != PH_ACTIVE) busy = true;
-  if (busy) qa_range_error("Q3 guest checkpoint requires completed client operations");
+  if (busy) qa_raise("Error", 0, 0, "%s", "Q3 guest checkpoint requires completed client operations");
   qa_save_value *root = qa_save_value_object();
   qa_qvm_game_data_state data = qa_qvm_game_data_checkpoint(game->engine->data);
   qa_save_value *data_value = qa_save_value_object();
@@ -701,9 +736,11 @@ static client_row *read_clients(const qa_save_reader *reader, size_t *out_count)
 qa_app_q3_saved_guest_client *qa_app_saved_q3_guest_clients(const uint8_t *host_bytes, size_t host_length,
     const char *host_format, size_t *out_count) {
   if (!host_format || strcmp(host_format, "q3:qagame-host") != 0)
-    qa_range_error("Unsupported Q3 guest host checkpoint format");
+    qa_raise("Error", 0, 0, "%s", "Unsupported Q3 guest host checkpoint format");
   qa_save_value *decoded = qa_decode_checkpoint_value(host_bytes, host_length);
-  if (!decoded) qa_range_error("Unsupported Q3 guest host checkpoint format");
+  if (!decoded) qa_range_error("Out of memory");
+  /* The rows keep only numbers and the static phase names, so the tree goes with the reader (or the refusal). */
+  qa_cleanup decoded_node; qa_cleanup_push(&decoded_node, (void (*)(void *))qa_save_value_free, decoded);
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, decoded, "q3.guest.host")) qa_range_error("Out of memory");
   qa_save_reader version = c_field(&reader, "version");
@@ -731,7 +768,8 @@ qa_app_q3_saved_guest_client *qa_app_saved_q3_guest_clients(const uint8_t *host_
   }
   free(rows);
   *out_count = count;
-  (void)decoded;
+  qa_cleanup_pop(&decoded_node);
+  qa_save_value_free(decoded);
   return out;
 }
 static qa_qvm_host_checkpoint host_checkpoint(void *ctx) {
@@ -758,7 +796,7 @@ static void discard_step(void *arg) { qa_app_q3_qvm_server_game_discard(arg); }
 void qa_app_q3_qvm_server_game_restore_checkpoint(qa_app_q3_qvm_server_game *game, const qa_guest_checkpoint *checkpoint,
     qa_client_id (*resolve_client)(void *ctx, qa_app_q3_saved_guest_client_id saved), void *resolve_ctx) {
   current(game);
-  if (game->lifecycle != LC_CREATED) qa_range_error("Q3 guest restore requires an inert candidate");
+  if (game->lifecycle != LC_CREATED) qa_raise("Error", 0, 0, "%s", "Q3 guest restore requires an inert candidate");
   game->lifecycle = LC_RESTORING; game->resolve_client = resolve_client; game->resolve_ctx = resolve_ctx;
   restore_step step = {game, checkpoint};
   qa_caught_error error;
@@ -766,7 +804,7 @@ void qa_app_q3_qvm_server_game_restore_checkpoint(qa_app_q3_qvm_server_game *gam
     game->resolve_client = NULL;
     qa_caught_error cleanup;
     if (!qa_try(discard_step, game, &cleanup))
-      qa_raise("AggregateError", 0, 0, "Q3 guest restore and discard failed: %s; %s", error.message, cleanup.message);
+      qa_raise("AggregateError", 0, 0, "Q3 guest restore and discard failed");
     qa_rethrow(&error);
   }
   game->resolve_client = NULL;
@@ -781,12 +819,16 @@ static void host_restore(void *ctx, const qa_qvm_host_checkpoint *checkpoint) {
 static void restore_host_bytes(qa_app_q3_qvm_server_game *game, const uint8_t *bytes, size_t length,
     const char *format, size_t callback_count, size_t random_count) {
   if (game->lifecycle != LC_RESTORING || !game->resolve_client)
-    qa_range_error("Q3 guest host restore requires the candidate restore operation");
+    qa_raise("Error", 0, 0, "%s", "Q3 guest host restore requires the candidate restore operation");
   if (!format || strcmp(format, "q3:qagame-host") != 0 || callback_count != 0 || random_count != 0)
-    qa_range_error("Unsupported Q3 guest host checkpoint format, callbacks or external random streams");
+    qa_raise("Error", 0, 0, "%s", "Unsupported Q3 guest host checkpoint format, callbacks or external random streams");
   if (game->options.source_restored) game->options.source_restored(game->options.ctx);
   qa_save_value *decoded = qa_decode_checkpoint_value(bytes, length);
-  if (!decoded) qa_range_error("Unsupported Q3 guest host checkpoint format, callbacks or external random streams");
+  if (!decoded) qa_range_error("Out of memory");
+  /* The game keeps the decoded record: savedBots borrows its "bots" value until attachBots restores them. */
+  game->saved_bots = NULL;
+  qa_save_value_free(game->host_decoded);
+  game->host_decoded = decoded;
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, decoded, "q3.guest.host")) qa_range_error("Out of memory");
   qa_save_reader r = c_field(&reader, "version"); qa_save_reader_literal_number(&r, 1); qa_save_reader_destroy(&r);
@@ -820,8 +862,10 @@ static void restore_host_bytes(qa_app_q3_qvm_server_game *game, const uint8_t *b
     bool resolved = qa_session_actor_registry_resolve_saved(game->options.records.actors, clients[i].actor, &actor);
     qa_client_id client = game->resolve_client(game->resolve_ctx, clients[i].client);
     double slot;
+    qa_session_id session = qa_session_actor_registry_session(game->options.records.actors);
     if (clients[i].source_entity >= game->options.max_clients || clients[i].source_entity != clients[i].client.slot
-        || find_client(game, clients[i].source_entity) || (double)client.slot != clients[i].source_entity || !resolved
+        || find_client(game, clients[i].source_entity) || client.session.token != session.token
+        || (double)client.slot != clients[i].source_entity || !resolved
         || !qa_app_q3_guest_records_slot(game->records, actor.id, &slot) || slot != clients[i].source_entity)
       qa_save_reader_fail(&reader, "invalid restored guest client binding");
     client_entry *entry = &game->clients[game->client_count++];
@@ -834,82 +878,111 @@ static void restore_host_bytes(qa_app_q3_qvm_server_game *game, const uint8_t *b
   r = c_field(&reader, "bots");
   game->saved_bots = qa_save_reader_is_null(&r) ? NULL : r.value;
   qa_save_reader_destroy(&r);
+  /* savedClients.list(cell => cell.integer(0)): every slot is read before the first is checked. */
   r = c_field(&reader, "botClients");
   if (!qa_save_reader_is_undefined(&r)) {
     size_t count = qa_save_reader_list_count(&r);
     for (size_t i = 0; i < count; i++) {
       qa_save_reader item;
       if (!qa_save_reader_item(&r, i, &item)) qa_range_error("Out of memory");
+      (void)qa_save_reader_integer_min(&item, 0);
+      qa_save_reader_destroy(&item);
+    }
+    for (size_t i = 0; i < count; i++) {
+      qa_save_reader item;
+      if (!qa_save_reader_item(&r, i, &item)) qa_range_error("Out of memory");
       double slot = qa_save_reader_integer_min(&item, 0);
       qa_save_reader_destroy(&item);
       if (!find_client(game, slot) || in_slots(game->bot_clients, game->bot_client_count, slot))
-        qa_range_error("Invalid saved guest bot slot");
+        qa_raise("Error", 0, 0, "%s", "Invalid saved guest bot slot");
       slot_add(game->bot_clients, &game->bot_client_count, slot);
     }
   }
   qa_save_reader_destroy(&r);
+  /* messages.list(cell => ({ slot, messages: list(string) })): the whole list is read before any owner is checked. */
   r = c_field(&reader, "botMessages");
   if (!qa_save_reader_is_undefined(&r)) {
     size_t count = qa_save_reader_list_count(&r);
-    for (size_t i = 0; i < count; i++) {
-      qa_save_reader entry;
-      if (!qa_save_reader_item(&r, i, &entry)) qa_range_error("Out of memory");
-      qa_save_reader slot_reader = c_field(&entry, "slot");
-      double slot = qa_save_reader_integer_min(&slot_reader, 0);
-      qa_save_reader_destroy(&slot_reader);
-      if (!in_slots(game->bot_clients, game->bot_client_count, slot) || find_messages(game, slot))
-        qa_range_error("Invalid saved guest bot message owner");
-      message_queue *queue = add_messages(game, slot);
-      qa_save_reader texts = c_field(&entry, "messages");
-      size_t texts_count = qa_save_reader_list_count(&texts);
-      for (size_t j = 0; j < texts_count; j++) {
-        qa_save_reader text;
-        if (!qa_save_reader_item(&texts, j, &text)) qa_range_error("Out of memory");
-        queue_push(queue, qa_save_reader_string(&text));
-        qa_save_reader_destroy(&text);
+    for (int pass = 0; pass < 2; pass++)
+      for (size_t i = 0; i < count; i++) {
+        qa_save_reader entry;
+        if (!qa_save_reader_item(&r, i, &entry)) qa_range_error("Out of memory");
+        qa_save_reader slot_reader = c_field(&entry, "slot");
+        double slot = qa_save_reader_integer_min(&slot_reader, 0);
+        qa_save_reader_destroy(&slot_reader);
+        message_queue *queue = NULL;
+        if (pass == 1) {
+          if (!in_slots(game->bot_clients, game->bot_client_count, slot) || find_messages(game, slot))
+            qa_raise("Error", 0, 0, "%s", "Invalid saved guest bot message owner");
+          queue = add_messages(game, slot);
+        }
+        qa_save_reader texts = c_field(&entry, "messages");
+        size_t texts_count = qa_save_reader_list_count(&texts);
+        for (size_t j = 0; j < texts_count; j++) {
+          qa_save_reader text;
+          if (!qa_save_reader_item(&texts, j, &text)) qa_range_error("Out of memory");
+          const char *value = qa_save_reader_string(&text);
+          if (queue != NULL) queue_push(queue, value);
+          qa_save_reader_destroy(&text);
+        }
+        qa_save_reader_destroy(&texts);
+        qa_save_reader_destroy(&entry);
       }
-      qa_save_reader_destroy(&texts);
-      qa_save_reader_destroy(&entry);
-    }
   }
   qa_save_reader_destroy(&r);
   qa_save_reader_destroy(&reader);
 }
 void qa_app_q3_qvm_server_game_complete_restore(qa_app_q3_qvm_server_game *game, qa_app_q3_guest_output output) {
   current(game);
-  if (game->lifecycle != LC_RESTORED) qa_range_error("Q3 guest restore is not ready for output attachment");
-  if (game->saved_bots) qa_range_error("Saved guest bot services must be restored before output attachment");
+  if (game->lifecycle != LC_RESTORED) qa_raise("Error", 0, 0, "%s", "Q3 guest restore is not ready for output attachment");
+  if (game->saved_bots) qa_raise("Error", 0, 0, "%s", "Saved guest bot services must be restored before output attachment");
   game->output = output; game->has_output = true; game->lifecycle = LC_RUNNING;
 }
-static void release_source(qa_app_q3_qvm_server_game *game, bool transfer_clients) {
-  if (game->has_bots) qa_app_q3_guest_bots_close(game->bots);
-  qa_qvm_files_close_all(game->files);
-  if (game->options.before_retire) game->options.before_retire(game->options.ctx);
-  qa_app_q3_guest_records_close(game->records);
+static void discard_before_retire(void *arg);
+static void discard_engine_retire(void *arg);
+/* releaseSource(errors, transferClients): each failing step adds to the caller's error count. */
+static size_t release_source(qa_app_q3_qvm_server_game *game, bool transfer_clients) {
+  size_t failures = 0;
+  qa_caught_error caught;
+  if (game->has_bots && !qa_try((void (*)(void *))qa_app_q3_guest_bots_close, game->bots, &caught)) failures++;
+  if (!qa_try((void (*)(void *))qa_qvm_files_close_all, game->files, &caught)) failures++;
+  if (!qa_try(discard_before_retire, game, &caught)) failures++;
+  if (!qa_try((void (*)(void *))qa_app_q3_guest_records_close, game->records, &caught)) failures++;
   if (!transfer_clients) {
     for (size_t i = 0; i < game->bot_client_count; i++) {
       client_entry *entry = find_client(game, game->bot_clients[i]);
       if (entry && game->has_bots) game->bot_preparation.free_client(game->bot_preparation.ctx, entry->player.client);
     }
   }
-  game->bot_client_count = 0; game->bot_message_count = 0;
+  game->bot_client_count = 0;
+  while (game->bot_message_count > 0) remove_messages(game, (double)game->bot_message_slots[0]);
   for (size_t i = 0; i < game->client_count; i++) qa_app_q3_server_state_clear_client(game->options.state, game->clients[i].player.source_entity);
   for (size_t i = 0; i < game->reconnecting_count; i++) qa_app_q3_server_state_clear_client(game->options.state, (double)game->reconnecting[i].client.slot);
-  game->engine->ops->retire(game->engine);
-  game->client_count = 0; game->reconnecting_count = 0; game->lifecycle = LC_RETIRED;
+  if (!qa_try(discard_engine_retire, game, &caught)) failures++;
+  clear_client_entries(game); game->reconnecting_count = 0; game->lifecycle = LC_RETIRED;
+  return failures;
 }
+static void discard_before_retire(void *arg) {
+  qa_app_q3_qvm_server_game *game = arg;
+  if (game->options.before_retire) game->options.before_retire(game->options.ctx);
+}
+static void discard_engine_retire(void *arg) { qa_app_q3_qvm_server_game *game = arg; game->engine->ops->retire(game->engine); }
 void qa_app_q3_qvm_server_game_discard(qa_app_q3_qvm_server_game *game) {
   if (game->lifecycle == LC_RETIRED) return;
   if (game->external_operations != 0 || module_active(game))
-    qa_range_error("Q3 guest discard must await the active operation");
+    qa_raise("Error", 0, 0, "%s", "Q3 guest discard must await the active operation");
   close_input(game);
   game->retirement_count = 0;
-  if (game->has_bots) qa_app_q3_guest_bots_close(game->bots);
-  qa_qvm_files_close_all(game->files);
-  if (game->options.before_retire) game->options.before_retire(game->options.ctx);
-  qa_app_q3_guest_records_close(game->records);
-  game->engine->ops->retire(game->engine);
-  game->client_count = 0; game->reconnecting_count = 0; game->lifecycle = LC_RETIRED;
+  /* Every step runs in its own try; the failures are reported together once the guest is retired. */
+  size_t failures = 0;
+  qa_caught_error caught;
+  if (game->has_bots && !qa_try((void (*)(void *))qa_app_q3_guest_bots_close, game->bots, &caught)) failures++;
+  if (!qa_try((void (*)(void *))qa_qvm_files_close_all, game->files, &caught)) failures++;
+  if (!qa_try(discard_before_retire, game, &caught)) failures++;
+  if (!qa_try((void (*)(void *))qa_app_q3_guest_records_close, game->records, &caught)) failures++;
+  if (!qa_try(discard_engine_retire, game, &caught)) failures++;
+  clear_client_entries(game); game->reconnecting_count = 0; game->lifecycle = LC_RETIRED;
+  if (failures != 0) qa_raise("AggregateError", 0, 0, "Q3 guest discard failed");
 }
 double qa_app_q3_qvm_server_game_time_milliseconds(qa_app_q3_qvm_server_game *game) {
   current(game); return game->options.now(game->options.ctx);
@@ -928,16 +1001,24 @@ static void refresh_server_info(qa_app_q3_qvm_server_game *game) {
   if (value) output_of(game).configstring(game->output.ctx, 0, value);
   current(game);
 }
+typedef struct initialize_job { qa_app_q3_qvm_server_game *game; bool restart; } initialize_job;
+static void initialize_body(void *arg) {
+  initialize_job *job = arg; qa_app_q3_qvm_server_game *game = job->game;
+  double level_time = game->options.now(game->options.ctx);
+  game->engine->ops->initialize(game->engine, level_time, game->options.seed, job->restart);
+  refresh_server_info(game);
+  current(game); game->lifecycle = LC_RUNNING; drain_bot_commands(game);
+}
 void qa_app_q3_qvm_server_game_initialize(qa_app_q3_qvm_server_game *game, qa_app_q3_guest_output output,
     const char *start_kind, const qa_app_q3_guest_map_client *clients, size_t client_count) {
   current(game);
-  if (game->lifecycle != LC_CREATED) qa_range_error("Q3 guest has already initialized");
+  if (game->lifecycle != LC_CREATED) qa_raise("Error", 0, 0, "%s", "Q3 guest has already initialized");
   bool is_new = !start_kind || strcmp(start_kind, "new") == 0;
   if (!is_new) {
     double slots[64]; size_t slot_count = 0;
     for (size_t i = 0; i < client_count; i++) {
       validate_client(game, clients[i].client);
-      if (in_slots(slots, slot_count, (double)clients[i].client.slot)) qa_range_error("Q3 map transition repeats a client slot");
+      if (in_slots(slots, slot_count, (double)clients[i].client.slot)) qa_raise("Error", 0, 0, "%s", "Q3 map transition repeats a client slot");
       slots[slot_count++] = (double)clients[i].client.slot;
     }
     for (size_t i = 0; i < client_count; i++) {
@@ -951,116 +1032,151 @@ void qa_app_q3_qvm_server_game_initialize(qa_app_q3_qvm_server_game *game, qa_ap
   }
   if (!game->has_bots) {
     double enabled = qa_cvar_registry_variable_value(qa_app_q3_server_state_cvars(game->options.state), "bot_enable");
-    if (enabled != 0) qa_range_error("Q3 guest bot services must be attached before initialization");
+    if (enabled != 0) qa_raise("Error", 0, 0, "%s", "Q3 guest bot services must be attached before initialization");
   }
   game->output = output; game->has_output = true; game->lifecycle = LC_INITIALIZING;
-  double level_time = game->options.now(game->options.ctx);
-  game->engine->ops->initialize(game->engine, level_time, game->options.seed, start_kind && strcmp(start_kind, "map-restart") == 0);
-  refresh_server_info(game);
-  current(game); game->lifecycle = LC_RUNNING; drain_bot_commands(game);
+  initialize_job job = {game, start_kind != NULL && strcmp(start_kind, "map-restart") == 0};
+  qa_caught_error error;
+  if (!qa_try(initialize_body, &job, &error)) {
+    /* catch (error) { try { await this.shutdown() } catch (cleanup) { AggregateError } throw error } */
+    qa_caught_error cleanup;
+    if (!qa_try((void (*)(void *))qa_app_q3_qvm_server_game_shutdown, game, &cleanup))
+      qa_raise("AggregateError", 0, 0, "Q3 guest initialization and cleanup failed");
+    qa_rethrow(&error);
+  }
+}
+/* The admitting entry: entries live in an array that moves, so the entry is found again by its slot and player. */
+static client_entry *admitting_entry(qa_app_q3_qvm_server_game *game, qa_app_q3_player player) {
+  client_entry *entry = find_client(game, player.source_entity);
+  return entry != NULL && client_eq(entry->player.client, player.client) && qa_same_actor(entry->player.actor, player.actor) ? entry : NULL;
+}
+typedef struct admit_frame { qa_app_q3_qvm_server_game *game; qa_app_q3_player player; } admit_frame;
+/* catch (error) { if (this.clients.get(slot) === entry) this.release(entry); throw error; } */
+static void admit_release(void *arg) {
+  admit_frame *frame = arg;
+  client_entry *entry = admitting_entry(frame->game, frame->player);
+  if (entry != NULL) release_entry(frame->game, entry);
 }
 static qa_app_q3_admission admit(qa_app_q3_qvm_server_game *game, qa_client_id client, const char *userinfo, bool first_time, bool is_bot) {
-  game->external_operations++;
+  operation_scope scope; operation_begin(game, &scope);
   qa_app_q3_admission result; memset(&result, 0, sizeof result);
   running(game);
   qa_app_q3_player existing;
-  if (qa_app_q3_qvm_server_game_player(game, client, &existing)) { finish_operation(game); qa_range_error("Q3 client already has a guest slot"); }
+  if (qa_app_q3_qvm_server_game_player(game, client, &existing)) qa_raise("Error", 0, 0, "%s", "Q3 client already has a guest slot");
   double slot = (double)client.slot;
   validate_client(game, client);
   bool retiring = false;
   for (size_t i = 0; i < game->retirement_count; i++) if (game->retirements[i].slot == slot) retiring = true;
   if (find_client(game, slot) || retiring) {
     result.accepted = false; result.reason = "Client slot is already occupied.";
-    finish_operation(game); return result;
+    operation_end(&scope); return result;
   }
   qa_owned_actor actor = qa_app_q3_guest_records_actor(game->records, slot);
   qa_app_q3_player player = {client, actor.id, slot};
   client_entry *entry = &game->clients[game->client_count++];
   memset(entry, 0, sizeof *entry); entry->player = player; entry->phase = PH_CONNECTING;
+  admit_frame frame = {game, player};
+  qa_cleanup release_node; qa_cleanup_push(&release_node, admit_release, &frame);
   qa_app_q3_server_state_set_userinfo(game->options.state, slot, userinfo);
-  free(game->denied);
+  free(game->denied); game->denied = NULL;
   game->denied = game->engine->ops->client_connect(game->engine, slot, first_time, is_bot);
   const char *denied = game->denied;
   current(game);
-  if (find_client(game, slot) != entry || entry->phase == PH_DROPPING) {
+  entry = admitting_entry(game, player);
+  if (entry == NULL || entry->phase == PH_DROPPING) {
     result.accepted = false;
-    if (entry->phase == PH_DROPPING) {
-      static char reasons[64][256]; size_t cursor = 0;
-      strncpy(reasons[cursor % 64], entry->drop_reason, 255);
-      result.reason = reasons[cursor++ % 64];
+    if (entry != NULL) {
+      const char *reason = entry->drop_reason != NULL ? entry->drop_reason : "";
+      size_t length = strlen(reason) + 1; char *copy = malloc(length);
+      if (!copy) qa_range_error("Out of memory");
+      memcpy(copy, reason, length); free(game->admission_reason); game->admission_reason = copy;
+      result.reason = game->admission_reason;
     } else result.reason = "Client disconnected during admission.";
-    finish_operation(game); return result;
+    qa_cleanup_pop(&release_node);
+    operation_end(&scope); return result;
   }
   if (denied) {
     if (first_time) release_entry(game, entry);
     else qa_app_q3_qvm_server_game_disconnect(game, player);
     result.accepted = false; result.reason = denied;
-    finish_operation(game); return result;
+    qa_cleanup_pop(&release_node);
+    operation_end(&scope); return result;
   }
   entry->phase = PH_CONNECTED;
   result.accepted = true; result.player = player;
-  finish_operation(game);
+  qa_cleanup_pop(&release_node);
+  operation_end(&scope);
   return result;
 }
 qa_app_q3_admission qa_app_q3_qvm_server_game_connect(qa_app_q3_qvm_server_game *game, qa_client_id client, const char *userinfo) {
   for (size_t i = 0; i < game->reconnecting_count; i++)
-    if (game->reconnecting[i].client.slot == client.slot) qa_range_error("Q3 carried client requires map reconnection");
+    if (game->reconnecting[i].client.slot == client.slot) qa_raise("Error", 0, 0, "%s", "Q3 carried client requires map reconnection");
   return admit(game, client, userinfo, true, false);
+}
+typedef struct reconnect_frame { qa_app_q3_qvm_server_game *game; int64_t slot; } reconnect_frame;
+static void reconnect_forget(void *arg) {
+  reconnect_frame *frame = arg; qa_app_q3_qvm_server_game *game = frame->game;
+  for (size_t i = 0; i < game->reconnecting_count; i++) {
+    if (game->reconnecting[i].client.slot == frame->slot) {
+      memmove(game->reconnecting + i, game->reconnecting + i + 1, (game->reconnecting_count - i - 1) * sizeof *game->reconnecting);
+      game->reconnecting_count--; break;
+    }
+  }
 }
 qa_app_q3_admission qa_app_q3_qvm_server_game_reconnect(qa_app_q3_qvm_server_game *game, qa_client_id client) {
   running(game);
   size_t index = game->reconnecting_count;
   for (size_t i = 0; i < game->reconnecting_count; i++) if (game->reconnecting[i].client.slot == client.slot) index = i;
   if (index >= game->reconnecting_count || !client_eq(game->reconnecting[index].client, client))
-    qa_range_error("Q3 client is not carried by this map transition");
+    qa_raise("Error", 0, 0, "%s", "Q3 client is not carried by this map transition");
   qa_app_q3_guest_map_client previous = game->reconnecting[index];
   const char *userinfo = qa_app_q3_server_state_get_userinfo(game->options.state, (double)client.slot);
+  /* try { admit } finally { this.reconnecting.delete(client.slot) } */
+  reconnect_frame frame = {game, client.slot};
+  qa_cleanup node; qa_cleanup_push(&node, reconnect_forget, &frame);
   qa_app_q3_admission result = admit(game, client, userinfo ? userinfo : previous.userinfo, false, previous.bot);
-  for (size_t i = 0; i < game->reconnecting_count; i++) {
-    if (game->reconnecting[i].client.slot == client.slot) {
-      memmove(game->reconnecting + i, game->reconnecting + i + 1, (game->reconnecting_count - i - 1) * sizeof *game->reconnecting);
-      game->reconnecting_count--; break;
-    }
-  }
+  qa_cleanup_pop(&node);
+  reconnect_forget(&frame);
   return result;
 }
 void qa_app_q3_qvm_server_game_begin(qa_app_q3_qvm_server_game *game, qa_app_q3_player player, qa_q3_base_user_command command) {
-  game->external_operations++;
+  operation_scope scope; operation_begin(game, &scope);
   running(game); client_entry *entry = entry_of(game, player);
-  if (entry->phase != PH_CONNECTED) { finish_operation(game); qa_range_error("Q3 guest client cannot begin in this phase"); }
+  if (entry->phase != PH_CONNECTED) qa_raise("Error", 0, 0, "%s", "Q3 guest client cannot begin in this phase");
   qa_app_q3_server_state_set_user_command(game->options.state, player.source_entity, command);
   game->engine->ops->client_begin(game->engine, player.source_entity);
   current(game);
-  if (find_client(game, player.source_entity) == entry && entry->phase == PH_CONNECTED) {
+  entry = admitting_entry(game, player);
+  if (entry != NULL && entry->phase == PH_CONNECTED) {
     entry->phase = PH_ACTIVE;
     if (game->options.client_changed) game->options.client_changed(game->options.ctx, "admitted", player.actor);
   }
-  finish_operation(game);
+  operation_end(&scope);
 }
 void qa_app_q3_qvm_server_game_think(qa_app_q3_qvm_server_game *game, qa_app_q3_player player, qa_q3_base_user_command command) {
-  game->external_operations++;
+  operation_scope scope; operation_begin(game, &scope);
   running(game);
-  if (entry_of(game, player)->phase != PH_ACTIVE) { finish_operation(game); qa_range_error("Q3 guest client is not active"); }
+  if (entry_of(game, player)->phase != PH_ACTIVE) qa_raise("Error", 0, 0, "%s", "Q3 guest client is not active");
   qa_app_q3_server_state_set_user_command(game->options.state, player.source_entity, command);
   game->engine->ops->client_think(game->engine, player.source_entity);
   current(game);
-  finish_operation(game);
+  operation_end(&scope);
 }
 void qa_app_q3_qvm_server_game_userinfo(qa_app_q3_qvm_server_game *game, qa_app_q3_player player, const char *value) {
-  game->external_operations++;
+  operation_scope scope; operation_begin(game, &scope);
   running(game); (void)entry_of(game, player);
   qa_app_q3_server_state_set_userinfo(game->options.state, player.source_entity, value);
   game->engine->ops->client_userinfo_changed(game->engine, player.source_entity);
   current(game);
   if (game->options.client_changed) game->options.client_changed(game->options.ctx, "userinfo", player.actor);
-  finish_operation(game);
+  operation_end(&scope);
 }
 void qa_app_q3_qvm_server_game_command_immediate(qa_app_q3_qvm_server_game *game, qa_app_q3_player player, const char *const *argv, size_t argc) {
-  game->external_operations++;
+  operation_scope scope; operation_begin(game, &scope);
   running(game); (void)entry_of(game, player);
   game->engine->ops->client_command(game->engine, player.source_entity, argv, argc);
   current(game);
-  finish_operation(game);
+  operation_end(&scope);
 }
 void qa_app_q3_qvm_server_game_command(qa_app_q3_qvm_server_game *game, qa_app_q3_player player, const char *const *argv, size_t argc) {
   qa_app_q3_qvm_server_game_command_immediate(game, player, argv, argc);
@@ -1073,43 +1189,51 @@ void qa_app_q3_qvm_server_game_drop(qa_app_q3_qvm_server_game *game, double slot
     }
   }
   client_entry *entry = find_client(game, slot);
-  if (entry) { notify_disconnect(game, entry); entry->phase = PH_DROPPING; strncpy(entry->drop_reason, reason, 255); }
+  if (entry) { notify_disconnect(game, entry); entry->phase = PH_DROPPING; set_drop_reason(entry, reason); }
   if (!in_slots(game->bot_clients, game->bot_client_count, slot)) output_of(game).drop_client(game->output.ctx, slot, reason);
   current(game);
   if (entry && find_client(game, slot) == entry) qa_app_q3_qvm_server_game_disconnect(game, entry->player);
 }
+typedef struct disconnect_frame { qa_app_q3_qvm_server_game *game; qa_app_q3_player player; } disconnect_frame;
+static void disconnect_finally(void *arg) {
+  disconnect_frame *frame = arg; qa_app_q3_qvm_server_game *game = frame->game; double slot = frame->player.source_entity;
+  qa_app_q3_server_state_clear_client(game->options.state, slot);
+  qa_app_q3_guest_records_release_client(game->records, slot);
+  if (slot_remove(game->bot_clients, &game->bot_client_count, slot) && game->has_bots)
+    game->bot_preparation.free_client(game->bot_preparation.ctx, frame->player.client);
+  remove_messages(game, slot);
+}
 void qa_app_q3_qvm_server_game_disconnect(qa_app_q3_qvm_server_game *game, qa_app_q3_player player) {
-  game->external_operations++;
+  operation_scope scope; operation_begin(game, &scope);
   current(game);
-  if (!(game->lifecycle == LC_INITIALIZING || game->lifecycle == LC_RUNNING || game->lifecycle == LC_SHUTTING_DOWN)) {
-    finish_operation(game); qa_range_error("Q3 guest client disconnect requires attached output");
-  }
+  if (!(game->lifecycle == LC_INITIALIZING || game->lifecycle == LC_RUNNING || game->lifecycle == LC_SHUTTING_DOWN))
+    qa_raise("Error", 0, 0, "%s", "Q3 guest client disconnect requires attached output");
   client_entry *entry = find_client(game, player.source_entity);
-  if (!entry || !client_eq(entry->player.client, player.client)) { finish_operation(game); return; }
+  if (!entry || !client_eq(entry->player.client, player.client) || !qa_same_actor(entry->player.actor, player.actor)) {
+    operation_end(&scope); return;
+  }
   notify_disconnect(game, entry);
-  if (entry->phase != PH_DROPPING) { entry->phase = PH_DROPPING; strncpy(entry->drop_reason, "Client disconnected.", 255); }
-  qa_app_q3_player saved_player = entry->player;
+  if (entry->phase != PH_DROPPING) { entry->phase = PH_DROPPING; set_drop_reason(entry, "Client disconnected."); }
   remove_client_entry(game, entry);
+  /* try { ClientDisconnect } finally { clearClient, releaseClient, the bot client and its messages } */
+  disconnect_frame frame = {game, player};
+  qa_cleanup node; qa_cleanup_push(&node, disconnect_finally, &frame);
   game->engine->ops->client_disconnect(game->engine, player.source_entity);
   current(game);
-  qa_app_q3_server_state_clear_client(game->options.state, player.source_entity);
-  qa_app_q3_guest_records_release_client(game->records, player.source_entity);
-  if (slot_remove(game->bot_clients, &game->bot_client_count, player.source_entity) && game->has_bots)
-    game->bot_preparation.free_client(game->bot_preparation.ctx, saved_player.client);
-  message_queue *queue = find_messages(game, player.source_entity);
-  if (queue) { for (size_t i = 0; i < queue->count; i++) free(queue->items[(queue->head + i) % 64]); queue->count = 0; }
-  finish_operation(game);
+  qa_cleanup_pop(&node);
+  disconnect_finally(&frame);
+  operation_end(&scope);
 }
 bool qa_app_q3_qvm_server_game_console_command(qa_app_q3_qvm_server_game *game, const char *const *argv, size_t argc) {
-  game->external_operations++;
+  operation_scope scope; operation_begin(game, &scope);
   running(game);
   bool handled = game->engine->ops->console_command(game->engine, argv, argc);
   current(game); drain_bot_commands(game);
-  finish_operation(game);
+  operation_end(&scope);
   return handled;
 }
 void qa_app_q3_qvm_server_game_run_frame(qa_app_q3_qvm_server_game *game, double time_milliseconds) {
-  game->external_operations++;
+  operation_scope scope; operation_begin(game, &scope);
   running(game);
   if (game->has_bots) {
     bool enabled = qa_cvar_registry_variable_value(qa_app_q3_server_state_cvars(game->options.state), "bot_enable") != 0;
@@ -1120,7 +1244,7 @@ void qa_app_q3_qvm_server_game_run_frame(qa_app_q3_qvm_server_game *game, double
   game->engine->ops->run_frame(game->engine, time_milliseconds);
   refresh_server_info(game);
   current(game); drain_bot_commands(game);
-  finish_operation(game);
+  operation_end(&scope);
 }
 size_t qa_app_q3_qvm_server_game_players(qa_app_q3_qvm_server_game *game, qa_app_q3_player *out, size_t capacity) {
   size_t count = 0;
@@ -1146,43 +1270,62 @@ bool qa_app_q3_qvm_server_game_is_bot(qa_app_q3_qvm_server_game *game, qa_client
   return in_slots(game->bot_clients, game->bot_client_count, (double)client.slot)
       && qa_app_q3_qvm_server_game_player(game, client, &player);
 }
-void qa_app_q3_qvm_server_game_shutdown(qa_app_q3_qvm_server_game *game) {
-  if (game->lifecycle == LC_RETIRED) return;
-  if (game->external_operations != 0 || module_active(game))
-    qa_range_error("Q3 guest shutdown must await the active operation");
+/* shutdownSource(restart): the input binding goes, then GAME_SHUTDOWN while output is attached. */
+typedef struct shutdown_job { qa_app_q3_qvm_server_game *game; bool restart; } shutdown_job;
+static void shutdown_source(void *arg) {
+  shutdown_job *job = arg; qa_app_q3_qvm_server_game *game = job->game;
   close_input(game);
   game->retirement_count = 0;
   if (game->lifecycle == LC_INITIALIZING || game->lifecycle == LC_RUNNING || game->lifecycle == LC_SHUTTING_DOWN) {
-    qa_app_q3_guest_output output = game->output;
-    (void)output; game->lifecycle = LC_SHUTTING_DOWN;
-    game->engine->ops->shutdown(game->engine, false);
+    game->lifecycle = LC_SHUTTING_DOWN;
+    game->engine->ops->shutdown(game->engine, job->restart);
   }
-  release_source(game, false);
+}
+void qa_app_q3_qvm_server_game_shutdown(qa_app_q3_qvm_server_game *game) {
+  if (game->lifecycle == LC_RETIRED) return;
+  if (game->external_operations != 0 || module_active(game))
+    qa_raise("Error", 0, 0, "%s", "Q3 guest shutdown must await the active operation");
+  qa_caught_error caught;
+  size_t failures = qa_try(shutdown_source, &(shutdown_job){game, false}, &caught) ? 0 : 1;
+  failures += release_source(game, false);
+  if (failures != 0) qa_raise("AggregateError", 0, 0, "Q3 guest shutdown failed");
+}
+typedef struct map_change_job { qa_app_q3_qvm_server_game *game; bool restart, captured; qa_app_q3_guest_map_transition transition; } map_change_job;
+static void map_change_body(void *arg) {
+  map_change_job *job = arg; qa_app_q3_qvm_server_game *game = job->game;
+  shutdown_job shutdown = {game, job->restart};
+  shutdown_source(&shutdown);
+  qa_app_q3_guest_map_transition *transition = &job->transition;
+  transition->cvars = qa_cvar_registry_capture_save_state(qa_app_q3_server_state_cvars(game->options.state));
+  transition->clients = calloc(game->client_count ? game->client_count : 1, sizeof *transition->clients);
+  if (!transition->clients) qa_range_error("Out of memory");
+  for (size_t i = 0; i < game->client_count; i++) {
+    if (game->clients[i].phase == PH_DROPPING) continue;
+    transition->clients[transition->client_count].client = game->clients[i].player.client;
+    const char *userinfo = qa_app_q3_server_state_get_userinfo(game->options.state, game->clients[i].player.source_entity);
+    transition->clients[transition->client_count].userinfo = dup_str(userinfo ? userinfo : "");
+    transition->clients[transition->client_count].bot = in_slots(game->bot_clients, game->bot_client_count, game->clients[i].player.source_entity);
+    transition->client_count++;
+  }
+  job->captured = true;
 }
 qa_app_q3_guest_map_transition qa_app_q3_qvm_server_game_shutdown_for_map_change(qa_app_q3_qvm_server_game *game, bool restart) {
   running(game);
   bool busy = game->external_operations != 0 || module_active(game) || game->reconnecting_count != 0;
   for (size_t i = 0; i < game->client_count; i++)
     if (game->clients[i].phase != PH_CONNECTED && game->clients[i].phase != PH_ACTIVE) busy = true;
-  if (busy) qa_range_error("Q3 map transition requires completed client operations");
-  close_input(game);
-  game->retirement_count = 0;
-  game->lifecycle = LC_SHUTTING_DOWN;
-  game->engine->ops->shutdown(game->engine, restart);
-  qa_app_q3_guest_map_transition transition; memset(&transition, 0, sizeof transition);
-  transition.cvars = qa_cvar_registry_capture_save_state(qa_app_q3_server_state_cvars(game->options.state));
-  transition.clients = calloc(game->client_count ? game->client_count : 1, sizeof *transition.clients);
-  if (!transition.clients) qa_range_error("Out of memory");
-  for (size_t i = 0; i < game->client_count; i++) {
-    if (game->clients[i].phase == PH_DROPPING) continue;
-    transition.clients[transition.client_count].client = game->clients[i].player.client;
-    const char *userinfo = qa_app_q3_server_state_get_userinfo(game->options.state, game->clients[i].player.source_entity);
-    transition.clients[transition.client_count].userinfo = dup_str(userinfo ? userinfo : "");
-    transition.clients[transition.client_count].bot = in_slots(game->bot_clients, game->bot_client_count, game->clients[i].player.source_entity);
-    transition.client_count++;
+  if (busy) qa_raise("Error", 0, 0, "%s", "Q3 map transition requires completed client operations");
+  /* try { shutdownSource(restart); transition = {...} } catch (error) { errors.push(error) }, then releaseSource(errors,
+   * transition !== null) and one AggregateError for every failure. */
+  map_change_job job; memset(&job, 0, sizeof job); job.game = game; job.restart = restart;
+  qa_caught_error caught;
+  size_t failures = qa_try(map_change_body, &job, &caught) ? 0 : 1;
+  failures += release_source(game, job.captured);
+  if (failures != 0) {
+    qa_app_q3_guest_map_transition_destroy(&job.transition);
+    qa_raise("AggregateError", 0, 0, "Q3 guest map shutdown failed");
   }
-  release_source(game, true);
-  return transition;
+  return job.transition;
 }
 void qa_app_q3_guest_map_transition_destroy(qa_app_q3_guest_map_transition *transition) {
   if (!transition) return;

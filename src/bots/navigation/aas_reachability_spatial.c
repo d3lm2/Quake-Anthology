@@ -101,7 +101,10 @@ bool qa_aas_reachability_entities_init(qa_aas_reachability_entities *entities, c
   memset(entities, 0, sizeof *entities);
   entities->records = qa_q3_parse_entities(text ? text : "", NULL, &entities->count);
   if (!entities->records && entities->count > 0) return false;
-  if (entities->count >= 2048) qa_range_error("Too many BSP entities for AAS generation");
+  if (entities->count >= 2048) {
+    qa_aas_reachability_entities_destroy(entities); /* the parsed records die with the throw */
+    qa_range_error("Too many BSP entities for AAS generation");
+  }
   return true;
 }
 void qa_aas_reachability_entities_destroy(qa_aas_reachability_entities *entities) {
@@ -247,7 +250,7 @@ void qa_aas_spatial_model_bounds(qa_aas_reachability_spatial *spatial, int64_t m
 qa_aas_client_move qa_aas_spatial_predict_client_movement(qa_aas_reachability_spatial *spatial, qa_bot_movement_prediction request) {
   request.entity_num = spatial->options.prediction_client;
   qa_bot_travel_prediction_result result = spatial->options.predict_client_movement(spatial->options.predict_ctx, request);
-  if (!result.has_end_area) qa_range_error("AAS generation prediction requires an AAS end area");
+  if (!result.has_end_area) qa_raise("Error", 0, 0, "AAS generation prediction requires an AAS end area");
   double frames = result.stop_event == 0 ? result.frames : qa_js_max(0, result.frames - 1);
   qa_aas_client_move move;
   move.end = result.end;
@@ -299,6 +302,7 @@ qa_aas_trace qa_aas_spatial_trace_client_bbox(qa_aas_reachability_spatial *spati
 void qa_aas_area_link_free(qa_aas_area_link *head) {
   while (head) { qa_aas_area_link *next = head->next_area; free(head); head = next; }
 }
+static void area_links_release(void *arg) { qa_aas_area_link **head = arg; qa_aas_area_link_free(*head); *head = NULL; }
 qa_aas_area_link *qa_aas_spatial_link_client_bounds(qa_aas_reachability_spatial *spatial, int64_t entity, qa_bounds bounds, int64_t presence) {
   (void)entity;
   qa_aas_asset *world = &spatial->world->asset;
@@ -308,7 +312,7 @@ qa_aas_area_link *qa_aas_spatial_link_client_bounds(qa_aas_reachability_spatial 
     if (world->bboxes[i].presence == presence) { found = world->bboxes[i].bounds; client = &found; break; }
   if (!client) {
     if (presence == 4) {
-      if (!spatial->options.profile.has_crouched_shape) qa_range_error("Missing AAS presence bounds %lld", (long long)presence);
+      if (!spatial->options.profile.has_crouched_shape) qa_raise("Error", 0, 0, "Missing AAS presence bounds %lld", (long long)presence);
       found = spatial->options.profile.crouched_shape.bounds;
     } else found = spatial->options.profile.shape.bounds;
     client = &found;
@@ -348,11 +352,14 @@ qa_aas_best_area qa_aas_spatial_best_reachable_area(qa_aas_reachability_spatial 
   qa_bounds expanded = {qa_add3(origin, bounds.min), qa_add3(origin, bounds.max)};
   qa_aas_area_link *head = qa_aas_spatial_link_client_bounds(spatial, -1, expanded, 4);
   qa_aas_best_area result = {0, origin};
+  qa_cleanup guard; /* aasAt(settings, area) RangeError: the temporary links go with it */
+  qa_cleanup_push(&guard, area_links_release, &head);
   for (qa_aas_area_link *link = head; link; link = link->next_area)
     if ((qa_aas_at_setting(&spatial->world->asset, link->area)->flags & 5) != 0) { result = (qa_aas_best_area){link->area, origin}; goto done; }
   for (qa_aas_area_link *link = head; link; link = link->next_area)
     if (link->area != 0) { result = (qa_aas_best_area){link->area, origin}; goto done; }
 done:
+  qa_cleanup_pop(&guard);
   qa_aas_area_link_free(head);
   return result;
 }

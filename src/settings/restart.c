@@ -48,10 +48,13 @@ void qa_restart_controls_request(qa_restart_controls *controls,
     qa_bounded_queue_push(&controls->pending, &kind);
 }
 
+static void stop_running(void *arg) { ((qa_restart_controls *)arg)->running = false; }
 void qa_restart_controls_drain(qa_restart_controls *controls) {
   if (controls->running)
     qa_error("Restart controls already have an active operation");
   controls->running = true;
+  qa_cleanup guard; /* TS finally: a restart that throws leaves the controls idle */
+  qa_cleanup_push(&guard, stop_running, controls);
   qa_restart_kind kind;
   while (qa_bounded_queue_shift(&controls->pending, &kind)) {
     for (size_t i = 0; i < controls->latched_count[kind]; i++) {
@@ -64,6 +67,7 @@ void qa_restart_controls_drain(qa_restart_controls *controls) {
     if (controls->services[kind].restart != NULL)
       controls->services[kind].restart(controls->services[kind].ctx);
   }
+  qa_cleanup_pop(&guard);
   controls->running = false;
 }
 

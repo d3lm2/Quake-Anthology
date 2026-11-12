@@ -14,6 +14,9 @@ typedef struct entry {
   const void *writable;
   bool has_client; qa_active_mod_client_presentation client;
   qa_app_unified_component_identity metadata;
+  /* Owned copies (qa_app_unified_component_identity_clone): active/client identity from the
+   * activating update, metadata from the latest; the decoded updates are freed once applied. */
+  void *active_block, *metadata_block;
   double game_state_revision;
   qa_q3_source_game_state_record game_state; /* deep-owned */
   qa_qvm_cp_scene_command *commands; size_t command_count, command_cap;
@@ -122,16 +125,18 @@ static void source_command(void *ctx, qa_actor_id viewer,
 static const qa_qvm_presentation_binding *source_bindings(void *ctx, size_t *out_count) {
   entry *e = ctx;
   source_assert(ctx);
+  /* TS liveEntry.frame?.bindings ?? []: the current frame's bindings, refreshed on every call
+   * (a later frame can bind other actors to the same number of slots). */
   size_t count = e->has_frame ? e->frame.binding_count : 0;
   if (e->binding_count != count) {
     free(e->binding_storage);
     e->binding_storage = xmalloc(count * sizeof *e->binding_storage);
     e->binding_count = count;
-    for (size_t i = 0; i < count; i++) {
-      e->binding_storage[i].actor = e->frame.bindings[i].actor;
-      e->binding_storage[i].slot = (double)e->frame.bindings[i].slot;
-      e->binding_storage[i].owned = e->frame.bindings[i].owned;
-    }
+  }
+  for (size_t i = 0; i < count; i++) {
+    e->binding_storage[i].actor = e->frame.bindings[i].actor;
+    e->binding_storage[i].slot = (double)e->frame.bindings[i].slot;
+    e->binding_storage[i].owned = e->frame.bindings[i].owned;
   }
   *out_count = count;
   return e->binding_storage;
@@ -193,6 +198,8 @@ static void entry_free(qa_app_unified_component_consumers *c, entry *e) {
   scene_free(e->scene);
   scene_free(e->baseline);
   free(e->binding_storage);
+  free(e->active_block);
+  free(e->metadata_block);
   free(e);
 }
 qa_app_unified_component_consumers *qa_app_unified_component_consumers_create(
@@ -326,12 +333,14 @@ void qa_app_unified_component_consumers_update(qa_app_unified_component_consumer
       e->writable = writable;
       e->borrowed = mounts != installed;
       scope.created[scope.created_count++] = e;
-      e->active.owner = metadata->identity.owner;
-      e->active.identity = metadata->identity.identity;
+      qa_app_unified_component_identity active =
+          qa_app_unified_component_identity_clone(&metadata->identity, &e->active_block);
+      e->active.owner = active.owner;
+      e->active.identity = active.identity;
       e->active.prepared = prepared->presentation;
       e->active.source.ctx = e;
       e->active.source.module = prepared->presentation.source;
-      e->active.source.abi_profile = metadata->identity.abi;
+      e->active.source.abi_profile = active.abi;
       e->active.source.generation = metadata->identity.generation;
       e->active.source.context = source_context;
       e->active.source.files = source_files;
@@ -340,7 +349,7 @@ void qa_app_unified_component_consumers_update(qa_app_unified_component_consumer
       e->active.source.actor = source_actor;
       e->active.source.live = source_live;
       e->active.source.assert_current = source_assert;
-      e->metadata = metadata->identity;
+      e->metadata = qa_app_unified_component_identity_clone(&metadata->identity, &e->metadata_block);
       e->game_state = record_copy(&metadata->game_state);
       e->frame_game_state = e->game_state;
       e->game_state_revision = metadata->game_state_revision;
@@ -351,8 +360,8 @@ void qa_app_unified_component_consumers_update(qa_app_unified_component_consumer
           ? &declaration->as.scene->base : &declaration->as.player_events->base;
       if (base->hud) {
         e->has_client = true;
-        e->client.owner = metadata->identity.owner;
-        e->client.identity = metadata->identity.identity;
+        e->client.owner = active.owner;
+        e->client.identity = active.identity;
         e->client.source.ctx = e;
         e->client.source.generation = metadata->identity.generation;
         e->client.source.frame = client_frame;
@@ -395,7 +404,9 @@ void qa_app_unified_component_consumers_update(qa_app_unified_component_consumer
     if (!e) qa_raise("Error", 0, 0, "Remote component admission disappeared");
     c->options.admit_replicated_owner(c->options.ctx, metadata->identity.owner,
         metadata->identity.identity.source.content);
-    e->metadata = metadata->identity;
+    void *previous_block = e->metadata_block;
+    e->metadata = qa_app_unified_component_identity_clone(&metadata->identity, &e->metadata_block);
+    free(previous_block);
     e->game_state_revision = metadata->game_state_revision;
     if (metadata->has_game_state) {
       /* An accepted frame keeps the record it was published under (TS frameGameState); a
@@ -488,6 +499,7 @@ bool qa_app_unified_component_consumers_accept(qa_app_unified_component_consumer
     /* The decoded frame is freed after this call: the entry keeps its own copy. */
     qa_app_unified_component_frame frame = *source;
     frame.owner = e->active.owner;
+    frame.abi = e->active.source.abi_profile;
     frame.bindings = xmalloc(source->binding_count * sizeof *frame.bindings);
     if (source->binding_count) memcpy(frame.bindings, source->bindings, source->binding_count * sizeof *frame.bindings);
     if (source->has_scene) frame.scene.snapshot = snapshot_copy(&source->scene.snapshot);
@@ -543,14 +555,24 @@ const qa_active_mod_client_presentation *qa_app_unified_component_consumers_clie
   *out_count = count;
   return consumers->client_sources;
 }
+typedef struct close_step { qa_app_unified_component_consumers *consumers; entry *e; } close_step;
+static void close_retire_body(void *ctx) {
+  close_step *step = ctx;
+  retire(step->consumers, step->e, false);
+}
 void qa_app_unified_component_consumers_close(qa_app_unified_component_consumers *consumers) {
   if (consumers->closed) return;
   consumers->closed = true;
   /* TS this.entries.clear(), then retire each entry (closing borrowed mounts). */
   size_t count = consumers->count;
   consumers->count = 0;
+  /* Each retirement runs even after one fails; the failures become one AggregateError. */
+  size_t failures = 0;
   for (size_t i = 0; i < count; i++) {
-    retire(consumers, consumers->entries[i], false);
+    close_step step = {consumers, consumers->entries[i]};
+    qa_caught_error caught;
+    if (!qa_try(close_retire_body, &step, &caught)) failures++;
     entry_free(consumers, consumers->entries[i]);
   }
+  if (failures != 0) qa_raise("AggregateError", 0, 0, "Remote component retirement failed");
 }

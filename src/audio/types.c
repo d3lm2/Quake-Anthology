@@ -1,10 +1,12 @@
 /* Port of src/audio/types.ts. GPL-2.0-or-later. */
 #include "qa/audio/types.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "qa/foundation/support.h"
+#include "qa/network/common/js_number.h"
 
 const char *qa_sound_family_name(qa_sound_family family) {
   switch (family) {
@@ -22,9 +24,10 @@ bool qa_sound_family_parse(const char *text, qa_sound_family *out) {
   return false;
 }
 
-qa_sound_channel_command qa_source_sound_channel(qa_sound_family family,
-                                                 int64_t channel) {
-  if (channel < 0 && !(family == QA_SOUND_FAMILY_Q1 && channel == -1))
+qa_sound_channel_command qa_source_sound_channel_number(qa_sound_family family,
+                                                        double channel) {
+  if (!(isfinite(channel) && trunc(channel) == channel) ||
+      (channel < 0 && !(family == QA_SOUND_FAMILY_Q1 && channel == -1)))
     qa_range_error("Invalid source sound channel");
   qa_sound_channel_command command = {0};
   if (channel == -1) {
@@ -40,11 +43,15 @@ qa_sound_channel_command qa_source_sound_channel(qa_sound_family family,
   static const char *const q12_names[] = {"weapon", "voice", "item", "body"};
   command.kind = QA_SOUND_CHANNEL_CHANNEL;
   if (family == QA_SOUND_FAMILY_Q3 && channel - 1 < 7)
-    snprintf(command.channel, sizeof command.channel, "%s", q3_names[channel - 1]);
+    snprintf(command.channel, sizeof command.channel, "%s", q3_names[(int)channel - 1]);
   else if (family != QA_SOUND_FAMILY_Q3 && channel - 1 < 4)
-    snprintf(command.channel, sizeof command.channel, "%s", q12_names[channel - 1]);
-  else
-    snprintf(command.channel, sizeof command.channel, "%s:extension:%lld",
-             qa_sound_family_name(family), (long long)channel);
+    snprintf(command.channel, sizeof command.channel, "%s", q12_names[(int)channel - 1]);
+  else /* `${family}:extension:${channel}`: any integer the number holds, in JS spelling */
+    snprintf(command.channel, sizeof command.channel, "%s:extension:%s",
+             qa_sound_family_name(family), QA_JS_NUMBER(channel));
   return command;
+}
+qa_sound_channel_command qa_source_sound_channel(qa_sound_family family,
+                                                 int64_t channel) {
+  return qa_source_sound_channel_number(family, (double)channel);
 }

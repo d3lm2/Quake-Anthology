@@ -63,6 +63,19 @@ noreturn void qa_application_close_failed_world(qa_application *app, const qa_ca
 }
 
 /* ---- closeOwned steps ---- */
+/* TS: if (ownership.kind === "borrowed") await ownership.client.stopRecording(this). */
+static void step_stop_borrowed_recording(void *ctx) {
+  close_step *s = ctx;
+  qa_app_client_bootstrap *client = s->app->ownership.borrowed_client;
+  if (client->stop_recording == NULL) return;
+  const char *error = client->stop_recording(client->stop_recording_ctx, &s->app->source_lifetime);
+  if (error != NULL) qa_raise("Error", 0, 0, "%s", error);
+}
+/* TS: ownership.client.capture.beforeWorldChange() while this application is the client's current source. */
+static void step_borrowed_capture(void *ctx) {
+  close_step *s = ctx;
+  qa_app_capture_before_world_change(s->app->ownership.borrowed_client->capture);
+}
 static void step_stop_recordings(void *ctx) {
   close_step *s = ctx;
   if (s->app->owned_recording == NULL) return;
@@ -108,6 +121,23 @@ static void step_save_client_archives(void *ctx) {
   qa_application *app = s->app;
   qa_application_save_client_archives(app, &app->launch_options, app->loaded_content, app->client_cvar_seats, app->client_cvars,
       app->client_cvar_count, app->team_arena_overrides);
+}
+/* TS saveHeadlessArchives: a dedicated server has no input owner, so the movement and fallback archives it loaded
+ * are saved here. */
+static void step_save_headless_archives(void *ctx) {
+  close_step *s = ctx;
+  qa_application *app = s->app;
+  if (!app->launch_options.dedicated) return;
+  qa_app_prepared_startup *prepared = app->prepared_startup;
+  if (prepared == NULL) return;
+  qa_cvar_registry *movement = qa_app_prepared_startup_movement(prepared);
+  qa_cvar_registry *fallback = qa_app_prepared_startup_fallback(prepared);
+  const char *movement_owner[2] = { "movement", qa_app_configuration_dialect_name(qa_cvar_registry_dialect(movement)) };
+  qa_app_save_cvar_archive(&app->input_config, movement_owner, 2, movement, NULL, 0);
+  if (fallback != movement) {
+    const char *fallback_owner[2] = { "fallback", qa_app_configuration_dialect_name(qa_cvar_registry_dialect(fallback)) };
+    qa_app_save_cvar_archive(&app->input_config, fallback_owner, 2, fallback, NULL, 0);
+  }
 }
 static void step_release_settings(void *ctx) { close_step *s = ctx; qa_application_release_settings(s->app); }
 static void step_close_image_settings(void *ctx) {
@@ -174,8 +204,10 @@ static void step_close_presentation(void *ctx) {
     qa_resource_scope_destroy(previous);
   } else {
     qa_app_world_seat_presentation_close(presentation->presentation);
-    /* C: close no longer frees (presentation.h); TS GC reclaims the closed object. */
-    qa_app_world_seat_presentation_destroy(presentation->presentation);
+    /* C: close no longer frees (presentation.h); TS GC reclaims the closed object. A borrowed client published the
+     * presentation with its () => presentation.close() cleanup, and a world the frontend already detached still
+     * holds that cleanup (StartupApplication.returnToFrontend closes it after this), so the cleanup frees it. */
+    if (s->app->ownership.borrowed_client == NULL) qa_app_world_seat_presentation_destroy(presentation->presentation);
   }
 }
 static void step_retire_guest_seat(void *ctx) {
@@ -226,6 +258,7 @@ static void step_close_world(void *ctx) {
   else qa_app_shared_sim_close(s->app->world_simulation);
 }
 static void step_close_game_log(void *ctx) { close_step *s = ctx; qa_application_close_game_log(s->app); }
+static void step_close_console_log(void *ctx) { close_step *s = ctx; qa_application_close_console_log(s->app); }
 static void step_close_input(void *ctx) { close_step *s = ctx; if (s->graphical != NULL) qa_app_application_input_close(s->graphical->input); }
 static void step_close_audio(void *ctx) { close_step *s = ctx; if (s->graphical != NULL) qa_app_application_audio_close(s->graphical->audio); }
 static void step_close_effects(void *ctx) { close_step *s = ctx; if (s->graphical != NULL) qa_app_application_effects_close(s->graphical->effects); }
@@ -297,6 +330,8 @@ void qa_application_close_owned(qa_application *app) {
   app->graphical = NULL;
   close_errors errors = { NULL, 0, 0 };
   close_step step = { app, graphical, 0 };
+  qa_app_client_bootstrap *client = app->ownership.borrowed_client;
+  if (client != NULL) attempt(&errors, step_stop_borrowed_recording, &step);
   attempt(&errors, step_stop_recordings, &step);
   attempt(&errors, step_release_demos, &step);
   app->has_owned_demos = false; app->owned_demos_service = NULL; app->owned_demos_release.fn = NULL;
@@ -304,6 +339,7 @@ void qa_application_close_owned(qa_application *app) {
   app->tools = NULL;
   attempt(&errors, step_close_video_restart, &step);
   app->owned_video_restart = NULL;
+  if (client != NULL && client->source_current == &app->source_lifetime) attempt(&errors, step_borrowed_capture, &step);
   for (step.index = 0; step.index < app->movie_count; step.index++) attempt(&errors, step_close_movie, &step);
   app->movie_count = 0;
   if (app->ownership.borrowed_client == NULL) attempt(&errors, step_close_capture, &step);
@@ -313,6 +349,7 @@ void qa_application_close_owned(qa_application *app) {
       && !(app->prepared_startup != NULL && qa_app_prepared_startup_pending(app->prepared_startup))) {
     attempt(&errors, step_save_source_archive, &step);
     attempt(&errors, step_save_client_archives, &step);
+    attempt(&errors, step_save_headless_archives, &step);
   }
   attempt(&errors, step_release_settings, &step);
   if (app->ownership.borrowed_client == NULL) attempt(&errors, step_close_image_settings, &step);
@@ -337,7 +374,7 @@ void qa_application_close_owned(qa_application *app) {
   qa_application_release_guest_browser(app->guest_browser);
   app->guest_browser = NULL;
   void (*const sequence[])(void *) = { step_close_rankings, step_close_bots, step_close_network, step_shutdown_q3_guest,
-    step_write_shutdown_log, step_close_world, step_close_game_log, step_close_input, step_close_audio, step_close_effects,
+    step_write_shutdown_log, step_close_world, step_close_game_log, step_close_console_log, step_close_input, step_close_audio, step_close_effects,
     step_close_dedicated_console, step_close_art, step_close_assets, step_flush_renderer };
   for (size_t i = 0; i < sizeof sequence / sizeof sequence[0]; i++) attempt(&errors, sequence[i], &step);
   for (step.index = 0; step.index < app->source_connection_count; step.index++) attempt(&errors, step_disconnect_source_client, &step);
@@ -358,6 +395,10 @@ void qa_application_close_owned(qa_application *app) {
   app->local_seat_count = 0;
   for (size_t i = 0; i < app->network_player_identity_count; i++) free(app->network_player_identities[i].social_id);
   app->network_player_identity_count = 0;
+  if (client != NULL && client->source_current == &app->source_lifetime) {
+    client->source_current = NULL;
+    client->has_source_profile = false;
+  }
   size_t failures = errors.count;
   free(errors.items);
   if (failures > 0) qa_raise("AggregateError", 0, (long long)failures, "Application shutdown failed");

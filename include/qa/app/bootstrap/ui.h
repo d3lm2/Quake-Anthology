@@ -10,8 +10,10 @@
  *    qa_app_seat_ui_image_refresh handle.
  *  - The weapon HUD assets, Q1 wheel, sound captions, native Q2 HUD and game
  *    prompt read the ApplicationAssets passed to prepare, as TS.
- *  - sharedSettings(): ApplicationInput returns the shared registry current
- *    at construction; the TS view follows a later publishSharedCvars.
+ *  - sharedSettings() is the input's qa_ui_setting_cvars view: the
+ *    preferences, settings bindings and r_smp worker follow a later
+ *    publishSharedCvars, as TS (the native HUD's rerelease localizations
+ *    still take the registry current when first created).
  * GPL-2.0-or-later. */
 #ifndef QA_APP_BOOTSTRAP_UI_H
 #define QA_APP_BOOTSTRAP_UI_H
@@ -90,7 +92,9 @@ typedef struct qa_app_seat_ui_options {
   const qa_ui_gameplay_settings_source *gameplay;
   const qa_app_seat_ui_lobby *lobby;
   const qa_app_seat_ui_rankings *rankings;
-  qa_app_seat_ui_localize_fn native_hud_localizer; void *native_hud_localizer_ctx;
+  /* TS nativeHudLocalizer(content): resolves the content's localizer (its catalog) once; prepareNativeQ2Hud
+   * applies it to every text of that prepare. NULL undefined. */
+  qa_app_rerelease_localizer *(*native_hud_localizer)(void *ctx, qa_content_id content); void *native_hud_localizer_ctx;
   qa_app_seat_ui_localize_fn localize; void *localize_ctx;
 } qa_app_seat_ui_options;
 
@@ -115,6 +119,8 @@ void qa_app_seat_ui_refresh_images(qa_app_seat_ui *ui, qa_text_font_selection fo
 typedef struct qa_app_seat_ui_image_refresh qa_app_seat_ui_image_refresh;
 qa_app_seat_ui_image_refresh *qa_app_seat_ui_prepare_image_refresh(qa_app_seat_ui *ui, qa_app_prepared_images *providers);
 void qa_app_seat_ui_image_refresh_commit(qa_app_seat_ui_image_refresh *refresh);
+/* Drops an uncommitted refresh (TS: the closure is never called). NULL is allowed. */
+void qa_app_seat_ui_image_refresh_discard(qa_app_seat_ui_image_refresh *refresh);
 void qa_app_seat_ui_prepare(qa_app_seat_ui *ui, qa_app_application_assets *assets);
 
 /* ApplicationInputUi. */

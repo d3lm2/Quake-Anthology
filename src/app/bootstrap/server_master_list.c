@@ -65,11 +65,13 @@ char *qa_app_js_trim(const char *text) { return qa_app_js_trim_range(text, strle
 typedef struct parse_scope {
   char *text;
   char **servers; size_t count, capacity;
+  size_t *lengths; /* byte length of each line: a decoded NUL stays inside it */
   char **valid; size_t valid_count;
 } parse_scope;
 static void parse_scope_release(void *arg) {
   parse_scope *scope = arg;
   free(scope->text); scope->text = NULL;
+  free(scope->lengths); scope->lengths = NULL;
   qa_app_server_master_list_free(scope->servers, scope->count); scope->servers = NULL; scope->count = 0;
   free(scope->valid); scope->valid = NULL;
 }
@@ -94,25 +96,38 @@ char **qa_app_parse_server_master_list(const uint8_t *bytes, size_t length, qa_a
   memcpy(scope.text, bytes + start, length - start);
   scope.text[length - start] = '\0';
   /* .split(/\r?\n/).map(trim).filter(non-empty, not '#') into a Set (first-seen order).
-   * A decoded NUL is kept by JS; the C text ends there (string-model limit). */
+   * A decoded NUL is kept by JS: lines are compared by their bytes, and one holding it is never a valid address. */
   size_t text_length = length - start;
   for (size_t cursor = 0; cursor <= text_length;) {
     const char *nl = memchr(scope.text + cursor, '\n', text_length - cursor);
     size_t line_end = nl != NULL ? (size_t)(nl - scope.text) : text_length;
     size_t line_length = line_end - cursor;
     if (nl != NULL && line_length > 0 && scope.text[line_end - 1] == '\r') line_length--;
-    char *line = qa_app_js_trim_range(scope.text + cursor, line_length);
-    if (line == NULL) qa_range_error("Out of memory");
-    bool keep = line[0] != '\0' && line[0] != '#';
-    for (size_t i = 0; keep && i < scope.count; i++) if (strcmp(scope.servers[i], line) == 0) keep = false;
-    if (!keep) free(line);
-    else {
+    /* line.trim() over the whole line: a NUL byte (TS keeps the decoded U+0000) is not white space. */
+    const char *raw = scope.text + cursor;
+    size_t first = 0, last = line_length, step;
+    while (first < last && (step = qa_app_js_space_at(raw, last, first)) != 0) first += step;
+    while (last > first && (step = js_space_before(raw, last)) != 0) last -= step;
+    size_t trimmed = last - first;
+    bool keep = trimmed != 0 && raw[first] != '#';
+    for (size_t i = 0; keep && i < scope.count; i++)
+      if (scope.lengths[i] == trimmed && memcmp(scope.servers[i], raw + first, trimmed) == 0) keep = false;
+    if (keep) {
       if (scope.count == scope.capacity) {
         size_t capacity = scope.capacity ? scope.capacity * 2 : 16;
         char **grown = realloc(scope.servers, capacity * sizeof *grown);
-        if (grown == NULL) { free(line); qa_range_error("Out of memory"); }
-        scope.servers = grown; scope.capacity = capacity;
+        if (grown == NULL) qa_range_error("Out of memory");
+        scope.servers = grown;
+        size_t *grown_lengths = realloc(scope.lengths, capacity * sizeof *grown_lengths);
+        if (grown_lengths == NULL) qa_range_error("Out of memory");
+        scope.lengths = grown_lengths;
+        scope.capacity = capacity;
       }
+      char *line = malloc(trimmed + 1);
+      if (line == NULL) qa_range_error("Out of memory");
+      memcpy(line, raw + first, trimmed);
+      line[trimmed] = '\0';
+      scope.lengths[scope.count] = trimmed;
       scope.servers[scope.count++] = line;
     }
     if (nl == NULL) break;
@@ -125,10 +140,13 @@ char **qa_app_parse_server_master_list(const uint8_t *bytes, size_t length, qa_a
   for (size_t i = 0; i < scope.count; i++) {
     direct_scope check = {scope.servers[i]};
     qa_caught_error caught;
-    if (qa_try(direct_text_body, &check, &caught)) scope.valid[scope.valid_count++] = scope.servers[i];
+    /* directServerText rejects every text holding U+0000 ("Invalid direct server address"). */
+    bool nul = memchr(scope.servers[i], '\0', scope.lengths[i]) != NULL;
+    if (!nul && qa_try(direct_text_body, &check, &caught)) scope.valid[scope.valid_count++] = scope.servers[i];
     else { free(scope.servers[i]); scope.servers[i] = NULL; }
   }
   size_t total = scope.count;
+  free(scope.lengths); scope.lengths = NULL;
   free(scope.servers);
   scope.servers = scope.valid; scope.count = scope.valid_count; scope.valid = NULL;
   /* skipped is a caller callback: the guard still owns the valid list if it raises. */

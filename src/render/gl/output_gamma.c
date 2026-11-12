@@ -37,7 +37,7 @@ static gimpl *G(qa_gl_output_gamma *g) { return (gimpl *)g->impl; }
 static int32_t integer1(gimpl *p, uint32_t name) { int32_t v = 0; p->gl->glGetIntegerv(name, &v); return v; }
 static int32_t uniform_of(gimpl *p, const char *name) {
   int32_t location = p->shaders.glGetUniformLocation(p->program, name);
-  if (location < 0) qa_range_error("OpenGL gamma uniform is missing: %s", name);
+  if (location < 0) qa_raise("Error", 0, 0, "OpenGL gamma uniform is missing: %s", name);
   return location;
 }
 typedef void (*texture_action)(gimpl *p, void *ctx);
@@ -77,12 +77,9 @@ static void blit(gimpl *p, uint32_t mask) {
   if (scissor) gl->glEnable(0xc11);
 }
 
-bool qa_gl_output_gamma_init(qa_gl_output_gamma *g, const qa_gl_context *context, qa_gl *gl, qa_gl_precision precision, const uint8_t table[256]) {
-  gimpl *p = (gimpl *)calloc(1, sizeof *p); if (p == NULL) return false;
-  p->gl = gl; p->precision = precision;
-  if (!qa_load_gl_framebuffers(context, &p->fbo)) { free(p); return false; }
-  if (!qa_load_gl_programs(context, &p->shaders)) { qa_gl_framebuffers_close(&p->fbo); free(p); return false; }
-  g->impl = p;
+typedef struct init_scope { qa_gl_output_gamma *g; gimpl *p; const uint8_t *table; } init_scope;
+static void init_body(void *ctx) {
+  init_scope *s = (init_scope *)ctx; gimpl *p = s->p; qa_gl *gl = p->gl; qa_gl_precision precision = p->precision;
   int32_t component = 0;
   p->fbo.glGetFramebufferAttachmentParameteriv(0x8d40, 0x1801, 0x8211, &component);
   bool floating = component == 0x1406, stencil = precision.stencil_bits > 0;
@@ -93,15 +90,28 @@ bool qa_gl_output_gamma_init(qa_gl_output_gamma *g, const qa_gl_context *context
   p->mask = 0x4000u | 0x100u | (stencil ? 0x400u : 0u);
   p->fbo.glGenFramebuffers(1, p->target);
   gl->glGenTextures(1, p->depth); gl->glGenTextures(1, p->table);
-  if (p->target[0] == 0 || p->depth[0] == 0 || p->table[0] == 0) {
+  if (p->target[0] == 0 || p->depth[0] == 0 || p->table[0] == 0) qa_raise("Error", 0, 0, "OpenGL gamma allocation failed");
+  p->program = qa_gl_compile_program(&p->shaders, VERTEX, FRAGMENT);
+  p->raw_uniform = uniform_of(p, "rawColor"); p->table_uniform = uniform_of(p, "gammaTable");
+  qa_gl_output_gamma_update(s->g, s->table);
+}
+bool qa_gl_output_gamma_init(qa_gl_output_gamma *g, const qa_gl_context *context, qa_gl *gl, qa_gl_precision precision, const uint8_t table[256]) {
+  gimpl *p = (gimpl *)calloc(1, sizeof *p); if (p == NULL) return false;
+  p->gl = gl; p->precision = precision;
+  if (!qa_load_gl_framebuffers(context, &p->fbo)) { free(p); return false; }
+  if (!qa_load_gl_programs(context, &p->shaders)) { qa_gl_framebuffers_close(&p->fbo); free(p); return false; }
+  g->impl = p;
+  /* TS constructor catch: delete what was created, close both libraries, rethrow. */
+  init_scope scope = {g, p, table};
+  qa_caught_error caught;
+  if (!qa_try(init_body, &scope, &caught)) {
+    if (p->program != 0) p->shaders.glDeleteProgram(p->program);
     p->fbo.glDeleteFramebuffers(1, p->target);
     gl->glDeleteTextures(1, p->depth); gl->glDeleteTextures(1, p->table);
     qa_gl_programs_close(&p->shaders); qa_gl_framebuffers_close(&p->fbo);
-    qa_range_error("OpenGL gamma allocation failed");
+    free(p); g->impl = NULL;
+    qa_rethrow(&caught);
   }
-  p->program = qa_gl_compile_program(&p->shaders, VERTEX, FRAGMENT);
-  p->raw_uniform = uniform_of(p, "rawColor"); p->table_uniform = uniform_of(p, "gammaTable");
-  qa_gl_output_gamma_update(g, table);
   return true;
 }
 
@@ -120,11 +130,11 @@ bool qa_gl_output_gamma_bind(qa_gl_output_gamma *g, double buffer, double width,
   if (color == NULL) {
     changed = true;
     uint32_t name = 0; gl->glGenTextures(1, &name);
-    if (name == 0) qa_range_error("OpenGL gamma color allocation failed");
+    if (name == 0) qa_raise("Error", 0, 0, "OpenGL gamma color allocation failed");
     if (p->color_count == p->color_cap) {
       size_t cap = p->color_cap ? p->color_cap * 2 : 4;
       gcolor *grown = (gcolor *)realloc(p->colors, cap * sizeof *grown);
-      if (grown == NULL) qa_range_error("OpenGL gamma color allocation failed");
+      if (grown == NULL) qa_raise("Error", 0, 0, "OpenGL gamma color allocation failed");
       p->colors = grown; p->color_cap = cap;
     }
     color = &p->colors[p->color_count++]; color->buffer = buffer; color->name = name;
@@ -134,7 +144,7 @@ bool qa_gl_output_gamma_bind(qa_gl_output_gamma *g, double buffer, double width,
     fbo->glFramebufferTexture2D(0x8d40, p->precision.stencil_bits > 0 ? 0x821a : 0x8d00, 0xde1, p->depth[0], 0);
     gl->glDrawBuffer(0x8ce0); fbo->glReadBuffer(0x8ce0);
     uint32_t status = fbo->glCheckFramebufferStatus(0x8d40);
-    if (status != 0x8cd5) qa_range_error("OpenGL gamma framebuffer incomplete: 0x%x", status);
+    if (status != 0x8cd5) qa_raise("Error", 0, 0, "OpenGL gamma framebuffer incomplete: 0x%x", status);
     fbo->glBindFramebuffer(0x8ca8, 0); fbo->glReadBuffer((uint32_t)buffer);
     blit(p, initialize_depth ? p->mask : 0x4000u);
   }

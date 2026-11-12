@@ -115,10 +115,18 @@ qa_bot_goal qa_bot_goal_state_get(const qa_bot_goal_state_bots_a *goal);
 /* TS BotWaypoint. */
 typedef struct qa_bot_waypoint_bots_a {
   bool inuse;
-  char name[64];
+  /* TS name is an unbounded string (a checkpoint can restore any length): owned heap text, NULL
+     reads as "". Set it with qa_bot_waypoint_set_name_bots_a; the context destroy frees it. */
+  char *name;
   qa_bot_goal_state_bots_a goal;
   struct qa_bot_waypoint_bots_a *next, *prev;
 } qa_bot_waypoint_bots_a;
+static inline const char *qa_bot_waypoint_name_bots_a(const qa_bot_waypoint_bots_a *waypoint) {
+  return waypoint->name != NULL ? waypoint->name : "";
+}
+/* Replaces the name with the first `length` bytes of `text` (raises on allocation failure). */
+void qa_bot_waypoint_set_name_bots_a(qa_bot_waypoint_bots_a *waypoint, const char *text,
+                                     size_t length);
 
 /* bot_activategoal_t: 244 bytes; the source next pointer cell stays zero. */
 typedef struct qa_bot_activate_goal_source {

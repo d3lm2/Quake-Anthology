@@ -349,8 +349,9 @@ double qa_app_application_world_scene_style(const qa_app_application_world_scene
   if (row == NULL || row->pattern[0] == '\0') return absent;
   double length = (double)strlen(row->pattern);
   double position = fmod(trunc(scene->prepared_time * 10), length);
-  /* charCodeAt outside the string is NaN. */
-  if (!(position >= 0) || position >= length) return NAN;
+  /* charCodeAt(NaN) reads index 0 (ToIntegerOrInfinity); outside the string is NaN. */
+  if (position != position) position = 0;
+  if (position < 0 || position >= length) return NAN;
   return (double)(unsigned char)row->pattern[(size_t)position] - 97;
 }
 qa_app_world_scene_styles qa_app_application_world_scene_styles(qa_app_application_world_scene *scene) {

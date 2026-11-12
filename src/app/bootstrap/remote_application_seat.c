@@ -879,10 +879,20 @@ static void bind_publish_body(void *ctx) {
     if (!qa_q3_client_reliable_commands_add(qa_q3_client_connection_reliable(c->connection), c->pure, &added))
       qa_range_error("Out of memory");
   }
-  for (size_t i = 0; i < c->action_count; i++) {
-    qa_remote_command *action = &c->actions[i];
-    qa_remote_application_queue_command(app, action->name, (const char *const *)action->args, action->arg_count,
-        action->has_seat ? &action->seat : NULL, action->has_source ? &action->source : NULL);
+  /* this.commands.push(...actions): the recorded commands move as they are (queueCommand would
+   * refuse a closing application, attach the default execution context to a sourceless action
+   * and derive its seat from that context). */
+  if (c->action_count > 0) {
+    size_t needed = app->command_count + c->action_count;
+    if (needed > app->command_capacity) {
+      qa_remote_command *grown = realloc(app->commands, needed * sizeof *grown);
+      if (grown == NULL) qa_range_error("Out of memory");
+      app->commands = grown;
+      app->command_capacity = needed;
+    }
+    memcpy(app->commands + app->command_count, c->actions, c->action_count * sizeof *c->actions);
+    app->command_count = needed;
+    c->action_count = 0;
   }
   if (c->quit) qa_remote_application_request_quit(app);
   app->q3_initial_view_pending = c->connection != NULL;

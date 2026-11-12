@@ -33,6 +33,7 @@ typedef struct qa_q2_rerelease_module {
   qa_q2rr_saved_slots *cp_picked; double **cp_slot_arrays;
   qa_q2rr_saved_time *cp_sounds; qa_q2rr_saved_light *cp_lights;
   qa_q2_rerelease_level_entry *cp_levels; const char **cp_visited;
+  size_t cp_slot_array_count, cp_level_count; /* sizes of cp_slot_arrays / cp_levels at the capture */
   /* Storage behind qa_q2_rerelease_module_callbacks (per module). */
   qa_q2_named_think cb_thinks[64]; qa_q2_named_touch cb_touches[64]; qa_q2_named_use cb_uses[64];
 } qa_q2_rerelease_module;

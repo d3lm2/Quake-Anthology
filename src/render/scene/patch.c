@@ -190,7 +190,7 @@ static tblock *tblock_new(qa_patch_memory_profile p, size_t length) {
   else { t->bytes = xalloc(length); t->address = 0; }
   return t;
 }
-static uint8_t *tbytes(tblock *t) { if (!t->live) qa_range_error("Patch allocation is no longer valid"); return t->alloc ? t->alloc->bytes : t->bytes; }
+static uint8_t *tbytes(tblock *t) { if (!t->live) qa_raise("Error", 0, 0, "Patch allocation is no longer valid"); return t->alloc ? t->alloc->bytes : t->bytes; }
 static void tblock_free(tblock *t, qa_patch_memory_profile p) {
   if (p.zone) { if (t->alloc && t->alloc->free_fn) t->alloc->free_fn(t->alloc->ctx, t->alloc); }
   else (void)tbytes(t);
@@ -222,9 +222,9 @@ void qa_temporary_patch_mesh_create(const qa_patch_mesh *mesh, qa_patch_memory_p
   memset(out, 0, sizeof *out); out->temporary = true; out->profile = profile; out->indices = mesh->indices; out->index_count = mesh->index_count;
   int w = (int)mesh->width, h = (int)mesh->height;
   tblock *grid = tblock_new(profile, 92 + (size_t)(w*h)*44); uint8_t *block = tbytes(grid); memset(block, 0, grid->length);
-  tblock *wb = tblock_new(profile, (size_t)w*4); put_i32(block, 84, (int32_t)wb->address);
+  tblock *wb = tblock_new(profile, (size_t)w*4); put_i32(block, 84, qa_js_to_int32(wb->address)); /* DataView.setInt32: ToInt32 */
   for (int i = 0; i < w; i++) put_f32(tbytes(wb), (size_t)i*4, mesh->width_lod_error[i]);
-  tblock *hb = tblock_new(profile, (size_t)h*4); put_i32(block, 88, (int32_t)hb->address);
+  tblock *hb = tblock_new(profile, (size_t)h*4); put_i32(block, 88, qa_js_to_int32(hb->address));
   for (int i = 0; i < h; i++) put_f32(tbytes(hb), (size_t)i*4, mesh->height_lod_error[i]);
   put_i32(block, 76, w); put_i32(block, 80, h); put_i32(block, 0, 3);
   qa_vec3 mn = {99999,99999,99999}, mx = {-99999,-99999,-99999};
@@ -233,7 +233,7 @@ void qa_temporary_patch_mesh_create(const qa_patch_mesh *mesh, qa_patch_memory_p
     put_vec(block,o,pt.position); put_vec(block,o+28,pt.normal);
     put_f32(block,o+12,pt.tex_coord.x); put_f32(block,o+16,pt.tex_coord.y);
     put_f32(block,o+20,pt.lightmap_coord.x); put_f32(block,o+24,pt.lightmap_coord.y);
-    block[o+40]=(uint8_t)pt.color.x; block[o+41]=(uint8_t)pt.color.y; block[o+42]=(uint8_t)pt.color.z; block[o+43]=(uint8_t)pt.color.w;
+    block[o+40]=qa_js_to_uint8(pt.color.x); block[o+41]=qa_js_to_uint8(pt.color.y); block[o+42]=qa_js_to_uint8(pt.color.z); block[o+43]=qa_js_to_uint8(pt.color.w); /* Uint8Array.set: ToUint8 */
     if (pt.position.x<mn.x) mn.x=pt.position.x;
     if (pt.position.x>mx.x) mx.x=pt.position.x;
     if (pt.position.y<mn.y) mn.y=pt.position.y;
@@ -265,9 +265,9 @@ void qa_temporary_patch_mesh_move_to_hunk(qa_allocated_patch_mesh *temp, qa_patc
   memcpy(block, temp->block, g->length);
   int w = (int)qa_allocated_patch_mesh_width(temp), h = (int)qa_allocated_patch_mesh_height(temp);
   uint8_t *widthb = allocate(ctx, "R_MovePatchSurfacesToHunk:widthLodError", (size_t)w*4, &waddr);
-  memcpy(widthb, temp->width_block, (size_t)w*4); put_i32(block, 84, (int32_t)waddr);
+  memcpy(widthb, temp->width_block, (size_t)w*4); put_i32(block, 84, qa_js_to_int32(waddr));
   uint8_t *heightb = allocate(ctx, "R_MovePatchSurfacesToHunk:heightLodError", (size_t)h*4, &haddr);
-  put_i32(block, 88, (int32_t)haddr);
+  put_i32(block, 88, qa_js_to_int32(haddr));
   /* TS self-copies the old height array; new hunk array stays zeroed. */
   memmove(temp->height_block, temp->height_block, (size_t)h*4);
   (void)wb;

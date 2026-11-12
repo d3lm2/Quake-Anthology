@@ -185,10 +185,15 @@ void qa_remote_application_save_source_settings(qa_remote_application *app) {
     char **bindings = qa_cvar_registry_archive_commands(qa_app_client_socks_settings_cvars(app->socks_settings), NULL, NULL, &count);
     qa_cleanup guard;
     qa_cleanup_push(&guard, free, bindings);
-    (void)qa_config_store_save_cvars(app->client_config, "settings/client.cfg", app->client_command_owner->cvars,
+    /* saveCvars rejects when writeAtomic fails; the C store reports it as false. */
+    errno = 0;
+    bool saved = qa_config_store_save_cvars(app->client_config, "settings/client.cfg", app->client_command_owner->cvars,
         (const char *const *)bindings, count);
+    int code = errno;
     qa_cleanup_pop(&guard);
     free_string_list(bindings, count);
+    if (!saved)
+      qa_raise("Error", code, 0, "%s: could not write settings/client.cfg", code != 0 ? strerror(code) : "write failed");
   }
   if (app->loaded_content != NULL) {
     const qa_executable_recipe *recipe = qa_app_loaded_content_recipe(app->loaded_content);
@@ -333,7 +338,10 @@ static bool menu_art_read(void *ctx, const char *path, qa_image_level *out) {
 }
 
 /* ---- loadFrontend (TS 1816-1873) --------------------------------------- */
-typedef struct frontend_state { qa_remote_application *app; qa_app_loaded_content *content; qa_remote_world_frontend *frontend; } frontend_state;
+typedef struct frontend_state {
+  qa_remote_application *app; qa_app_loaded_content *content; qa_remote_world_frontend *frontend;
+  qa_app_effect_preload_failure *failures; size_t failure_count; /* released by the caller on both paths */
+} frontend_state;
 static void frontend_body(void *ctx) {
   frontend_state *state = ctx;
   qa_remote_application *app = state->app;
@@ -377,14 +385,18 @@ static void frontend_body(void *ctx) {
   size_t failure_count = 0;
   qa_app_effect_preload_failure *failures = qa_app_application_effects_preload_transient_resources(frontend->effects,
       &failure_count);
+  state->failures = failures;
+  state->failure_count = failure_count;
   for (size_t i = 0; i < failure_count; i++) {
     size_t length = strlen(failures[i].content) + strlen(failures[i].path) + strlen(failures[i].error) + 48;
     char *line = xcalloc(length, 1);
     snprintf(line, length, "Optional effect preload skipped: %s/%s: %s\n", failures[i].content, failures[i].path, failures[i].error);
+    qa_cleanup line_guard;
+    qa_cleanup_push(&line_guard, free, line);
     qa_remote_application_print(app, line, NULL);
+    qa_cleanup_pop(&line_guard);
     free(line);
   }
-  qa_app_effect_preload_failures_free(failures, failure_count);
 }
 static void frontend_free(qa_remote_world_frontend *frontend) {
   if (frontend->effects != NULL) qa_app_application_effects_destroy(frontend->effects);
@@ -414,12 +426,17 @@ qa_remote_world_frontend *qa_remote_application_load_frontend(qa_remote_applicat
       qa_app_native_renderer_images(app->renderer), assets_print, app, &images);
   qa_scene_image_policy_owned_destroy(&policy);
   if (frontend->assets == NULL) { free(frontend); qa_range_error("Out of memory"); }
-  frontend_state state = {app, content, frontend};
+  frontend_state state = {app, content, frontend, NULL, 0};
   qa_caught_error caught;
-  if (!qa_try(frontend_body, &state, &caught)) {
+  bool ok = qa_try(frontend_body, &state, &caught);
+  if (state.failures != NULL) qa_app_effect_preload_failures_free(state.failures, state.failure_count);
+  if (!ok) {
     qa_caught_error cleanup;
-    (void)qa_try(frontend_cleanup, frontend, &cleanup);
+    /* TS catch: effects?.close(); audio?.close(); art?.close(); assets.close() run unguarded, so a
+     * close that throws replaces the error and skips the renderer execute. */
+    bool closed = qa_try(frontend_cleanup, frontend, &cleanup);
     frontend_free(frontend);
+    if (!closed) qa_rethrow(&cleanup);
     if (!qa_try(execute_empty, app, &cleanup))
       qa_raise("AggregateError", 0, 0, "Remote frontend preparation and image retirement failed");
     qa_rethrow(&caught);
@@ -561,6 +578,9 @@ qa_app_loaded_content *qa_remote_application_load_q2_server_world(qa_remote_appl
       (const char *const *)names.images.items, names.images.count, NULL, true);
   qa_cleanup_pop(&guard);
   q2_world_names_free(&names);
+  /* this.loadedServerCount = state.data.servercount */
+  app->has_loaded_server_count = true;
+  app->loaded_server_count = ((const qa_q2_server_data_result *)state->data)->servercount;
   return content;
 }
 
@@ -630,7 +650,9 @@ qa_app_remote_content_mounts *qa_remote_application_select_remote_content(qa_rem
      * immediately; otherwise it suspends to the next frame boundary. The C source
      * operation runs synchronously to its end inside advanceSource, so no frame
      * boundary can intervene: the admission publishes here in both cases. */
-    if (app->peer_admission != NULL && app->pending_advance == NULL && app->primary_peer == NULL) {
+    /* TS: primaryPeer === null && pendingAdvance !== null && peerAdmission !== null (C never
+     * leaves an admission pending, so this only guards the TS shape). */
+    if (app->peer_admission != NULL && app->pending_advance != NULL && app->primary_peer == NULL) {
       qa_app_options_destroy(&options);
       qa_app_remote_content_mounts_close(prepared);
       qa_app_remote_content_mounts_destroy(prepared);
@@ -1015,7 +1037,7 @@ static void *q3c_load(void *ctx, const qa_pure_mount_policy *policy) {
   q3_content_host *host = ctx;
   qa_app_options options;
   qa_app_startup_options_copy(&options, &host->options);
-  qa_app_loaded_content *content = qa_app_load_application_content_native((qa_app_content_host){0}, options, NULL, false,
+  qa_app_loaded_content *content = qa_app_load_application_content_native(options, NULL, false,
       policy, NULL, host->recorded ? &host->source : NULL);
   if (content == NULL) qa_range_error("Out of memory");
   return content;
@@ -1244,7 +1266,7 @@ static void world_load_content(world_state *state) {
   qa_app_content_source presentation = {"recorded", app->family};
   qa_app_options options;
   qa_app_startup_options_copy(&options, &state->options);
-  state->content = qa_app_load_application_content_native((qa_app_content_host){0}, options, NULL, false, NULL,
+  state->content = qa_app_load_application_content_native(options, NULL, false, NULL,
       !live && state->pending != NULL ? state->pending->catalog : NULL, live ? NULL : &presentation);
   if (state->content == NULL) qa_range_error("Out of memory");
 }

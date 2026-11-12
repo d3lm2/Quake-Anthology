@@ -1,6 +1,7 @@
 /* Port of src/app/bootstrap/prepared-startup.ts. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "qa/app/bootstrap/prepared_startup.h"
+#include "qa/core/commands/text.h"
 #include <ctype.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -8,12 +9,14 @@
 #include <string.h>
 #include "qa/app/bootstrap/audio/commands.h"
 #include "qa/app/bootstrap/gtv_commands.h"
+#include "qa/app/bootstrap/native_settings.h"
 #include "qa/app/bootstrap/player_userinfo.h"
 #include "qa/app/bootstrap/q1_client_settings.h"
 #include "qa/app/bootstrap/server_administration.h"
 #include "qa/app/bootstrap/shared_setting_cvars.h"
 #include "qa/app/bootstrap/startup_commands.h"
 #include "qa/foundation/support.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/input/support.h"
 #include "qa/foundation/js.h"
 
@@ -89,6 +92,7 @@ struct qa_app_prepared_startup {
   qa_binding_store *console_bindings;
   qa_binding_command_seat console_seat;
   qa_app_console_routing *routing_owner;
+  bool owns_routing_owner; /* false once a caller's ApplicationConsoleRouting is adopted (borrowed) */
   qa_command_cvar_routing routing;
   qa_q3_product_policy q3_policy;
   char **deferred; size_t deferred_count;
@@ -227,12 +231,36 @@ static qa_cvar_registry *routing_shared(void *ctx) {
 }
 /* --- command buffer callbacks --- */
 static void refresh_registry_output(qa_app_prepared_startup *startup);
-static qa_script_read_result read_script_adapter(void *ctx, const char *name, qa_command_context source) {
+typedef struct script_read_call {
+  qa_app_prepared_startup *startup; const char *name; qa_command_context source; char *text;
+} script_read_call;
+static void script_read_body(void *ctx) {
+  script_read_call *call = ctx;
+  call->text = qa_app_prepared_startup_read_script(call->startup, call->name, call->source);
+}
+/* TS readScript returns a promise: a read that rejects (an unreadable file, a folder) settles the exec as failed, so
+ * the buffer prints "couldn't exec <name>: <message>" and the startup's onScriptComplete rethrows the error. The one
+ * synchronous throw on this path (StartupConfig's read with no scoped reader, "Startup script reader is missing")
+ * leaves the exec command as TS's does. */
+qa_script_read_result qa_app_script_read_settle(void (*body)(void *ctx), void *ctx, char **text) {
   qa_script_read_result result = {0};
-  result.kind = QA_SCRIPT_READ_READY;
-  result.text = qa_app_prepared_startup_read_script(ctx, name, source);
-  result.has_text = result.text != NULL;
+  qa_caught_error caught;
+  if (qa_try(body, ctx, &caught)) {
+    result.kind = QA_SCRIPT_READ_READY;
+    result.text = *text;
+    result.has_text = result.text != NULL;
+    return result;
+  }
+  const char *message = qa_caught_message(&caught);
+  if (strcmp(caught.name, "Error") == 0 && strcmp(message, "Startup script reader is missing") == 0) qa_rethrow(&caught);
+  result.kind = QA_SCRIPT_READ_FAILED;
+  result.error_name = caught.name;
+  result.error_message = xstrdup(message);
   return result;
+}
+static qa_script_read_result read_script_adapter(void *ctx, const char *name, qa_command_context source) {
+  script_read_call call = {ctx, name, source, NULL};
+  return qa_app_script_read_settle(script_read_body, &call, &call.text);
 }
 static void script_complete_adapter(void *ctx, const qa_script_completion *event) {
   qa_app_startup_config *active = current_startup(ctx);
@@ -378,6 +406,10 @@ static void writeconfig_handler(void *ctx, qa_command_invocation *command) {
     first = false;
   }
   cursor += sprintf(cursor, "\n");
+  /* The contents are console text; store.dump writes the string as UTF-8 (core/commands/text.h). */
+  char *utf8 = qa_command_text_to_utf8(contents);
+  free(contents);
+  contents = utf8;
   qa_config_store store = {NULL};
   const char *error = NULL;
   bool store_open = qa_config_store_init(&store, qa_app_console_script_files_root(startup->scripts));
@@ -387,10 +419,14 @@ static void writeconfig_handler(void *ctx, qa_command_invocation *command) {
     write_config_op op = {&store, path, contents};
     error = qa_app_console_script_files_write(startup->scripts, write_config_run, &op);
   }
-  char message[1024];
-  if (error == NULL) (void)snprintf(message, sizeof message, "Wrote %s\n", path);
-  else (void)snprintf(message, sizeof message, "Console output failed: %s\n", error);
+  /* The path is the console argument: no fixed cap on the message. */
+  const char *lead = error == NULL ? "Wrote " : "Console output failed: ";
+  const char *subject = error == NULL ? path : error;
+  size_t message_size = strlen(lead) + strlen(subject) + 2;
+  char *message = xmalloc(message_size);
+  (void)snprintf(message, message_size, "%s%s\n", lead, subject);
   prepared_print(startup, message, &command->source);
+  free(message);
   if (store_open) qa_config_store_destroy(&store);
   for (size_t i = 0; i < archived_count; i++) free(archived[i]);
   free(archived);
@@ -401,14 +437,23 @@ static void writeconfig_handler(void *ctx, qa_command_invocation *command) {
 }
 /* --- registry output refresh --- */
 static void refresh_registry_output(qa_app_prepared_startup *startup) {
-  qa_cvar_registry *wanted[64];
-  size_t wanted_count = 0;
+  /* The registries to bind (TS Set, no cap). */
+  qa_cvar_registry **wanted = NULL;
+  size_t wanted_count = 0, wanted_capacity = 0;
   if (startup->output_count != 0 && startup->commands != NULL) {
     qa_cvar_registry *base[] = {startup->source, startup->movement, startup->fallback};
     for (size_t i = 0; i < 3; i++) {
       bool seen = false;
       for (size_t j = 0; j < wanted_count; j++) if (wanted[j] == base[i]) seen = true;
-      if (!seen && base[i] != NULL && wanted_count < 64) wanted[wanted_count++] = base[i];
+      if (!seen && base[i] != NULL) {
+        if (wanted_count == wanted_capacity) {
+          wanted_capacity = wanted_capacity == 0 ? 16 : wanted_capacity * 2;
+          qa_cvar_registry **grown = realloc(wanted, wanted_capacity * sizeof *grown);
+          if (grown == NULL) { free(wanted); qa_range_error("Out of memory"); }
+          wanted = grown;
+        }
+        wanted[wanted_count++] = base[i];
+      }
     }
     size_t context_count = startup->active_seat_count + 1;
     for (size_t c = 0; c < context_count; c++) {
@@ -424,7 +469,14 @@ static void refresh_registry_output(qa_app_prepared_startup *startup) {
       for (size_t i = 0; i < visible_count; i++) {
         bool seen = false;
         for (size_t j = 0; j < wanted_count; j++) if (wanted[j] == visible[i]) seen = true;
-        if (!seen && wanted_count < 64) wanted[wanted_count++] = visible[i];
+        if (seen) continue;
+        if (wanted_count == wanted_capacity) {
+          wanted_capacity = wanted_capacity == 0 ? 16 : wanted_capacity * 2;
+          qa_cvar_registry **grown = realloc(wanted, wanted_capacity * sizeof *grown);
+          if (grown == NULL) { free(wanted); qa_range_error("Out of memory"); }
+          wanted = grown;
+        }
+        wanted[wanted_count++] = visible[i];
       }
     }
   }
@@ -456,6 +508,7 @@ static void refresh_registry_output(qa_app_prepared_startup *startup) {
     entry->ctx = binding_ctx;
     entry->binding = qa_cvar_registry_bind_output(wanted[i], registry_print_adapter, binding_ctx);
   }
+  free(wanted);
 }
 /* --- q3 policy registrar over a landed registry --- */
 static bool q3_register_cvar(void *ctx, const char *name, const char *default_value,
@@ -525,11 +578,12 @@ void qa_app_prepared_startup_close(qa_app_prepared_startup *startup) {
   free(startup->forwards);
   for (size_t i = 0; i < startup->deferred_count; i++) free(startup->deferred[i]);
   free(startup->deferred);
-  if (startup->routing_owner != NULL) qa_app_console_routing_destroy(startup->routing_owner);
+  if (startup->owns_routing_owner && startup->routing_owner != NULL) qa_app_console_routing_destroy(startup->routing_owner);
   if (startup->owns_commands && startup->commands != NULL) qa_command_buffer_destroy(startup->commands);
   if (startup->owns_fallback && startup->fallback != NULL) qa_cvar_registry_destroy(startup->fallback);
   free(startup);
 }
+static void local_form_adapter(void *ctx, const qa_local_form *form);
 /* --- concrete constructor --- */
 static qa_cvar_registry *current_routing_owner(void *ctx, const char *name, qa_command_context source);
 static qa_cvar_registry *const *current_routing_visible(void *ctx, qa_command_context source, size_t *out_count);
@@ -593,6 +647,7 @@ qa_app_prepared_startup *qa_app_prepared_startup_create_concrete(
   routing_options.shared = routing_shared;
   startup->routing_owner = qa_app_console_routing_create(routing_options);
   if (startup->routing_owner == NULL) qa_range_error("Out of memory");
+  startup->owns_routing_owner = true;
   startup->routing = qa_app_console_routing_view(startup->routing_owner);
   qa_app_startup_phases phases = qa_app_startup_command_phases(
       options->startup_commands, options->startup_command_count, options->dialect);
@@ -616,6 +671,8 @@ qa_app_prepared_startup *qa_app_prepared_startup_create_concrete(
   buffer_options.allow_command_ctx = startup;
   buffer_options.forward_to_server = forward_to_server_adapter;
   buffer_options.forward_to_server_ctx = startup;
+  buffer_options.local_form = local_form_adapter;
+  buffer_options.local_form_ctx = startup;
   startup->commands = qa_command_buffer_create(&buffer_options);
   qa_app_startup_phases_free(&phases);
   if (startup->commands == NULL) qa_range_error("Out of memory");
@@ -723,7 +780,7 @@ void qa_app_prepared_startup_forward_commands(qa_app_prepared_startup *startup,
 }
 char *qa_app_prepared_startup_read_configuration(qa_app_prepared_startup *startup, const char *name,
     qa_command_context source, qa_app_startup_script_scope scope) {
-  if (startup->scoped_read == NULL) qa_range_error("Startup script reader is missing");
+  if (startup->scoped_read == NULL) qa_raise("Error", 0, 0, "Startup script reader is missing");
   return startup->scoped_read(startup->scoped_read_ctx, name, source, scope);
 }
 char *qa_app_prepared_startup_read_script(qa_app_prepared_startup *startup, const char *name, qa_command_context source) {
@@ -745,7 +802,7 @@ void qa_app_prepared_startup_adopt_readers(qa_app_prepared_startup *startup,
 void qa_app_prepared_startup_adopt_configuration_continuation(qa_app_prepared_startup *startup,
     qa_app_prepared_configuration_continuation continuation) {
   if (!qa_command_buffer_has_preparation_prefix(startup->commands))
-    qa_range_error("Configuration continuation requires its published command prefix");
+    qa_raise("Error", 0, 0, "Configuration continuation requires its published command prefix");
   if (startup->continuation_count == startup->continuation_capacity) {
     size_t capacity = startup->continuation_capacity == 0 ? 2 : startup->continuation_capacity * 2;
     qa_app_prepared_configuration_continuation *grown = realloc(startup->continuations, capacity * sizeof *grown);
@@ -762,7 +819,7 @@ void qa_app_prepared_startup_validate_owners(qa_app_prepared_startup *startup, c
   bool foreign = qa_cvar_registry_dialect(owners->fallback) != qa_cvar_registry_dialect(owners->source);
   for (size_t i = 0; i < 3; i++)
     if (!same_session(qa_cvar_registry_context(registries[i]).session, session)) foreign = true;
-  if (foreign) qa_range_error("Prepared profile registry belongs to another session or dialect");
+  if (foreign) qa_raise("Error", 0, 0, "Prepared profile registry belongs to another session or dialect");
   qa_command_buffer_validate_profile(startup->commands, qa_cvar_registry_dialect(owners->source), owners->fallback);
 }
 static qa_cvar_registry *current_routing_owner(void *ctx, const char *name, qa_command_context source) {
@@ -791,15 +848,17 @@ static void adopt_impl(qa_app_prepared_startup *startup, qa_command_cvar_routing
     for (size_t i = 0; i < startup->seat_count; i++)
       if (seat_index_is_active(startup, i) && startup->seats[i].input != NULL
           && qa_seat_input_has_held_input(startup->seats[i].input))
-        qa_range_error("Prepared profile requires released input");
+        qa_raise("Error", 0, 0, "Prepared profile requires released input");
   }
   if (owners != NULL) qa_app_prepared_startup_validate_owners(startup, owners);
   if (profile_changed && owners != NULL)
     qa_command_buffer_set_profile(startup->commands, qa_cvar_registry_dialect(owners->source), owners->fallback);
   startup->routing = routing;
   qa_app_console_routing *previous_owner = startup->routing_owner;
+  bool owned_previous = startup->owns_routing_owner;
   startup->routing_owner = routing_owner;
-  if (previous_owner != NULL && previous_owner != routing_owner) qa_app_console_routing_destroy(previous_owner);
+  startup->owns_routing_owner = false;
+  if (owned_previous && previous_owner != NULL && previous_owner != routing_owner) qa_app_console_routing_destroy(previous_owner);
   qa_app_prepared_startup_forward_commands(startup, forward, forward_ctx);
   if (owners != NULL) {
     if (startup->owns_fallback && startup->fallback != owners->fallback) {
@@ -809,8 +868,8 @@ static void adopt_impl(qa_app_prepared_startup *startup, qa_command_cvar_routing
     startup->source = owners->source;
     startup->movement = owners->movement;
     startup->fallback = owners->fallback;
-    startup->options.dialect = qa_cvar_registry_dialect(owners->source);
-    startup->options.movement_dialect = qa_cvar_registry_dialect(owners->movement);
+    /* TS keeps this.options (the constructor's dialect and movementDialect): allowCommand's Q3 map check, setmaster
+     * and run() read those after an adopted profile change. */
     qa_app_prepared_startup_adopt_readers(startup, owners->scripts, owners->read, owners->read_ctx);
     if (profile_changed) {
       if (startup->release_view != NULL) qa_app_q1_view_commands_release(startup->release_view);
@@ -835,7 +894,7 @@ void qa_app_prepared_startup_set_active_seats(qa_app_prepared_startup *startup,
     const qa_seat_id *ids, size_t count) {
   for (size_t i = 0; i < count; i++)
     if (find_seat(startup, ids[i], NULL) == NULL)
-      qa_range_error("Active seat is not retained by this client");
+      qa_raise("Error", 0, 0, "Active seat is not retained by this client");
   qa_seat_id *copy = NULL;
   if (count > 0) {
     copy = xmalloc(count * sizeof *copy);
@@ -858,7 +917,7 @@ void qa_app_prepared_startup_publish_seats(qa_app_prepared_startup *startup,
   for (size_t i = 0; i < wanted; i++) {
     bool retained = false;
     for (size_t j = 0; j < seat_count; j++) if (qa_same_seat(seats[j].id, active_ids[i])) retained = true;
-    if (!retained) { free(active_ids); qa_range_error("Active seat is not retained by this client"); }
+    if (!retained) { free(active_ids); qa_raise("Error", 0, 0, "Active seat is not retained by this client"); }
   }
   qa_app_prepared_seat *published = seat_count > 0 ? xcalloc(seat_count, sizeof *published) : NULL;
   seat_state *states = seat_count > 0 ? xcalloc(seat_count, sizeof *states) : NULL;
@@ -874,12 +933,15 @@ void qa_app_prepared_startup_publish_seats(qa_app_prepared_startup *startup,
     }
     if (found) {
       claimed[previous] = true;
+      /* TS returns the previous seat object with only cvars and mouse replaced. */
+      published[i].context = startup->seats[previous].context;
       published[i].all_bindings_chosen = startup->seats[previous].all_bindings_chosen;
       published[i].collecting_bindings = startup->seats[previous].collecting_bindings;
       states[i] = startup->states[previous];
       memset(&startup->states[previous], 0, sizeof startup->states[previous]);
     } else {
       published[i].all_bindings_chosen = true;
+      published[i].collecting_bindings = false;
       if (startup->seat_count > 0 && startup->states[0].has_authored) {
         states[i].has_authored = true;
         states[i].authored_count = startup->states[0].authored_count;
@@ -985,8 +1047,10 @@ static bool weapon_command_text(const qa_input_binding *binding) {
     bool match = true;
     for (size_t j = 0; j < length && match; j++) /* stops at the terminator of a shorter text */
       if (tolower((unsigned char)binding->target.text[j]) != words[i][j]) match = false;
-    /* TS /^(?:weapon|impulse|use)\s/i: \s is JS white space. */
-    if (match && qa_js_white_space_length(binding->target.text + length) != 0) return true;
+    /* TS /^(?:weapon|impulse|use)\s/i: \s is JS white space; a bound command's text is console text (one byte per
+     * character), whose white space is TAB..CR, space and U+00A0. */
+    unsigned char next = match ? (unsigned char)binding->target.text[length] : 0;
+    if (match && ((next >= '\t' && next <= '\r') || next == ' ' || next == 0xa0)) return true;
   }
   return false;
 }
@@ -1049,7 +1113,7 @@ void qa_app_prepared_startup_reset_bindings(qa_app_prepared_startup *startup, qa
   size_t index = 0;
   qa_app_prepared_seat *seat = find_seat(startup, id, &index);
   if (seat == NULL || !startup->states[index].has_authored)
-    qa_range_error("Authored binding defaults are not ready");
+    qa_raise("Error", 0, 0, "Authored binding defaults are not ready");
   seat_state *state = &startup->states[index];
   binding_map defaults = {0};
   map_add_all(&defaults, state->authored, state->authored_count);
@@ -1129,7 +1193,7 @@ static void apply_startup_variables(qa_app_prepared_startup *startup) {
     set_cvar(owner, variable->name, variable->value, true);
     qa_cvar_snapshot snapshot = {0};
     if (!qa_cvar_registry_register(owner, variable->name, "", 0, &snapshot))
-      qa_range_error("Q3 startup variable registration rejected: %s", variable->name);
+      qa_raise("Error", 0, 0, "Q3 startup variable registration rejected: %s", variable->name);
     qa_cvar_registry_add_flags(owner, snapshot.name, QA_CVAR_FLAG_USER_CREATED);
     qa_cvar_read_free(&snapshot);
   }
@@ -1151,6 +1215,29 @@ static qa_input_binding *selected_or_defaults(qa_app_prepared_startup *startup, 
   *owned_defaults = qa_default_bindings(0, startup->options.movement_dialect, NULL, 0, out_count);
   if (*owned_defaults == NULL) qa_range_error("Out of memory");
   return *owned_defaults;
+}
+/* TS `owned(entries)`: native?.filterArchive(entries) ?? entries, applied. */
+static void apply_archive_owned(const qa_native_config *native, qa_cvar_registry *registry,
+    const qa_cvar_archive_entry *entries, size_t count) {
+  if (native == NULL || count == 0) {
+    qa_cvar_registry_apply_archive(registry, entries, count);
+    return;
+  }
+  qa_cvar_archive_entry *kept = calloc(count, sizeof *kept);
+  if (kept == NULL) qa_range_error("Out of memory");
+  size_t kept_count = 0;
+  for (size_t i = 0; i < count; i++)
+    if (qa_native_config_keeps_archive_entry(native, entries[i].name)) kept[kept_count++] = entries[i];
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, kept);
+  qa_cvar_registry_apply_archive(registry, kept, kept_count);
+  qa_cleanup_pop(&guard);
+  free(kept);
+}
+/* TS localForm: form => noteLocalForm(this.scripts?.layers, form). */
+static void local_form_adapter(void *ctx, const qa_local_form *form) {
+  qa_app_prepared_startup *startup = ctx;
+  qa_app_note_local_form(startup->scripts != NULL ? qa_app_console_script_files_layers(startup->scripts) : NULL, form);
 }
 static void apply_selected_defaults(void *ctx) {
   apply_ctx *apply = ctx;
@@ -1182,6 +1269,20 @@ static void apply_selected_defaults(void *ctx) {
   state->has_authored = true;
   map_free(&authored);
   free(owned);
+  qa_game_layers *layers = startup->scripts != NULL ? qa_app_console_script_files_layers(startup->scripts) : NULL;
+  if (apply->index == 0 && layers != NULL) {
+    /* this.scripts.layers?.noteDefaultBinds(archivedBindingPairs(seat.input)) */
+    current = qa_seat_input_bindings(seat->input, &current_count);
+    size_t pair_count = 0;
+    qa_binding_pair *pairs = qa_archived_binding_pairs(current, current_count, false, &pair_count);
+    if (pairs == NULL && pair_count > 0) qa_range_error("Out of memory");
+    qa_layer_pair *view = calloc(pair_count + 1, sizeof *view);
+    if (view == NULL) qa_range_error("Out of memory");
+    for (size_t i = 0; i < pair_count; i++) view[i] = (qa_layer_pair){pairs[i].key, pairs[i].command};
+    qa_game_layers_note_default_binds(layers, view, pair_count);
+    free(view);
+    qa_binding_pairs_free(pairs, pair_count);
+  }
   seat->collecting_bindings = true;
 }
 static void apply_archive(void *ctx) {
@@ -1189,19 +1290,32 @@ static void apply_archive(void *ctx) {
   qa_app_prepared_startup *startup = apply->startup;
   qa_app_prepared_execute_options *options = &startup->run.options;
   size_t index = apply->index;
+  const qa_native_config *native = startup->scripts != NULL ? qa_app_console_script_files_native(startup->scripts) : NULL;
   if (index == 0) {
-    qa_cvar_registry_apply_archive(startup->source, options->source_archive, options->source_archive_count);
-    qa_cvar_registry_apply_archive(startup->movement, options->movement_archive, options->movement_archive_count);
-    qa_cvar_registry_apply_archive(startup->fallback, options->fallback_archive, options->fallback_archive_count);
+    apply_archive_owned(native, startup->source, options->source_archive, options->source_archive_count);
+    apply_archive_owned(native, startup->movement, options->movement_archive, options->movement_archive_count);
+    apply_archive_owned(native, startup->fallback, options->fallback_archive, options->fallback_archive_count);
     if (startup->options.shared != NULL)
       qa_cvar_registry_apply_archive(startup->options.shared, options->shared_archive, options->shared_archive_count);
   }
   if (startup->seat_count == 0) return;
   qa_app_prepared_seat *seat = &startup->seats[index];
   const qa_app_prepared_seat_configuration *saved = &startup->seat_configs[index];
-  qa_cvar_registry_apply_archive(seat->cvars, saved->archive, saved->archive_count);
-  qa_cvar_registry_apply_archive(seat->mouse.cvars, saved->mouse_archive, saved->mouse_archive_count);
-  if (saved->profile != NULL) {
+  apply_archive_owned(native, seat->cvars, saved->archive, saved->archive_count);
+  apply_archive_owned(native, seat->mouse.cvars, saved->mouse_archive, saved->mouse_archive_count);
+  /* A stock game's own file holds its key and mouse bindings; what that file cannot express stays with the seat. */
+  bool native_bindings = index == 0 && native != NULL && qa_native_config_suppresses_profile_bindings(native);
+  if (saved->profile != NULL && native_bindings)
+    for (size_t i = 0; i < saved->profile->binding_count; i++) {
+      const qa_input_binding *binding = &saved->profile->bindings[i];
+      if (qa_native_config_carries(binding)) continue;
+      if (!qa_seat_input_bind(seat->input, binding)) qa_range_error("Out of memory");
+      char *key = qa_physical_input_key(&binding->input);
+      if (key == NULL) qa_range_error("Out of memory");
+      overridden_add(&startup->states[index], key);
+      free(key);
+    }
+  if (saved->profile != NULL && !native_bindings) {
     qa_seat_input_unbind_all(seat->input);
     for (size_t i = 0; i < saved->profile->binding_count; i++)
       if (!qa_seat_input_bind(seat->input, &saved->profile->bindings[i])) qa_range_error("Out of memory");
@@ -1274,7 +1388,7 @@ static bool run_step(qa_app_prepared_startup *startup) {
       if (!run->seat_started) {
         run->seat_started = true;
         if (startup->seat_count > 0 && index >= startup->seat_config_count)
-          qa_range_error("Startup seat configuration is missing");
+          qa_raise("Error", 0, 0, "Startup seat configuration is missing");
         if (index != 0 && startup->seat_count > 0) {
           binding_map defaults = {0};
           if (startup->states[0].has_authored)
@@ -1321,7 +1435,9 @@ static bool run_step(qa_app_prepared_startup *startup) {
       startup->active = NULL;
       run->seat_started = false;
       run->index++;
-      return false;
+      /* TS `while (!(await startup.executeFrame(...))) yield;` yields only while a frame is unfinished: a finished
+       * configuration goes on to the next one (and then the late phase) in the same generator step. */
+      return run_step(startup);
     }
   }
   if (run->stage == RUN_LATE) {
@@ -1344,6 +1460,17 @@ static bool run_step(qa_app_prepared_startup *startup) {
     return true;
   }
   return true;
+}
+bool qa_app_prepared_startup_retract_configuration_continuation(qa_app_prepared_startup *startup, void *ctx) {
+  for (size_t i = startup->continuation_count; i-- > 0;) {
+    if (startup->continuations[i].ctx != ctx) continue;
+    memmove(&startup->continuations[i], &startup->continuations[i + 1],
+        (startup->continuation_count - i - 1) * sizeof *startup->continuations);
+    startup->continuation_count--;
+    qa_command_buffer_finish_preparation(startup->commands);
+    return true;
+  }
+  return false;
 }
 bool qa_app_prepared_startup_advance_frame(qa_app_prepared_startup *startup) {
   if (startup->continuation_count > 0) {
@@ -1420,10 +1547,19 @@ bool qa_app_allow_seat_configuration_command_for(qa_command_invocation *command,
   }
   if (allowed) { free(name); return true; }
   if (print != NULL) {
-    char message[1024];
-    (void)snprintf(message, sizeof message,
-        "Ignoring shared cvar %s in saved secondary-seat configuration; use autoexec.cfg for intentional shared overrides.\n", target);
+    static const char format[] =
+        "Ignoring shared cvar %s in saved secondary-seat configuration; use autoexec.cfg for intentional shared overrides.\n";
+    size_t length = strlen(target) + sizeof format; /* no fixed cap: a token can be long */
+    char *message = xmalloc(length);
+    (void)snprintf(message, length, format, target);
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, message);
+    qa_cleanup name_guard;
+    qa_cleanup_push(&name_guard, free, name);
     print(print_ctx, message, &command->source);
+    qa_cleanup_pop(&name_guard);
+    qa_cleanup_pop(&guard);
+    free(message);
   }
   free(name);
   return false;
@@ -1489,26 +1625,43 @@ static bool bindings_equal_identity(const qa_input_binding *left, size_t left_co
   }
   return true;
 }
+/* A TS Set<CvarRegistry> (membership only), grown as needed. */
+typedef struct registry_set { qa_cvar_registry **items; size_t count, capacity; } registry_set;
+static void registry_set_add(registry_set *set, qa_cvar_registry *registry) {
+  for (size_t i = 0; i < set->count; i++) if (set->items[i] == registry) return;
+  if (set->count == set->capacity) {
+    size_t capacity = set->capacity == 0 ? 16 : set->capacity * 2;
+    qa_cvar_registry **grown = realloc(set->items, capacity * sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    set->items = grown;
+    set->capacity = capacity;
+  }
+  set->items[set->count++] = registry;
+}
+static void registry_set_free(void *set) { free(((registry_set *)set)->items); }
 qa_app_prepared_client_commands *qa_app_prepare_client_commands(qa_command_buffer *commands,
     const qa_app_prepared_seat *inputs, size_t input_count,
     qa_cvar_registry *const *live_registries, size_t live_registry_count,
     const qa_command_buffer_options *options, qa_binding_store *console_bindings) {
   /* candidate registries: options.cvars + routing.visible of contexts */
-  qa_cvar_registry *candidates[64];
-  size_t candidate_count = 0;
-  if (options->cvars != NULL) candidates[candidate_count++] = options->cvars;
+  registry_set candidates = {0};
+  qa_cleanup candidates_guard;
+  qa_cleanup_push(&candidates_guard, registry_set_free, &candidates);
+  if (options->cvars != NULL) registry_set_add(&candidates, options->cvars);
   if (options->cvar_routing.visible != NULL) {
     for (size_t c = 0; c < input_count + 1; c++) {
       qa_command_context context = c == 0 ? options->context : inputs[c - 1].context;
       size_t visible_count = 0;
       qa_cvar_registry *const *visible = options->cvar_routing.visible(options->cvar_routing.ctx, context, &visible_count);
-      for (size_t i = 0; i < visible_count && candidate_count < 64; i++) candidates[candidate_count++] = visible[i];
+      for (size_t i = 0; i < visible_count; i++) registry_set_add(&candidates, visible[i]);
     }
   }
-  for (size_t i = 0; i < candidate_count; i++)
+  for (size_t i = 0; i < candidates.count; i++)
     for (size_t j = 0; j < live_registry_count; j++)
-      if (candidates[i] == live_registries[j])
-        qa_range_error("Candidate client commands require isolated cvar owners");
+      if (candidates.items[i] == live_registries[j])
+        qa_raise("Error", 0, 0, "Candidate client commands require isolated cvar owners");
+  qa_cleanup_pop(&candidates_guard);
+  registry_set_free(&candidates);
   qa_app_prepared_client_commands *client = xcalloc(1, sizeof *client);
   client->program = qa_command_buffer_prepare_program(commands, options);
   if (client->program == NULL) qa_range_error("Out of memory");
@@ -1585,20 +1738,25 @@ void qa_app_prepared_client_commands_validate_publication(qa_app_prepared_client
     size_t count = 0;
     const qa_input_binding *current = qa_binding_store_bindings(client->console_bindings, &count);
     if (!bindings_equal_identity(current, count, client->original_console, client->original_console_count))
-      qa_range_error("Console bindings changed during preparation");
+      qa_raise("Error", 0, 0, "Console bindings changed during preparation");
   }
   for (size_t i = 0; i < client->seat_count; i++) {
     size_t count = 0;
     const qa_input_binding *current = qa_seat_input_bindings(client->seats[i].input, &count);
     if (!bindings_equal_identity(current, count, client->seats[i].original, client->seats[i].original_count))
-      qa_range_error("Client bindings changed during preparation");
+      qa_raise("Error", 0, 0, "Client bindings changed during preparation");
   }
+}
+static void release_append_target(void *ctx, const char *text, const qa_command_context *source) {
+  qa_app_prepared_client_commands_release_append(ctx, text, source);
 }
 void qa_app_prepared_client_commands_release_inputs(qa_app_prepared_client_commands *client, double time) {
   qa_app_prepared_client_commands_validate_publication(client);
+  /* TS { append: (text, source) => program.commands.append(text, source, releaseDialect) }. */
+  qa_command_append_target target = {client, release_append_target};
   for (size_t i = 0; i < client->seat_count; i++) {
     staged_seat *seat = &client->seats[i];
-    if (seat->cleared) qa_seat_input_release(seat->input, time, client->program->commands);
+    if (seat->cleared) qa_seat_input_release_to(seat->input, time, &target);
   }
 }
 void qa_app_prepared_client_commands_publish(qa_app_prepared_client_commands *client) {
@@ -1642,21 +1800,15 @@ qa_app_prepared_client_commands *qa_app_prepared_startup_prepare_client_commands
     inputs = startup->seats;
     input_count = startup->seat_count;
   }
-  qa_cvar_registry *live[64];
-  size_t live_count = 0;
+  registry_set live = {0};
+  qa_cleanup live_guard;
+  qa_cleanup_push(&live_guard, registry_set_free, &live);
   qa_cvar_registry *base[] = {startup->source, startup->movement, startup->fallback};
-  for (size_t i = 0; i < 3; i++) {
-    bool seen = false;
-    for (size_t j = 0; j < live_count; j++) if (live[j] == base[i]) seen = true;
-    if (!seen && base[i] != NULL) live[live_count++] = base[i];
-  }
+  for (size_t i = 0; i < 3; i++)
+    if (base[i] != NULL) registry_set_add(&live, base[i]);
   for (size_t i = 0; i < startup->seat_count; i++) {
-    qa_cvar_registry *pair[] = {startup->seats[i].cvars, startup->seats[i].mouse.cvars};
-    for (size_t k = 0; k < 2; k++) {
-      bool seen = false;
-      for (size_t j = 0; j < live_count; j++) if (live[j] == pair[k]) seen = true;
-      if (!seen && live_count < 64) live[live_count++] = pair[k];
-    }
+    registry_set_add(&live, startup->seats[i].cvars);
+    registry_set_add(&live, startup->seats[i].mouse.cvars);
   }
   if (startup->routing.visible != NULL) {
     for (size_t c = 0; c < startup->active_seat_count + 2; c++) {
@@ -1671,13 +1823,12 @@ qa_app_prepared_client_commands *qa_app_prepared_startup_prepare_client_commands
       if (!current_context(startup, context)) continue;
       size_t visible_count = 0;
       qa_cvar_registry *const *visible = startup->routing.visible(startup->routing.ctx, context, &visible_count);
-      for (size_t i = 0; i < visible_count; i++) {
-        bool seen = false;
-        for (size_t j = 0; j < live_count; j++) if (live[j] == visible[i]) seen = true;
-        if (!seen && live_count < 64) live[live_count++] = visible[i];
-      }
+      for (size_t i = 0; i < visible_count; i++) registry_set_add(&live, visible[i]);
     }
   }
-  return qa_app_prepare_client_commands(startup->commands, inputs, input_count,
-      live, live_count, options, startup->console_bindings);
+  qa_app_prepared_client_commands *client = qa_app_prepare_client_commands(startup->commands, inputs, input_count,
+      live.items, live.count, options, startup->console_bindings);
+  qa_cleanup_pop(&live_guard);
+  registry_set_free(&live);
+  return client;
 }

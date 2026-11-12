@@ -6,7 +6,8 @@
 
 #include "q2_codec_internal.h"
 
-static void copy_text(char *dst, size_t cap, const char *src) { (void)snprintf(dst, cap, "%s", src != NULL ? src : ""); }
+/* The decoded state borrows its strings from the save document (any length); restore clones them. */
+static char *borrowed_text(const char *src) { return (char *)(src != NULL ? src : ""); }
 static qa_save_value *number_array_value(const double *values, size_t count) {
   qa_save_value *array = qa_save_value_array();
   for (size_t i = 0; array != NULL && i < count; i++)
@@ -69,15 +70,15 @@ static qa_q2rr_player_extra_state read_player(const qa_save_reader *reader, qa_p
   out.help_changed = q2c_number(reader, "helpChanged");
   out.help_time = q2c_number(reader, "helpTime");
   out.seat = q2c_integer(reader, "seat", 0);
-  copy_text(out.social_id, sizeof out.social_id, q2c_string(reader, "socialId"));
+  out.social_id = borrowed_text(q2c_string(reader, "socialId"));
   /* field("autoSwitch").choice(0, 1, 2, 3) */
+  static const double AUTO_SWITCH[] = {0, 1, 2, 3};
   qa_save_reader sw = q2c_field(reader, "autoSwitch");
-  double value = qa_save_reader_number(&sw);
-  if (value != 0 && value != 1 && value != 2 && value != 3) qa_save_reader_fail(&sw, "expected 0 or 1 or 2 or 3");
+  double value = qa_save_reader_choice_number(&sw, AUTO_SWITCH, 4);
   qa_save_reader_destroy(&sw);
   out.auto_switch = value;
   out.auto_shield = q2c_number(reader, "autoShield");
-  copy_text(out.dogtag, sizeof out.dogtag, q2c_string(reader, "dogtag"));
+  out.dogtag = borrowed_text(q2c_string(reader, "dogtag"));
   out.slime_debounce = q2c_number(reader, "slimeDebounce");
   out.wind_sound_time = q2c_number(reader, "windSoundTime");
   out.animation_time = q2c_number(reader, "animationTime");
@@ -121,7 +122,7 @@ static qa_q2rr_player_extra_state read_player(const qa_save_reader *reader, qa_p
   out.slow_view_angles = q2c_vector(reader, "slowViewAngles");
   out.quake_time = q2c_number(reader, "quakeTime");
   out.help_location = q2c_vector(reader, "helpLocation");
-  copy_text(out.help_image, sizeof out.help_image, q2c_string(reader, "helpImage"));
+  out.help_image = borrowed_text(q2c_string(reader, "helpImage"));
   qa_save_reader points = q2c_field(reader, "helpPoints");
   out.help_point_count = qa_save_reader_list_count(&points);
   out.help_points = qa_persist_decoded_array(owner, out.help_point_count, sizeof *out.help_points);
@@ -203,6 +204,8 @@ static qa_save_value *player_value(const qa_q2rr_player_extra_state *in) {
 /* ---- Q2RereleasePlayersCheckpoint (captureRerelease literal order) ---- */
 qa_q2_rerelease_players_checkpoint qa_read_q2_rerelease_players_checkpoint(const qa_save_reader *reader,
                                                                           qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2_rerelease_players_checkpoint out;
   memset(&out, 0, sizeof out);
   qa_save_reader version = q2c_field(reader, "version");
@@ -260,6 +263,7 @@ qa_q2_rerelease_players_checkpoint qa_read_q2_rerelease_players_checkpoint(const
   }
   qa_save_reader_destroy(&squads);
   out.squad_spawns = placements;
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 static qa_save_value *rerelease_players_value(const qa_q2_rerelease_players_checkpoint *in) {
@@ -317,15 +321,20 @@ uint8_t *qa_encode_q2_rerelease_players_checkpoint(const qa_q2_rerelease_players
 }
 bool qa_decode_q2_rerelease_players_checkpoint(const uint8_t *bytes, size_t length, qa_q2_rerelease_players_checkpoint *out,
                                                qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_save_reader reader;
-  if (!q2c_open(bytes, length, "q2-rerelease-players", owner, &reader)) return false;
+  if (!q2c_open(bytes, length, "q2-rerelease-players", owner, &reader)) { qa_persist_decoded_leave(&owner_scope); return false; }
   *out = qa_read_q2_rerelease_players_checkpoint(&reader, owner);
   qa_save_reader_destroy(&reader);
+  qa_persist_decoded_leave(&owner_scope);
   return true;
 }
 
 /* ---- Q2RereleaseQ64Checkpoint ---- */
 qa_q2_rerelease_q64_checkpoint qa_read_q2_rerelease_q64_checkpoint(const qa_save_reader *reader, qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2_rerelease_q64_checkpoint out;
   memset(&out, 0, sizeof out);
   qa_save_reader eyes = q2c_field(reader, "eyes");
@@ -373,6 +382,7 @@ qa_q2_rerelease_q64_checkpoint qa_read_q2_rerelease_q64_checkpoint(const qa_save
   }
   qa_save_reader_destroy(&dummies);
   out.dummies = dummy;
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 static qa_save_value *q64_value(const qa_q2_rerelease_q64_checkpoint *in) {
@@ -434,8 +444,13 @@ static qa_save_value *q64_value(const qa_q2_rerelease_q64_checkpoint *in) {
 /* ---- Q2RereleaseModuleCheckpoint (Q2RereleaseModule.capture literal order) ---- */
 qa_q2_rerelease_module_checkpoint qa_read_q2_rerelease_module_checkpoint(const qa_save_reader *reader,
                                                                         qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_q2_rerelease_module_checkpoint out;
   memset(&out, 0, sizeof out);
+  /* TS binds sky, campaign, campaign.mission and goals before the literal: a campaign that is not a
+   * record fails first. */
+  qa_save_reader campaign = q2c_field(reader, "campaign"), mission = q2c_field(&campaign, "mission");
   qa_save_reader version = q2c_field(reader, "version");
   out.version = qa_save_reader_literal_number(&version, 1);
   qa_save_reader_destroy(&version);
@@ -464,7 +479,6 @@ qa_q2_rerelease_module_checkpoint qa_read_q2_rerelease_module_checkpoint(const q
   out.goals.goals = q2c_is_null(&goals, "goals") ? NULL : q2c_string(&goals, "goals");
   out.goals.goal_number = q2c_number(&goals, "goalNumber");
   qa_save_reader_destroy(&goals);
-  qa_save_reader campaign = q2c_field(reader, "campaign"), mission = q2c_field(&campaign, "mission");
   out.campaign.mission.primary = (char *)q2c_string(&mission, "primary");
   out.campaign.mission.secondary = (char *)q2c_string(&mission, "secondary");
   out.campaign.mission.primary_changes = q2c_number(&mission, "primaryChanges");
@@ -571,6 +585,7 @@ qa_q2_rerelease_module_checkpoint qa_read_q2_rerelease_module_checkpoint(const q
   }
   qa_save_reader_destroy(&sounds);
   out.trigger_sound_times = time;
+  qa_persist_decoded_leave(&owner_scope);
   return out;
 }
 static qa_save_value *module_value(const qa_q2_rerelease_module_checkpoint *in) {
@@ -684,9 +699,12 @@ uint8_t *qa_encode_q2_rerelease_module_checkpoint(const qa_q2_rerelease_module_c
 }
 bool qa_decode_q2_rerelease_module_checkpoint(const uint8_t *bytes, size_t length, qa_q2_rerelease_module_checkpoint *out,
                                               qa_persist_decoded *owner) {
+  qa_persist_decoded_scope owner_scope; /* a raise releases what this read added */
+  qa_persist_decoded_enter(&owner_scope, owner);
   qa_save_reader reader;
-  if (!q2c_open(bytes, length, "q2-rerelease-module", owner, &reader)) return false;
+  if (!q2c_open(bytes, length, "q2-rerelease-module", owner, &reader)) { qa_persist_decoded_leave(&owner_scope); return false; }
   *out = qa_read_q2_rerelease_module_checkpoint(&reader, owner);
   qa_save_reader_destroy(&reader);
+  qa_persist_decoded_leave(&owner_scope);
   return true;
 }

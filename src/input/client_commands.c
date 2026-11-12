@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "qa/core/commands/text.h"
+#include "qa/foundation/support.h"
 #include "qa/input/support.h"
 
 struct qa_client_command_owner {
@@ -30,6 +31,12 @@ struct qa_client_command_bindings {
   qa_client_command_owner **owners;
   size_t owner_count;
   size_t owner_capacity;
+  /* Owners publishSeats dropped: TS keeps the object alive behind the caller's
+     registration (register then throws "retired", remove and close are
+     no-ops), so the handle stays valid until close or destroy. */
+  qa_client_command_owner **retired;
+  size_t retired_count;
+  size_t retired_capacity;
   installed_name *installed;
   size_t installed_count;
   size_t installed_capacity;
@@ -133,8 +140,23 @@ void qa_client_command_bindings_destroy(qa_client_command_bindings *bindings) {
   qa_client_command_bindings_deactivate(bindings);
   for (size_t i = 0; i < bindings->owner_count; i++) owner_free(bindings->owners[i]);
   free(bindings->owners);
+  for (size_t i = 0; i < bindings->retired_count; i++) owner_free(bindings->retired[i]);
+  free(bindings->retired);
   free(bindings->seats);
   free(bindings);
+}
+
+static void retire_owner(qa_client_command_bindings *bindings,
+                         qa_client_command_owner *owner) {
+  if (bindings->retired_count == bindings->retired_capacity) {
+    size_t grown = bindings->retired_capacity == 0 ? 4 : bindings->retired_capacity * 2;
+    qa_client_command_owner **retired = (qa_client_command_owner **)realloc(
+        bindings->retired, grown * sizeof *retired);
+    if (retired == NULL) return; /* OOM only: the handle leaks */
+    bindings->retired = retired;
+    bindings->retired_capacity = grown;
+  }
+  bindings->retired[bindings->retired_count++] = owner;
 }
 
 void qa_client_command_bindings_publish_seats(qa_client_command_bindings *bindings,
@@ -150,7 +172,9 @@ void qa_client_command_bindings_publish_seats(qa_client_command_bindings *bindin
       for (size_t n = 0; n < owner->name_count; n++) {
         remove_unused(bindings, owner->names[n]);
       }
-      owner_free(owner);
+      for (size_t n = 0; n < owner->name_count; n++) free(owner->names[n]);
+      owner->name_count = 0;
+      retire_owner(bindings, owner);
     } else {
       i++;
     }
@@ -258,7 +282,19 @@ void qa_client_command_owner_close(qa_client_command_bindings *bindings,
   for (size_t i = 0; i < bindings->owner_count; i++) {
     if (bindings->owners[i] == owner) index = i;
   }
-  if (index == bindings->owner_count) return;
+  if (index == bindings->owner_count) {
+    /* TS: close() of an owner publishSeats dropped is a no-op; the handle is
+       released here. */
+    for (size_t i = 0; i < bindings->retired_count; i++) {
+      if (bindings->retired[i] != owner) continue;
+      memmove(&bindings->retired[i], &bindings->retired[i + 1],
+              (bindings->retired_count - i - 1) * sizeof *bindings->retired);
+      bindings->retired_count--;
+      owner_free(owner);
+      return;
+    }
+    return;
+  }
   memmove(&bindings->owners[index], &bindings->owners[index + 1],
           (bindings->owner_count - index - 1) * sizeof *bindings->owners);
   bindings->owner_count--;
@@ -340,10 +376,10 @@ bool qa_client_command_bindings_dispatch(qa_client_command_bindings *bindings,
   if (producer != NULL && producer->kind != NULL &&
       strcmp(producer->kind, "client-module") == 0) {
     qa_client_command_owner *claim = NULL;
-    for (size_t i = 0; i < claim_count; i++) {
+    for (size_t i = 0; i < claim_count && claim == NULL; i++) {
       if (claims[i]->has_handler &&
           claims[i]->handler.instance == producer->instance) {
-        claim = claims[i];
+        claim = claims[i]; /* TS find: the first claim */
       }
     }
     free(claims);
@@ -354,9 +390,9 @@ bool qa_client_command_bindings_dispatch(qa_client_command_bindings *bindings,
   }
   for (size_t i = 0; i < claim_count; i++) {
     if (!claims[i]->has_handler) {
-      bindings->execute(bindings->execute_ctx, command, seat);
       free(claims);
       free(name);
+      bindings->execute(bindings->execute_ctx, command, seat);
       return true;
     }
   }
@@ -377,9 +413,14 @@ bool qa_client_command_bindings_dispatch(qa_client_command_bindings *bindings,
                            ? claims[i]->handler.label
                            : "");
       }
-      qa_input_error("Ambiguous component client command %s: %s", name, labels);
     }
-    qa_input_error("Ambiguous component client command %s: ", name);
+    char message[QA_CAUGHT_MESSAGE_CAPACITY];
+    snprintf(message, sizeof message, "Ambiguous component client command %s: %s", name,
+             labels != NULL ? labels : "");
+    free(labels);
+    free(claims);
+    free(name);
+    qa_input_error("%s", message);
   }
   qa_client_command_owner *claim = claims[0];
   free(claims);

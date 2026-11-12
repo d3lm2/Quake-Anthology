@@ -2,6 +2,7 @@
  * errors abort via qa_binary_error. GPL-2.0-or-later. */
 #include "qa/bots/navigation/nav.h"
 #include "qa/core/binary/index.h"
+#include "qa/foundation/support.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,12 +27,30 @@ static int64_t count(qa_binary_reader *r, int64_t stride, const char *source) {
     qa_binary_error(source, (int64_t)offset, "invalid navigation record count");
   return value;
 }
+/* A raise (BinaryError) frees what the parse holds, as TS leaves it to the GC. */
+typedef struct parse_guard {
+  qa_binary_reader r;
+  char *magic;
+  qa_kex_navigation_asset asset; /* the tables built so far */
+} parse_guard;
+static void parse_release(void *arg) {
+  parse_guard *g = arg;
+  qa_binary_reader_destroy(&g->r);
+  free(g->magic);
+  g->magic = NULL;
+  qa_kex_navigation_asset_destroy(&g->asset);
+}
 bool qa_parse_kex_navigation(qa_kex_navigation_asset *out, uint8_t *bytes, size_t length, const char *source) {
   memset(out, 0, sizeof *out);
   if (!source) source = "<nav>";
-  qa_binary_reader r;
-  if (!qa_binary_reader_init(&r, bytes, length, source)) return false;
-  char *magic = qa_binary_reader_fixed_string(&r, 4);
+  parse_guard g;
+  memset(&g, 0, sizeof g);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, parse_release, &g);
+#define r g.r
+#define magic g.magic
+  if (!qa_binary_reader_init(&r, bytes, length, source)) goto fail;
+  magic = qa_binary_reader_fixed_string(&r, 4);
   bool nav2 = magic && !strcmp(magic, "NAV2"), nav3 = magic && !strcmp(magic, "NAV3");
   if (!nav2 && !nav3) qa_binary_error(source, 0, "expected NAV2 or NAV3");
   bool is_nav3 = nav3;
@@ -39,14 +58,15 @@ bool qa_parse_kex_navigation(qa_kex_navigation_asset *out, uint8_t *bytes, size_
   if (!is_nav3 ? (version < 12 || version > 18) : (version < 1 || version > 6))
     qa_binary_error(source, 4, "unsupported %s version %lld", magic, (long long)version);
   free(magic);
+  magic = NULL;
   int64_t node_count = count(&r, 20, source), link_count = count(&r, 6, source),
           traversal_count = count(&r, 36, source);
   double heuristic = is_nav3 || version >= 16 ? qa_binary_reader_finite_f32(&r) : 1;
   if (heuristic <= 0) qa_binary_error(source, (int64_t)qa_binary_reader_offset(&r) - 4, "navigation cost multiplier must be positive");
-  qa_kex_nav_node *nodes = calloc((size_t)(node_count ? node_count : 1), sizeof *nodes);
-  qa_kex_nav_link *links = calloc((size_t)(link_count ? link_count : 1), sizeof *links);
-  qa_traversal_hint *traversals = calloc((size_t)(traversal_count ? traversal_count : 1), sizeof *traversals);
-  if (!nodes || !links || !traversals) { free(nodes); free(links); free(traversals); qa_binary_reader_destroy(&r); return false; }
+  qa_kex_nav_node *nodes = g.asset.nodes = calloc((size_t)(node_count ? node_count : 1), sizeof *nodes);
+  qa_kex_nav_link *links = g.asset.links = calloc((size_t)(link_count ? link_count : 1), sizeof *links);
+  qa_traversal_hint *traversals = g.asset.traversals = calloc((size_t)(traversal_count ? traversal_count : 1), sizeof *traversals);
+  if (!nodes || !links || !traversals) goto fail;
   for (int64_t i = 0; i < node_count; i++) {
     int64_t flags = qa_binary_reader_u16(&r), links_n = qa_binary_reader_u16(&r),
             first_link = qa_binary_reader_u16(&r), radius = qa_binary_reader_u16(&r);
@@ -68,10 +88,11 @@ bool qa_parse_kex_navigation(qa_kex_navigation_asset *out, uint8_t *bytes, size_
     if (is_nav3 && version >= 4) { traversals[i].has_ladder_plane = true; traversals[i].ladder_plane = vector(&r); }
   }
   int64_t entity_count = count(&r, 26, source);
-  qa_kex_nav_entity *entities = calloc((size_t)(entity_count ? entity_count : 1), sizeof *entities);
-  if (!entities) { free(nodes); free(links); free(traversals); qa_binary_reader_destroy(&r); return false; }
+  qa_kex_nav_entity *entities = g.asset.entities = calloc((size_t)(entity_count ? entity_count : 1), sizeof *entities);
+  if (!entities) goto fail;
   for (int64_t i = 0; i < entity_count; i++) {
     qa_kex_nav_entity *e = &entities[i];
+    g.asset.entity_count = (size_t)i + 1;
     e->link = qa_binary_reader_u16(&r);
     if (is_nav3) { e->has_model = true; e->model = version >= 2 ? qa_binary_reader_i32(&r) : 0; }
     e->bounds.min = vector(&r); e->bounds.max = vector(&r);
@@ -79,7 +100,7 @@ bool qa_parse_kex_navigation(qa_kex_navigation_asset *out, uint8_t *bytes, size_
       size_t words = version <= 12 ? 0 : version <= 14 ? 2 : 1;
       if (words) {
         e->tail = malloc(words * sizeof *e->tail);
-        if (!e->tail) { entities[i].tail = NULL; /* OOM cleanup below via destroy path */ }
+        if (!e->tail) goto fail;
         e->tail_count = words;
         for (size_t w = 0; w < words; w++) { int32_t v = qa_binary_reader_i32(&r); if (e->tail) e->tail[w] = v; }
       }
@@ -90,6 +111,7 @@ bool qa_parse_kex_navigation(qa_kex_navigation_asset *out, uint8_t *bytes, size_
   }
   if (qa_binary_reader_remaining(&r) != 0) qa_binary_error(source, (int64_t)qa_binary_reader_offset(&r), "unconsumed navigation bytes");
   qa_binary_reader_destroy(&r);
+  qa_cleanup_pop(&guard);
   out->is_nav3 = is_nav3; out->source = dups(source); out->version = version; out->heuristic = heuristic;
   out->nodes = nodes; out->node_count = (size_t)node_count;
   out->links = links; out->link_count = (size_t)link_count;
@@ -97,4 +119,10 @@ bool qa_parse_kex_navigation(qa_kex_navigation_asset *out, uint8_t *bytes, size_
   out->entities = entities; out->entity_count = (size_t)entity_count;
   if (!out->source) { qa_kex_navigation_asset_destroy(out); return false; }
   return true;
+fail:
+  qa_cleanup_pop(&guard);
+  parse_release(&g);
+  return false;
+#undef r
+#undef magic
 }

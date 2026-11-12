@@ -560,6 +560,11 @@ qa_sdl_runtime qa_sdl_controllers_runtime(void) {
   return result;
 }
 
+static void open_discover(void *ctx) {
+  SDL_GameControllerEventState(SDL_ENABLE);
+  discover((qa_sdl_controllers *)ctx, SDL_GetTicks(), false, 0);
+}
+
 qa_sdl_controllers *qa_sdl_controllers_open(void) {
   if (owner_singleton != NULL)
     qa_error("SDL controller events already have an owner");
@@ -573,8 +578,13 @@ qa_sdl_controllers *qa_sdl_controllers_open(void) {
   }
   controllers->previous_event_state = previous;
   owner_singleton = controllers;
-  SDL_GameControllerEventState(SDL_ENABLE);
-  discover(controllers, SDL_GetTicks(), false, 0);
+  /* TS try { ... discover } catch { owner.close(); throw } */
+  qa_caught_error caught;
+  if (!qa_try(open_discover, controllers, &caught)) {
+    qa_sdl_controllers_close(controllers);
+    free(controllers);
+    qa_rethrow(&caught);
+  }
   return controllers;
 }
 
@@ -928,6 +938,24 @@ static int virtual_rumble_triggers(void *userdata, Uint16 low, Uint16 high) {
   return 0;
 }
 
+typedef struct attach_scope {
+  qa_virtual_sdl_controller *controller;
+  void *sink;
+  int index;
+  SDL_Joystick *pointer;
+} attach_scope;
+
+static void attach_unwind(void *raw) {
+  attach_scope *scope = (attach_scope *)raw;
+  SDL_JoystickDetachVirtual(scope->index);
+  SDL_JoystickClose(scope->pointer);
+  qa_bounded_queue_destroy(&scope->controller->effects);
+  free(scope->controller->name);
+  free(scope->controller);
+  free(scope->sink);
+  SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
+}
+
 qa_virtual_sdl_controller *qa_virtual_sdl_controller_attach(const char *name,
                                                             bool rumble) {
   initialize();
@@ -989,6 +1017,10 @@ qa_virtual_sdl_controller *qa_virtual_sdl_controller_attach(const char *name,
     SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER);
     qa_error("SDL_JoystickOpen virtual: %s", message);
   }
+  /* TS catch: detach, close the joystick, release the callbacks, quit. */
+  attach_scope scope = {controller, sink, index, pointer};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, attach_unwind, &scope);
   int32_t instance =
       checked(SDL_JoystickInstanceID(pointer), "SDL_JoystickInstanceID virtual");
   /* Virtual trigger joysticks use -32768 for the unpressed end of their mapping. */
@@ -997,6 +1029,7 @@ qa_virtual_sdl_controller *qa_virtual_sdl_controller_attach(const char *name,
     checked(SDL_JoystickSetVirtualAxis(pointer, trigger_axes[i], -32768),
             "SDL_JoystickSetVirtualAxis trigger");
   SDL_JoystickUpdate();
+  qa_cleanup_pop(&guard);
   controller->pointer = pointer;
   controller->instance = instance;
   return controller;

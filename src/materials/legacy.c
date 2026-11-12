@@ -58,13 +58,17 @@ static qa_q1_material_frame *build_sequence(struct frame_map frames,
     result = malloc(count * sizeof *result);
     if (result == NULL) qa_range_error("legacy allocation failed");
   }
+  /* A missing frame raises: the sequence built so far goes with it (TS GC). */
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, result);
   for (size_t frame = 0; frame < count; frame++) {
     if (frames.images[frame] == NULL)
-      qa_range_error("Missing Q1 animation frame %zu in %s", frame, name);
+      qa_raise("Error", 0, 0, "Missing Q1 animation frame %zu in %s", frame, name);
     result[frame].image = *frames.images[frame];
     result[frame].start_tenths = (double)frame * 2;
     result[frame].end_tenths = ((double)frame + 1) * 2;
   }
+  qa_cleanup_pop(&node);
   *out_count = count;
   return result;
 }
@@ -91,13 +95,17 @@ qa_q1_texture_animations qa_q1_texture_animations_build(const char *name,
       alternate.images[code - 65] = &textures[i].image;
       if (code - 65 > alternate.max_index) alternate.max_index = code - 65;
     } else {
-      qa_range_error("Bad Q1 animated texture frame %s", texture_name);
+      qa_raise("Error", 0, 0, "Bad Q1 animated texture frame %s", texture_name);
     }
   }
   qa_q1_material_frame *animation = build_sequence(primary, name,
                                                    &out.animation_count);
+  /* A missing alternate frame raises: the primary sequence is released (TS GC). */
+  qa_cleanup animation_node;
+  qa_cleanup_push(&animation_node, free, animation);
   qa_q1_material_frame *alternate_animation = build_sequence(alternate, name,
       &out.alternate_animation_count);
+  qa_cleanup_pop(&animation_node);
   int code = strlen(name) >= 2 ? toupper((unsigned char)name[1]) : 0;
   if (code >= 65) {
     out.animation = alternate_animation;
@@ -136,14 +144,14 @@ qa_renderer_image qa_q1_animated_texture(const qa_render_material *material,
   for (size_t i = 0; i < count; i++)
     if (phase >= frames[i].start_tenths && phase < frames[i].end_tenths)
       return frames[i].image;
-  qa_range_error("Broken animation cycle in %s", material->name);
+  qa_raise("Error", 0, 0, "Broken animation cycle in %s", material->name);
 }
 
 qa_render_material qa_create_q2_material(const char *name,
     const qa_renderer_image *frames, size_t frame_count,
     qa_surface_lighting lighting, double surface_flags, const char *material) {
   if (frame_count == 0)
-    qa_range_error("Q2 material requires at least one texture frame");
+    qa_raise("Error", 0, 0, "Q2 material requires at least one texture frame");
   int32_t flags = qa_mat_to_int32(surface_flags);
   qa_render_material out;
   memset(&out, 0, sizeof out);
@@ -164,11 +172,11 @@ qa_renderer_image qa_q2_animated_texture(const qa_render_material *material,
                                          double frame) {
   int64_t count = (int64_t)material->frame_count;
   if (count <= 0)
-    qa_range_error("Broken Q2 animation cycle in %s", material->name);
+    qa_raise("Error", 0, 0, "Broken Q2 animation cycle in %s", material->name);
   /* ((Math.trunc(frame) % n) + n) % n on doubles; frames[NaN] is undefined. */
   double index = fmod(fmod(trunc(frame), (double)count) + (double)count, (double)count);
   if (!(index >= 0 && index < (double)count))
-    qa_range_error("Broken Q2 animation cycle in %s", material->name);
+    qa_raise("Error", 0, 0, "Broken Q2 animation cycle in %s", material->name);
   return material->frames[(size_t)index];
 }
 
@@ -200,6 +208,18 @@ qa_vec2 qa_q1_sky_tex_coords(qa_vec3 position, qa_vec3 view_origin,
   return out;
 }
 
+typedef struct legacy_batches_guard {
+  qa_render_vertex *vertices; /* owned by batches[0] until a pair conversion */
+  qa_draw_batch *batches;
+  size_t count;
+  bool vertices_alone;
+} legacy_batches_guard;
+static void legacy_batches_release(void *raw) {
+  legacy_batches_guard *guard = raw;
+  if (guard->batches == NULL || guard->count == 0 || guard->vertices_alone) free(guard->vertices);
+  if (guard->batches != NULL) qa_mat_draw_batches_destroy(guard->batches, guard->count);
+}
+
 static double *copy_indices(qa_material_geometry geometry) {
   double *indices = malloc(
       (geometry.index_count > 0 ? geometry.index_count : 1) * sizeof *indices);
@@ -215,7 +235,7 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
   bool is_q1 = eq(material->kind, "q1"), is_q2 = eq(material->kind, "q2");
   if ((is_q1 && eq(material->surface, "sky")) ||
       (is_q2 && (qa_mat_to_int32(material->surface_flags) & 4) != 0))
-    qa_range_error("Sky surfaces require the sky geometry and layer path");
+    qa_raise("Error", 0, 0, "Sky surfaces require the sky geometry and layer path");
   qa_renderer_image image = is_q1
       ? qa_q1_animated_texture(material, context->time,
                                context->alternate_animation)
@@ -251,6 +271,10 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
   qa_render_vertex *vertices = malloc(
       (vcount > 0 ? vcount : 1) * sizeof *vertices);
   if (vertices == NULL) qa_range_error("legacy allocation failed");
+  /* What is built so far is released when a projection or a missing lightmap raises (TS GC). */
+  legacy_batches_guard guard = {vertices, NULL, 0, false};
+  qa_cleanup guard_node;
+  qa_cleanup_push(&guard_node, legacy_batches_release, &guard);
   for (size_t i = 0; i < vcount; i++) {
     qa_material_vertex vertex = geometry.vertices[i];
     qa_vec2 uv = vertex.tex_coord;
@@ -272,6 +296,7 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
   }
   qa_draw_batch *batches = calloc(3, sizeof *batches);
   if (batches == NULL) qa_range_error("legacy allocation failed");
+  guard.batches = batches;
   size_t count = 1;
   batches[0].lighting.kind = "vertex";
   if (context->fragment_lighting != NULL && !has_lightmap) {
@@ -282,6 +307,7 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
   batches[0].indices.count = geometry.index_count;
   batches[0].vertices = vertices;
   batches[0].vertex_count = vcount;
+  guard.count = 1;
   batches[0].state = state;
   batches[0].texture.kind = QA_TEXTURE_BINDING_BIND_IMAGE;
   batches[0].texture.image = image;
@@ -291,7 +317,7 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
     if (blended || context->q1_fog_active) {
       paired_converted = true;
       if (!context->has_translucent_lightmap)
-        qa_range_error("Translucent lightmapped surfaces require an uploaded directLightmapPixels image");
+        qa_raise("Error", 0, 0, "Translucent lightmapped surfaces require an uploaded directLightmapPixels image");
       qa_multitexture_vertex *paired = malloc(
           (vcount > 0 ? vcount : 1) * sizeof *paired);
       if (paired == NULL) qa_range_error("legacy allocation failed");
@@ -301,6 +327,7 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
       }
       batches[0].vertices = NULL;
       batches[0].vertex_count = 0;
+      guard.vertices_alone = true;
       batches[0].texturing_is_pair = true;
       batches[0].pair_vertices = paired;
       batches[0].pair_vertex_count = vcount;
@@ -340,8 +367,9 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
         direct = context->translucent_lightmap;
       }
       if (!has_direct)
-        qa_range_error("Fragment-lit lightmap requires uploaded direct RGB pixels");
+        qa_raise("Error", 0, 0, "Fragment-lit lightmap requires uploaded direct RGB pixels");
       qa_draw_batch *batch = &batches[count++];
+      guard.count = count;
       batch->lighting.kind = "vertex";
       if (context->fragment_lighting != NULL) {
         batch->lighting = *context->fragment_lighting;
@@ -371,6 +399,7 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
 
   if (context->fullbright != NULL) {
     qa_draw_batch *batch = &batches[count++];
+    guard.count = count;
     batch->lighting.kind = "vertex";
     batch->texture.kind = QA_TEXTURE_BINDING_BIND_IMAGE;
     batch->texture.image = *context->fullbright;
@@ -394,6 +423,7 @@ qa_draw_batch *qa_prepare_legacy_material_batches(
     batch->state.depth_write = false;
     batch->state.alpha_test = "gt0";
   }
+  qa_cleanup_pop(&guard_node);
   if (paired_converted) free(vertices);
   *out_count = count;
   return batches;
@@ -408,42 +438,54 @@ void qa_split_sky_texture_destroy(qa_split_sky_texture *split) {
 
 static uint8_t palette_at(qa_render_image image, size_t index,
                           const char *message) {
-  if (index >= image.palette.colors.length) qa_range_error("%s", message);
+  if (index >= image.palette.colors.length) qa_raise("Error", 0, 0, "%s", message);
   return image.palette.colors.bytes[index];
 }
 
+static void split_release(void *raw) { qa_split_sky_texture_destroy((qa_split_sky_texture *)raw); }
+
 qa_split_sky_texture qa_split_q1_sky_texture(qa_render_image image) {
-  if (image.level_count == 0 || image.levels[0].width != 256 ||
-      image.levels[0].height != 128)
-    qa_range_error("Classic Q1 sky requires a 256x128 texture");
+  /* TS reads image.levels[0].width: no level is JSC's TypeError for undefined. */
+  if (image.level_count == 0)
+    qa_raise("TypeError", 0, 0, "undefined is not an object (evaluating 'level.width')");
+  if (image.levels[0].width != 256 || image.levels[0].height != 128)
+    qa_raise("Error", 0, 0, "Classic Q1 sky requires a 256x128 texture");
   qa_image_level level = image.levels[0];
-  uint8_t *solid = malloc(128 * 128 * 4);
-  uint8_t *overlay = malloc(128 * 128 * 4);
+  uint8_t *solid = calloc(128 * 128 * 4, 1);
+  uint8_t *overlay = calloc(128 * 128 * 4, 1);
   if (solid == NULL || overlay == NULL)
     qa_range_error("legacy allocation failed");
   qa_split_sky_texture out = {{128, 128, {solid, 128 * 128 * 4}},
                               {128, 128, {overlay, 128 * 128 * 4}}};
   if (image.kind == QA_RENDER_IMAGE_RGBA8) {
+    /* overlay.set(pixels.subarray(at, at + 4), ...): subarray clamps to the
+       pixels, so a short level copies what it has (the rest stays 0). */
     for (int y = 0; y < 128; y++) {
       for (int x = 0; x < 128; x++) {
-        memcpy(overlay + (y * 128 + x) * 4,
-               level.pixels.bytes + (y * 256 + x) * 4, 4);
-        memcpy(solid + (y * 128 + x) * 4,
-               level.pixels.bytes + (y * 256 + x + 128) * 4, 4);
+        size_t from[2] = {(size_t)(y * 256 + x) * 4, (size_t)(y * 256 + x + 128) * 4};
+        uint8_t *to[2] = {overlay + (y * 128 + x) * 4, solid + (y * 128 + x) * 4};
+        for (int k = 0; k < 2; k++) {
+          size_t available = from[k] < level.pixels.length ? level.pixels.length - from[k] : 0;
+          if (available > 4) available = 4;
+          if (available > 0) memcpy(to[k], level.pixels.bytes + from[k], available);
+        }
       }
     }
     return out;
   }
   if (image.kind != QA_RENDER_IMAGE_INDEXED8) {
     qa_split_sky_texture_destroy(&out);
-    qa_range_error("Classic Q1 sky requires an indexed or RGBA texture");
+    qa_raise("Error", 0, 0, "Classic Q1 sky requires an indexed or RGBA texture");
   }
+  /* The halves are released when an incomplete texture or palette raises (TS GC). */
+  qa_cleanup node;
+  qa_cleanup_push(&node, split_release, &out);
   int64_t red = 0, green = 0, blue = 0;
   for (int y = 0; y < 128; y++) {
     for (int x = 0; x < 128; x++) {
       size_t at = (size_t)(y * 256 + x + 128);
       if (at >= level.pixels.length)
-        qa_range_error("Q1 sky texture is incomplete");
+        qa_raise("Error", 0, 0, "Q1 sky texture is incomplete");
       int index = level.pixels.bytes[at];
       uint8_t *p = solid + (y * 128 + x) * 4;
       p[0] = palette_at(image, (size_t)index * 3, "Q1 sky palette is incomplete");
@@ -459,7 +501,7 @@ qa_split_sky_texture qa_split_q1_sky_texture(qa_render_image image) {
     for (int x = 0; x < 128; x++) {
       size_t at = (size_t)(y * 256 + x);
       if (at >= level.pixels.length)
-        qa_range_error("Q1 sky texture is incomplete");
+        qa_raise("Error", 0, 0, "Q1 sky texture is incomplete");
       int index = level.pixels.bytes[at];
       uint8_t *p = overlay + (y * 128 + x) * 4;
       if (index == 0) {
@@ -472,25 +514,31 @@ qa_split_sky_texture qa_split_q1_sky_texture(qa_render_image image) {
       }
     }
   }
+  qa_cleanup_pop(&node);
   return out;
 }
 
 qa_split_sky_texture qa_split_q64_sky_texture(qa_render_image image) {
   if (image.kind != QA_RENDER_IMAGE_INDEXED8)
-    qa_range_error("Quake64 sky requires an indexed source image");
+    qa_raise("Error", 0, 0, "Quake64 sky requires an indexed source image");
   if (image.level_count == 0 || image.levels[0].height < 2 ||
       fmod(image.levels[0].height, 2) != 0) /* height % 2 on a double */
-    qa_range_error("Quake64 sky requires two vertically stacked layers");
+    qa_raise("Error", 0, 0, "Quake64 sky requires two vertically stacked layers");
   qa_image_level level = image.levels[0];
   double width = level.width, height = level.height / 2;
   size_t count = (size_t)(width * height);
-  uint8_t *solid = malloc(count * 4);
-  uint8_t *overlay = malloc(count * 4);
+  uint8_t *solid = malloc(count * 4 > 0 ? count * 4 : 1);
+  uint8_t *overlay = malloc(count * 4 > 0 ? count * 4 : 1);
   if (solid == NULL || overlay == NULL)
     qa_range_error("legacy allocation failed");
+  qa_split_sky_texture out = {{width, height, {solid, count * 4}},
+                              {width, height, {overlay, count * 4}}};
+  /* Released when an incomplete texture or palette raises (TS GC). */
+  qa_cleanup node;
+  qa_cleanup_push(&node, split_release, &out);
   for (size_t index = 0; index < count; index++) {
     if (index >= level.pixels.length || count + index >= level.pixels.length)
-      qa_range_error("Quake64 sky texture is incomplete");
+      qa_raise("Error", 0, 0, "Quake64 sky texture is incomplete");
     int front = level.pixels.bytes[index];
     int back = level.pixels.bytes[count + index];
     for (int channel = 0; channel < 3; channel++) {
@@ -502,7 +550,6 @@ qa_split_sky_texture qa_split_q64_sky_texture(qa_render_image image) {
     overlay[index * 4 + 3] = 128;
     solid[index * 4 + 3] = 255;
   }
-  qa_split_sky_texture out = {{width, height, {solid, count * 4}},
-                              {width, height, {overlay, count * 4}}};
+  qa_cleanup_pop(&node);
   return out;
 }

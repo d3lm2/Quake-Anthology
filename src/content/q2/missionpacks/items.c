@@ -151,14 +151,15 @@ qa_q2mp_powerups qa_q2mp_items_powerups(qa_q2mp_items *items, qa_actor_id actor)
 qa_q2w_input qa_q2mp_items_input(qa_q2mp_items *items, qa_actor_id actor, qa_q2w_input input) {
   qa_q2mp_powerups powers = qa_q2mp_items_powerups(items, actor);
   qa_q2w_input out = input;
-  out.quad_fire_until = input.quad_fire_until > powers.quad_fire_until ? input.quad_fire_until : powers.quad_fire_until;
-  out.double_until = input.double_until > powers.double_until ? input.double_until : powers.double_until;
+  out.quad_fire_until = qa_js_max(input.quad_fire_until, powers.quad_fire_until); /* Math.max: NaN propagates */
+  out.double_until = qa_js_max(input.double_until, powers.double_until);
   return out;
 }
 void qa_q2mp_items_reset(qa_q2mp_items *items, qa_actor_id actor) {
   for (size_t i = 0; i < items->power_count; i++)
     if (qa_same_actor(items->powers[i].actor, actor)) {
-      items->powers[i] = items->powers[items->power_count - 1];
+      /* Map.delete keeps the insertion order of the rest (capture lists the entries in that order). */
+      memmove(&items->powers[i], &items->powers[i + 1], (items->power_count - i - 1) * sizeof *items->powers);
       items->power_count--;
       return;
     }
@@ -276,8 +277,7 @@ void qa_q2mp_items_ammo_pack(qa_q2mp_items *items, qa_owned_actor player, qa_q2_
     memset(&entry, 0, sizeof entry);
     entry.item = changes[i].item;
     entry.count = current != NULL ? current->count : 0;
-    double capacity = current != NULL ? current->capacity : 0;
-    entry.capacity = capacity > changes[i].capacity ? capacity : changes[i].capacity;
+    entry.capacity = qa_js_max(current != NULL ? current->capacity : 0, changes[i].capacity);
     qa_shared_inventory_table_configure(game->host->inventory, player, entry, NULL, NULL);
     (void)qa_shared_inventory_table_give(game->host->inventory, player, changes[i].item, changes[i].give);
   }
@@ -304,12 +304,19 @@ void qa_q2mp_items_checkpoint_free(qa_q2mp_items_checkpoint *checkpoint) {
   checkpoint->powers = NULL; checkpoint->power_count = 0;
 }
 void qa_q2mp_items_restore(qa_q2mp_items *items, qa_q2_game_services *game, const qa_q2mp_items_checkpoint *checkpoint) {
+  /* TS builds the whole Map before assigning it: a restoreQ2Actor that throws leaves the old powers in place. */
+  qa_actor_id *actors = malloc((checkpoint->power_count ? checkpoint->power_count : 1) * sizeof *actors);
+  if (actors == NULL) qa_raise("Error", 0, 0, "Out of memory restoring mission-pack powerups");
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, actors);
+  for (size_t i = 0; i < checkpoint->power_count; i++) actors[i] = qa_q2_restore_actor(game, checkpoint->powers[i].actor).id;
+  qa_cleanup_pop(&node);
   items->power_count = 0;
   for (size_t i = 0; i < checkpoint->power_count; i++) {
-    qa_owned_actor restored = qa_q2_restore_actor(game, checkpoint->powers[i].actor);
-    qa_q2mp_powerups *entry = power_entry(items, restored.id, true);
+    qa_q2mp_powerups *entry = power_entry(items, actors[i], true); /* Map: a repeated actor keeps its place, last state wins */
     if (entry != NULL) *entry = checkpoint->powers[i].state;
   }
+  free(actors);
 }
 
 static double *power_field(qa_q2mp_powerups *powers, int field) {
@@ -321,7 +328,7 @@ static bool power_use_timeout(qa_q2mp_power_env *env, qa_owned_actor player, qa_
   qa_q2mp_powerups *powers = power_entry(items, player.id, true);
   if (powers == NULL) return false; /* OOM only; TS has no counterpart */
   double *field = power_field(powers, env->field);
-  *field = (q2mp_now(game) > *field ? q2mp_now(game) : *field) + timeout;
+  *field = qa_js_max(q2mp_now(game), *field) + timeout;
   qa_q2_entity *entity = q2mp_ent(game, true, player.id);
   if (entity != NULL) q2mp_sound(game, entity, env->sound, true, 3, false, 0, false, 0);
   if (env->field == 2) {
@@ -343,8 +350,7 @@ static bool power_pickup(void *ctx, qa_q2_entity *entity, qa_q2_game_services *g
   if (qa_shared_inventory_table_give(game->host->inventory, player, env->item, 1) == 0) return false;
   bool dropped_quad_fire = env->field == 0 && ((q2mp_u32(entity->spawnflags) & 0x20000u) != 0);
   if (((q2mp_u32(qa_q2_options_deathmatch_flags(&game->options)) & 16u) != 0) || dropped_quad_fire) {
-    double timeout = dropped_quad_fire && entity->has_next_think
-        ? (entity->next_think - q2mp_now(game) > 0 ? entity->next_think - q2mp_now(game) : 0) : env->duration;
+    double timeout = dropped_quad_fire && entity->has_next_think ? qa_js_max(0, entity->next_think - q2mp_now(game)) : env->duration;
     (void)power_use_timeout(env, player, game, timeout);
   }
   return true;
@@ -414,8 +420,7 @@ static bool nuke_use(void *ctx, qa_owned_actor player, qa_q2_game_services *game
   if (entity == NULL || !qa_shared_inventory_table_consume(game->host->inventory, player, "q2:ammo_nuke", 1)) return false;
   qa_q2mp_powerups powers = qa_q2mp_items_powerups(items, player.id);
   bool quad = (input != NULL ? input->quad_until : 0) > q2mp_now(game);
-  double double_until = powers.double_until > (input != NULL ? input->double_until : 0) ? powers.double_until
-                                                                                        : (input != NULL ? input->double_until : 0);
+  double double_until = qa_js_max(powers.double_until, input != NULL ? input->double_until : 0);
   double multiplier = (quad ? 4 : 1) *
       (double_until > q2mp_now(game) && !(quad && input != NULL && input->no_stack_double) ? 2 : 1);
   qa_vec3 angles = input != NULL ? input->angles : q2mp_body(game, entity).angles;

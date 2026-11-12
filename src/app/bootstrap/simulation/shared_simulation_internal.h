@@ -14,6 +14,8 @@
  * GPL-2.0-or-later. */
 #ifndef QA_SRC_APP_BOOTSTRAP_SIMULATION_SHARED_SIMULATION_INTERNAL_H
 #define QA_SRC_APP_BOOTSTRAP_SIMULATION_SHARED_SIMULATION_INTERNAL_H
+#include <stdarg.h>
+#include <stdnoreturn.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -99,6 +101,7 @@
 #include "qa/contracts/original_pickups.h"
 #include "qa/contracts/pickups.h"
 #include "qa/core/cvars/index.h"
+#include "qa/core/math.h"
 #include "qa/settings/server/cvars.h"
 #include "qa/settings/server/profile.h"
 #include "qa/settings/server/selection.h"
@@ -394,6 +397,8 @@ struct qa_app_shared_simulation {
   qa_frame_context equipment_frame;
   qa_app_q3_selected_source *selected_q3_source;
   qa_app_q3_mapped_ammo_regeneration *selected_ammo_timers;
+  /* The timer owner's actors.onRelease subscription (TS unobserve, ended by close()). */
+  bool has_selected_ammo_release; int64_t selected_ammo_release;
   double selected_q3_time, selected_q3_next;
   qa_ss_map selected_q3_strings; /* number -> char * (malloc'd, owned; freed by qa_app_shared_sim_arsenal_destroy) */
   qa_app_sim_simulation_weapon_behaviors *weapon_behavior;
@@ -478,8 +483,12 @@ struct qa_app_shared_simulation {
   qa_q1_client_visibility *q1_client_visibility;
   double attack_sequence;
   bool q1_restart;
-  qa_ss_map last_attack;  /* OwnedActor -> qa_attack_provenance */
-  qa_ss_map q2_entity_attacks; /* C: ActorId -> qa_attack_provenance * borrowed by Q2 entity.lastAttack */
+  qa_ss_map last_attack;  /* OwnedActor -> qa_ss_attack_box * (TS keeps the request's attack object) */
+  qa_ss_map q2_entity_attacks; /* C: ActorId -> qa_ss_attack_box * borrowed by Q2 entity.lastAttack */
+  /* C: ActorId -> the selected Q3 source's execution record (TS closure entry), owned while the actor's execution is
+   * registered; a released actor's record retires and is freed at the next frame end (a running turn may still hold it). */
+  qa_ss_map q3_source_executions;
+  void **retired_q3_executions; size_t retired_q3_execution_count, retired_q3_execution_capacity;
   qa_ss_map area_portals; /* number -> bool */
   qa_event_ring quake_world_commands; /* qa_ss_quakeworld_command, capacity 8192 */
   qa_event_cursor quake_world_cursor;
@@ -491,6 +500,9 @@ struct qa_app_shared_simulation {
   qa_app_sim_q1_actor_host_env *q1_host_envs; size_t q1_host_env_count;
   qa_app_sim_q2_actor_host_env **q2_host_envs; size_t q2_host_env_count;
   void **allocations; size_t allocation_count, allocation_capacity; /* closure records freed by destroy */
+  /* Per-call records (TS objects the call's caller drops): freed at the next step's start or claimed by a longer owner. */
+  void **scratch; size_t scratch_count, scratch_capacity;
+  qa_ss_map interned; /* string -> const char *: qa_app_shared_sim_intern's copies, one per distinct text */
   /* Owned records with their own release, run by destroy (last kept first) before the allocations are freed. */
   struct qa_ss_owned { void *value; void (*release)(void *value); } *owned; size_t owned_count, owned_capacity;
   qa_actor_id damage_scratch[2];     /* QuakeC damageRequest attacker/inflictor storage */
@@ -503,12 +515,16 @@ struct qa_app_shared_simulation {
   /* C-only B2 storage (shared_simulation_arsenal.c; freed by qa_app_shared_sim_arsenal_destroy). */
   qa_app_sim_native_primary_weapon_context b2_native_host; /* context of the transient nativePrimaryWeaponHost views */
   qa_ss_dispose *b2_owned; size_t b2_owned_count, b2_owned_capacity; /* owners the B2 constructions created, released LIFO */
-  qa_ss_map b2_player_ammo; /* ActorId -> qa_inventory_entry *: the selected read adopted by player->arsenal */
+  /* Selected reads adopted as some player->arsenal (qa_app_shared_sim_store_player_arsenal); each is freed once no
+   * player's arsenal references it (qa_app_shared_sim_collect_player_arsenals, at each step's start). */
+  void **b2_adopted_ammo; size_t b2_adopted_count, b2_adopted_capacity;
+  qa_ss_map b2_slot_bindings; /* ActorId -> malloc'd records a weapon slot's callbacks borrow (owner check, primary handoff) */
+  qa_ss_map b2_slot_attachments; /* grapple view attachment array -> malloc'd presentation rows (ss_slot_attachments) */
+  qa_ss_map b2_slot_presentations; /* ActorId -> malloc'd {sim, actor}: the grapple slot host presentation context */
 };
 
 /* ---- TS free helpers (runtime.ts 270-280) ---- */
-extern const qa_vec3 qa_ss_zero;
-qa_vec3 qa_ss_add(qa_vec3 a, qa_vec3 b);
+/* zero and add are core/math.h qa_zero_vec3 and qa_add3 (TS zeroVec3, add3). */
 qa_vec3 qa_ss_subtract(qa_vec3 a, qa_vec3 b);
 double qa_ss_seconds(qa_source_time time);
 bool qa_ss_is_q1_barrel(const char *classname);
@@ -520,11 +536,26 @@ bool qa_ss_is(const char *a, const char *b);
 char *qa_ss_strdup(const char *text);
 /* TS numeric String(n) of the cvar setters. */
 const char *qa_ss_number_text(double value, char buffer[32]);
+/* Raises a plain Error with the whole formatted message. */
+noreturn void qa_ss_raise_error(const char *format, va_list args);
+/* Q3MappedAmmoRegeneration.close() for the selected ammo timer owner (unobserve, then clear). */
+void qa_app_shared_sim_close_selected_ammo(qa_app_shared_simulation *sim);
+/* The released actor's selected Q3 source execution record retires; free_retired frees the retired ones. */
+void qa_app_shared_sim_retire_q3_execution(qa_app_shared_simulation *sim, qa_actor_id actor);
+void qa_app_shared_sim_free_retired_q3_executions(qa_app_shared_simulation *sim);
 
 /* ---- Phase A: implemented in shared_simulation_core.c ---- */
 qa_mod_client_services qa_app_shared_sim_create_mod_clients(qa_app_shared_simulation *sim);
 qa_mod_client_player_view qa_app_shared_sim_source_client_view(qa_app_shared_simulation *sim, qa_actor_id actor);
 /* false = TS null. */
+/* An attack provenance the simulation keeps past the damage call: its attacker and inflictor point into the box (the
+ * request's own pointers are the caller's). `attack` is the first member, so the box is freed through it. */
+typedef struct qa_ss_attack_box { qa_attack_provenance attack; qa_actor_id attacker, inflictor; } qa_ss_attack_box;
+qa_attack_provenance *qa_ss_attack_box_store(qa_ss_attack_box **slot, const qa_attack_provenance *attack);
+/* lastAttack.set(actor, attack) / .get(actor) (NULL = undefined) / .delete(actor). */
+void qa_app_shared_sim_record_attack(qa_app_shared_simulation *sim, qa_owned_actor actor, const qa_attack_provenance *attack);
+const qa_attack_provenance *qa_app_shared_sim_last_attack(qa_app_shared_simulation *sim, qa_owned_actor actor);
+void qa_app_shared_sim_forget_attack(qa_app_shared_simulation *sim, qa_owned_actor actor);
 bool qa_app_shared_sim_active_client_outputs(qa_app_shared_simulation *sim, qa_actor_id actor, qa_mod_client_movement_outputs *out);
 void qa_app_shared_sim_assert_open(const qa_app_shared_simulation *sim);
 void qa_app_shared_sim_schedule(qa_app_shared_simulation *sim, qa_owned_actor actor, double due);
@@ -636,6 +667,11 @@ void qa_app_shared_sim_install_rerelease_navigation(qa_app_shared_simulation *si
 /* TS nativeModContext(): false = undefined. */
 bool qa_app_shared_sim_native_mod_context(qa_app_shared_simulation *sim, void *out_context);
 qa_compat_q2_rerelease_navigation_services qa_app_shared_sim_rerelease_navigation_services(qa_app_shared_simulation *sim);
+/* foreign-match-rules.ts ForeignMatchRules (foreign_match_rules.c). */
+void qa_app_foreign_match_rules_tick(qa_app_shared_simulation *sim);
+void qa_app_foreign_match_rules_release(qa_app_shared_simulation *sim, qa_actor_id actor);
+bool qa_app_foreign_match_rules_blocks_checkpoint(qa_app_shared_simulation *sim);
+void qa_app_foreign_match_rules_register_combat(qa_app_shared_simulation *sim);
 void qa_app_shared_sim_tick_horde_wave(qa_app_shared_simulation *sim);
 bool qa_app_shared_sim_foreign_tag(qa_app_shared_simulation *sim);
 void qa_app_shared_sim_tick_tag(qa_app_shared_simulation *sim);
@@ -884,6 +920,11 @@ const qa_compat_q2_native_inventory_row *qa_app_shared_sim_native_inventory_rows
     size_t *out_count);
 /* Stores a selected read into player->arsenal, adopting its malloc'd ammo array (the previous adopted array is freed). */
 void qa_app_shared_sim_store_player_arsenal(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player, qa_arsenal_state arsenal);
+/* player.arsenal = this.arsenal(player): a selected read is adopted (store_player_arsenal), a base arsenal borrowed. */
+void qa_app_shared_sim_assign_player_arsenal(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player);
+void qa_app_shared_sim_collect_player_arsenals(qa_app_shared_simulation *sim);
+/* Frees the records the actor's weapon slot borrowed; call after that slot is destroyed (actor NULL: every slot's). */
+void qa_app_shared_sim_release_slot_bindings(qa_app_shared_simulation *sim, const qa_actor_id *actor);
 /* C-only: releases the B2 owners (selected arsenals, equipment runtimes and their games). */
 void qa_app_shared_sim_arsenal_destroy(qa_app_shared_simulation *sim);
 bool qa_app_shared_sim_require_equipment_player(qa_app_shared_simulation *sim, qa_actor_id actor);
@@ -920,7 +961,7 @@ void qa_app_shared_sim_player_weapon(qa_app_shared_simulation *sim, qa_app_sim_m
 qa_q2w_input qa_app_shared_sim_q2_weapon_input(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player);
 void qa_app_shared_sim_project_quake_c_attack(qa_app_shared_simulation *sim, qa_owned_actor actor, qa_arsenal_state before);
 qa_actor_command qa_app_shared_sim_prepare_arsenal_command(qa_app_shared_simulation *sim, qa_app_sim_movement_player *player,
-    qa_actor_command command, bool paused);
+    qa_actor_command command, bool paused, qa_arsenal_intent *storage);
 qa_app_sim_player_ui qa_app_shared_sim_player_ui(qa_app_shared_simulation *sim, qa_actor_id actor);
 void qa_app_shared_sim_restore_native_inventory_cursors(qa_app_shared_simulation *sim, const qa_actor_id *actor);
 bool qa_app_shared_sim_grant_selected_arsenal(qa_app_shared_simulation *sim, qa_actor_id actor, const char *category);
@@ -1002,6 +1043,9 @@ void qa_ss_q2_native_checkpoint_extras(qa_app_shared_simulation *sim, qa_save_va
 void qa_ss_q3_qvm_checkpoint_extras(qa_app_shared_simulation *sim, qa_save_value *record);
 void qa_ss_q2_native_restore_loading(qa_app_shared_simulation *sim, const qa_save_image *save, qa_app_shared_sim_next_frame_fn next_frame,
     void *frame_ctx);
+void qa_ss_q2_native_import_loading(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported,
+    qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx);
+void qa_ss_q2_native_import_original(qa_app_shared_simulation *sim, const qa_app_sim_native_q2_import *imported);
 void qa_ss_q2_native_restore_guest(qa_app_shared_simulation *sim, const qa_save_image *save, bool native_restored);
 void qa_ss_q3_restore_continuation(qa_app_shared_simulation *sim, const qa_save_image *save);
 void qa_ss_q1_restore_foundation(qa_app_shared_simulation *sim, const qa_save_image *save, const qa_save_reader *reader);
@@ -1033,19 +1077,23 @@ typedef struct qa_app_shared_sim_save {
   qa_persist_decoded owner;
   qa_body_checkpoint *bodies; size_t body_count; /* captureSharedBodies storage */
 } qa_app_shared_sim_save;
+/* checkpoint(options: SaveCaptureOptions = {}): the plain form is the TS default `{}`; _with takes the options. */
 void qa_app_shared_sim_checkpoint(qa_app_shared_simulation *sim, qa_app_shared_sim_save *out);
-/* checkpointFromSource(rereleaseSave?, weaponBehaviors?, mods?): NULL = TS undefined. */
-void qa_app_shared_sim_checkpoint_from_source(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *rerelease_save,
+void qa_app_shared_sim_checkpoint_with(qa_app_shared_simulation *sim, qa_app_sim_save_capture_options options, qa_app_shared_sim_save *out);
+/* checkpointFromSource(autosave, rereleaseSave?, weaponBehaviors?, mods?): NULL = TS undefined. */
+void qa_app_shared_sim_checkpoint_from_source(qa_app_shared_simulation *sim, bool autosave, const qa_app_sim_rerelease_guest_save *rerelease_save,
     const qa_save_value *weapon_behaviors, const qa_mod_session_checkpoint *mods, qa_app_shared_sim_save *out);
-/* checkpointLoading(nextFrame): TS async, pumped synchronously. */
+/* checkpointLoading(nextFrame, options: SaveCaptureOptions = {}): TS async, pumped synchronously. */
 void qa_app_shared_sim_checkpoint_loading(qa_app_shared_simulation *sim, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx,
     qa_app_shared_sim_save *out);
+void qa_app_shared_sim_checkpoint_loading_with(qa_app_shared_simulation *sim, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx,
+    qa_app_sim_save_capture_options options, qa_app_shared_sim_save *out);
 void qa_app_shared_sim_save_free(qa_app_shared_sim_save *save);
-/* checkpointFromSource's nativeOriginal: the q2-native original-save provider
+/* Q2NativeStrategy.originalSave(guestSave, autosave): the q2-native original-save provider
  * record (encodeQ2RereleaseNativeSave / encodeQ2ClassicOriginalSave over
- * source.files.capture); bytes kept in owner. Not yet ported. */
+ * source.files.capture); bytes kept in owner. An autosave carries no level for a map the unit has not left before. */
 void qa_app_shared_sim_native_original_checkpoint(qa_app_shared_simulation *sim, const qa_app_sim_rerelease_guest_save *rerelease_save,
-    qa_persist_decoded *owner, qa_provider_checkpoint *out);
+    bool autosave, qa_persist_decoded *owner, qa_provider_checkpoint *out);
 /* The plain records the world:simulation record embeds are built by
  * app/bootstrap/simulation/checkpoint_values.h; SourcePickupCargo.capture
  * and restore are in dropped_pickups.h. */
@@ -1324,6 +1372,12 @@ qa_app_q3_selected_arsenal *qa_app_shared_sim_selected_q3_weapon_source(qa_app_s
 /* ---- Phase A helpers shared by the region files (shared_simulation_core.c) ---- */
 /* Keeps a closure record (calloc'd) alive until the simulation is destroyed. */
 void *qa_app_shared_sim_keep(qa_app_shared_simulation *sim, size_t size);
+/* A zeroed record that lives until the next step starts (the per-call TS objects nothing keeps), unless claimed. */
+void *qa_app_shared_sim_scratch(qa_app_shared_simulation *sim, size_t size);
+/* Takes a scratch record over (the caller frees it); false when value is not a pending scratch record. */
+bool qa_app_shared_sim_scratch_claim(qa_app_shared_simulation *sim, void *value);
+/* C ownership at a step's start: frees the scratch records and the selected arsenal reads no player holds. */
+void qa_app_shared_sim_release_call_storage(qa_app_shared_simulation *sim);
 /* Keeps an owned record until the simulation is destroyed, where release(value) runs. */
 void qa_app_shared_sim_keep_owned(qa_app_shared_simulation *sim, void *value, void (*release)(void *value));
 /* SimulationEvents super: binds the PresentationState members into the
@@ -1344,6 +1398,13 @@ qa_app_sim_classic_guest_world *qa_app_shared_sim_classic_travel_revisit(qa_app_
     bool loading, qa_app_shared_sim_next_frame_fn next_frame, void *frame_ctx);
 /* A string kept alive for the simulation's lifetime (TS template literals stored in records). */
 const char *qa_app_shared_sim_intern(qa_app_shared_simulation *sim, const char *text);
+/* TS sourceModels.set(actor, event) / .delete(actor). The TS map holds the event object and so its strings; a C
+ * producer emits from storage it rewrites (an entity's model fields, a guest's appearance slots), so the map owns a
+ * copy of the event's path and attached models, released when the entry is replaced or deleted. */
+void qa_app_shared_sim_set_source_model(qa_app_shared_simulation *sim, const qa_q2_presentation_event *model);
+/* load: sourceItemsRestore?.finish(actors, inventory) through the persistence host views (shared_simulation_checkpoint.c). */
+void qa_app_shared_sim_finish_source_item_restore(qa_app_shared_simulation *sim);
+void qa_app_shared_sim_delete_source_model(qa_app_shared_simulation *sim, qa_actor_id actor);
 /* Constructor 822-841: game.bindInput(definition, {...}) for the Q3 QVM source (shared_simulation_source.c). */
 void qa_app_shared_sim_bind_qvm_input(qa_app_shared_simulation *sim);
 /* load 969-976: run the pendingNativeTravel closure (shared_simulation_source.c). */

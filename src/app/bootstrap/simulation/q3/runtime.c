@@ -322,19 +322,22 @@ static void fn_remap_teams_at(owner_t *o, double level_time) {
   /* TS remapTeams (490-496). */
   if (o->parts.product != QA_Q3_BASE_PRODUCT_MISSIONPACK) return;
   double time = (double)(float)((float)level_time * (float)0.001);
-  char buffer[512];
   const char *suffixes[2] = {"01", "02"};
-  for (int i = 0; i < 2; i++) {
-    char old_name[64];
-    snprintf(old_name, sizeof old_name, "textures/ctf2/redteam%s", suffixes[i]);
-    snprintf(buffer, sizeof buffer, "team_icon/%s_red", owner_string(o, "g_redteam"));
-    qa_q3_shader_remap_registry_add(&o->remaps, old_name, buffer, time);
-  }
-  for (int i = 0; i < 2; i++) {
-    char old_name[64];
-    snprintf(old_name, sizeof old_name, "textures/ctf2/blueteam%s", suffixes[i]);
-    snprintf(buffer, sizeof buffer, "team_icon/%s_blue", owner_string(o, "g_blueteam"));
-    qa_q3_shader_remap_registry_add(&o->remaps, old_name, buffer, time);
+  for (int pass = 0; pass < 2; pass++) {
+    const char *color = pass == 0 ? "red" : "blue";
+    for (int i = 0; i < 2; i++) {
+      char old_name[64];
+      snprintf(old_name, sizeof old_name, "textures/ctf2/%steam%s", color, suffixes[i]);
+      /* `team_icon/${string("g_redteam")}_red`: the whole cvar value (no cap), read per call like TS. */
+      const char *team = owner_string(o, pass == 0 ? "g_redteam" : "g_blueteam");
+      size_t length = strlen("team_icon/") + strlen(team) + strlen(color) + 2;
+      char *name = malloc(length);
+      if (!name) qa_range_error("Out of memory");
+      snprintf(name, length, "team_icon/%s_%s", team, color);
+      qa_cleanup scope; qa_cleanup_push(&scope, free, name);
+      qa_q3_shader_remap_registry_add(&o->remaps, old_name, name, time);
+      qa_cleanup_pop(&scope); free(name);
+    }
   }
   char *config = qa_q3_shader_remap_registry_build_config(&o->remaps);
   if (o->config.store.set) o->config.store.set(o->config.store.ctx, 24, config ? config : "");
@@ -655,6 +658,8 @@ void qa_app_q3_source_subsystems_owner_refresh(qa_app_q3_source_subsystems_owner
    * TS level IS the match state: level.base is the one record the match,
    * command and admission hosts share. */
   o->missiles.host.previous_time = o->level.previous_time;
+  /* TS EntityPool options `get mapStartTime() { return runtime.level.startTime; }`: live, set by load and restore. */
+  o->pool.options.map_start_time = o->level.base.start_time;
   o->weapons.host.quad_factor = owner_number(o, "g_quadfactor");
   o->team.host.game_type = owner_game_type(o);
   o->team.host.time = o->level.base.time;
@@ -1156,7 +1161,7 @@ static bool h_in_pvs(void *ctx, qa_vec3 first, qa_vec3 second) {
 /* setBrushModel (runtime.ts 398-406). */
 static void h_set_brush_model(void *ctx, qa_q3_game_entity *entity, const char *name) {
   owner_t *o = ctx;
-  if (name == NULL || name[0] != '*') qa_range_error("SV_SetBrushModel: %s is not a brush model", name ? name : "null");
+  if (name == NULL || name[0] != '*') qa_raise("Error", 0, 0, "SV_SetBrushModel: %s is not a brush model", name ? name : "null"); /* TS Error */
   double index = qa_game_atoi(name + 1);
   entity->s.modelindex = index;
   qa_bounds bounds = qa_shared_model_bounds(HOST(o)->scene, index);
@@ -1340,7 +1345,7 @@ static void h_adjust_area_portal_state(void *ctx, qa_q3_game_entity *entity, boo
   owner_t *o = ctx; const qa_app_q3_source_host *h = HOST(o);
   if (o->parts.foreign_world) return;
   qa_linked_body_result linked = qa_shared_body_table_linked(h->bodies, qa_q3_game_entity_actor(entity).id);
-  if (!linked.has_value) qa_range_error("Area portal mover must be linked");
+  if (!linked.has_value) qa_raise("Error", 0, 0, "%s", "Area portal mover must be linked");
   qa_leaf_query_result leaves = qa_shared_box_leaves(h->scene, linked.value.absolute_bounds, 128);
   double areas[2]; size_t count = 0;
   for (size_t i = 0; i < leaves.leaves.count && count < 2; i++) {
@@ -2119,6 +2124,12 @@ static qa_save_value *number_list(const double *values, size_t count) {
   for (size_t i = 0; ok && i < count; i++) push(array, qa_save_value_number(values[i]), &ok);
   return finish(array, ok);
 }
+static qa_save_value *registry_string_value(const char *bytes) {
+  char *utf8 = qa_command_text_to_utf8(bytes);
+  qa_save_value *value = qa_save_value_string(utf8);
+  free(utf8);
+  return value;
+}
 /* save-level.ts captureQ3Level over save-values.ts captureLevelValues. */
 static qa_save_value *capture_level_value(qa_q3_game_level *level) {
   qa_q3_level_capture capture = qa_q3_capture_level(level);
@@ -2224,10 +2235,11 @@ static qa_save_value *t_capture_part(void *ctx, const char *name) {
     for (size_t i = 0; i < count; i++) {
       const qa_q3_module_cvar_capture *row = &rows[i];
       qa_save_value *entry = qa_save_value_object();
-      put(entry, "name", qa_save_value_string(row->name), &ok);
-      put(entry, "value", qa_save_value_string(row->value), &ok);
-      put(entry, "resetValue", qa_save_value_string(row->reset_value), &ok);
-      put(entry, "latchedValue", row->latched_value ? qa_save_value_string(row->latched_value) : qa_save_value_null(), &ok);
+      /* vmCvar texts are registry texts (one byte per character); the tree holds the UTF-8 TS's JSON writes. */
+      put(entry, "name", registry_string_value(row->name), &ok);
+      put(entry, "value", registry_string_value(row->value), &ok);
+      put(entry, "resetValue", registry_string_value(row->reset_value), &ok);
+      put(entry, "latchedValue", row->latched_value ? registry_string_value(row->latched_value) : qa_save_value_null(), &ok);
       put(entry, "flags", qa_save_value_number(row->flags), &ok);
       put(entry, "modified", qa_save_value_boolean(row->modified), &ok);
       put(entry, "modificationCount", qa_save_value_number(row->modification_count), &ok);
@@ -2310,13 +2322,14 @@ static qa_save_value *t_capture_part(void *ctx, const char *name) {
 }
 static void t_restore_part(void *ctx, const char *name, const qa_save_value *value) {
   owner_t *o = ctx;
-  if (strcmp(name, "level") == 0) qa_q3_restore_level(&o->level, value);
-  else if (strcmp(name, "graph") == 0) {
-    qa_q3_graph_state graph = qa_q3_read_graph(value);
-    qa_q3_restore_graph(&o->pool, &graph);
-    qa_q3_graph_state_destroy(&graph);
-  }
-  else if (strcmp(name, "spawns") == 0) qa_q3_ta_client_spawn_runtime_restore_save_state(&o->spawns, value);
+  /* The graph is not a part: finishNativeRestore restores it through restoreQ3Graph (qa_q3_restore_q3_graph). */
+  if (strcmp(name, "level") == 0) {
+    qa_q3_restore_level(&o->level, value);
+    /* TS level.newSession is the one field the session world's getter/setter reads; refresh copies the session
+     * world's copy back into level, so the restored value must land in both. */
+    o->session_world.new_session = o->level.new_session;
+    o->pool.options.map_start_time = o->level.base.start_time; /* the pool's live mapStartTime getter */
+  } else if (strcmp(name, "spawns") == 0) qa_q3_ta_client_spawn_runtime_restore_save_state(&o->spawns, value);
   else if (strcmp(name, "match") == 0) qa_q3_ta_match_runtime_restore_save_state(&o->match, value);
   else if (strcmp(name, "remaps") == 0) qa_q3_shader_remap_registry_restore(&o->remaps, value);
   else if (strcmp(name, "memory") == 0) qa_q3_game_memory_restore_save_state(&o->memory, value);
@@ -2374,8 +2387,9 @@ static void t_items_save(void *ctx) {
       o->parts.host ? fwd_pool_print
       : o->items.services.log ? o->items.services.log : (o->parts.pool_options.print ? fwd_pool_print : NULL));
 }
-static qa_app_q3_spawn_report t_spawn_entities(void *ctx) {
-  owner_t *o = ctx;
+/* TS spawnHandlers(): createQ3SpawnHandlers over the owner's hosts. Building them binds the trigger, misc and
+ * target save callbacks into the pool's catalog, which a restore needs before the graph resolves them. */
+static qa_q3_spawn_handler_entry *owner_spawn_handlers(owner_t *o, size_t *out_count) {
   qa_app_q3_source_subsystems_owner_refresh(o);
   qa_q3_misc_spawn_host misc = o->parts.misc_spawn_host;
   misc.ctx = o; misc.pool = &o->pool; misc.world = o->server_world;
@@ -2414,6 +2428,13 @@ static qa_app_q3_spawn_report t_spawn_entities(void *ctx) {
     handlers = grown;
     handler_count = qa_q3_base_create_spawn_handlers(handlers_host, handlers, handler_count);
   }
+  *out_count = handler_count;
+  return handlers;
+}
+static qa_app_q3_spawn_report t_spawn_entities(void *ctx) {
+  owner_t *o = ctx;
+  size_t handler_count = 0;
+  qa_q3_spawn_handler_entry *handlers = owner_spawn_handlers(o, &handler_count);
   qa_q3_spawn_map_context map; memset(&map, 0, sizeof map);
   map.spawn.pool = &o->pool; map.spawn.memory = &o->memory;
   map.spawn.product = owner_game_product(o);
@@ -2929,6 +2950,8 @@ qa_app_q3_source_runtime *qa_app_q3_source_runtime_new(qa_app_q3_source_options 
     qa_q3_graph_state_destroy(&state);
     qa_save_reader_destroy(&graph);
     qa_save_reader_destroy(&reader);
+    size_t handler_count = 0;
+    free(owner_spawn_handlers(o, &handler_count)); /* TS this.spawnHandlers(): binds the save callbacks the graph names */
   }
   return runtime;
 }
@@ -2990,8 +3013,8 @@ static qa_save_value *saved_actor_value(qa_saved_actor_id saved) {
  * module come from the owner table (capture_part); graph uses the complete
  * captureQ3Graph tree. */
 qa_save_value *qa_app_q3_source_runtime_capture_native_state(qa_app_q3_source_runtime *runtime) {
-  if (!runtime->loaded || !runtime->has_report) qa_range_error("Q3 native save requires a loaded source");
-  if (qa_actor_callback_table_current(runtime->host.callbacks) != NULL) qa_range_error("Cannot save Q3 during an actor callback");
+  if (!runtime->loaded || !runtime->has_report) qa_raise("Error", 0, 0, "%s", "Q3 native save requires a loaded source");
+  if (qa_actor_callback_table_current(runtime->host.callbacks) != NULL) qa_raise("Error", 0, 0, "%s", "Cannot save Q3 during an actor callback");
   owner_t *o = runtime->owner;
   qa_save_value *root = qa_save_value_object(), *events = qa_save_value_array(), *report = qa_save_value_object();
   qa_save_value *variables = qa_save_value_array(), *outcomes = qa_save_value_array();
@@ -3060,15 +3083,16 @@ uint8_t *qa_app_q3_source_runtime_capture_native_bytes(qa_app_q3_source_runtime 
   qa_save_value_free(state);
   return encoded;
 }
+/* TS actor => this.host.actors.referenceSaved(actor): a checkpoint reference, which may name a released actor
+ * (the missile's owner can be gone); resolveSaved would refuse it. */
 static qa_actor_id rt_reference_saved(void *ctx, qa_saved_actor_id saved) {
   qa_app_q3_source_runtime *runtime = ctx;
-  qa_owned_actor actor;
-  if (!qa_session_actor_registry_resolve_saved(runtime->host.actors, saved, &actor)) qa_range_error("Saved Q3 actor has no session owner");
-  return actor.id;
+  return qa_session_actor_registry_reference_saved(runtime->host.actors, saved, "checkpoint");
 }
+typedef struct published_read { qa_saved_actor_id saved; double event, time; } published_read;
 /* finishNativeRestore (262-292). */
 void qa_app_q3_source_runtime_finish_native_restore(qa_app_q3_source_runtime *runtime) {
-  if (runtime->loaded || !runtime->mode.restore) qa_range_error("Q3 native hydration requires a prepared restore source");
+  if (runtime->loaded || !runtime->mode.restore) qa_raise("Error", 0, 0, "%s", "Q3 native hydration requires a prepared restore source");
   owner_t *o = runtime->owner;
   qa_save_reader reader;
   native_reader(runtime, runtime->mode.state, &reader);
@@ -3101,21 +3125,30 @@ void qa_app_q3_source_runtime_finish_native_restore(qa_app_q3_source_runtime *ru
   runtime->published_count = 0;
   qa_save_reader events = c_field(&reader, "publishedEvents");
   size_t event_count = qa_save_reader_list_count(&events);
+  /* TS reads the whole list (actor, event, time per entry) before resolving the first actor. */
+  published_read *read = calloc(event_count ? event_count : 1, sizeof *read);
+  if (!read) qa_range_error("Out of memory");
+  qa_cleanup read_scope; qa_cleanup_push(&read_scope, free, read);
   for (size_t i = 0; i < event_count; i++) {
     qa_save_reader entry;
     if (!qa_save_reader_item(&events, i, &entry)) qa_range_error("Out of memory");
     qa_save_reader actor_reader = c_field(&entry, "actor");
-    qa_saved_actor_id saved = qa_read_saved_actor(&actor_reader);
+    read[i].saved = qa_read_saved_actor(&actor_reader);
     qa_save_reader_destroy(&actor_reader);
-    qa_save_reader event_reader = c_field(&entry, "event"), time_reader = c_field(&entry, "time");
-    double event = qa_save_reader_number(&event_reader), time = qa_save_reader_number(&time_reader);
+    qa_save_reader event_reader = c_field(&entry, "event");
+    read[i].event = qa_save_reader_number(&event_reader);
+    qa_save_reader time_reader = c_field(&entry, "time");
+    read[i].time = qa_save_reader_number(&time_reader);
     qa_save_reader_destroy(&event_reader); qa_save_reader_destroy(&time_reader);
     qa_save_reader_destroy(&entry);
-    qa_owned_actor actor;
-    if (!qa_session_actor_registry_resolve_saved(runtime->host.actors, saved, &actor) || published_find(runtime, actor))
-      qa_save_reader_fail(&reader, "Invalid published Q3 event actor");
-    published_set(runtime, actor, event, time);
   }
+  for (size_t i = 0; i < event_count; i++) {
+    qa_owned_actor actor;
+    if (!qa_session_actor_registry_resolve_saved(runtime->host.actors, read[i].saved, &actor) || published_find(runtime, actor))
+      qa_save_reader_fail(&reader, "Invalid published Q3 event actor");
+    published_set(runtime, actor, read[i].event, read[i].time);
+  }
+  qa_cleanup_pop(&read_scope); free(read);
   qa_save_reader_destroy(&events);
   qa_save_reader report = c_field(&reader, "report");
   qa_app_q3_spawn_report_destroy(&runtime->map_report);
@@ -3154,6 +3187,7 @@ void qa_app_q3_source_runtime_finish_native_restore(qa_app_q3_source_runtime *ru
       const char *routes[2] = {"item", "handler"};
       outcome->route = qa_save_reader_choice_string(&route, routes, 2);
       qa_save_reader_destroy(&route);
+      (void)qa_q3_entity_pool_at(&o->pool, slot); /* TS entity: this.pool.at(slot) refuses a slot past the pool */
       qa_save_reader classname = c_field(&entry, "classname");
       outcome->classname = dup_str(qa_save_reader_string(&classname));
       qa_save_reader_destroy(&classname);
@@ -3188,7 +3222,7 @@ size_t qa_app_q3_source_runtime_presentations(qa_app_q3_source_runtime *runtime,
   return qa_app_q3_source_models(runtime, out, capacity);
 }
 const qa_app_q3_spawn_report *qa_app_q3_source_runtime_spawn_report(qa_app_q3_source_runtime *runtime) {
-  if (!runtime->has_report) qa_range_error("Q3 map not loaded");
+  if (!runtime->has_report) qa_raise("Error", 0, 0, "%s", "Q3 map not loaded");
   return &runtime->map_report;
 }
 const char *qa_app_q3_source_runtime_setting_string(qa_app_q3_source_runtime *runtime, const char *name) {
@@ -3222,7 +3256,7 @@ static bool rt_cvar_modified(qa_cvar_registry *cvars, const char *name) {
 }
 /* restartCompatibility (513-518). */
 const char *qa_app_q3_source_runtime_restart_compatibility(qa_app_q3_source_runtime *runtime) {
-  if (!runtime->loaded || runtime->retired) qa_range_error("Q3 round is not active");
+  if (!runtime->loaded || runtime->retired) qa_raise("Error", 0, 0, "%s", "Q3 round is not active");
   qa_cvar_registry *cvars = runtime->host.cvars;
   if (rt_cvar_modified(cvars, "sv_maxclients") || qa_cvar_registry_variable_value(cvars, "sv_maxclients") != runtime->options.max_clients)
     return "client-capacity-changed";
@@ -3245,9 +3279,10 @@ void qa_app_q3_source_runtime_close(qa_app_q3_source_runtime *runtime) {
 /* load (526-556). */
 const qa_app_q3_spawn_report *qa_app_q3_source_runtime_load(qa_app_q3_source_runtime *runtime) {
   if (runtime->retired || runtime->loaded || runtime->mode.restore)
-    qa_range_error("Q3 source map cannot spawn in its current construction mode");
+    qa_raise("Error", 0, 0, "%s", "Q3 source map cannot spawn in its current construction mode");
   owner_t *o = runtime->owner;
   o->level.base.time = runtime->host.now(runtime->host.ctx); o->level.base.start_time = o->level.base.time;
+  o->pool.options.map_start_time = o->level.base.start_time; /* the pool's live mapStartTime getter */
   o->level.base.warmup_modification_count = qa_q3_base_game_settings_snapshot(o->settings, "g_warmup")->modification_count;
   qa_q3_game_memory_initialize(&o->memory);
   qa_q3_entity_pool_initialize_clients(&o->pool, runtime->options.max_clients);
@@ -3302,6 +3337,9 @@ void qa_app_q3_source_runtime_begin_frame(qa_app_q3_source_runtime *runtime, qa_
   o->level.previous_time = o->level.base.time;
   o->level.base.time = frame.time.kind == QA_SOURCE_TIME_MILLISECONDS ? frame.time.value : trunc(frame.time.value * 1000);
   qa_q3_base_game_settings_update(o->settings);
+  /* TS hosts read level.time and the settings through live getters; the C hosts hold snapshots, so the new
+   * frame's values must land before player commands and touches run in it. */
+  qa_app_q3_source_subsystems_owner_refresh(o);
 }
 /* runActor (572-583); runMover (585-601) is the table's run_mover. */
 void qa_app_q3_source_runtime_run_actor(qa_app_q3_source_runtime *runtime, qa_owned_actor actor) {
@@ -3370,7 +3408,7 @@ void qa_app_q3_source_runtime_end_frame(qa_app_q3_source_runtime *runtime) {
 }
 qa_app_q3_runtime_entity_view qa_app_q3_source_runtime_prepare_client(qa_app_q3_source_runtime *runtime,
     qa_owned_actor actor, double client) {
-  if (!runtime->loaded) qa_range_error("Q3 source map must be loaded before admitting players");
+  if (!runtime->loaded) qa_raise("Error", 0, 0, "%s", "Q3 source map must be loaded before admitting players");
   return owner_view(runtime->owner, qa_q3_base_entity_records_attach(runtime->owner->records, client, actor, true));
 }
 qa_app_q3_runtime_entity_view qa_app_q3_source_runtime_admit_player(qa_app_q3_source_runtime *runtime,
@@ -3437,14 +3475,15 @@ void qa_app_q3_source_runtime_disconnect_player(qa_app_q3_source_runtime *runtim
 }
 void qa_app_q3_source_runtime_player_think(qa_app_q3_source_runtime *runtime, qa_actor_command input) {
   qa_q3_game_entity *entity = qa_q3_base_entity_records_by_actor(runtime->owner->records, true, input.actor);
-  if (!entity || !entity->client) qa_range_error("Q3 client command has no admitted actor");
+  if (!entity || !entity->client) qa_raise("Error", 0, 0, "%s", "Q3 client command has no admitted actor");
   qa_q3_base_user_command command = runtime->host.source_command(runtime->host.source_command_ctx, input);
+  qa_app_q3_source_subsystems_owner_refresh(runtime->owner); /* the hosts' snapshots of TS live getters */
   qa_q3_ta_client_think_runtime_client_think(&runtime->owner->think, entity->slot, command);
 }
 void qa_app_q3_source_runtime_player_command(qa_app_q3_source_runtime *runtime, qa_actor_id actor,
     const char *name, const char *const *args, size_t argc) {
   qa_q3_game_entity *entity = qa_q3_base_entity_records_by_actor(runtime->owner->records, true, actor);
-  if (!entity || !entity->client) qa_range_error("Q3 client command has no admitted actor");
+  if (!entity || !entity->client) qa_raise("Error", 0, 0, "%s", "Q3 client command has no admitted actor");
   qa_q3_base_game_settings_update(runtime->owner->settings);
   const char **argv = malloc((argc + 1) * sizeof *argv);
   if (!argv) qa_range_error("Out of memory");
@@ -3455,7 +3494,7 @@ void qa_app_q3_source_runtime_player_command(qa_app_q3_source_runtime *runtime, 
 }
 void qa_app_q3_source_runtime_player_weapon(qa_app_q3_source_runtime *runtime, qa_actor_id actor) {
   qa_q3_game_entity *entity = qa_q3_base_entity_records_by_actor(runtime->owner->records, true, actor);
-  if (!entity || !entity->client) qa_range_error("Q3 weapon fire has no admitted actor");
+  if (!entity || !entity->client) qa_raise("Error", 0, 0, "%s", "Q3 weapon fire has no admitted actor");
   entity->s.weapon = entity->client->ps.weapon;
   qa_app_q3_source_subsystems_owner_refresh(runtime->owner);
   qa_q3_weapon_fire(&runtime->owner->weapons, entity);

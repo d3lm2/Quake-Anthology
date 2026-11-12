@@ -12,7 +12,7 @@ qa_compat_q2_native_damage_arguments_result qa_compat_q2_native_damage_arguments
   double damage_flags;
   if (cause.kind == QA_ATTACK_CAUSE_Q2) damage_flags = cause.damage_flags;
   else damage_flags = (double)((request.delivery && strcmp(request.delivery, "radius") == 0 ? 1 : 0) | (fl.flags.no_armor ? 2 : 0) | (fl.flags.energy ? 4 : 0) | (fl.no_knockback ? 8 : 0) | (fl.no_protection ? 32 : 0));
-  qa_q2_native_cause native; bool have = false;
+  qa_q2_native_cause native; bool have = false; memset(&native, 0, sizeof native); /* TS null: no edition */
   if (cause.kind == QA_ATTACK_CAUSE_Q2 && cause.has_native) {
     const char *ed = profile.rerelease ? "rerelease" : "classic";
     bool same = cause.native.edition && strcmp(cause.native.edition, ed) == 0 && (profile.rerelease || (cause.native.game && profile.game && strcmp(cause.native.game, profile.game) == 0));

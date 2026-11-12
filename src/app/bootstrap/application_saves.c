@@ -4,6 +4,8 @@
  * docs/application_layout.md. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
 #include "application_internal.h"
+#include "qa/app/bootstrap/simulation/native_q2_rerelease_pak.h"
+#include "qa/foundation/caught_message.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,10 +44,8 @@ static void mkdir_recursive(const char *directory) {
         int error = errno;
         const char *code, *description;
         node_errno_text(error, &code, &description);
-        qa_caught_error message;
-        (void)snprintf(message.message, sizeof message.message, "%s: %s, mkdir '%s'", code, description, directory);
         free(copy);
-        qa_raise("Error", 0, 0, "%s", message.message);
+        qa_raise("Error", 0, 0, "%s: %s, mkdir '%s'", code, description, directory);
       }
     } else if (!S_ISDIR(info.st_mode)) {
       free(copy);
@@ -58,25 +58,57 @@ static void mkdir_recursive(const char *directory) {
 }
 
 typedef struct autosave_attempt { qa_application *app; const char *directory; } autosave_attempt;
+static void native_layout_cleanup(void *layout) { qa_native_save_layout_destroy(layout); }
 static void autosave_run(void *ctx) {
   autosave_attempt *attempt = ctx;
-  mkdir_recursive(attempt->directory);
-  size_t n = strlen(attempt->directory) + sizeof "/autosave.sav";
-  char *joined = checked(malloc(n));
-  (void)snprintf(joined, n, "%s/autosave.sav", attempt->directory);
-  char *path = qa_application_path_normalize(joined);
-  free(joined);
+  qa_application *app = attempt->app;
+  /* The original game module's autosave is the original's `save0` slot, written the way id's engine writes it on
+   * entering a level. */
+  qa_native_save_layout native;
+  bool has_native = qa_application_native_saves(app, &native);
+  bool original = has_native && qa_application_native_q2_original(app, &native);
+  char *path;
+  if (original) {
+    qa_cleanup native_guard;
+    qa_cleanup_push(&native_guard, native_layout_cleanup, &native);
+    path = qa_native_save_layout_locate(&native, qa_app_sim_rerelease_autosave_name(false));
+    qa_cleanup_pop(&native_guard);
+    qa_native_save_layout_destroy(&native);
+  } else {
+    if (has_native) qa_native_save_layout_destroy(&native);
+    mkdir_recursive(attempt->directory);
+    size_t n = strlen(attempt->directory) + sizeof "/autosave.sav";
+    char *joined = checked(malloc(n));
+    (void)snprintf(joined, n, "%s/autosave.sav", attempt->directory);
+    path = qa_application_path_normalize(joined);
+    free(joined);
+  }
   qa_cleanup cleanup;
   qa_cleanup_push(&cleanup, free, path);
-  qa_application_save_game(attempt->app, path, NULL);
-  qa_application_printf(attempt->app, "Autosaved %s.\n", path);
+  char *written = qa_application_save_game_at(app, path, "shared", true);
   qa_cleanup_pop(&cleanup);
   free(path);
+  qa_cleanup written_cleanup;
+  qa_cleanup_push(&written_cleanup, free, written);
+  qa_application_printf(app, "Autosaved %s.\n", written);
+  qa_cleanup_pop(&written_cleanup);
+  free(written);
+}
+/* TS autosaveAvailable(): the engine's own sources autosave, and so does a stock Quake II game on its original
+ * module, which writes the original's `save0`. */
+static bool autosave_available(qa_application *app) {
+  if (qa_application_level_recovery_available(app, app->world_simulation, &app->launch_options)) return true;
+  qa_native_save_layout native;
+  if (!qa_application_native_saves(app, &native)) return false;
+  bool available = qa_application_native_q2_original(app, &native) && !app->launch_options.dedicated &&
+      strcmp(app->launch_options.network_kind, "offline") == 0 &&
+      strcmp(qa_application_simulation_mode(app->world_simulation), "singleplayer") == 0;
+  qa_native_save_layout_destroy(&native);
+  return available;
 }
 /* TS autosaveLevel(). */
 void qa_application_autosave_level(qa_application *app) {
-  if (!qa_application_level_recovery_available(app, app->world_simulation, &app->launch_options)
-      || qa_application_save_unavailable(app, QA_SAVE_PURPOSE_AUTOSAVE) != NULL) return;
+  if (!autosave_available(app) || qa_application_save_unavailable(app, QA_SAVE_PURPOSE_AUTOSAVE) != NULL) return;
   qa_cvar_registry *cvars = qa_application_source_cvars(app, NULL);
   if (cvars != NULL && qa_cvar_registry_variable_value(cvars, "sv_autosave") == 0) return;
   const qa_catalog_discovered_product *product = qa_content_catalog_product(qa_app_loaded_content_catalog(app->loaded_content),
@@ -89,6 +121,6 @@ void qa_application_autosave_level(qa_application *app) {
   free(joined);
   autosave_attempt attempt = { app, directory };
   qa_caught_error caught;
-  if (!qa_try(autosave_run, &attempt, &caught)) qa_application_printf(app, "Autosave failed: %s\n", caught.message);
+  if (!qa_try(autosave_run, &attempt, &caught)) qa_application_printf(app, "Autosave failed: %s\n", qa_caught_message(&caught));
   free(directory);
 }

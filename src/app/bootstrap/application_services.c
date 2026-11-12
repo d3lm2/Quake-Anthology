@@ -180,6 +180,8 @@ static void team_arena_demos_set(qa_application *app, qa_app_shared_simulation *
   app->team_arena_demo_simulations[app->team_arena_demo_count] = simulation;
   app->team_arena_demos[app->team_arena_demo_count++] = demo;
 }
+static void user_file_store_release(void *ctx) { qa_user_file_store_destroy(ctx); }
+static void demo_library_release(void *ctx) { qa_app_demo_library_destroy(ctx); }
 /* The pendingTeamArenaPostgame block of sourceActions. */
 static void team_arena_postgame(qa_application *app) {
   qa_app_team_arena_postgame stats = app->pending_team_arena_postgame;
@@ -191,7 +193,12 @@ static void team_arena_postgame(qa_application *app) {
   qa_user_file_store files;
   if (!qa_user_file_store_init(&files, config.root)) qa_range_error("Out of memory");
   qa_config_store_destroy(&config);
+  /* A raise below (the score file, the demo library) frees the store and the map name (TS GC). */
+  qa_cleanup files_guard;
+  qa_cleanup_push(&files_guard, user_file_store_release, &files);
   char *map = map_short_name(app->launch_options.map);
+  qa_cleanup map_guard;
+  qa_cleanup_push(&map_guard, free, map);
   qa_q3_game_level *level = qa_app_q3_source_subsystems_owner_level(qa_app_q3_source_runtime_owner(source));
   qa_app_team_arena_score_input input = { stats, level->base.start_time,
     qa_cvar_registry_variable_value(cvars, "g_spSkill"), qa_cvar_registry_variable_value(cvars, "ui_teamArenaTimeToBeat") };
@@ -229,13 +236,26 @@ static void team_arena_postgame(qa_application *app) {
   }
   if (result.new_high_score) qa_application_printf(app, "New Team Arena high score: %s\n", number);
   qa_app_demo_library_mounts mounts = { app->loaded_content, demo_list_files, demo_read };
-  qa_app_demo_library *library = checked(qa_app_demo_library_create(files.root, mounts));
+  /* nativeFolders(stockNativeConfig(catalog, engineBehavior, recipeComponents(recipe), options.nativeConfigRoot)) */
+  qa_app_stock_native *demo_native = qa_app_stock_game_folders(qa_app_loaded_content_catalog(app->loaded_content),
+      qa_app_loaded_content_recipe(app->loaded_content), app->launch_options.native_config_root);
+  size_t native_root_count = 0;
+  char **native_roots = qa_app_native_folders(demo_native != NULL ? &demo_native->layout : NULL, &native_root_count);
+  qa_app_stock_native_destroy(demo_native);
+  qa_app_demo_library *library = checked(qa_app_demo_library_create_native(files.root, mounts,
+      (const char *const *)native_roots, native_root_count));
+  qa_app_native_folders_free(native_roots, native_root_count);
+  qa_cleanup library_guard;
+  qa_cleanup_push(&library_guard, demo_library_release, library);
   qa_cvar_snapshot protocol;
   double protocol_value = 68;
   if (qa_cvar_registry_get(cvars, "protocol", &protocol)) { protocol_value = protocol.integer_value; qa_cvar_read_free(&protocol); }
   qa_app_team_arena_demo found;
   bool exists = qa_app_team_arena_demo_lookup(map, game_type, protocol_value, demo_exists, library, &found);
+  qa_cleanup_pop(&library_guard);
   qa_app_demo_library_destroy(library);
+  qa_cleanup_pop(&map_guard);
+  qa_cleanup_pop(&files_guard);
   qa_user_file_store_destroy(&files);
   free(map);
   if (!exists) team_arena_demos_set(app, app->world_simulation, NULL);
@@ -251,6 +271,9 @@ static void mod_client_drops(qa_application *app) {
   qa_app_shared_simulation *dropping = app->world_simulation;
   size_t count = 0;
   qa_ss_mod_client_drop *drops = qa_app_shared_sim_take_mod_client_drops(dropping, &count);
+  /* The drained records are a malloc'd copy; a raise in one drop frees it too. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, drops);
   for (size_t i = 0; i < count; i++) {
     qa_ss_mod_client_drop request = drops[i];
     qa_client_id current;
@@ -277,6 +300,8 @@ static void mod_client_drops(qa_application *app) {
     qa_application_printf(app, "%s: client %lld: %s\n", request.content, (long long)request.client.slot, request.reason);
     if (local) qa_application_request_quit(app);
   }
+  qa_cleanup_pop(&guard);
+  free(drops);
 }
 
 /* The q3-source drop-client branch; true is the TS `continue` after a bot drop. */
@@ -425,9 +450,15 @@ static bool operator_send(void *ctx, const qa_net_address *to, const uint8_t *by
 }
 static void operator_write_config(void *ctx, const char *name, const char *text) {
   qa_application *app = ctx;
-  qa_config_store config = qa_application_source_config(&app->launch_options, app->loaded_content);
-  bool written = qa_config_store_dump(&config, name, text);
-  qa_config_store_destroy(&config);
+  /* writeAtomic(settingsPath(Application.gameFilesRoot(this.options, this.content), name), text) */
+  char *root = qa_application_game_files_root(&app->launch_options, app->loaded_content);
+  qa_cleanup root_guard;
+  qa_cleanup_push(&root_guard, free, root);
+  char *path = qa_settings_path(root, name);
+  qa_cleanup_pop(&root_guard);
+  free(root);
+  bool written = path != NULL && qa_write_atomic_text(path, text);
+  free(path);
   if (!written) qa_raise("Error", 0, 0, "Cannot write %s", name);
 }
 static void operator_heartbeat(void *ctx) {
@@ -528,14 +559,33 @@ typedef struct host_binding {
   qa_q2_connectionless_host q2_operator;
   qa_app_limited_rcon limited;
   const char **limited_prefixes;
-  const qa_net_address *masters; size_t master_count;
-  const void **master_pointers;
+  const void **master_pointers; size_t master_count; /* the last masters() rows */
+  /* The Q2 guest world view the native server hosts keep a pointer to (TS captures the object). */
+  qa_app_sim_q2_guest_world guest_world;
   qa_net_address *qw_masters; size_t qw_master_count;
   qa_application_native_server_host host;
   void (*q2_destroy)(qa_app_q2_server_host host);
   /* the Q3 host the disconnect override forwards to */
   qa_app_sim_q3_server_authority original_q3;
 } host_binding;
+/* TS `masters: () => administration.masters().filter(ipv4 | ipv6)` (QW) and `masters: administration.masters` (Q2):
+ * read on every call, so a later setmaster or `public` change is seen. The rows point into the administration's
+ * last masters() result and stay valid until the next call. */
+static const void *const *binding_masters(host_binding *binding, bool ip_only, size_t *out_count) {
+  size_t count = 0;
+  const qa_net_address *masters = binding->administration.masters(binding->administration.ctx, &count);
+  const void **rows = checked(calloc(count + 1, sizeof *rows));
+  size_t kept = 0;
+  for (size_t i = 0; i < count; i++)
+    if (!ip_only || masters[i].kind == QA_NET_IPV4 || masters[i].kind == QA_NET_IPV6) rows[kept++] = &masters[i];
+  free(binding->master_pointers);
+  binding->master_pointers = rows;
+  binding->master_count = kept;
+  *out_count = kept;
+  return rows;
+}
+static const void *const *qw_binding_masters(void *ctx, size_t *out_count) { return binding_masters(ctx, true, out_count); }
+static const void *const *q2_binding_masters(void *ctx, size_t *out_count) { return binding_masters(ctx, false, out_count); }
 static void host_binding_free(void *record) {
   host_binding *binding = record;
   switch (binding->host.kind) {
@@ -747,12 +797,6 @@ qa_application_native_server_host qa_application_network_host(qa_application *ap
   switch (source->family) {
     case QA_GAME_FAMILY_Q1:
       if (source->edition != NULL && strcmp(source->edition, "quakeworld") == 0) {
-        /* masters: administration.masters().filter(ipv4 | ipv6). */
-        size_t count = 0;
-        const qa_net_address *masters = binding->administration.masters(binding->administration.ctx, &count);
-        binding->master_pointers = checked(calloc(count + 1, sizeof *binding->master_pointers));
-        for (size_t i = 0; i < count; i++)
-          if (masters[i].kind == QA_NET_IPV4 || masters[i].kind == QA_NET_IPV6) binding->master_pointers[binding->master_count++] = &masters[i];
         binding->qw_administration.ctx = binding;
         binding->qw_administration.rcon_password = qw_rcon_password;
         binding->qw_administration.blocked = qw_blocked;
@@ -765,7 +809,7 @@ qa_application_native_server_host qa_application_network_host(qa_application *ap
         qw.quakec = qa_app_shared_sim_quakec_source(simulation);
         qw.server_count = server_count;
         qw.administration = &binding->qw_administration;
-        qw.masters = binding->master_pointers; qw.master_count = binding->master_count;
+        qw.masters_ctx = binding; qw.masters = qw_binding_masters;
         qw.print_ctx = binding; qw.print = binding_print;
         binding->host.kind = QA_APPLICATION_NETWORK_QW;
         binding->host.qw = qa_app_sim_create_qw_application_server_host(qw);
@@ -794,10 +838,6 @@ qa_application_native_server_host qa_application_network_host(qa_application *ap
       binding->q2_operator.rcon_rate_allowed = q2_rcon_rate_allowed;
       binding->q2_operator.recharge_rcon_rate = q2_recharge_rcon_rate;
       binding->q2_operator.execute_rcon = q2_execute_rcon;
-      size_t count = 0;
-      const qa_net_address *masters = binding->administration.masters(binding->administration.ctx, &count);
-      binding->master_pointers = checked(calloc(count + 1, sizeof *binding->master_pointers));
-      for (size_t i = 0; i < count; i++) binding->master_pointers[binding->master_count++] = &masters[i];
       qa_app_sim_q2_server_binding_options q2;
       memset(&q2, 0, sizeof q2);
       q2.session = app->session;
@@ -805,7 +845,7 @@ qa_application_native_server_host qa_application_network_host(qa_application *ap
       q2.simulation = &binding->network_simulation; q2.content = &binding->network_content;
       q2.protocol = qa_app_live_q2_protocol(options, rerelease);
       q2.administration = &binding->q2_operator;
-      q2.masters = binding->master_pointers; q2.master_count = binding->master_count;
+      q2.masters_ctx = binding; q2.masters = q2_binding_masters;
       q2.player_identity_ctx = binding; q2.player_identity = q2_player_identity;
       q2.print_ctx = binding; q2.print = binding_print;
       binding->host.kind = QA_APPLICATION_NETWORK_Q2;
@@ -813,12 +853,12 @@ qa_application_native_server_host qa_application_network_host(qa_application *ap
         binding->host.q2 = qa_app_sim_create_q2_application_server_host(q2);
         binding->q2_destroy = qa_app_sim_q2_application_server_host_destroy;
       } else {
-        qa_app_sim_q2_guest_world world = qa_app_shared_sim_q2_guest_world(simulation);
+        binding->guest_world = qa_app_shared_sim_q2_guest_world(simulation);
         if (classic != NULL) {
-          binding->host.q2 = qa_app_sim_create_classic_q2_application_server_host(q2, &world);
+          binding->host.q2 = qa_app_sim_create_classic_q2_application_server_host(q2, &binding->guest_world);
           binding->q2_destroy = qa_app_sim_classic_q2_application_server_host_destroy;
         } else {
-          binding->host.q2 = qa_app_sim_create_rerelease_native_q2_application_server_host(q2, &world);
+          binding->host.q2 = qa_app_sim_create_rerelease_native_q2_application_server_host(q2, &binding->guest_world);
           binding->q2_destroy = qa_app_sim_rerelease_native_q2_application_server_host_destroy;
         }
       }
@@ -1172,8 +1212,10 @@ void qa_application_recording_feed_detach(qa_application_recording_feed *feed, v
 static qa_application_recording_feed *new_feed(qa_application *app, feed_kind kind) {
   qa_application_recording_feed *feed = checked(calloc(1, sizeof *feed));
   feed->app = app; feed->kind = kind;
+  /* root: stockGameDirectory(this.content, this.options, product.userContent?.root ?? userProductDirectory(...)) */
   qa_config_store config = qa_application_client_config(&app->launch_options, app->loaded_content);
-  feed->root = config.root;
+  feed->root = qa_application_stock_game_directory(app->loaded_content, &app->launch_options, config.root);
+  qa_config_store_destroy(&config);
   remember(app, feed_record_free, feed);
   return feed;
 }
@@ -1390,7 +1432,10 @@ bool qa_application_read_client_resource(qa_application *app, const char *path, 
   if (app->closed) qa_raise("Error", 0, 0, "Client source has retired");
   qa_content_opened_resource opened;
   bool found = qa_content_mounted_open((qa_content_mounted *)qa_app_loaded_content_mounts(content), path, NULL, NULL, &opened);
-  if (app->closed || app->loaded_content != content) qa_raise("Error", 0, 0, "Client source changed during resource read");
+  if (app->closed || app->loaded_content != content) {
+    if (found) free(opened.bytes);
+    qa_raise("Error", 0, 0, "Client source changed during resource read");
+  }
   *out_bytes = NULL; *out_length = 0;
   if (!found) return false;
   *out_bytes = opened.bytes; /* the caller owns the opened bytes */

@@ -11,7 +11,7 @@
 
 /* TS `throw new Error(msg)`, as in src/text/atlas.c. */
 static noreturn void qa_error(const char *format, ...) {
-  char text[1536];
+  char text[sizeof ((qa_platform_ipx_error *)0)->message];
   va_list args;
   va_start(args, format);
   vsnprintf(text, sizeof text, format, args);
@@ -68,6 +68,18 @@ qa_platform_native_ipx_capability qa_bun_native_ipx_capability(void) {
   return capability;
 }
 
+typedef struct bind_job {
+  const qa_platform_ipx_bind_options *options;
+  qa_native_ipx_socket *socket;
+  qa_platform_ipx_error *error;
+  bool ok;
+} bind_job;
+
+static void bind_run(void *ctx) {
+  bind_job *job = (bind_job *)ctx;
+  job->ok = qa_bind_native_ipx_socket(job->options, job->socket, job->error);
+}
+
 bool qa_native_ipx_capability_bind(
     const qa_platform_native_ipx_capability *capability,
     const qa_platform_ipx_bind_options *options, qa_native_ipx_transport *out,
@@ -83,15 +95,28 @@ bool qa_native_ipx_capability_bind(
   }
   qa_platform_ipx_error inner;
   memset(&inner, 0, sizeof inner);
-  if (!qa_bind_native_ipx_socket(options, &out->socket, &inner)) {
+  bind_job job = {options, &out->socket, &inner, false};
+  qa_caught_error caught;
+  if (!qa_try(bind_run, &job, &caught)) {
+    /* checkedOptions/portNumber RangeErrors reach the same TS catch. */
+    job.ok = false;
+    inner.unsupported = false;
+    snprintf(inner.message, sizeof inner.message, "%s", caught.message);
+  }
+  if (!job.ok) {
     if (error != NULL) {
       if (inner.unsupported) {
         *error = inner;
       } else {
         error->unsupported = false;
-        snprintf(error->message, sizeof error->message,
-                 "Native IPX %s/%s bind failed: %.240s", host_platform(),
-                 host_arch(), inner.message);
+        /* `Native IPX ${platform}/${arch} bind failed: ${message}`: the inner text (a caught
+         * message, below QA_CAUGHT_MESSAGE_CAPACITY) fits whole after the prefix. */
+        int used = snprintf(error->message, sizeof error->message,
+                            "Native IPX %s/%s bind failed: ", host_platform(), host_arch());
+        size_t at = used < 0 ? 0 : (size_t)used, length = strlen(inner.message);
+        if (length > sizeof error->message - 1 - at) length = sizeof error->message - 1 - at;
+        memcpy(error->message + at, inner.message, length);
+        error->message[at + length] = '\0';
       }
     }
     return false;
@@ -203,13 +228,14 @@ size_t qa_native_ipx_transport_subscribe_readable(
     transport->listener_capacity = capacity;
   }
   size_t id = ++transport->next_listener_id;
+  bool queued = transport->has_fault && !transport->fault_reported;
   transport->listeners[transport->listener_count].fn = fn;
   transport->listeners[transport->listener_count].ctx = ctx;
   transport->listeners[transport->listener_count].id = id;
+  transport->listeners[transport->listener_count].queued = queued;
   transport->listener_count++;
   if (!transport->pumping && !transport->has_fault) transport->pumping = true;
-  if (transport->has_fault && !transport->fault_reported)
-    transport->pending_notify = true;
+  if (queued) transport->pending_notify = true;
   return id;
 }
 
@@ -229,8 +255,25 @@ void qa_native_ipx_transport_unsubscribe(qa_native_ipx_transport *transport,
 void qa_native_ipx_transport_pump(qa_native_ipx_transport *transport) {
   if (transport->ended) return;
   if (transport->pending_notify) {
+    /* Each queued microtask calls only its own listener, if still subscribed. */
     transport->pending_notify = false;
-    notify(transport);
+    size_t count = transport->listener_count;
+    size_t *ids = count == 0 ? NULL : (size_t *)malloc(count * sizeof *ids);
+    if (count != 0 && ids == NULL) qa_range_error("out of memory");
+    size_t queued = 0;
+    for (size_t i = 0; i < count; i++) {
+      if (!transport->listeners[i].queued) continue;
+      transport->listeners[i].queued = false;
+      ids[queued++] = transport->listeners[i].id;
+    }
+    for (size_t q = 0; q < queued && !transport->ended; q++) {
+      for (size_t j = 0; j < transport->listener_count; j++) {
+        if (transport->listeners[j].id != ids[q]) continue;
+        transport->listeners[j].fn(transport->listeners[j].ctx);
+        break;
+      }
+    }
+    free(ids);
     return;
   }
   if (!transport->pumping) return;

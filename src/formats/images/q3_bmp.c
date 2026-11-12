@@ -7,7 +7,22 @@
 #include <string.h>
 
 #include "qa/core/binary/index.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
+
+/* String(value) for a non-negative integer-valued double below 1e21: the
+ * shortest round-trip digits padded with zeros ("18446744056529683000"), not
+ * the exact binary value %.0f prints past 2^53. */
+static const char *js_integer_text(double value, char buffer[32]) {
+  if (value == 0) return "0";
+  char digits[18];
+  int exponent = qa_js_shortest_digits(value, digits);
+  size_t count = strlen(digits), at = 0;
+  for (size_t i = 0; i < count; i++) buffer[at++] = digits[i];
+  for (int i = (int)count - 1; i < exponent; i++) buffer[at++] = '0';
+  buffer[at] = '\0';
+  return buffer;
+}
 
 noreturn void qa_bmp_drop_error(const char *source, const char *format, ...) {
   (void)source; /* the TS keeps it as a field; the message embeds it */
@@ -85,9 +100,10 @@ int qa_decode_q3_bmp(const uint8_t *bytes, size_t length, const char *source,
   int64_t height = signed_height < 0 ? -signed_height : signed_height;
   double output_length = (double)width * (double)height * 4.0;
   if (output_length > 2147483647.0) {
+    char text[32];
     qa_binary_error(name, 18,
-                    "decoded BMP size %.0f overflows signed 32-bit source allocation arithmetic",
-                    output_length);
+                    "decoded BMP size %s overflows signed 32-bit source allocation arithmetic",
+                    js_integer_text(output_length, text));
   }
   if (output_length == 0) {
     free(palette);

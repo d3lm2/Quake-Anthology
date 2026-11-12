@@ -114,6 +114,42 @@ static const char *retain_id(qa_native_ui_controller *c, const char *id) {
 
 static const qa_vec4 WHITE = { 1, 1, 1, 1 };
 
+/* A key code compared with `===` against integer KeyCodes: a fractional, NaN or
+ * out-of-range code matches none of them (a C (int) cast would truncate 13.5 to
+ * Enter, and is undefined past INT_MAX). */
+static int key_int(double code) {
+  return code >= -1e9 && code <= 1e9 && code == floor(code) ? (int)code : -2147483647 - 1;
+}
+
+/* Map.delete on the held table: keeps the remaining entries in insertion order. */
+static void held_remove(qa_native_ui_controller *c, const char *id) {
+  for (size_t i = 0; i < c->held_count; i++)
+    if (strcmp(c->held[i].id, id) == 0) {
+      free(c->held[i].id);
+      memmove(&c->held[i], &c->held[i + 1], (c->held_count - i - 1) * sizeof *c->held);
+      c->held_count--;
+      return;
+    }
+}
+
+/* Map.set on the held table: an existing id keeps its place, a new one is appended. */
+static void held_set(qa_native_ui_controller *c, const char *id, double code, double next) {
+  held_axis *held = NULL;
+  for (size_t i = 0; i < c->held_count; i++)
+    if (strcmp(c->held[i].id, id) == 0) held = &c->held[i];
+  if (held == NULL) {
+    held_axis *grown = grow(c->held, &c->held_capacity, c->held_count + 1, sizeof *grown);
+    if (grown == NULL) qa_range_error("Out of memory");
+    c->held = grown;
+    char *copy = xstrdup(id);
+    if (copy == NULL) qa_range_error("Out of memory");
+    held = &c->held[c->held_count++];
+    held->id = copy;
+  }
+  held->code = code;
+  held->next = next;
+}
+
 static bool control_enabled(const qa_ui_control *control) {
   return control->enabled && control->visible;
 }
@@ -205,7 +241,7 @@ int qa_native_ui_controller_register(qa_native_ui_controller *c,
                                      qa_ui_menu_factory_fn factory,
                                      void *factory_ctx) {
   if (find_menu(c, id) != NULL)
-    qa_range_error("Menu already registered: %s", id);
+    qa_raise("Error", 0, 0, "Menu already registered: %s", id);
   menu_entry *menus = grow(c->menus, &c->menu_capacity, c->menu_count + 1,
                            sizeof *menus);
   if (menus == NULL) return -1;
@@ -305,7 +341,7 @@ void qa_native_ui_controller_presentation(
 void qa_native_ui_controller_open_menu(qa_native_ui_controller *c,
                                        qa_ui_menu_id id) {
   menu_entry *entry = find_menu(c, id);
-  if (entry == NULL) qa_range_error("Unknown menu: %s", id);
+  if (entry == NULL) qa_raise("Error", 0, 0, "Unknown menu: %s", id);
   for (size_t i = 0; i < c->stack_count; i++) {
     if (strcmp(c->stack[i].id, id) == 0) {
       while (c->stack_count > i + 1) qa_native_ui_controller_close_menu(c);
@@ -374,10 +410,10 @@ static bool active(qa_native_ui_controller *c, qa_ui_menu *out_menu,
   menu_cursor *cursor = &c->stack[c->stack_count - 1];
   menu_entry *entry = find_menu(c, cursor->id);
   if (entry == NULL)
-    qa_range_error("Active menu is not registered: %s", cursor->id);
+    qa_raise("Error", 0, 0, "Active menu is not registered: %s", cursor->id);
   qa_ui_menu menu = entry->factory(entry->ctx);
   if (strcmp(menu.id, cursor->id) != 0)
-    qa_range_error("Menu factory returned a different identity");
+    qa_raise("Error", 0, 0, "Menu factory returned a different identity");
   bool focus_ok = false;
   for (size_t i = 0; i < menu.control_count; i++)
     if (cursor->focus != NULL
@@ -436,7 +472,7 @@ static void move_focus(qa_native_ui_controller *c, int direction) {
   int index = -1;
   for (size_t i = 0; i < menu.control_count; i++) {
     if (!control_enabled(&menu.controls[i])) continue;
-    if (cursor->focus != NULL
+    if (index < 0 && cursor->focus != NULL
         && strcmp(menu.controls[i].id, cursor->focus) == 0)
       index = (int)count;
     count++;
@@ -498,15 +534,18 @@ static void change_control(qa_native_ui_controller *c,
     control->change_value(control->ctx, c->seat,
       quantize(control, control->value + control->step * direction));
   } else if (kind_is(control, "choice")) {
-    if (control->choice_count == 0) return;
-    int at = -1;
-    for (size_t i = 0; i < control->choice_count; i++)
-      if (control->selected != NULL
-          && strcmp(control->choices[i].id, control->selected) == 0)
-        at = (int)i;
-    size_t next = (size_t)((at + direction + (int)control->choice_count)
-                           % (int)control->choice_count);
-    control->select_choice(control->ctx, c->seat, control->choices[next].id);
+    /* TS: with no choices the index is NaN, nothing is selected, and the
+       change sound still plays. findIndex takes the first match. */
+    if (control->choice_count > 0) {
+      int at = -1;
+      for (size_t i = 0; at < 0 && i < control->choice_count; i++)
+        if (control->selected != NULL
+            && strcmp(control->choices[i].id, control->selected) == 0)
+          at = (int)i;
+      size_t next = (size_t)((at + direction + (int)control->choice_count)
+                             % (int)control->choice_count);
+      control->select_choice(control->ctx, c->seat, control->choices[next].id);
+    }
   } else return;
   c->options.sound(c->options.ctx, "change", c->seat);
 }
@@ -597,8 +636,9 @@ static void field_text(qa_native_ui_controller *c,
   size_t incoming = cp_length(clean);
   double room_d = (double)control->maximum_length - (double)length
     + (field->overstrike ? (double)(length - field->cursor) : 0);
-  size_t room = room_d <= 0 ? 0 : (size_t)room_d;
-  size_t accepted = incoming < room ? incoming : room;
+  /* incoming.slice(0, room): NaN is 0, Infinity keeps everything. */
+  size_t accepted = !(room_d > 0) ? 0
+    : room_d >= (double)incoming ? incoming : (size_t)room_d;
   char *add = cp_slice(clean, 0, accepted);
   free(clean);
   if (add == NULL) qa_range_error("Out of memory");
@@ -647,7 +687,7 @@ static bool field_key(qa_native_ui_controller *c,
                       const qa_ui_control *control, double key) {
   field_cursor *field = field_for(c, control);
   size_t length = cp_length(control->text);
-  int code = (int)key;
+  int code = key_int(key);
   if (code == QA_KEY_LEFT && field->cursor > 0) field->cursor--;
   else if (code == QA_KEY_LEFT) { /* stays 0 */ }
   else if (code == QA_KEY_RIGHT) {
@@ -721,7 +761,7 @@ static list_layout list_layout_of(qa_native_ui_controller *c,
     for (size_t i = 0; i < control->row_count; i++) {
       state->rows[i] = xstrdup(control->rows[i].id);
       if (state->rows[i] == NULL) qa_range_error("Out of memory");
-      if (control->selected != NULL
+      if (selected < 0 && control->selected != NULL
           && strcmp(control->rows[i].id, control->selected) == 0)
         selected = (int)i;
     }
@@ -748,13 +788,15 @@ static void list_pointer(qa_native_ui_controller *c,
 
 static bool list_key(qa_native_ui_controller *c, const qa_ui_control *control,
                      double key) {
-  int code = (int)key;
+  int code = key_int(key);
   if (code == QA_KEY_DELETE) {
-    for (size_t i = 0; i < control->row_count; i++) {
+    /* rows.find: only the first row with the selected id. */
+    for (size_t i = 0; control->selected != NULL && i < control->row_count; i++) {
       const qa_ui_list_row *row = &control->rows[i];
-      if (control->selected != NULL && strcmp(row->id, control->selected) == 0
-          && row->enabled && row->action != NULL)
+      if (strcmp(row->id, control->selected) != 0) continue;
+      if (row->enabled && row->action != NULL)
         row->action->activate(row->action->ctx, c->seat);
+      break;
     }
     return true;
   }
@@ -762,7 +804,7 @@ static bool list_key(qa_native_ui_controller *c, const qa_ui_control *control,
   int current = -1, enabled_count = 0;
   for (size_t i = 0; i < control->row_count; i++) {
     if (!control->rows[i].enabled) continue;
-    if (control->selected != NULL
+    if (current < 0 && control->selected != NULL
         && strcmp(control->rows[i].id, control->selected) == 0)
       current = enabled_count;
     enabled_count++;
@@ -808,7 +850,7 @@ static const qa_ui_control *focused_control(const qa_ui_menu *menu,
 }
 
 static bool key_event(qa_native_ui_controller *c, double code_d, bool down) {
-  int code = (int)code_d;
+  int code = key_int(code_d);
   if (code == QA_KEY_SHIFT) { c->shift = down; return true; }
   if (code == QA_KEY_CONTROL) { c->control = down; return true; }
   qa_ui_menu menu;
@@ -859,7 +901,7 @@ static void pointer_move(qa_native_ui_controller *c, qa_vec2 position) {
   if (c->has_menu_drag_offset) { menu_pointer(c, &menu, cursor); return; }
   const qa_ui_control *drag = NULL;
   if (c->dragging != NULL)
-    for (size_t i = 0; i < menu.control_count; i++)
+    for (size_t i = 0; drag == NULL && i < menu.control_count; i++)
       if (strcmp(menu.controls[i].id, c->dragging) == 0)
         drag = &menu.controls[i];
   if (drag != NULL && kind_is(drag, "slider")) { slider_pointer(c, drag); return; }
@@ -885,7 +927,7 @@ static bool capture_event(qa_native_ui_controller *c,
   void (*cancel)(void *ctx) = c->capture_cancel;
   void *ctx = c->capture_ctx;
   if (strcmp(event.kind, "key") == 0 && event.down
-      && (int)event.code == QA_KEY_ESCAPE) {
+      && key_int(event.code) == QA_KEY_ESCAPE) {
     c->has_capture = false;
     cancel(ctx);
     return true;
@@ -953,7 +995,7 @@ static bool capture_event(qa_native_ui_controller *c,
 bool qa_native_ui_controller_input(qa_native_ui_controller *c,
                                    qa_seat_input_event event) {
   if (!qa_same_seat(event.seat, c->seat))
-    qa_range_error("UI input delivered to another seat");
+    qa_raise("Error", 0, 0, "UI input delivered to another seat");
   if (strcmp(event.kind, "focus") == 0 && !event.focused) {
     c->dragging = NULL;
     c->has_menu_drag_offset = false;
@@ -966,8 +1008,8 @@ bool qa_native_ui_controller_input(qa_native_ui_controller *c,
   /* Modifier state must follow key-ups that arrive with no menu open, or it
      sticks across the next menu. */
   if (strcmp(event.kind, "key") == 0) {
-    if ((int)event.code == QA_KEY_SHIFT) c->shift = event.down;
-    else if ((int)event.code == QA_KEY_CONTROL) c->control = event.down;
+    if (key_int(event.code) == QA_KEY_SHIFT) c->shift = event.down;
+    else if (key_int(event.code) == QA_KEY_CONTROL) c->control = event.down;
   }
   if (capture_event(c, event)) return true;
   qa_ui_menu menu;
@@ -1085,7 +1127,7 @@ bool qa_native_ui_controller_input(qa_native_ui_controller *c,
       return true;
     }
     const qa_ui_control *hovered = NULL;
-    for (size_t i = 0; i < menu.control_count; i++)
+    for (size_t i = 0; hovered == NULL && i < menu.control_count; i++)
       if (control_enabled(&menu.controls[i])
           && kind_is(&menu.controls[i], "list")
           && qa_ui_contains(menu.controls[i].rect, c->cursor))
@@ -1116,61 +1158,27 @@ bool qa_native_ui_controller_input(qa_native_ui_controller *c,
     char id[96];
     snprintf(id, sizeof id, "%s:button:%s", QA_JS_NUMBER(event.device), QA_JS_NUMBER(button));
     const bool navigation = button >= 11 && button <= 14;
-    if (!event.down) {
-      for (size_t i = 0; i < c->held_count; i++)
-        if (strcmp(c->held[i].id, id) == 0) {
-          free(c->held[i].id);
-          c->held[i] = c->held[--c->held_count];
-          break;
-        }
-    } else if (navigation) {
-      held_axis *held = NULL;
-      for (size_t i = 0; i < c->held_count; i++)
-        if (strcmp(c->held[i].id, id) == 0) held = &c->held[i];
-      if (held == NULL) {
-        held_axis *grown = grow(c->held, &c->held_capacity, c->held_count + 1, sizeof *grown);
-        if (grown == NULL) qa_range_error("Out of memory");
-        c->held = grown;
-        held = &c->held[c->held_count++];
-        held->id = xstrdup(id);
-        if (held->id == NULL) qa_range_error("Out of memory");
-      }
-      held->code = code;
-      held->next = event.time_milliseconds + 300;
-    }
+    if (!event.down) held_remove(c, id);
+    else if (navigation) held_set(c, id, code, event.time_milliseconds + 300);
     key_event(c, code, event.down);
   } else if (strcmp(event.kind, "controller-axis") == 0) {
     if (strcmp(event.axis, "left-x") == 0
         || strcmp(event.axis, "left-y") == 0) {
-      char id[64];
+      char id[96];
       snprintf(id, sizeof id, "%s:%s", QA_JS_NUMBER(event.device), event.axis);
-      if (fabs(event.value) < 0.35) {
-        for (size_t i = 0; i < c->held_count; i++)
-          if (strcmp(c->held[i].id, id) == 0) {
-            free(c->held[i].id);
-            c->held[i] = c->held[--c->held_count];
-            break;
-          }
-      } else if (fabs(event.value) >= 0.6) { /* held repeat arms below */
+      if (fabs(event.value) < 0.35) held_remove(c, id);
+      else if (!(fabs(event.value) < 0.6)) { /* a NaN value passes, as in TS */
         double code = strcmp(event.axis, "left-x") == 0
           ? (event.value < 0 ? QA_KEY_LEFT : QA_KEY_RIGHT)
           : (event.value < 0 ? QA_KEY_UP : QA_KEY_DOWN);
-        held_axis *held = NULL;
+        const held_axis *held = NULL;
         for (size_t i = 0; i < c->held_count; i++)
           if (strcmp(c->held[i].id, id) == 0) held = &c->held[i];
         if (held == NULL || held->code != code) {
           key_event(c, code, true);
-          if (held == NULL) {
-            held_axis *grown = grow(c->held, &c->held_capacity,
-                                    c->held_count + 1, sizeof *grown);
-            if (grown == NULL) qa_range_error("Out of memory");
-            c->held = grown;
-            held = &c->held[c->held_count++];
-            held->id = xstrdup(id);
-            if (held->id == NULL) qa_range_error("Out of memory");
-          }
-          held->code = code;
-          held->next = event.time_milliseconds + 300;
+          /* The key may close or open a menu, which clears the table; TS sets the
+             entry afterwards either way. */
+          held_set(c, id, code, event.time_milliseconds + 300);
         }
       }
     }
@@ -1306,7 +1314,7 @@ const qa_ui_draw_command *qa_native_ui_controller_draw(
   c->string_count = 0;
   c->command_count = 0;
   if (!qa_same_seat(context.binding.seat, c->seat))
-    qa_range_error("UI draw delivered to another seat");
+    qa_raise("Error", 0, 0, "UI draw delivered to another seat");
   qa_native_ui_appearance appearance = c->options.appearance != NULL
     ? c->options.appearance(c->options.ctx)
     : (qa_native_ui_appearance){ 1, 1, false, NULL };
@@ -1530,8 +1538,10 @@ const qa_ui_draw_command *qa_native_ui_controller_draw(
       else if (kind_is(control, "choice")) {
         for (size_t i = 0; i < control->choice_count; i++)
           if (control->selected != NULL
-              && strcmp(control->choices[i].id, control->selected) == 0)
+              && strcmp(control->choices[i].id, control->selected) == 0) {
             value = control->choices[i].label;
+            break;
+          }
       }
       /* TS textFit with a row height: the text is also limited
          vertically, so a large Text size shrinks to its row. */

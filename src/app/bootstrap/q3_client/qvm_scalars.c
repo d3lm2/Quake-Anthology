@@ -4,6 +4,7 @@
 #define _DEFAULT_SOURCE 1
 #include "qa/app/bootstrap/q3_client/qvm_scalars.h"
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysinfo.h>
@@ -16,6 +17,8 @@
 #include "qa/platform/sdl.h"
 #include "qa/foundation/js_case.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/support.h"
+#include "qa/formats/text_decoder.h"
 static bool is(const char *a, const char *b) { return a != NULL && strcmp(a, b) == 0; }
 static int32_t word_i32(const qa_qvm_host_call *call, size_t offset) {
   int32_t v;
@@ -75,12 +78,15 @@ bool qa_app_qvm_client_input_syscall(const qa_qvm_host_call *call, qa_app_qvm_cl
     }
     if (code == QA_QVM_UI_IMPORT_UI_KEY_SETBINDING) {
       char *text = qa_qvm_memory_read_string(guest, word_i32(call, 8));
+      qa_cleanup guard; /* bind can raise */
+      qa_cleanup_push(&guard, free, text);
       qa_input_binding binding;
       binding.input = physical(word_i32(call, 4));
       binding.target.is_action = false;
       binding.target.action = NULL;
       binding.target.text = text;
       input.seat.bind(input.seat.ctx, &binding);
+      qa_cleanup_pop(&guard);
       free(text);
       *out = 0;
       return true;
@@ -122,6 +128,48 @@ static void write_vector(qa_qvm_memory *guest, int32_t pointer, qa_vec3 value) {
   qa_qvm_writable_view_set_float32(&view, 4, value.y, true);
   qa_qvm_writable_view_set_float32(&view, 8, value.z, true);
 }
+/* node:os freemem() as Bun reports it on Linux: MemAvailable from /proc/meminfo (sysinfo's freeram when that is
+ * unreadable). */
+static double free_memory(void) {
+  FILE *file = fopen("/proc/meminfo", "r");
+  if (file != NULL) {
+    char line[256];
+    while (fgets(line, sizeof line, file) != NULL) {
+      unsigned long long kilobytes = 0;
+      if (sscanf(line, "MemAvailable: %llu kB", &kilobytes) == 1) {
+        fclose(file);
+        return (double)kilobytes * 1024;
+      }
+    }
+    fclose(file);
+  }
+  struct sysinfo info;
+  return sysinfo(&info) == 0 ? (double)info.freeram * info.mem_unit : 0;
+}
+static long timezone_offset_minutes(const struct tm *local) { return -(long)(local->tm_gmtoff / 60); }
+/* new Date(year, month, 1).getTimezoneOffset(): local midnight on the first of the month. */
+static long month_start_offset(int year, int month) {
+  struct tm day;
+  memset(&day, 0, sizeof day);
+  day.tm_year = year;
+  day.tm_mon = month;
+  day.tm_mday = 1;
+  day.tm_isdst = -1;
+  (void)mktime(&day);
+  return timezone_offset_minutes(&day);
+}
+void qa_app_qvm_real_time_fields(int64_t now, int32_t fields[9]) {
+  time_t seconds = (time_t)now;
+  struct tm local;
+  localtime_r(&seconds, &local);
+  long january = month_start_offset(local.tm_year, 0), july = month_start_offset(local.tm_year, 6);
+  /* Number(getTimezoneOffset() < Math.max(january.getTimezoneOffset(), july.getTimezoneOffset())) */
+  int dst = timezone_offset_minutes(&local) < (january > july ? january : july) ? 1 : 0;
+  /* the UTC date difference from January 1 is the local tm_yday */
+  int32_t values[9] = {local.tm_sec, local.tm_min, local.tm_hour, local.tm_mday, local.tm_mon,
+                       local.tm_year, local.tm_wday, local.tm_yday, dst};
+  memcpy(fields, values, sizeof values);
+}
 void qa_app_qvm_application_scalars_init(qa_app_qvm_application_scalars *scalars,
                                          qa_app_qvm_application_scalar_options options) {
   scalars->options = options;
@@ -154,9 +202,8 @@ bool qa_app_qvm_application_scalars_dispatch(qa_app_qvm_application_scalars *sca
     return true;
   }
   if (code == (ui ? QA_QVM_UI_IMPORT_UI_MEMORY_REMAINING : QA_QVM_CGAME_IMPORT_CG_MEMORY_REMAINING)) {
-    struct sysinfo info;
-    double free_memory = sysinfo(&info) == 0 ? (double)info.freeram * info.mem_unit : 0;
-    *out = (qa_qvm_host_result)(free_memory > 0x7fffffff ? 0x7fffffff : free_memory);
+    double available = free_memory();
+    *out = (qa_qvm_host_result)(available > 0x7fffffff ? 0x7fffffff : available);
     return true;
   }
   if (code == (ui ? QA_QVM_UI_IMPORT_UI_UPDATESCREEN : QA_QVM_CGAME_IMPORT_CG_UPDATESCREEN)) {
@@ -178,7 +225,10 @@ bool qa_app_qvm_application_scalars_dispatch(qa_app_qvm_application_scalars *sca
   if (ui) {
     if (code == QA_QVM_UI_IMPORT_UI_KEY_KEYNUMTOSTRINGBUF) {
       char *text = qa_keynum_to_string(word_i32(call, 4));
+      qa_cleanup guard; /* a bad guest pointer raises */
+      qa_cleanup_push(&guard, free, text);
       qa_qvm_memory_write_string(guest, word_i32(call, 8), text != NULL ? text : "", word_i32(call, 12));
+      qa_cleanup_pop(&guard);
       free(text);
       *out = 0;
       return true;
@@ -195,13 +245,16 @@ bool qa_app_qvm_application_scalars_dispatch(qa_app_qvm_application_scalars *sca
     if (code == QA_QVM_UI_IMPORT_UI_GETCLIPBOARDDATA) {
       size_t length = 0;
       uint8_t *bytes = qa_read_sdl_clipboard(&length);
-      char *text = malloc(length + 1);
-      if (text == NULL) { free(bytes); *out = 0; return true; }
-      if (bytes != NULL && length > 0) memcpy(text, bytes, length);
-      text[length] = '\0';
-      qa_qvm_memory_write_string(guest, word_i32(call, 4), text, word_i32(call, 8));
-      free(text);
+      /* bytes === null ? "" : new TextDecoder().decode(bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD */
+      bool present = bytes != NULL;
+      char *text = present ? qa_text_decoder_decode(bytes, length, NULL) : NULL;
       free(bytes);
+      if (present && text == NULL) qa_range_error("Out of memory");
+      qa_cleanup guard;
+      qa_cleanup_push(&guard, free, text);
+      qa_qvm_memory_write_string(guest, word_i32(call, 4), text != NULL ? text : "", word_i32(call, 8));
+      qa_cleanup_pop(&guard);
+      free(text);
       *out = 0;
       return true;
     }
@@ -210,20 +263,8 @@ bool qa_app_qvm_application_scalars_dispatch(qa_app_qvm_application_scalars *sca
     time_t now = time(NULL);
     int32_t pointer = word_i32(call, 4);
     if (pointer != 0) {
-      struct tm local;
-      localtime_r(&now, &local);
-      struct tm january = local, july = local;
-      january.tm_mon = 0; january.tm_mday = 1;
-      july.tm_mon = 6; july.tm_mday = 1;
-      (void)mktime(&january);
-      (void)mktime(&july);
-      long offset_min = -(long)(local.tm_gmtoff / 60);
-      long max_offset = january.tm_gmtoff > july.tm_gmtoff ? -(long)(january.tm_gmtoff / 60) : -(long)(july.tm_gmtoff / 60);
-      /* JS getTimezoneOffset comparison: smaller offset = DST. */
-      int dst = offset_min < max_offset ? 1 : 0;
-      /* yday from UTC date difference equals local tm_yday here. */
-      int32_t fields[9] = {local.tm_sec, local.tm_min, local.tm_hour, local.tm_mday, local.tm_mon,
-                           local.tm_year, local.tm_wday, local.tm_yday, dst};
+      int32_t fields[9];
+      qa_app_qvm_real_time_fields((int64_t)now, fields);
       qa_qvm_writable_view view;
       qa_qvm_memory_view(guest, pointer, 36, 0, &view);
       for (int i = 0; i < 9; i++) qa_qvm_writable_view_set_int32(&view, i * 4, fields[i], true);

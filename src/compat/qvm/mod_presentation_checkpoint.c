@@ -92,7 +92,11 @@ void qa_qvm_read_presentation_game_state(const qa_save_reader *reader, qa_q3_sou
   int64_t limit = count > 1 ? count : 1;
   bool invalid = offset_count != 1024 || data_length != 16000 || count > 16000;
   for (size_t i = 0; i < offset_count && !invalid; i++) if (values[i] >= limit) invalid = true;
-  if (invalid) qa_save_reader_fail(reader, "invalid source gameState extent");
+  if (invalid) {
+    free(values);
+    free(data);
+    qa_save_reader_fail(reader, "invalid source gameState extent");
+  }
   out->string_offsets = values;
   out->string_data = data;
   out->data_count = count;
@@ -174,12 +178,17 @@ void qa_qvm_read_presentation_snapshot(const qa_save_reader *reader, qa_qvm_abi_
   uint8_t *bytes = xmalloc(length);
   memcpy(bytes, borrowed, length);
   qa_save_reader_destroy(&bytes_reader);
-  if ((int64_t)length != (int64_t)qa_qvm_snapshot_bytes_for(profile))
+  if ((int64_t)length != (int64_t)qa_qvm_snapshot_bytes_for(profile)) {
+    free(bytes);
     qa_save_reader_fail(reader, "invalid source snapshot extent");
+  }
   int player_size = qa_qvm_player_state_bytes(profile);
   int entity_size = (int)qa_qvm_entity_state_bytes_for(profile);
   int32_t count = bytes_i32(bytes, (size_t)(44 + player_size));
-  if (count < 0 || count > 256) qa_save_reader_fail(reader, "invalid source snapshot entity count");
+  if (count < 0 || count > 256) {
+    free(bytes);
+    qa_save_reader_fail(reader, "invalid source snapshot entity count");
+  }
   out->server_time = bytes_i32(bytes, 8);
   out->flags = bytes_i32(bytes, 0);
   uint8_t *area_mask = xmalloc(32);

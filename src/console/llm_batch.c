@@ -161,10 +161,24 @@ void qa_llm_batch_lines_free(char **lines, size_t count) {
   free(lines);
 }
 
+/* TS string length: UTF-16 code units of the UTF-8 text (a four-byte sequence is two units;
+ * any other lead or stray byte is one). */
+static size_t utf16_units(const char *text, size_t length) {
+  size_t units = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)text[i];
+    if ((c & 0xc0) == 0x80) continue;
+    units += (c & 0xf8) == 0xf0 ? 2 : 1;
+  }
+  return units;
+}
+
 static bool split_lines(const char *text, qa_command_buffer *commands, line_list *out,
                         char **error) {
   size_t length = strlen(text);
-  if (length > MAX_TEXT) {
+  /* text.length > 4096 counts UTF-16 units (a non-ASCII response is refused below, but only
+     after this length test). */
+  if (utf16_units(text, length) > MAX_TEXT) {
     *error = make_error("Response exceeds 4096 characters. Ask for a smaller change.");
     return false;
   }
@@ -497,6 +511,7 @@ static ranked_entry *ranked_catalog(qa_console_discovery_entry *entries, size_t 
 static char *catalog_documentation(const ranked_entry *ranked, size_t count,
                                    bool relevant_only, size_t limit) {
   text_builder out = {0};
+  size_t out_units = 0; /* documentation.length in UTF-16 units */
   for (size_t i = 0; i < count; i++) {
     const qa_console_discovery_entry *entry = ranked[i].entry;
     if (relevant_only && ranked[i].score == 0) continue;
@@ -519,8 +534,13 @@ static char *catalog_documentation(const ranked_entry *ranked, size_t count,
       }
     }
     builder_add_text(&line, "\n");
-    if (line.data != NULL && out.length + line.length <= limit)
+    /* documentation.length + line.length > limit, in UTF-16 units (mod-supplied text may be
+       non-ASCII). */
+    size_t line_units = line.data == NULL ? 0 : utf16_units(line.data, line.length);
+    if (line.data != NULL && out_units + line_units <= limit) {
       builder_add(&out, line.data, line.length);
+      out_units += line_units;
+    }
     free(line.data);
   }
   return builder_finish(&out);

@@ -147,7 +147,7 @@ qa_comp_q1_source_client *qa_comp_q1_source_clients_get(qa_comp_q1_source_client
 
 qa_comp_q1_source_client *qa_comp_q1_source_clients_require(qa_comp_q1_source_clients *clients, qa_actor_id actor) {
   qa_comp_q1_source_client *client = qa_comp_q1_source_clients_get(clients, actor);
-  if (client == NULL) qa_range_error("Q1 source client is not admitted");
+  if (client == NULL) qa_raise("Error", 0, 0, "%s", "Q1 source client is not admitted"); /* TS: new Error */
   return client;
 }
 
@@ -192,10 +192,10 @@ qa_comp_q1_source_client *qa_comp_q1_source_clients_attach(qa_comp_q1_source_cli
   qa_session_actor_registry_assert_owned(clients->game->host.actors, actor);
   for (size_t i = 0; i < clients->record_count; i++)
     if (same_owned(clients->records[i].actor, actor) || clients->records[i].slot == admission->slot)
-      qa_range_error("Q1 source client slot is already admitted");
+      qa_raise("Error", 0, 0, "%s", "Q1 source client slot is already admitted");
   double max_clients = clients->game->options.has_max_clients ? clients->game->options.max_clients : 1;
   if (admission->slot < 0 || (double)admission->slot >= max_clients)
-    qa_range_error("Q1 source client slot is out of range");
+    qa_raise("Error", 0, 0, "%s", "Q1 source client slot is out of range");
   if (clients->record_count == clients->record_capacity) {
     size_t capacity = clients->record_capacity == 0 ? 4 : clients->record_capacity * 2;
     qa_comp_q1_source_client *grown =
@@ -343,6 +343,13 @@ static bool field_boolean(qa_save_reader *reader, const char *name) {
   return value;
 }
 
+static void pending_client_release(void *arg) {
+  qa_comp_q1_source_client *client = (qa_comp_q1_source_client *)arg;
+  client_clear_userinfo(client);
+  free(client->userinfo);
+  client->userinfo = NULL;
+}
+
 bool qa_comp_q1_source_clients_restore(qa_comp_q1_source_clients *clients, const uint8_t *bytes, size_t length) {
   qa_save_value *decoded = qa_decode_checkpoint_value(bytes, length);
   if (decoded == NULL) return false;
@@ -387,6 +394,12 @@ bool qa_comp_q1_source_clients_restore(qa_comp_q1_source_clients *clients, const
       clients->records = grown;
       clients->record_capacity = capacity;
     }
+    /* TS records.set(actor, client): a second saved client of the same actor
+     * replaces the first where it stands. The new record is built in the
+     * spare slot and moved over the old one when it is complete. */
+    size_t replaced = clients->record_count;
+    for (size_t j = 0; j < clients->record_count; j++)
+      if (same_owned(clients->records[j].actor, actor)) { replaced = j; break; }
     qa_comp_q1_source_client *client = &clients->records[clients->record_count];
     memset(client, 0, sizeof *client);
     client->actor = actor;
@@ -400,14 +413,20 @@ bool qa_comp_q1_source_clients_restore(qa_comp_q1_source_clients *clients, const
       if (!qa_save_reader_item(&info, j, &entry) || !qa_save_reader_field(&entry, "key", &key) ||
           !qa_save_reader_field(&entry, "value", &value))
         qa_range_error("Out of memory");
-      ok = userinfo_set(client, qa_save_reader_string(&key), qa_save_reader_string(&value));
+      /* TS reads key, then value: a malformed key reports first. */
+      const char *key_text = qa_save_reader_string(&key);
+      const char *value_text = qa_save_reader_string(&value);
+      ok = userinfo_set(client, key_text, value_text);
       qa_save_reader_destroy(&key);
       qa_save_reader_destroy(&value);
       qa_save_reader_destroy(&entry);
     }
     qa_save_reader_destroy(&info);
     if (!ok) { client_clear_userinfo(client); free(client->userinfo); qa_save_reader_destroy(&saved); break; }
-    clients->record_count++;
+    /* TS adds the client to the records only after every field is read: a
+     * field that fails leaves the records without it. */
+    qa_cleanup pending_node;
+    qa_cleanup_push(&pending_node, pending_client_release, client);
     client->frags = field_number(&saved, "frags", 1);
     client->observer = field_boolean(&saved, "observer");
     client->impulse = field_number(&saved, "impulse", 0);
@@ -420,7 +439,16 @@ bool qa_comp_q1_source_clients_restore(qa_comp_q1_source_clients *clients, const
     client->god_mode = qa_save_reader_is_undefined(&god_mode) ? false : qa_save_reader_boolean(&god_mode);
     qa_save_reader_destroy(&god_mode);
     client->team = field_number(&saved, "team", 1);
+    qa_cleanup_pop(&pending_node);
+    clients->record_count++;
     qa_save_reader_destroy(&saved);
+    if (replaced + 1 < clients->record_count) {
+      qa_comp_q1_source_client *old = &clients->records[replaced];
+      client_clear_userinfo(old);
+      free(old->userinfo);
+      *old = *client;
+      clients->record_count--;
+    }
   }
   qa_save_reader_destroy(&list);
   qa_save_reader_destroy(&reader);

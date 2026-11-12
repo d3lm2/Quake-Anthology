@@ -8,8 +8,19 @@
 #include <string.h>
 
 #include "qa/core/binary/index.h"
+#include "qa/foundation/support.h"
 #include "qa/input/support.h"
 #include "qa/foundation/js.h"
+
+typedef struct bnvib_unwind {
+  qa_binary_reader *reader;
+  qa_bnvib_sample *samples;
+} bnvib_unwind;
+static void bnvib_release(void *arg) {
+  bnvib_unwind *unwind = (bnvib_unwind *)arg;
+  free(unwind->samples);
+  qa_binary_reader_destroy(unwind->reader);
+}
 
 bool qa_parse_bnvib(const uint8_t *bytes, size_t length, qa_bnvib_pattern *out) {
   memset(out, 0, sizeof *out);
@@ -17,10 +28,14 @@ bool qa_parse_bnvib(const uint8_t *bytes, size_t length, qa_bnvib_pattern *out) 
   if (!qa_binary_reader_init(&reader, (uint8_t *)bytes, length, "BNVIB")) {
     return false;
   }
+  /* Every refusal below (and a short read, BinaryError) releases the reader
+     and the samples read so far. */
+  bnvib_unwind unwind = {&reader, NULL};
+  qa_cleanup node;
+  qa_cleanup_push(&node, bnvib_release, &unwind);
   uint32_t size = qa_binary_reader_u32(&reader);
   if (size != 4 && size != 12 && size != 16) {
-    char *text = qa_input_js_number(size);
-    qa_input_error("Unsupported BNVIB metadata size %s", text != NULL ? text : "");
+    qa_input_error("Unsupported BNVIB metadata size %u", (unsigned)size);
   }
   if (qa_binary_reader_u16(&reader) != 3) {
     qa_input_error("Unsupported BNVIB format");
@@ -39,25 +54,26 @@ bool qa_parse_bnvib(const uint8_t *bytes, size_t length, qa_bnvib_pattern *out) 
     qa_input_error("BNVIB data size is not a multiple of four");
   }
   size_t count = data_size / 4;
-  qa_bnvib_sample *samples = NULL;
   if (count != 0) {
-    samples = (qa_bnvib_sample *)malloc(count * sizeof *samples);
-    if (samples == NULL) {
+    unwind.samples = (qa_bnvib_sample *)malloc(count * sizeof *unwind.samples);
+    if (unwind.samples == NULL) {
+      qa_cleanup_pop(&node);
       qa_binary_reader_destroy(&reader);
       return false;
     }
   }
+  qa_bnvib_sample *samples = unwind.samples;
   for (size_t i = 0; i < count; i++) {
     samples[i].amp_low = qa_binary_reader_u8(&reader);
     samples[i].freq_low = qa_binary_reader_u8(&reader);
     samples[i].amp_high = qa_binary_reader_u8(&reader);
     samples[i].freq_high = qa_binary_reader_u8(&reader);
   }
-  qa_binary_reader_destroy(&reader);
   if (has_loop && (loop_start >= loop_end || loop_end > (double)count)) {
-    free(samples);
     qa_input_error("BNVIB loop exceeds sample data");
   }
+  qa_cleanup_pop(&node);
+  qa_binary_reader_destroy(&reader);
   out->sample_rate_hz = sample_rate_hz;
   out->samples = samples;
   out->sample_count = count;
@@ -183,8 +199,27 @@ qa_haptics_result qa_bnvib_scheduler_update(qa_bnvib_scheduler *scheduler,
 typedef struct cache_entry {
   char *key;
   bool has_pattern;
-  qa_bnvib_pattern pattern;
+  /* Heap storage: the scheduler borrows the playing pattern, and the cache array moves when it grows. */
+  qa_bnvib_pattern *pattern;
+  /* TS caches the load promise: a load or parse that threw rejects every
+     later sound() for the same key with the same error. */
+  bool has_error;
+  qa_caught_error error;
 } cache_entry;
+
+typedef struct load_call {
+  qa_seat_haptics *haptics;
+  qa_resource_request request;
+  size_t entry; /* index: the load callback may grow the cache */
+  uint8_t *bytes;
+  double epoch; /* the cache contents the entry index belongs to */
+} load_call;
+static void free_load_bytes(void *arg) {
+  load_call *call = (load_call *)arg;
+  free(call->bytes);
+  call->bytes = NULL;
+}
+static void run_load(void *ctx);
 
 struct qa_seat_haptics {
   qa_seat_haptics_options options;
@@ -192,6 +227,7 @@ struct qa_seat_haptics {
   cache_entry *cache;
   size_t cache_count;
   size_t cache_capacity;
+  double cache_epoch; /* bumped when the cache is cleared: entry indices from before are gone */
   double generation;
   double requested;
   double accepted;
@@ -213,8 +249,41 @@ static qa_controller_operation_result seat_set_motors(void *ctx, double low,
     snprintf(result.reason, sizeof result.reason, "Seat has no assigned controller");
     return result;
   }
+  if (haptics->options.rumble != NULL)
+    return haptics->options.rumble(haptics->options.rumble_ctx, haptics->device, low, high, duration);
   return qa_sdl_controllers_rumble(haptics->options.controllers,
                                    (int32_t)haptics->device, low, high, duration);
+}
+
+static void run_load(void *ctx) {
+  load_call *call = (load_call *)ctx;
+  qa_seat_haptics *haptics = call->haptics;
+  size_t length = 0;
+  qa_cleanup node;
+  qa_cleanup_push(&node, free_load_bytes, call);
+  bool loaded =
+      haptics->options.load(haptics->options.load_ctx, call->request, &call->bytes, &length);
+  if (loaded) {
+    qa_bnvib_pattern pattern;
+    if (qa_parse_bnvib(call->bytes, length, &pattern)) {
+      /* The load callback can clear the cache (invalidateAssets or close; in TS the load is still pending then
+       * and its result is dropped by the generation check); the entry is gone, so the pattern has no owner. */
+      if (call->epoch != haptics->cache_epoch) {
+        qa_bnvib_pattern_dispose(&pattern);
+      } else {
+        qa_bnvib_pattern *stored = (qa_bnvib_pattern *)malloc(sizeof *stored);
+        if (stored == NULL) {
+          qa_bnvib_pattern_dispose(&pattern);
+        } else {
+          *stored = pattern;
+          haptics->cache[call->entry].pattern = stored;
+          haptics->cache[call->entry].has_pattern = true;
+        }
+      }
+    }
+  }
+  qa_cleanup_pop(&node);
+  free_load_bytes(call);
 }
 
 qa_seat_haptics *qa_seat_haptics_create(qa_seat_haptics_options options) {
@@ -232,10 +301,12 @@ static void cache_clear(qa_seat_haptics *haptics) {
   for (size_t i = 0; i < haptics->cache_count; i++) {
     free(haptics->cache[i].key);
     if (haptics->cache[i].has_pattern) {
-      qa_bnvib_pattern_dispose(&haptics->cache[i].pattern);
+      qa_bnvib_pattern_dispose(haptics->cache[i].pattern);
+      free(haptics->cache[i].pattern);
     }
   }
   haptics->cache_count = 0;
+  haptics->cache_epoch++;
 }
 
 void qa_seat_haptics_destroy(qa_seat_haptics *haptics) {
@@ -330,23 +401,28 @@ bool qa_seat_haptics_sound(qa_seat_haptics *haptics, qa_content_id content,
     cached = (ssize_t)haptics->cache_count++;
     memset(&haptics->cache[cached], 0, sizeof haptics->cache[cached]);
     haptics->cache[cached].key = qa_input_dup(key);
-    qa_resource_request request = {content, path};
-    uint8_t *bytes = NULL;
-    size_t length = 0;
-    if (haptics->options.load(haptics->options.load_ctx, request, &bytes, &length)) {
-      qa_bnvib_pattern pattern;
-      if (qa_parse_bnvib(bytes, length, &pattern)) {
-        haptics->cache[cached].pattern = pattern;
-        haptics->cache[cached].has_pattern = true;
-      }
-      free(bytes);
+    load_call call = {haptics, {content, path}, (size_t)cached, NULL, haptics->cache_epoch};
+    qa_caught_error caught;
+    bool loaded = qa_try(run_load, &call, &caught);
+    if (call.epoch != haptics->cache_epoch) {
+      /* The cache was cleared inside the load: the entry no longer exists, and the generation that every clear
+       * bumps makes the TS drop the result. */
+      free(key);
+      free(path);
+      if (!loaded) qa_rethrow(&caught);
+      return false;
+    }
+    if (!loaded) {
+      haptics->cache[cached].has_error = true;
+      haptics->cache[cached].error = caught;
     }
   }
-  bool has_pattern = haptics->cache[cached].has_pattern;
-  const qa_bnvib_pattern *pattern =
-      has_pattern ? &haptics->cache[cached].pattern : NULL;
   free(key);
   free(path);
+  if (haptics->cache[cached].has_error) qa_rethrow(&haptics->cache[cached].error);
+  bool has_pattern = haptics->cache[cached].has_pattern;
+  const qa_bnvib_pattern *pattern =
+      has_pattern ? haptics->cache[cached].pattern : NULL;
   if (haptics->closed || generation != haptics->generation) return false;
   synchronize_device(haptics);
   if (pattern == NULL || generation != haptics->generation ||

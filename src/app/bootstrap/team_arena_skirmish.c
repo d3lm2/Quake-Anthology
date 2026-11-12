@@ -49,50 +49,99 @@ static char *next_token(qa_common_parse_state *st, qa_common_parse_cursor *cur) 
   const char *t = qa_common_parse_state_parse(st, cur, true);
   return xdup(t ? t : "");
 }
+static void secs_free(secs *s);
+/* One parse's partial state: metadata is untrusted file text, and a TS throw leaves all of it to the GC. */
+typedef struct sections_scope {
+  secs out;
+  sec current; bool has_current;
+  char **row; size_t row_n;
+  char *token;
+  qa_common_parse_cursor *cursor;
+} sections_scope;
+static void sections_scope_free(void *v) {
+  sections_scope *scope = v;
+  if (scope->has_current) {
+    scope->out.items = realloc(scope->out.items, (scope->out.count + 1) * sizeof *scope->out.items);
+    if (scope->out.items != NULL) scope->out.items[scope->out.count++] = scope->current;
+  }
+  secs_free(&scope->out);
+  for (size_t i = 0; i < scope->row_n; i++) free(scope->row[i]);
+  free(scope->row);
+  free(scope->token);
+  if (scope->cursor != NULL) qa_common_parse_cursor_destroy(scope->cursor);
+}
 static secs parse_sections(const char *text) {
   qa_common_parse_state st; qa_common_parse_state_init(&st);
   qa_common_parse_cursor cur;
   if (!qa_common_parse_cursor_init(&cur, text, strlen(text), false)) qa_range_error("Out of memory");
-  secs out; memset(&out, 0, sizeof out);
+  sections_scope scope; memset(&scope, 0, sizeof scope);
+  scope.cursor = &cur;
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, sections_scope_free, &scope);
   size_t cap = 0;
   for (;;) {
-    char *section = next_token(&st, &cur);
-    if (section[0] == '\0') { free(section); break; }
+    scope.token = next_token(&st, &cur);
+    if (scope.token[0] == '\0') { free(scope.token); scope.token = NULL; break; }
+    char *section = scope.token;
     char *open = next_token(&st, &cur);
-    if (strcmp(open, "{") != 0) qa_range_error("Invalid Team Arena %s section", section);
+    bool opened = strcmp(open, "{") == 0;
     free(open);
-    sec s; memset(&s, 0, sizeof s); s.name = lower_dup(section); free(section);
+    if (!opened) qa_raise("Error", 0, 0, "Invalid Team Arena %s section", section);
+    memset(&scope.current, 0, sizeof scope.current);
+    scope.current.name = lower_dup(section);
+    scope.has_current = true;
+    free(section); scope.token = NULL;
+    sec *current = &scope.current;
     size_t rcap = 0;
     for (;;) {
       char *tok = next_token(&st, &cur);
-      if (strcmp(tok, "}") == 0) { free(tok); break; }
-      if (strcmp(tok, "{") != 0) qa_range_error("Invalid Team Arena %s row", s.name);
+      bool close = strcmp(tok, "}") == 0, row_open = strcmp(tok, "{") == 0;
       free(tok);
-      char **row = NULL; size_t n = 0, fcap = 0;
+      if (close) break;
+      if (!row_open) qa_raise("Error", 0, 0, "Invalid Team Arena %s row", current->name);
+      size_t fcap = 0;
       for (;;) {
         char *field = next_token(&st, &cur);
         if (strcmp(field, "}") == 0) { free(field); break; }
-        if (field[0] == '\0' || strcmp(field, "{") == 0) qa_range_error("Invalid Team Arena %s field", s.name);
-        if (n == fcap) { fcap = fcap ? fcap * 2 : 8; row = realloc(row, fcap * sizeof *row); if (!row) qa_range_error("Out of memory"); }
-        row[n++] = field;
+        if (field[0] == '\0' || strcmp(field, "{") == 0) { free(field); qa_raise("Error", 0, 0, "Invalid Team Arena %s field", current->name); }
+        if (scope.row_n == fcap) {
+          fcap = fcap ? fcap * 2 : 8;
+          char **grown = realloc(scope.row, fcap * sizeof *grown);
+          if (!grown) { free(field); qa_range_error("Out of memory"); }
+          scope.row = grown;
+        }
+        scope.row[scope.row_n++] = field;
       }
-      if (s.row_count == rcap) {
+      if (current->row_count == rcap) {
         rcap = rcap ? rcap * 2 : 8;
-        s.rows = realloc(s.rows, rcap * sizeof *s.rows);
-        s.row_lens = realloc(s.row_lens, rcap * sizeof *s.row_lens);
-        if (!s.rows || !s.row_lens) qa_range_error("Out of memory");
+        char ***rows = realloc(current->rows, rcap * sizeof *rows);
+        if (!rows) qa_range_error("Out of memory");
+        current->rows = rows;
+        size_t *lens = realloc(current->row_lens, rcap * sizeof *lens);
+        if (!lens) qa_range_error("Out of memory");
+        current->row_lens = lens;
       }
-      s.rows[s.row_count] = row; s.row_lens[s.row_count] = n; s.row_count++;
+      current->rows[current->row_count] = scope.row; current->row_lens[current->row_count] = scope.row_n; current->row_count++;
+      scope.row = NULL; scope.row_n = 0;
     }
-    if (out.count == cap) { cap = cap ? cap * 2 : 4; out.items = realloc(out.items, cap * sizeof *out.items); if (!out.items) qa_range_error("Out of memory"); }
-    out.items[out.count++] = s;
+    if (scope.out.count == cap) {
+      cap = cap ? cap * 2 : 4;
+      sec *items = realloc(scope.out.items, cap * sizeof *items);
+      if (!items) qa_range_error("Out of memory");
+      scope.out.items = items;
+    }
+    scope.out.items[scope.out.count++] = scope.current;
+    scope.has_current = false;
   }
+  qa_cleanup_pop(&guard);
   qa_common_parse_cursor_destroy(&cur);
-  return out;
+  return scope.out;
 }
+/* result.set(section.toLowerCase(), rows): a repeated section's last rows win. */
 static const sec *find_sec(const secs *s, const char *name) {
-  for (size_t i = 0; i < s->count; i++) if (strcmp(s->items[i].name, name) == 0) return &s->items[i];
-  return NULL;
+  const sec *found = NULL;
+  for (size_t i = 0; i < s->count; i++) if (strcmp(s->items[i].name, name) == 0) found = &s->items[i];
+  return found;
 }
 static void secs_free(secs *s) {
   for (size_t i = 0; i < s->count; i++) {
@@ -106,22 +155,33 @@ static void secs_free(secs *s) {
   free(s->items);
 }
 static const char *field_at(char **row, size_t len, size_t index) {
-  if (index >= len) qa_range_error("Incomplete Team Arena metadata row");
+  if (index >= len) qa_raise("Error", 0, 0, "Incomplete Team Arena metadata row");
   return row[index];
 }
 static double integer_at(char **row, size_t len, size_t index) {
   const char *v = field_at(row, len, index);
   const char *p = v; if (*p == '-') p++;
-  if (*p == '\0') qa_range_error("Invalid Team Arena metadata integer");
-  for (; *p; p++) if (!isdigit((unsigned char)*p)) qa_range_error("Invalid Team Arena metadata integer");
+  if (*p == '\0') qa_raise("Error", 0, 0, "Invalid Team Arena metadata integer");
+  for (; *p; p++) if (!isdigit((unsigned char)*p)) qa_raise("Error", 0, 0, "Invalid Team Arena metadata integer");
   double n = qa_input_js_parse_number(v);
   if (!(isfinite(n) && n == trunc(n)) || n > 9007199254740991.0 || n < -9007199254740991.0)
-    qa_range_error("Team Arena metadata integer is out of range");
+    qa_raise("Error", 0, 0, "Team Arena metadata integer is out of range");
   return n;
 }
+typedef struct campaign_scope { secs game, teams; qa_app_team_arena_campaign *campaign; } campaign_scope;
+static void campaign_scope_free(void *v) {
+  campaign_scope *scope = v;
+  secs_free(&scope->game); secs_free(&scope->teams);
+  qa_app_team_arena_campaign_destroy(scope->campaign);
+}
 qa_app_team_arena_campaign *qa_app_parse_team_arena_campaign(const char *game_info, const char *team_info) {
-  secs game = parse_sections(game_info), teams = parse_sections(team_info);
-  qa_app_team_arena_campaign *c = calloc(1, sizeof *c);
+  campaign_scope scope; memset(&scope, 0, sizeof scope);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, campaign_scope_free, &scope);
+  scope.game = parse_sections(game_info);
+  scope.teams = parse_sections(team_info);
+  secs game = scope.game, teams = scope.teams;
+  qa_app_team_arena_campaign *c = scope.campaign = calloc(1, sizeof *c);
   if (!c) qa_range_error("Out of memory");
   const sec *gt = find_sec(&game, "gametypes");
   if (gt) {
@@ -162,7 +222,7 @@ qa_app_team_arena_campaign *qa_app_parse_team_arena_campaign(const char *game_in
       for (const char *p = name;; p++) {
         if (*p == '/' || *p == '\0') { if ((size_t)(p - part) == 2 && part[0] == '.' && part[1] == '.') bad_name = true; if (!*p) break; part = p + 1; }
       }
-      if (bad_name || members < 1 || members > 5) qa_range_error("Invalid Team Arena campaign map");
+      if (bad_name || members < 1 || members > 5) qa_raise("Error", 0, 0, "Invalid Team Arena campaign map");
       m->title = xdup(field_at(row, len, 0)); m->name = xdup(name);
       m->team_members = members; m->opponent = xdup(field_at(row, len, 3));
     }
@@ -171,22 +231,39 @@ qa_app_team_arena_campaign *qa_app_parse_team_arena_campaign(const char *game_in
   if (tm) {
     c->teams = calloc(tm->row_count ? tm->row_count : 1, sizeof *c->teams);
     if (!c->teams) qa_range_error("Out of memory");
-    c->team_count = tm->row_count;
+    /* new Map(entries): a repeated key keeps its first position and takes the last members. */
+    size_t kept = 0;
     for (size_t i = 0; i < tm->row_count; i++) {
-      c->teams[i].key = lower_dup(field_at(tm->rows[i], tm->row_lens[i], 0));
-      for (size_t k = 0; k < 5; k++) c->teams[i].members[k] = xdup(field_at(tm->rows[i], tm->row_lens[i], 2 + k));
+      char *key = lower_dup(field_at(tm->rows[i], tm->row_lens[i], 0));
+      size_t at = kept;
+      for (size_t j = 0; j < kept; j++) if (strcmp(c->teams[j].key, key) == 0) { at = j; break; }
+      if (at == kept) { c->teams[at].key = key; c->team_count = ++kept; }
+      else free(key);
+      for (size_t k = 0; k < 5; k++) {
+        char *member = xdup(field_at(tm->rows[i], tm->row_lens[i], 2 + k));
+        free(c->teams[at].members[k]);
+        c->teams[at].members[k] = member;
+      }
     }
+    c->team_count = kept;
   }
   const sec *al = find_sec(&teams, "aliases");
   if (al) {
     c->aliases = calloc(al->row_count ? al->row_count : 1, sizeof *c->aliases);
     if (!c->aliases) qa_range_error("Out of memory");
-    c->alias_count = al->row_count;
+    size_t kept = 0;
     for (size_t i = 0; i < al->row_count; i++) {
-      c->aliases[i].key = lower_dup(field_at(al->rows[i], al->row_lens[i], 0));
-      c->aliases[i].value = xdup(field_at(al->rows[i], al->row_lens[i], 1));
+      char *key = lower_dup(field_at(al->rows[i], al->row_lens[i], 0));
+      size_t at = kept;
+      for (size_t j = 0; j < kept; j++) if (strcmp(c->aliases[j].key, key) == 0) { at = j; break; }
+      if (at == kept) { c->aliases[at].key = key; c->alias_count = ++kept; }
+      else free(key);
+      char *value = xdup(field_at(al->rows[i], al->row_lens[i], 1));
+      free(c->aliases[at].value);
+      c->aliases[at].value = value;
     }
   }
+  qa_cleanup_pop(&guard);
   secs_free(&game); secs_free(&teams);
   return c;
 }
@@ -216,7 +293,7 @@ static bool map_active(const camp_map *m, double game_type) {
 qa_app_team_arena_cursor qa_app_next_team_arena_cursor(const qa_app_team_arena_campaign *c, qa_app_team_arena_cursor current) {
   long gt_i = (long)current.game_type_index, map_i = (long)current.map_index;
   if (gt_i < 0 || (size_t)gt_i >= c->game_type_count || map_i < 0 || (size_t)map_i >= c->map_count)
-    qa_range_error("Invalid Team Arena campaign cursor");
+    qa_raise("Error", 0, 0, "Invalid Team Arena campaign cursor");
   double type = c->game_types[gt_i];
   for (size_t i = (size_t)map_i + 1; i < c->map_count; i++)
     if (map_active(&c->maps[i], type)) { qa_app_team_arena_cursor r = {current.game_type_index, (double)i}; return r; }
@@ -226,7 +303,7 @@ qa_app_team_arena_cursor qa_app_next_team_arena_cursor(const qa_app_team_arena_c
   double gt = has_gt ? c->game_types[next_gt] : 0;
   long found = -1;
   if (has_gt) for (size_t i = 0; i < c->map_count; i++) if (map_active(&c->maps[i], gt)) { found = (long)i; break; }
-  if (found == -1) qa_range_error("Next Team Arena game type has no authored single-player maps");
+  if (found == -1) qa_raise("Error", 0, 0, "Next Team Arena game type has no authored single-player maps");
   qa_app_team_arena_cursor r = {(double)next_gt, (double)found};
   return r;
 }
@@ -234,10 +311,15 @@ qa_app_team_arena_cursor qa_app_current_team_arena_cursor(const qa_app_team_aren
   long gt_i = -1, map_i = -1;
   for (size_t i = 0; i < c->game_type_count; i++) if (c->game_types[i] == game_type) { gt_i = (long)i; break; }
   for (size_t i = 0; i < c->map_count; i++) {
-    char buf[1024]; snprintf(buf, sizeof buf, "maps/%s.bsp", c->maps[i].name);
-    if (ci_eq(buf, map)) { map_i = (long)i; break; }
+    size_t size = strlen(c->maps[i].name) + 10;
+    char *path = malloc(size);
+    if (path == NULL) qa_range_error("Out of memory");
+    snprintf(path, size, "maps/%s.bsp", c->maps[i].name);
+    bool same = ci_eq(path, map);
+    free(path);
+    if (same) { map_i = (long)i; break; }
   }
-  if (gt_i == -1 || map_i == -1) qa_range_error("Current Team Arena match has no authored campaign entry");
+  if (gt_i == -1 || map_i == -1) qa_raise("Error", 0, 0, "Current Team Arena match has no authored campaign entry");
   qa_app_team_arena_cursor r = {(double)gt_i, (double)map_i};
   return r;
 }
@@ -263,8 +345,8 @@ void qa_app_team_arena_skirmish_init_default(qa_app_team_arena_skirmish *out, co
   double game_type = (gt_i >= 0 && (size_t)gt_i < c->game_type_count) ? c->game_types[gt_i] : -1;
   const camp_map *map = (map_i >= 0 && (size_t)map_i < c->map_count) ? &c->maps[map_i] : NULL;
   if (game_type != 1 && game_type != 4 && game_type != 5 && game_type != 6 && game_type != 7)
-    qa_range_error("Unsupported Team Arena single-player game type");
-  if (map == NULL || !map_active(map, game_type)) qa_range_error("Selected Team Arena map is not authored for this skirmish");
+    qa_raise("Error", 0, 0, "Unsupported Team Arena single-player game type");
+  if (map == NULL || !map_active(map, game_type)) qa_raise("Error", 0, 0, "Selected Team Arena map is not authored for this skirmish");
   size_t bcap = 0;
   qa_app_team_arena_bot *bots = NULL; size_t nbots = 0;
   if (game_type == 1) {
@@ -280,9 +362,9 @@ void qa_app_team_arena_skirmish_init_default(qa_app_team_arena_skirmish *out, co
       const team_row *row = NULL;
       for (size_t i = 0; i < c->team_count; i++) if (strcmp(c->teams[i].key, key) == 0) row = &c->teams[i];
       free(key);
-      if (!row) qa_range_error("Team Arena team is missing: %s", names[side]);
+      if (!row) qa_raise("Error", 0, 0, "Team Arena team is missing: %s", names[side]);
       for (double idx = 0; idx < counts[side]; idx++) {
-        if ((size_t)idx >= 5) qa_range_error("Incomplete Team Arena metadata row");
+        if ((size_t)idx >= 5) qa_raise("Error", 0, 0, "Incomplete Team Arena metadata row");
         const char *member = row->members[(size_t)idx];
         char *mkey = lower_dup(member);
         const char *ai = "James";
@@ -325,8 +407,11 @@ void qa_app_team_arena_skirmish_init_default(qa_app_team_arena_skirmish *out, co
   push_nv(&client, &ncl, &clcap, "cg_cameraOrbit", "0");
   push_nv(&client, &ncl, &clcap, "cg_thirdPerson", "0");
   push_nv(&client, &ncl, &clcap, "cg_drawTimer", "1");
-  char map_path[1024]; snprintf(map_path, sizeof map_path, "maps/%s.bsp", map->name);
-  out->map = xdup(map_path); out->title = xdup(map->title);
+  size_t map_size = strlen(map->name) + 10;
+  out->map = malloc(map_size);
+  if (out->map == NULL) qa_range_error("Out of memory");
+  snprintf(out->map, map_size, "maps/%s.bsp", map->name);
+  out->title = xdup(map->title);
   out->game_type = game_type; out->max_clients = max_clients; out->time_to_beat = time_to_beat; out->skill = skill;
   out->cvars = cvars; out->cvar_count = nc; out->client_cvars = client; out->client_cvar_count = ncl;
   out->bots = bots; out->bot_count = nbots;
@@ -361,17 +446,36 @@ qa_app_name_value *qa_app_team_arena_client_cvars(const qa_app_team_arena_skirmi
   for (size_t i = 0; i < setup->client_cvar_count; i++) push_nv(&out, &n, &cap, setup->client_cvars[i].name, setup->client_cvars[i].value);
   *out_count = n; return out;
 }
+typedef struct read_scope { char *game, *teams; qa_app_team_arena_campaign *campaign; char **files; size_t file_count; } read_scope;
+static void read_scope_free(void *v) {
+  read_scope *scope = v;
+  free(scope->game); free(scope->teams);
+  qa_app_team_arena_campaign_destroy(scope->campaign);
+  for (size_t i = 0; i < scope->file_count; i++) free(scope->files[i]);
+  free(scope->files);
+}
 qa_app_team_arena_campaign *qa_app_read_team_arena_campaign(qa_app_team_arena_campaign_host host) {
-  char *game = host.read_file(host.ctx, host.game_info_path);
-  char *teams = host.read_file(host.ctx, host.team_info_path);
-  qa_app_team_arena_campaign *c = qa_app_parse_team_arena_campaign(game, teams);
-  free(game); free(teams);
-  if (!host.additional_teams) return c;
-  size_t count = 0; char **files = host.list_team_files(host.ctx, &count);
+  read_scope scope; memset(&scope, 0, sizeof scope);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, read_scope_free, &scope);
+  scope.game = host.read_file(host.ctx, host.game_info_path);
+  scope.teams = host.read_file(host.ctx, host.team_info_path);
+  qa_app_team_arena_campaign *c = scope.campaign = qa_app_parse_team_arena_campaign(scope.game, scope.teams);
+  free(scope.game); free(scope.teams); scope.game = scope.teams = NULL;
+  if (!host.additional_teams) { qa_cleanup_pop(&guard); return c; }
+  size_t count = 0; char **files = scope.files = host.list_team_files(host.ctx, &count);
+  scope.file_count = count;
   for (size_t i = 0; i < count; i++) {
-    char path[1024]; snprintf(path, sizeof path, "scripts/%s", files[i]);
+    size_t path_size = strlen(files[i]) + 9;
+    char *path = malloc(path_size);
+    if (path == NULL) qa_range_error("Out of memory");
+    snprintf(path, path_size, "scripts/%s", files[i]);
     char *text = host.read_file(host.ctx, path);
+    free(path);
+    qa_cleanup text_guard;
+    qa_cleanup_push(&text_guard, free, text);
     qa_app_team_arena_campaign *extra = qa_app_parse_team_arena_campaign("", text);
+    qa_cleanup_pop(&text_guard);
     free(text);
     /* Merge: set/replace by key (Map.set). */
     for (size_t t = 0; t < extra->team_count; t++) {
@@ -397,21 +501,25 @@ qa_app_team_arena_campaign *qa_app_read_team_arena_campaign(qa_app_team_arena_ca
       } else { free(c->aliases[at].value); c->aliases[at].value = xdup(extra->aliases[t].value); }
     }
     qa_app_team_arena_campaign_destroy(extra);
-    free(files[i]);
+    free(files[i]); files[i] = NULL;
   }
+  qa_cleanup_pop(&guard);
   free(files);
   return c;
 }
 qa_app_team_arena_campaign *qa_app_load_team_arena_campaign(qa_app_team_arena_campaign_host host) {
   /* TS prepareQ3ApplicationProduct/catalog mounting is host-resolved here;
    * a NULL game_info_path signals the TS "requires a Q3 product policy". */
-  if (host.game_info_path == NULL) qa_range_error("Team Arena requires a Q3 product policy");
+  if (host.game_info_path == NULL) qa_raise("Error", 0, 0, "Team Arena requires a Q3 product policy");
   return qa_app_read_team_arena_campaign(host);
 }
+static void campaign_destroy_cleanup(void *c) { qa_app_team_arena_campaign_destroy(c); }
 void qa_app_read_team_arena_skirmish(qa_app_team_arena_skirmish *out, qa_app_team_arena_campaign_host host, double skill,
                                      bool has_previous, const char *prev_map, double prev_game_type, bool advance,
                                      bool has_teams, qa_app_team_arena_teams teams) {
   qa_app_team_arena_campaign *c = qa_app_read_team_arena_campaign(host);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, campaign_destroy_cleanup, c);
   qa_app_team_arena_cursor cursor = {3, 0};
   if (has_previous) {
     qa_app_team_arena_cursor cur = qa_app_current_team_arena_cursor(c, prev_map, prev_game_type);
@@ -419,6 +527,7 @@ void qa_app_read_team_arena_skirmish(qa_app_team_arena_skirmish *out, qa_app_tea
   }
   qa_app_team_arena_teams t = has_teams ? teams : (qa_app_team_arena_teams){"Pagans", "Stroggs"};
   qa_app_team_arena_skirmish_init_default(out, c, skill, cursor, t);
+  qa_cleanup_pop(&guard);
   qa_app_team_arena_campaign_destroy(c);
 }
 struct qa_app_team_arena_launch_overrides {
@@ -485,8 +594,8 @@ void qa_app_team_arena_launch_overrides_apply(qa_app_team_arena_launch_overrides
   for (size_t i = 0; i < o->source_count; i++) cvar_set_(source, o->source[i].name, o->source[i].value, true);
   for (size_t i = 0; i < seat_count; i++) {
     size_t at = o->seat_count;
-    for (size_t j = 0; j < o->seat_count; j++) if (qa_same_seat(o->seat_ids[j], seats[i].id)) at = j;
-    if (at == o->seat_count) qa_range_error("Team Arena preparation adopted an unknown seat");
+    for (size_t j = 0; j < o->seat_count && at == o->seat_count; j++) if (qa_same_seat(o->seat_ids[j], seats[i].id)) at = j;
+    if (at == o->seat_count) qa_raise("Error", 0, 0, "Team Arena preparation adopted an unknown seat");
     for (size_t k = 0; k < o->seat_counts[at]; k++) cvar_set_(seats[i].cvars, o->seat_settings[at][k].name, o->seat_settings[at][k].value, true);
   }
 }

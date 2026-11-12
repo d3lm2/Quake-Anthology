@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/app/bootstrap/simulation/q3/player_state.h"
+#include "qa/content/q3/foundation/arsenal.h"
 #include "qa/app/bootstrap/simulation/bot_mover_connections.h"
 #include "qa/app/bootstrap/simulation/bot_prediction.h"
 #include "qa/app/bootstrap/simulation/q3/guest_runtime.h"
@@ -443,7 +444,9 @@ static bool ss_q3_arsenal_runtime(void *ctx, qa_client_id client, const char **o
   qa_q3_game_entity *entity = qa_q3_entity_pool_at(qa_app_q3_source_subsystems_owner_pool(sim->source.q3_owner), (double)client.slot);
   if (!entity) return false;
   *out_product = qa_app_q3_source_runtime_options(sim->source.q3)->product;
-  *out = qa_app_read_q3_arsenal_runtime(entity, *out);
+  /* readQ3ArsenalRuntime(entity, q3SpawnArsenalRuntime(source.options.product, 100)): the previous state is the
+   * source product's spawn state, not the caller's output. */
+  *out = qa_app_read_q3_arsenal_runtime(entity, qa_q3_spawn_arsenal_runtime(*out_product, 100, 0));
   return true;
 }
 static qa_combat_state_result ss_combat_read(void *ctx, qa_actor_id actor) { return qa_gameplay_authority_read(ss(ctx)->combat, actor); }

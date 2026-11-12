@@ -11,17 +11,44 @@
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 
+/* TS WeakMap<Q2Entity, DoorState> / WeakMap<Q2Entity, TrainState>. A C entity
+ * is freed when its actor is released, so the module watches releases: the
+ * released entity's own state becomes a free slot (e == NULL, reused by the
+ * next spawn; slots never move, callers hold pointers to them), and every
+ * master, team or destination reference to it becomes NULL, which is a dead
+ * member: TS still holds the dead object and throws once it reads its body. */
 typedef struct door_state {
-  qa_q2_entity *e;
+  qa_q2_entity *e; qa_actor_id actor;
   qa_vec3 start, end, safe_direction;
   double distance, water_divisor, debounce;
   bool button, angular, water, reversed, activated;
   const char *phase;
   qa_q2_entity *master;
   qa_q2_entity **team; size_t team_count;
+  /* The actors behind master and team[]: a capture names a dead member too, as TS does. */
+  qa_actor_id master_id; qa_actor_id *team_ids;
 } door_state;
+static void clear_door(door_state *d) { free(d->team); free(d->team_ids); *d = (door_state){0}; }
+static void set_master(door_state *d, qa_q2_entity *master) { d->master = master; d->master_id = master->actor.id; }
+static void set_team(door_state *d, qa_q2_entity *const *members, size_t count) {
+  free(d->team); free(d->team_ids);
+  d->team = malloc((count ? count : 1) * sizeof *d->team);
+  d->team_ids = malloc((count ? count : 1) * sizeof *d->team_ids);
+  if (!d->team || !d->team_ids) qa_range_error("out of memory");
+  for (size_t i = 0; i < count; i++) { d->team[i] = members[i]; d->team_ids[i] = members[i]->actor.id; }
+  d->team_count = count;
+}
 /* TS TrainState: wait is the wait of the corner trainNext last chose. */
-typedef struct train_state { qa_q2_entity *e, *destination; double debounce, wait; bool ship; } train_state;
+typedef struct train_state {
+  qa_q2_entity *e, *destination; double debounce, wait; bool ship; qa_actor_id actor; bool destination_dead; qa_actor_id destination_id;
+  /* What trainWait still reads from a released corner (TS keeps the dead Q2Entity object): its authored-target
+   * fields and its pathtarget, as interned strings. */
+  qa_authored_target dead_corner; const char *dead_path_target;
+} train_state;
+static void set_destination(train_state *t, qa_q2_entity *corner) {
+  t->destination = corner; t->destination_dead = false;
+  if (corner != NULL) t->destination_id = corner->actor.id;
+}
 
 struct qa_q2_mover_module {
   qa_q2_mover_hooks hooks;
@@ -35,7 +62,8 @@ struct qa_q2_mover_module {
   qa_q2_named_die dies[1];
   qa_q2_named_blocked blockeds[4];
   qa_q2_callback_definitions defs;
-  qa_q2_door_checkpoint *cp_doors; qa_saved_actor_id **cp_teams;
+  qa_session_actor_registry *registry; int64_t release_subscription; /* release watch, set at first spawn or restore */
+  qa_q2_door_checkpoint *cp_doors; qa_saved_actor_id **cp_teams; size_t cp_team_count;
   qa_q2_train_checkpoint *cp_trains;
   qa_q2_train_stop *route_scratch; size_t route_cap;
   char *buf;
@@ -71,21 +99,90 @@ static void train_blocked_fn(void *, qa_q2_entity *, qa_q2_game_services *, qa_a
 static void rotating_damage_fn(void *, qa_q2_entity *, qa_q2_game_services *, qa_actor_id);
 
 static door_state *find_door(qa_q2_mover_module *m, qa_q2_entity *e) {
+  if (e == NULL) return NULL;
   for (size_t i = 0; i < m->door_count; i++) if (m->doors[i].e == e) return &m->doors[i];
   return NULL;
 }
 static door_state *door_of(qa_q2_mover_module *m, qa_q2_entity *e) {
   door_state *d = find_door(m, e);
-  if (!d) qa_range_error("Missing Q2 door state");
+  if (!d) qa_raise("Error", 0, 0, "Missing Q2 door state");
   return d;
 }
 static train_state *find_train(qa_q2_mover_module *m, qa_q2_entity *e) {
+  if (e == NULL) return NULL;
   for (size_t i = 0; i < m->train_count; i++) if (m->trains[i].e == e) return &m->trains[i];
   return NULL;
 }
 static train_state *train_of(qa_q2_mover_module *m, qa_q2_entity *e) {
   train_state *t = find_train(m, e);
-  if (!t) qa_range_error("Missing Q2 train state");
+  if (!t) qa_raise("Error", 0, 0, "Missing Q2 train state");
+  return t;
+}
+/* A team member, master or corner whose entity was released (see door_state). */
+static qa_q2_entity *held(qa_q2_entity *e) {
+  if (e == NULL) qa_raise("Error", 0, 0, "Q2 callback used a released body");
+  return e;
+}
+static void movers_on_release(void *ctx, qa_owned_actor actor) {
+  qa_q2_mover_module *m = ctx;
+  qa_q2_entity *gone = NULL;
+  for (size_t i = 0; i < m->door_count; i++)
+    if (m->doors[i].e != NULL && qa_same_actor(m->doors[i].actor, actor.id)) {
+      gone = m->doors[i].e;
+      clear_door(&m->doors[i]);
+    }
+  for (size_t i = 0; i < m->train_count; i++)
+    if (m->trains[i].e != NULL && qa_same_actor(m->trains[i].actor, actor.id)) {
+      gone = m->trains[i].e;
+      m->trains[i] = (train_state){0};
+    }
+  if (gone != NULL)
+    for (size_t i = 0; i < m->door_count; i++) {
+      if (m->doors[i].e == NULL) continue;
+      if (m->doors[i].master == gone) m->doors[i].master = NULL;
+      for (size_t j = 0; j < m->doors[i].team_count; j++) if (m->doors[i].team[j] == gone) m->doors[i].team[j] = NULL;
+    }
+  /* A corner is any entity: match the destination by its actor. */
+  for (size_t i = 0; i < m->train_count; i++)
+    if (m->trains[i].e != NULL && m->trains[i].destination != NULL && qa_same_actor(m->trains[i].destination_id, actor.id)) {
+      /* The entity stays allocated while its release is announced. */
+      const qa_q2_entity *corner = m->trains[i].destination;
+      const char *path_target = qa_q2_spawn_get(&corner->spawn, "pathtarget");
+      m->trains[i].dead_path_target = qa_q2_intern(path_target != NULL ? path_target : "");
+      m->trains[i].dead_corner = (qa_authored_target){.actor = corner->actor,
+          .classname = qa_q2_intern(corner->classname != NULL ? corner->classname : ""),
+          .targetname = (char *)qa_q2_intern(corner->targetname != NULL ? corner->targetname : ""),
+          .target = (char *)qa_q2_intern(corner->target != NULL ? corner->target : ""),
+          .killtarget = (char *)qa_q2_intern(corner->killtarget != NULL ? corner->killtarget : ""),
+          .message = (char *)qa_q2_intern(corner->message != NULL ? corner->message : ""), .delay = corner->delay};
+      m->trains[i].destination = NULL; m->trains[i].destination_dead = true;
+    }
+}
+static void watch_releases(qa_q2_mover_module *m, qa_q2_game_services *g) {
+  if (m->registry != NULL) return;
+  m->registry = g->host->actors;
+  m->release_subscription = qa_session_actor_registry_on_release(m->registry, movers_on_release, m);
+}
+static door_state *new_door(qa_q2_mover_module *m, qa_q2_entity *e) {
+  door_state *d = NULL;
+  for (size_t i = 0; i < m->door_count && d == NULL; i++) if (m->doors[i].e == NULL) d = &m->doors[i];
+  if (d == NULL) {
+    if (m->door_count == m->door_cap) { m->door_cap = m->door_cap ? m->door_cap * 2 : 8; m->doors = realloc(m->doors, m->door_cap * sizeof *m->doors); if (!m->doors) qa_range_error("out of memory"); }
+    d = &m->doors[m->door_count++];
+  }
+  *d = (door_state){0};
+  d->e = e; d->actor = e->actor.id;
+  return d;
+}
+static train_state *new_train(qa_q2_mover_module *m, qa_q2_entity *e) {
+  train_state *t = NULL;
+  for (size_t i = 0; i < m->train_count && t == NULL; i++) if (m->trains[i].e == NULL) t = &m->trains[i];
+  if (t == NULL) {
+    if (m->train_count == m->train_cap) { m->train_cap = m->train_cap ? m->train_cap * 2 : 8; m->trains = realloc(m->trains, m->train_cap * sizeof *m->trains); if (!m->trains) qa_range_error("out of memory"); }
+    t = &m->trains[m->train_count++];
+  }
+  *t = (train_state){0};
+  t->e = e; t->actor = e->actor.id;
   return t;
 }
 static bool live(qa_q2_game_services *g, qa_actor_id id) { return qa_session_actor_registry_is_live(g->host->actors, id); }
@@ -127,7 +224,7 @@ static void door_sound(qa_q2_mover_module *m, qa_q2_entity *e, qa_q2_game_servic
     if (g->options.edition == QA_Q2_EDITION_RERELEASE && st->team_count > 1) {
       qa_vec3 sum = QA_Q2_ZERO;
       for (size_t i = 0; i < st->team_count; i++) {
-        qa_body_state b = qa_q2_game_body(g, st->team[i]);
+        qa_body_state b = qa_q2_game_body(g, held(st->team[i]));
         sum = qa_q2_add(sum, qa_q2_add(b.origin, qa_q2_scale(qa_q2_add(b.bounds.min, b.bounds.max), 0.5)));
       }
       qa_vec3 center = qa_q2_scale(sum, 1 / (double)st->team_count);
@@ -238,7 +335,7 @@ static void use_door(qa_q2_mover_module *m, qa_q2_entity *e, qa_q2_game_services
     }
   }
   for (size_t i = 0; i < st->team_count; i++) {
-    qa_q2_entity *member = st->team[i];
+    qa_q2_entity *member = held(st->team[i]);
     if (!st->button) { member->message = ""; member->touch = (qa_q2_touch){0}; }
     if (close) down_fn(m, member, g);
     else up(m, member, g, activator);
@@ -262,8 +359,9 @@ bool qa_q2_mover_module_train_route(qa_q2_mover_module *m, qa_q2_entity *e, qa_q
   const char *start_name = qa_q2_spawn_get(&e->spawn, "target");
   if (!start_name) start_name = e->target;
   size_t stop_count = 0;
-  qa_actor_id visited[256];
-  size_t visited_count = 0;
+  /* TS visited Set: every corner of the route, however many. */
+  qa_actor_id *visited = NULL;
+  size_t visited_count = 0, visited_cap = 0;
   const char *cur_name = start_name;
   for (;;) {
     qa_q2_entity *corner = NULL;
@@ -278,7 +376,12 @@ bool qa_q2_mover_module_train_route(qa_q2_mover_module *m, qa_q2_entity *e, qa_q
     bool seen = false;
     for (size_t i = 0; i < visited_count; i++) if (qa_same_actor(visited[i], corner->actor.id)) seen = true;
     if (seen) break;
-    if (visited_count < 256) visited[visited_count++] = corner->actor.id;
+    if (visited_count == visited_cap) {
+      visited_cap = visited_cap ? visited_cap * 2 : 32;
+      visited = realloc(visited, visited_cap * sizeof *visited);
+      if (!visited) qa_range_error("out of memory");
+    }
+    visited[visited_count++] = corner->actor.id;
     /* next */
     qa_q2_entity *next = NULL;
     bool next_ambiguous = false;
@@ -288,7 +391,7 @@ bool qa_q2_mover_module_train_route(qa_q2_mover_module *m, qa_q2_entity *e, qa_q
       next = entities[i];
     }
     if (next_ambiguous) next = NULL;
-    if (corner->target[0] && !next) return false;
+    if (corner->target[0] && !next) { free(visited); return false; }
     if (stop_count == m->route_cap) { m->route_cap = m->route_cap ? m->route_cap * 2 : 8; m->route_scratch = realloc(m->route_scratch, m->route_cap * sizeof *m->route_scratch); if (!m->route_scratch) qa_range_error("out of memory"); }
     qa_q2_train_stop *stop = &m->route_scratch[stop_count++];
     *stop = (qa_q2_train_stop){0};
@@ -302,11 +405,13 @@ bool qa_q2_mover_module_train_route(qa_q2_mover_module *m, qa_q2_entity *e, qa_q
     cur_name = corner->target;
     (void)n;
   }
+  bool destination_seen = !st->destination_dead; /* a released corner is on no route */
   if (st->destination) {
-    bool seen = false;
-    for (size_t i = 0; i < visited_count; i++) if (qa_same_actor(visited[i], st->destination->actor.id)) seen = true;
-    if (!seen) return false;
+    destination_seen = false;
+    for (size_t i = 0; i < visited_count; i++) if (qa_same_actor(visited[i], st->destination->actor.id)) destination_seen = true;
   }
+  free(visited);
+  if (!destination_seen) return false;
   out->running = (qa_js_to_int32(e->spawnflags) & 1) != 0;
   out->has_destination = st->destination != NULL;
   if (st->destination) out->destination = st->destination->actor.id;
@@ -328,11 +433,13 @@ qa_q2_traversal qa_q2_mover_module_traversal(qa_q2_mover_module *m, qa_q2_entity
 }
 
 static qa_saved_actor_id ref_of(qa_q2_entity *e) { return (qa_saved_actor_id){(double)e->actor.id.slot, (double)e->actor.id.generation}; }
+static qa_saved_actor_id saved_id(qa_actor_id id) { return (qa_saved_actor_id){(double)id.slot, (double)id.generation}; }
 
 qa_q2_movers_checkpoint qa_q2_mover_module_capture(qa_q2_mover_module *m, qa_q2_game_services *g) {
-  if (m->cp_teams) { for (size_t i = 0; i < m->door_count; i++) free(m->cp_teams[i]); }
+  /* cp_teams holds one array per captured door (cp_team_count of them), not per live door state. */
+  for (size_t i = 0; i < m->cp_team_count; i++) free(m->cp_teams[i]);
   free(m->cp_doors); free(m->cp_trains); free(m->cp_teams);
-  m->cp_doors = NULL; m->cp_trains = NULL; m->cp_teams = NULL;
+  m->cp_doors = NULL; m->cp_trains = NULL; m->cp_teams = NULL; m->cp_team_count = 0;
   size_t n = 0;
   qa_q2_entity *const *entities = g->entities(g->ctx, &n);
   m->cp_doors = malloc((n ? n : 1) * sizeof *m->cp_doors);
@@ -346,11 +453,12 @@ qa_q2_movers_checkpoint qa_q2_mover_module_capture(qa_q2_mover_module *m, qa_q2_
     if (d) {
       qa_saved_actor_id *team = malloc((d->team_count ? d->team_count : 1) * sizeof *team);
       if (!team) qa_range_error("out of memory");
-      for (size_t j = 0; j < d->team_count; j++) team[j] = ref_of(d->team[j]);
       m->cp_teams[dn] = team;
+      m->cp_team_count = dn + 1;
+      for (size_t j = 0; j < d->team_count; j++) team[j] = saved_id(d->team_ids[j]);
       m->cp_doors[dn] = (qa_q2_door_checkpoint){ref_of(entities[i]),
         {d->start, d->end, d->safe_direction, d->distance, d->water_divisor, d->debounce, d->button, d->angular, d->water, d->reversed, d->activated, d->phase},
-        ref_of(d->master), team, d->team_count};
+        saved_id(d->master_id), team, d->team_count};
       dn++;
     }
     if (t) {
@@ -372,34 +480,43 @@ qa_q2_movers_checkpoint qa_q2_mover_module_capture(qa_q2_mover_module *m, qa_q2_
 static qa_q2_entity *ref_entity(qa_q2_game_services *g, qa_saved_actor_id saved) {
   qa_owned_actor owner = qa_q2_restore_actor(g, saved);
   qa_q2_entity *e = g->entity(g->ctx, &owner.id);
-  if (!e) qa_range_error("Q2 mover checkpoint has no source actor");
+  if (!e) qa_raise("Error", 0, 0, "Q2 mover checkpoint has no source actor");
   return e;
 }
 
 void qa_q2_mover_module_restore(qa_q2_mover_module *m, qa_q2_game_services *g, qa_q2_movers_checkpoint cp) {
-  for (size_t i = 0; i < m->door_count; i++) free(m->doors[i].team);
+  watch_releases(m, g);
+  for (size_t i = 0; i < m->door_count; i++) clear_door(&m->doors[i]);
   m->door_count = 0; m->train_count = 0;
   for (size_t i = 0; i < cp.door_count; i++) {
     qa_q2_entity *e = ref_entity(g, cp.doors[i].actor);
-    if (m->door_count == m->door_cap) { m->door_cap = m->door_cap ? m->door_cap * 2 : 8; m->doors = realloc(m->doors, m->door_cap * sizeof *m->doors); if (!m->doors) qa_range_error("out of memory"); }
-    door_state *d = &m->doors[m->door_count++];
-    *d = (door_state){0};
-    d->e = e;
+    /* TS doors.set(entity, ...): a second entry for one entity replaces the first. */
+    door_state *d = find_door(m, e);
+    if (d != NULL) { clear_door(d); d->e = e; d->actor = e->actor.id; }
+    else d = new_door(m, e);
     d->start = cp.doors[i].state.start; d->end = cp.doors[i].state.end; d->safe_direction = cp.doors[i].state.safe_direction;
     d->distance = cp.doors[i].state.distance; d->water_divisor = cp.doors[i].state.water_divisor; d->debounce = cp.doors[i].state.debounce;
     d->button = cp.doors[i].state.button; d->angular = cp.doors[i].state.angular; d->water = cp.doors[i].state.water;
     d->reversed = cp.doors[i].state.reversed; d->activated = cp.doors[i].state.activated; d->phase = cp.doors[i].state.phase;
-    d->master = ref_entity(g, cp.doors[i].master);
-    d->team_count = cp.doors[i].team_count;
-    d->team = malloc((d->team_count ? d->team_count : 1) * sizeof *d->team);
-    if (!d->team) qa_range_error("out of memory");
-    for (size_t j = 0; j < d->team_count; j++) d->team[j] = ref_entity(g, cp.doors[i].team[j]);
+    set_master(d, ref_entity(g, cp.doors[i].master));
+    size_t members = cp.doors[i].team_count;
+    d->team = calloc(members ? members : 1, sizeof *d->team);
+    d->team_ids = calloc(members ? members : 1, sizeof *d->team_ids);
+    if (!d->team || !d->team_ids) qa_range_error("out of memory");
+    for (size_t j = 0; j < members; j++) {
+      qa_q2_entity *member = ref_entity(g, cp.doors[i].team[j]);
+      d->team[j] = member; d->team_ids[j] = member->actor.id; d->team_count = j + 1;
+    }
   }
   for (size_t i = 0; i < cp.train_count; i++) {
     qa_q2_entity *e = ref_entity(g, cp.trains[i].actor);
-    if (m->train_count == m->train_cap) { m->train_cap = m->train_cap ? m->train_cap * 2 : 8; m->trains = realloc(m->trains, m->train_cap * sizeof *m->trains); if (!m->trains) qa_range_error("out of memory"); }
-    m->trains[m->train_count++] = (train_state){e, cp.trains[i].has_destination ? ref_entity(g, cp.trains[i].destination) : NULL, cp.trains[i].debounce,
-        cp.trains[i].has_wait ? cp.trains[i].wait : 0, cp.trains[i].ship};
+    train_state *t = find_train(m, e);
+    if (t == NULL) t = new_train(m, e);
+    set_destination(t, NULL);
+    set_destination(t, cp.trains[i].has_destination ? ref_entity(g, cp.trains[i].destination) : NULL);
+    t->debounce = cp.trains[i].debounce;
+    t->wait = cp.trains[i].has_wait ? cp.trains[i].wait : 0;
+    t->ship = cp.trains[i].ship;
   }
   qa_q2_linear_motion_restore(m->linear, g, cp.linear);
   qa_q2_angular_motion_restore(m->angular, g, cp.angular);
@@ -485,16 +602,17 @@ static void spawn_door(qa_q2_mover_module *m, qa_q2_entity *e, qa_q2_game_servic
     g->move(g->ctx, e, ch, true);
     if (angular) e->movedir = qa_q2_scale(e->movedir, -1);
   }
-  if (m->door_count == m->door_cap) { m->door_cap = m->door_cap ? m->door_cap * 2 : 8; m->doors = realloc(m->doors, m->door_cap * sizeof *m->doors); if (!m->doors) qa_range_error("out of memory"); }
-  door_state *d = &m->doors[m->door_count++];
-  *d = (door_state){0};
-  d->e = e; d->start = start; d->end = end; d->distance = distance;
+  door_state *d = find_door(m, e); /* TS doors.set */
+  if (d != NULL) { clear_door(d); d->e = e; d->actor = e->actor.id; }
+  else d = new_door(m, e);
+  d->start = start; d->end = end; d->distance = distance;
   d->button = button; d->angular = angular; d->water = water; d->safe_direction = safe; d->water_divisor = water_divisor;
-  d->phase = "bottom"; d->master = e;
-  d->team = malloc(sizeof *d->team);
-  if (!d->team) qa_range_error("out of memory");
-  d->team[0] = e; d->team_count = 1;
-  if (!qa_q2_spawn_get(&e->spawn, "team")) { e->has_team_master = true; e->team_master = e->actor.id; }
+  d->phase = "bottom";
+  set_master(d, e);
+  qa_q2_entity *const self_team[1] = {e};
+  set_team(d, self_team, 1);
+  const char *team_name = qa_q2_spawn_get(&e->spawn, "team");
+  if (!team_name || !team_name[0]) { e->has_team_master = true; e->team_master = e->actor.id; } /* TS !values.get("team"): "" too */
   if (water) {
     e->accel = e->decel = e->speed;
     if (e->wait == -1) e->spawnflags = (double)(qa_js_to_int32(e->spawnflags) | 32);
@@ -546,19 +664,15 @@ static void prepare_door_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_entity *master = team_count ? team[0] : e;
   for (size_t i = 0; i < team_count; i++) {
     door_state *d = door_of(m, team[i]);
-    d->master = master;
-    free(d->team);
-    d->team = malloc((team_count ? team_count : 1) * sizeof *d->team);
-    if (!d->team) qa_range_error("out of memory");
-    memcpy(d->team, team, team_count * sizeof *team);
-    d->team_count = team_count;
+    set_master(d, master);
+    set_team(d, team, team_count);
   }
   if (master != e) { free(team); return; }
   if (g->options.edition == QA_Q2_EDITION_RERELEASE && !door_of(m, e)->angular && (qa_js_to_int32(e->spawnflags) & 1) != 0) portals(e, g, true);
   double shortest = 0;
   for (size_t i = 0; i < team_count; i++) {
     double a = fabs(door_of(m, team[i])->distance);
-    if (i == 0 || a < shortest) shortest = a;
+    shortest = i == 0 ? a : qa_js_min(shortest, a); /* Math.min: NaN propagates */
   }
   double time = shortest / e->speed;
   if (time > 0) {
@@ -638,12 +752,14 @@ static void smart_water_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
 
 void qa_q2_mover_module_resume_train_at(qa_q2_mover_module *m, qa_q2_entity *e, qa_q2_game_services *g, qa_q2_entity *corner) {
   train_state *st = train_of(m, e);
-  st->destination = corner;
+  set_destination(st, corner);
   e->spawnflags = (double)(qa_js_to_int32(e->spawnflags) | 1);
   qa_q2_linear_motion_move_to(m->linear, e, g, train_destination(e, corner, g), TCB(m, train_wait_fn));
 }
 qa_vec3 qa_q2_mover_module_train_direction(qa_q2_mover_module *m, qa_q2_entity *e, qa_q2_game_services *g) {
-  qa_q2_entity *corner = train_of(m, e)->destination;
+  train_state *train = train_of(m, e);
+  qa_q2_entity *corner = train->destination;
+  if (!corner && train->destination_dead) corner = held(NULL);
   if (!corner) return QA_Q2_ZERO;
   qa_vec3 a = train_destination(e, corner, g);
   qa_vec3 b = qa_q2_game_body(g, e).origin;
@@ -652,24 +768,46 @@ qa_vec3 qa_q2_mover_module_train_direction(qa_q2_mover_module *m, qa_q2_entity *
   return d == 0 ? QA_Q2_ZERO : qa_q2_scale(delta, 1 / d);
 }
 
+/* TS: target.target = pathTarget; try { useTargets(target) } finally { target.target = previous }.
+ * The corner may be released by its own targets, so it is written only while still live. */
+typedef struct path_target_scope { qa_q2_game_services *g; qa_q2_entity *corner; qa_actor_id corner_id; const char *previous; } path_target_scope;
+static void path_target_restore(void *arg) {
+  path_target_scope *scope = arg;
+  if (scope->g->entity(scope->g->ctx, &scope->corner_id) == scope->corner) scope->corner->target = scope->previous;
+}
 static void train_wait_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_mover_module *m = c;
-  qa_q2_entity *target = train_of(m, e)->destination;
-  if (!target) return;
-  const char *path_target = qa_q2_spawn_get(&target->spawn, "pathtarget");
+  train_state *train = train_of(m, e);
+  qa_q2_entity *target = train->destination;
+  if (!target && !train->destination_dead) return;
+  if (!target) {
+    /* TS still holds the released corner: useTargets runs over the dead object with its pathtarget as the target.
+     * Its source is no longer live, so it stops after the first kill target or the first target it fires. */
+    if (train->dead_path_target != NULL && train->dead_path_target[0]) {
+      qa_authored_target source = train->dead_corner;
+      source.target = (char *)train->dead_path_target;
+      qa_actor_id act = e->activator;
+      g->use_targets(g->ctx, source, e->has_activator ? &act : NULL, false);
+      if (!live(g, e->actor.id)) return;
+    }
+  }
+  const char *path_target = target ? qa_q2_spawn_get(&target->spawn, "pathtarget") : NULL;
   if (path_target && path_target[0]) {
-    const char *prev = target->target;
+    path_target_scope scope = {g, target, target->actor.id, target->target};
+    qa_cleanup cleanup;
     target->target = path_target;
+    qa_cleanup_push(&cleanup, path_target_restore, &scope);
     qa_actor_id act = e->activator;
     qa_q2_game_use_targets_entity(g, target, e->has_activator ? &act : NULL, false);
-    target->target = prev;
+    qa_cleanup_pop(&cleanup);
+    path_target_restore(&scope);
     if (!live(g, e->actor.id)) return;
   }
   double wait = train_of(m, e)->wait;
   if (wait == 0) { train_next_fn(m, e, g); return; }
   if (wait > 0) g->schedule(g->ctx, e, wait, TCB(m, train_next_fn));
   else if ((qa_js_to_int32(e->spawnflags) & 2) != 0) {
-    if (g->options.edition == QA_Q2_EDITION_RERELEASE) train_of(m, e)->destination = NULL;
+    if (g->options.edition == QA_Q2_EDITION_RERELEASE) set_destination(train_of(m, e), NULL);
     else train_next_fn(m, e, g);
     e->spawnflags = (double)(qa_js_to_int32(e->spawnflags) & ~1);
     qa_q2_body_changes ch = {0}; ch.has_velocity = true; ch.velocity = QA_Q2_ZERO;
@@ -700,7 +838,7 @@ static void train_next_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
       g->host->diagnostic(g->host->ctx, m->buf ? m->buf : "Q2 train target missing");
       return;
     }
-    e->target = target->target;
+    e->target = qa_q2_intern(target->target); /* a copy: the corner can be released before the train reads it again */
     if ((qa_js_to_int32(target->spawnflags) & 1) != 0) {
       if (teleported) { g->host->diagnostic(g->host->ctx, "Q2 train has consecutive teleport corners"); return; }
       teleported = true;
@@ -711,7 +849,7 @@ static void train_next_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
       g->host->emit(g->host->ctx, ev);
       continue;
     }
-    train_of(m, e)->destination = target;
+    set_destination(train_of(m, e), target);
     train_of(m, e)->wait = target->wait;
     if (g->options.edition == QA_Q2_EDITION_RERELEASE && target->speed != 0) {
       e->speed = target->speed;
@@ -744,8 +882,10 @@ static void train_next_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
 
 void qa_q2_mover_module_spawn_train(qa_q2_mover_module *m, qa_q2_entity *e, qa_q2_game_services *g) {
   bool ship = strcmp(e->classname, "func_train") != 0;
-  if (m->train_count == m->train_cap) { m->train_cap = m->train_cap ? m->train_cap * 2 : 8; m->trains = realloc(m->trains, m->train_cap * sizeof *m->trains); if (!m->trains) qa_range_error("out of memory"); }
-  m->trains[m->train_count++] = (train_state){e, NULL, 0, 0, ship};
+  watch_releases(m, g);
+  train_state *created = find_train(m, e); /* TS trains.set */
+  if (created == NULL) created = new_train(m, e);
+  set_destination(created, NULL); created->debounce = 0; created->wait = 0; created->ship = ship;
   if (ship) {
     e->model = strcmp(e->classname, "misc_strogg_ship") == 0 ? "models/ships/strogg1/tris.md2" : "models/ships/viper/tris.md2";
     e->visible = false;
@@ -793,6 +933,7 @@ static void spawn_path(qa_q2_mover_module *m, qa_q2_entity *e, qa_q2_game_servic
 }
 
 bool qa_q2_mover_module_spawn(qa_q2_mover_module *m, qa_q2_entity *e, qa_q2_game_services *g) {
+  watch_releases(m, g);
   const char *cn = e->classname;
   if (strcmp(cn, "func_door") == 0 || strcmp(cn, "func_door_rotating") == 0 || strcmp(cn, "func_water") == 0 || strcmp(cn, "func_button") == 0) { spawn_door(m, e, g); return true; }
   if (strcmp(cn, "func_train") == 0 || strcmp(cn, "misc_strogg_ship") == 0 || strcmp(cn, "misc_viper") == 0) { qa_q2_mover_module_spawn_train(m, e, g); return true; }
@@ -810,16 +951,15 @@ static void door_use_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g, const 
 static void door_killed_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g, qa_death_reaction r) {
   qa_q2_mover_module *m = c;
   door_state *st = door_of(m, e);
-  qa_q2_entity *master = st->master;
   size_t tn = st->team_count;
   for (size_t i = 0; i < tn; i++) {
-    qa_q2_entity *member = st->team[i];
+    qa_q2_entity *member = held(st->team[i]);
     if (member->max_health <= 0) continue;
     qa_gameplay_authority_set_health(g->host->combat, member->actor, member->max_health);
     qa_combat_trait_changes tc = {0}; tc.has_can_take_damage = true; tc.can_take_damage = false;
     qa_gameplay_authority_set_traits(g->host->combat, member->actor, tc);
   }
-  use_door(m, master, g, r.pain.attacker);
+  use_door(m, held(st->master), g, r.pain.attacker);
 }
 static void button_touch_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g, qa_touch_contact contact) {
   qa_combat_state_result cs = qa_gameplay_authority_read(g->host->combat, contact.other);
@@ -858,7 +998,7 @@ static void door_blocked_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g, qa
   door_state *st = door_of(m, e);
   bool reverse = strcmp(st->phase, "down") == 0;
   for (size_t i = 0; i < st->team_count; i++) {
-    qa_q2_entity *member = st->team[i];
+    qa_q2_entity *member = held(st->team[i]);
     if (reverse) {
       qa_actor_id act = member->activator;
       up(m, member, g, member->has_activator ? &act : NULL);
@@ -915,6 +1055,7 @@ static void train_use_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g, const
     return;
   }
   qa_q2_entity *dest = train_of(m, e)->destination;
+  if (!dest && train_of(m, e)->destination_dead) dest = held(NULL);
   if (!dest) { train_next_fn(m, e, g); return; }
   e->spawnflags = (double)(qa_js_to_int32(e->spawnflags) | 1);
   qa_q2_linear_motion_move_to(m->linear, e, g, train_destination(e, dest, g), TCB(m, train_wait_fn));
@@ -948,7 +1089,7 @@ static void train_find_fn(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
     g->host->diagnostic(g->host->ctx, m->buf ? m->buf : "Q2 train first target missing");
     return;
   }
-  e->target = target->target;
+  e->target = qa_q2_intern(target->target); /* a copy: see train_next_fn */
   qa_q2_body_changes ch = {0}; ch.has_origin = true; ch.origin = train_destination(e, target, g);
   g->move(g->ctx, e, ch, true);
   if (e->targetname[0] == '\0') e->spawnflags = (double)(qa_js_to_int32(e->spawnflags) | 1);
@@ -1025,8 +1166,9 @@ qa_q2_mover_module *qa_q2_mover_module_create(qa_q2_mover_hooks hooks) {
 qa_q2_mover_module *qa_q2_create_mover_module(qa_q2_mover_hooks hooks) { return qa_q2_mover_module_create(hooks); }
 void qa_q2_mover_module_destroy(qa_q2_mover_module *m) {
   if (!m) return;
-  for (size_t i = 0; i < m->door_count; i++) free(m->doors[i].team);
-  if (m->cp_teams) { for (size_t i = 0; i < m->door_count; i++) free(m->cp_teams[i]); }
+  if (m->registry != NULL) qa_session_actor_registry_off_release(m->registry, m->release_subscription);
+  for (size_t i = 0; i < m->door_count; i++) clear_door(&m->doors[i]);
+  for (size_t i = 0; i < m->cp_team_count; i++) free(m->cp_teams[i]);
   free(m->doors); free(m->trains); free(m->cp_doors); free(m->cp_trains); free(m->cp_teams);
   free(m->route_scratch); free(m->buf);
   qa_q2_linear_motion_destroy(m->linear);

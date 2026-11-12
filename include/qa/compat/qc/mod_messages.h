@@ -43,6 +43,9 @@ typedef struct qa_compat_qc_mod_messages_operations {
   bool (*body_origin)(void *ctx, qa_actor_id actor, qa_vec3 *out);
   bool (*camera_angles)(void *ctx, qa_actor_id actor, qa_vec3 *out);
   void *host_ctx;
+  /* TS host(): the engine presentation check runs before the clock, players and world actor are read.
+   * Nullable (no check). Called with host_ctx. */
+  void (*require_presentation)(void *ctx);
   qa_compat_qc_local_message_host (*host)(void *ctx, const qa_actor_id *target, double seconds, const qa_actor_id *recipients, size_t recipient_count, qa_actor_id source_actor);
   void (*emit)(void *ctx, qa_q1_event event, const qa_actor_id *recipient);
   bool (*clients_for_actor)(void *ctx, qa_actor_id actor); /* services.clients pick */

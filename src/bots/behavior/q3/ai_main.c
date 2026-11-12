@@ -206,7 +206,7 @@ void qa_bot_test_aas_bots_a(qa_game_ai_context_bots_a *ctx, qa_vec3 origin) {
       qa_ai_print_bots_a(ctx, "\r^1Solid!                              ");
     else {
       if (!qa_ai_navigation_ready_bots_a(ctx))
-        qa_range_error("BotTestAAS requires the initialized AAS world");
+        qa_raise("Error", 0, 0, "BotTestAAS requires the initialized AAS world");
       qa_bot_navigation_bots_a *navigation = qa_game_ai_context_navigation(ctx);
       qa_bot_navigation_area settings = navigation->get_area(navigation->ctx, area);
       qa_q3_game_format_arg args[] = {qa_q3_game_format_number((double)area),
@@ -523,7 +523,7 @@ static void schedule_think(qa_game_ai_bots_a *g) {
     if (state == NULL || !state->src->inuse)
       continue;
     if (ctx->num_bots == 0)
-      qa_range_error("BotScheduleBotThink divides by zero with an active bot");
+      qa_raise("Error", 0, 0, "BotScheduleBotThink divides by zero with an active bot");
     int32_t think = (int32_t)qa_game_ai_context_cvar(ctx, "bot_thinktime")->integer_value;
     int32_t product = (int32_t)((uint32_t)think * (uint32_t)bot_number);
     state->src->bot_think_residual = (int32_t)trunc((double)product / ctx->num_bots);
@@ -622,7 +622,7 @@ bool qa_game_ai_setup_client_bots_a(qa_game_ai_bots_a *g, int64_t client,
   state->src->walker =
       qa_bot_character_bounded_float(&library->characters, state->src->character, QA_CHAR_WALKER, 0, 1);
   setting_up(state, QA_BOT_SETUP_WALKER);
-  ctx->num_bots = (int32_t)((int64_t)ctx->num_bots + 1);
+  ctx->num_bots = qa_js_to_int32(ctx->num_bots + 1); /* TS (numBots + 1) | 0 on a number */
   setting_up(state, QA_BOT_SETUP_COUNTED);
   qa_cvar_read testichat;
   int64_t testichat_value = 0;
@@ -665,7 +665,7 @@ bool qa_game_ai_shutdown_client_bots_a(qa_game_ai_bots_a *g, int64_t client, boo
   qa_bot_free_waypoints_bots_a(ctx, state->patrol_points);
   qa_bot_clear_activate_goal_stack_bots_a(ctx, state);
   qa_bot_state_clear(state);
-  ctx->num_bots = (int32_t)((int64_t)ctx->num_bots - 1);
+  ctx->num_bots = qa_js_to_int32(ctx->num_bots - 1);
   return true;
 }
 
@@ -748,7 +748,7 @@ static bool bot_ai(qa_game_ai_context_bots_a *ctx, int64_t client, double think_
 static bool client_connected(qa_game_ai_context_bots_a *ctx, int64_t client) {
   qa_bot_observed_entity_bots_a entity = ctx->game->entity(ctx->game->ctx, client);
   if (!entity.has_player)
-    qa_range_error("BotAIStartFrame reads a null game client");
+    qa_raise("Error", 0, 0, "BotAIStartFrame reads a null game client");
   return entity.player_connected;
 }
 
@@ -956,7 +956,7 @@ void qa_game_ai_interbreed_end_match_bots_a(qa_game_ai_bots_a *g) {
   qa_game_ai_context_bots_a *ctx = &g->context;
   if (!ctx->interbreed)
     return;
-  ctx->interbreed_match_count = (int32_t)((int64_t)ctx->interbreed_match_count + 1);
+  ctx->interbreed_match_count = qa_js_to_int32(ctx->interbreed_match_count + 1);
   double left = ctx->interbreed_match_count;
   double right = (double)qa_game_ai_context_cvar(ctx, "bot_interbreedcycle")->integer_value;
   if (left <
@@ -991,7 +991,7 @@ void qa_game_ai_interbreed_end_match_bots_a(qa_game_ai_bots_a *g) {
     qa_bot_state_bots_a *second = qa_bot_state_store_get(&ctx->states, selection.parent2);
     qa_bot_state_bots_a *child = qa_bot_state_store_get(&ctx->states, selection.child);
     if (first == NULL || second == NULL || child == NULL)
-      qa_range_error("Bot interbreeding selected an unallocated bot state");
+      qa_raise("Error", 0, 0, "Bot interbreeding selected an unallocated bot state");
     qa_string_list errors = qa_bot_goal_interbreed_goal_fuzzy_logic(
         &library->goals, first->src->gs, second->src->gs, child->src->gs);
     qa_string_list_destroy(&errors);

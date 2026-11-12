@@ -28,7 +28,7 @@ bool qa_qvm_resolve_artifact(qa_qvm_resolve_artifact_options options,
   if (digest == NULL) return false;
   if (strcmp(options.module.digest, digest) != 0) {
     free(digest);
-    qa_range_error("QVM artifact bytes do not match their module identity");
+    qa_raise("Error", 0, 0, "QVM artifact bytes do not match their module identity");
   }
   const qa_known_qvm_artifact *known = NULL;
   for (size_t i = 0; i < QA_KNOWN_QVM_ARTIFACT_COUNT; i++) {
@@ -41,7 +41,7 @@ bool qa_qvm_resolve_artifact(qa_qvm_resolve_artifact_options options,
   if (known != NULL && strcmp(known->role, options.role) != 0) {
     const char *known_role = known->role;
     free(digest);
-    qa_range_error("QVM artifact is %s, requested %s", known_role, options.role);
+    qa_raise("Error", 0, 0, "QVM artifact is %s, requested %s", known_role, options.role);
   }
   const qa_qvm_replacement *replacement = NULL;
   for (size_t i = 0; i < options.replacement_count; i++) {

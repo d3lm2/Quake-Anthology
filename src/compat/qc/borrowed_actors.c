@@ -89,7 +89,12 @@ static void refresh(qa_compat_qc_borrowed_actors *b, qa_compat_qc_borrowed_row *
     if (requested[F_TAKEDAMAGE]) qa_compat_qc_words_set_float(fields, b->offsets[F_TAKEDAMAGE], can ? 1 : 0);
   }
   if (requested[F_CLASSNAME]) {
+    /* The rows are an array that grows and closes up; a host callback that borrows or releases
+     * another actor moves them, where TS holds the row object. Find this row again by its slot. */
+    int64_t row_slot = row->slot;
     const char *cn = b->host.classname(b->host.ctx, row->actor.id);
+    row = find_slot(b, row_slot);
+    if (!row) return;
     if (!row->classname || strcmp(row->classname, cn) != 0) {
       char engine_name[64]; snprintf(engine_name, sizeof engine_name, "borrowed-classname:%lld", (long long)row->slot);
       int64_t cap = (int64_t)strlen(cn) + 1; if (cap < 128) cap = 128;

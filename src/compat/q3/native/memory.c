@@ -57,15 +57,27 @@ static qa_qvm_game_region bytes_at(qa_native_game_memory *native, qa_guest_core_
       outer->buf = target;
       longjmp(*target, 1);
     }
+    /* No processor is running: the fault is an ordinary TS throw of its own class. */
+    if (caught.kind == QA_GUEST_THROW_MEMORY)
+      qa_raise("GuestMemoryFault", (int)caught.memory.reason, (long long)caught.memory.address, "%s", caught.memory.message);
     qa_range_error("%s", caught.memory.message);
   }
   uint8_t *copy = malloc(length == 0 ? 1 : (size_t)length);
   if (copy == NULL) qa_range_error("Native game memory out of memory");
   qa_sparse_copy(memory, address, copy, (size_t)length);
+  /* TS copies are collected once the trap that asked for them drops the region. A region here is
+   * used within its trap, so the oldest copies are released once this many newer ones exist
+   * (a session would otherwise keep one copy per read of a read-only mapping). */
+  enum { RETAINED_COPIES = 256 };
+  if (native->copy_count == RETAINED_COPIES) {
+    free(native->copies[0]);
+    memmove(&native->copies[0], &native->copies[1], (native->copy_count - 1) * sizeof *native->copies);
+    native->copy_count--;
+  }
   if (native->copy_count == native->copy_cap) {
     native->copy_cap = native->copy_cap == 0 ? 8 : native->copy_cap * 2;
     uint8_t **grown = realloc(native->copies, native->copy_cap * sizeof *grown);
-    if (grown == NULL) qa_range_error("Native game memory out of memory");
+    if (grown == NULL) { free(copy); qa_range_error("Native game memory out of memory"); }
     native->copies = grown;
   }
   native->copies[native->copy_count++] = copy;

@@ -64,7 +64,9 @@ qa_repaired_frames qa_repair_frames(const qa_scene_entity *entity) {
   if (!entity->pose.is_frame) return (qa_repaired_frames){0, 0, 0, false};
   double frame = entity->pose.frame, previous = entity->pose.previous_frame;
   double back_lerp = entity->pose.back_lerp;
-  if (trunc(frame) != frame || trunc(previous) != previous || !isfinite(back_lerp))
+  /* Number.isInteger: an infinite frame is not an integer. */
+  if (!isfinite(frame) || trunc(frame) != frame || !isfinite(previous) ||
+      trunc(previous) != previous || !isfinite(back_lerp))
     qa_range_error("Invalid scene model pose");
   if (flags_is(entity, "q2") && bit(entity->flags_bits, 128))
     return (qa_repaired_frames){frame, previous, back_lerp, false};
@@ -118,7 +120,7 @@ static qa_model_image_selection selected_shader(
     out.name = options->custom_shader;
     return out;
   }
-  if (options->custom_skin != NULL) {
+  if (options->has_custom_skin || options->custom_skin != NULL) {
     for (size_t i = 0; i < options->custom_skin_count; i++)
       if (strcmp(options->custom_skin[i].name, name) == 0) {
         out.kind = QA_MODEL_IMAGE_EXTERNAL;
@@ -246,6 +248,8 @@ static void ensure_lighting(prep *p) {
     p->lighting = p->context->prepare_vertex_lighting(
         p->context->prepare_vertex_lighting_ctx, &p->entity, p->options);
     p->has_lighting = p->lighting.shade != NULL;
+    /* Surfaces pushed before the lighting was prepared share the entity it was prepared for. */
+    for (size_t i = 0; i < p->count; i++) p->surfaces[i].lighting_identity = p->has_lighting ? p->lighting.shade_ctx : NULL;
   }
 }
 
@@ -321,6 +325,7 @@ static void push_surface(prep *p, const char *name, char *owned_name,
   surface->name = owned_name != NULL ? owned_name : name;
   surface->owned_name = owned_name;
   surface->entity = *entity;
+  surface->lighting_identity = p->has_lighting ? p->lighting.shade_ctx : NULL;
   surface->transform = entity->transform;
   surface->image = image;
   surface->local_geometry = (qa_material_geometry){local, vertex_count, indices, index_count};
@@ -523,7 +528,7 @@ static bool prepare_at_transform(qa_scene_entity entity_value,
   const qa_decoded_model *model = &entity.model;
   if (!str_is(source_cull, "out") && flags_is(&entity, "q2") && bit(bits, 128)) {
     if (context->palette_color == NULL)
-      qa_range_error("Q2 beam preparation requires its source palette");
+      qa_raise("Error", 0, 0, "Q2 beam preparation requires its source palette");
     qa_vec3 palette = context->palette_color(
         context->palette_color_ctx, &entity,
         (double)(qa_int32(entity.skin) & 255));
@@ -656,8 +661,8 @@ static bool prepare_at_transform(qa_scene_entity entity_value,
         p.fog_radius = fog_frame->radius;
         bool culled = false;
         if (!context->no_cull && context->frustum != NULL &&
-            !str_is(source_cull, "in") && trunc(entity.skin) == entity.skin &&
-            entity.skin >= 0) {
+            !str_is(source_cull, "in") && isfinite(entity.skin) &&
+            trunc(entity.skin) == entity.skin && entity.skin >= 0) {
           qa_bounds envelope;
           if (qa_md3_world_envelope(selected, frame, previous_frame, back_lerp,
                                     entity.transform, &envelope) &&
@@ -1130,11 +1135,13 @@ typedef struct group_list {
 static void collect_groups(group_list *list,
                            const qa_prepared_model_entity *model,
                            const qa_model_group_context *material) {
-  if (!str_is(model->cull, "out") && !model->personal_model) {
+  /* R_AddMD3Surfaces: a personal model skips its colour surfaces, but
+   * projection shadows still use it (the draw decides). */
+  if (!str_is(model->cull, "out")) {
     for (size_t si = 0; si < model->surface_count; si++) {
       size_t drawn_count = 0;
-      qa_scene_model_group *drawn =
-          material->draw(material->ctx, &model->surfaces[si], &drawn_count);
+      qa_scene_model_group *drawn = material->draw(
+          material->ctx, &model->surfaces[si], model->personal_model, &drawn_count);
       for (size_t i = 0; i < drawn_count; i++) {
         if (list->count == list->capacity) {
           list->capacity = list->capacity ? list->capacity * 2 : 8;

@@ -3,9 +3,8 @@
 Source: `../quake-anthology-ts/src/app/bootstrap/remote-application.ts` (2,511 lines on 2026-11-03; the TS tree is
 edited concurrently, so re-run the outline before trusting a line number). One TS class, `RemoteApplication`, is ported
 as one C type, `qa_remote_application` (public header `include/qa/app/bootstrap/remote_application_class.h`), in
-`src/app/bootstrap/remote_application_*.c`. It is built beside the old host shell `qa_app_remote_application`
-(`remote_application.c`, `remote_application.h`), which main.c and startup.c keep using until the connection step. The
-two share no code.
+`src/app/bootstrap/remote_application_*.c`. StartupApplication opens it (2026-11-12: the old host shell
+`qa_app_remote_application`, `remote_application.c` and `remote_application.h`, is deleted).
 
 Naming: member `fooBar` is `qa_remote_application_foo_bar(qa_remote_application *app, ...)`; a static member takes no
 `app`. Fields are members of `struct qa_remote_application` in `src/app/bootstrap/remote_application_internal.h`, in TS
@@ -318,3 +317,11 @@ instrumented, library uninstrumented): no errors; LeakSanitizer reported 8.5 KB,
 (default bindings, script reader, program inputs) and socks_settings.c (register snapshots never freed). Fixed
 (unified2, 2026-11-03): with the whole library instrumented (build/agents/unified-asan) the default run reports no ASan
 or UBSan error and no leak.
+
+## TS drift D9b (2026-11-10, 87e98c5c -> 1.2.7)
+
+| TS member | C |
+|---|---|
+| `consoleLog`, `logConsole`, `hostWithConsoleLog(host, ...)` | `qa_remote_application.console_log`, `unlogged_host`, `console_log_attached` (remote_application_internal.h); the wrapper and the mode/root closures are in remote_application_open.c beside `qa_remote_application_construct`; `console_log_attached` is set when `openSource` assigns `application`. Closed first in `closeOwned` (remote_application_close.c). |
+| `gameFolder()` | `qa_remote_application_game_folder` (remote_application_open.c); the standalone recording root (remote_application_commands.c) uses it |
+| `loadedServerCount` | `has_loaded_server_count` / `loaded_server_count`; set by `qa_remote_application_load_q2_server_world` (remote_application_world.c) and by the primary's seat `load` (remote_application_seats.c `seat_load_counted`), which a secondary Q2 seat's readiness test compares |

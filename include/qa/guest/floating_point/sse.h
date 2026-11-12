@@ -1,7 +1,7 @@
 /*
  * Port of src/guest/floating-point/sse.ts: SSE/SSE2 numeric execution.
  * Also hosts qa_execute_numeric_instruction, mirroring the dispatcher in
- * src/guest/floating-point/index.ts (barrels are not ported this wave).
+ * src/guest/floating-point/index.ts (C has no barrel modules).
  * TS UnsupportedSse/NumericFault throws ride the context throw channel.
  * GPL-2.0-or-later.
  */

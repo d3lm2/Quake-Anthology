@@ -57,7 +57,7 @@ static qa_trace_query build_query(qa_q3_base_world_adapter *adapter, qa_q3_base_
 qa_q3_base_actor_trace_result qa_q3_base_world_adapter_trace_actor(qa_q3_base_world_adapter *adapter,
     qa_q3_base_actor_trace_query input) {
   qa_trace_result result = qa_shared_trace(adapter->host.queries, build_query(adapter, input));
-  if (strcmp(result.kind, "q3") != 0) qa_range_error("Shared scene did not adapt a Q3 trace policy");
+  if (strcmp(result.kind, "q3") != 0) qa_raise("Error", 0, 0, "Shared scene did not adapt a Q3 trace policy");
   qa_q3_base_actor_trace_result out;
   memset(&out, 0, sizeof out);
   out.fraction = result.fraction;
@@ -103,8 +103,14 @@ const qa_actor_id *qa_q3_base_world_adapter_area_actors(qa_q3_base_world_adapter
     qa_bounds bounds, double maximum, size_t *out_count) {
   size_t count = 0;
   const qa_spatial_actor *actors = qa_shared_query_actors(adapter->host.queries, bounds, "both", &count);
-  size_t take = count;
-  if (maximum >= 0 && take > (size_t)maximum) take = (size_t)maximum;
+  /* TS .slice(0, maximum): the end index is ToIntegerOrInfinity(maximum), so NaN takes nothing, a
+     negative end counts back from the length, and a fraction is truncated. */
+  size_t take = 0;
+  if (!isnan(maximum)) {
+    double end = trunc(maximum);
+    if (end < 0) end = (double)count + end;
+    take = end <= 0 ? 0 : end >= (double)count ? count : (size_t)end;
+  }
   if (take > adapter->scratch_capacity) {
     qa_actor_id *grown = realloc(adapter->scratch, take * sizeof *grown);
     if (!grown && take) qa_range_error("out of memory");
@@ -149,7 +155,7 @@ double qa_q3_base_world_adapter_point_contents(qa_q3_base_world_adapter *adapter
   qa_trace_query base = build_query(adapter, input);
   qa_point_contents_query query = {point, base.target, base.policy, base.numeric, base.pass_actor};
   qa_point_contents_result result = qa_shared_point_contents(adapter->host.queries, query);
-  if (strcmp(result.kind, "q3") != 0) qa_range_error("Shared scene did not adapt Q3 point contents");
+  if (strcmp(result.kind, "q3") != 0) qa_raise("Error", 0, 0, "Shared scene did not adapt Q3 point contents");
   return result.contents;
 }
 

@@ -2,6 +2,7 @@
 #include "qa/app/bootstrap/keys.h"
 #include <stdlib.h>
 #include <string.h>
+#include "qa/app/bootstrap/cvar_archives.h"
 #include "qa/content/user_data.h"
 #include "qa/foundation/support.h"
 typedef struct profile_store {
@@ -18,13 +19,16 @@ struct qa_app_key_profile {
   qa_q3_cd_key_state state;
   profile_store base;
   profile_store *mod; /* NULL = TS null */
+  /* the state's markModifiedFlags closure: `(profile?.cvars ?? cvars)`; `ready` is TS's assigned `profile` */
+  qa_cvar_registry *fallback_cvars;
+  bool ready;
 };
 struct qa_app_keys {
   qa_app_key_profile *current;
   qa_app_keys_print_fn print;
   void *print_ctx;
+  /* TS: one Q3ClientAuthorization for the keys' lifetime; its cvars, keys and demoRestricted read `active`. */
   qa_q3_client_authorization *authorization;
-  qa_app_key_profile *authorization_profile;
 };
 static char *dup_text(const char *text) {
   size_t len = strlen(text);
@@ -44,7 +48,8 @@ static const char *store_load_text(void *ctx, const char *name) {
 }
 static void store_dump(void *ctx, const char *name, const char *contents) {
   profile_store *store = ctx;
-  (void)qa_config_store_dump(&store->write, name, contents);
+  /* TS ConfigStore.dump rejects when the write fails. */
+  qa_app_config_store_dump(&store->write, name, contents);
 }
 static void store_init(profile_store *store, const qa_app_options *options,
     const qa_catalog_discovered_product *selected) {
@@ -59,7 +64,8 @@ static void store_init(profile_store *store, const qa_app_options *options,
     root = qa_user_product_directory(user_root, selected->expectation.content_directory);
     free(fallback_root);
   }
-  if (root == NULL || !qa_config_store_init(&store->write, root)) qa_range_error("Out of memory");
+  if (root == NULL) qa_range_error("Out of memory");
+  if (!qa_config_store_init(&store->write, root)) { free(root); qa_range_error("Out of memory"); }
   if (selected->loose_root != NULL && strcmp(selected->loose_root, store->write.root) != 0) {
     if (!qa_config_store_init(&store->fallback, selected->loose_root)) qa_range_error("Out of memory");
     store->has_fallback = true;
@@ -94,10 +100,11 @@ void qa_app_key_profile_read_ui(qa_app_key_profile *profile, int64_t unique_key_
 }
 void qa_app_key_profile_write_ui(qa_app_key_profile *profile, double unique,
     const char *directory, const uint8_t *source, size_t source_length) {
-  qa_q3_cd_key_state_write_ui(&profile->state, (int64_t)unique, directory, source, source_length);
+  /* the state compares uniqueKeyResult === 1 only; a NaN or out-of-range double is not cast */
+  qa_q3_cd_key_state_write_ui(&profile->state, unique == 1 ? 1 : 0, directory, source, source_length);
   bool use_mod = unique == 1 && directory[0] != '\0';
   profile_store *store = use_mod ? profile->mod : &profile->base;
-  if (store == NULL) qa_range_error("Selected Q3 UI has no mod key write root");
+  if (store == NULL) qa_raise("Error", 0, 0, "Selected Q3 UI has no mod key write root");
   qa_q3_cd_key_state_write_file(&profile->state, &store->storage, use_mod ? 16 : 0);
 }
 void qa_app_key_profile_read_authorization(qa_app_key_profile *profile,
@@ -109,21 +116,39 @@ void qa_app_key_profile_save(qa_app_key_profile *profile) {
   if (profile->mod != NULL)
     qa_q3_cd_key_state_write_file(&profile->state, &profile->mod->storage, 16);
 }
-typedef struct mark_ctx { qa_app_key_profile *profile; qa_cvar_registry *fallback; } mark_ctx;
-static mark_ctx active_mark;
 static void mark_modified(void *ctx, int64_t flags) {
-  mark_ctx *mark = ctx;
-  qa_cvar_registry *cvars = mark->profile != NULL ? mark->profile->cvars : mark->fallback;
+  qa_app_key_profile *profile = ctx;
+  qa_cvar_registry *cvars = profile->ready ? profile->cvars : profile->fallback_cvars;
   qa_cvar_registry_mark_modified_flags(cvars, (double)flags);
 }
-static const char *basename_of(const char *path) {
-  const char *slash = strrchr(path, '/');
-  return slash != NULL ? slash + 1 : path;
+/* node:path basename: trailing separators are ignored. */
+static char *basename_of(const char *path) {
+  size_t end = strlen(path);
+  while (end > 1 && path[end - 1] == '/') end--;
+  size_t start = end;
+  while (start > 0 && path[start - 1] != '/') start--;
+  if (end == 1 && path[0] == '/') start = end = 0;
+  char *out = malloc(end - start + 1);
+  if (out == NULL) qa_range_error("Out of memory");
+  memcpy(out, path + start, end - start);
+  out[end - start] = '\0';
+  return out;
 }
+static bool demo_restricted_of(void *ctx);
+static qa_cvar_registry *authorization_cvars(void *ctx) { return qa_app_keys_active(ctx)->cvars; }
+static const qa_q3_cd_key_state *authorization_keys(void *ctx) { return &qa_app_keys_active(ctx)->state; }
 qa_app_keys *qa_app_keys_create(qa_app_keys_print_fn print, void *print_ctx) {
   qa_app_keys *keys = calloc(1, sizeof *keys);
   if (keys == NULL) qa_range_error("Out of memory");
   keys->print = print; keys->print_ctx = print_ctx;
+  qa_q3_client_authorization_options options = {0};
+  options.cvars_of = authorization_cvars;
+  options.keys_of = authorization_keys;
+  options.demo_restricted = demo_restricted_of;
+  options.print = print;
+  options.print_ctx = print_ctx;
+  options.ctx = keys;
+  if (!qa_q3_client_authorization_init(&keys->authorization, &options)) { free(keys); qa_range_error("Out of memory"); }
   return keys;
 }
 void qa_app_keys_destroy(qa_app_keys *keys) {
@@ -133,29 +158,15 @@ void qa_app_keys_destroy(qa_app_keys *keys) {
   free(keys);
 }
 qa_app_key_profile *qa_app_keys_active(qa_app_keys *keys) {
-  if (keys->current == NULL) qa_range_error("Q3 keys have no published source profile");
+  if (keys->current == NULL) qa_raise("Error", 0, 0, "Q3 keys have no published source profile");
   return keys->current;
 }
 static bool demo_restricted_of(void *ctx) {
   qa_app_keys *keys = ctx;
   return qa_app_keys_active(keys)->demo_restricted;
 }
-qa_q3_client_authorization *qa_app_keys_authorization(qa_app_keys *keys) {
-  qa_app_key_profile *active = qa_app_keys_active(keys);
-  if (keys->authorization != NULL && keys->authorization_profile == active) return keys->authorization;
-  qa_q3_client_authorization_destroy(keys->authorization);
-  keys->authorization = NULL; keys->authorization_profile = NULL;
-  qa_q3_client_authorization_options options = {0};
-  options.cvars = active->cvars;
-  options.keys = &active->state;
-  options.demo_restricted = demo_restricted_of;
-  options.print = (qa_q3_message_print_fn)keys->print;
-  options.print_ctx = keys->print_ctx;
-  options.ctx = keys;
-  if (!qa_q3_client_authorization_init(&keys->authorization, &options)) qa_range_error("Out of memory");
-  keys->authorization_profile = active;
-  return keys->authorization;
-}
+qa_q3_client_authorization *qa_app_keys_authorization(qa_app_keys *keys) { return keys->authorization; }
+static void destroy_partial_profile(void *ctx) { qa_app_key_profile_destroy(ctx); }
 qa_app_key_profile *qa_app_keys_prepare(qa_app_keys *keys, const qa_app_options *options,
     const qa_content_catalog *catalog, qa_cvar_registry *cvars) {
   (void)keys;
@@ -167,6 +178,8 @@ qa_app_key_profile *qa_app_keys_prepare(qa_app_keys *keys, const qa_app_options 
     base = qa_content_catalog_product(catalog, base->expectation.base_product);
   qa_app_key_profile *profile = calloc(1, sizeof *profile);
   if (profile == NULL) qa_range_error("Out of memory");
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, destroy_partial_profile, profile);
   store_init(&profile->base, options, base);
   bool has_mod = strcmp(product->id, base->id) != 0;
   if (has_mod) {
@@ -174,20 +187,19 @@ qa_app_key_profile *qa_app_keys_prepare(qa_app_keys *keys, const qa_app_options 
     if (profile->mod == NULL) qa_range_error("Out of memory");
     store_init(profile->mod, options, product);
   }
-  active_mark.profile = NULL; active_mark.fallback = cvars;
-  qa_q3_cd_key_state_init(&profile->state, mark_modified, &active_mark, QA_Q3_KEY_BUILD_CLIENT);
+  profile->fallback_cvars = cvars;
+  qa_q3_cd_key_state_init(&profile->state, mark_modified, profile, QA_Q3_KEY_BUILD_CLIENT);
   qa_q3_cd_key_state_read_file(&profile->state, &profile->base.storage);
   if (profile->mod != NULL) qa_q3_cd_key_state_append_file(&profile->state, &profile->mod->storage);
   profile->cvars = cvars;
-  profile->game_directory = dup_text(has_mod ? basename_of(product->expectation.content_directory) : "");
+  profile->game_directory = has_mod ? basename_of(product->expectation.content_directory) : dup_text("");
   profile->demo_restricted = demo_restricted;
-  active_mark.profile = profile;
+  profile->ready = true;
+  qa_cleanup_pop(&guard);
   return profile;
 }
 void qa_app_keys_publish(qa_app_keys *keys, qa_app_key_profile *profile, qa_cvar_registry *cvars) {
   if (profile != NULL) profile->cvars = cvars;
-  qa_q3_client_authorization_destroy(keys->authorization);
-  keys->authorization = NULL; keys->authorization_profile = NULL;
   /* Publishing the current profile again keeps it (TS keeps the object the map holds). */
   if (keys->current != profile) qa_app_key_profile_destroy(keys->current);
   keys->current = profile;

@@ -3,13 +3,19 @@
  * (ConsoleField), command completion, and ConsoleHistory over
  * BoundedQueue. Re-exports EditField/FieldControls/FieldClipboard
  * from source-field.ts, as the TS file does.
- * C accommodations: the TS field edits an array of Unicode code
- * points; here the text is stored as UTF-8 bytes while cursor,
- * scroll and maximumLength count code points, as in TS (a byte that
- * starts no valid sequence counts as one). The TS \s classes match
- * the JS white space code points. Key codes are the numeric KeyCode
- * values of src/input/key-codes.ts (input module not yet ported;
- * values are named in field.c). The clipboard closure becomes a
+ * C accommodations: the TS field edits an array of characters (code
+ * points) and its text is a JS string; here the field text is that
+ * string as UTF-8 (well formed: insert and setText decode their input
+ * as TextDecoder does, an ill-formed sequence is U+FFFD), so a
+ * character above U+00FF stays in the field as in TS. Cursor, scroll
+ * and maximumLength count code points. Platform text (SDL text input,
+ * the clipboard) goes in as is; the text becomes console text (one
+ * byte per character, core/commands/text.h) where SeatConsole hands it
+ * to a command, and console history lines are field text too.
+ * Completion names are console text. The TS \s classes match the JS
+ * white space characters (U+00A0 among them). Key codes are the numeric KeyCode
+ * values of src/input/key-codes.ts (the values are named in
+ * field.c). The clipboard closure becomes a
  * function pointer + ctx returning a borrowed string or NULL.
  * Ownership: fields/histories own their buffers and completion
  * state; init returns false only on OOM. qa_console_field_text
@@ -35,7 +41,7 @@
 typedef const char *(*qa_console_clipboard_fn)(void *ctx);
 
 typedef struct qa_console_field {
-  char *characters; /* byte buffer, not NUL-terminated internally */
+  char *characters; /* UTF-8 text, not NUL-terminated internally */
   size_t length;
   size_t capacity;
   int64_t cursor;
@@ -57,12 +63,13 @@ typedef struct qa_console_field {
 bool qa_console_field_init(qa_console_field *field, int64_t maximum_length,
                            int64_t width_in_chars);
 void qa_console_field_destroy(qa_console_field *field);
-/* Malloc'd field text; caller frees. NULL only on OOM. */
+/* Malloc'd field text (UTF-8); caller frees. NULL only on OOM. */
 char *qa_console_field_text(const qa_console_field *field);
 /* Borrowed selected completion or NULL (TS null). */
 const char *qa_console_field_selected_completion(const qa_console_field *field);
 void qa_console_field_complete(qa_console_field *field, const char *const *names,
                                size_t name_count, bool reverse);
+/* text is UTF-8 (field text, platform text). */
 void qa_console_field_set_text(qa_console_field *field, const char *text);
 void qa_console_field_clear(qa_console_field *field);
 void qa_console_field_insert(qa_console_field *field, const char *text);

@@ -14,6 +14,7 @@
 #include "qa/app/bootstrap/simulation/rerelease_guest_services.h"
 #include "qa/compat/q2/classic/records.h"
 #include "qa/compat/q2/rerelease/api.h"
+#include "qa/compat/q2/rerelease/deferred_damage.h"
 #include "qa/compat/q2/rerelease/imports.h"
 #include "qa/compat/q2/rerelease/layouts.h"
 #include "qa/compat/q2/rerelease/public_state.h"
@@ -50,7 +51,7 @@ typedef struct host {
   const qa_app_sim_native_mod_host_context *context;
   const qa_mod_host_services *services;
   bool rerelease, closed;
-  qa_provider_timing timing;
+  qa_provider_timing timing; bool has_timing;
   qa_cvar_registry *cvars;
   double max_clients;
   qa_mod_command_port *commands;
@@ -245,9 +246,14 @@ static uint8_t *encode_cvars(host_t *h, size_t *length) {
   if (bytes == NULL) qa_range_error("Out of memory");
   return bytes;
 }
+static void free_value(void *value) { qa_save_value_free(value); }
+/* cvars.restoreSaveState(decodeCheckpointValue(bytes)): the decoder raises its own SaveFormatError; a refused state
+ * releases the decoded tree. */
 static void restore_cvars(host_t *h, const uint8_t *bytes, size_t length) {
-  qa_save_value *value = qa_decode_checkpoint_value(bytes, length); if (value == NULL) fail("Invalid native mod cvar state");
-  qa_cvar_registry_restore_save_state(h->cvars, value); qa_save_value_free(value);
+  qa_save_value *value = qa_decode_checkpoint_value(bytes, length); if (value == NULL) qa_range_error("Out of memory");
+  qa_cleanup node; qa_cleanup_push(&node, free_value, value);
+  qa_cvar_registry_restore_save_state(h->cvars, value);
+  qa_cleanup_pop(&node); qa_save_value_free(value);
 }
 static void spawn_done(host_t *h) {
   if (h->rerelease) qa_app_sim_rerelease_guest_services_complete_spawn(h->rr); else qa_app_sim_classic_guest_services_complete_spawn(h->classic);
@@ -284,10 +290,13 @@ static qa_save_value *p_checkpoint(void *ctx) {
   if (value == NULL) qa_range_error("Out of memory");
   return value;
 }
+static void checkpoint_release(void *ctx) { qa_app_sim_native_mod_presentation_checkpoint_free(ctx); }
 static void p_restore(void *ctx, const qa_save_value *saved) {
   qa_save_reader reader; if (!qa_save_reader_init(&reader, saved, "presentation")) qa_range_error("Out of memory");
   qa_app_sim_native_mod_presentation_checkpoint checkpoint; qa_app_sim_read_native_mod_presentation(&reader, &checkpoint); qa_save_reader_destroy(&reader);
+  qa_cleanup node; qa_cleanup_push(&node, checkpoint_release, &checkpoint); /* a refused restore frees the read checkpoint */
   qa_app_sim_native_mod_presentation_restore(of(ctx)->presentation, &checkpoint);
+  qa_cleanup_pop(&node);
   qa_app_sim_native_mod_presentation_checkpoint_free(&checkpoint);
 }
 static void p_close(void *ctx) { qa_app_sim_native_mod_presentation_close(of(ctx)->presentation); }
@@ -390,6 +399,7 @@ static void capture_server(void *ctx, qa_q2_classic_original_server_state *out) 
   for (size_t i = 0; i < count; i++) { s->configstrings[i].index = table[i].index; s->configstrings[i].value = table[i].value; }
   out->state.configstrings = s->configstrings; out->state.configstring_count = count;
 }
+static void server_state_free(void *ctx) { server_state *s = ctx; free(s->cvars); free(s->configstrings); s->cvars = NULL; s->configstrings = NULL; }
 static void write_original(void *ctx, const char *game, const char *level, bool autosave) {
   qa_compat_q2_classic_guest_host *host = classic_host(of(ctx));
   qa_compat_q2_classic_guest_host_save(host, "WriteGame", game, autosave); qa_compat_q2_classic_guest_host_save(host, "WriteLevel", level, false);
@@ -397,7 +407,10 @@ static void write_original(void *ctx, const char *game, const char *level, bool 
 static qa_compat_q2_native_mod_source_save c_checkpoint(void *ctx) {
   host_t *h = ctx; free_saved(h);
   server_state server = {h, NULL, 0, NULL}; qa_q2_classic_original_save save;
+  /* A raising WriteGame/WriteLevel frees the captured server state. */
+  qa_cleanup server_node; qa_cleanup_push(&server_node, server_state_free, &server);
   if (!qa_classic_original_save_files_capture(h->files, classic_identity(h), capture_server, &server, write_original, h, false, &save)) qa_range_error("Out of memory");
+  qa_cleanup_pop(&server_node);
   qa_provider_checkpoint original; bool encoded = qa_encode_q2_classic_original_save(&save, &original);
   qa_q2_classic_original_save_free(&save); free(server.cvars); free(server.configstrings);
   if (!encoded) qa_range_error("Out of memory");
@@ -411,15 +424,19 @@ static void read_original(void *ctx, const char *game, const char *level) {
   qa_compat_q2_classic_guest_host_save_loading(host, "ReadGame", game, next_frame_fn, h); spawn(h);
   for (size_t i = 0; i < r->original->server.state.configstring_count; i++)
     qa_app_sim_classic_guest_services_set_configstring(h->classic, r->original->server.state.configstrings[i].index, r->original->server.state.configstrings[i].value);
-  qa_compat_q2_classic_guest_host_save_loading(host, "ReadLevel", level, next_frame_fn, h);
+  /* level NULL is the TS null: the save carries no current level. */
+  if (level != NULL) qa_compat_q2_classic_guest_host_save_loading(host, "ReadLevel", level, next_frame_fn, h);
 }
 static void c_restore(void *ctx, const qa_compat_q2_native_mod_source_save *save) {
   host_t *h = ctx; if (save->rerelease) fail("Native mod save ABI differs");
   qa_q2_classic_original_identity identity = classic_identity(h); qa_q2_classic_original_save original;
   if (!qa_decode_q2_classic_original_save(&save->original, identity, &original)) qa_range_error("Out of memory");
+  /* A refused restore (the save's cvars, files or the guest's ReadGame/ReadLevel) releases the decoded save. */
+  qa_cleanup node; qa_cleanup_push(&node, (void (*)(void *))qa_q2_classic_original_save_free, &original);
   restore_cvars(h, original.server.cvars.bytes, original.server.cvars.length);
   classic_read read = {h, &original};
-  qa_classic_original_save_files_restore_loading(h->files, &original, identity, read_original, &read);
+  qa_classic_original_save_files_restore_loading(h->files, &original, read_original, &read);
+  qa_cleanup_pop(&node);
   qa_q2_classic_original_save_free(&original);
 }
 static void c_close(void *ctx) { host_t *h = ctx; h->closed = true; qa_app_sim_classic_guest_source_close(h->classic_source); }
@@ -571,8 +588,11 @@ static qa_compat_q2_native_mod_source_save r_checkpoint(void *ctx) {
   host_t *h = ctx; free_saved(h);
   qa_compat_q2_rerelease_source_save game = qa_compat_q2_rerelease_q2_guest_host_write_save_loading(rr_host(h), "game", false, next_frame_fn, h);
   h->saved_bytes[0] = game.native; bool game_extra = game.deferred_damage_count != 0 || game.projection_count != 0;
+  /* The deferred damage lists are the writes' own; the check needs only their lengths. */
+  qa_compat_q2_rerelease_deferred_damage_free_saves((qa_compat_q2_rerelease_deferred_damage_save *)game.deferred_damage, game.deferred_damage_count);
   qa_compat_q2_rerelease_source_save level = qa_compat_q2_rerelease_q2_guest_host_write_save_loading(rr_host(h), "level", false, next_frame_fn, h);
   h->saved_bytes[1] = level.native;
+  qa_compat_q2_rerelease_deferred_damage_free_saves((qa_compat_q2_rerelease_deferred_damage_save *)level.deferred_damage, level.deferred_damage_count);
   if (game_extra || level.deferred_damage_count != 0 || level.projection_count != 0) fail("Unexpected whole-world native mod save state");
   size_t cvars_length = 0; h->saved_bytes[2] = encode_cvars(h, &cvars_length);
   size_t count = 0; const qa_app_sim_configstring *table = qa_app_sim_rerelease_guest_services_configstrings(h->rr, &count);
@@ -666,12 +686,16 @@ static void create_cvars(host_t *h) {
     if (value != h->max_clients) fail("Native component client capacity differs from maxclients");
   }
 }
+static void host_release_cleanup(void *h);
 qa_compat_q2_native_mod_host *qa_app_sim_create_native_mod_host(const qa_app_sim_native_mod_host_options *options) {
   if ((options->classic == NULL) == (options->rerelease == NULL)) qa_range_error("Native mod host requires one prepared guest");
   host_t *h = xcalloc(1, sizeof *h);
+  /* A guest the loader refuses (or a declaration the host refuses) releases the partly built host. */
+  qa_cleanup created; qa_cleanup_push(&created, host_release_cleanup, h);
   h->options = *options; h->declaration = options->declaration; h->context = options->context; h->services = options->services;
   h->rerelease = options->rerelease != NULL;
   if (!qa_native_provider_timing(options->source, QA_GAME_FAMILY_Q2, h->rerelease, &h->timing)) qa_range_error("Out of memory");
+  h->has_timing = true;
   h->max_clients = h->declaration->clients != NULL ? h->declaration->clients->maximum : h->context->max_clients;
   create_cvars(h);
   h->commands = options->bind_commands != NULL ? options->bind_commands(options->ctx, h->cvars) : NULL;
@@ -700,18 +724,28 @@ qa_compat_q2_native_mod_host *qa_app_sim_create_native_mod_host(const qa_app_sim
   t->set_instruction_pointer = set_instruction_pointer; t->observe_writes = observe_writes; t->unobserve_writes = unobserve_writes; t->with_command = with_command;
   if (h->rerelease) create_rerelease(h); else create_classic(h);
   t->runner = qa_app_sim_native_guest_runner(h->guest);
+  qa_cleanup_pop(&created);
   return t;
 }
+/* Releases whatever a host holds; a host whose creation was refused part way holds only some members. */
+static void host_release(host_t *h) {
+  if (h->guest != NULL) while (h->observers != NULL) unobserve_writes(h, h->observers->handle);
+  while (h->cells != NULL) { import_cell *next = h->cells->next; free(h->cells->name); free(h->cells); h->cells = next; }
+  if (h->presentation != NULL) qa_app_sim_native_mod_presentation_destroy(h->presentation);
+  if (h->rr_source != NULL) qa_app_sim_rerelease_guest_source_destroy(h->rr_source);
+  if (h->rr != NULL) qa_app_sim_rerelease_guest_services_destroy(h->rr);
+  if (h->classic_source != NULL) qa_app_sim_classic_guest_source_destroy(h->classic_source);
+  if (h->classic != NULL) qa_app_sim_classic_guest_services_destroy(h->classic);
+  if (h->files != NULL) qa_classic_original_save_files_destroy(h->files);
+  if (h->random != NULL) qa_app_sim_source_random_destroy(h->random);
+  if (h->cvars != NULL) qa_cvar_registry_destroy(h->cvars);
+  if (h->has_timing) qa_native_provider_timing_free(&h->timing);
+  free_saved(h); free(h->signature); free(h->weapon_path); free(h->map); free(h);
+}
+static void host_release_cleanup(void *h) { host_release(h); }
 void qa_app_sim_native_mod_host_destroy(qa_compat_q2_native_mod_host *table) {
   if (table == NULL) return;
-  host_t *h = table->ctx;
-  while (h->observers != NULL) unobserve_writes(h, h->observers->handle);
-  while (h->cells != NULL) { import_cell *next = h->cells->next; free(h->cells->name); free(h->cells); h->cells = next; }
-  qa_app_sim_native_mod_presentation_destroy(h->presentation);
-  if (h->rerelease) { qa_app_sim_rerelease_guest_source_destroy(h->rr_source); qa_app_sim_rerelease_guest_services_destroy(h->rr); }
-  else { qa_app_sim_classic_guest_source_destroy(h->classic_source); qa_app_sim_classic_guest_services_destroy(h->classic); qa_classic_original_save_files_destroy(h->files); }
-  qa_app_sim_source_random_destroy(h->random); qa_cvar_registry_destroy(h->cvars); qa_native_provider_timing_free(&h->timing);
-  free_saved(h); free(h->signature); free(h->weapon_path); free(h->map); free(h);
+  host_release(table->ctx);
 }
 qa_cvar_registry *qa_app_sim_native_mod_host_cvars(const qa_compat_q2_native_mod_host *table) { return ((const host_t *)table->ctx)->cvars; }
 qa_app_sim_native_mod_presentation *qa_app_sim_native_mod_host_presentation(const qa_compat_q2_native_mod_host *table) { return ((const host_t *)table->ctx)->presentation; }

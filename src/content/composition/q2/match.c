@@ -203,6 +203,16 @@ void qa_q2_product_match_init(qa_q2_product_match *match, const qa_q2_match_sele
   match->world = world;
   match->hooks = hooks;
   match->services = services;
+  if (selection->kind == QA_Q2_MATCH_LMCTF && selection->travel != NULL) {
+    const qa_lmctf_travel *travel = selection->travel;
+    match->has_travel = true;
+    match->travel_countdown = travel->countdown;
+    match->travel_paused = travel->paused;
+    match->travel_player_count = travel->player_count;
+    match->travel_players = malloc((travel->player_count != 0 ? travel->player_count : 1) * sizeof *match->travel_players);
+    if (match->travel_players == NULL) qa_range_error("out of memory");
+    for (size_t i = 0; i < travel->player_count; i++) match->travel_players[i] = travel->players[i];
+  }
   qa_shared_grapple_control *grapple = services->shared_grapple;
   switch (selection->kind) {
     case QA_Q2_MATCH_CTF:
@@ -247,6 +257,10 @@ void qa_q2_product_match_destroy(qa_q2_product_match *match) {
   if (match->horde != NULL) qa_q2_horde_destroy(match->horde);
   free(match->settings_skins[0]);
   free(match->settings_skins[1]);
+  free(match->travel_players);
+  match->travel_players = NULL;
+  match->travel_player_count = 0;
+  match->has_travel = false;
   match->ctf = NULL; match->lmctf = NULL; match->horde = NULL;
   match->settings_skins[0] = match->settings_skins[1] = NULL;
 }

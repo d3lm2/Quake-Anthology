@@ -3,8 +3,9 @@
  * ELF image. The returned qa_elf_guest_image owns its inspection, label
  * strings, export/import name copies and arrays; release with
  * qa_elf_guest_image_free(). The file bytes are copied (TS bytes.slice()).
- * ElfError conditions abort via qa_range_error, so the TS catch-and-unmap
- * rollback (including GNU-unique removal) is unobservable and omitted.
+ * ElfError is a qa_raise under that name. A load that raises is rolled back
+ * as TS's catch does (mapped pages unmapped, GNU-unique names it added
+ * removed) and leaves `out` zeroed.
  * GPL-2.0-or-later.
  */
 #ifndef QA_GUEST_ELF_H

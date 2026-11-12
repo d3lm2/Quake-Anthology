@@ -23,6 +23,7 @@
 #include "qa/contracts/content.h"
 #include "qa/foundation/support.h"
 #include "qa/persistence/execution.h"
+#include "qa/foundation/js.h"
 
 #define MAX_EVENT_BYTES ((size_t)16 * 1024 * 1024)
 #define MAX_SAFE_INTEGER 9007199254740991.0
@@ -615,7 +616,7 @@ static qa_save_value *read_source_player_state(const qa_save_reader *reader, con
     ev_item(reader, i, &item);
     double value = qa_save_reader_integer_min(&item, 0);
     if (value > 255) qa_save_reader_fail(&item, "source client value out of range");
-    bytes[i] = (uint8_t)value;
+    bytes[i] = qa_js_to_uint8(value);
     qa_save_reader_destroy(&item);
   }
   if (count != (size_t)qa_qvm_player_state_bytes("q3-modern"))

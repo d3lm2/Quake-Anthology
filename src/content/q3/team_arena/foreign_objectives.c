@@ -91,7 +91,7 @@ void qa_q3_ta_foreign_objective_adaptation_destroy(qa_q3_ta_foreign_objective_ad
   result->entities = NULL;
 }
 static char *quote(const char *value) {
-  if (strchr(value, '"') || strchr(value, '\0') != value + strlen(value)) qa_range_error("Invalid quoted entity field");
+  if (strchr(value, '"') || strchr(value, '\0') != value + strlen(value)) qa_raise("Error", 0, 0, "Invalid quoted entity field");
   size_t n = strlen(value);
   char *out = xmalloc(n + 3);
   out[0] = '"'; memcpy(out + 1, value, n); out[n + 1] = '"'; out[n + 2] = '\0';
@@ -141,7 +141,10 @@ qa_q3_ta_foreign_objective_adaptation qa_q3_ta_adapt_foreign_q3_objectives(
   qa_q1_entities_destroy(parsed, parsed_count);
   for (size_t i = 0; i < explicit_count; i++) {
     qa_vec3 o = explicit_placements[i].origin;
-    if (!isfinite(o.x) || !isfinite(o.y) || !isfinite(o.z)) qa_range_error("Objective position must be finite");
+    if (!isfinite(o.x) || !isfinite(o.y) || !isfinite(o.z)) {
+      qa_q1_entities_destroy(entities.values, entities.count); /* nothing is kept across the raise */
+      qa_raise("Error", 0, 0, "Objective position must be finite");
+    }
     bool exists = false;
     for (size_t j = 0; j < entities.count; j++) {
       const char *cn = qa_q1_entity_value(&entities.values[j], "classname");
@@ -172,12 +175,25 @@ qa_q3_ta_foreign_objective_adaptation qa_q3_ta_adapt_foreign_q3_objectives(
     if (strcmp(cn, "info_player_deathmatch") == 0 || strcmp(cn, "team_CTF_redplayer") == 0
         || strcmp(cn, "team_CTF_blueplayer") == 0) has_spawn = true;
   }
-  if (!has_spawn) qa_range_error("Q3 rules require an authored player spawn");
+  if (!has_spawn) {
+    qa_q1_entities_destroy(entities.values, entities.count);
+    qa_raise("Error", 0, 0, "Q3 rules require an authored player spawn");
+  }
+  /* "{\n" and "\n}\n" are five bytes for every entity, one with no fields included; each
+   * field adds two quoted texts, the space between them and the joining newline. */
   size_t total = 1;
+  bool quotable = true;
   for (size_t i = 0; i < entities.count; i++) {
-    total += 3;
-    for (size_t j = 0; j < entities.values[i].property_count; j++)
-      total += strlen(entities.values[i].properties[j].key) + strlen(entities.values[i].properties[j].value) + 8;
+    total += 5;
+    for (size_t j = 0; j < entities.values[i].property_count; j++) {
+      const char *key = entities.values[i].properties[j].key, *value = entities.values[i].properties[j].value;
+      if (strchr(key, '"') || strchr(value, '"')) quotable = false;
+      total += strlen(key) + strlen(value) + 6;
+    }
+  }
+  if (!quotable) {
+    qa_q1_entities_destroy(entities.values, entities.count);
+    qa_raise("Error", 0, 0, "Invalid quoted entity field");
   }
   char *serialized = xmalloc(total);
   size_t at = 0;

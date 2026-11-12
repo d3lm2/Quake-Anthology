@@ -9,6 +9,7 @@
 #define QA_INPUT_MOUSE_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "qa/contracts/math.h"
 
@@ -25,7 +26,16 @@ typedef struct qa_mouse_tuning {
   bool look_spring;
   bool look_strafe;
   bool invert_pitch;
+  /* The TS object's key order, which JSON.stringify keeps (QA_MOUSE_KEYS_*). */
+  uint8_t key_order;
 } qa_mouse_tuning;
+/* defaultMouseTuning's literal: sensitivity, acceleration, filter, yaw, pitch, side, forward, freeLook, lookSpring,
+ * lookStrafe, invertPitch. */
+#define QA_MOUSE_KEYS_DEFAULT 0
+/* The settings parser's: ... side, forward, lookSpring, lookStrafe, freeLook, invertPitch. */
+#define QA_MOUSE_KEYS_PARSED 1
+/* MouseSettings.read()'s: ... yaw, pitch, invertPitch, side, forward, freeLook, lookSpring, lookStrafe. */
+#define QA_MOUSE_KEYS_CVARS 2
 
 extern const qa_mouse_tuning qa_default_mouse_tuning;
 

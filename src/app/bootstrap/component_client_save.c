@@ -4,28 +4,32 @@
 #include "qa/foundation/support.h"
 #include "qa/persistence/provider_ownership.h"
 static const char *const SCHEMA = "app:component-clients";
+static void free_value(void *value) { qa_save_value_free(value); }
 qa_save_value *qa_app_read_component_clients(const qa_save_image *image) {
   const qa_provider_checkpoint *row = NULL;
   size_t count = 0;
   for (size_t i = 0; i < image->provider_count; i++)
     if (image->providers[i].schema && strcmp(image->providers[i].schema, SCHEMA) == 0) { row = &image->providers[i]; count++; }
   if (count == 0) return NULL;
-  if (count != 1 || !row) qa_range_error("Duplicate component client checkpoint");
+  if (count != 1 || !row) qa_raise("Error", 0, 0, "Duplicate component client checkpoint");
   qa_validate_save_provider_owner(*row, image->recipe.map.entities.provider);
   qa_save_value *value = qa_decode_checkpoint_value(row->bytes.bytes, row->bytes.length);
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, free_value, value);
   qa_save_reader reader, version;
   qa_save_reader_init(&reader, value, SCHEMA);
   qa_save_reader_field(&reader, "version", &version);
   qa_save_reader_literal_number(&version, 1);
   qa_save_reader_destroy(&version);
   qa_save_reader_destroy(&reader);
+  qa_cleanup_pop(&cleanup);
   return value;
 }
 void qa_app_save_component_clients(const qa_save_image *image, const qa_save_value *value,
                                    qa_provider_checkpoint *out_checkpoint, uint8_t **out_bytes, size_t *out_length) {
   for (size_t i = 0; i < image->provider_count; i++)
     if (image->providers[i].schema && strcmp(image->providers[i].schema, SCHEMA) == 0)
-      qa_range_error("Component client checkpoint is already attached");
+      qa_raise("Error", 0, 0, "Component client checkpoint is already attached");
   qa_provider_checkpoint_ref ref = qa_save_provider_contract(SCHEMA, image->recipe.map.entities.provider);
   *out_bytes = qa_encode_checkpoint_value(value, out_length);
   out_checkpoint->provider = ref.provider;
@@ -37,12 +41,15 @@ void qa_app_save_component_clients(const qa_save_image *image, const qa_save_val
 void qa_app_require_component_client_presentation(const qa_save_image *image) {
   qa_save_value *value = qa_app_read_component_clients(image);
   if (!value) return;
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, free_value, value);
   qa_save_reader reader, seats;
   qa_save_reader_init(&reader, value, SCHEMA);
   qa_save_reader_field(&reader, "seats", &seats);
   size_t count = qa_save_reader_list_count(&seats);
+  qa_cleanup_pop(&cleanup);
   qa_save_reader_destroy(&seats);
   qa_save_reader_destroy(&reader);
   qa_save_value_free(value);
-  if (count != 0) qa_range_error("Saved component viewing clients require a graphical destination");
+  if (count != 0) qa_raise("Error", 0, 0, "Saved component viewing clients require a graphical destination");
 }

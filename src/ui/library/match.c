@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/support.h"
 
@@ -52,12 +53,14 @@ static void set_str(char **slot, const char *value) {
   *slot = qa_input_dup(value);
   if (*slot == NULL) qa_range_error("Out of memory");
 }
+/* text.trim() === "": JS white space over UTF-8 code points. */
 static bool blank_trim(const char *text) {
-  char *trimmed = qa_input_js_trim(text);
-  if (trimmed == NULL) qa_range_error("Out of memory");
-  bool empty = trimmed[0] == '\0';
-  free(trimmed);
-  return empty;
+  for (const char *p = text; *p != '\0';) {
+    size_t space = qa_js_white_space_length(p);
+    if (space == 0) return false;
+    p += space;
+  }
+  return true;
 }
 static void run_command(match_state *s, const char *name,
                         const char *const *args, size_t count) {

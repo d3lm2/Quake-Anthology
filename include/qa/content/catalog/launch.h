@@ -170,6 +170,11 @@ typedef struct qa_resolve_launch_result {
   qa_launch_string_list strings;
   qa_provider_timing *weapon_timing;
   size_t weapon_timing_count;
+  /* recipe.mounts orders as the opened plan has them (TS mounted.plan). */
+  qa_mount_id *opened_default_order;          /* owned array */
+  qa_prefix_mount_order *opened_prefix_orders; /* owned array */
+  qa_mount_id **opened_prefix_mounts;         /* owned arrays */
+  size_t opened_prefix_count;
 } qa_resolve_launch_result;
 bool qa_resolve_launch(const qa_resolve_launch_options *options,
                        qa_resolve_launch_result *out);

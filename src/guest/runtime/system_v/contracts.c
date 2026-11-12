@@ -54,10 +54,13 @@ qa_call_result qa_system_v_invoke(qa_system_v_service_host *host, const qa_guest
   return host->invoke(host->ctx, context, target, parameters, parameter_count,
                       result_is_void, result, arguments, argument_count);
 }
+void qa_system_v_own(qa_system_v_service_host *host, void *resource, void (*release)(void *resource)) {
+  host->own(host->ctx, resource, release);
+}
 void qa_unsupported_system_v_service(const char *library, const char *symbol,
                                      const char *version, const char *detail) {
   if (version == NULL)
-    qa_range_error("Unsupported System V guest service %s:%s: %s", library, symbol, detail);
+    qa_raise("UnsupportedSystemVService", 0, 0, "Unsupported System V guest service %s:%s: %s", library, symbol, detail);
   else
-    qa_range_error("Unsupported System V guest service %s:%s@%s: %s", library, symbol, version, detail);
+    qa_raise("UnsupportedSystemVService", 0, 0, "Unsupported System V guest service %s:%s@%s: %s", library, symbol, version, detail);
 }

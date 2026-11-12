@@ -140,12 +140,23 @@ static bool push_edge(EdgeList *l, qa_navigation_edge x) {
   l->v[l->n++] = x; return true;
 }
 
+/* A raise (record bounds, world callbacks) frees the lists built so far, as TS leaves them to the GC. */
+typedef struct build_guard { NodeList *nodes; EdgeList *edges; bool owns_raw; } build_guard;
+static void build_release(void *arg) {
+  build_guard *g = arg;
+  if (g->owns_raw) for (size_t i = 0; i < g->edges->n; i++) free((void *)g->edges->v[i].entity.raw);
+  free(g->nodes->v); free(g->edges->v);
+  g->nodes->v = NULL; g->edges->v = NULL; g->nodes->n = g->edges->n = 0;
+}
 bool qa_navigation_from_asset(qa_navigation_graph *out, qa_navigation_map_identity map,
                               const qa_aas_asset *aas, const qa_kex_navigation_asset *kex,
                               qa_navigation_profile profile, const qa_navigation_world *world) {
   memset(out, 0, sizeof *out);
   qa_nav_validate_profile(&profile);
   NodeList nodes = {0}; EdgeList edges = {0};
+  build_guard g = {&nodes, &edges, aas != NULL};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, build_release, &g);
   bool ok = true;
   if (aas) {
     for (int64_t number = 1; ok && number < (int64_t)aas->area_count; number++) {
@@ -282,6 +293,7 @@ bool qa_navigation_from_asset(qa_navigation_graph *out, qa_navigation_map_identi
       rejected[rn].source = edges.v[i].source; rejected[rn].reason = reason; rn++;
     }
   }
+  qa_cleanup_pop(&guard);
   size_t cluster_count = 0;
   qa_navigation_cluster_list *clusters = NULL;
   if (ok) {

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/input/key_codes.h"
@@ -351,16 +352,20 @@ static const qa_app_startup_native_preset *find_preset(qa_app_startup_menu *m, c
   for (size_t i = 0; i < count; i++) if (streq(list[i].choice.id, id)) return &list[i];
   return NULL;
 }
+static void options_cleanup(void *raw) { qa_app_options_destroy(raw); }
 /* catalog.product(model.options.product).expectation */
 static const qa_catalog_product_expectation *selected_expectation(qa_app_startup_menu *m) {
   qa_app_options options;
   qa_app_startup_selection_options(m->o.model, &options);
   const qa_catalog_discovered_product *product =
       qa_content_catalog_product(qa_app_startup_selection_catalog(m->o.model), options.product);
-  char product_id[256];
-  set_fixed(product_id, sizeof product_id, options.product);
+  if (product == NULL) {
+    /* The raise formats the whole message before it runs the cleanups. */
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, options_cleanup, &options);
+    qa_raise("RangeError", 0, 0, "Unknown requested content or mod: %s", options.product != NULL ? options.product : "undefined");
+  }
   qa_app_options_destroy(&options);
-  if (product == NULL) qa_raise("Error", 0, 0, "Unknown product %s", product_id);
   return &product->expectation;
 }
 static void set_status(qa_app_startup_menu *m, const char *text, bool busy) {
@@ -522,7 +527,7 @@ static void prepare_map_choices(qa_app_startup_menu *m, double offset, double co
   /* TS: null returns; otherwise "Checking map rules..." (busy) until the preparation settles. */
   map_choices_call call = {m, offset, count, false};
   qa_caught_error caught;
-  if (!qa_try(map_choices_body, &call, &caught)) { set_status(m, caught.message, false); return; }
+  if (!qa_try(map_choices_body, &call, &caught)) { set_status(m, qa_caught_message(&caught), false); return; }
   if (call.prepared) set_status(m, "", false);
 }
 /* TS prepareBuilderDropdownScroll(scroll). */
@@ -589,7 +594,7 @@ static void roster_body(void *ctx) { qa_app_startup_selection_prepare_monster_ro
 static void open_roster(qa_app_startup_menu *m) {
   set_status(m, "Reading this map's monster roster...", true);
   qa_caught_error caught;
-  if (!qa_try(roster_body, m, &caught)) { set_status(m, caught.message, false); return; }
+  if (!qa_try(roster_body, m, &caught)) { set_status(m, qa_caught_message(&caught), false); return; }
   set_status(m, "", false);
   qa_native_ui_controller_open_menu(m->controller, ID_ROSTER);
 }
@@ -1012,7 +1017,7 @@ static void browser_connect_body(void *ctx) {
 static void browser_discover_body(void *ctx) { qa_app_startup_server_browser_discover(((qa_app_startup_menu *)ctx)->o.browser); }
 static void browser_run(qa_app_startup_menu *m, void (*work)(void *ctx)) {
   qa_caught_error caught;
-  if (!qa_try(work, m, &caught)) qa_app_startup_server_browser_set_status(m->o.browser, caught.message);
+  if (!qa_try(work, m, &caught)) qa_app_startup_server_browser_set_status(m->o.browser, qa_caught_message(&caught));
 }
 static void arenas_body(void *ctx) { qa_app_startup_selection_refresh_base_arenas(((qa_app_startup_menu *)ctx)->o.model); }
 typedef struct hosting_call { qa_app_startup_menu *m; qa_app_startup_hosting value; } hosting_call;
@@ -1063,7 +1068,7 @@ static void on_activate(void *ctx, qa_seat_id seat) {
       }
       set_status(m, "Loading arenas...", true);
       qa_caught_error caught;
-      if (!qa_try(arenas_body, m, &caught)) { set_status(m, caught.message, false); break; }
+      if (!qa_try(arenas_body, m, &caught)) { set_status(m, qa_caught_message(&caught), false); break; }
       set_status(m, "", false);
       qa_native_ui_controller_open_menu(m->controller, ID_ARENAS);
       break;
@@ -1082,7 +1087,7 @@ static void on_activate(void *ctx, qa_seat_id seat) {
       hosting_call call = {m, m->host_draft};
       if (!streq(m->host_draft.kind, "offline")) call.value.port = qa_js_string_to_number(m->host_port);
       qa_caught_error caught;
-      if (!qa_try(hosting_body, &call, &caught)) { set_status(m, caught.message, false); break; }
+      if (!qa_try(hosting_body, &call, &caught)) { set_status(m, qa_caught_message(&caught), false); break; }
       clear_status(m);
       qa_native_ui_controller_close_menu(m->controller);
       break;
@@ -1196,9 +1201,18 @@ static void on_activate(void *ctx, qa_seat_id seat) {
       /* TS discover().catch(error => browser.status = String(error)). */
       qa_caught_error caught;
       if (!qa_try(browser_discover_body, m, &caught)) {
-        char text[sizeof caught.message + 64];
-        snprintf(text, sizeof text, "%s: %s", caught.name != NULL ? caught.name : "Error", caught.message);
+        /* String(error): "<name>: <message>", or "<name>" for an empty message. */
+        const char *name = caught.name != NULL ? caught.name : "Error", *message = qa_caught_message(&caught);
+        size_t length = strlen(name) + strlen(message) + 3;
+        char *text = malloc(length);
+        if (text == NULL) qa_range_error("Out of memory");
+        if (message[0] == '\0') snprintf(text, length, "%s", name);
+        else snprintf(text, length, "%s: %s", name, message);
+        qa_cleanup guard;
+        qa_cleanup_push(&guard, free, text);
         qa_app_startup_server_browser_set_status(m->o.browser, text);
+        qa_cleanup_pop(&guard);
+        free(text);
       }
       break;
     }
@@ -1824,7 +1838,14 @@ void qa_app_startup_menu_bind_input(qa_app_startup_menu *m, qa_seat_input *input
     const qa_ui_binding_action *source, size_t source_count,
     const qa_ui_binding_action *(*get_source)(void *ctx, size_t *out_count), void *source_ctx,
     const qa_ui_binding_reset *reset) {
-  qa_ui_settings_menus menus = qa_ui_register_binding_menus(m->controller, input, source, source_count, get_source, source_ctx, reset);
+  qa_app_startup_menu_bind_input_scoped(m, input, source, source_count, get_source, source_ctx, reset, NULL);
+}
+void qa_app_startup_menu_bind_input_scoped(qa_app_startup_menu *m, qa_seat_input *input,
+    const qa_ui_binding_action *source, size_t source_count,
+    const qa_ui_binding_action *(*get_source)(void *ctx, size_t *out_count), void *source_ctx,
+    const qa_ui_binding_reset *reset, const qa_ui_binding_scope *scope) {
+  qa_ui_settings_menus menus = qa_ui_register_binding_menus_scoped(m->controller, input, source, source_count, get_source,
+      source_ctx, reset, scope);
   if (m->has_bindings) qa_ui_settings_menus_dispose(&m->binding_menus);
   m->binding_menus = menus;
   m->binding_menu = menus.root;
@@ -1881,7 +1902,7 @@ bool qa_app_startup_menu_input(qa_app_startup_menu *m, qa_seat_input_event event
   menu_input_call call = {m, event, false};
   qa_caught_error caught;
   if (!qa_try(menu_input_body, &call, &caught)) {
-    set_status(m, caught.message, false);
+    set_status(m, qa_caught_message(&caught), false);
     return true;
   }
   return call.handled;

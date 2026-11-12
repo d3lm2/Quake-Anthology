@@ -99,12 +99,14 @@ typedef struct binding_entry {
    * that closure's context is separate from binding.ctx. */
   bool has_adjust_ctx, has_admit_ctx;
   void *adjust_ctx, *admit_ctx;
+  void *owned_state; /* create()'s copied state, released with the entry or a rebind */
 } binding_entry;
 typedef struct cell_entry {
   qa_owned_actor actor;
   qa_power_armor_cell_binding binding;
 } cell_entry;
 typedef struct bound_protection {
+  size_t refs; /* the slot's reference plus one per pickup match that reads its captured rules */
   qa_protection_binding binding;
   qa_captured_original_pickup_rule *pickups;
   size_t pickup_count;
@@ -167,8 +169,13 @@ struct qa_gameplay_authority {
   qa_damage_request *dispatched;
   size_t dispatched_count, dispatched_capacity;
   int64_t release_subscription;
-  void **retained; /* outcome mutation arrays + closure states */
+  void **retained; /* closure states kept for their identity until destroy */
   size_t retained_count, retained_capacity;
+  /* A hit's closed cursors, its decisions' mutation copies and replaced create() states: an outcome or decision
+   * points into them (TS objects the GC keeps while referenced). They stay valid until the next outermost damage
+   * call on this authority begins (callers read an outcome before applying the next hit), then are freed. */
+  void **hit_retained;
+  size_t hit_retained_count, hit_retained_capacity;
   qa_current_original_pickup *scratch_matches;
   size_t scratch_matches_capacity;
   qa_item_id *scratch_items;
@@ -185,6 +192,26 @@ static void retain(qa_gameplay_authority *authority, void *ptr) {
   authority->retained[authority->retained_count++] = ptr;
 }
 
+static void hit_retain(qa_gameplay_authority *authority, void *ptr) {
+  if (ptr == NULL) return;
+  if (authority->hit_retained_count == authority->hit_retained_capacity) {
+    authority->hit_retained_capacity =
+        authority->hit_retained_capacity != 0 ? authority->hit_retained_capacity * 2 : 32;
+    authority->hit_retained = xrealloc(authority->hit_retained,
+                                       authority->hit_retained_capacity * sizeof *authority->hit_retained);
+  }
+  authority->hit_retained[authority->hit_retained_count++] = ptr;
+}
+/* At the start of an outermost damage call: the previous hits' outcomes are no longer read. */
+static void release_hit_retained(qa_gameplay_authority *authority) {
+  if (authority->active_hits != 0) return;
+  for (size_t i = 0; i < authority->hit_retained_count; i++) free(authority->hit_retained[i]);
+  authority->hit_retained_count = 0;
+}
+static void free_binding_entry(qa_gameplay_authority *authority, binding_entry *entry) {
+  hit_retain(authority, entry->owned_state);
+  free(entry);
+}
 static binding_entry *find_binding_entry(qa_gameplay_authority *authority, qa_owned_actor actor) {
   for (size_t i = 0; i < authority->binding_count; i++) {
     if (qa_same_owned_actor(authority->bindings[i]->actor, actor)) return authority->bindings[i];
@@ -222,7 +249,7 @@ static binding_entry *require_binding(qa_gameplay_authority *authority, qa_owned
 }
 
 static void free_bound_protection(bound_protection *binding) {
-  if (binding == NULL) return;
+  if (binding == NULL || --binding->refs != 0) return;
   qa_free_captured_original_pickup_rules(binding->pickups, binding->pickup_count);
   free(binding);
 }
@@ -268,7 +295,7 @@ static void on_release(void *ctx, qa_owned_actor actor) {
   }
   for (size_t i = 0; i < authority->binding_count; i++) {
     if (qa_same_owned_actor(authority->bindings[i]->actor, actor)) {
-      free(authority->bindings[i]);
+      free_binding_entry(authority, authority->bindings[i]);
       memmove(&authority->bindings[i], &authority->bindings[i + 1],
               (authority->binding_count - i - 1) * sizeof *authority->bindings);
       authority->binding_count--;
@@ -303,7 +330,7 @@ qa_gameplay_authority *qa_gameplay_authority_create(qa_session_actor_registry *a
 void qa_gameplay_authority_destroy(qa_gameplay_authority *authority) {
   if (authority == NULL) return;
   qa_session_actor_registry_off_release(authority->actors, authority->release_subscription);
-  for (size_t i = 0; i < authority->binding_count; i++) free(authority->bindings[i]);
+  for (size_t i = 0; i < authority->binding_count; i++) free_binding_entry(authority, authority->bindings[i]);
   free(authority->bindings);
   free(authority->cells);
   for (size_t i = 0; i < authority->protection_count; i++) {
@@ -324,6 +351,8 @@ void qa_gameplay_authority_destroy(qa_gameplay_authority *authority) {
   free(authority->dispatched);
   for (size_t i = 0; i < authority->retained_count; i++) free(authority->retained[i]);
   free(authority->retained);
+  for (size_t i = 0; i < authority->hit_retained_count; i++) free(authority->hit_retained[i]);
+  free(authority->hit_retained);
   qa_mod_operation_destroy(&authority->damage_op);
   free(authority->scratch_matches);
   free(authority->scratch_items);
@@ -396,6 +425,8 @@ void qa_gameplay_authority_rebind(qa_gameplay_authority *authority, qa_owned_act
     entry->binding = binding;
     /* A new binding object: not one create() copied. */
     entry->copied = false;
+    hit_retain(authority, entry->owned_state);
+    entry->owned_state = NULL;
     entry->version = ++authority->next_binding_version;
     entry->has_adjust_ctx = entry->has_admit_ctx = false;
     entry->adjust_ctx = entry->admit_ctx = NULL;
@@ -597,9 +628,9 @@ static void close_cursor(qa_gameplay_authority *authority, qa_owned_actor actor,
       break;
     }
   }
-  /* Mutations may be referenced by a returned decision: retain them. */
-  retain(authority, value->mutations);
-  retain(authority, value);
+  /* Mutations and the request's provenance may be referenced by a returned decision or outcome. */
+  hit_retain(authority, value->mutations);
+  hit_retain(authority, value);
 }
 /* try { ... } finally { closeCursor(target, cursor) } */
 typedef struct cursor_scope {
@@ -639,7 +670,7 @@ static qa_damage_decision build_decision(qa_gameplay_authority *authority,
                                          qa_combat_result result) {
   qa_damage_mutation *copy = xcalloc((count != 0 ? count : 1) * sizeof *copy);
   if (count != 0) memcpy(copy, mutations, count * sizeof *copy);
-  retain(authority, copy);
+  hit_retain(authority, copy);
   qa_damage_decision decision;
   memset(&decision, 0, sizeof decision);
   decision.request = request;
@@ -739,6 +770,15 @@ typedef struct absorb_observer_state {
 /* The observer's ctx is a closure handle: a component that keeps the
  * observer and calls it after its stage gets the TS "closed" throw. */
 static void close_observer_handle(void *token) { qa_world_handle_close(token); }
+typedef struct absorb_scope {
+  void *token;
+  bound_protection *protection;
+} absorb_scope;
+static void release_absorb_scope(void *arg) {
+  absorb_scope *scope = arg;
+  qa_world_handle_close(scope->token);
+  free_bound_protection(scope->protection);
+}
 static void absorb_stored(void *ctx, qa_protection_store change) {
   absorb_observer_state *state = qa_world_handle_get(ctx);
   if (state == NULL || !state->open) qa_error("Armor observer is closed");
@@ -787,11 +827,16 @@ static qa_armor_stage_result absorb_protection(qa_gameplay_authority *authority,
   qa_protection_observer observer;
   observer.ctx = qa_world_handle_open(&state);
   observer.stored = absorb_stored;
+  /* TS keeps the component object alive while its absorb runs: a component
+   * that removes itself mid-call (and its observer's owner check) still reads
+   * it. The call holds a reference so that removal cannot free it. */
+  protection->refs++;
+  absorb_scope scope = {observer.ctx, protection};
   qa_cleanup node; /* finally { open = false } */
-  qa_cleanup_push(&node, close_observer_handle, observer.ctx);
+  qa_cleanup_push(&node, release_absorb_scope, &scope);
   qa_armor_stage_result result = protection->binding.absorb(protection->binding.ctx, input, observer);
   qa_cleanup_pop(&node);
-  qa_world_handle_close(observer.ctx);
+  release_absorb_scope(&scope);
   state.open = false;
   if (!isfinite(result.saved) || result.saved < 0 || result.saved > input.amount)
     qa_error("Armor savings must be within the current damage amount");
@@ -871,6 +916,11 @@ static void release_progress_mutations(qa_combat_progress *progress) {
   free((void *)progress->mutations);
   progress->mutations = NULL;
   progress->mutation_count = 0;
+}
+static void progress_scope_release(void *arg) {
+  qa_combat_progress *progress = arg;
+  release_progress_mutations(progress);
+  discard_progress(progress);
 }
 typedef struct reservation_state {
   qa_gameplay_authority *authority;
@@ -959,13 +1009,18 @@ static void close_observe_release(void *arg) {
    * compares against it, as TS compares slot identity. */
   retain(authority, state->slot_value);
 }
+static void release_unbound_protection(void *arg) { free_bound_protection(arg); }
 static void reservation_close_fn(void *ctx) { reservation_close_impl(ctx); }
 static void reservation_close_cleanup(void *ctx) { reservation_close_impl(ctx); }
 static qa_armor_stage_removal reservation_bind_fn(void *ctx, qa_protection_binding original) {
   reservation_state *state = ctx;
   qa_gameplay_authority *authority = state->authority;
   bound_protection *bound = xcalloc(sizeof *bound);
+  bound->refs = 1;
   bound->binding = original;
+  /* Until the slot holds it, a raise drops the captured binding (TS GC). */
+  qa_cleanup bound_node;
+  qa_cleanup_push(&bound_node, release_unbound_protection, bound);
   size_t pickup_count = 0;
   bound->pickups = qa_capture_original_pickup_rules(original.pickups, original.pickup_count,
                                                     &pickup_count);
@@ -983,6 +1038,7 @@ static qa_armor_stage_removal reservation_bind_fn(void *ctx, qa_protection_bindi
        (!str_eq(state->claim.admission.kind, "replace-primary") ||
         !str_eq(original.claim.admission.owner, state->claim.admission.owner))))
     qa_error("Protection binding differs from its reservation");
+  qa_cleanup_pop(&bound_node);
   state->slot_value->binding = bound;
   /* try { attach the source stage } catch { close(); throw } */
   qa_cleanup node;
@@ -1116,6 +1172,11 @@ typedef struct pickup_current_state {
   bound_protection *binding;
   qa_protection_channel channel;
 } pickup_current_state;
+static void authority_pickup_release(void *ctx) {
+  pickup_current_state *state = ctx;
+  free_bound_protection(state->binding);
+  free(state);
+}
 static bool authority_pickup_current(void *ctx) {
   pickup_current_state *state = ctx;
   protection_entry *entry = find_protection(state->authority, state->actor);
@@ -1166,8 +1227,9 @@ qa_original_pickup_resolution qa_gameplay_authority_resolve_pickup(
         state->slot_value = slots[s];
         state->binding = binding;
         state->channel = binding->binding.channel;
-        retain(authority, state);
+        binding->refs++; /* the match reads the binding's captured rules until it is released */
         qa_current_original_pickup *match = &authority->scratch_matches[at++];
+        memset(match, 0, sizeof *match);
         match->ctx = state;
         match->owner = binding->binding.claim.owner;
         match->operation = rule->operation;
@@ -1180,6 +1242,7 @@ qa_original_pickup_resolution qa_gameplay_authority_resolve_pickup(
         match->captured.ctx = rule->take_ctx;
         match->write = write;
         match->current = authority_pickup_current;
+        match->release = authority_pickup_release;
       }
     }
   }
@@ -1360,7 +1423,6 @@ void qa_gameplay_authority_create_state(
   state->state = qa_copy_combat(initial);
   state->admit_damage = admit_damage;
   state->admit_ctx = admit_ctx;
-  retain(authority, state);
   qa_combat_state_binding binding;
   memset(&binding, 0, sizeof binding);
   binding.ctx = state;
@@ -1370,9 +1432,8 @@ void qa_gameplay_authority_create_state(
   binding.write_traits = copied_write_traits;
   if (admit_damage != NULL) binding.admit_damage = copied_admit;
   qa_session_actor_registry_assert_owned(authority->actors, actor);
-  if (find_binding_entry(authority, actor) != NULL)
-    qa_error("Actor already has a combat binding");
-  (void)add_binding(authority, actor, binding, true);
+  if (find_binding_entry(authority, actor) != NULL) { free(state); qa_error("Actor already has a combat binding"); }
+  add_binding(authority, actor, binding, true)->owned_state = state;
 }
 
 qa_combat_state_result qa_gameplay_authority_read(qa_gameplay_authority *authority,
@@ -1643,6 +1704,7 @@ qa_damage_outcome qa_gameplay_authority_run_source_damage(
     qa_source_damage_result (*execute)(void *ctx, qa_source_damage_observer observer,
                                        qa_damage_request request),
     void *execute_ctx) {
+  release_hit_retained(authority);
   authority->active_hits++;
   qa_cleanup node;
   qa_cleanup_push(&node, active_hits_release, authority);
@@ -1667,6 +1729,7 @@ void qa_gameplay_authority_source_reaction(qa_gameplay_authority *authority,
   if (!qa_session_actor_registry_resolve_owned(authority->actors, request.target, &target))
     return;
   if (!isfinite(result.applied_damage)) qa_error("Source applied damage must be finite");
+  release_hit_retained(authority);
   qa_combat_result combat;
   memset(&combat, 0, sizeof combat);
   combat.applied_damage = result.applied_damage;
@@ -1789,6 +1852,11 @@ static qa_damage_outcome apply_canonical(qa_gameplay_authority *authority,
                    attacker_state.has_value ? &attacker_state.value : NULL,
                    has_prepared, prepared_amount, &progress);
   }
+  /* A raise inside the loop (a rejected mutation or armor stage, a throwing
+   * component) drops the current progress: release its mutations and
+   * continuation state (TS GC). A resume owns its ctx once called. */
+  qa_cleanup progress_node;
+  qa_cleanup_push(&progress_node, progress_scope_release, &progress);
   for (;;) {
     if (!request_equal(progress.request, request))
       qa_error("Combat policy replaced attack provenance");
@@ -1824,6 +1892,7 @@ static qa_damage_outcome apply_canonical(qa_gameplay_authority *authority,
     if (str_eq(progress.kind, "source-continuation")) {
       qa_combat_progress next;
       memset(&next, 0, sizeof next);
+      progress.discard = NULL;
       progress.resume_source(progress.ctx, current, &next);
       progress = next;
       continue;
@@ -1871,9 +1940,11 @@ static qa_damage_outcome apply_canonical(qa_gameplay_authority *authority,
     }
     qa_combat_progress next;
     memset(&next, 0, sizeof next);
+    progress.discard = NULL;
     progress.resume_armor(progress.ctx, stage_result, current, &next);
     progress = next;
   }
+  qa_cleanup_pop(&progress_node);
   (void)have_decision;
   if (policy->after_health != NULL &&
       qa_session_actor_registry_is_live(authority->actors, target.id)) {
@@ -1967,6 +2038,7 @@ qa_damage_outcome qa_gameplay_authority_apply(
     state.entry_version = state.entry->version;
     state.original = state.entry->binding.source_damage;
   }
+  release_hit_retained(authority);
   authority->active_hits++;
   qa_cleanup node;
   qa_cleanup_push(&node, active_hits_release, authority);

@@ -47,12 +47,14 @@ void qa_bot_script_sources_dispose_resources(qa_bot_script_sources *s) {
 
 void qa_bot_script_sources_destroy(qa_bot_script_sources *s) {
   qa_bot_script_sources_dispose_resources(s);
+  free(s->resolved_path);
+  s->resolved_path = NULL;
   qa_bot_memory_destroy(&s->memory);
 }
 
 static void live(qa_bot_script_sources *s) {
   if (s->terminal)
-    qa_range_error("Bot script source resources have been disposed");
+    qa_raise("Error", 0, 0, "Bot script source resources have been disposed");
 }
 
 /* TS boundedPath: writes the 63-byte slice into out. */
@@ -198,12 +200,19 @@ bool qa_bot_script_sources_resolve(qa_bot_script_sources *s,
     strcpy(retry, prefix);
     strcat(retry, filename);
     storage = read_file(s, retry);
-    free(retry);
+    free(filename);
+    filename = retry;
   }
-  free(filename);
-  if (storage == NULL) return false;
+  if (storage == NULL) {
+    free(filename);
+    return false;
+  }
+  /* TS returns the source readFile allocated: its path is the path that was read (separator runs
+   * collapsed, or the retry under the including file's directory), not the text of the directive. */
+  free(s->resolved_path);
+  s->resolved_path = filename;
   memset(out, 0, sizeof *out);
-  out->path = request->requested_path;
+  out->path = s->resolved_path;
   out->storage = storage;
   return true;
 }
@@ -284,7 +293,7 @@ bool qa_bot_script_sources_read_token(qa_bot_script_sources *s, int64_t handle,
     return false;
   qa_ui_script_source_reader *source = s->handles[handle];
   if (source == NULL)
-    qa_range_error("script handle retired during a completed read");
+    qa_raise("Error", 0, 0, "script handle retired during a completed read");
   qa_ui_script_source_reader_current_record(source, out);
   return true;
 }
@@ -375,7 +384,7 @@ void qa_bot_script_sources_restore_save_state(
     const qa_ui_script_memory_restore *restore) {
   for (int i = 0; i < QA_BOT_MAX_SOURCE_FILES; i++)
     if (s->handles[i] != NULL)
-      qa_range_error("Script restore requires an empty handle owner");
+      qa_raise("Error", 0, 0, "Script restore requires an empty handle owner");
   if (s->globals == NULL)
     qa_range_error("Bot script sources have no script globals");
   qa_save_reader reader, folder_reader, terminal_reader, files_reader, globals_reader;

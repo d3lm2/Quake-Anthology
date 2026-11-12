@@ -45,7 +45,7 @@ qa_scene_group qa_source_draw_group(qa_registered_scene_material material, qa_so
   if (!is_int_num(source.fog) || source.fog < 0 || source.fog > 31) qa_range_error("Source fog index exceeds the draw-sort field");
   if (!is_int_num(source.dlight) || source.dlight < 0 || source.dlight > 3) qa_range_error("Source light flag exceeds the draw-sort field");
   if (!material.registration || material.registration->provider->owner != source.view->registrations)
-    qa_range_error("Source material belongs to another scene");
+    qa_raise("Error", 0, 0, "Source material belongs to another scene");
   qa_scene_group_order o; memset(&o, 0, sizeof o); o.kind = QA_GROUP_SOURCE; o.source_material = material; o.source = source;
   return make_group(o, batches, count, count == 0);
 }
@@ -53,13 +53,31 @@ qa_scene_group qa_sequence_draw_group(qa_sequence_phase phase, const qa_draw_bat
   qa_scene_group_order o; memset(&o, 0, sizeof o); o.kind = QA_GROUP_SEQUENCE; o.phase = phase;
   return make_group(o, batches, count, 0);
 }
+qa_scene_group qa_shadow_volume_group(qa_registered_scene_material material, const qa_source_surface_order *source, qa_render_operation operation) {
+  qa_scene_group_order o; memset(&o, 0, sizeof o);
+  if (source == NULL) { o.kind = QA_GROUP_COMPILED; o.material = qa_registered_scene_material_compiled(material); }
+  else {
+    /* sourceDrawGroup(material, source, []).order: its checks run, its (empty) operations are dropped. */
+    qa_scene_group ordered = qa_source_draw_group(material, *source, NULL, 0);
+    o = ordered.order;
+    qa_scene_group_destroy(&ordered);
+  }
+  qa_scene_group g; memset(&g, 0, sizeof g); g.order = o;
+  g.owned_operation = xalloc(sizeof *g.owned_operation);
+  *g.owned_operation = operation;
+  g.operations = g.owned_operation; g.operation_count = 1;
+  return g;
+}
 const qa_draw_batch **qa_scene_model_batches(const qa_scene_group *groups, size_t count, size_t *out_count) {
   size_t n = 0;
-  for (size_t i = 0; i < count; i++) for (size_t k = 0; k < groups[i].operation_count; k++) n += groups[i].operations[k].batch_count;
+  /* operation.kind === "draw" ? operation.batches : [] */
+  for (size_t i = 0; i < count; i++) for (size_t k = 0; k < groups[i].operation_count; k++)
+    if (groups[i].operations[k].kind == QA_RENDER_OP_DRAW) n += groups[i].operations[k].batch_count;
   const qa_draw_batch **result = xalloc((n ? n : 1) * sizeof *result);
   size_t w = 0;
   for (size_t i = 0; i < count; i++) for (size_t k = 0; k < groups[i].operation_count; k++)
-    for (size_t b = 0; b < groups[i].operations[k].batch_count; b++) result[w++] = &groups[i].operations[k].batches[b];
+    if (groups[i].operations[k].kind == QA_RENDER_OP_DRAW)
+      for (size_t b = 0; b < groups[i].operations[k].batch_count; b++) result[w++] = &groups[i].operations[k].batches[b];
   if (out_count) *out_count = w;
   return result;
 }
@@ -108,10 +126,10 @@ bool qa_finish_scene_operations(const qa_scene_operation *input, size_t count, q
       const qa_registered_scene_material *snap = qa_scene_material_registrations_snapshot(view->registrations, true, &snap_n);
       for (size_t i = 0; i < ns; i++) {
         qa_scene_group_order *order = (qa_scene_group_order *)&source[i].group->order;
-        if (order->source.view != view) qa_range_error("Different source views share a sortable range");
+        if (order->source.view != view) qa_raise("Error", 0, 0, "Different source views share a sortable range");
         long rank = -1;
         for (size_t k = 0; k < snap_n; k++) if (snap[k].registration == order->source_material.registration) rank = (long)k;
-        if (rank < 0) qa_range_error("Source material has no published shader rank");
+        if (rank < 0) qa_raise("Error", 0, 0, "Source material has no published shader rank");
         if (rank >= 16384) qa_range_error("Source shader rank exceeds the draw-sort field");
         double entity = order->source.entity.is_refentity ? order->source.entity.index : 1022;
         source[i].sort = qa_pack_source_draw_sort((double)rank, entity, order->source.fog, order->source.dlight);
@@ -174,7 +192,8 @@ static int same_lighting(qa_batch_lighting a, qa_batch_lighting b) {
   if (str_eq(a.kind, "q2-model-shadow"))
     return a.atlas_value.image.owner.identity == b.atlas_value.image.owner.identity && a.atlas_value.image.ordinal == b.atlas_value.image.ordinal
       && (!a.has_shade_scale ? !b.has_shade_scale : b.has_shade_scale && a.shade_scale == b.shade_scale)
-      && a.lights == b.lights && a.light_count == b.light_count;
+      /* a.lights === b.lights: the model-shadow light list (array identity), not the q2-world one. */
+      && a.model_shadow_lights == b.model_shadow_lights && a.model_shadow_light_count == b.model_shadow_light_count;
   if (str_eq(a.kind, "q2-world")) {
     if (!str_eq(a.pass, b.pass)) return 0;
     int atlas_eq = (a.atlas == NULL && b.atlas == NULL) || (a.atlas && b.atlas && a.atlas->image.owner.identity == b.atlas->image.owner.identity && a.atlas->image.ordinal == b.atlas->image.ordinal);

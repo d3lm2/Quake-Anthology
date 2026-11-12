@@ -34,6 +34,15 @@ static qa_byte_view read_level(qa_binary_reader *reader, double offset, double m
   return view;
 }
 
+static void *xcalloc(size_t count, size_t size) {
+  void *p = calloc(count == 0 ? 1 : count, size);
+  if (p == NULL) qa_range_error("Out of memory");
+  return p;
+}
+
+static void lump_release(void *lump) { qa_q1_texture_lump_destroy((qa_q1_texture_lump *)lump); }
+static void reader_release(void *reader) { qa_binary_reader_destroy((qa_binary_reader *)reader); }
+
 void qa_q1_read_textures(qa_binary_reader *reader, bool quake64, qa_q1_texture_lump *out) {
   memset(out, 0, sizeof *out);
   if (reader->length == 0) return;
@@ -41,9 +50,13 @@ void qa_q1_read_textures(qa_binary_reader *reader, bool quake64, qa_q1_texture_l
   if (count < 0 || (double)count > (double)qa_binary_reader_remaining(reader) / 4) {
     qa_binary_error(reader->source, 0, "invalid miptex count %d", (int)count);
   }
-  out->textures = xmalloc((size_t)count * sizeof *out->textures);
-  out->offsets = xmalloc((size_t)count * sizeof *out->offsets);
-  out->mip_offsets = xmalloc((size_t)count * sizeof *out->mip_offsets);
+  /* A BinaryError from a malformed texture releases the lump read so far: every
+   * slot is zeroed and each texture is attached as soon as it is allocated. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, lump_release, out);
+  out->textures = xcalloc((size_t)count, sizeof *out->textures);
+  out->offsets = xcalloc((size_t)count, sizeof *out->offsets);
+  out->mip_offsets = xcalloc((size_t)count, sizeof *out->mip_offsets);
   out->texture_count = out->offset_count = out->mip_offset_count = (size_t)count;
   for (int32_t i = 0; i < count; i++) {
     int32_t offset = qa_binary_reader_i32(reader);
@@ -61,12 +74,13 @@ void qa_q1_read_textures(qa_binary_reader *reader, bool quake64, qa_q1_texture_l
     double offset = out->offsets[i].value;
     qa_binary_reader header;
     section_or_die(reader, (int64_t)offset, (int64_t)header_size, &header);
-    char *name = qa_binary_reader_fixed_byte_string(&header, 16);
+    qa_cleanup header_guard;
+    qa_cleanup_push(&header_guard, reader_release, &header);
+    qa_q1_mip_texture *texture = xcalloc(1, sizeof *texture);
+    out->textures[i] = texture;
+    texture->name = qa_binary_reader_fixed_byte_string(&header, 16);
     double width = qa_binary_reader_u32(&header);
     double height = qa_binary_reader_u32(&header);
-    qa_q1_mip_texture *texture = xmalloc(sizeof *texture);
-    memset(texture, 0, sizeof *texture);
-    texture->name = name;
     texture->width = width;
     texture->height = height;
     if (quake64) {
@@ -75,6 +89,7 @@ void qa_q1_read_textures(qa_binary_reader *reader, bool quake64, qa_q1_texture_l
     }
     double mips[4];
     for (int j = 0; j < 4; j++) mips[j] = qa_binary_reader_u32(&header);
+    qa_cleanup_pop(&header_guard);
     qa_binary_reader_destroy(&header);
     out->mip_offsets[i].has_value = true;
     for (int j = 0; j < 4; j++) out->mip_offsets[i].values[j] = mips[j];
@@ -82,7 +97,6 @@ void qa_q1_read_textures(qa_binary_reader *reader, bool quake64, qa_q1_texture_l
     bool all_zero = mips[0] == 0 && mips[1] == 0 && mips[2] == 0 && mips[3] == 0;
     if (!quake64 && all_zero) {
       texture->is_embedded = false;
-      out->textures[i] = texture;
       continue;
     }
     texture->is_embedded = true;
@@ -90,8 +104,8 @@ void qa_q1_read_textures(qa_binary_reader *reader, bool quake64, qa_q1_texture_l
     texture->levels[1] = read_level(reader, offset, mips[1], 2, width, height, quake64, header_size);
     texture->levels[2] = read_level(reader, offset, mips[2], 4, width, height, quake64, header_size);
     texture->levels[3] = read_level(reader, offset, mips[3], 8, width, height, quake64, header_size);
-    out->textures[i] = texture;
   }
+  qa_cleanup_pop(&guard);
 }
 
 void qa_q1_texture_lump_destroy(qa_q1_texture_lump *lump) {

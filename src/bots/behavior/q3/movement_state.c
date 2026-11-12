@@ -2,6 +2,7 @@
 #include "qa/bots/behavior/q3/movement_state.h"
 #include "qa/foundation/support.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 _Static_assert(sizeof(qa_bot_avoid_spot) == 20, "avoid spot");
 _Static_assert(sizeof(qa_bot_move_record) == 772, "bot_movestate_t");
@@ -19,7 +20,7 @@ void qa_bot_move_state_init(qa_bot_move_state *st, qa_bot_memory *memory,
   st->memory = memory;
   if (restored != NULL) {
     if (restored->length != sizeof(qa_bot_move_record))
-      qa_range_error("Saved bot move allocation size mismatch");
+      qa_raise("Error", 0, 0, "Saved bot move allocation size mismatch");
     st->allocation = *restored;
   } else if (!qa_bot_memory_allocate(memory, sizeof(qa_bot_move_record), QA_BOT_MEMORY_HEAP, true,
                                      &st->allocation))
@@ -173,7 +174,7 @@ void qa_bot_move_state_store_add_avoid_spot(qa_bot_move_state_store *s, int64_t 
   if (r->num_avoid_spots >= QA_MAX_AVOID_SPOTS)
     return;
   if (r->num_avoid_spots < 0)
-    qa_range_error("Invalid move-state avoid-spot count");
+    qa_raise("Error", 0, 0, "Invalid move-state avoid-spot count");
   qa_bot_avoid_spot *sp = &r->avoid_spots[r->num_avoid_spots];
   sp->origin = qa_bot_fv3(o);
   sp->radius = (float)radius;
@@ -267,7 +268,35 @@ void qa_bot_move_state_store_restore(qa_bot_move_state_store *s, const qa_save_v
   if (!qa_save_reader_init(&reader, value, "bot.movement"))
     qa_range_error("Out of memory reading bot move checkpoint");
   field(&reader, "variables", &refs);
-  /* TS reads every variable pointer (integer(1)) before validating the states. */
+  /* TS image order: every states entry (allocation integer(0), walkEdge nullable integer(0)), then
+     every variable pointer (integer(1)), then the extent check. */
+  field(&reader, "states", &states);
+  size_t count = qa_save_reader_list_count(&states);
+  struct saved_state {
+    bool present, has_walk_edge;
+    int64_t allocation, walk_edge;
+  } *saved = calloc(count == 0 ? 1 : count, sizeof *saved);
+  if (saved == NULL)
+    qa_range_error("Out of memory reading bot move checkpoint");
+  qa_cleanup saved_guard;
+  qa_cleanup_push(&saved_guard, free, saved);
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader entry, cell;
+    if (!qa_save_reader_item(&states, i, &entry))
+      qa_range_error("Out of memory reading bot move checkpoint");
+    saved[i].present = !qa_save_reader_is_null(&entry);
+    if (saved[i].present) {
+      field(&entry, "allocation", &cell);
+      saved[i].allocation = (int64_t)qa_save_reader_integer_min(&cell, 0);
+      qa_save_reader_destroy(&cell);
+      field(&entry, "walkEdge", &cell);
+      saved[i].has_walk_edge = !qa_save_reader_is_null(&cell);
+      if (saved[i].has_walk_edge)
+        saved[i].walk_edge = (int64_t)qa_save_reader_integer_min(&cell, 0);
+      qa_save_reader_destroy(&cell);
+    }
+    qa_save_reader_destroy(&entry);
+  }
   double pointers[10];
   int next = 0;
 #define READ_POINTER(name, member)                                                                 \
@@ -279,46 +308,30 @@ void qa_bot_move_state_store_restore(qa_bot_move_state_store *s, const qa_save_v
   }
   VARIABLES(READ_POINTER)
 #undef READ_POINTER
-  field(&reader, "states", &states);
-  size_t count = qa_save_reader_list_count(&states);
-  bool invalid = count != QA_MAX_MOVE_STATES + 1;
+  bool invalid = count != QA_MAX_MOVE_STATES + 1 || saved[0].present;
   for (int i = 0; i <= QA_MAX_MOVE_STATES; i++)
     invalid = invalid || s->allocated[i];
-  if (!invalid) {
-    qa_save_reader first;
-    if (!qa_save_reader_item(&states, 0, &first))
-      qa_range_error("Out of memory reading bot move checkpoint");
-    invalid = !qa_save_reader_is_null(&first);
-    qa_save_reader_destroy(&first);
-  }
   if (invalid)
-    qa_range_error("Invalid bot move state restoration");
+    qa_raise("Error", 0, 0, "Invalid bot move state restoration");
   bool allocated[QA_MAX_MOVE_STATES + 1];
   qa_bot_move_state restored[QA_MAX_MOVE_STATES + 1];
   memset(allocated, 0, sizeof allocated);
   for (size_t i = 1; i < count; i++) {
-    qa_save_reader entry, cell;
-    if (!qa_save_reader_item(&states, i, &entry))
-      qa_range_error("Out of memory reading bot move checkpoint");
-    if (!qa_save_reader_is_null(&entry)) {
-      field(&entry, "allocation", &cell);
-      qa_bot_memory_allocation allocation =
-          qa_bot_memory_restored_allocation(memory, (int64_t)qa_save_reader_integer_min(&cell, 0));
-      qa_save_reader_destroy(&cell);
-      qa_bot_move_state_init(&restored[i], s->memory, &allocation);
-      allocated[i] = true;
-      field(&entry, "walkEdge", &cell);
-      if (!qa_save_reader_is_null(&cell)) {
-        int64_t id = (int64_t)qa_save_reader_integer_min(&cell, 0);
-        if (edge == NULL || !edge(edge_ctx, restored[i].src->client, id))
-          qa_range_error("Saved bot movement references an unknown navigation edge");
-        restored[i].has_walk_progress = true;
-        restored[i].walk_edge_id = id;
-      }
-      qa_save_reader_destroy(&cell);
+    if (!saved[i].present)
+      continue;
+    qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, saved[i].allocation);
+    qa_bot_move_state_init(&restored[i], s->memory, &allocation);
+    allocated[i] = true;
+    if (saved[i].has_walk_edge) {
+      int64_t id = saved[i].walk_edge;
+      if (edge == NULL || !edge(edge_ctx, restored[i].src->client, id))
+        qa_raise("Error", 0, 0, "Saved bot movement references an unknown navigation edge");
+      restored[i].has_walk_progress = true;
+      restored[i].walk_edge_id = id;
     }
-    qa_save_reader_destroy(&entry);
   }
+  qa_cleanup_pop(&saved_guard);
+  free(saved);
   next = 0;
   qa_bot_lib_var *resolved[10];
   for (int i = 0; i < 10; i++)

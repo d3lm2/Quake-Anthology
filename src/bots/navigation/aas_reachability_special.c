@@ -76,6 +76,12 @@ static void link_reach_s(qa_aas_reachability_special *s, int64_t area, qa_aas_li
   reach->next = qa_aas_at_head(s->context, area);
   s->context->heads[area] = reach;
 }
+static void area_links_release_s(void *arg) { qa_aas_area_link **head = arg; qa_aas_area_link_free(*head); *head = NULL; }
+static void reach_chain_release(void *arg) {
+  qa_aas_linked_reachability **head = arg;
+  for (qa_aas_linked_reachability *link = *head; link;) { qa_aas_linked_reachability *next = link->next; free(link); link = next; }
+  *head = NULL;
+}
 static void ctx_print(qa_aas_reachability_special *s, int64_t severity, const char *text) {
   qa_aas_reachability_context_print(s->context, severity, text);
 }
@@ -185,6 +191,8 @@ void qa_aas_reachability_special_teleport(qa_aas_reachability_special *special) 
     qa_bounds bounds = {qa_add3(model_origin, model_bounds.min), qa_add3(model_origin, model_bounds.max)};
     qa_vec3 midpoint = middle(bounds.min, bounds.max);
     qa_aas_area_link *areas = qa_aas_spatial_link_client_bounds(spatial, -1, bounds, 4);
+    qa_cleanup areas_guard; /* a raise below drops the temporary links (TS garbage) */
+    qa_cleanup_push(&areas_guard, area_links_release_s, &areas);
     if (!areas) ctx_print(special, 1, "trigger_multiple not in any area\n");
     for (qa_aas_area_link *link = areas; link; link = link->next_area) {
       if (!area_teleport_s(special, link->area)) continue;
@@ -201,6 +209,7 @@ void qa_aas_reachability_special_teleport(qa_aas_reachability_special *special) 
       link_reach_s(special, link->area, reach);
       qa_aas_reachability_debug_count(&c->debug_state, "teleport");
     }
+    qa_cleanup_pop(&areas_guard);
     qa_aas_area_link_free(areas);
   }
 }
@@ -324,6 +333,8 @@ static qa_aas_linked_reachability *find_face_reachabilities(qa_aas_reachability_
   qa_aas_reachability_spatial *spatial = c->spatial;
   const qa_aas_movement_settings *settings = c->settings;
   qa_aas_linked_reachability *links = NULL;
+  qa_cleanup links_guard; /* a raise drops the links found so far */
+  qa_cleanup_push(&links_guard, reach_chain_release, &links);
   int64_t best_face = 0;
   const qa_aas_plane_rec *best_plane = NULL;
   qa_aas_closest_edge_state state; memset(&state, 0, sizeof state);
@@ -360,7 +371,7 @@ static qa_aas_linked_reachability *find_face_reachabilities(qa_aas_reachability_
     qa_vec3 test_point = with_z(test, (double)fr(best_plane->distance - qa_dot3(best_plane->normal, test)) / best_plane->normal.z);
     if (!qa_aas_spatial_point_inside_face(spatial, best_face, test_point, fr(0.1)) && (double)fr(end.z - 16) > start.z) continue;
     qa_aas_linked_reachability *reach = qa_aas_reachability_context_allocate(c);
-    if (!reach) return links;
+    if (!reach) { qa_cleanup_pop(&links_guard); return links; }
     qa_aas_link_set_area(reach, area_number);
     qa_aas_link_set_face(reach, 0);
     qa_aas_link_set_edge(reach, 0);
@@ -371,6 +382,7 @@ static qa_aas_linked_reachability *find_face_reachabilities(qa_aas_reachability_
     reach->next = links; links = reach;
     qa_aas_reachability_context_permanent_line(c, qa_aas_link_start(reach), qa_aas_link_end(reach), towards_face ? 1 : 2);
   }
+  qa_cleanup_pop(&links_guard);
   return links;
 }
 void qa_aas_reachability_special_func_bobbing(qa_aas_reachability_special *special) {
@@ -435,8 +447,12 @@ void qa_aas_reachability_special_func_bobbing(qa_aas_reachability_special *speci
     for (int direction = 0; direction < 2; direction++) {
       qa_aas_linked_reachability *starts = find_face_reachabilities(special, direction == 0 ? start_points : end_points, 4,
                                                                      direction == 0 ? start_plane : end_plane, true);
-      qa_aas_linked_reachability *ends = find_face_reachabilities(special, direction == 0 ? end_points : start_points, 4,
-                                                                   direction == 0 ? end_plane : start_plane, false);
+      qa_cleanup starts_guard, ends_guard; /* a raise below drops the temporary links (TS garbage) */
+      qa_aas_linked_reachability *ends = NULL;
+      qa_cleanup_push(&starts_guard, reach_chain_release, &starts);
+      qa_cleanup_push(&ends_guard, reach_chain_release, &ends);
+      ends = find_face_reachabilities(special, direction == 0 ? end_points : start_points, 4,
+                                      direction == 0 ? end_plane : start_plane, false);
       qa_aas_linked_reachability *next_start = NULL, *next_end = NULL;
       for (qa_aas_linked_reachability *start_reach = starts; start_reach; start_reach = next_start) {
         next_start = start_reach->next;
@@ -459,11 +475,12 @@ void qa_aas_reachability_special_func_bobbing(qa_aas_reachability_special *speci
           qa_aas_linked_reachability *reach = qa_aas_reachability_context_allocate(c);
           if (!reach) qa_range_error("AAS_Reachability_FuncBobbing would dereference a failed reachability allocation");
           qa_aas_link_set_area(reach, qa_aas_link_area(end_reach));
-          int64_t edge_value = direction == 0
-              ? (source_int(axis_of(move_start, axis)) << 16) | (source_int(axis_of(move_end, axis)) & 0xffff)
-              : (source_int(axis_of(move_end, axis)) << 16) | (source_int(axis_of(move_start, axis)) & 0xffff);
-          qa_aas_link_set_edge(reach, edge_value);
-          qa_aas_link_set_face(reach, (spawn_flags << 16) | model_number);
+          /* (a << 16) | (b & 0xffff) and (spawnFlags << 16) | modelNumber are int32 operations;
+           * a negative coordinate or spawnflags must not be shifted as a signed C value. */
+          int64_t high = direction == 0 ? source_int(axis_of(move_start, axis)) : source_int(axis_of(move_end, axis));
+          int64_t low = direction == 0 ? source_int(axis_of(move_end, axis)) : source_int(axis_of(move_start, axis));
+          qa_aas_link_set_edge(reach, (int32_t)(((uint32_t)high << 16) | ((uint32_t)low & 0xffffu)));
+          qa_aas_link_set_face(reach, (int32_t)(((uint32_t)spawn_flags << 16) | (uint32_t)model_number));
           qa_aas_link_set_start(reach, qa_aas_link_start(start_reach));
           qa_aas_link_set_end(reach, qa_aas_link_end(end_reach));
           qa_aas_link_set_travel_type(reach, QA_TRAVEL_FUNCBOB);
@@ -473,6 +490,8 @@ void qa_aas_reachability_special_func_bobbing(qa_aas_reachability_special *speci
           link_reach_s(special, qa_aas_link_area(start_reach), reach);
         }
       }
+      qa_cleanup_pop(&ends_guard);
+      qa_cleanup_pop(&starts_guard);
       for (qa_aas_linked_reachability *link = starts; link;) {
         qa_aas_linked_reachability *next = link->next;
         qa_aas_reachability_context_free_link(c, link);
@@ -505,11 +524,13 @@ void qa_aas_reachability_special_jump_pad(qa_aas_reachability_special *special) 
     if (!qa_aas_spatial_get_jump_pad_info(spatial, entity, &pad)) continue;
     qa_vec3 start = pad.start, velocity = pad.velocity;
     qa_aas_area_link *areas = qa_aas_spatial_link_client_bounds(spatial, -1, pad.bounds, 4);
+    qa_cleanup areas_guard; /* a raise below drops the temporary links (TS garbage) */
+    qa_cleanup_push(&areas_guard, area_links_release_s, &areas);
     qa_aas_area_link *pad_link = areas;
     while (pad_link && !area_jump_pad_s(special, pad_link->area)) pad_link = pad_link->next_area;
     if (!pad_link) {
       ctx_print(special, 1, "trigger_push not in any jump pad area\n");
-      qa_aas_area_link_free(areas);
+      qa_cleanup_pop(&areas_guard); qa_aas_area_link_free(areas);
       continue;
     }
     char fx[64], fy[64], fz[64];
@@ -537,11 +558,11 @@ void qa_aas_reachability_special_jump_pad(qa_aas_reachability_special *special) 
         start = move.end; velocity = move.velocity;
       }
       if (destination_area != 0 && frame < 20) {
-        if (!has_move) qa_range_error("Jump-pad movement has no prediction output");
+        if (!has_move) qa_raise("Error", 0, 0, "Jump-pad movement has no prediction output");
         for (qa_aas_area_link *link = areas; link; link = link->next_area) {
           if (!area_jump_pad_s(special, link->area) || qa_aas_reachability_context_exists(c, link->area, destination_area)) continue;
           qa_aas_linked_reachability *reach = qa_aas_reachability_context_allocate(c);
-          if (!reach) { qa_aas_area_link_free(areas); return; }
+          if (!reach) { qa_cleanup_pop(&areas_guard); qa_aas_area_link_free(areas); return; }
           qa_aas_link_set_area(reach, destination_area);
           qa_aas_link_set_face(reach, source_int(velocity.z));
           qa_aas_link_set_edge(reach, source_int(sqrt((double)fr((double)fr(velocity.x * velocity.x) + (double)fr(velocity.y * velocity.y)))));
@@ -555,7 +576,7 @@ void qa_aas_reachability_special_jump_pad(qa_aas_reachability_special *special) 
         }
       }
     }
-    if (fabs(velocity.x) > 100 || fabs(velocity.y) > 100) { qa_aas_area_link_free(areas); continue; }
+    if (fabs(velocity.x) > 100 || fabs(velocity.y) > 100) { qa_cleanup_pop(&areas_guard); qa_aas_area_link_free(areas); continue; }
     for (int64_t destination_area = 1; destination_area < (int64_t)world->area_count; destination_area++) {
       qa_aas_area_link *source_link = areas;
       for (; source_link; source_link = source_link->next_area)
@@ -588,7 +609,7 @@ void qa_aas_reachability_special_jump_pad(qa_aas_reachability_special *special) 
         for (qa_aas_area_link *link = areas; link; link = link->next_area) {
           if (!area_jump_pad_s(special, link->area) || qa_aas_reachability_context_exists(c, link->area, destination_area)) continue;
           qa_aas_linked_reachability *reach = qa_aas_reachability_context_allocate(c);
-          if (!reach) { qa_aas_area_link_free(areas); return; }
+          if (!reach) { qa_cleanup_pop(&areas_guard); qa_aas_area_link_free(areas); return; }
           qa_aas_link_set_area(reach, move.end_area);
           qa_aas_link_set_face(reach, source_int(velocity.z));
           qa_aas_link_set_edge(reach, source_int(sqrt((double)fr((double)fr(command.x * command.x) + (double)fr(command.y * command.y)))));
@@ -602,7 +623,7 @@ void qa_aas_reachability_special_jump_pad(qa_aas_reachability_special *special) 
         }
       }
     }
-    qa_aas_area_link_free(areas);
+    qa_cleanup_pop(&areas_guard); qa_aas_area_link_free(areas);
   }
 }
 bool qa_aas_reachability_special_grapple(qa_aas_reachability_special *special, int64_t from, int64_t to) {
@@ -653,11 +674,9 @@ bool qa_aas_reachability_special_grapple(qa_aas_reachability_special *special, i
         qa_aas_reachability_context_exists(c, from, destination_area) || !area_grounded_s(special, destination_area)) continue;
     size_t crossing_count = 0;
     qa_aas_area_crossing *crossings = qa_aas_spatial_trace_areas(spatial, area_start, bsp_trace.end, 20, &crossing_count);
-    bool blocked = crossing_count >= 20;
-    for (size_t ci = 0; ci < crossing_count; ci++)
-      if ((qa_aas_at_setting(world, crossings[ci].area)->contents & 8) != 0) blocked = true;
-    free(crossings);
-    if (blocked) continue;
+    /* crossings.length >= 20 || crossings.some(...): the area test is not reached at 20. */
+    if (crossing_count >= 20) { free(crossings); continue; }
+    if (qa_aas_crossings_any_contents(world, crossings, crossing_count, 8)) continue;
     qa_aas_linked_reachability *reach = qa_aas_reachability_context_allocate(c);
     if (!reach) return false;
     qa_aas_link_set_area(reach, destination_area);

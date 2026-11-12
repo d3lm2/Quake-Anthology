@@ -91,9 +91,11 @@ void qa_ranking_lifecycle_account(qa_ranking_lifecycle *l, double slot, const qa
   set_player(l, slot, player_state("pending", NULL));
   const char *error = NULL;
   qa_ranking_login_result result; memset(&result, 0, sizeof result);
+  /* The catch marks the player with the error's message (or "Ranking login failed"); the
+   * enqueue catch then marks the service with it (or "Ranking service failed"). */
   if (!l->provider->login(l->provider->ctx, l->match, request, &result, &error)) {
     set_player(l, slot, player_state("denied", error ? error : "Ranking login failed"));
-    fail(l, error ? error : "Ranking login failed");
+    fail(l, error);
   }
   if (!result.active) { set_player(l, slot, player_state("denied", result.reason)); return; }
   for (size_t i = 0; i < l->count; i++)
@@ -103,7 +105,7 @@ void qa_ranking_lifecycle_account(qa_ranking_lifecycle *l, double slot, const qa
     }
   if (!l->provider->join(l->provider->ctx, l->match, result.account, &error)) {
     set_player(l, slot, player_state("denied", error ? error : "Ranking login failed"));
-    fail(l, error ? error : "Ranking login failed");
+    fail(l, error);
   }
   qa_ranking_player_state active; memset(&active, 0, sizeof active);
   active.kind = "active"; active.account = result.account;

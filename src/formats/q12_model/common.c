@@ -61,11 +61,15 @@ double *qa_q12_intervals(qa_binary_reader *reader, double frame_count, size_t *o
   (void)qa_binary_reader_data_view(reader, (int64_t)reader->cursor, (int64_t)(frame_count * 4));
   size_t count = (size_t)frame_count;
   double *result = xmalloc(count * sizeof *result);
+  /* A bad interval raises: the endpoints read so far must not leak. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, result);
   for (size_t i = 0; i < count; i++) {
     double endpoint = qa_binary_reader_finite_f32(reader);
     if (endpoint <= 0) qa_q12_fail(reader, "group interval must be positive");
     result[i] = endpoint;
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }

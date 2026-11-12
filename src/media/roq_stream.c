@@ -116,16 +116,23 @@ static int64_t stream_read(qa_roq_stream *stream, int64_t length) {
   return count;
 }
 
+/* TS `${this.source}@${offset}`: malloc'd, any length. */
+static char *located_source(const qa_roq_stream *stream, int64_t offset) {
+  size_t length = strlen(stream->source) + 24;
+  char *source = (char *)malloc(length);
+  if (source == NULL) media_error("out of memory");
+  snprintf(source, length, "%s@%lld", stream->source, (long long)offset);
+  return source;
+}
+
 static qa_roq_chunk_header parse_header(qa_roq_stream *stream,
                                         int64_t offset) {
-  char source[1024];
-  snprintf(source, sizeof source, "%s@%lld", stream->source,
-           (long long)(stream->buffer_offset + offset));
+  char *source = located_source(stream, stream->buffer_offset + offset);
   qa_binary_reader reader;
-  if (!qa_binary_reader_init(&reader, stream->buffer + (size_t)offset, 8,
-                             source)) {
-    media_error("out of memory");
-  }
+  bool ok = qa_binary_reader_init(&reader, stream->buffer + (size_t)offset, 8,
+                                  source);
+  free(source);
+  if (!ok) media_error("out of memory");
   qa_roq_chunk_header header;
   header.id = qa_binary_reader_u16(&reader);
   /* cl_cin reads three size bytes and skips the fourth. */
@@ -250,15 +257,13 @@ bool qa_roq_stream_next_chunk(qa_roq_stream *stream,
                         stream->end_policy == QA_ROQ_END_CINEMATIC_LOOKAHEAD
                     ? scratch_limit(stream, true)
                     : offset + decoded_size;
-  char source[1024];
-  snprintf(source, sizeof source, "%s@%lld", stream->source,
-           (long long)(stream->buffer_offset + offset));
+  char *source = located_source(stream, stream->buffer_offset + offset);
   out->header = header;
-  if (!qa_binary_reader_init(&out->reader,
-                             stream->buffer + (size_t)offset,
-                             (size_t)(end - offset), source)) {
-    media_error("out of memory");
-  }
+  bool ok = qa_binary_reader_init(&out->reader,
+                                  stream->buffer + (size_t)offset,
+                                  (size_t)(end - offset), source);
+  free(source);
+  if (!ok) media_error("out of memory");
   return true;
 }
 
@@ -448,13 +453,16 @@ void qa_roq_stream_restore_checkpoint(qa_roq_stream *stream,
   read_field(&r, "buffer", &f);
   size_t buffer_length = 0;
   const uint8_t *buffer = qa_save_reader_bytes(&f, &buffer_length);
+  /* TS r.fail: the record's path, not the field's. */
   if (buffer_length != stream->buffer_length) {
-    qa_save_reader_fail(&f, "scratch buffer size differs");
+    qa_save_reader_fail(&r, "scratch buffer size differs");
   }
   uint8_t *buffer_copy = (uint8_t *)malloc(buffer_length == 0 ? 1 : buffer_length);
   if (buffer_copy == NULL) media_error("out of memory");
   memcpy(buffer_copy, buffer, buffer_length);
   qa_save_reader_destroy(&f);
+  qa_cleanup copy_guard;
+  qa_cleanup_push(&copy_guard, free, buffer_copy);
   bool has_header = false;
   uint8_t header_bytes[8] = {0};
   read_field(&r, "header", &f);
@@ -535,6 +543,7 @@ void qa_roq_stream_restore_checkpoint(qa_roq_stream *stream,
   stream->has_next_header = has_next;
   stream->next_header = next_header;
   memcpy(stream->buffer, buffer_copy, buffer_length);
+  qa_cleanup_pop(&copy_guard);
   free(buffer_copy);
   qa_save_reader_destroy(&r);
   if (closed) qa_roq_stream_close(stream);

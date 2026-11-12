@@ -349,7 +349,7 @@ static int64_t choose_weapon(void *ctx, struct qa_bot_library_bots_a *library,
       continue;
     double horizontal = inventory(state, QA_INV_ENEMY_HORIZONTAL_DIST);
     double height = inventory(state, QA_INV_ENEMY_HEIGHT);
-    double distance = hypot(horizontal, height);
+    double distance = qa_js_hypot2(horizontal, height); /* Math.hypot, not C hypot */
     if (candidate->has_maximum_range && distance > candidate->maximum_range)
       continue;
     int64_t weapon_slot, ammo_slot;

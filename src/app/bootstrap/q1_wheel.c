@@ -6,6 +6,8 @@
 #include <string.h>
 #include "qa/content/catalog/index.h"
 #include "qa/content/mounts.h"
+#include "qa/formats/text_decoder.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
 #include "qa/network/common/js_number.h"
@@ -115,11 +117,10 @@ void qa_app_application_q1_wheel_prepare(qa_app_application_q1_wheel *wheel, qa_
   qa_app_provider_scene_assets provider = qa_app_application_assets_provider(assets, content);
   qa_content_opened_resource file;
   if (!qa_content_mounted_open(provider.mounts, "wwheel.txt", NULL, NULL, &file)) return;
-  /* new TextDecoder().decode(bytes): the C text is the bytes (invalid UTF-8 is not replaced). */
-  char *text = malloc(file.byte_length + 1);
-  if (text == NULL) qa_range_error("Out of memory");
-  memcpy(text, file.bytes, file.byte_length); text[file.byte_length] = '\0';
+  /* new TextDecoder().decode(bytes): a leading BOM dropped, invalid UTF-8 as U+FFFD. */
+  char *text = qa_text_decoder_decode(file.bytes, file.byte_length, NULL);
   free(file.bytes);
+  if (text == NULL) qa_range_error("Out of memory");
   qa_ui_q1_wheel_parse parsed;
   memset(&parsed, 0, sizeof parsed);
   bool ok = qa_ui_parse_q1_weapon_wheel(text, &parsed);
@@ -156,7 +157,7 @@ void qa_app_application_q1_wheel_prepare(qa_app_application_q1_wheel *wheel, qa_
       qa_caught_error caught;
       if (qa_try(icon_load_run, &load, &caught)) { set_image(wheel, paths[p], load.id); continue; }
       char *key = joined_text("q1-wheel-icon:", content, "/", paths[p], "");
-      char *message = joined_text("Weapon wheel icon ", paths[p], " unavailable: ", caught.message, "\n");
+      char *message = joined_text("Weapon wheel icon ", paths[p], " unavailable: ", qa_caught_message(&caught), "\n");
       qa_app_application_assets_warn_once(assets, key, message);
       free(key); free(message);
     }

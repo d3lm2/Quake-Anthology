@@ -24,7 +24,7 @@ uint64_t qa_add_guest_pointer(uint64_t value, int64_t displacement, int pointer_
 
 struct qa_sparse_write_observer {
   uint64_t id;
-  bool removed;
+  bool removed; /* unobserved while a delivery was in progress; unlinked when it ends */
   qa_guest_write_observer_fn notify;
   void *ctx;
   /* watched chunks in backing coordinates */
@@ -133,6 +133,7 @@ static qa_sparse_backing *new_backing(qa_sparse_guest_memory *mem, uint8_t *byte
   qa_sparse_backing *backing = (qa_sparse_backing *)xcalloc(1, sizeof *backing);
   backing->bytes = bytes;
   backing->byte_length = byte_length;
+  backing->slot = mem->backing_count;
   if (mem->backing_count == mem->backing_cap) {
     mem->backing_cap = mem->backing_cap == 0 ? 8 : mem->backing_cap * 2;
     mem->backings = (qa_sparse_backing **)xrealloc(mem->backings, mem->backing_cap * sizeof *mem->backings);
@@ -141,13 +142,62 @@ static qa_sparse_backing *new_backing(qa_sparse_guest_memory *mem, uint8_t *byte
   return backing;
 }
 
-static qa_sparse_mapping *new_mapping(uint64_t base, size_t byte_length, qa_guest_permissions permissions,
-                                      const char *label, qa_sparse_backing *backing, size_t backing_offset) {
+/* TS frees a backing buffer once nothing refers to it: here when the last mapping and the last observer chunk let go. */
+static void backing_release(qa_sparse_guest_memory *mem, qa_sparse_backing *backing) {
+  if (--backing->refs != 0) return;
+  qa_sparse_backing *moved = mem->backings[mem->backing_count - 1u];
+  mem->backings[backing->slot] = moved;
+  moved->slot = backing->slot;
+  mem->backing_count--;
+  free(backing->bytes);
+  free(backing->page_revisions);
+  free(backing);
+}
+
+static size_t label_hash(const char *text) {
+  uint64_t hash = 1469598103934665603ull; /* FNV-1a */
+  for (const unsigned char *p = (const unsigned char *)text; *p != 0; p++) hash = (hash ^ *p) * 1099511628211ull;
+  return (size_t)hash;
+}
+static const char *intern_label(qa_sparse_guest_memory *mem, const char *label) {
+  if (mem->label_capacity != 0) {
+    for (size_t i = label_hash(label) & (mem->label_capacity - 1u);; i = (i + 1u) & (mem->label_capacity - 1u)) {
+      if (mem->label_slots[i] == NULL) break;
+      if (mem->label_slots[i] == label || strcmp(mem->label_slots[i], label) == 0) return mem->label_slots[i];
+    }
+  }
+  if ((mem->label_count + 1u) * 2u > mem->label_capacity) {
+    size_t capacity = mem->label_capacity == 0 ? 64 : mem->label_capacity * 2u;
+    char **slots = (char **)xcalloc(capacity, sizeof *slots);
+    for (size_t i = 0; i < mem->label_capacity; i++) {
+      char *entry = mem->label_slots[i];
+      if (entry == NULL) continue;
+      size_t at = label_hash(entry) & (capacity - 1u);
+      while (slots[at] != NULL) at = (at + 1u) & (capacity - 1u);
+      slots[at] = entry;
+    }
+    free(mem->label_slots);
+    mem->label_slots = slots;
+    mem->label_capacity = capacity;
+  }
+  char *copy = dup_str(label);
+  size_t at = label_hash(copy) & (mem->label_capacity - 1u);
+  while (mem->label_slots[at] != NULL) at = (at + 1u) & (mem->label_capacity - 1u);
+  mem->label_slots[at] = copy;
+  mem->label_count++;
+  return copy;
+}
+
+static qa_sparse_mapping *new_mapping(qa_sparse_guest_memory *mem, uint64_t base, size_t byte_length,
+                                      qa_guest_permissions permissions, const char *label, qa_sparse_backing *backing,
+                                      size_t backing_offset) {
   qa_sparse_mapping *m = (qa_sparse_mapping *)xcalloc(1, sizeof *m);
+  m->serial = ++mem->next_mapping_serial;
+  backing->refs++;
   m->base = base;
   m->byte_length = byte_length;
   m->permissions = permissions;
-  m->label = dup_str(label);
+  m->label = intern_label(mem, label);
   m->backing = backing;
   m->backing_offset = backing_offset;
   m->end = base + (uint64_t)byte_length;
@@ -166,7 +216,6 @@ static void insert_mapping(qa_sparse_guest_memory *mem, qa_sparse_mapping *mappi
   memmove(mem->mappings + at + 1, mem->mappings + at, (mem->mapping_count - at) * sizeof *mem->mappings);
   mem->mappings[at] = mapping;
   mem->mapping_count++;
-  mem->mapped_total += mapping->byte_length;
 }
 
 /* TS #recentMappings key: read, write, execute, or "any" for access null. */
@@ -175,8 +224,8 @@ static int recent_slot(bool has_access, qa_guest_access access) {
   return access == QA_ACCESS_READ ? 0 : access == QA_ACCESS_WRITE ? 1 : 2;
 }
 
-/* TS #remember. Retired mappings stay alive, so stale slots only need the
- * active check their readers already make. */
+/* TS #remember. A retired mapping is dropped from these slots when it is freed, which reads the same as the
+ * inactive entry TS keeps and skips. */
 static void remember(qa_sparse_guest_memory *mem, int slot, qa_sparse_mapping *mapping) {
   mem->recent_mappings[slot] = mapping;
   for (size_t i = 0; i < QA_SPARSE_WORKING_SET; i++)
@@ -309,14 +358,44 @@ static void invalidate_code(qa_sparse_backing *backing, size_t absolute_offset, 
   for (size_t i = first; i <= last; i++) backing->page_revisions[i] += 1u; /* fresh revision token */
 }
 
+static void free_observer(qa_sparse_guest_memory *mem, qa_sparse_write_observer *observer) {
+  for (size_t i = 0; i < observer->chunk_count; i++) backing_release(mem, observer->chunks[i].backing);
+  free(observer->chunks);
+  free(observer);
+}
+/* Drops the observers unobserved during a delivery, once no delivery still refers to them. */
+static void sweep_observers(qa_sparse_guest_memory *mem) {
+  mem->observers_unlinked = false;
+  for (qa_sparse_write_observer **link = &mem->observers; *link != NULL;) {
+    qa_sparse_write_observer *observer = *link;
+    if (!observer->removed) { link = &observer->next; continue; }
+    *link = observer->next;
+    free_observer(mem, observer);
+  }
+}
+
+typedef struct observer_call {
+  qa_sparse_write_observer *observer;
+  const qa_guest_written_range *ranges;
+  size_t range_count;
+} observer_call;
+static void observer_call_run(void *ctx) {
+  observer_call *call = (observer_call *)ctx;
+  call->observer->notify(call->observer->ctx, call->ranges, call->range_count);
+}
+
 /* TS #notifyWrite. TS indexes watched ranges by backing page (PERF1); the
  * result is the same as this full scan: observers in registration order,
  * ranges in watched-then-written chunk order. Every pending range is
  * collected first, then #writeDeliveries counts the store once, then the
- * observers run. */
-static void notify_write(qa_sparse_guest_memory *mem, const chunk *written, size_t written_count) {
-  if (mem->observers == NULL) return;
-  /* Snapshot the observer list; callbacks may add/remove/write. */
+ * observers run. An observer that raises does not stop the others: one error
+ * is rethrown as it was, several become TS's AggregateError. `release` is
+ * storage of the caller's (its chunk list) freed before this returns or raises. */
+static void notify_write(qa_sparse_guest_memory *mem, const chunk *written, size_t written_count, void *release) {
+  bool any = false;
+  for (qa_sparse_write_observer *observer = mem->observers; observer != NULL && !any; observer = observer->next)
+    any = !observer->removed;
+  if (!any) { free(release); return; }
   size_t count = 0, cap = 0;
   struct pending { qa_sparse_write_observer *observer; qa_guest_written_range *ranges; size_t range_count; } *pending = NULL;
   for (qa_sparse_write_observer *observer = mem->observers; observer != NULL; observer = observer->next) {
@@ -355,17 +434,45 @@ static void notify_write(qa_sparse_guest_memory *mem, const chunk *written, size
     pending[count].range_count = range_count;
     count++;
   }
+  free(release); /* the written chunks are not read past this point */
   if (count == 0) return;
   mem->write_deliveries++;
+  /* A fault an observer takes on this memory is an ordinary throw of the observer here (TS collects it with the
+   * others), so it must not leave through the processor's fault target and skip the frames below. */
+  qa_guest_throw *const outer_throw = mem->throw_ctx;
+  mem->throw_ctx = NULL;
+  mem->notify_depth++;
+  size_t error_count = 0;
+  qa_caught_error *first_error = NULL;
   for (size_t i = 0; i < count; i++) {
-    if (!pending[i].observer->removed)
-      pending[i].observer->notify(pending[i].observer->ctx, pending[i].ranges, pending[i].range_count);
+    if (pending[i].observer->removed) continue;
+    observer_call call = { pending[i].observer, pending[i].ranges, pending[i].range_count };
+    qa_caught_error caught;
+    if (qa_try(observer_call_run, &call, &caught)) continue;
+    if (error_count++ == 0) {
+      first_error = (qa_caught_error *)malloc(sizeof *first_error);
+      if (first_error != NULL) *first_error = caught;
+    }
   }
+  mem->notify_depth--;
+  mem->throw_ctx = outer_throw;
   for (size_t i = 0; i < count; i++) free(pending[i].ranges);
   free(pending);
+  if (mem->notify_depth == 0 && mem->observers_unlinked) sweep_observers(mem);
+  if (error_count == 0) return;
+  if (error_count == 1 && first_error != NULL) {
+    qa_caught_error only = *first_error;
+    free(first_error);
+    /* TS rethrows the observer's own error: a GuestMemoryFault stays one for the processor that is running. */
+    if (strcmp(only.name, "GuestMemoryFault") == 0) qa_guest_rethrow_memory(outer_throw, only.message);
+    qa_rethrow(&only);
+  }
+  free(first_error);
+  qa_raise("AggregateError", 0, 0, "Guest write observers failed");
 }
 
-static void commit_write(qa_sparse_guest_memory *mem, const chunk *chunks, size_t count, const uint8_t *source) {
+/* Stores the bytes; the caller then reports the write with notify_write. */
+static void store_chunks(const chunk *chunks, size_t count, const uint8_t *source) {
   size_t consumed = 0;
   for (size_t i = 0; i < count; i++) {
     qa_sparse_mapping *m = chunks[i].mapping;
@@ -374,7 +481,6 @@ static void commit_write(qa_sparse_guest_memory *mem, const chunk *chunks, size_
     invalidate_code(m->backing, abs_off, chunks[i].byte_length);
     consumed += chunks[i].byte_length;
   }
-  notify_write(mem, chunks, count);
 }
 
 static void copy_chunks_into(const chunk *chunks, size_t count, uint8_t *dest) {
@@ -405,13 +511,15 @@ static size_t contiguous_offset(qa_sparse_guest_memory *mem, const chunk *chunks
   return start;
 }
 
+/* TS `mapping.active = false`: nothing reaches the object again (guards and fetch sequences revalidate by serial
+ * and generation), so it is freed here and its backing follows when this was the last holder. */
 static void retire_mapping(qa_sparse_guest_memory *mem, qa_sparse_mapping *mapping) {
-  mapping->active = false;
-  if (mem->retired_count == mem->retired_cap) {
-    mem->retired_cap = mem->retired_cap == 0 ? 8 : mem->retired_cap * 2;
-    mem->retired = (qa_sparse_mapping **)xrealloc(mem->retired, mem->retired_cap * sizeof *mem->retired);
-  }
-  mem->retired[mem->retired_count++] = mapping;
+  for (size_t i = 0; i < 4; i++)
+    if (mem->recent_mappings[i] == mapping) mem->recent_mappings[i] = NULL;
+  for (size_t i = 0; i < QA_SPARSE_WORKING_SET; i++)
+    if (mem->working_set[i] == mapping) mem->working_set[i] = NULL;
+  backing_release(mem, mapping->backing);
+  free(mapping);
 }
 
 /* TS #replaceRange (permissions NULL = unmap). */
@@ -427,7 +535,6 @@ static void replace_range(qa_sparse_guest_memory *mem, uint64_t base, size_t byt
   for (; last < mem->mapping_count; last++) {
     qa_sparse_mapping *mapping = mem->mappings[last];
     if (!end_wraps && mapping->base >= end) break;
-    retire_mapping(mem, mapping);
     uint64_t cut_start = base > mapping->base ? base : mapping->base;
     size_t start_offset = (size_t)(cut_start - mapping->base);
     size_t end_offset;
@@ -435,18 +542,17 @@ static void replace_range(qa_sparse_guest_memory *mem, uint64_t base, size_t byt
     else if (mapping->end_wraps) end_offset = (size_t)(end - mapping->base);
     else if (end_wraps) end_offset = (size_t)(mapping->end - mapping->base);
     else end_offset = (size_t)((end < mapping->end ? end : mapping->end) - mapping->base);
-    if (permissions == NULL) mem->mapped_total -= end_offset - start_offset;
     qa_sparse_mapping *pieces[3];
     int piece_count = 0;
     if (start_offset > 0)
-      pieces[piece_count++] = new_mapping(mapping->base, start_offset, mapping->permissions, mapping->label,
+      pieces[piece_count++] = new_mapping(mem, mapping->base, start_offset, mapping->permissions, mapping->label,
                                           mapping->backing, mapping->backing_offset);
     if (permissions != NULL)
-      pieces[piece_count++] = new_mapping(mapping->base + (uint64_t)start_offset, end_offset - start_offset,
+      pieces[piece_count++] = new_mapping(mem, mapping->base + (uint64_t)start_offset, end_offset - start_offset,
                                           *permissions, mapping->label, mapping->backing,
                                           mapping->backing_offset + start_offset);
     if (end_offset < mapping->byte_length)
-      pieces[piece_count++] = new_mapping(mapping->base + (uint64_t)end_offset, mapping->byte_length - end_offset,
+      pieces[piece_count++] = new_mapping(mem, mapping->base + (uint64_t)end_offset, mapping->byte_length - end_offset,
                                           mapping->permissions, mapping->label, mapping->backing,
                                           mapping->backing_offset + end_offset);
     for (int p = 0; p < piece_count; p++) {
@@ -470,6 +576,7 @@ static void replace_range(qa_sparse_guest_memory *mem, uint64_t base, size_t byt
     }
   }
   mem->generation += 1;
+  for (size_t index = first; index < last; index++) retire_mapping(mem, mem->mappings[index]);
   size_t removed = last - first;
   size_t new_total = mem->mapping_count - removed + next_count;
   if (new_total > mem->mapping_cap) {
@@ -500,7 +607,8 @@ static void write_bytes(qa_sparse_guest_memory *mem, qa_guest_core_address addre
   qa_sparse_mapping *single = single_mapping(mem, address, byte_length, QA_ACCESS_WRITE, &single_offset);
   if (single != NULL) {
     chunk only = {single, single_offset, byte_length};
-    commit_write(mem, &only, 1, bytes);
+    store_chunks(&only, 1, bytes);
+    notify_write(mem, &only, 1, NULL);
     return;
   }
   size_t count = 0;
@@ -513,14 +621,15 @@ static void write_bytes(qa_sparse_guest_memory *mem, qa_guest_core_address addre
     if (byte_length > 0 && bytes < b + blen && b < bytes + byte_length) overlaps = true;
   }
   if (overlaps && byte_length > 0) {
-    uint8_t *snapshot = (uint8_t *)xmalloc(byte_length);
+    uint8_t *snapshot = (uint8_t *)malloc(byte_length);
+    if (snapshot == NULL) { free(chunks); qa_range_error("Guest memory allocation failed"); }
     memcpy(snapshot, bytes, byte_length);
-    commit_write(mem, chunks, count, snapshot);
+    store_chunks(chunks, count, snapshot);
     free(snapshot);
   } else {
-    commit_write(mem, chunks, count, bytes);
+    store_chunks(chunks, count, bytes);
   }
-  free(chunks);
+  notify_write(mem, chunks, count, chunks);
 }
 
 static qa_guest_core_address make_address(uint64_t byte_offset) {
@@ -550,17 +659,12 @@ qa_guest_core_address qa_sparse_offset(qa_sparse_guest_memory *mem, qa_guest_cor
 
 qa_guest_core_address qa_sparse_map(qa_sparse_guest_memory *mem, const qa_guest_map_options *options) {
   available(mem, options->base, options->byte_length);
-  if (mem->mapped_total + (uint64_t)options->byte_length > mem->maximum_mapped_bytes) {
-    char detail[96];
-    (void)snprintf(detail, sizeof detail, "guest mappings would exceed %llu bytes", (unsigned long long)mem->maximum_mapped_bytes);
-    fault(mem, QA_FAULT_QUOTA, options->base, options->byte_length, QA_FAULT_ACCESS_MAP, detail);
-  }
   if (options->bytes != NULL && options->bytes_length > options->byte_length)
     qa_range_error("Initial guest bytes exceed the mapping length");
   uint8_t *bytes = (uint8_t *)xcalloc(options->byte_length == 0 ? 1 : options->byte_length, 1);
   if (options->bytes != NULL) memcpy(bytes, options->bytes, options->bytes_length);
   qa_sparse_backing *backing = new_backing(mem, bytes, options->byte_length);
-  insert_mapping(mem, new_mapping(options->base, options->byte_length, options->permissions,
+  insert_mapping(mem, new_mapping(mem, options->base, options->byte_length, options->permissions,
                                    options->label != NULL ? options->label : "", backing, 0));
   return make_address(options->base);
 }
@@ -636,7 +740,7 @@ static bool release_pooled_page(qa_sparse_guest_memory *mem, qa_guest_core_addre
     slab->used[index] = 0;
     size_t offset = 0;
     qa_sparse_mapping *mapping = single_mapping(mem, address, byte_length, QA_ACCESS_WRITE, &offset);
-    if (mapping == NULL) qa_range_error("Pooled guest page lost its mapping");
+    if (mapping == NULL) qa_raise("Error", 0, 0, "Pooled guest page lost its mapping");
     const size_t absolute = mapping->backing_offset + offset;
     memset(mapping->backing->bytes + absolute, 0, byte_length);
     invalidate_code(mapping->backing, absolute, byte_length);
@@ -715,7 +819,7 @@ qa_guest_core_address qa_sparse_map_alias(qa_sparse_guest_memory *mem, uint64_t 
   qa_sparse_backing *backing = NULL;
   size_t start = contiguous_offset(mem, chunks, count, source, byte_length, &backing);
   free(chunks);
-  insert_mapping(mem, new_mapping(base, byte_length, permissions, label != NULL ? label : "alias", backing, start));
+  insert_mapping(mem, new_mapping(mem, base, byte_length, permissions, label != NULL ? label : "alias", backing, start));
   return make_address(base);
 }
 
@@ -831,6 +935,10 @@ void qa_sparse_write(qa_sparse_guest_memory *mem, qa_guest_core_address address,
   write_bytes(mem, address, bytes, byte_length);
 }
 void qa_sparse_move(qa_sparse_guest_memory *mem, qa_guest_core_address destination, qa_guest_core_address source, size_t byte_length) {
+  /* TS checks the whole source for reading, then the whole destination for writing, before it copies; the checks
+   * come first here so a faulting move neither allocates for a length the guest chose nor leaks its copy. */
+  qa_sparse_check(mem, source, byte_length, QA_ACCESS_READ);
+  qa_sparse_check(mem, destination, byte_length, QA_ACCESS_WRITE);
   uint8_t *snapshot = (uint8_t *)xmalloc(byte_length);
   read_bytes(mem, source, snapshot, byte_length);
   write_bytes(mem, destination, snapshot, byte_length);
@@ -846,8 +954,7 @@ void qa_sparse_fill(qa_sparse_guest_memory *mem, qa_guest_core_address address, 
     memset(m->backing->bytes + abs_off, byte, chunks[i].byte_length);
     invalidate_code(m->backing, abs_off, chunks[i].byte_length);
   }
-  notify_write(mem, chunks, count);
-  free(chunks);
+  notify_write(mem, chunks, count, chunks);
 }
 qa_guest_write_observer_handle qa_sparse_observe_writes(qa_sparse_guest_memory *mem, qa_guest_core_address address,
                                                         size_t byte_length, qa_guest_write_observer_fn notify, void *ctx) {
@@ -861,11 +968,11 @@ qa_guest_write_observer_handle qa_sparse_observe_writes(qa_sparse_guest_memory *
   observer->chunks = (struct qa_sparse_chunk_ref *)xmalloc((count == 0 ? 1 : count) * sizeof *observer->chunks);
   for (size_t i = 0; i < count; i++) {
     observer->chunks[i].backing = chunks[i].mapping->backing;
+    observer->chunks[i].backing->refs++; /* TS: the observer's chunks keep the buffer alive */
     observer->chunks[i].offset = chunks[i].mapping->backing_offset + chunks[i].offset;
     observer->chunks[i].byte_length = chunks[i].byte_length;
   }
   free(chunks);
-  observer->next = mem->observers;
   /* TS Set preserves insertion order; append to keep notify order. */
   observer->next = NULL;
   if (mem->observers == NULL) mem->observers = observer;
@@ -877,8 +984,14 @@ qa_guest_write_observer_handle qa_sparse_observe_writes(qa_sparse_guest_memory *
   return observer->id;
 }
 void qa_sparse_unobserve_writes(qa_sparse_guest_memory *mem, qa_guest_write_observer_handle handle) {
-  for (qa_sparse_write_observer *o = mem->observers; o != NULL; o = o->next) {
-    if (o->id == handle) { o->removed = true; return; }
+  for (qa_sparse_write_observer **link = &mem->observers; *link != NULL; link = &(*link)->next) {
+    qa_sparse_write_observer *o = *link;
+    if (o->id != handle) continue;
+    if (o->removed) return;
+    if (mem->notify_depth != 0) { o->removed = true; mem->observers_unlinked = true; return; } /* a delivery may still name it */
+    *link = o->next;
+    free_observer(mem, o);
+    return;
   }
 }
 uint64_t qa_sparse_write_deliveries(const qa_sparse_guest_memory *mem) { return mem->write_deliveries; }
@@ -920,7 +1033,7 @@ bool qa_sparse_scalar_write(qa_sparse_guest_memory *mem, uint64_t address, int b
   invalidate_code(mapping->backing, absolute, (size_t)byte_length);
   if (mem->observers != NULL) {
     chunk written = { mapping, offset, (size_t)byte_length };
-    notify_write(mem, &written, 1);
+    notify_write(mem, &written, 1, NULL);
   }
   return true;
 }
@@ -1139,9 +1252,23 @@ uint8_t qa_guest_fetch_sequence_next(qa_guest_fetch_sequence *seq) {
   return byte;
 }
 
+/* TS `mapping.active` for a guard's captured mapping. The mapping object is freed when it is retired, so the guard
+ * does not look at it until it has proved the same mapping (by serial) is still the one at its address; while the
+ * memory's generation is unchanged no mapping was retired and the pointer stands. */
+static qa_sparse_mapping *guard_live_mapping(const qa_guest_executable_guard *guard) {
+  if (guard->mapping == NULL) return NULL;
+  const qa_sparse_guest_memory *mem = guard->mem;
+  if (guard->generation == mem->generation) return guard->mapping;
+  size_t index = first_end_after(mem, guard->address);
+  if (index >= mem->mapping_count || mem->mappings[index]->serial != guard->mapping_serial) return NULL;
+  return mem->mappings[index];
+}
+
 static bool guard_unchanged_range(qa_guest_executable_guard *guard) {
-  qa_sparse_mapping *mapping = guard->mapping;
-  if (mapping == NULL || !mapping->active) return false;
+  qa_sparse_mapping *mapping = guard_live_mapping(guard);
+  guard->mapping = mapping; /* a retired mapping never returns */
+  if (mapping == NULL) return false;
+  guard->generation = guard->mem->generation;
   qa_sparse_backing *backing = mapping->backing;
   if (!backing->exposed && guard->has_page && guard->has_checked &&
       guard->checked == backing->page_revisions[guard->page]) return true;
@@ -1166,6 +1293,9 @@ bool qa_sparse_retain_executable_range(qa_sparse_guest_memory *mem, uint64_t byt
   size_t offset = (size_t)(byte_offset - mapping->base);
   if (offset + byte_length > mapping->byte_length) return false;
   out->mapping = mapping;
+  out->address = byte_offset;
+  out->mapping_serial = mapping->serial;
+  out->generation = mem->generation;
   out->mapping_offset = offset;
   out->byte_length = byte_length;
   out->expected = (uint8_t *)xmalloc(byte_length);
@@ -1220,8 +1350,10 @@ bool qa_guest_executable_guard_unchanged(qa_guest_executable_guard *guard) {
   return true;
 }
 bool qa_guest_executable_block_after_store(const qa_guest_executable_guard *guard) {
-  if (guard == NULL || !guard->valid || guard->mapping == NULL || !guard->mapping->active) return false;
-  qa_sparse_backing *backing = guard->mapping->backing;
+  if (guard == NULL || !guard->valid) return false;
+  const qa_sparse_mapping *mapping = guard_live_mapping(guard);
+  if (mapping == NULL) return false;
+  qa_sparse_backing *backing = mapping->backing;
   for (size_t i = 0; i < guard->block_page_count; i++) {
     if (guard->block_checked[i] != backing->page_revisions[guard->block_pages[i]]) return false;
   }
@@ -1244,13 +1376,14 @@ bool qa_sparse_checkpoint(qa_sparse_guest_memory *mem, qa_guest_memory_snapshot 
   out->backing_lengths = (size_t *)xcalloc(mem->mapping_count == 0 ? 1 : mem->mapping_count, sizeof *out->backing_lengths);
   out->mappings = (qa_guest_snapshot_mapping *)xcalloc(mem->mapping_count == 0 ? 1 : mem->mapping_count, sizeof *out->mappings);
   out->mapping_count = mem->mapping_count;
+  /* TS Map of buffer -> backing index, in order of first use. */
+  for (size_t i = 0; i < mem->mapping_count; i++) mem->mappings[i]->backing->snapshot_index = SIZE_MAX;
   for (size_t i = 0; i < mem->mapping_count; i++) {
     qa_sparse_mapping *mapping = mem->mappings[i];
-    size_t backing_index = out->backing_count;
-    for (size_t j = 0; j < i; j++) {
-      if (mem->mappings[j]->backing == mapping->backing) { backing_index = out->mappings[j].backing; break; }
-    }
-    if (backing_index == out->backing_count) {
+    size_t backing_index = mapping->backing->snapshot_index;
+    if (backing_index == SIZE_MAX) {
+      backing_index = out->backing_count;
+      mapping->backing->snapshot_index = backing_index;
       size_t len = mapping->backing->byte_length;
       out->backings[backing_index] = (uint8_t *)xmalloc(len);
       memcpy(out->backings[backing_index], mapping->backing->bytes, len);
@@ -1272,12 +1405,14 @@ static bool same_module_field(const char *a, const char *b) {
   return strcmp(a, b) == 0;
 }
 
+static void restore_abandon(void *memory) { qa_sparse_guest_memory_destroy((qa_sparse_guest_memory *)memory); }
+
 bool qa_sparse_guest_memory_restore(qa_sparse_guest_memory *out, const qa_guest_module_ref *module,
                                     const qa_guest_memory_snapshot *snapshot) {
   if (!same_module_field(module->id, snapshot->module.id) ||
       !same_module_field(module->digest, snapshot->module.digest) ||
       !same_module_field(module->revision, snapshot->module.revision))
-    qa_range_error("Guest snapshot belongs to a different module artifact");
+    qa_raise("Error", 0, 0, "Guest snapshot belongs to a different module artifact");
   qa_sparse_guest_memory_options options;
   memset(&options, 0, sizeof options);
   options.module = *module;
@@ -1285,8 +1420,13 @@ bool qa_sparse_guest_memory_restore(qa_sparse_guest_memory *out, const qa_guest_
   options.allocation_base = snapshot->allocation_base;
   options.has_allocation_base = true;
   qa_sparse_guest_memory_init(out, &options);
+  /* A snapshot that fails part way leaves nothing behind (TS drops the half-built memory). */
+  qa_cleanup destroy_node;
+  qa_cleanup_push(&destroy_node, restore_abandon, out);
   qa_sparse_backing **backings = (qa_sparse_backing **)xcalloc(
       snapshot->backing_count == 0 ? 1 : snapshot->backing_count, sizeof *backings);
+  qa_cleanup backings_node;
+  qa_cleanup_push(&backings_node, free, backings);
   for (size_t i = 0; i < snapshot->backing_count; i++) {
     uint8_t *bytes = (uint8_t *)xmalloc(snapshot->backing_lengths[i]);
     memcpy(bytes, snapshot->backings[i], snapshot->backing_lengths[i]);
@@ -1297,14 +1437,14 @@ bool qa_sparse_guest_memory_restore(qa_sparse_guest_memory *out, const qa_guest_
     available(out, mapping->base, mapping->byte_length);
     if (mapping->backing >= snapshot->backing_count ||
         mapping->backing_offset + mapping->byte_length < mapping->backing_offset ||
-        mapping->backing_offset + mapping->byte_length > snapshot->backing_lengths[mapping->backing]) {
-      free(backings);
+        mapping->backing_offset + mapping->byte_length > snapshot->backing_lengths[mapping->backing])
       qa_range_error("Invalid guest snapshot backing range");
-    }
-    insert_mapping(out, new_mapping(mapping->base, mapping->byte_length, mapping->permissions,
+    insert_mapping(out, new_mapping(out, mapping->base, mapping->byte_length, mapping->permissions,
                                     mapping->label != NULL ? mapping->label : "",
                                     backings[mapping->backing], mapping->backing_offset));
   }
+  qa_cleanup_pop(&backings_node);
+  qa_cleanup_pop(&destroy_node);
   free(backings);
   return true;
 }
@@ -1351,7 +1491,6 @@ static void init_impl(qa_sparse_guest_memory *mem, const qa_sparse_guest_memory_
   mem->module = options->module;
   mem->managed = managed;
   mem->allocation_base = options->has_allocation_base ? options->allocation_base : 0x10000ull;
-  mem->maximum_mapped_bytes = options->maximum_mapped_bytes != 0 ? options->maximum_mapped_bytes : 0x40000000ull;
   mem->base.ctx = mem;
   mem->base.pointer_bytes = options->pointer_bytes;
   mem->base.managed_sparse = managed;
@@ -1381,15 +1520,11 @@ void qa_sparse_guest_memory_init_managed(qa_sparse_guest_memory *mem, const qa_s
 }
 bool qa_sparse_guest_memory_managed(const qa_sparse_guest_memory *mem) { return mem->managed; }
 
-static void free_mapping(qa_sparse_mapping *mapping) {
-  free(mapping->label);
-  free(mapping);
-}
 void qa_sparse_guest_memory_destroy(qa_sparse_guest_memory *mem) {
-  for (size_t i = 0; i < mem->mapping_count; i++) free_mapping(mem->mappings[i]);
+  for (size_t i = 0; i < mem->mapping_count; i++) free(mem->mappings[i]);
   free(mem->mappings);
-  for (size_t i = 0; i < mem->retired_count; i++) free_mapping(mem->retired[i]);
-  free(mem->retired);
+  for (size_t i = 0; i < mem->label_capacity; i++) free(mem->label_slots[i]);
+  free(mem->label_slots);
   for (size_t i = 0; i < mem->backing_count; i++) {
     free(mem->backings[i]->bytes);
     free(mem->backings[i]->page_revisions);

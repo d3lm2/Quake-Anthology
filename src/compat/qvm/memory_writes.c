@@ -60,12 +60,18 @@ static void *xmalloc(size_t size) {
 /* Raw views (qa_qvmx_view) carry no owner, so stores into an interpreter's
  * allocation find its one writes owner here. The TS engine is single threaded
  * and so is every QVM call path. */
-#define RAW_OWNER_CAPACITY 64
-static qa_qvm_memory_writes *raw_owners[RAW_OWNER_CAPACITY];
-static size_t raw_owner_count;
+static qa_qvm_memory_writes **raw_owners;
+static size_t raw_owner_count, raw_owner_capacity;
 
+/* TS has no limit on live interpreters, so the list grows. */
 void qa_qvm_memory_writes_bind_raw(qa_qvm_memory_writes *writes) {
-  if (raw_owner_count == RAW_OWNER_CAPACITY) qa_range_error("Too many live QVM allocations");
+  if (raw_owner_count == raw_owner_capacity) {
+    size_t capacity = raw_owner_capacity == 0 ? 16 : raw_owner_capacity * 2;
+    qa_qvm_memory_writes **grown = realloc(raw_owners, capacity * sizeof *grown);
+    if (grown == NULL) qa_range_error("QVM memory allocation failed");
+    raw_owners = grown;
+    raw_owner_capacity = capacity;
+  }
   raw_owners[raw_owner_count++] = writes;
 }
 
@@ -107,11 +113,11 @@ bool qa_qvm_memory_writes_get_intercepts(const qa_qvm_memory_writes *writes) {
 }
 
 void qa_qvm_memory_writes_assert_not_publishing(const qa_qvm_memory_writes *writes) {
-  if (writes->publishing) qa_range_error("QVM store publication permits bookkeeping only");
+  if (writes->publishing) qa_raise("Error", 0, 0, "QVM store publication permits bookkeeping only");
 }
 
 void qa_qvm_memory_writes_assert_live(const qa_qvm_memory_writes *writes) {
-  if (writes->closed) qa_range_error("QVM memory has been retired");
+  if (writes->closed) qa_raise("Error", 0, 0, "QVM memory has been retired");
 }
 
 void qa_qvm_memory_writes_assert_writable(const qa_qvm_memory_writes *writes) {
@@ -135,12 +141,13 @@ size_t qa_qvm_memory_writes_observe(qa_qvm_memory_writes *writes,
                                     qa_qvm_publish_fn publish, void *publish_ctx,
                                     qa_qvm_publish_fn after_publication, void *after_ctx) {
   qa_qvm_memory_writes_assert_live(writes);
+  /* Validate before allocating: a refused range raises with nothing held. */
+  for (size_t i = 0; i < range_count; i++)
+    qa_qvm_memory_writes_range(writes, ranges[i].byte_offset, ranges[i].byte_length);
   qa_qvm_write_range *sorted = xmalloc(range_count * sizeof *sorted);
   size_t kept = 0;
-  for (size_t i = 0; i < range_count; i++) {
-    qa_qvm_memory_writes_range(writes, ranges[i].byte_offset, ranges[i].byte_length);
+  for (size_t i = 0; i < range_count; i++)
     if (ranges[i].byte_length != 0) sorted[kept++] = ranges[i];
-  }
   qa_js_sort(sorted, kept, sizeof *sorted, compare_range);
   size_t merged_count = 0;
   for (size_t i = 0; i < kept; i++) {
@@ -303,16 +310,20 @@ void qa_qvm_memory_writes_after(qa_qvm_memory_writes *writes, qa_qvm_write_captu
   }
   /* Every live listener drains even when an earlier one throws; one failure
    * rethrows as itself and several become the TS AggregateError message. */
-  char failure[512];
+  /* The error TS rethrows keeps its class, code and text. It lives on the heap:
+   * an after-publication effect can reenter the interpreter from this frame. */
+  qa_caught_error *caught = xmalloc(sizeof *caught), *failure = NULL;
   size_t failure_count = 0;
   writes->publishing = true;
   for (size_t e = 0; e < captures->entry_count; e++) {
     capture_entry *entry = &captures->entries[e];
     if (watch_active(writes, entry->watch_id) && entry->publish != NULL) {
       delivery_job job = {entry->publish, entry->publish_ctx, &events[e]};
-      char message[512];
-      if (!qa_range_error_catch(run_delivery, &job, message, sizeof message)) {
-        if (failure_count == 0) memcpy(failure, message, sizeof failure);
+      if (!qa_try(run_delivery, &job, caught)) {
+        if (failure_count == 0) {
+          failure = xmalloc(sizeof *failure);
+          *failure = *caught;
+        }
         failure_count++;
       }
     }
@@ -321,7 +332,7 @@ void qa_qvm_memory_writes_after(qa_qvm_memory_writes *writes, qa_qvm_write_captu
   bool after_failed = false;
   if (failure_count == 0) {
     after_publication_job job = {writes, captures, events};
-    after_failed = !qa_range_error_catch(run_after_publications, &job, failure, sizeof failure);
+    after_failed = !qa_try(run_after_publications, &job, caught);
   }
   for (size_t e = 0; e < captures->entry_count; e++) {
     for (size_t r = 0; r < captures->entries[e].range_count; r++) {
@@ -337,8 +348,13 @@ void qa_qvm_memory_writes_after(qa_qvm_memory_writes *writes, qa_qvm_write_captu
   free(events);
   free(captures->entries);
   free(captures);
-  if (failure_count == 1 || after_failed) qa_range_error("%s", failure);
-  if (failure_count > 1) qa_range_error("QVM committed store publication failed");
+  qa_caught_error thrown;
+  if (failure_count == 1) thrown = *failure;
+  else if (after_failed) thrown = *caught;
+  free(failure);
+  free(caught);
+  if (failure_count == 1 || after_failed) qa_rethrow(&thrown);
+  if (failure_count > 1) qa_raise("AggregateError", 0, 0, "QVM committed store publication failed");
 }
 
 void qa_qvm_memory_writes_clear(qa_qvm_memory_writes *writes) {
@@ -356,11 +372,19 @@ void qa_qvm_memory_writes_close(qa_qvm_memory_writes *writes) {
   writes->closed = true;
 }
 
-/* View access: TS DataView index() truncates toward zero (NaN -> 0);
- * C callers pass int64 offsets, so only the bounds check remains. */
-static size_t view_offset(const qa_qvm_writable_view *view, int64_t byte_offset, int64_t size) {
-  if (byte_offset < 0 || byte_offset > view->length - size)
-    qa_range_error("Offset is outside the bounds of the DataView");
+/* View access. A store into a watched (or publishing, or retired) allocation
+ * goes through the TS index(), which truncates toward zero (NaN -> 0) and has
+ * its own message; every read and every other store is the native DataView,
+ * whose two refusals JavaScriptCore words differently. C callers pass int64
+ * offsets, so only the bounds checks remain. */
+static size_t view_offset(const qa_qvm_writable_view *view, int64_t byte_offset, int64_t size, bool indexed) {
+  if (indexed) {
+    if (byte_offset < 0 || byte_offset > view->length - size)
+      qa_range_error("Offset is outside the bounds of the DataView");
+  } else {
+    if (byte_offset < 0) qa_range_error("byteOffset cannot be negative");
+    if (byte_offset > view->length - size) qa_range_error("Out of bounds access");
+  }
   return (size_t)(view->start + byte_offset);
 }
 
@@ -372,7 +396,7 @@ void qa_qvm_memory_writes_store(qa_qvm_memory_writes *writes, int64_t offset, co
 }
 
 static uint64_t load_bits(const qa_qvm_writable_view *view, int64_t byte_offset, int size, bool little_endian) {
-  size_t at = view_offset(view, byte_offset, size);
+  size_t at = view_offset(view, byte_offset, size, false);
   uint64_t result = 0;
   for (int i = 0; i < size; i++) {
     int shift = little_endian ? i * 8 : (size - 1 - i) * 8;
@@ -386,7 +410,7 @@ static void store_bits(qa_qvm_writable_view *view, int64_t byte_offset, uint64_t
   qa_qvm_write_capture *capture = NULL;
   if (view->read_only) qa_raise("RangeError", 0, 0, "Native module memory is read-only");
   if (view->writes == NULL) {
-    at = view_offset(view, byte_offset, size);
+    at = view_offset(view, byte_offset, size, false);
     for (int i = 0; i < size; i++) {
       int shift = little_endian ? i * 8 : (size - 1 - i) * 8;
       view->bytes[at + (size_t)i] = (uint8_t)(value >> shift);
@@ -394,9 +418,9 @@ static void store_bits(qa_qvm_writable_view *view, int64_t byte_offset, uint64_t
     return;
   }
   if (!qa_qvm_memory_writes_get_intercepts(view->writes)) {
-    at = view_offset(view, byte_offset, size);
+    at = view_offset(view, byte_offset, size, false);
   } else {
-    size_t checked = view_offset(view, byte_offset, size);
+    size_t checked = view_offset(view, byte_offset, size, true);
     capture = qa_qvm_memory_writes_before(view->writes, (int64_t)checked, size);
     at = checked;
   }

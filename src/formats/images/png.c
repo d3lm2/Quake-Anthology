@@ -5,6 +5,7 @@
 #include "qa/foundation/js.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -390,11 +391,27 @@ static int png_expand(const char *name, const uint8_t *bytes,
     z_stream stream;
     memset(&stream, 0, sizeof stream);
     stream.next_in = compressed;
-    stream.avail_in = (uInt)compressed_length;
     stream.next_out = raw;
-    stream.avail_out = (uInt)raw_length;
+    /* zlib counts in uInt: feed both buffers in pieces so a 16-bit RGBA image
+     * past 4 GiB of scanlines is not cut to its low 32 bits. */
+    size_t in_left = compressed_length, out_left = (size_t)raw_length;
+    stream.avail_in = 0;
+    stream.avail_out = 0;
     int status = inflateInit(&stream);
-    if (status == Z_OK) status = inflate(&stream, Z_NO_FLUSH);
+    while (status == Z_OK) {
+      if (stream.avail_in == 0 && in_left != 0) {
+        uInt take = in_left > UINT_MAX ? UINT_MAX : (uInt)in_left;
+        stream.avail_in = take;
+        in_left -= take;
+      }
+      if (stream.avail_out == 0 && out_left != 0) {
+        uInt take = out_left > UINT_MAX ? UINT_MAX : (uInt)out_left;
+        stream.avail_out = take;
+        out_left -= take;
+      }
+      if (stream.avail_out == 0) break;
+      status = inflate(&stream, Z_NO_FLUSH);
+    }
     /* node inflateSync({ maxOutputLength }): one more byte of output past
      * the expected size is "Cannot create a Buffer larger than N bytes". */
     bool too_large = false;
@@ -515,14 +532,29 @@ int qa_decode_png(const uint8_t *bytes, size_t length, const char *source,
     if (end + 4 > (uint64_t)length) {
       qa_binary_error(name, (int64_t)offset, "PNG: truncated chunk");
     }
-    char type[5];
-    memcpy(type, bytes + offset + 4, 4);
-    type[4] = '\0';
+    /* TS String.fromCharCode of the four bytes: a byte past 0x7f is a Latin-1
+     * code unit, two UTF-8 bytes in the message. (A NUL byte cannot be carried
+     * in C message text.) */
+    char type[9];
+    {
+      size_t at = 0;
+      for (int k = 0; k < 4; k++) {
+        uint8_t ch = bytes[offset + 4 + (size_t)k];
+        if (ch == 0) continue; /* U+0000 cannot travel in C message text */
+        if (ch < 0x80) {
+          type[at++] = (char)ch;
+        } else {
+          type[at++] = (char)(0xc0 | (ch >> 6));
+          type[at++] = (char)(0x80 | (ch & 0x3f));
+        }
+      }
+      type[at] = '\0';
+    }
     if (get_u32_be(bytes, (size_t)end) !=
         png_crc32(bytes + offset + 4, (size_t)(end - (offset + 4)))) {
       qa_binary_error(name, (int64_t)offset, "PNG: bad %s CRC", type);
     }
-    if (strcmp(type, "IHDR") == 0) {
+    if (memcmp(bytes + offset + 4, "IHDR", 4) == 0) {
       if (offset != 8 || chunk_length != 13) {
         qa_binary_error(name, (int64_t)offset, "PNG: misplaced or malformed IHDR");
       }
@@ -549,7 +581,7 @@ int qa_decode_png(const uint8_t *bytes, size_t length, const char *source,
                         "PNG: unsupported color type %lld at depth %lld",
                         (long long)color_type, (long long)bit_depth);
       }
-    } else if (strcmp(type, "PLTE") == 0) {
+    } else if (memcmp(bytes + offset + 4, "PLTE", 4) == 0) {
       if (chunk_length == 0 || chunk_length > 768 || chunk_length % 3 != 0) {
         qa_binary_error(name, (int64_t)start, "PNG: invalid palette");
       }
@@ -558,26 +590,26 @@ int qa_decode_png(const uint8_t *bytes, size_t length, const char *source,
       if (palette == NULL) goto oom;
       memcpy(palette, bytes + start, chunk_length);
       palette_length = chunk_length;
-    } else if (strcmp(type, "tRNS") == 0) {
+    } else if (memcmp(bytes + offset + 4, "tRNS", 4) == 0) {
       free(transparency);
       transparency = chunk_length == 0 ? NULL : (uint8_t *)malloc(chunk_length);
       if (chunk_length != 0 && transparency == NULL) goto oom;
       if (chunk_length != 0) memcpy(transparency, bytes + start, chunk_length);
       transparency_length = chunk_length;
       has_transparency = 1;
-    } else if (strcmp(type, "gAMA") == 0) {
+    } else if (memcmp(bytes + offset + 4, "gAMA", 4) == 0) {
       if (chunk_length != 4 || get_u32_be(bytes, start) == 0) {
         qa_binary_error(name, (int64_t)start, "PNG: invalid gamma");
       }
       gamma = (double)get_u32_be(bytes, start) / 100000.0;
       has_gamma = 1;
-    } else if (strcmp(type, "sRGB") == 0) {
+    } else if (memcmp(bytes + offset + 4, "sRGB", 4) == 0) {
       if (chunk_length != 1 || bytes[start] > 3) {
         qa_binary_error(name, (int64_t)start, "PNG: invalid sRGB intent");
       }
       srgb_intent = bytes[start];
       has_srgb = 1;
-    } else if (strcmp(type, "IDAT") == 0) {
+    } else if (memcmp(bytes + offset + 4, "IDAT", 4) == 0) {
       if (idat_count == idat_capacity) {
         size_t capacity = idat_capacity == 0 ? 8 : idat_capacity * 2;
         struct idat_part *grown =
@@ -590,7 +622,7 @@ int qa_decode_png(const uint8_t *bytes, size_t length, const char *source,
       idat[idat_count].length = chunk_length;
       idat_count++;
       compressed_length += chunk_length;
-    } else if (strcmp(type, "IEND") == 0) {
+    } else if (memcmp(bytes + offset + 4, "IEND", 4) == 0) {
       if (chunk_length != 0) {
         qa_binary_error(name, (int64_t)start, "PNG: invalid IEND");
       }

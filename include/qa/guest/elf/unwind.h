@@ -4,10 +4,11 @@
  * come from src/guest/elf/parse.ts (unported); the minimal fields unwind.ts
  * reads are mirrored here. checkedNumber/elfFileOffset (parse.ts) and
  * elfAddress (relocate.ts) are mirrored locally in unwind.c. TS ElfError
- * throws abort with the same "ELF: ..." message via qa_range_error (the TS
- * loader surface treating them as fatal load failures). GuestUnwindRegion
- * comes from src/guest/core/contracts.ts. Each returned region owns a copy
- * of the section metadata bytes (TS shares one Uint8Array per section).
+ * is a qa_raise under that name with the same "ELF: ..." message.
+ * GuestUnwindRegion comes from src/guest/core/contracts.ts. The regions of
+ * one frame table share one copy of its bytes, as TS shares one Uint8Array;
+ * they are adjacent in the result and qa_elf_unwind_regions_free frees each
+ * distinct buffer once.
  * GPL-2.0-or-later.
  */
 #ifndef QA_GUEST_ELF_UNWIND_H

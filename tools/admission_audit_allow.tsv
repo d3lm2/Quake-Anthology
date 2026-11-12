@@ -1,0 +1,61 @@
+# tools/admission_audit.sh allow-list: hits whose text is legitimate and must stay as written.
+# path	fixed text on the line	reason
+src/guest/elf/relocate.c	QA_RESOLUTION_UNRESOLVED	ABI resolution kind (TS GuestImportResolution kind "unresolved")
+src/guest/pe/loader.c	QA_RESOLUTION_UNRESOLVED	ABI resolution kind (TS GuestImportResolution kind "unresolved")
+include/qa/guest/abi/values.h	QA_RESOLUTION_UNRESOLVED	ABI resolution kind (TS GuestImportResolution kind "unresolved")
+include/qa/guest/abi/values.h	/* unresolved */	field comments of the unresolved resolution variant
+src/guest/runtime/system_v/runtime.c	unresolved(	TS unresolved() helper, ported under its name
+src/guest/runtime/system_v/runtime.c	QA_RESOLUTION_UNRESOLVED	ABI resolution kind (TS GuestImportResolution kind "unresolved")
+src/guest/runtime/system_v/runtime.c	unresolved data reservations	TS comment about unresolved data imports (ELF semantics, not missing behaviour)
+src/guest/runtime/common/format/scan.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message): guest scanf rejects input forms the TS rejects
+src/guest/runtime/common/format/services.c	are not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/common/format/services.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/system_v/cxx_data.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/system_v/iostream.c	was not constructed	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/system_v/iostream.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/system_v/stdio.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/windows/msvc/locale.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message) (`locale ${requested} is not implemented`, null spelled "null")
+src/guest/runtime/windows/msvc/streams.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/windows/contracts.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/windows/crt.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/windows/runtime.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/guest/runtime/windows/kernel.c	is not implemented	TypeScript throws or prints the same text (guest runtime contract message)
+src/formats/images/jpeg.c	Fractional sampling not implemented yet	TS jpeg.ts throws the same text for fractional sampling factors
+src/llm/auth.c	codex_cli_simplified_flow	OAuth form parameter name sent by TS llm/auth.ts
+src/content/composition/q2_q3_items.c	i_fixme	id's icon name (TS q2-q3-items.ts)
+src/content/q2/foundation/items.c	i_fixme	id's icon name for item_ancient_head (TS items.ts, g_items.c)
+src/content/q1/base/monster_actions.c	Q1 frame action is not implemented	TS monster-actions.ts throws the same RangeError text for unknown frame actions
+src/content/q1/foundation/spawns.c	Q1 official spawn not yet implemented	TS spawns.ts throws UnknownQ1SpawnError with this text
+src/content/q1/addons/context.c	placeholder becomes the first word	describes the word table's initial entry, not missing behaviour
+src/content/q2/rerelease/monsters/tables/insane.c	insane_move_uptodown	id's move name (m_insane.c)
+src/content/q2/base/monsters/tables/insane.c	insane_move_uptodown	id's move name (m_insane.c)
+src/content/q2/base/monsters/insane.c	insane_move_uptodown	id's move name (m_insane.c)
+src/content/q2/multiplayer/ctf/presentation.c	AutoDoc	CTF tech name (TS ctf/presentation.ts)
+src/content/q2/multiplayer/ctf/techs.c	AutoDoc	CTF tech name (TS ctf/techs.ts)
+src/app/bootstrap/q2_match_ui.c	AutoDoc	CTF tech name (TS q2-match-ui.ts)
+src/content/q3/presentation/resources.c	unresolved lookups are cached	describes a cache bound for model lookups that fail, not missing behaviour
+src/world/gameplay/authority.c	placeholder	parameter name: the item id that stands in for an empty grant (TS placeholder)
+include/qa/world/gameplay/authority.h	placeholder	parameter name: the item id that stands in for an empty grant (TS placeholder)
+src/compat/qvm/client_render_syscalls.c	keep their handles unresolved	describes TS readQvmRefEntity: portal surfaces keep raw handles
+include/qa/compat/qvm/render_record.h	handles stay unresolved	describes TS readQvmRefEntity: handles stay raw (is_handle)
+src/compat/qvm/file_syscalls.c	ZIP FILE FSEEK NOT YET IMPLEMENTED	id's FS_Seek error text, reproduced by TS file-syscalls.ts
+src/compat/qvm/syscalls.c	is not implemented	TS syscalls.ts throws the same text for a legacy ABI trap it does not serve
+src/network/q3/download.c	not a pure server	id's cl_main.c message text (TS download.ts)
+src/network/q3/download.c	Cannot autodownload	id's cl_main.c message text (TS download.ts)
+src/network/q3/download.c	autodownloading	id's cl_main.c message text (TS download.ts)
+src/bots/behavior/library/chat.c	unresolved root	describes TS parser() returning undefined for an unknown root
+src/bots/navigation/aas_write.c	Header placeholders	describes the AAS writer's header patch-up after the lumps (same bytes as TS)
+src/ui/common/legacy/runtime.c	FIXME	id's literal "FIXME" bind text in Item_Bind_Paint (ui_shared.c), as TS
+src/app/bootstrap/network/remote_q1.c	Unresolved NetQuake sound	TS remote-q1.ts throws the same text
+src/app/bootstrap/simulation/classic_guest_world.c	Native services were not constructed	TS classic-guest-world.ts throws the same text
+src/app/bootstrap/remote_application_step.c	Unresolved %s effect	TS remote-application.ts prints `Unresolved ${kind} effect: ${reason}`
+src/app/bootstrap/application_dispatch.c	Unresolved %s effect	TS application.ts prints `Unresolved ${kind} effect: ${reason}`
+src/app/bootstrap/effects.c	Unresolved Quake II source effect	TS effects.ts reason text
+src/app/bootstrap/audio.c	Unresolved Quake II monster muzzle sound	TS audio.ts prints the same text
+src/app/bootstrap/startup_selection.c	Independent pickup replacement is not implemented	TS startup-selection.ts help text
+src/app/bootstrap/simulation/shared_simulation_core.c	inert placeholders	describes retiring placeholder actors (TS comment), not missing behaviour
+include/qa/persistence/q1_selection.h	unresolved_reason	field name: TS Q1 selection unresolvedReason
+include/qa/render/scene/models/types.h	no placeholder allocation	describes an allocation C skips because TS's empty array needs none
+include/qa/network/q2/gtv_transport.h	hello lands	"lands" means arrives (GTV hello); not a porting note
+include/qa/app/bootstrap/network/gtv_source.h	header lands	"lands" means arrives (first DATA header); not a porting note
+include/qa/app/bootstrap/capture.h	is left for allocation failure	"left for" means reserved for (the message used on allocation failure); not a porting note

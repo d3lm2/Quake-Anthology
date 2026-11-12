@@ -84,6 +84,19 @@ static void print_to(qa_q2_player_context *context, const char *text) {
   context->hooks->emit(context->hooks->ctx, event);
 }
 
+/* print(context, `${prefix}${value}\n`) for client text of any length. */
+static void print_value(qa_q2_player_context *context, const char *prefix, const char *value) {
+  size_t prefix_length = strlen(prefix), value_length = strlen(value);
+  char *message = malloc(prefix_length + value_length + 2);
+  if (!message) qa_range_error("Out of memory");
+  memcpy(message, prefix, prefix_length);
+  memcpy(message + prefix_length, value, value_length);
+  message[prefix_length + value_length] = '\n';
+  message[prefix_length + value_length + 1] = '\0';
+  print_to(context, message);
+  free(message);
+}
+
 static void publish_inventory(qa_q2_player_context *context) {
   size_t entry_count = 0;
   const qa_inventory_entry *entries = qa_shared_inventory_table_entries(context->game->host->inventory, context->entity->actor.id, &entry_count);
@@ -167,9 +180,7 @@ static void use_item_value(qa_q2_player_context *context, const char *value) {
   qa_q2_game_services *game = context->game;
   qa_q2_inventory_item item;
   if (!qa_q2_item_module_lookup(context->items, value, &item)) {
-    char message[512];
-    (void)snprintf(message, sizeof message, "unknown item: %s\n", value);
-    print_to(context, message);
+    print_value(context, "unknown item: ", value);
     return;
   }
   if (!item.usable) { print_to(context, "Item is not usable.\n"); return; }
@@ -201,9 +212,7 @@ static void drop_item_value(qa_q2_players *players, qa_q2_player_context *contex
   qa_q2_game_services *game = context->game;
   qa_q2_inventory_item item;
   if (!qa_q2_item_module_lookup(context->items, value, &item)) {
-    char message[512];
-    (void)snprintf(message, sizeof message, "unknown item: %s\n", value);
-    print_to(context, message);
+    print_value(context, "unknown item: ", value);
     return;
   }
   if (!item.droppable || (game->options.mode == QA_Q2_MODE_COOP && item.stay_coop && !qa_q2_players_can_drop_coop_stay_items(players, game))) {
@@ -310,9 +319,12 @@ static void say(qa_q2_players *players, qa_q2_player_context *context, const cha
   if (is_team) (void)snprintf(message, sizeof message, "(%s): %s", state->name, words);
   else (void)snprintf(message, sizeof message, "%s: %s", state->name, words);
   free(words);
-  /* TS slice(0, 150) + "\n" (byte-wise for ASCII chat). */
-  if (strlen(message) > 150) message[150] = '\0';
-  size_t length = strlen(message);
+  /* TS slice(0, 150) + "\n": 150 UTF-16 units (a name or chat above U+007F is not cut inside a character). The
+   * 511-byte buffer holds more than any 150 units (at most 450 bytes), so its own cut never reaches the slice. */
+  char *sliced = qa_q2_text_slice_units(message, strlen(message), 150);
+  size_t length = strlen(sliced);
+  memcpy(message, sliced, length);
+  free(sliced);
   message[length] = '\n'; message[length + 1] = '\0';
   size_t count = qa_q2_players_state_count(players);
   for (size_t i = 0; i < count; i++) {
@@ -326,7 +338,7 @@ static void say(qa_q2_players *players, qa_q2_player_context *context, const cha
     event.level = "chat"; event.text = message;
     context->hooks->emit(context->hooks->ctx, event);
   }
-  if (!qa_q2_players_get_state(players, entity->actor.id)) qa_range_error("Chat actor disconnected during synchronous command");
+  if (!qa_q2_players_get_state(players, entity->actor.id)) qa_raise("Error", 0, 0, "Chat actor disconnected during synchronous command");
 }
 
 static void give_items(qa_q2_player_context *context, const char *const *args, size_t arg_count);
@@ -588,11 +600,20 @@ static void cheat_handler(qa_q2_players *players, qa_q2_player_context *context,
     char *name = join_args(args, arg_count);
     size_t count = 0;
     qa_q2_entity *const *targets = game->targets(game->ctx, name, &count);
+    free(name);
+    /* TS iterates its own array: game->targets returns a scratch that a use
+     * callback (useTargets) rewrites, so the actors are copied first. */
+    qa_owned_actor *actors = malloc((count ? count : 1) * sizeof *actors);
+    if (!actors) qa_range_error("Out of memory");
+    for (size_t i = 0; i < count; i++) actors[i] = targets[i]->actor;
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, free, actors);
     for (size_t i = 0; i < count; i++) {
       qa_actor_id self_id = entity->actor.id;
-      (void)qa_actor_callback_table_use(game->host->callbacks, targets[i]->actor, &self_id, &self_id);
+      (void)qa_actor_callback_table_use(game->host->callbacks, actors[i], &self_id, &self_id);
     }
-    free(name);
+    qa_cleanup_pop(&guard);
+    free(actors);
   } else give_items(context, args, arg_count);
 }
 
@@ -806,8 +827,11 @@ static void check_power_armor_after_give(qa_q2_player_context *context) {
     if (length >= sizeof token) length = sizeof token - 1;
     memcpy(token, cursor, length);
     token[length] = '\0';
-    if (field % 2 == 1 && strcmp(token, "autoshield") == 0) pending_value = sep ? sep + 1 : NULL;
-    else if (pending_value && field % 2 == 0) { automatic = js_parse_int(token); pending_value = NULL; }
+    if (field % 2 == 1 && strcmp(token, "autoshield") == 0) {
+      pending_value = sep ? sep + 1 : NULL;
+      /* TS parseInt(fields[index + 1] ?? "0"): a key that ends the userinfo reads 0. */
+      if (!sep) automatic = 0;
+    } else if (pending_value && field % 2 == 0) { automatic = js_parse_int(token); pending_value = NULL; }
     if (!sep) break;
     cursor = sep + 1;
     field++;

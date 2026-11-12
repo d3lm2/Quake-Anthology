@@ -36,43 +36,13 @@ typedef struct qa_app_application_configuration_selection {
 } qa_app_application_configuration_selection;
 typedef struct qa_app_loaded_content qa_app_loaded_content;
 typedef struct qa_app_configuration_content qa_app_configuration_content;
-/* TS ApplicationConfigurationRequest union (kind text). */
-typedef struct qa_app_configuration_request {
-  const char *kind; /* "launch" | other host kinds */
-  const qa_launch_preset *preset;
-  qa_launch_choice choice;
-} qa_app_configuration_request;
-typedef struct qa_app_content_host {
-  void *ctx;
-  /* Catalog product facts used by the pure selectors. */
-  bool (*product)(void *ctx, const char *id, qa_game_family *family, const char **edition, const char **campaign, bool *installed, bool *builtin);
-  bool (*require_product)(void *ctx, const char *id); /* false aborts as catalog.require */
-  /* Composition steps; return error text or NULL. */
-  const char *(*open_loaded)(void *ctx, qa_app_loaded_content *content);
-  const char *(*open_configuration)(void *ctx, qa_app_configuration_content *content);
-  const char *(*open_remote)(void *ctx, qa_app_configuration_content *content);
-  const char *(*for_content)(void *ctx, qa_app_loaded_content *content, qa_content_id content_id, const void **out_mounts);
-  const char *(*prepare_mods)(void *ctx, qa_app_loaded_content *content, const char *purpose);
-  const char *(*prepare_grapple)(void *ctx, qa_app_loaded_content *content);
-  const char *(*prepare_weapon_behaviors)(void *ctx, qa_app_loaded_content *content);
-  const char *(*close_loaded)(void *ctx, qa_app_loaded_content *content);
-  const char *(*resolve_travel)(void *ctx, qa_app_loaded_content *content, const char *path, qa_executable_recipe *out);
-  const char *(*preset)(void *ctx, const qa_app_options *options, bool configuration, qa_launch_preset *out);
-} qa_app_content_host;
 bool qa_app_application_discovers_mods(const qa_app_options *options, bool has_recipe,
                                        bool product_known, qa_game_family product_family);
-qa_app_application_source_selection qa_app_application_source_selection_of(qa_app_content_host host, const char *product, const char *rules);
-qa_app_loaded_content *qa_app_load_application_content(qa_app_content_host host, qa_app_options options,
-                                                       const qa_executable_recipe *restored_recipe, bool has_recipe);
 void qa_app_loaded_content_destroy(qa_app_loaded_content *content);
 const qa_executable_recipe *qa_app_loaded_content_recipe(const qa_app_loaded_content *content);
-void qa_app_loaded_content_set_recipe(qa_app_loaded_content *content, qa_executable_recipe recipe);
 const void *qa_app_loaded_content_catalog(const qa_app_loaded_content *content);
-void qa_app_loaded_content_set_catalog(qa_app_loaded_content *content, const void *catalog);
 const void *qa_app_loaded_content_mounts(const qa_app_loaded_content *content);
-void qa_app_loaded_content_set_mounts(qa_app_loaded_content *content, const void *mounts);
 bool qa_app_loaded_content_q3_policy(const qa_app_loaded_content *content, qa_q3_product_policy *out);
-void qa_app_loaded_content_set_q3_policy(qa_app_loaded_content *content, qa_q3_product_policy policy);
 /* TS q3Product: false is TS null. */
 bool qa_app_loaded_content_q3_product(const qa_app_loaded_content *content, qa_q3_application_product *out);
 const void *qa_app_loaded_content_for_content(qa_app_loaded_content *content, qa_content_id content_id);
@@ -94,25 +64,17 @@ const struct qa_app_prepared_qvm_grapple *qa_app_loaded_content_prepared_qvm_gra
 void qa_app_loaded_content_close(qa_app_loaded_content *content);
 qa_executable_recipe qa_app_resolve_application_travel(qa_app_loaded_content *content, const char *path);
 /* Configuration content (TS ApplicationConfigurationContent). */
-qa_app_configuration_content *qa_app_open_application_configuration_content(qa_app_content_host host, qa_app_configuration_request request);
-qa_app_configuration_content *qa_app_open_remote_application_content(qa_app_content_host host, qa_app_options options);
 void qa_app_configuration_content_destroy(qa_app_configuration_content *content);
 qa_app_application_configuration_selection qa_app_configuration_content_selection(const qa_app_configuration_content *content);
-void qa_app_configuration_content_set_selection(qa_app_configuration_content *content, qa_app_application_configuration_selection selection);
 const void *qa_app_configuration_content_mounts(const qa_app_configuration_content *content);
-void qa_app_configuration_content_set_mounts(qa_app_configuration_content *content, const void *mounts);
 const void *qa_app_configuration_content_catalog(const qa_app_configuration_content *content);
-void qa_app_configuration_content_set_catalog(qa_app_configuration_content *content, const void *catalog);
 bool qa_app_configuration_content_q3_product(const qa_app_configuration_content *content, const void **out);
-void qa_app_configuration_content_set_q3_product(qa_app_configuration_content *content, const void *product);
 void qa_app_configuration_content_close(qa_app_configuration_content *content);
 /* TS adoptUnifiedProfile's `{ catalog, mounts, q3Product, close, selection }` over a loaded content: shares its
  * catalog, mounts and Q3 product (owned by the loaded content), selection from its recipe (map.entities,
  * engineBehavior, match, combat, movement, timing); closing runs close(close_ctx). NULL only on OOM. */
 qa_app_configuration_content *qa_app_configuration_content_over_loaded(qa_app_loaded_content *loaded,
     void (*close)(void *ctx), void *close_ctx);
-qa_launch_preset qa_app_application_preset(qa_app_content_host host, const qa_app_options *options);
-qa_launch_preset qa_app_application_configuration_preset(qa_app_content_host host, const qa_app_options *options);
 /* --- Concrete catalog composition (TS content.ts over the landed
  * qa_content_catalog). Owned backing for a built preset; the preset
  * borrows from it and from the catalog/options. --- */
@@ -163,15 +125,14 @@ qa_catalog_archive_inspector qa_app_default_archive_inspector(void);
  * pure NULL = TS undefined. guest_host supplies the LoadedApplication-
  * Content prepare steps (mods/grapple/weapon behaviors) and may be
  * zeroed when the recipe needs none of them; the catalog/mount/world
- * assembly itself is concrete. Returns NULL only on OOM or when a
- * required guest preparation has no landed concrete host (see the
- * .c note); TS validation errors abort with the exact messages.
+ * assembly itself is concrete. Returns NULL only on OOM; TS validation
+ * errors raise with the exact messages.
  * options is taken over by the content (destroyed with it, or on a NULL
  * return). restored_recipe is borrowed: keep it alive while the content
  * lives.
  * Resource references the content keeps past a mount set (pure-policy
  * recipe resources, map sidecars) are owned copies it releases. */
-qa_app_loaded_content *qa_app_load_application_content_native(qa_app_content_host guest_host, qa_app_options options,
+qa_app_loaded_content *qa_app_load_application_content_native(qa_app_options options,
     const qa_executable_recipe *restored_recipe, bool has_recipe, const qa_pure_mount_policy *pure,
     qa_content_catalog *installed_catalog, const qa_app_content_source *presentation_source);
 qa_app_application_world qa_app_loaded_content_world(const qa_app_loaded_content *content);
@@ -233,8 +194,7 @@ qa_app_configuration_content *qa_app_open_remote_application_content_native(cons
  * closing the result closes content. Options borrowed. */
 qa_app_configuration_content *qa_app_remote_configuration_content_native(const qa_app_options *options,
     qa_app_configuration_content *content);
-/* TS ApplicationConfigurationRequest (native form; the host-shaped
- * qa_app_configuration_request above is unchanged). */
+/* TS ApplicationConfigurationRequest. */
 typedef struct qa_app_configuration_request_native {
   const char *kind; /* "launch" | "recipe" */
   const qa_launch_preset *preset;  /* launch */

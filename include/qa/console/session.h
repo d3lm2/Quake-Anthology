@@ -10,6 +10,11 @@
  *  - Event/focus kinds are the contracts' exact kind strings; key
  *    codes arrive as the contracts' double and compare against the
  *    KeyCode values of src/input/key-codes.ts (named in session.c).
+ *  - The field, chat field and history hold UTF-8 (console/field.h).
+ *    submit converts the command to console text, refusing a
+ *    character above U+00FF with TS's RangeError "Command text
+ *    requires source bytes" after the echo; the chat callback gets
+ *    the field text as UTF-8, and console prints of it are UTF-8.
  *  - selectedCompletionEntry returns a malloc'd single entry (free
  *    with qa_console_discovery_entries_free(entry, 1)) or NULL for
  *    the TS undefined.

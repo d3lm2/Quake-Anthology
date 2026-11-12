@@ -49,8 +49,9 @@ static const qa_structure_definition weapon_dump = {WEAPON_INFO_BYTES, weapon_fi
                                                     sizeof weapon_fields / sizeof weapon_fields[0]};
 /* Bounds-checked DataView cell access over one allocation. */
 static uint8_t *cell(const qa_bot_memory_allocation *allocation, int64_t offset, int64_t size) {
-  if (offset < 0 || (uint64_t)(offset + size) > allocation->length)
-    qa_range_error("Offset is outside the bounds of the DataView");
+  /* TS view.getInt32 / getFloat32 and their setters: the native DataView refusals. */
+  if (offset < 0) qa_range_error("byteOffset cannot be negative");
+  if ((uint64_t)(offset + size) > allocation->length) qa_range_error("Out of bounds access");
   return allocation->bytes + offset;
 }
 static void read_text(const qa_bot_memory_allocation *allocation, int64_t offset, char *out) {
@@ -189,6 +190,9 @@ __attribute__((format(printf, 4, 5))) static void emit(qa_weapon_ai_bots_a *w, q
 typedef struct setup_scope {
   qa_weapon_ai_bots_a *weapons;
   int64_t generation, revision;
+  /* TS diagnosticCallbackAborted: set while a host callback runs, so a raise that leaves it set
+   * came out of that callback and is not the setup's to handle. */
+  bool in_callback;
 } setup_scope;
 static bool scope_current(const setup_scope *scope) {
   return scope->generation == scope->weapons->generation && scope->revision == scope->weapons->setup_revision;
@@ -207,7 +211,11 @@ static bool append_script_diagnostic(setup_scope *scope, bool origin_print, cons
   }
   qa_weapon_diagnostic local = {origin_print, severity, d->message, d->location};
   if (!duplicate) local = *push_reported(w, origin_print, severity, d->message, &d->location);
-  if (w->options.report != NULL) w->options.report(w->options.report_ctx, &local);
+  if (w->options.report != NULL) {
+    scope->in_callback = true;
+    w->options.report(w->options.report_ctx, &local);
+    scope->in_callback = false;
+  }
   return scope_current(scope);
 }
 /* ---- pointers ---- */
@@ -435,8 +443,19 @@ typedef struct load_context {
 } load_context;
 static void load_report(void *ctx, const qa_ui_script_diagnostic *diagnostic) {
   load_context *load = ctx;
-  if (load->base->report != NULL) load->base->report(load->base->report_ctx, diagnostic);
+  if (load->base->report != NULL) {
+    load->scope->in_callback = true;
+    load->base->report(load->base->report_ctx, diagnostic);
+    load->scope->in_callback = false;
+  }
   if (!append_script_diagnostic(load->scope, false, diagnostic)) load->retired = true;
+}
+static void load_debug_eval(void *ctx, const char *text) {
+  load_context *load = ctx;
+  qa_weapon_ai_bots_a *w = load->scope->weapons;
+  load->scope->in_callback = true;
+  w->resolver.debug_eval(w->resolver.debug_eval_ctx, text);
+  load->scope->in_callback = false;
 }
 static bool load_resolve(void *ctx, const qa_ui_script_include_request *request, qa_ui_script_source *out) {
   qa_weapon_ai_bots_a *w = ctx;
@@ -711,8 +730,8 @@ static load_status load_config(qa_weapon_ai_bots_a *w, const char *path, int64_t
   qa_ui_script_preprocessor_options options = w->preprocessor;
   options.globals = w->resolver.globals;
   if (w->resolver.debug_eval != NULL) {
-    options.debug_eval = w->resolver.debug_eval;
-    options.debug_eval_ctx = w->resolver.debug_eval_ctx;
+    options.debug_eval = load_debug_eval;
+    options.debug_eval_ctx = &load;
   }
   options.report = load_report;
   options.report_ctx = &load;
@@ -723,6 +742,7 @@ static load_status load_config(qa_weapon_ai_bots_a *w, const char *path, int64_t
                            (uint32_t)(projectile_capacity * PROJECTILE_INFO_BYTES));
   if (size < 0 || (int64_t)size > 2147483647LL - 4) {
     *out_thrown = lib_strdup("Bot memory allocation must fit a signed source size with its four-byte prefix");
+    qa_ui_script_source_reader_destroy(preprocessor);
     free(canonical);
     return LOAD_THROWN;
   }
@@ -742,6 +762,16 @@ static load_status load_config(qa_weapon_ai_bots_a *w, const char *path, int64_t
   weapon_parser parser = {w, &load, &tokens, &reader, canonical, weapon_capacity, projectile_capacity, allocation,
                           NULL, 0, NULL};
   bool ok = parse_weapon_config(&parser, config);
+  /* TS bindWeaponConfig, which the parse ends with: a header that outruns the allocation. */
+  if (ok && parser.thrown == NULL) {
+    int64_t header_capacity = lib_i32(allocation.bytes), header_count = lib_i32(allocation.bytes + 4);
+    if (header_capacity < 0 || header_count < 0 ||
+        WEAPON_CONFIG_BYTES + header_capacity * WEAPON_INFO_BYTES + header_count * PROJECTILE_INFO_BYTES >
+            (int64_t)allocation.length) {
+      parser.thrown = lib_strdup("Saved weapon configuration header exceeds allocation");
+      ok = false;
+    }
+  }
   free(parser.defined);
   if (tokens.unread != NULL) qa_ui_script_token_release(tokens.unread);
   load_status status = LOAD_OK;
@@ -775,6 +805,20 @@ static load_status load_config(qa_weapon_ai_bots_a *w, const char *path, int64_t
   *out = config;
   return status;
 }
+typedef struct load_call {
+  qa_weapon_ai_bots_a *weapons;
+  const char *path;
+  int64_t weapon_capacity, projectile_capacity;
+  setup_scope *scope;
+  qa_weapon_config_bots_a **out;
+  char **out_thrown;
+  load_status status;
+} load_call;
+static void load_run(void *ctx) {
+  load_call *call = ctx;
+  call->status = load_config(call->weapons, call->path, call->weapon_capacity, call->projectile_capacity, call->scope,
+                             call->out, call->out_thrown);
+}
 static void validate_config_path(const char *path) {
   size_t length = strlen(path);
   if (length == 0) qa_range_error("weapon config path cannot be empty");
@@ -791,7 +835,7 @@ static int64_t debug_write(void *ctx, const char *text) {
 qa_weapon_load_result qa_weapon_ai_setup(qa_weapon_ai_bots_a *w, const char *path_argument) {
   const char *path = path_argument != NULL ? path_argument : "weapons.c";
   validate_config_path(path);
-  setup_scope scope = {w, w->generation, ++w->setup_revision};
+  setup_scope scope = {w, w->generation, ++w->setup_revision, false};
   qa_weapon_capacity weapon_option = w->options.max_weapon_info;
   double weapon_value = weapon_option.fn != NULL ? weapon_option.fn(weapon_option.ctx) : weapon_option.value;
   if (!scope_current(&scope)) return QA_WEAPON_LOAD_CANNOT_LOAD_WEAPON_CONFIG;
@@ -813,7 +857,17 @@ qa_weapon_load_result qa_weapon_ai_setup(qa_weapon_ai_bots_a *w, const char *pat
   }
   qa_weapon_config_bots_a *config = NULL;
   char *thrown = NULL;
-  load_status status = load_config(w, path, (int64_t)weapons, (int64_t)projectiles, &scope, &config, &thrown);
+  /* TS catch (error): everything loadConfig throws is the setup's to report, except a CommonError
+   * and whatever a host callback threw. */
+  load_call call = {w, path, (int64_t)weapons, (int64_t)projectiles, &scope, &config, &thrown, LOAD_OK};
+  qa_caught_error caught;
+  if (!qa_try(load_run, &call, &caught)) {
+    if (scope.in_callback || strcmp(caught.name, "CommonError") == 0) qa_rethrow(&caught);
+    free(thrown);
+    thrown = lib_strdup(caught.message);
+    call.status = LOAD_THROWN;
+  }
+  load_status status = call.status;
   if (status != LOAD_OK) {
     if (!scope_current(&scope)) {
       free(thrown);
@@ -1064,6 +1118,25 @@ static void pointers_restore(qa_weapon_ai_bots_a *w, const qa_save_value *value,
   double next = lib_int_min(&reader, "next", 1);
   lib_field(&reader, "records", &records);
   lib_field(&reader, "configs", &configs);
+  /* TS reads the whole image (a SaveFormatError for any malformed cell) before it validates. */
+  for (size_t i = 0, count = qa_save_reader_list_count(&records); i < count; i++) {
+    qa_save_reader entry, kind_reader;
+    lib_item(&records, i, &entry);
+    (void)lib_int_min(&entry, "pointer", 1);
+    lib_field(&entry, "kind", &kind_reader);
+    (void)qa_save_reader_choice_string(&kind_reader, kinds, 2);
+    qa_save_reader_destroy(&kind_reader);
+    (void)lib_int_min(&entry, "target", 0);
+    (void)lib_int_min(&entry, "references", 0);
+    qa_save_reader_destroy(&entry);
+  }
+  for (size_t i = 0, count = qa_save_reader_list_count(&configs); i < count; i++) {
+    qa_save_reader entry;
+    lib_item(&configs, i, &entry);
+    (void)lib_int_min(&entry, "pointer", 1);
+    (void)lib_int_min(&entry, "config", 0);
+    qa_save_reader_destroy(&entry);
+  }
   if (w->record_count != 0 || next < 1 || next > 4294967296.0)
     qa_ui_script_plain_error("Invalid weapon pointer restoration");
   size_t record_count = qa_save_reader_list_count(&records);
@@ -1116,9 +1189,50 @@ void qa_weapon_ai_restore(qa_weapon_ai_bots_a *w, const qa_save_value *value, qa
   double generation = lib_int_min(&reader, "generation", 0);
   double revision = lib_int_min(&reader, "setupRevision", 0);
   lib_field(&reader, "reported", &reported);
+  /* TS reads the whole image (a SaveFormatError for any malformed cell) before it validates. */
+  for (size_t i = 0, count = qa_save_reader_list_count(&reported); i < count; i++) {
+    qa_save_reader entry, cell_reader, location;
+    lib_item(&reported, i, &entry);
+    lib_field(&entry, "origin", &cell_reader);
+    (void)qa_save_reader_choice_string(&cell_reader, origins, 2);
+    qa_save_reader_destroy(&cell_reader);
+    lib_field(&entry, "severity", &cell_reader);
+    (void)qa_save_reader_choice_string(&cell_reader, severities, 4);
+    qa_save_reader_destroy(&cell_reader);
+    lib_field(&entry, "message", &cell_reader);
+    (void)qa_save_reader_string(&cell_reader);
+    qa_save_reader_destroy(&cell_reader);
+    lib_field(&entry, "location", &location);
+    lib_field(&location, "path", &cell_reader);
+    (void)qa_save_reader_string(&cell_reader);
+    qa_save_reader_destroy(&cell_reader);
+    (void)lib_int_min(&location, "line", 0);
+    (void)lib_int_min(&location, "column", 0);
+    qa_save_reader_destroy(&location);
+    qa_save_reader_destroy(&entry);
+  }
   lib_field(&reader, "pointers", &pointers);
   lib_field(&reader, "states", &states);
+  for (size_t i = 0, count = qa_save_reader_list_count(&states); i < count; i++) {
+    qa_save_reader entry;
+    lib_item(&states, i, &entry);
+    if (!qa_save_reader_is_null(&entry)) {
+      (void)lib_int_min(&entry, "allocation", 0);
+      (void)lib_int_min(&entry, "revision", 0);
+    }
+    qa_save_reader_destroy(&entry);
+  }
   lib_field(&reader, "config", &config);
+  if (!qa_save_reader_is_null(&config)) {
+    qa_save_reader cell_reader;
+    (void)lib_int_min(&config, "allocation", 0);
+    lib_field(&config, "path", &cell_reader);
+    (void)qa_save_reader_string(&cell_reader);
+    qa_save_reader_destroy(&cell_reader);
+    lib_diagnostics scratch = {NULL, 0, 0};
+    lib_read_diagnostics(&config, "diagnostics", &scratch);
+    lib_diagnostics_destroy(&scratch);
+  }
   bool any = w->current_config != NULL;
   for (int64_t handle = 0; handle <= QA_MAX_WEAPON_STATES && !any; handle++) any = w->states[handle].used;
   bool first_null = false;
@@ -1139,22 +1253,24 @@ void qa_weapon_ai_restore(qa_weapon_ai_bots_a *w, const qa_save_value *value, qa
       double state_revision = lib_int_min(&entry, "revision", 0);
       qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
       if (allocation.length != 8 || state_revision < 0) qa_ui_script_plain_error("Invalid saved bot weapon state");
-      w->states[index] = (qa_weapon_state_bots_a){true, w->next_serial++, allocation, (int64_t)state_revision};
-      (void)state_config(w, &w->states[index]);
+      /* TS admits the state only once its configuration pointer has resolved. */
+      qa_weapon_state_bots_a restored_state = {true, 0, allocation, (int64_t)state_revision};
+      (void)state_config(w, &restored_state);
+      restored_state.serial = w->next_serial++;
+      w->states[index] = restored_state;
     }
     qa_save_reader_destroy(&entry);
   }
   if (!qa_save_reader_is_null(&config)) {
     double reference = lib_int_min(&config, "allocation", 0);
-    char *path = lib_read_string(&config, "path");
     qa_bot_memory_allocation allocation = qa_bot_memory_restored_allocation(memory, (int64_t)reference);
-    if (allocation.length < WEAPON_CONFIG_BYTES)
-      qa_ui_script_plain_error("Saved weapon configuration header exceeds allocation");
-    int32_t capacity = lib_i32(allocation.bytes), count = lib_i32(allocation.bytes + 4);
+    /* TS header.int(0) / header.int(4): the DataView refuses an allocation too short to hold them. */
+    int32_t capacity = lib_i32(cell(&allocation, 0, 4)), count = lib_i32(cell(&allocation, 4, 4));
     if (capacity < 0 || count < 0 ||
         WEAPON_CONFIG_BYTES + (int64_t)capacity * WEAPON_INFO_BYTES + (int64_t)count * PROJECTILE_INFO_BYTES >
             (int64_t)allocation.length)
       qa_ui_script_plain_error("Saved weapon configuration header exceeds allocation");
+    char *path = lib_read_string(&config, "path");
     qa_weapon_config_bots_a *restored = config_create(w, allocation, path);
     free(path);
     lib_read_diagnostics(&config, "diagnostics", &restored->diagnostics);

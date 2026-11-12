@@ -20,6 +20,8 @@
 #include "qa/content/archive/source.h"
 #include "qa/content/roots.h"
 #include "qa/content/user_data.h"
+#include "qa/foundation/js_case.h"
+#include "qa/foundation/node_path.h"
 #include "qa/foundation/support.h"
 #include "qa/network/q3/pure.h"
 #include "qa/persistence/value.h"
@@ -47,126 +49,27 @@ static bool text_equal(const char *left, const char *right) {
   if (left == NULL || right == NULL) return left == right;
   return strcmp(left, right) == 0;
 }
+/* text.toLowerCase() */
 static char *lowered_copy(const char *text) {
-  char *out = copy_text(text);
-  if (out == NULL) return NULL;
-  for (size_t i = 0; out[i] != '\0'; i++)
-    if (out[i] >= 'A' && out[i] <= 'Z') out[i] = (char)(out[i] - 'A' + 'a');
+  char *out = qa_js_to_lower_case(text);
+  if (out == NULL) oom_error();
   return out;
 }
 static bool starts_with(const char *text, const char *prefix) {
   return strncmp(text, prefix, strlen(prefix)) == 0;
 }
+/* text.toLowerCase().startsWith(prefix.toLowerCase()) */
 static bool starts_with_ci(const char *text, const char *prefix) {
-  char *lower_text = lowered_copy(text);
-  char *lower_prefix = lowered_copy(prefix);
-  bool result = lower_text != NULL && lower_prefix != NULL &&
-                starts_with(lower_text, lower_prefix);
-  free(lower_text);
-  free(lower_prefix);
-  return result;
+  return qa_js_starts_with_ignore_case(text, prefix);
 }
 
-/* Lexical absolute normalization (node:path resolve / dirname). */
-static char *normalize_absolute(const char *joined) {
-  size_t length = strlen(joined);
-  char *copy = copy_text(joined);
-  if (copy == NULL) return NULL;
-  char **parts = (char **)malloc((length / 2 + 2) * sizeof *parts);
-  if (parts == NULL) { free(copy); return NULL; }
-  size_t count = 0;
-  char *cursor = copy;
-  while (*cursor != '\0') {
-    while (*cursor == '/') cursor++;
-    if (*cursor == '\0') break;
-    char *start = cursor;
-    while (*cursor != '\0' && *cursor != '/') cursor++;
-    size_t part_length = (size_t)(cursor - start);
-    if (*cursor == '/') *cursor++ = '\0';
-    if (part_length == 1 && start[0] == '.') continue;
-    if (part_length == 2 && start[0] == '.' && start[1] == '.') {
-      if (count > 0) count--;
-      continue;
-    }
-    parts[count++] = start;
-  }
-  char *out = (char *)malloc(length + 2);
-  if (out == NULL) { free(parts); free(copy); return NULL; }
-  size_t at = 0;
-  if (count == 0) out[at++] = '/';
-  for (size_t i = 0; i < count; i++) {
-    out[at++] = '/';
-    size_t part_length = strlen(parts[i]);
-    memcpy(out + at, parts[i], part_length);
-    at += part_length;
-  }
-  out[at] = '\0';
-  free(parts);
-  free(copy);
-  return out;
-}
+/* node:path resolve / relative (qa/foundation/node_path.h). */
 static char *resolve2(const char *first, const char *second) {
-  char joined[PATH_MAX * 2];
-  if (second != NULL && second[0] == '/') {
-    (void)snprintf(joined, sizeof joined, "%s", second);
-  } else if (first[0] == '/') {
-    if (second != NULL) (void)snprintf(joined, sizeof joined, "%s/%s", first, second);
-    else (void)snprintf(joined, sizeof joined, "%s", first);
-  } else {
-    char cwd[PATH_MAX] = "";
-    if (getcwd(cwd, sizeof cwd) == NULL) cwd[0] = '\0';
-    if (second != NULL)
-      (void)snprintf(joined, sizeof joined, "%s/%s/%s", cwd, first, second);
-    else
-      (void)snprintf(joined, sizeof joined, "%s/%s", cwd, first);
-  }
-  return normalize_absolute(joined);
+  return second != NULL ? qa_node_path_resolve2(first, second)
+                        : qa_node_path_resolve1(first);
 }
 static char *relative_path(const char *from, const char *to) {
-  char *resolved_from = resolve2(from, NULL);
-  char *resolved_to = resolve2(to, NULL);
-  if (resolved_from == NULL || resolved_to == NULL) {
-    free(resolved_from); free(resolved_to);
-    return NULL;
-  }
-  if (strcmp(resolved_from, resolved_to) == 0) {
-    free(resolved_from); free(resolved_to);
-    return copy_text("");
-  }
-  size_t from_length = strlen(resolved_from);
-  char *result = NULL;
-  if (strcmp(resolved_from, "/") != 0 &&
-      strncmp(resolved_to, resolved_from, from_length) == 0 &&
-      resolved_to[from_length] == '/') {
-    result = copy_text(resolved_to + from_length + 1);
-  } else if (strcmp(resolved_from, "/") == 0 && resolved_to[0] == '/') {
-    result = copy_text(resolved_to + 1);
-  } else {
-    /* Generic ".." walk: count from-segments past the common prefix. */
-    size_t common = 0;
-    while (resolved_from[common] != '\0' && resolved_to[common] != '\0' &&
-           resolved_from[common] == resolved_to[common])
-      common++;
-    while (common > 0 && resolved_to[common] != '/') common--;
-    size_t ups = 0;
-    for (const char *p = resolved_from + common; *p != '\0'; p++)
-      if (*p == '/') ups++;
-    size_t rest_length = strlen(resolved_to + common + (resolved_to[common] == '/' ? 1 : 0));
-    result = (char *)malloc(ups * 3 + rest_length + 1);
-    if (result != NULL) {
-      size_t at = 0;
-      for (size_t i = 0; i < ups; i++) {
-        memcpy(result + at, "../", 3);
-        at += 3;
-      }
-      const char *rest = resolved_to + common + (resolved_to[common] == '/' ? 1 : 0);
-      memcpy(result + at, rest, rest_length + 1);
-      if (at > 0 && result[at - 1] == '/' && rest_length == 0) result[at - 1] = '\0';
-    }
-  }
-  free(resolved_from);
-  free(resolved_to);
-  return result;
+  return qa_node_path_relative(from, to);
 }
 
 /* ---- digests ---------------------------------------------------- */
@@ -246,10 +149,11 @@ static bool fingerprint_matches(const digest_fingerprint *entry,
 static char *digest_cache_file(void) {
   char *root = qa_default_user_content_root();
   if (root == NULL) return NULL;
-  char joined[PATH_MAX * 2];
-  (void)snprintf(joined, sizeof joined, "%s/../cache/archive-digests.json", root);
+  /* resolve(defaultUserContentRoot(), "..", "cache", "archive-digests.json") */
+  const char *parts[4] = {root, "..", "cache", "archive-digests.json"};
+  char *file = qa_node_path_resolve(parts, 4);
   free(root);
-  return normalize_absolute(joined);
+  return file;
 }
 
 static void load_disk_digests(void) {
@@ -406,7 +310,7 @@ static double timespec_ms(struct timespec value) {
 
 char *qa_digest_file(const char *path) {
   struct stat info;
-  if (stat(path, &info) != 0) plain_error("%s", strerror(errno));
+  if (stat(path, &info) != 0) qa_content_fs_error(errno, "statx", path);
   digest_fingerprint fingerprint = {(double)info.st_size,
                                     timespec_ms(info.st_mtim),
                                     timespec_ms(info.st_ctim),
@@ -430,7 +334,7 @@ char *qa_digest_file(const char *path) {
     }
   }
   FILE *file = fopen(path, "rb");
-  if (file == NULL) plain_error("%s", strerror(errno));
+  if (file == NULL) qa_content_fs_error(errno, "open", path);
   EVP_MD_CTX *context = EVP_MD_CTX_new();
   if (context == NULL) { (void)fclose(file); return NULL; }
   (void)EVP_DigestInit_ex(context, EVP_sha256(), NULL);
@@ -486,14 +390,15 @@ typedef struct opened_records {
   size_t count, capacity;
 } opened_records;
 
-typedef struct listing_entry {
-  char *name; /* owned */
-  unsigned char type; /* DT_* */
-} listing_entry;
+/* TS #listings: directory -> Promise<Dirent[] | null>. A missing directory
+ * is the cached null; any other readdir failure is the cached rejection,
+ * thrown again on every later lookup until the listings are invalidated. */
 typedef struct listing_cache {
   char *directory; /* owned */
   bool missing;
-  listing_entry *entries;
+  int failed; /* errno of the cached rejection, or 0 */
+  char **names; /* owned */
+  unsigned char *types; /* DT_* per name */
   size_t count;
 } listing_cache;
 
@@ -688,14 +593,18 @@ static qa_open_mount_options empty_options(void) {
 }
 static void resolve_mount_plan_into(qa_content_mounted *mounted,
                                     const qa_resolved_mount_plan *plan,
-                                    const qa_open_mount_options *options) {
-  for (size_t i = 0; i < plan->mount_count; i++)
-    for (size_t j = i + 1; j < plan->mount_count; j++)
+                                    const qa_open_mount_options *options,
+                                    bool reorder) {
+  /* TS walks the mounts once: the first one whose id was already seen. */
+  for (size_t j = 1; j < plan->mount_count; j++)
+    for (size_t i = 0; i < j; i++)
       if (text_equal(mount_identity(&plan->mounts[i])->id,
                      mount_identity(&plan->mounts[j])->id))
         qa_range_error("Repeated mount identity: %s",
-                       mount_identity(&plan->mounts[i])->id);
-  resolve_order_into(mounted, plan, options);
+                       mount_identity(&plan->mounts[j])->id);
+  /* borrowWithLooseMount builds its plan directly: the orders are taken as
+   * given, with no pure reordering. */
+  resolve_order_into(mounted, plan, reorder ? options : NULL);
   mounted->options = options != NULL ? *options : empty_options();
   if (options != NULL && options->has_pure) {
     mounted->pure_archives = (qa_content_digest *)malloc(
@@ -739,14 +648,26 @@ static void resolve_mount_plan_into(qa_content_mounted *mounted,
     }
   }
 }
-static qa_content_mounted *mounted_create_plan(
-    const qa_resolved_mount_plan *plan, const qa_open_mount_options *options) {
+static void mounted_discard(void *arg) {
+  qa_content_mounted_destroy((qa_content_mounted *)arg);
+}
+static qa_content_mounted *mounted_create_ordered(
+    const qa_resolved_mount_plan *plan, const qa_open_mount_options *options,
+    bool reorder) {
   qa_content_mounted *mounted =
       (qa_content_mounted *)calloc(1, sizeof *mounted);
   if (mounted == NULL) return NULL;
   mounted->next_opened_key = 1;
-  resolve_mount_plan_into(mounted, plan, options);
+  /* An invalid plan raises; the unfinished view is released. */
+  qa_cleanup node;
+  qa_cleanup_push(&node, mounted_discard, mounted);
+  resolve_mount_plan_into(mounted, plan, options, reorder);
+  qa_cleanup_pop(&node);
   return mounted;
+}
+static qa_content_mounted *mounted_create_plan(
+    const qa_resolved_mount_plan *plan, const qa_open_mount_options *options) {
+  return mounted_create_ordered(plan, options, true);
 }
 static void records_clear(opened_records *records) {
   for (size_t i = 0; i < records->count; i++) {
@@ -801,8 +722,9 @@ static void clear_listings(qa_content_mounted *mounted) {
   for (size_t i = 0; i < mounted->listing_count; i++) {
     free(mounted->listings[i].directory);
     for (size_t j = 0; j < mounted->listings[i].count; j++)
-      free(mounted->listings[i].entries[j].name);
-    free(mounted->listings[i].entries);
+      free(mounted->listings[i].names[j]);
+    free(mounted->listings[i].names);
+    free(mounted->listings[i].types);
   }
   free(mounted->listings);
   mounted->listings = NULL;
@@ -896,6 +818,19 @@ static bool source_allowed(const qa_content_mounted *mounted,
   return pure_loose_path(path);
 }
 
+static const listing_cache *listing_for(qa_content_mounted *mounted,
+                                        const char *directory);
+/* The TS `cached` lister: the names of the cached listing; a missing
+ * directory throws ENOENT, which findContentPath reads as a miss. */
+static bool list_cached(void *ctx, const char *directory, char ***out_names,
+                        size_t *out_count, bool *out_owned) {
+  const listing_cache *cache = listing_for((qa_content_mounted *)ctx, directory);
+  *out_owned = false;
+  *out_names = cache->names;
+  *out_count = cache->count;
+  return !cache->missing;
+}
+
 typedef struct source_read {
   uint8_t *bytes;
   size_t byte_length;
@@ -942,8 +877,14 @@ static bool read_source(qa_content_mounted *mounted, mounted_source *source,
     out->member_path = copy_text_or_oom(entry->path);
     return true;
   }
+  /* Cached listings serve repeated probes; a miss is re-checked against the
+   * disk so new files are never hidden. A cached hit is taken as it is: a
+   * stale spelling wins until the listings are invalidated. */
   char *found_path = NULL;
-  if (!qa_find_content_path(source->mount.as.loose.root_path, member_path,
+  if (!qa_find_content_path_listed(source->mount.as.loose.root_path,
+                                   member_path, loose_comparison_of(mounted),
+                                   list_cached, mounted, &found_path) &&
+      !qa_find_content_path(source->mount.as.loose.root_path, member_path,
                             loose_comparison_of(mounted), &found_path))
     return false;
   struct stat info;
@@ -951,10 +892,9 @@ static bool read_source(qa_content_mounted *mounted, mounted_source *source,
     /* TS isMissingFile (ENOENT, ENOTDIR) is a miss; other stat errors throw. */
     int code = errno;
     if (code != ENOENT && code != ENOTDIR) {
-      char text[PATH_MAX + 64];
-      snprintf(text, sizeof text, "%s", found_path);
-      free(found_path);
-      qa_raise("Error", 0, 0, "%s, stat '%s'", strerror(code), text);
+      qa_cleanup node;
+      qa_cleanup_push(&node, free, found_path);
+      qa_content_fs_error(code, "statx", found_path);
     }
     free(found_path);
     return false;
@@ -1077,6 +1017,12 @@ static void normalize_run(void *raw) {
   job->normalized = qa_normalize_resource_path(job->path);
 }
 
+static bool open_normalized(qa_content_mounted *mounted,
+                            const qa_resolved_mount_plan *plan,
+                            const char *requested_path, qa_mount_accept_fn accept,
+                            void *accept_ctx, opened_records *records,
+                            qa_content_opened_resource *out);
+
 static bool mounted_open_impl(qa_content_mounted *mounted,
                               const qa_resolved_mount_plan *plan,
                               const char *path, qa_mount_accept_fn accept,
@@ -1093,6 +1039,21 @@ static bool mounted_open_impl(qa_content_mounted *mounted,
   }
   char *requested_path = job.normalized;
   if (requested_path == NULL) oom_error();
+  /* A source that throws (an unreadable directory, a changed archive) leaves
+   * nothing behind. */
+  qa_cleanup requested_node;
+  qa_cleanup_push(&requested_node, free, requested_path);
+  bool opened = open_normalized(mounted, plan, requested_path, accept, accept_ctx, records, out);
+  qa_cleanup_pop(&requested_node);
+  free(requested_path);
+  return opened;
+}
+
+static bool open_normalized(qa_content_mounted *mounted,
+                            const qa_resolved_mount_plan *plan,
+                            const char *requested_path, qa_mount_accept_fn accept,
+                            void *accept_ctx, opened_records *records,
+                            qa_content_opened_resource *out) {
   if (mounted->user_mount_count != 0) {
     for (size_t rank = 0; rank < plan->default_order_count; rank++) {
       qa_mount_id id = plan->default_order[rank];
@@ -1114,7 +1075,6 @@ static bool mounted_open_impl(qa_content_mounted *mounted,
         out->reference = &record->reference;
         out->bytes = read.bytes;
         out->byte_length = read.byte_length;
-        free(requested_path);
         return true;
       }
     }
@@ -1125,7 +1085,6 @@ static bool mounted_open_impl(qa_content_mounted *mounted,
     mounted_source *source = source_for(mounted, link->mount);
     if (source == NULL) plain_error("Unknown link mount: %s", link->mount);
     if (!accept_mount(accept, accept_ctx, &source->mount)) {
-      free(requested_path);
       return false;
     }
     const char *target_prefix =
@@ -1136,15 +1095,20 @@ static bool mounted_open_impl(qa_content_mounted *mounted,
     if (joined == NULL) oom_error();
     (void)snprintf(joined, joined_length, "%s%s", target_prefix,
                    requested_path + strlen(link->source_prefix));
+    qa_cleanup joined_node;
+    qa_cleanup_push(&joined_node, free, joined);
     char *target_path = qa_normalize_resource_path(joined);
+    qa_cleanup_pop(&joined_node);
     free(joined);
     if (target_path == NULL) oom_error();
     source_read read;
+    qa_cleanup target_node;
+    qa_cleanup_push(&target_node, free, target_path);
     bool found = read_source(mounted, source, target_path, &read);
+    qa_cleanup_pop(&target_node);
     qa_content_mounted_assert_open(mounted);
     if (!found) {
       free(target_path);
-      free(requested_path);
       return false;
     }
     qa_resource_resolution resolution;
@@ -1159,7 +1123,6 @@ static bool mounted_open_impl(qa_content_mounted *mounted,
     out->reference = &record->reference;
     out->bytes = read.bytes;
     out->byte_length = read.byte_length;
-    free(requested_path);
     return true;
   }
   const qa_prefix_mount_order *prefix = find_prefix(plan, requested_path);
@@ -1189,11 +1152,9 @@ static bool mounted_open_impl(qa_content_mounted *mounted,
       out->reference = &record->reference;
       out->bytes = read.bytes;
       out->byte_length = read.byte_length;
-      free(requested_path);
       return true;
     }
   }
-  free(requested_path);
   return false;
 }
 
@@ -1350,8 +1311,11 @@ void qa_content_mounted_invalidate_listings(qa_content_mounted *mounted) {
 static const listing_cache *listing_for(qa_content_mounted *mounted,
                                         const char *directory) {
   for (size_t i = 0; i < mounted->listing_count; i++)
-    if (strcmp(mounted->listings[i].directory, directory) == 0)
+    if (strcmp(mounted->listings[i].directory, directory) == 0) {
+      if (mounted->listings[i].failed != 0)
+        qa_content_fs_error(mounted->listings[i].failed, "scandir", directory);
       return &mounted->listings[i];
+    }
   if (mounted->listing_count == mounted->listing_capacity) {
     size_t next = mounted->listing_capacity == 0 ? 8 : mounted->listing_capacity * 2;
     listing_cache *grown =
@@ -1371,8 +1335,9 @@ static const listing_cache *listing_for(qa_content_mounted *mounted,
       cache->missing = true;
       return cache;
     }
-    fprintf(stderr, "Error: %s: %s\n", directory, strerror(error_number));
-    abort();
+    /* The rejection stays cached, as the TS promise does. */
+    cache->failed = error_number;
+    qa_content_fs_error(error_number, "scandir", directory);
   }
   struct dirent *entry;
   size_t capacity = 0;
@@ -1381,30 +1346,54 @@ static const listing_cache *listing_for(qa_content_mounted *mounted,
       continue;
     if (cache->count == capacity) {
       size_t next = capacity == 0 ? 16 : capacity * 2;
-      listing_entry *grown =
-          (listing_entry *)realloc(cache->entries, next * sizeof *grown);
-      if (grown == NULL) oom_error();
-      cache->entries = grown;
+      char **grown_names = (char **)realloc(cache->names, next * sizeof *grown_names);
+      if (grown_names == NULL) { (void)closedir(dir); oom_error(); }
+      cache->names = grown_names;
+      unsigned char *grown_types = (unsigned char *)realloc(cache->types, next);
+      if (grown_types == NULL) { (void)closedir(dir); oom_error(); }
+      cache->types = grown_types;
       capacity = next;
     }
-    cache->entries[cache->count].name = copy_text_or_oom(entry->d_name);
-    cache->entries[cache->count].type = entry->d_type;
+    char *name = copy_text(entry->d_name);
+    if (name == NULL) { (void)closedir(dir); oom_error(); }
+    cache->names[cache->count] = name;
+    cache->types[cache->count] = entry->d_type;
     cache->count++;
   }
   (void)closedir(dir);
   return cache;
 }
 
+/* name.toLowerCase() === part.toLowerCase(), `lowered_part` precomputed. */
+static bool name_equals_ci(const char *name, const char *lowered_part) {
+  bool ascii = true;
+  for (const unsigned char *p = (const unsigned char *)name; *p != '\0'; p++)
+    if (*p >= 0x80) { ascii = false; break; }
+  if (ascii) {
+    size_t i = 0;
+    for (; name[i] != '\0'; i++) {
+      char c = name[i];
+      if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+      if (c != lowered_part[i]) return false;
+    }
+    return lowered_part[i] == '\0';
+  }
+  char *lowered = lowered_copy(name);
+  bool equal = strcmp(lowered, lowered_part) == 0;
+  free(lowered);
+  return equal;
+}
+
 static bool entry_kind(const listing_cache *cache, size_t index,
                        const char *current_path, bool want_file,
                        bool want_directory, bool *is_link, bool *unknown) {
-  unsigned char type = cache->entries[index].type;
+  unsigned char type = cache->types[index];
   *is_link = type == DT_LNK;
   *unknown = type != DT_REG && type != DT_DIR && type != DT_LNK;
   if (want_file && type == DT_REG) return true;
   if (want_directory && type == DT_DIR) return true;
   if (*unknown) {
-    char *joined = resolve2(current_path, cache->entries[index].name);
+    char *joined = resolve2(current_path, cache->names[index]);
     struct stat info;
     bool result = false;
     if (joined != NULL && lstat(joined, &info) == 0) {
@@ -1420,6 +1409,15 @@ static bool entry_kind(const listing_cache *cache, size_t index,
   return false;
 }
 
+typedef struct probe_strings {
+  char *normalized;
+  char **current;
+} probe_strings;
+static void probe_strings_release(void *arg) {
+  probe_strings *strings = (probe_strings *)arg;
+  free(strings->normalized);
+  free(*strings->current);
+}
 static bool probe_loose(qa_content_mounted *mounted, const char *root_path,
                         const char *member_path) {
   char *normalized = qa_normalize_resource_path(member_path);
@@ -1427,6 +1425,10 @@ static bool probe_loose(qa_content_mounted *mounted, const char *root_path,
   bool exact = loose_comparison_of(mounted) == QA_CONTENT_PATH_EXACT;
   char *current = resolve2(root_path, NULL);
   if (current == NULL) oom_error();
+  /* Released when a listing or the fallback lookup throws. */
+  probe_strings strings = {normalized, &current};
+  qa_cleanup strings_node;
+  qa_cleanup_push(&strings_node, probe_strings_release, &strings);
   size_t length = strlen(normalized), start = 0;
   size_t part_index = 0;
   size_t part_total = 1;
@@ -1451,30 +1453,22 @@ static bool probe_loose(qa_content_mounted *mounted, const char *root_path,
     long exact_index = -1;
     long ci_index = -1;
     size_t ci_count = 0;
+    char *lower_part = exact ? NULL : lowered_copy(part);
     for (size_t e = 0; e < cache->count; e++) {
-      if (strcmp(cache->entries[e].name, part) == 0) exact_index = (long)e;
-      char *lower_name = lowered_copy(cache->entries[e].name);
-      char *lower_part = lowered_copy(part);
-      bool equal = lower_name != NULL && lower_part != NULL &&
-                   strcmp(lower_name, lower_part) == 0;
-      free(lower_name);
-      free(lower_part);
-      if (equal) {
+      if (exact_index < 0 && strcmp(cache->names[e], part) == 0) exact_index = (long)e;
+      if (!exact && name_equals_ci(cache->names[e], lower_part)) {
         if (ci_count == 0) ci_index = (long)e;
         ci_count++;
       }
     }
+    free(lower_part);
     long chosen;
     if (exact) {
       chosen = exact_index;
     } else if (exact_index >= 0) {
       chosen = exact_index;
     } else {
-      if (ci_count > 1) {
-        free(current);
-        free(normalized);
-        plain_error("Ambiguous content path: %s", member_path);
-      }
+      if (ci_count > 1) plain_error("Ambiguous content path: %s", member_path);
       chosen = ci_index;
     }
     if (chosen < 0) {
@@ -1486,7 +1480,7 @@ static bool probe_loose(qa_content_mounted *mounted, const char *root_path,
                               &is_link, &unknown);
     bool is_directory = entry_kind(cache, (size_t)chosen, current, false, true,
                                    &is_link, &unknown);
-    char *next = resolve2(current, cache->entries[chosen].name);
+    char *next = resolve2(current, cache->names[chosen]);
     if (next == NULL) oom_error();
     free(current);
     current = next;
@@ -1500,8 +1494,9 @@ static bool probe_loose(qa_content_mounted *mounted, const char *root_path,
         struct stat info;
         if (stat(found, &info) != 0) {
           int error = errno;
-          free(found); free(current); free(normalized);
-          plain_error("%s", strerror(error));
+          qa_cleanup node;
+          qa_cleanup_push(&node, free, found);
+          qa_content_fs_error(error, "statx", found);
         }
         result = S_ISREG(info.st_mode);
       }
@@ -1519,6 +1514,7 @@ static bool probe_loose(qa_content_mounted *mounted, const char *root_path,
     part_index++;
     start = i + 1;
   }
+  qa_cleanup_pop(&strings_node);
   free(current);
   free(normalized);
   return result;
@@ -1545,18 +1541,26 @@ static bool probe_source(qa_content_mounted *mounted, mounted_source *source,
   return probe_loose(mounted, source->mount.as.loose.root_path, member_path);
 }
 
+static bool exists_normalized(qa_content_mounted *mounted, char *requested_path);
 bool qa_content_mounted_exists(qa_content_mounted *mounted, const char *path) {
   qa_content_mounted_assert_open(mounted);
-  const qa_resolved_mount_plan *plan = &mounted->plan;
   char *requested_path = qa_normalize_resource_path(path);
   if (requested_path == NULL) oom_error();
+  qa_cleanup requested_node;
+  qa_cleanup_push(&requested_node, free, requested_path);
+  bool exists = exists_normalized(mounted, requested_path);
+  qa_cleanup_pop(&requested_node);
+  free(requested_path);
+  return exists;
+}
+static bool exists_normalized(qa_content_mounted *mounted, char *requested_path) {
+  const qa_resolved_mount_plan *plan = &mounted->plan;
   if (mounted->user_mount_count != 0) {
     for (size_t i = 0; i < plan->default_order_count; i++) {
       qa_mount_id id = plan->default_order[i];
       if (!is_user_mount(mounted, id)) continue;
       mounted_source *source = source_for(mounted, id);
       if (source != NULL && probe_source(mounted, source, requested_path)) {
-        free(requested_path);
         return true;
       }
     }
@@ -1574,12 +1578,17 @@ bool qa_content_mounted_exists(qa_content_mounted *mounted, const char *path) {
     if (joined == NULL) oom_error();
     (void)snprintf(joined, joined_length, "%s%s", target_prefix,
                    requested_path + strlen(link->source_prefix));
+    qa_cleanup joined_node;
+    qa_cleanup_push(&joined_node, free, joined);
     char *target_path = qa_normalize_resource_path(joined);
+    qa_cleanup_pop(&joined_node);
     free(joined);
     if (target_path == NULL) oom_error();
+    qa_cleanup target_node;
+    qa_cleanup_push(&target_node, free, target_path);
     bool result = probe_source(mounted, source, target_path);
+    qa_cleanup_pop(&target_node);
     free(target_path);
-    free(requested_path);
     return result;
   }
   const qa_prefix_mount_order *prefix = find_prefix(plan, requested_path);
@@ -1592,11 +1601,9 @@ bool qa_content_mounted_exists(qa_content_mounted *mounted, const char *path) {
     if (source == NULL) plain_error("Unknown mounted source: %s", id);
     if (is_user_mount(mounted, id)) continue;
     if (probe_source(mounted, source, requested_path)) {
-      free(requested_path);
       return true;
     }
   }
-  free(requested_path);
   return false;
 }
 
@@ -1606,56 +1613,159 @@ static size_t path_depth(const char *value) {
     if (*p == '/' || *p == '\\') depth++;
   return depth;
 }
-static bool has_suffix_ci(const char *name, const char *extension) {
-  size_t name_length = strlen(name), extension_length = strlen(extension);
-  if (name_length < extension_length) return false;
-  for (size_t i = 0; i < extension_length; i++) {
-    char a = name[name_length - extension_length + i];
-    char b = extension[i];
-    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
-    if (a != b) return false;
+
+/* A TS string whose characters are all at most U+00FF, as the bytes of
+ * those characters (the form archive member names have here). Returns NULL
+ * when a character is above U+00FF; *out_units is the UTF-16 length either
+ * way. Bytes that are not UTF-8 count as one character each. */
+static char *latin1_bytes(const char *text, size_t *out_units) {
+  size_t length = strlen(text);
+  char *out = (char *)malloc(length + 1);
+  if (out == NULL) oom_error();
+  size_t at = 0, units = 0;
+  bool wide = false;
+  for (size_t i = 0; i < length;) {
+    unsigned char c = (unsigned char)text[i];
+    if (c < 0x80) { out[at++] = (char)c; units++; i++; continue; }
+    size_t need = c >= 0xf0 && c <= 0xf4 ? 3 : c >= 0xe0 ? 2 : c >= 0xc2 ? 1 : 0;
+    if (c > 0xf4) need = 0;
+    bool valid = need != 0;
+    for (size_t k = 1; valid && k <= need; k++)
+      if (((unsigned char)text[i + k] & 0xc0) != 0x80) valid = false;
+    if (!valid) { out[at++] = (char)c; units++; i++; continue; }
+    if (need == 1 && c <= 0xc3) {
+      out[at++] = (char)(((c & 0x03) << 6) | ((unsigned char)text[i + 1] & 0x3f));
+      units++;
+    } else {
+      wide = true;
+      units += need == 3 ? 2 : 1;
+    }
+    i += need + 1;
   }
-  return true;
+  out[at] = '\0';
+  if (out_units != NULL) *out_units = units;
+  if (wide) { free(out); return NULL; }
+  return out;
+}
+/* The UTF-8 text of a byte string (one character per byte). */
+static char *latin1_to_utf8(const char *bytes) {
+  size_t length = strlen(bytes);
+  char *out = (char *)malloc(length * 2 + 1);
+  if (out == NULL) oom_error();
+  size_t at = 0;
+  for (size_t i = 0; i < length; i++) {
+    unsigned char c = (unsigned char)bytes[i];
+    if (c < 0x80) out[at++] = (char)c;
+    else {
+      out[at++] = (char)(0xc0 | (c >> 6));
+      out[at++] = (char)(0x80 | (c & 0x3f));
+    }
+  }
+  out[at] = '\0';
+  return out;
+}
+
+typedef struct file_listing {
+  char **names;
+  size_t count, capacity;
+  char **seen; /* name.toLowerCase(), UTF-8 */
+  size_t seen_count, seen_capacity;
+  char *directory;    /* Latin-1 bytes */
+  char *extension;    /* Latin-1 bytes */
+  DIR *dir;
+  char *location;
+} file_listing;
+static void file_listing_release(void *arg) {
+  file_listing *listing = (file_listing *)arg;
+  qa_content_free_string_list(listing->names, listing->count);
+  qa_content_free_string_list(listing->seen, listing->seen_count);
+  free(listing->directory);
+  free(listing->extension);
+  free(listing->location);
+  if (listing->dir != NULL) (void)closedir(listing->dir);
+  memset(listing, 0, sizeof *listing);
+}
+/* TS add(name): at most 4095 names, unique by name.toLowerCase(). Takes
+ * the lower-cased UTF-8 key. */
+static void file_listing_add(file_listing *listing, const char *name, char *lower) {
+  if (listing->count >= 4095) { free(lower); return; }
+  for (size_t s = 0; s < listing->seen_count; s++)
+    if (strcmp(listing->seen[s], lower) == 0) { free(lower); return; }
+  if (listing->seen_count == listing->seen_capacity) {
+    size_t next = listing->seen_capacity == 0 ? 16 : listing->seen_capacity * 2;
+    char **grown = (char **)realloc(listing->seen, next * sizeof *grown);
+    if (grown == NULL) { free(lower); oom_error(); }
+    listing->seen = grown;
+    listing->seen_capacity = next;
+  }
+  listing->seen[listing->seen_count++] = lower;
+  if (listing->count == listing->capacity) {
+    size_t next = listing->capacity == 0 ? 16 : listing->capacity * 2;
+    char **grown = (char **)realloc(listing->names, next * sizeof *grown);
+    if (grown == NULL) oom_error();
+    listing->names = grown;
+    listing->capacity = next;
+  }
+  listing->names[listing->count] = copy_text_or_oom(name);
+  listing->count++;
 }
 
 char **qa_content_mounted_list_files(qa_content_mounted *mounted,
                                      const char *path, const char *extension,
                                      size_t *out_count) {
   qa_content_mounted_assert_open(mounted);
-  if (strlen(path) >= 256)
+  /* TS: path.length >= 256 (UTF-16 units), or any character of path or
+   * extension above U+00FF. */
+  file_listing listing;
+  memset(&listing, 0, sizeof listing);
+  size_t path_units = 0;
+  char *path_bytes = latin1_bytes(path, &path_units);
+  listing.extension = latin1_bytes(extension, NULL);
+  if (path_units >= 256 || path_bytes == NULL || listing.extension == NULL) {
+    free(path_bytes);
+    free(listing.extension);
     qa_range_error("Q3 file listing exceeds source path representation");
+  }
+  listing.directory = path_bytes;
+  qa_cleanup node;
+  qa_cleanup_push(&node, file_listing_release, &listing);
+  /* path.replace(/[\\/]$/, ""), on the text and on its byte form. */
   char *directory = copy_text_or_oom(path);
-  size_t directory_length = strlen(directory);
+  size_t text_length = strlen(directory);
+  if (text_length > 0 && (directory[text_length - 1] == '/' ||
+                          directory[text_length - 1] == '\\'))
+    directory[--text_length] = '\0';
+  listing.location = directory; /* released with the listing until replaced */
+  size_t directory_length = strlen(listing.directory);
   if (directory_length > 0 &&
-      (directory[directory_length - 1] == '/' ||
-       directory[directory_length - 1] == '\\'))
-    directory[--directory_length] = '\0';
-  if (directory_length != 0) {
+      (listing.directory[directory_length - 1] == '/' ||
+       listing.directory[directory_length - 1] == '\\'))
+    listing.directory[--directory_length] = '\0';
+  if (text_length != 0) {
     char *normalized = qa_normalize_resource_path(directory);
     if (normalized == NULL) oom_error();
     free(normalized);
   }
-  char *with_slash = (char *)malloc(directory_length + 2);
+  char *with_slash = (char *)malloc(text_length + 2);
   if (with_slash == NULL) oom_error();
-  (void)snprintf(with_slash, directory_length + 2, "%s/", directory);
+  (void)snprintf(with_slash, text_length + 2, "%s/", directory);
   const qa_prefix_mount_order *prefix = find_prefix(&mounted->plan, with_slash);
   free(with_slash);
   const qa_mount_id *order =
       prefix != NULL ? prefix->mounts : mounted->plan.default_order;
   size_t order_count =
       prefix != NULL ? prefix->mount_count : mounted->plan.default_order_count;
-  char **names = NULL;
-  size_t count = 0, capacity = 0;
-  char **seen = NULL;
-  size_t seen_count = 0, seen_capacity = 0;
+  size_t extension_length = strlen(listing.extension);
+  size_t requested_depth = path_depth(path);
   for (size_t oi = 0; oi < order_count; oi++) {
     qa_mount_id id = order[oi];
     mounted_source *source = source_for(mounted, id);
     if (source == NULL) plain_error("Unknown mounted source: %s", id);
     if (source->mount.kind == QA_CONTENT_MOUNT_ARCHIVE) {
+      /* Member names are byte strings: one character per byte. */
       for (size_t e = 0; e < source->archive->entry_count; e++) {
         const char *name = source->archive->entries[e].path;
+        size_t name_length = strlen(name);
         const char *slash = strrchr(name, '/');
         const char *backslash = strrchr(name, '\\');
         long last_separator = -1;
@@ -1664,41 +1774,27 @@ char **qa_content_mounted_list_files(qa_content_mounted *mounted,
           last_separator = (long)(backslash - name);
         long floor_separator = last_separator > 0 ? last_separator : 0;
         if (!source_allowed(mounted, source, name)) continue;
-        if ((long)path_depth(name) - (long)path_depth(path) > 2) continue;
+        if ((long)path_depth(name) - (long)requested_depth > 2) continue;
         if ((long)directory_length > floor_separator) continue;
         bool head_equal = true;
-        for (size_t i = 0; i < directory_length; i++) {
-          char a = name[i], b = directory[i];
-          if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-          if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
-          if (a != b) head_equal = false;
-        }
+        for (size_t i = 0; head_equal && i < directory_length; i++)
+          if (qa_js_latin1_lower((unsigned char)name[i]) !=
+              qa_js_latin1_lower((unsigned char)listing.directory[i]))
+            head_equal = false;
         if (!head_equal) continue;
-        if (!has_suffix_ci(name, extension)) continue;
+        if (name_length < extension_length) continue;
+        bool tail_equal = true;
+        for (size_t i = 0; tail_equal && i < extension_length; i++)
+          if (qa_js_latin1_lower((unsigned char)name[name_length - extension_length + i]) !=
+              qa_js_latin1_lower((unsigned char)listing.extension[i]))
+            tail_equal = false;
+        if (!tail_equal) continue;
         const char *relative_name =
             name + (directory_length == 0 ? 0 : directory_length + 1);
-        if (count >= 4095) continue;
-        char *lower = lowered_copy(relative_name);
-        bool duplicate = false;
-        for (size_t s = 0; s < seen_count; s++)
-          if (lower != NULL && strcmp(seen[s], lower) == 0) duplicate = true;
-        if (duplicate) { free(lower); continue; }
-        if (seen_count == seen_capacity) {
-          size_t next = seen_capacity == 0 ? 16 : seen_capacity * 2;
-          char **grown = (char **)realloc(seen, next * sizeof *grown);
-          if (grown == NULL) oom_error();
-          seen = grown;
-          seen_capacity = next;
-        }
-        seen[seen_count++] = lower;
-        if (count == capacity) {
-          size_t next = capacity == 0 ? 16 : capacity * 2;
-          char **grown = (char **)realloc(names, next * sizeof *grown);
-          if (grown == NULL) oom_error();
-          names = grown;
-          capacity = next;
-        }
-        names[count++] = copy_text_or_oom(relative_name);
+        char *text = latin1_to_utf8(relative_name);
+        char *lower = lowered_copy(text);
+        free(text);
+        file_listing_add(&listing, relative_name, lower);
       }
     } else {
       if (!is_user_mount(mounted, mount_identity(&source->mount)->id) &&
@@ -1707,7 +1803,7 @@ char **qa_content_mounted_list_files(qa_content_mounted *mounted,
             mounted->options.pure.archive_count != 0)))
         continue;
       char *location = NULL;
-      if (directory_length == 0) {
+      if (text_length == 0) {
         location = copy_text_or_oom(source->mount.as.loose.root_path);
       } else if (!qa_find_content_path(source->mount.as.loose.root_path,
                                        directory,
@@ -1715,19 +1811,20 @@ char **qa_content_mounted_list_files(qa_content_mounted *mounted,
                                        &location)) {
         continue;
       }
-      DIR *dir = opendir(location);
-      if (dir == NULL) {
+      listing.dir = opendir(location);
+      if (listing.dir == NULL) {
         int error_number = errno;
-        free(location);
-        if (qa_is_missing_file(error_number)) continue;
-        fprintf(stderr, "Error: %s: %s\n", directory, strerror(error_number));
-        abort();
+        if (qa_is_missing_file(error_number)) { free(location); continue; }
+        qa_cleanup location_node;
+        qa_cleanup_push(&location_node, free, location);
+        qa_content_fs_error(error_number, "scandir", location);
       }
-      free(location);
+      qa_cleanup location_node;
+      qa_cleanup_push(&location_node, free, location);
       qa_content_mounted_assert_open(mounted);
       struct dirent *entry;
       bool want_directories = strcmp(extension, "/") == 0;
-      while ((entry = readdir(dir)) != NULL) {
+      while ((entry = readdir(listing.dir)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 ||
             strcmp(entry->d_name, "..") == 0)
           continue;
@@ -1735,47 +1832,33 @@ char **qa_content_mounted_list_files(qa_content_mounted *mounted,
         bool is_directory = entry->d_type == DT_DIR;
         if (entry->d_type == DT_UNKNOWN) {
           struct stat info;
-          char joined[PATH_MAX];
-          (void)snprintf(joined, sizeof joined, "%s/%s",
-                         source->mount.as.loose.root_path, entry->d_name);
+          char *joined = qa_node_path_join2(location, entry->d_name);
           if (lstat(joined, &info) == 0) {
             is_link = S_ISLNK(info.st_mode);
             is_directory = S_ISDIR(info.st_mode);
           }
+          free(joined);
         }
         if (is_link) continue;
         if (want_directories != is_directory) continue;
-        if (!want_directories && !has_suffix_ci(entry->d_name, extension))
+        if (!want_directories &&
+            !qa_js_ends_with_ignore_case(entry->d_name, extension))
           continue;
-        if (count >= 4095) continue;
-        char *lower = lowered_copy(entry->d_name);
-        bool duplicate = false;
-        for (size_t s = 0; s < seen_count; s++)
-          if (lower != NULL && strcmp(seen[s], lower) == 0) duplicate = true;
-        if (duplicate) { free(lower); continue; }
-        if (seen_count == seen_capacity) {
-          size_t next = seen_capacity == 0 ? 16 : seen_capacity * 2;
-          char **grown = (char **)realloc(seen, next * sizeof *grown);
-          if (grown == NULL) oom_error();
-          seen = grown;
-          seen_capacity = next;
-        }
-        seen[seen_count++] = lower;
-        if (count == capacity) {
-          size_t next = capacity == 0 ? 16 : capacity * 2;
-          char **grown = (char **)realloc(names, next * sizeof *grown);
-          if (grown == NULL) oom_error();
-          names = grown;
-          capacity = next;
-        }
-        names[count++] = copy_text_or_oom(entry->d_name);
+        file_listing_add(&listing, entry->d_name, lowered_copy(entry->d_name));
       }
-      (void)closedir(dir);
+      (void)closedir(listing.dir);
+      listing.dir = NULL;
+      qa_cleanup_pop(&location_node);
+      free(location);
     }
   }
   qa_content_mounted_assert_open(mounted);
-  qa_content_free_string_list(seen, seen_count);
-  free(directory);
+  qa_cleanup_pop(&node);
+  char **names = listing.names;
+  size_t count = listing.count;
+  listing.names = NULL;
+  listing.count = 0;
+  file_listing_release(&listing);
   /* NULL only on OOM (mounts.h): an empty listing is an empty array. */
   if (names == NULL) {
     names = (char **)malloc(sizeof *names);
@@ -1967,8 +2050,10 @@ qa_content_mounted *qa_content_mounted_borrow_with_loose_mount(
   plan.default_order_count = mounted->plan.default_order_count + 1;
   plan.prefix_orders = prefixes;
   plan.prefix_order_count = mounted->plan.prefix_order_count;
+  /* TS `new MountedContent(plan, ...)`: the plan is not resolved again, so the
+   * user mount stays first in every order (rank 0), ahead of pure archives. */
   qa_content_mounted *borrowed =
-      mounted_create_plan(&plan, &mounted->options);
+      mounted_create_ordered(&plan, &mounted->options, false);
   if (borrowed == NULL) oom_error();
   mounted_source *sources =
       (mounted_source *)calloc(mount_count, sizeof *sources);

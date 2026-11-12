@@ -3,10 +3,12 @@
 #include "qa/app/bootstrap/audio.h"
 #include "qa/network/common/js_number.h"
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "qa/app/bootstrap/audio/playlist_settings.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/support.h"
 #include "qa/persistence/value.h"
 static char *dup(const char *s) { if (!s) return NULL; size_t n = strlen(s) + 1; char *p = malloc(n); if (p) memcpy(p, s, n); return p; }
@@ -19,8 +21,9 @@ static qa_app_audio_preferences preferences(const qa_save_value *value) {
   const qa_save_value *device = qa_save_value_get(value, "deviceName");
   const qa_save_value *effects = qa_save_value_get(value, "effectsVolume");
   const qa_save_value *music = qa_save_value_get(value, "musicVolume");
+  /* deviceName.length > 0 && !deviceName.includes("\0"): a "\u0000" escape is a NUL inside text_length. */
   bool device_ok = device && (device->kind == QA_SAVE_NULL ||
-      (device->kind == QA_SAVE_STRING && device->text[0] != '\0'));
+      (device->kind == QA_SAVE_STRING && device->text[0] != '\0' && device->text_length == 0));
   if (!version || version->kind != QA_SAVE_NUMBER || version->number != 1 || !device_ok ||
       !effects || effects->kind != QA_SAVE_NUMBER || !isfinite(effects->number) || effects->number < 0 || effects->number > 1 ||
       !music || music->kind != QA_SAVE_NUMBER || !isfinite(music->number) || music->number < 0 || music->number > 1)
@@ -45,6 +48,10 @@ static qa_app_audio_preferences preferences(const qa_save_value *value) {
     out.output_format.sample_rate = (int64_t)rate->number;
     out.output_format.channels = (int64_t)channels->number;
     out.output_format.sample_bits = (int64_t)bits->number;
+    out.has_output_format = true;
+  } else {
+    /* TS: outputFormat: "outputFormat" in value ? audioOutputFormat(value.outputFormat) : defaultAudioOutputFormat. */
+    out.output_format = qa_default_audio_output_format;
     out.has_output_format = true;
   }
   if (shuffle) { out.has_music_shuffle = true; out.music_shuffle = shuffle_value; }
@@ -78,24 +85,60 @@ bool qa_app_load_audio_settings_warn(const qa_config_store *store, qa_app_audio_
   qa_save_value_free(value);
   if (!valid) {
     if (warn != NULL) {
-      char text[QA_CAUGHT_MESSAGE_CAPACITY + 32];
-      snprintf(text, sizeof text, "Ignoring audio.json: %s\n", caught.message);
+      const char *message = qa_caught_message(&caught);
+      size_t size = strlen(message) + 32;
+      char *text = malloc(size);
+      if (text == NULL) qa_range_error("Out of memory");
+      snprintf(text, size, "Ignoring audio.json: %s\n", message);
+      qa_cleanup node;
+      qa_cleanup_push(&node, free, text);
       warn(warn_ctx, text);
+      qa_cleanup_pop(&node);
+      free(text);
     }
     return false;
   }
   *out = call.out;
   return true;
 }
-static void append_json_string(char *buf, size_t cap, size_t *len, const char *text) {
-  *len += (size_t)snprintf(buf + *len, cap - *len, "\"");
+/* The document under construction: grows with the text (TS JSON.stringify has no size limit). */
+typedef struct json_text { char *data; size_t length, capacity; } json_text;
+static void json_text_release(void *value) { free(((json_text *)value)->data); }
+static void json_append(json_text *out, const char *format, ...) {
+  va_list args;
+  va_start(args, format);
+  va_list measure;
+  va_copy(measure, args);
+  int needed = vsnprintf(NULL, 0, format, measure);
+  va_end(measure);
+  if (needed < 0) { va_end(args); qa_range_error("Out of memory"); }
+  if (out->length + (size_t)needed + 1 > out->capacity) {
+    size_t capacity = out->capacity == 0 ? 256 : out->capacity;
+    while (out->length + (size_t)needed + 1 > capacity) capacity *= 2;
+    char *grown = realloc(out->data, capacity);
+    if (grown == NULL) { va_end(args); qa_range_error("Out of memory"); }
+    out->data = grown; out->capacity = capacity;
+  }
+  vsnprintf(out->data + out->length, out->capacity - out->length, format, args);
+  va_end(args);
+  out->length += (size_t)needed;
+}
+static void append_json_string(json_text *out, const char *text) {
+  json_append(out, "\"");
   for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
     unsigned char c = *p;
-    if (c == '"' || c == '\\') *len += (size_t)snprintf(buf + *len, cap - *len, "\\%c", c);
-    else if (c < 0x20) *len += (size_t)snprintf(buf + *len, cap - *len, "\\u%04x", c);
-    else *len += (size_t)snprintf(buf + *len, cap - *len, "%c", c);
+    if (c == '"' || c == '\\') json_append(out, "\\%c", c);
+    else if (c == '\b' || c == '\f' || c == '\n' || c == '\r' || c == '\t') /* JSON.stringify's short escapes */
+      json_append(out, "\\%c", c == '\b' ? 'b' : c == '\f' ? 'f' : c == '\n' ? 'n' : c == '\r' ? 'r' : 't');
+    else if (c < 0x20) json_append(out, "\\u%04x", c);
+    else json_append(out, "%c", c);
   }
-  *len += (size_t)snprintf(buf + *len, cap - *len, "\"");
+  json_append(out, "\"");
+}
+static void saved_preferences_release(void *value) {
+  qa_app_audio_preferences *saved = value;
+  free(saved->menu_track); free(saved->device_name);
+  saved->menu_track = NULL; saved->device_name = NULL;
 }
 void qa_app_save_audio_settings(const qa_config_store *store, qa_app_audio_settings_input audio) {
   bool shuffle = false;
@@ -110,6 +153,11 @@ void qa_app_save_audio_settings(const qa_config_store *store, qa_app_audio_setti
       track = saved.has_menu_track ? saved.menu_track : "auto";
     }
   }
+  /* The loaded document's strings and the text built below are freed on every path (a validation raise too). */
+  qa_cleanup saved_guard, text_guard;
+  qa_cleanup_push(&saved_guard, saved_preferences_release, &saved);
+  json_text out = {NULL, 0, 0};
+  qa_cleanup_push(&text_guard, json_text_release, &out);
   /* preferences({...}) validation, mirrored on the constructed fields. */
   if (!qa_app_valid_menu_track(track)) qa_raise("Error", 0, 0, "Invalid music preferences");
   if ((audio.selected_output && audio.selected_output[0] == '\0') ||
@@ -118,17 +166,20 @@ void qa_app_save_audio_settings(const qa_config_store *store, qa_app_audio_setti
     qa_raise("Error", 0, 0, "Invalid audio preferences");
   qa_audio_output_format format = audio.has_output_format ? audio.output_format : qa_default_audio_output_format;
   format = qa_audio_output_format_validated(format.sample_rate, format.channels, format.sample_bits);
-  char buf[4096]; size_t len = 0;
-  len += (size_t)snprintf(buf + len, sizeof buf - len, "{\"version\":1,\"musicShuffle\":%s,\"menuTrack\":", shuffle ? "true" : "false");
-  append_json_string(buf, sizeof buf, &len, track);
-  len += (size_t)snprintf(buf + len, sizeof buf - len, ",\"outputFormat\":{\"sampleRate\":%lld,\"channels\":%lld,\"sampleBits\":%lld},\"deviceName\":",
+  json_append(&out, "{\"version\":1,\"musicShuffle\":%s,\"menuTrack\":", shuffle ? "true" : "false");
+  append_json_string(&out, track);
+  json_append(&out, ",\"outputFormat\":{\"sampleRate\":%lld,\"channels\":%lld,\"sampleBits\":%lld},\"deviceName\":",
       (long long)format.sample_rate, (long long)format.channels, (long long)format.sample_bits);
-  if (audio.selected_output) append_json_string(buf, sizeof buf, &len, audio.selected_output);
-  else len += (size_t)snprintf(buf + len, sizeof buf - len, "null");
-  len += (size_t)snprintf(buf + len, sizeof buf - len, ",\"effectsVolume\":%s,\"musicVolume\":%s}\n", QA_JS_NUMBER(audio.effects_volume), QA_JS_NUMBER(audio.music_volume));
-  free(saved.menu_track);
-  free(saved.device_name);
-  if (!qa_config_store_dump(store, "audio.json", buf)) qa_raise("Error", 0, 0, "Could not write audio.json");
+  if (audio.selected_output) append_json_string(&out, audio.selected_output);
+  else json_append(&out, "null");
+  json_append(&out, ",\"effectsVolume\":%s,", QA_JS_NUMBER(audio.effects_volume));
+  json_append(&out, "\"musicVolume\":%s}\n", QA_JS_NUMBER(audio.music_volume));
+  bool written = qa_config_store_dump(store, "audio.json", out.data);
+  qa_cleanup_pop(&text_guard);
+  qa_cleanup_pop(&saved_guard);
+  json_text_release(&out);
+  saved_preferences_release(&saved);
+  if (!written) qa_settings_raise_write_failure();
 }
 /* TS saveAudioSettings(store, audio) with an ApplicationAudio: its musicPreferences getter is always
  * defined, so the stored music settings never come from the document. */

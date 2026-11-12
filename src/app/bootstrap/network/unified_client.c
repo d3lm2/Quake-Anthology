@@ -8,6 +8,7 @@
 #include <sys/random.h>
 #include <time.h>
 #include "qa/core/commands/text.h"
+#include "qa/foundation/js.h"
 #include "qa/foundation/support.h"
 #include "qa/network/unified/channel.h"
 #include "qa/network/unified/packet.h"
@@ -77,12 +78,12 @@ qa_app_network_phase qa_app_unified_client_network_phase(
     const qa_app_unified_client_network *network) { return network->state; }
 void qa_app_unified_client_network_wire(const qa_app_unified_client_network *network,
     const char **composition_digest, const qa_save_value **snapshot_schema) {
-  if (!network->composition) qa_range_error("Unified composition has not been negotiated");
+  if (!network->composition) qa_raise("Error", 0, 0, "Unified composition has not been negotiated");
   *composition_digest = network->composition->digest;
   *snapshot_schema = qa_save_value_get(network->composition->recipe, "snapshotSchema");
 }
 static void send_control(qa_app_unified_client_network *n, const qa_app_unified_control *control) {
-  if (!n->channel_live) qa_range_error("Unified connection has no channel");
+  if (!n->channel_live) qa_raise("Error", 0, 0, "Unified connection has no channel");
   size_t length = 0;
   uint8_t *bytes = qa_app_unified_encode_control(control, &length);
   if (!bytes) qa_range_error("out of memory");
@@ -92,7 +93,7 @@ static void send_control(qa_app_unified_client_network *n, const qa_app_unified_
 static void assert_current(qa_app_unified_client_network *n, double generation) {
   if (n->state == QA_APP_PHASE_CLOSED || n->state == QA_APP_PHASE_REJECTED
       || generation != n->generation)
-    qa_range_error("Unified channel operation was retired");
+    qa_raise("Error", 0, 0, "Unified channel operation was retired");
 }
 static void send_packet(qa_app_unified_client_network *n, const uint8_t *bytes, size_t length) {
   n->options.transport->send(n->options.transport->ctx, &n->options.remote, bytes, length);
@@ -109,7 +110,7 @@ static void flush_channel(qa_app_unified_client_network *n, double now) {
   qa_cleanup guard;
   qa_cleanup_push(&guard, flush_owned_free, &owned);
   owned.packets = qa_unified_channel_flush(&n->channel, now, &owned.lengths, &owned.count);
-  if (n->channel.failure) qa_range_error("%s", n->channel.failure);
+  if (n->channel.failure) qa_raise("Error", 0, 0, "%s", n->channel.failure);
   for (size_t i = 0; i < owned.count; i++) send_packet(n, owned.packets[i], owned.lengths[i]);
   qa_cleanup_pop(&guard);
   flush_owned_free(&owned);
@@ -176,7 +177,7 @@ static bool receive_control(qa_app_unified_client_network *n, const qa_unified_d
     } else if (control.kind == QA_APP_UNIFIED_EVENTS) {
       qa_app_unified_remote_receive_events(n->options.host, control.epoch, control.frame,
           control.payload, control.payload_length, control.simulation, control.simulation_length);
-    } else qa_range_error("Unexpected unified server control");
+    } else qa_raise("Error", 0, 0, "Unexpected unified server control");
   }
   qa_cleanup_pop(&guard);
   qa_app_unified_control_free(&control);
@@ -189,7 +190,7 @@ static void receive_frame(qa_app_unified_client_network *n, const qa_unified_del
   assert_current(n, generation);
   if (!accepted) return;
   n->state = QA_APP_PHASE_ACTIVE;
-  if (acknowledged > n->acknowledged) n->acknowledged = acknowledged;
+  n->acknowledged = qa_js_max(n->acknowledged, acknowledged);
   size_t kept = 0;
   for (size_t j = 0; j < n->input_count; j++)
     if (n->inputs[j].sequence > n->acknowledged) n->inputs[kept++] = n->inputs[j];
@@ -264,7 +265,7 @@ static void poll_body(void *ctx) {
         qa_cleanup deliveries_guard;
         qa_cleanup_push(&deliveries_guard, cleanup_deliveries, &owned);
         owned.items = qa_unified_channel_receive(&n->channel, packet.payload, packet.length, now, &owned.count);
-        if (n->channel.failure) qa_range_error("%s", n->channel.failure);
+        if (n->channel.failure) qa_raise("Error", 0, 0, "%s", n->channel.failure);
         for (size_t i = 0; i < owned.count; i++) {
           const qa_unified_delivery *message = &owned.items[i];
           if (strcmp(message->kind, "reliable") != 0) receive_frame(n, message, generation);
@@ -284,7 +285,7 @@ static void poll_body(void *ctx) {
     qa_receive_event_destroy(&packet);
   }
   double since = n->has_last_received ? n->last_received : n->handshake_started;
-  if (now - since > 120000) qa_range_error("Unified connection timed out");
+  if (now - since > 120000) qa_raise("Error", 0, 0, "Unified connection timed out");
   if (n->channel_live) {
     if (n->state == QA_APP_PHASE_ACTIVE) {
       const char *userinfo = n->options.userinfo(n->options.userinfo_ctx);
@@ -333,8 +334,7 @@ const void *const *qa_app_unified_client_network_poll(qa_app_unified_client_netw
 }
 void qa_app_unified_client_network_submit(qa_app_unified_client_network *n,
     const qa_actor_command *commands, size_t count, double now) {
-  double elapsed = n->has_submitted_at ? now - n->submitted_at : 0;
-  if (elapsed < 0) elapsed = 0;
+  double elapsed = n->has_submitted_at ? qa_js_max(0, now - n->submitted_at) : 0;
   qa_app_unified_client_network_submit_timed(n, commands, count, now, elapsed);
 }
 static double command_duration(const qa_user_command *command, double elapsed) {
@@ -364,7 +364,7 @@ void qa_app_unified_client_network_submit_timed(qa_app_unified_client_network *n
         || !(command->source.client.slot == client_id.slot
             && command->source.client.generation == client_id.generation
             && command->source.client.token == client_id.token))
-      qa_range_error("Unified input belongs to another player");
+      qa_raise("Error", 0, 0, "Unified input belongs to another player");
     if (command->sequence <= n->acknowledged) continue;
     bool present = false;
     for (size_t j = 0; j < n->input_count; j++)
@@ -372,12 +372,11 @@ void qa_app_unified_client_network_submit_timed(qa_app_unified_client_network *n
     if (present) continue;
     double baseline = 0;
     if (!qa_app_unified_remote_command_time(n->options.host, &baseline))
-      qa_range_error("Unified input has no authoritative clock");
+      qa_raise("Error", 0, 0, "Unified input has no authoritative clock");
     qa_user_command timed = command->command;
     double duration = command_duration(&timed, elapsed);
-    double base = n->has_command_time ? n->command_time : baseline;
-    if (base < baseline) base = baseline;
-    n->command_time = base + duration;
+    /* Math.max(commandTime ?? baseline, baseline) + duration: NaN propagates. */
+    n->command_time = qa_js_max(n->has_command_time ? n->command_time : baseline, baseline) + duration;
     n->has_command_time = true;
     n->submitted_at = now;
     n->has_submitted_at = true;
@@ -438,7 +437,7 @@ void qa_app_unified_client_network_player_command(qa_app_unified_client_network 
 void qa_app_unified_client_network_component_command(qa_app_unified_client_network *n,
     qa_presentation_owner owner, double generation, const char *const *args, size_t count) {
   if (n->state != QA_APP_PHASE_ACTIVE)
-    qa_range_error("Component command requires an active client");
+    qa_raise("Error", 0, 0, "Component command requires an active client");
   qa_app_unified_control control = {0};
   control.kind = QA_APP_UNIFIED_COMPONENT_COMMAND;
   control.epoch = n->epoch;
@@ -460,7 +459,7 @@ void qa_app_unified_client_network_userinfo(qa_app_unified_client_network *n,
 void qa_app_unified_client_network_publish(qa_app_unified_client_network *n,
     const void *output, const void *const *events, size_t count, double now) {
   (void)n; (void)output; (void)events; (void)count; (void)now;
-  qa_range_error("Unified client cannot publish authoritative state");
+  qa_raise("Error", 0, 0, "Unified client cannot publish authoritative state");
 }
 static void farewell_body(void *ctx) {
   qa_app_unified_client_network *n = ctx;
@@ -495,8 +494,10 @@ static const void *const *net_poll(void *ctx, double now, size_t *out_count) {
 static void net_submit(void *ctx, const void *const *commands, size_t count, double now) {
   qa_app_unified_client_network *n = ctx;
   const qa_actor_command **list = (const qa_actor_command **)commands;
+  /* TS submit(commands, now) times the whole batch from one elapsed value. */
+  double elapsed = n->has_submitted_at ? qa_js_max(0, now - n->submitted_at) : 0;
   for (size_t i = 0; i < count; i++)
-    qa_app_unified_client_network_submit(n, list[i], 1, now);
+    qa_app_unified_client_network_submit_timed(n, list[i], 1, now, elapsed);
 }
 static void net_publish(void *ctx, const void *output, const void *const *events,
     size_t count, double now) {

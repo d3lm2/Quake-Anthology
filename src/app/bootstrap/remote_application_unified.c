@@ -240,7 +240,7 @@ static void *host_load_content(void *ctx, const qa_save_value *recipe_tree, cons
   qa_app_options owned;
   qa_app_startup_options_copy(&owned, &scope.configured);
   qa_app_content_source source = {"unified", demo_family(family)};
-  qa_app_loaded_content *content = qa_app_load_application_content_native((qa_app_content_host){0}, owned,
+  qa_app_loaded_content *content = qa_app_load_application_content_native(owned,
       &scope.kept->recipe, true, NULL, h->catalog, &source);
   if (content == NULL) qa_range_error("Out of memory");
   qa_app_loaded_content_keep(content, scope.kept, kept_recipe_release);

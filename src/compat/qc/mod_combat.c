@@ -55,17 +55,23 @@ static const char *qm_strings_get(void *ctx, int64_t reference, char *buf, size_
 static int64_t qm_strings_set_engine(void *ctx, const char *name, const char *text, size_t capacity) {
   C *c = ctx; return qa_compat_qc_strings_set_engine(&c->options.machine->strings, name, text, (int64_t)capacity);
 }
+static void qprogram_free(void *arg) {
+  C *c = arg;
+  free(c->qglobals); free(c->qfields); free(c->qfunctions); free(c->qstatements);
+  c->qglobals = NULL; c->qfields = NULL; c->qfunctions = NULL; c->qstatements = NULL;
+}
 void qa_compat_qc_validate_mod_combat(qa_compat_qc_program *p, qa_mod_qc_combat declaration) {
   C tmp; memset(&tmp, 0, sizeof tmp);
+  qa_cleanup scope; qa_cleanup_push(&scope, qprogram_free, &tmp); /* a refused declaration releases the view */
   if (!build_qprogram(&tmp, p)) qa_range_error("combat validation allocation failed");
   if (declaration.empty_armor) qa_q1qc_empty_armor_for(&tmp.qprogram, declaration.empty_armor);
   { qa_q1qc_armor_stage *s = qa_q1qc_armor_stage_create(&tmp.qprogram, declaration.armor_stage); qa_q1qc_armor_stage_destroy(s); }
   { qa_q1qc_damage_scale *s = qa_q1qc_damage_scale_create(&tmp.qprogram, &declaration.damage, declaration.damage_scale); qa_q1qc_damage_scale_destroy(s); }
   static const char *const fields[6] = {"health","takedamage","flags","invincible_finished","armorvalue","armortype"};
   for (int i = 0; i < 6; i++) { const qa_compat_qc_definition *d = qa_compat_qc_program_field_named(p, fields[i]);
-    if (!d || strcmp(d->type, "float") != 0) qa_range_error("QC combat requires float field %s", fields[i]); }
+    if (!d || strcmp(d->type, "float") != 0) qa_raise("Error", 0, 0, "QC combat requires float field %s", fields[i]); }
   qa_q1_id1_program_binding_get(&tmp.qprogram, &declaration.damage);
-  free(tmp.qglobals); free(tmp.qfields); free(tmp.qfunctions); free(tmp.qstatements);
+  qa_cleanup_pop(&scope); qprogram_free(&tmp);
 }
 /* Actor pointers borrow *r, which must outlive the entries. */
 static void fill_damage_inputs(const qa_damage_request *r, double seconds, qa_compat_qc_mod_input_entry entries[9]) {
@@ -80,11 +86,10 @@ static void fill_damage_inputs(const qa_damage_request *r, double seconds, qa_co
   entries[7].name="normal"; entries[7].value.kind="vector"; entries[7].value.vector_value=r->normal;
   entries[8].name="time"; entries[8].value.kind="float"; entries[8].value.number_value=seconds;
 }
-size_t qa_compat_qc_damage_inputs(qa_damage_request r, double seconds, qa_compat_qc_mod_input_entry *out, size_t cap) {
-  /* Actor pointers borrow this retained copy (valid until next call). */
-  static qa_damage_request saved; saved = r;
+size_t qa_compat_qc_damage_inputs(const qa_damage_request *r, double seconds, qa_compat_qc_mod_input_entry *out, size_t cap) {
+  /* Actor pointers borrow the caller's request, which outlives the entries (a nested damage owns its own). */
   qa_compat_qc_mod_input_entry entries[9];
-  fill_damage_inputs(&saved, seconds, entries);
+  fill_damage_inputs(r, seconds, entries);
   size_t n = cap < 9 ? cap : 9;
   for (size_t i = 0; i < n; i++) out[i] = entries[i];
   return 9;
@@ -129,6 +134,7 @@ void qa_compat_qc_mod_combat_destroy(C *c) {
   free(c->incoming); free(c->entered); free(c->outcomes); free(c->has_outcome);
   for (size_t i = 0; i < c->bind_count; i++) free(c->bind_storage[i]);
   free(c->bind_storage);
+  for (size_t i = 0; i < sizeof c->attacks / sizeof c->attacks[0]; i++) free(c->attacks[i].death_type);
   memset(c, 0, sizeof *c);
 }
 typedef struct qa_compat_qc_mod_combat_bind BindCtx;
@@ -141,7 +147,7 @@ static BindCtx *bind_for(C *c, qa_owned_actor actor) {
 static void write_armor_inner(BindCtx *b, qa_armor_state armor) {
   C *c = b->c;
   if (strcmp(armor.powered.kind, "none") != 0 || (armor.regular.kind != QA_REGULAR_ARMOR_NONE && armor.regular.kind != QA_REGULAR_ARMOR_Q1))
-    qa_range_error("Cannot store foreign armor in source QC fields");
+    qa_raise("Error", 0, 0, "Cannot store foreign armor in source QC fields");
   int64_t green = (int64_t)b->binding->armor_masks[0], yellow = (int64_t)b->binding->armor_masks[1], red = (int64_t)b->binding->armor_masks[2], mask = green | yellow | red;
   int64_t bit = armor.regular.kind == QA_REGULAR_ARMOR_NONE ? 0
     : armor.regular.item && strcmp(armor.regular.item, "q1:item_armorInv") == 0 ? red
@@ -181,7 +187,7 @@ static qa_combat_state b_read(void *ctx) {
 static void b_validate(void *ctx, qa_armor_state armor) {
   (void)ctx;
   if (strcmp(armor.powered.kind, "none") != 0 || (armor.regular.kind != QA_REGULAR_ARMOR_NONE && armor.regular.kind != QA_REGULAR_ARMOR_Q1))
-    qa_range_error("Cannot store foreign armor in source QC fields");
+    qa_raise("Error", 0, 0, "Cannot store foreign armor in source QC fields");
 }
 static void b_write_health(void *ctx, double h) { BindCtx *b = ctx; qa_compat_qc_words_set_float(b->words, fld(b->c, "health"), h); }
 static void b_write_armor(void *ctx, qa_armor_state a) { write_armor_inner(ctx, a); }
@@ -206,7 +212,7 @@ static qa_regular_armor_state b_empty(void *ctx, double points) {
 }
 void qa_compat_qc_mod_combat_admit(C *c, qa_owned_actor actor) {
   qa_actor_source_result src = qa_session_actor_registry_source_of(c->options.services->actors, actor.id);
-  if (!src.has_value || strcmp(src.provider, c->options.slots_options.provider) != 0) qa_range_error("QC combat admission requires its own source actor");
+  if (!src.has_value || strcmp(src.provider, c->options.slots_options.provider) != 0) qa_raise("Error", 0, 0, "QC combat admission requires its own source actor");
   BindCtx *b = bind_for(c, actor);
   b->words = qa_compat_qc_entity_memory_at(c->options.machine->entities, src.slot);
   b->binding = qa_q1_id1_program_binding_get(&c->qprogram, NULL);
@@ -238,29 +244,33 @@ static qa_damage_outcome apply_damage(C *c, qa_damage_request request) {
   c->options.invoke(c->options.ctx, c->options.declaration->damage, inputs, 9);
   qa_damage_outcome outcome = c->outcomes[i]; bool has = c->has_outcome[i];
   qa_cleanup_pop(&scope); pop_incoming(c);
-  if (!has) qa_range_error("QC damage did not complete its shared authority boundary");
+  if (!has) qa_raise("Error", 0, 0, "QC damage did not complete its shared authority boundary");
   return outcome;
 }
 static qa_damage_request request_of(void *ctx, qa_q1_id1_damage_call call) {
   C *c = ctx;
   if (c->incoming_count && !c->entered[c->incoming_count-1]) { c->entered[c->incoming_count-1] = true; return c->incoming[c->incoming_count-1]; }
-  if (!c->options.services->damage_context) qa_range_error("Authored QC damage requires canonical attack provenance");
+  if (!c->options.services->damage_context) qa_raise("Error", 0, 0, "Authored QC damage requires canonical attack provenance");
   double sequence = 0; qa_provider_id wp=NULL, cp=NULL, ip=NULL, mp=NULL;
   c->options.services->damage_context(c->options.services->ctx, c->options.module.id, &sequence, &wp, &cp, &ip, &mp);
   qa_compat_qc_machine *machine = c->options.machine;
   const qa_compat_qc_definition *death_type = qa_compat_qc_program_field_named(c->options.program, "deathtype");
-  struct qa_compat_qc_mod_combat_attack *cell = &c->attacks[c->attack_next++ % (sizeof c->attacks / sizeof c->attacks[0])];
   /* TS resolves the target's words even without a deathtype field: the
    * reference may lease a borrowed row. */
   qa_compat_qc_words *words = qa_compat_qc_entity_memory_from_reference(machine->entities, c->options.reference(c->options.ctx, &call.target));
-  cell->death_type[0] = 0;
-  if (death_type) snprintf(cell->death_type, sizeof cell->death_type, "%s", qa_compat_qc_strings_get(&machine->strings, qa_compat_qc_words_int(words, death_type->offset)));
+  /* TS literal order: point (body read), attack.time (the time global), then cause (the deathtype string). */
   qa_body_state_result body = qa_shared_body_table_read(c->options.services->bodies, call.target);
+  double time = qa_compat_qc_words_float(&machine->globals, qa_compat_qc_machine_global_offset(machine, "time"));
+  char *cause = strdup(death_type ? qa_compat_qc_strings_get(&machine->strings, qa_compat_qc_words_int(words, death_type->offset)) : "");
+  if (!cause) qa_range_error("combat allocation failed");
+  struct qa_compat_qc_mod_combat_attack *cell = &c->attacks[c->attack_next++ % (sizeof c->attacks / sizeof c->attacks[0])];
+  free(cell->death_type);
+  cell->death_type = cause;
   qa_damage_request r; memset(&r, 0, sizeof r);
   r.target = call.target; r.amount = call.amount; r.knockback = 0; r.delivery = "direct";
   r.point = body.has_value ? body.value.origin : (qa_vec3){0,0,0};
   r.attack.sequence = sequence; r.attack.weapon_provider = wp; r.attack.combat_provider = cp; r.attack.inventory_provider = ip; r.attack.movement_provider = mp;
-  r.attack.time = (qa_source_time){QA_SOURCE_TIME_SECONDS, qa_compat_qc_words_float(&machine->globals, qa_compat_qc_machine_global_offset(machine, "time"))};
+  r.attack.time = (qa_source_time){QA_SOURCE_TIME_SECONDS, time};
   cell->attacker = call.attacker; cell->inflictor = call.inflictor;
   r.attack.attacker = &cell->attacker; r.attack.inflictor = &cell->inflictor; r.attack.weapon = NULL;
   r.attack.cause.kind = QA_ATTACK_CAUSE_Q1; r.attack.cause.death_type = cell->death_type;
@@ -275,7 +285,7 @@ static void pain_prepare(void *ctx, qa_q1qc_machine *qm) {
 }
 static void pain_execute(void *ctx, qa_pain_reaction effective) {
   ReactionCtx *r = ctx;
-  if (!qa_q1qc_actor_equal(effective.self.id, r->owner)) qa_range_error("Source pain target changes require callback replacement");
+  if (!qa_q1qc_actor_equal(effective.self.id, r->owner)) qa_raise("Error", 0, 0, "Source pain target changes require callback replacement");
   r->entered = true;
   PainPrepare pp = {r, effective};
   r->execute.run(r->execute.ctx, pain_prepare, &pp);
@@ -284,20 +294,20 @@ static void die_execute(void *ctx, qa_death_reaction effective) {
   ReactionCtx *r = ctx;
   bool attacker_eq = (effective.pain.attacker == NULL && r->reaction.attacker == NULL) || (effective.pain.attacker && r->reaction.attacker && qa_q1qc_actor_equal(*effective.pain.attacker, *r->reaction.attacker));
   if (!qa_q1qc_actor_equal(effective.pain.self.id, r->owner) || !attacker_eq || effective.pain.damage != r->reaction.damage)
-    qa_range_error("Source death argument changes require callback replacement");
+    qa_raise("Error", 0, 0, "Source death argument changes require callback replacement");
   r->entered = true; r->execute.run(r->execute.ctx, NULL, NULL);
 }
 static void reaction_of(void *ctx, qa_damage_request request, qa_source_damage_result result, qa_q1qc_function_execution execute) {
   C *c = ctx; qa_owned_actor owner;
   if (!qa_session_actor_registry_resolve_owned(c->options.services->actors, request.target, &owner)) { int32_t zero[3] = {0,0,0}; execute.skip(execute.ctx, zero); return; }
-  if (!c->options.services->callbacks) qa_range_error("QC damage reactions require shared actor callbacks");
+  if (!c->options.services->callbacks) qa_raise("Error", 0, 0, "QC damage reactions require shared actor callbacks");
   qa_pain_reaction reaction = {&request.attack, owner, request.attack.attacker, request.knockback, result.applied_damage};
   ReactionCtx rc = {c, execute, false, owner.id, reaction};
   if (strcmp(result.reaction, "pain") == 0) qa_actor_callback_table_source_pain(c->options.services->callbacks, reaction, pain_execute, &rc);
   else if (strcmp(result.reaction, "death") == 0) {
     qa_death_reaction death = {reaction, request.attack.inflictor, request.point};
     qa_actor_callback_table_source_die(c->options.services->callbacks, death, die_execute, &rc);
-  } else qa_range_error("QC reaction boundary has no source reaction");
+  } else qa_raise("Error", 0, 0, "QC reaction boundary has no source reaction");
   if (!rc.entered) { int32_t zero[3] = {0,0,0}; execute.skip(execute.ctx, zero); }
 }
 static void actor_reaction(C *c, qa_pain_reaction reaction, const char *field, const qa_mod_callback_value *args, size_t argc) {

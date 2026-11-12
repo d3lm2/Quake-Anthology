@@ -145,7 +145,7 @@ qa_guest_entry_handle qa_guest_callback_table_bind_entry(qa_guest_callback_table
   qa_sparse_check(table->memory, address, 1, QA_ACCESS_EXECUTE);
   if (callback->signature.abi.pointer_bytes != table->memory->base.pointer_bytes ||
       by_address(table, address.byte_offset) != NULL)
-    qa_range_error("Invalid or occupied native callback entry");
+    qa_raise("Error", 0, 0, "Invalid or occupied native callback entry");
   qa_guest_callback_entry *entry = (qa_guest_callback_entry *)calloc(1, sizeof *entry);
   if (entry == NULL) qa_range_error("Guest memory allocation failed");
   entry->handle = ++table->next_handle;
@@ -228,19 +228,20 @@ qa_guest_core_address qa_guest_callback_table_bind(qa_guest_callback_table *tabl
   qa_guest_callback_entry *previous = by_id(table, callback->id);
   if (previous != NULL) {
     if (previous->callback != NULL && previous->callback != callback)
-      qa_range_error("Callback %s is already bound", callback->id);
+      qa_raise("Error", 0, 0, "Callback %s is already bound", callback->id);
     if (!same_signature(&previous->signature, &callback->signature))
-      qa_range_error("Callback %s changed ABI or signature", callback->id);
+      qa_raise("Error", 0, 0, "Callback %s changed ABI or signature", callback->id);
     previous->callback = callback;
     changed_entries(table);
     return previous->address;
   }
   /* INT3 is a trap if the CPU misses the table dispatch. */
-  char label[256];
-  (void)snprintf(label, sizeof label, "callback %s", callback->id);
-  char *label_copy = (char *)malloc(strlen(label) + 1u);
+  const size_t label_size = strlen(callback->id) + sizeof "callback "; /* the whole id: the label is checkpointed */
+  char *label_copy = (char *)malloc(label_size);
   if (label_copy == NULL) qa_range_error("Guest memory allocation failed");
-  strcpy(label_copy, label);
+  (void)snprintf(label_copy, label_size, "callback %s", callback->id);
+  qa_cleanup label_node;
+  qa_cleanup_push(&label_node, free, label_copy);
   qa_guest_allocation_options options;
   memset(&options, 0, sizeof options);
   options.byte_length = 16;
@@ -249,6 +250,7 @@ qa_guest_core_address qa_guest_callback_table_bind(qa_guest_callback_table *tabl
   options.has_permissions = true;
   options.label = label_copy;
   qa_guest_core_address address = qa_sparse_allocate(table->memory, &options);
+  qa_cleanup_pop(&label_node);
   free(label_copy); /* sparse map duplicated the label */
   uint8_t traps[16];
   memset(traps, 0xcc, sizeof traps);
@@ -289,7 +291,7 @@ const qa_guest_host_callback *qa_guest_callback_table_resolve(qa_guest_callback_
   if (entry == NULL) return NULL;
   if (entry->accepts != NULL && !entry->accepts(entry->accepts_ctx)) return NULL;
   if (entry->callback == NULL)
-    qa_range_error("Guest callback %s at 0x%llx is unbound", entry->id, (unsigned long long)entry->address.byte_offset);
+    qa_raise("Error", 0, 0, "Guest callback %s at 0x%llx is unbound", entry->id, (unsigned long long)entry->address.byte_offset);
   return entry->callback;
 }
 qa_call_result qa_guest_callback_table_invoke(qa_guest_callback_table *table, qa_guest_core_address address,
@@ -297,7 +299,7 @@ qa_call_result qa_guest_callback_table_invoke(qa_guest_callback_table *table, qa
                                                     const qa_call_value *arguments, size_t argument_count) {
   const qa_guest_host_callback *callback = qa_guest_callback_table_resolve(table, address);
   if (callback == NULL)
-    qa_range_error("No host callback at guest address 0x%llx", (unsigned long long)address.byte_offset);
+    qa_raise("Error", 0, 0, "No host callback at guest address 0x%llx", (unsigned long long)address.byte_offset);
   return callback->invoke(callback->ctx, context, arguments, argument_count);
 }
 qa_saved_host_callback_address *qa_guest_callback_table_checkpoint(const qa_guest_callback_table *table, size_t *out_count) {
@@ -319,25 +321,30 @@ qa_saved_host_callback_address *qa_guest_callback_table_checkpoint(const qa_gues
   *out_count = count;
   return saved;
 }
+static void restore_abandon(void *table) { qa_guest_callback_table_destroy(table); }
+
 void qa_guest_callback_table_restore(qa_guest_callback_table *table, qa_sparse_guest_memory *memory,
                                      const qa_saved_host_callback_address *saved, size_t count,
                                      const qa_guest_host_callback *(*resolve)(void *ctx, qa_callback_id id), void *resolve_ctx) {
   qa_guest_callback_table_init(table, memory);
+  /* TS builds a new table and throws it away on a bad record: nothing of it survives the raise. */
+  qa_cleanup table_node;
+  qa_cleanup_push(&table_node, restore_abandon, table);
   for (size_t i = 0; i < count; i++) {
     const qa_saved_host_callback_address *record = &saved[i];
     if (by_id(table, record->id) != NULL || by_address(table, record->byte_offset) != NULL)
-      qa_range_error("Duplicate restored guest callback identity or address");
+      qa_raise("Error", 0, 0, "Duplicate restored guest callback identity or address");
     qa_guest_core_address address;
     if (!qa_sparse_pointer(memory, record->byte_offset, &address))
-      qa_range_error("Guest callback cannot have a null address");
+      qa_raise("Error", 0, 0, "Guest callback cannot have a null address");
     qa_sparse_check(memory, address, 16, QA_ACCESS_EXECUTE);
     if (record->signature.abi.pointer_bytes != memory->base.pointer_bytes)
-      qa_range_error("Saved callback ABI differs from the restored address space");
+      qa_raise("Error", 0, 0, "Saved callback ABI differs from the restored address space");
     const qa_guest_host_callback *callback = record->binding == QA_CALLBACK_BOUND ? resolve(resolve_ctx, record->id) : NULL;
     if (record->binding == QA_CALLBACK_BOUND && callback == NULL)
-      qa_range_error("Missing restored host callback %s", record->id);
+      qa_raise("Error", 0, 0, "Missing restored host callback %s", record->id);
     if (callback != NULL && (!same_string(callback->id, record->id) || !same_signature(&callback->signature, &record->signature)))
-      qa_range_error("Restored callback %s has a different identity or signature", record->id);
+      qa_raise("Error", 0, 0, "Restored callback %s has a different identity or signature", record->id);
     qa_guest_callback_entry *entry = (qa_guest_callback_entry *)calloc(1, sizeof *entry);
     if (entry == NULL) qa_range_error("Guest memory allocation failed");
     entry->id = record->id;
@@ -347,5 +354,6 @@ void qa_guest_callback_table_restore(qa_guest_callback_table *table, qa_sparse_g
     entry->via_bind = true;
     append_entry(table, entry);
   }
+  qa_cleanup_pop(&table_node);
 }
 

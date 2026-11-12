@@ -2,6 +2,7 @@
 #include "qa/bots/behavior/library/call_steps.h"
 #include "qa/foundation/support.h"
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 qa_call_steps qa_call_steps_done(void *value) {
@@ -31,10 +32,16 @@ qa_call_step_result qa_call_steps_forward(qa_call_steps *inner, const char *thro
 
 void *qa_finish_calls(qa_call_steps steps) {
   qa_call_step_result step = qa_call_steps_next(&steps, NULL);
-  if (step.thrown != NULL)
-    qa_range_error("%s", step.thrown);
-  if (!step.done)
-    qa_range_error("Cannot synchronously finish an asynchronous call");
+  if (step.thrown != NULL || !step.done) {
+    /* The abandoned body is released before the throw leaves (TS leaves the generator to the GC).
+     * A thrown text may point into that body, so it is copied first. */
+    char text[QA_CAUGHT_MESSAGE_CAPACITY];
+    snprintf(text, sizeof text, "%s", step.thrown != NULL ? step.thrown : "");
+    bool thrown = step.thrown != NULL;
+    qa_call_steps_release(&steps);
+    if (thrown) qa_range_error("%s", text);
+    qa_raise("Error", 0, 0, "Cannot synchronously finish an asynchronous call");
+  }
   qa_call_steps_release(&steps);
   return step.value;
 }
@@ -90,7 +97,7 @@ static qa_call_step_result wait_for_call_next(void *ctx, const char *thrown) {
     return step;
   }
   if (!state->completed)
-    qa_range_error("Call resumed before its wait completed");
+    qa_raise("Error", 0, 0, "Call resumed before its wait completed");
   step.done = true;
   step.value = state->value;
   return step;

@@ -1,5 +1,7 @@
 /* Port of src/app/bootstrap/image-settings.ts. GPL-2.0-or-later. */
 #define _POSIX_C_SOURCE 200809L
+#include "qa/core/commands/text.h"
+#include "qa/formats/text_decoder.h"
 #include "qa/app/bootstrap/image_settings.h"
 #include <errno.h>
 #include <math.h>
@@ -17,7 +19,10 @@
 #include "qa/app/bootstrap/view_settings.h"
 #include "qa/content/user_data.h"
 #include "qa/core/commands/index.h"
+#include "qa/core/cvars/setting_declarations.h"
+#include "qa/foundation/caught_message.h"
 #include "qa/foundation/js.h"
+#include "qa/foundation/node_path.h"
 #include "qa/foundation/support.h"
 #include "qa/input/device_settings.h"
 #include "qa/input/support.h"
@@ -119,9 +124,7 @@ static qa_app_image_settings *construct(const qa_app_image_settings_options *sou
   /* new ConfigStore(join(userContentRoot ?? defaultUserContentRoot(), "settings")) */
   char *root = options->user_content_root != NULL ? xdup(options->user_content_root) : qa_default_user_content_root();
   if (root == NULL) qa_range_error("Out of memory");
-  size_t length = strlen(root) + sizeof "/settings";
-  char *settings_root = xcalloc(length, 1);
-  snprintf(settings_root, length, "%s/settings", root);
+  char *settings_root = qa_node_path_join2(root, "settings");
   free(root);
   if (!qa_config_store_init(&settings->store, settings_root)) qa_range_error("Out of memory");
   free(settings_root);
@@ -147,6 +150,7 @@ static qa_app_image_settings *construct(const qa_app_image_settings_options *sou
   register_cvar(cvars, "r_customwidth", "0", QA_CVAR_FLAG_ARCHIVE);
   register_cvar(cvars, "r_customheight", "0", QA_CVAR_FLAG_ARCHIVE);
   register_cvar(cvars, "r_fullscreen", "0", QA_CVAR_FLAG_ARCHIVE);
+  qa_register_setting_aliases(cvars, QA_ENGINE_SETTING_SHARED);
   register_cvar(cvars, "r_swapInterval", "1", QA_CVAR_FLAG_ARCHIVE);
   register_cvar(cvars, "r_smp", "0", QA_CVAR_FLAG_ARCHIVE);
   qa_cvar_value_binding smp = {NULL, validate_smp, changed_noop};
@@ -354,6 +358,9 @@ static void command_print(void *ctx, const char *text, const qa_command_context 
 qa_app_image_settings *qa_app_image_settings_open(qa_app_image_settings_options options) {
   qa_app_image_settings *settings = construct(&options);
   qa_cvar_registry *cvars = settings->cvars;
+  /* A rejected read (TS loadText) or a raise while executing images.cfg drops the settings. */
+  qa_cleanup settings_guard;
+  qa_cleanup_push(&settings_guard, (void (*)(void *))qa_app_image_settings_destroy, settings);
   size_t length = 0;
   char *text = qa_config_store_load_text(&settings->store, "images.cfg", &length);
   if (text != NULL) {
@@ -366,8 +373,12 @@ qa_app_image_settings *qa_app_image_settings_open(qa_app_image_settings_options 
     qa_command_buffer *commands = qa_command_buffer_create(&buffer_options);
     if (commands == NULL) qa_range_error("Out of memory");
     load_state state = {settings, commands, NULL, 0, 0};
-    qa_command_buffer_append(commands, text, &settings->options.context, -1);
+    /* Bun.file().text(): UTF-8 decoded (BOM dropped, ill-formed bytes U+FFFD); append takes the TS string. */
+    char *decoded = qa_text_decoder_decode((const uint8_t *)text, length, NULL);
     free(text);
+    if (decoded == NULL) qa_range_error("Out of memory");
+    qa_command_buffer_append_decoded(commands, decoded, &settings->options.context, -1);
+    free(decoded);
     (void)qa_command_buffer_execute_async(commands, load_after_dispatch, &state, NULL, NULL);
     qa_command_buffer_destroy(commands);
     settings->persisted = state.loaded;
@@ -386,6 +397,7 @@ qa_app_image_settings *qa_app_image_settings_open(qa_app_image_settings_options 
   replace_text(&settings->saved_stable, saved_stable);
   entries_free(settings->applied_values, settings->applied_value_count);
   settings->applied_values = archived_values(settings, &settings->applied_value_count);
+  qa_cleanup_pop(&settings_guard);
   return settings;
 }
 void qa_app_image_settings_destroy(qa_app_image_settings *settings) {
@@ -505,9 +517,13 @@ double qa_app_image_settings_gamma(qa_app_image_settings *settings) {
   return qa_cvar_registry_variable_value(settings->cvars, "r_gamma");
 }
 qa_app_model_policy qa_app_image_settings_model_policy(qa_app_image_settings *settings) {
+  /* trim() and Number() take the TS string: the cvar's console text (one byte per character) as UTF-8, so a U+00A0
+   * byte is white space as in TS. */
   char *value = qa_cvar_registry_variable_string(settings->cvars, "r_model_distance");
-  char *trimmed = value != NULL ? qa_input_js_trim(value) : NULL;
+  char *text = value != NULL ? qa_command_text_to_utf8(value) : NULL;
   free(value);
+  char *trimmed = text != NULL ? qa_input_js_trim(text) : NULL;
+  free(text);
   if (trimmed == NULL) qa_range_error("Out of memory");
   for (char *p = trimmed; *p != '\0'; p++) if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a'); /* toLowerCase (ASCII) */
   qa_app_model_policy policy;
@@ -537,12 +553,15 @@ static char *display_signature(qa_app_image_settings *settings) {
   }
   return builder.text;
 }
-/* `String(error)` for a caught error: "<name>: <message>". */
+/* `String(error)` for a caught error: "<name>: <message>", or "<name>" for an empty message (Error.prototype.toString);
+ * error.message alone when with_name is false. */
 static void print_caught(qa_app_image_settings *settings, const char *prefix, const qa_caught_error *caught, bool with_name) {
-  size_t length = strlen(prefix) + strlen(caught->name) + strlen(caught->message) + 8;
+  const char *message = qa_caught_message(caught);
+  size_t length = strlen(prefix) + strlen(caught->name) + strlen(message) + 8;
   char *text = xcalloc(length, 1);
-  if (with_name) snprintf(text, length, "%s%s: %s\n", prefix, caught->name, caught->message);
-  else snprintf(text, length, "%s%s\n", prefix, caught->message);
+  if (with_name && message[0] != '\0') snprintf(text, length, "%s%s: %s\n", prefix, caught->name, message);
+  else if (with_name) snprintf(text, length, "%s%s\n", prefix, caught->name);
+  else snprintf(text, length, "%s%s\n", prefix, message);
   print_sink(settings, text);
   free(text);
 }
@@ -630,6 +649,7 @@ static void apply_display(qa_app_image_settings *settings, qa_app_native_rendere
 }
 
 /* ---- save ---------------------------------------------------------------- */
+static void raise_write_failure(void *ctx) { (void)ctx; qa_settings_raise_write_failure(); }
 static void save(qa_app_image_settings *settings) {
   if (!settings->persistence_enabled) return;
   char *selected = signature(settings);
@@ -648,17 +668,23 @@ static void save(qa_app_image_settings *settings) {
   }
   free(commands);
   builder_text(&builder, "\n");
-  errno = 0;
-  if (!qa_config_store_dump(&settings->store, "images.cfg", builder.text)) {
-    /* TS prints the rejected write's error.message; the C store reports errno. */
-    const char *reason = errno != 0 ? strerror(errno) : "write failed";
-    size_t length = strlen(reason) + 64;
+  /* store.dump writes the string as UTF-8; the archive commands are console text (one byte per code unit). */
+  char *utf8 = qa_command_text_to_utf8(builder.text);
+  free(builder.text);
+  builder.text = utf8;
+  bool written = qa_config_store_dump(&settings->store, "images.cfg", builder.text);
+  free(builder.text);
+  if (!written) {
+    /* TS prints the rejected write's error.message: writeAtomic's Node fs error. */
+    qa_caught_error caught;
+    (void)qa_try(raise_write_failure, NULL, &caught);
+    const char *message = qa_caught_message(&caught);
+    size_t length = strlen(message) + 64;
     char *text = xcalloc(length, 1);
-    snprintf(text, length, "Could not save image settings: %s\n", reason);
+    snprintf(text, length, "Could not save image settings: %s\n", message);
     print_sink(settings, text);
     free(text);
   }
-  free(builder.text);
 }
 void qa_app_image_settings_refresh_display(qa_app_image_settings *settings, qa_app_native_renderer *renderer) {
   apply_display(settings, renderer);

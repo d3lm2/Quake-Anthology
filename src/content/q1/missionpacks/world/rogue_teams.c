@@ -66,13 +66,12 @@ static qa_q1_actor *state_of(qa_q1mp_rogue_teams *t, qa_actor_id actor) {
   if (resolved) set_state_entry(t, owner, state);
   return state;
 }
+static void message(qa_q1mp_rogue_teams *t, qa_actor_id actor, const char *text, bool center);
 /* Rogue ClientKill refuses the fifth suicide of a connection and counts every accepted one. */
 bool qa_q1mp_teams_suicide(qa_q1mp_rogue_teams *t, qa_actor_id actor) {
   qa_q1_actor *state = state_of(t, actor);
   if (num(state, "suicide_count") > 3) {
-    qa_q1_event event = {0};
-    event.kind = "message"; event.has_player = true; event.player = actor; event.text = "$qc_suicided_too_much"; event.center = false;
-    qa_q1_emit(t->game, event);
+    message(t, actor, "$qc_suicided_too_much", false);
     return false;
   }
   qa_q1mp_world_number(state, "suicide_count", num(state, "suicide_count") + 1);
@@ -101,8 +100,26 @@ static void message_args(qa_q1mp_rogue_teams *t, qa_actor_id actor, const char *
   event.args = args; event.arg_count = arg_count;
   qa_q1_emit(t->game, event);
 }
+/* TS message(actor, text, center = true, args = []): the event always carries args, an empty list by default. */
 static void message(qa_q1mp_rogue_teams *t, qa_actor_id actor, const char *text, bool center) {
-  message_args(t, actor, text, center, NULL, 0);
+  static const qa_q1_msg_arg NO_ARGS[1] = {{false, 0, NULL}};
+  message_args(t, actor, text, center, NO_ARGS, 0);
+}
+/* broadcast / message of a TS template literal carrying a player name (no fixed buffer). */
+static void broadcast(qa_q1mp_rogue_teams *t, const char *text);
+static void broadcast_owned(qa_q1mp_rogue_teams *t, char *text) {
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, text);
+  broadcast(t, text);
+  qa_cleanup_pop(&node);
+  free(text);
+}
+static void message_owned(qa_q1mp_rogue_teams *t, qa_actor_id actor, char *text, bool center) {
+  qa_cleanup node;
+  qa_cleanup_push(&node, free, text);
+  message(t, actor, text, center);
+  qa_cleanup_pop(&node);
+  free(text);
 }
 static void broadcast(qa_q1mp_rogue_teams *t, const char *text) {
   size_t count;
@@ -205,9 +222,7 @@ void qa_q1mp_teams_frame(qa_q1mp_rogue_teams *t, qa_actor_id actor) {
       message(t, actor, "$qc_color_games", false);
       if (t->hooks == NULL || t->hooks->disconnect == NULL) qa_range_error("Rogue team enforcement requires shared disconnect");
       t->hooks->disconnect(t->hooks->ctx, actor);
-      char text[160];
-      (void)snprintf(text, sizeof text, "%s has bad color sense\n", name_of(t, actor));
-      broadcast(t, text);
+      broadcast_owned(t, qa_q1mp_format("%s has bad color sense\n", name_of(t, actor)));
       return;
     }
     if (num(state, "ctf_killed") != 1) qa_q1mp_world_number(state, "ctf_killed", 2);
@@ -297,6 +312,7 @@ bool qa_q1mp_teams_impulse(qa_q1mp_rogue_teams *t, qa_actor_id actor, double imp
   if (mode_of(t) == 5) {
     qa_q1_actor *flag = find_flag(flags, count, "item_flag");
     const char *line;
+    char *owned = NULL;
     if (flag == NULL) line = "$qc_flag_missing";
     else if (num(flag, "cnt") == 0) line = "$qc_flag_at_base";
     else if (num(flag, "cnt") == 2) line = "$qc_flag_lying_about";
@@ -305,12 +321,13 @@ bool qa_q1mp_teams_impulse(qa_q1mp_rogue_teams *t, qa_actor_id actor, double imp
       else {
         const char * value3 = name_of(t, flag->owner);
         const char * value4 = team_name(team_of(t, flag->owner));
-        (void)snprintf(text, sizeof text, "%s of the %s team has the flag!\n", value3, value4);
-        line = text;
+        owned = qa_q1mp_format("%s of the %s team has the flag!\n", value3, value4);
+        line = owned;
       }
     } else line = "$qc_flag_screwed_up";
-    message(t, actor, line, false);
     free(flags);
+    if (owned != NULL) message_owned(t, actor, owned, false);
+    else message(t, actor, line, false);
     return true;
   }
   qa_q1_actor *red = find_flag(flags, count, "item_flag_team1"), *blue = find_flag(flags, count, "item_flag_team2");
@@ -328,19 +345,16 @@ bool qa_q1mp_teams_impulse(qa_q1mp_rogue_teams *t, qa_actor_id actor, double imp
     else (void)snprintf(label, sizeof label, "%s flag", index == 0 ? "Red" : "Blue");
     if (flag != NULL && num(flag, "cnt") == 1 && flag->has_owner) {
       const qa_actor_id owner = flag->owner;
-      const char *line;
       if (qa_same_actor(owner, actor)) {
-        if (mode_of(t) == 4) line = "$qc_you_have_enemy_flag";
-        else { (void)snprintf(text, sizeof text, "You have the %s flag!\n", index == 0 ? "Red" : "Blue"); line = text; }
+        if (mode_of(t) == 4) message(t, actor, "$qc_you_have_enemy_flag", false);
+        else { (void)snprintf(text, sizeof text, "You have the %s flag!\n", index == 0 ? "Red" : "Blue"); message(t, actor, text, false); }
       } else if (mode_of(t) == 4) {
-        (void)snprintf(text, sizeof text, "%s has %s flag.\n", name_of(t, owner), own ? "your" : "the enemy"); line = text;
+        message_owned(t, actor, qa_q1mp_format("%s has %s flag.\n", name_of(t, owner), own ? "your" : "the enemy"), false);
       } else {
         const char * value = name_of(t, owner);
         const char * value2 = team_name(team_of(t, owner));
-        (void)snprintf(text, sizeof text, "%s of the %s team has the %s flag.\n", value, value2, index == 0 ? "Red" : "Blue");
-        line = text;
+        message_owned(t, actor, qa_q1mp_format("%s of the %s team has the %s flag.\n", value, value2, index == 0 ? "Red" : "Blue"), false);
       }
-      message(t, actor, line, false);
     } else {
       const char *where = flag == NULL ? "missing!" : num(flag, "cnt") == 0 ? (mode_of(t) == 6 ? "at base." : own ? "in your base." : "in their base.")
                           : num(flag, "cnt") == 2 ? "lying about." : " corrupt.";
@@ -419,10 +433,8 @@ static void drop_flag(qa_q1mp_rogue_teams *t, qa_q1_actor *flag) {
   if (has_actor) {
     const char * value2;
     const char * value3;
-    char text[160];
-    if (mode_of(t) == 5) (void)snprintf(text, sizeof text, "%s lost the flag!\n", name_of(t, actor));
-    else (void)(value2 = name_of(t, actor), value3 = team_name(num(flag, "team")), snprintf(text, sizeof text, "%s lost the %s flag!\n", value2, value3));
-    broadcast(t, text);
+    if (mode_of(t) == 5) broadcast_owned(t, qa_q1mp_format("%s lost the flag!\n", name_of(t, actor)));
+    else { value2 = name_of(t, actor); value3 = team_name(num(flag, "team")); broadcast_owned(t, qa_q1mp_format("%s lost the %s flag!\n", value2, value3)); }
   }
   qa_q1_body_patch patch = {0};
   patch.has_origin = true; patch.origin = qa_q1_vadd(body.value.origin, QA_Q1MP_V3(0, 0, -24));
@@ -477,9 +489,7 @@ static void capture_flag(qa_q1mp_rogue_teams *t, qa_actor_id actor, bool alterna
   qa_q1_actor *state = state_of(t, actor);
   const double team = team_of(t, actor);
   const int32_t carried = bits(num(state, "ctf_flags"));
-  char text[160];
-  (void)snprintf(text, sizeof text, "%s captured the flag!\n", name_of(t, actor));
-  broadcast(t, text);
+  broadcast_owned(t, qa_q1mp_format("%s captured the flag!\n", name_of(t, actor)));
   clear_keys(t, actor);
   sound(t, actor, "misc/flagcap.wav", true);
   score(t, actor, alternate ? 8 : 15);
@@ -493,13 +503,11 @@ static void capture_flag(qa_q1mp_rogue_teams *t, qa_actor_id actor, bool alterna
       if (!alternate) {
         if (mode_of(t) != 5 && num(other, "ctf_lastreturnedflag") + 4 > game->time) {
           score(t, player, 1);
-          (void)snprintf(text, sizeof text, "%s gets an assist for returning the %s flag!\n", name_of(t, player), team_name(team));
-          broadcast(t, text);
+          broadcast_owned(t, qa_q1mp_format("%s gets an assist for returning the %s flag!\n", name_of(t, player), team_name(team)));
         }
         if (num(other, "ctf_lastfraggedcarrier") + 6 > game->time) {
           score(t, player, 2);
-          (void)snprintf(text, sizeof text, "%s gets an assist for fragging the flag carrier!\n", name_of(t, player));
-          broadcast(t, text);
+          broadcast_owned(t, qa_q1mp_format("%s gets an assist for fragging the flag carrier!\n", name_of(t, player)));
         }
       }
       if (mode_of(t) != 5) message(t, player, "$qc_your_team_captured", true);
@@ -540,19 +548,16 @@ static void flag_touch(void *ctx, qa_q1_services *game, qa_q1_actor *flag, qa_ac
       }
       score(t, actor, 1);
       qa_q1mp_world_number(state, "ctf_lastreturnedflag", game->time);
-      char returned[160];
-      (void)snprintf(returned, sizeof returned, "%s returned the %s flag!\n", name_of(t, actor), team_name(team));
-      broadcast(t, returned);
+      broadcast_owned(t, qa_q1mp_format("%s returned the %s flag!\n", name_of(t, actor), team_name(team)));
       sound(t, actor, qa_q1_actor_text(flag, "noise1"), false);
       return_flag(t, flag);
       return;
     }
     if ((carried & 3) != 0) return;
   }
-  char text[160];
-  if (mode_of(t) == 5) (void)snprintf(text, sizeof text, "%s got the flag!\n", name_of(t, actor));
-  else (void)snprintf(text, sizeof text, "%s got the %s flag!\n", name_of(t, actor), team_name(team));
-  broadcast(t, text);
+  char text[96]; /* team names only below */
+  if (mode_of(t) == 5) broadcast_owned(t, qa_q1mp_format("%s got the flag!\n", name_of(t, actor)));
+  else broadcast_owned(t, qa_q1mp_format("%s got the %s flag!\n", name_of(t, actor), team_name(team)));
   sound(t, actor, qa_q1_actor_text(flag, "noise"), false);
   qa_q1mp_world_number(state, "ctf_flags", carried | (team == 14 ? 2 : 1));
   qa_q1mp_world_number(state, "ctf_flagsince", game->time);
@@ -611,12 +616,10 @@ static void assists(qa_q1mp_rogue_teams *t, qa_actor_id target, qa_actor_id atta
     } else message(t, attacker, "$qc_enemy_killed_no_bonus", false);
   }
   bool flag_bonus = false, carrier_bonus = false;
-  char text[192];
   if (num(victim, "ctf_lasthurtcarrier") + 4 > game->time && (bits(num(killer, "ctf_flags")) & 3) == 0) {
     score(t, attacker, 2);
     carrier_bonus = true;
-    (void)snprintf(text, sizeof text, "%s defends %s's flag carrier against an agressive enemy\n", name_of(t, attacker), team_name(team));
-    broadcast(t, text);
+    broadcast_owned(t, qa_q1mp_format("%s defends %s's flag carrier against an agressive enemy\n", name_of(t, attacker), team_name(team)));
   }
   const qa_actor_id origins[2] = {attacker, target};
   for (size_t o = 0; o < 2; o++) {
@@ -640,17 +643,15 @@ static void assists(qa_q1mp_rogue_teams *t, qa_actor_id target, qa_actor_id atta
           !qa_same_actor(actor, attacker) && !carrier_bonus) {
         score(t, attacker, 1);
         carrier_bonus = true;
-        (void)snprintf(text, sizeof text, "%s defends %s's flag carrier\n", name_of(t, attacker), team_name(team));
-        broadcast(t, text);
+        broadcast_owned(t, qa_q1mp_format("%s defends %s's flag carrier\n", name_of(t, attacker), team_name(team)));
       }
       const char *classname = game->host.classname(game->host.ctx, actor);
       if ((team == 5 && qa_q1mp_streq(classname, "item_flag_team1")) || (team == 14 && qa_q1mp_streq(classname, "item_flag_team2")) ||
           (qa_q1mp_streq(classname, "item_flag") && (!qa_same_actor(origin_actor, target) || !flag_bonus))) {
         score(t, attacker, 1);
         flag_bonus = true;
-        if (mode_of(t) == 5) (void)snprintf(text, sizeof text, "%s defends the flag\n", name_of(t, attacker));
-        else (void)snprintf(text, sizeof text, "%s defends the %s flag\n", name_of(t, attacker), team_name(team));
-        broadcast(t, text);
+        if (mode_of(t) == 5) broadcast_owned(t, qa_q1mp_format("%s defends the flag\n", name_of(t, attacker)));
+        else broadcast_owned(t, qa_q1mp_format("%s defends the %s flag\n", name_of(t, attacker), team_name(team)));
       }
     }
     free(observations);

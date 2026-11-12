@@ -57,7 +57,7 @@ void qa_app_draw_q3_overlay(qa_app_q3_overlay_options options) {
       }
     } else if (is(submission->kind, "text")) {
       if (!qa_same_seat(submission->draw.seat, options.seat))
-        qa_range_error("Source HUD text belongs to another seat");
+        qa_raise("Error", 0, 0, "Source HUD text belongs to another seat");
       qa_material_draw_context context = options.host.material_context(
           options.host.ctx, options.camera, options.seat, options.time);
       qa_draw_batch *batches = NULL;
@@ -81,7 +81,7 @@ void qa_app_draw_q3_overlay(qa_app_q3_overlay_options options) {
       const qa_q3_pres_presented_scene *scene = submission->scene;
       if ((qa_js_to_int32(scene->source.render_flags) & QA_Q3_PRES_RDF_NOWORLDMODEL) == 0
           || !qa_same_seat(scene->seat, options.seat))
-        qa_range_error("Source HUD cannot replace a world view or another seat");
+        qa_raise("Error", 0, 0, "Source HUD cannot replace a world view or another seat");
       qa_scene_camera camera;
       if (!clipped_camera(scene->camera, viewport, &camera)) continue;
       const qa_render_operation *operations = NULL;

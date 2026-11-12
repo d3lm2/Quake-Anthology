@@ -8,10 +8,10 @@
 #include "qa/foundation/js.h"
 
 const qa_gamepad_tuning qa_default_gamepad_tuning = {
-    {QA_STICK_CURVE_RADIAL, 0.175, 0.02, 2},
-    {QA_STICK_CURVE_RADIAL, 0.175, 0.02, 2},
+    {QA_STICK_CURVE_RADIAL, 0.175, 0.02, 2, false},
+    {QA_STICK_CURVE_RADIAL, 0.175, 0.02, 2, false},
     false, 240, 130, false, 1, 1, 0.2,
-    {false, 1, 1, false}};
+    {false, 1, 1, false, false}}; /* the literal's key order (parsed_order false) */
 
 void qa_validate_gamepad_tuning(const qa_gamepad_tuning *tuning) {
   const qa_stick_curve curves[2] = {tuning->move, tuning->look};
@@ -55,7 +55,7 @@ qa_vec2 qa_apply_stick_curve(qa_vec2 axis, qa_stick_curve curve) {
     out.y = applied[1];
     return out;
   }
-  double magnitude = hypot(axis.x, axis.y);
+  double magnitude = qa_js_hypot2(axis.x, axis.y); /* Math.hypot */
   if (magnitude <= curve.deadzone) {
     qa_vec2 zero = {0, 0};
     return zero;

@@ -68,9 +68,11 @@ void qa_q1_client_notice_make(qa_q1_client_notice *notice, const char *edition, 
                               const char *name, double frags);
 
 /* TS Q1SourceFinale / Q1IntermissionResult (kind strings) and rule. */
+/* text is borrowed and whole (TS has no length limit): a finale table string, a literal key, or text the producing
+ * rule keeps until its next finale; a consumer that keeps the result copies it (the simulation event shape does). */
 typedef struct qa_q1_intermission_result {
   const char *kind; /* "waiting"|"travel"|"finale"|"sell-screen" */
-  char map[64]; char text[4096]; double track;
+  char map[64]; const char *text; double track;
 } qa_q1_intermission_result;
 /* finale returns: 0 = TS undefined, 1 = finale result, 2 = TS null. */
 typedef struct qa_q1_intermission_rule {

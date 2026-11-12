@@ -1,7 +1,7 @@
 /* Port of src/render/gl/object-opacity.ts: private scratch storage for one
  * object-opacity scope; child draws keep the renderer's live image registry.
- * TS throws become qa_range_error aborts (docs/PORTING.md), so the TS finally
- * restoration runs on the normal path only. GPL-2.0-or-later. */
+ * A raise inside the scope (a throwing child draw included) clears the active flag
+ * and restores the saved GL state first, as the TS finally blocks do. GPL-2.0-or-later. */
 #ifndef QA_RENDER_GL_OBJECT_OPACITY_H
 #define QA_RENDER_GL_OBJECT_OPACITY_H
 #include <stdbool.h>

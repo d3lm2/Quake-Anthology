@@ -26,8 +26,10 @@ static qa_saved_actor_id read_actor(const R *entry) {
   out.slot = (int64_t)qa_save_reader_integer_min(F(&actor, "slot", &slot), 0); out.generation = (int64_t)qa_save_reader_integer_min(F(&actor, "generation", &generation), 0);
   qa_save_reader_destroy(&slot); qa_save_reader_destroy(&generation); qa_save_reader_destroy(&actor); return out;
 }
+static void checkpoint_free_cleanup(void *ctx) { qa_app_sim_native_mod_presentation_checkpoint_free(ctx); }
 void qa_app_sim_read_native_mod_presentation(const R *reader, qa_app_sim_native_mod_presentation_checkpoint *out) {
   memset(out, 0, sizeof *out); R list, v;
+  qa_cleanup partial; qa_cleanup_push(&partial, checkpoint_free_cleanup, out); /* a refused save frees what was read */
   F(reader, "fog", &list); out->fog_count = qa_save_reader_list_count(&list); out->fog = xcalloc(out->fog_count, sizeof *out->fog);
   for (size_t i = 0; i < out->fog_count; i++) { R entry; qa_save_reader_item(&list, i, &entry); out->fog[i].actor = read_actor(&entry);
     out->fog[i].value = qa_read_q2_fog_state(F(&entry, "value", &v)); qa_save_reader_destroy(&v); qa_save_reader_destroy(&entry); }
@@ -48,6 +50,7 @@ void qa_app_sim_read_native_mod_presentation(const R *reader, qa_app_sim_native_
       if (out->clients[i].actor.slot == out->clients[j].actor.slot && out->clients[i].actor.generation == out->clients[j].actor.generation) qa_save_reader_fail(reader, "Duplicate native client presentation");
   }
   qa_save_reader_destroy(&list);
+  qa_cleanup_pop(&partial);
 }
 void qa_app_sim_native_mod_presentation_checkpoint_free(qa_app_sim_native_mod_presentation_checkpoint *c) {
   for (size_t i = 0; i < c->client_count; i++) free(c->clients[i].inventory);
@@ -85,7 +88,9 @@ typedef struct fog_row { qa_actor_id actor; qa_q2_fog_state value; } fog_row;
 typedef struct loop_row { qa_actor_id actor; char *path; double volume, attenuation; qa_vec3 origin; } loop_row;
 typedef struct event_row { qa_actor_id actor; double event; } event_row;
 typedef struct client_row { qa_actor_id actor; char *layout; double *inventory; size_t inventory_count; } client_row;
-typedef struct frame_row { qa_actor_id actor; qa_mod_client_presentation_frame frame; double stats[32]; size_t stat_count; } frame_row;
+/* stats: player.stats whole, as TS sends them (32 classic, 64 rerelease: the protocol's fixed counts). */
+#define FRAME_STATS 64
+typedef struct frame_row { qa_actor_id actor; qa_mod_client_presentation_frame frame; double stats[FRAME_STATS]; size_t stat_count; } frame_row;
 typedef struct config_row { double index; char *value; } config_row;
 /* TS ReadonlyMap<number, string> handed to the native HUD frame. */
 typedef struct qa_app_sim_native_mod_configstrings { qa_native_q2_config_string *entries; size_t count; } configstring_snapshot;
@@ -255,17 +260,34 @@ static size_t recipients(presentation_t *p, const qa_app_sim_classic_guest_messa
   }
   return kept;
 }
+/* The TS Q2ServerEvent kind strings, for the unbound-message error. */
+static const char *server_event_kind(qa_q2_server_event_kind kind) {
+  static const char *const names[] = {"nop", "disconnect", "reconnect", "level-restart", "server-data", "print", "center-print", "command-text",
+      "layout", "achievement", "config-string", "baseline", "frame", "sound", "temporary-entity", "muzzle-flash", "inventory", "download",
+      "setting", "seat", "damage", "localized-print", "fog", "poi", "help-path", "private"};
+  return (size_t)kind < sizeof names / sizeof names[0] ? names[kind] : "unknown";
+}
+typedef struct drain_scratch { qa_q2_server_record *records; size_t record_count; qa_actor_id *targets; qa_q2_server_record *copy; } drain_scratch;
+static void drain_scratch_free(void *ctx) {
+  drain_scratch *s = ctx;
+  free(s->copy); free(s->targets); qa_q2_server_records_free(s->records, s->record_count);
+  s->copy = NULL; s->targets = NULL; s->records = NULL; s->record_count = 0;
+}
 void qa_app_sim_native_mod_presentation_drain(presentation_t *p) {
   size_t count = 0; const qa_app_sim_classic_guest_message *messages = p->source.drain_messages(p->source.ctx, &count); if (count == 0) return;
   const qa_session_mod_engine_services *engine = engine_of(p); if (engine == NULL) fail("Native mod output requires presentation services");
   size_t config_count = 0; const qa_app_sim_configstring *configs = p->source.configstrings(p->source.ctx, &config_count);
   for (size_t i = 0; i < config_count; i++) config_set(p, configs[i].index, configs[i].value);
   qa_source_time time = now(p); double seconds = qa_compat_q2_time_seconds(time);
+  /* A raising translation, recipient lookup or unbound message frees this message's records and lists. */
+  drain_scratch scratch = {0};
+  qa_cleanup scratch_node; qa_cleanup_push(&scratch_node, drain_scratch_free, &scratch);
   for (size_t m = 0; m < count; m++) {
-    qa_q2_server_record *records = NULL; size_t record_count = 0;
-    if (!qa_q2_server_message_reader_read(&p->reader, messages[m].bytes, messages[m].length, &records, &record_count)) qa_range_error("Out of memory");
-    qa_actor_id *targets = NULL; bool null_recipient = false; size_t target_count = recipients(p, &messages[m], &targets, &null_recipient);
-    qa_q2_server_record *copy = xcalloc(record_count, sizeof *copy);
+    if (!qa_q2_server_message_reader_read(&p->reader, messages[m].bytes, messages[m].length, &scratch.records, &scratch.record_count)) qa_range_error("Out of memory");
+    qa_q2_server_record *records = scratch.records; size_t record_count = scratch.record_count;
+    bool null_recipient = false; size_t target_count = recipients(p, &messages[m], &scratch.targets, &null_recipient);
+    qa_actor_id *targets = scratch.targets;
+    qa_q2_server_record *copy = scratch.copy = xcalloc(record_count, sizeof *copy);
     for (size_t r = 0; r < target_count; r++) {
       translate_ctx t; memset(&t, 0, sizeof t); t.p = p; t.recipient = null_recipient ? NULL : &targets[r]; t.message = &messages[m]; t.time = time;
       if (t.recipient != NULL) t.has_slot = p->projection->slot_of(p->projection->ctx, *t.recipient, &t.slot);
@@ -284,11 +306,12 @@ void qa_app_sim_native_mod_presentation_drain(presentation_t *p) {
         if (kind == QA_Q2_SERVER_COMMAND_TEXT && engine->message != NULL) {
           qa_network_event event; memset(&event, 0, sizeof event); event.kind = QA_NETWORK_EVENT_COMMAND_TEXT; event.text = copy[k].event.text;
           engine->message(engine->ctx, event, t.recipient);
-        } else { free(copy); free(targets); qa_q2_server_records_free(records, record_count); qa_raise("Error", 0, 0, "Native mod message %d needs a shared destination binding", (int)kind); }
+        } else qa_raise("Error", 0, 0, "Native mod message %s needs a shared destination binding", server_event_kind(kind));
       }
     }
-    free(copy); free(targets); qa_q2_server_records_free(records, record_count);
+    drain_scratch_free(&scratch);
   }
+  qa_cleanup_pop(&scratch_node);
 }
 
 void qa_app_sim_native_mod_presentation_publish(presentation_t *p, const qa_app_sim_native_mod_actor_slot *actors, size_t count, bool events) {
@@ -325,7 +348,8 @@ void qa_app_sim_native_mod_presentation_publish(presentation_t *p, const qa_app_
         qa_native_q2_hud_frame *hud = &frame->native_hud_frame;
         hud->protocol.kind = player.rerelease ? "q2-rerelease" : "q2-classic"; hud->protocol.version = player.rerelease ? 1038 : 34;
         qa_double_view stats = player.rerelease ? player.rerelease_state.view.stats : player.classic.view.stats;
-        row->stat_count = stats.count < 32 ? stats.count : 32;
+        if (stats.count > FRAME_STATS) qa_range_error("Native HUD stats exceed the protocol's 64");
+        row->stat_count = stats.count;
         if (row->stat_count != 0) memcpy(row->stats, stats.values, row->stat_count * sizeof *row->stats);
         hud->stats = row->stats; hud->stat_count = row->stat_count;
         hud->configstrings = p->snapshot.entries; hud->configstring_count = p->snapshot.count;

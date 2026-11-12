@@ -3,6 +3,7 @@
 #include "qa/foundation/js.h"
 
 #include <math.h>
+#include <stdlib.h>
 
 #include "base_internal.h"
 #include "qa/content/q2/base/monsters/common.h"
@@ -16,8 +17,10 @@ static const qa_vec3 cable_offsets[10] = {
 
 static qa_q2_entity *patient(qa_q2m_monsters *monsters, qa_q2m_context *c) {
   qa_q2_entity *best = NULL;
+  /* TS iterates the array nearby() returned; the host reuses its result buffer and the
+   * visibility test below runs host queries, so the loop walks a copy. */
   size_t count = 0;
-  const qa_actor_id *actors = c->game->host->nearby(c->game->host->ctx, q2bm_body(c->game, c->entity).origin, 1024, &count);
+  qa_actor_id *actors = qa_q2_game_nearby_copy(c->game, q2bm_body(c->game, c->entity).origin, 1024, &count);
   for (size_t i = 0; i < count; i++) {
     qa_actor_id actor = actors[i];
     qa_q2_entity *entity = c->game->entity(c->game->ctx, &actor);
@@ -28,6 +31,7 @@ static qa_q2_entity *patient(qa_q2m_monsters *monsters, qa_q2m_context *c) {
       continue;
     if (best == NULL || entity->max_health > best->max_health) best = entity;
   }
+  free(actors);
   return best;
 }
 static bool acquire(qa_q2m_monsters *monsters, qa_q2m_context *c, bool preserve_enemy) {

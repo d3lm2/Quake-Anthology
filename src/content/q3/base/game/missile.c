@@ -36,17 +36,17 @@ static qa_q3_entity_pool *pool_of(RT *r) { return combat_of(r)->entities; }
 static qa_q3_game_entity *native_of(RT *r, qa_actor_id actor) {
   qa_q3_entity_pool *pool = pool_of(r); return pool->options.records.native_by_actor(pool->options.records.ctx, actor);
 }
-static qa_q3_game_client *client_of(qa_q3_game_entity *e) { if (!e->client) qa_range_error("Missile rule requires a client entity"); return e->client; }
-static qa_q3_game_entity *parent_of(qa_q3_game_entity *e) { if (!e->parent) qa_range_error("Missile rule requires its source parent"); return e->parent; }
+static qa_q3_game_client *client_of(qa_q3_game_entity *e) { if (!e->client) qa_raise("Error", 0, 0, "Missile rule requires a client entity"); return e->client; }
+static qa_q3_game_entity *parent_of(qa_q3_game_entity *e) { if (!e->parent) qa_raise("Error", 0, 0, "Missile rule requires its source parent"); return e->parent; }
 static qa_vec3 normalize_direction(qa_q3_missile_direction *d) {
   qa_vec3 n = qa_normalize3(qa_math_vec3(d->x, d->y, d->z)); d->x = n.x; d->y = n.y; d->z = n.z; return n;
 }
 static qa_vec3 center(qa_q3_game_entity *e) { qa_vec3 min = qa_q3_base_entity_shared_mins(&e->r); qa_vec3 max = qa_q3_base_entity_shared_maxs(&e->r); qa_bounds b = {min, max}; return qa_q3_grapple_target(qa_q3_base_entity_shared_current_origin(&e->r), b); }
 static const qa_q3_missionpack_missile_services *missionpack(RT *r) {
-  if (!r->host.has_missionpack) qa_range_error("Projectile requires missionpack");
+  if (!r->host.has_missionpack) qa_raise("Error", 0, 0, "Projectile requires missionpack");
   return &r->host.missionpack;
 }
-static void owned(RT *r, qa_q3_game_entity *e) { if (qa_q3_entity_pool_get(pool_of(r), e->slot) != e) qa_range_error("Missile entity does not belong to this pool"); }
+static void owned(RT *r, qa_q3_game_entity *e) { if (qa_q3_entity_pool_get(pool_of(r), e->slot) != e) qa_raise("Error", 0, 0, "Missile entity does not belong to this pool"); }
 static void link_entity(RT *r, qa_q3_game_entity *e) { r->host.world.link(r->host.world.ctx, e); }
 
 /* TS Map<GameEntity, NativeProjectile>: insertion ordered; removal retires the record until no projectile
@@ -96,7 +96,7 @@ static native_t *bind_projectile(qa_q3_game_entity *bolt, qa_actor_id owner, con
 }
 static native_t *projectile_of(RT *r, qa_q3_game_entity *e) {
   native_t *n = find_projectile(r, e);
-  if (!n || native_of(r, n->p.actor.id) != e) qa_range_error("Missile continuation does not own this actor lifetime");
+  if (!n || native_of(r, n->p.actor.id) != e) qa_raise("Error", 0, 0, "Missile continuation does not own this actor lifetime");
   return n;
 }
 static qa_q3_game_client *owner_client(RT *r, native_t *n) { qa_q3_game_entity *o = native_of(r, n->p.owner); return o ? o->client : NULL; }
@@ -158,7 +158,8 @@ static void h_move(void *ctx, qa_vec3 origin, qa_vec3 velocity) {
 static void h_set_origin(void *ctx, qa_vec3 origin) {
   hctx *h = ctx; h_begin(h); qa_q3_set_origin(h->e, origin);
   qa_body_state_result body = qa_shared_body_table_read(h->r->host.bodies, h->n->p.actor.id);
-  if (body.has_value) { body.value.origin = origin; body.value.velocity = qa_math_vec3(0, 0, 0); qa_shared_body_table_write(h->r->host.bodies, h->n->p.actor, body.value); }
+  /* TS writes back the body it read (whose origin setOrigin stored as binary32) with a zero velocity. */
+  if (body.has_value) { body.value.origin = qa_math_vec3(origin.x, origin.y, origin.z); body.value.velocity = qa_math_vec3(0, 0, 0); qa_shared_body_table_write(h->r->host.bodies, h->n->p.actor, body.value); }
   h_end(h);
 }
 static void h_link(void *ctx) { hctx *h = ctx; h_begin(h); link_entity(h->r, h->e); h_end(h); }
@@ -192,7 +193,7 @@ static void h_emit(void *ctx, qa_q3_projectile_impact ev) {
   if (ev.kind == QA_Q3_IMPACT_BOUNCE) qa_q3_entity_pool_add_event(pool, h->e, QA_Q3_EV_GRENADE_BOUNCE, 0);
   else if (ev.flesh && ev.has_target) {
     qa_q3_game_entity *target = native_of(h->r, ev.target);
-    if (!target || !target->client) qa_range_error("Q3 admitted player has no native hit-event client");
+    if (!target || !target->client) qa_raise("Error", 0, 0, "Q3 admitted player has no native hit-event client");
     qa_q3_entity_pool_add_event(pool, h->e, QA_Q3_EV_MISSILE_HIT, qa_q3_base_direction_to_byte(&ev.normal)); h->e->s.other_entity_num = target->s.number;
   } else qa_q3_entity_pool_add_event(pool, h->e, (qa_js_to_int32(ev.surface_flags) & SURF_METALSTEPS) ? QA_Q3_EV_MISSILE_MISS_METAL : QA_Q3_EV_MISSILE_MISS, qa_q3_base_direction_to_byte(&ev.normal));
   h_end(h);
@@ -218,7 +219,7 @@ static void h_think(void *ctx) { hctx *h = ctx; h_begin(h); qa_q3_game_entity * 
 static void h_moved(void *ctx) { (void)ctx; }
 static qa_q3_reflection_result h_reflection(void *ctx, qa_actor_id target, qa_vec3 direction, qa_vec3 point) {
   hctx *h = ctx; h_begin(h); qa_q3_game_entity *current = native_of(h->r, target);
-  if (!current || !current->client) qa_range_error("Invulnerable Q3 player lost its native client");
+  if (!current || !current->client) qa_raise("Error", 0, 0, "Invulnerable Q3 player lost its native client");
   const qa_q3_missionpack_missile_services *m = missionpack(h->r);
   qa_q3_reflection_result out = m->invulnerability_impact(m->ctx, current, direction, point); h_end(h); return out;
 }
@@ -226,7 +227,7 @@ static void proximity_player(RT *r, qa_q3_game_entity *mine, qa_q3_game_entity *
 static bool special_impact(RT *r, qa_q3_game_entity *entity, qa_q3_base_actor_trace_result trace, qa_actor_id actor) {
   qa_q3_game_combat_context *c = combat_of(r); qa_q3_entity_pool *pool = c->entities; qa_q3_game_entity *other = native_of(r, actor);
   qa_vec3 normal = trace.contact_is_plane ? trace.contact_plane.normal : qa_math_vec3(0, 0, 0);
-  if (!other && c->is_player(c->services_ctx, actor)) qa_range_error("Admitted Q3 map player has no native client behavior record");
+  if (!other && c->is_player(c->services_ctx, actor)) qa_raise("Error", 0, 0, "Admitted Q3 map player has no native client behavior record");
   if (r->host.has_missionpack && entity->s.weapon == QA_Q3_WP_PROX_LAUNCHER) {
     if (entity->s.pos.type != QA_Q3_BASE_TR_GRAVITY) return true;
     if (other && other->s.e_type == ET_PLAYER && qa_q3_game_entity_health(other) > 0) { proximity_player(r, entity, other); return true; }
@@ -392,7 +393,7 @@ static void proximity_activate(RT *r, qa_q3_game_entity *mine) {
 }
 static void proximity_explode_on_player(RT *r, qa_q3_game_entity *mine) {
   native_t *n = projectile_of(r, mine);
-  if (!n->attached_player) qa_range_error("Attached proximity mine requires its player lifetime");
+  if (!n->attached_player) qa_raise("Error", 0, 0, "Attached proximity mine requires its player lifetime");
   qa_q3_game_entity *player = native_of(r, n->attachment);
   if (!player) { release_projectile(r, n); return; }
   qa_q3_game_client *client = client_of(player); qa_q3_game_combat_context *c = combat_of(r);
@@ -413,7 +414,7 @@ static void proximity_player(RT *r, qa_q3_game_entity *mine, qa_q3_game_entity *
   qa_q3_game_combat_context *c = combat_of(r); qa_q3_entity_pool *pool = c->entities;
   qa_q3_entity_pool_add_event(pool, mine, QA_Q3_EV_PROXIMITY_MINE_STICK, 0);
   if (qa_js_to_int32(player->s.e_flags) & EF_TICKING) {
-    if (!player->activator) qa_range_error("Ticking player requires its proximity mine");
+    if (!player->activator) qa_raise("Error", 0, 0, "Ticking player requires its proximity mine");
     player->activator->splash_damage = qa_int32(player->activator->splash_damage + mine->splash_damage);
     player->activator->splash_radius = (float)(player->activator->splash_radius * (float)1.5);
     mine->think = qa_q3_callback_family_resolve(&pool->callbacks.think, IMPL("proximityPlayer.think")); qa_q3_game_entity_set_nextthink(mine, c->time); return;
@@ -428,7 +429,7 @@ static void proximity_player(RT *r, qa_q3_game_entity *mine, qa_q3_game_entity *
 static void apply_behavior_launch(RT *r, qa_q3_game_entity *bolt, qa_actor_id owner) {
   qa_owned_actor actor = qa_q3_game_entity_actor(bolt); double time = combat_of(r)->time;
   qa_body_state_result body = qa_shared_body_table_read(r->host.bodies, actor.id);
-  if (!body.has_value) qa_range_error("Launched Q3 missile lost its body");
+  if (!body.has_value) qa_raise("Error", 0, 0, "Launched Q3 missile lost its body");
   if (!r->host.weapon_behavior) return;
   const qa_weapon_behavior_projectile_port *port = r->host.weapon_behavior;
   qa_q3_projectile_behavior_result behavior = qa_q3_projectile_behavior(bolt->s.weapon);
@@ -530,7 +531,7 @@ void qa_q3_missile_bind_save_callbacks(RT *r) {
 void qa_q3_missile_runtime_bind(RT *r) {
   if (r->bound) return;
   qa_q3_game_combat_context *c = combat_of(r);
-  if (c->entities->options.product != c->product) qa_range_error("Missile product does not match its entity pool");
+  if (c->entities->options.product != c->product) qa_raise("Error", 0, 0, "Missile product does not match its entity pool");
   if (!c->authority || !c->participant || !c->is_player) qa_range_error("Missile runtime requires bound combat services");
   r->release_subscription = qa_session_actor_registry_on_release(r->host.actors, released, r);
   qa_q3_missile_bind_save_callbacks(r); r->bound = true;
@@ -573,10 +574,18 @@ static bool resolve_nullable(const qa_save_reader *entry, const char *name, qa_q
   if (has) *out = resolve(ctx, qa_read_saved_actor(&f));
   qa_save_reader_destroy(&f); return has;
 }
+typedef struct restore_entries { native_t **entries; size_t count; } restore_entries;
+static void free_restore_entries(void *arg) {
+  restore_entries *pending = arg;
+  for (size_t i = 0; i < pending->count; i++) free(pending->entries[i]);
+  free(pending->entries); pending->entries = NULL; pending->count = 0;
+}
 void qa_q3_missile_runtime_restore_save_state(RT *r, const qa_save_value *value, qa_q3_missile_resolve_actor_fn resolve, void *ctx) {
   qa_save_reader reader; qa_save_reader_init(&reader, value, "q3.missiles");
   size_t count = qa_save_reader_list_count(&reader);
   native_t **entries = calloc(count ? count : 1, sizeof *entries); if (!entries) qa_range_error("out of memory");
+  /* A rejected save raises; the records built so far are released then. */
+  restore_entries pending = {entries, count}; qa_cleanup pending_node; qa_cleanup_push(&pending_node, free_restore_entries, &pending);
   for (size_t i = 0; i < count; i++) {
     qa_save_reader entry, f; qa_save_reader_item(&reader, i, &entry);
     qa_save_reader_field(&entry, "entity", &f); qa_q3_game_entity *entity = qa_q3_read_module_entity(&f, pool_of(r)); qa_save_reader_destroy(&f);
@@ -593,6 +602,7 @@ void qa_q3_missile_runtime_restore_save_state(RT *r, const qa_save_value *value,
     qa_save_reader_destroy(&entry);
   }
   for (size_t i = 0; i < count; i++) for (size_t j = 0; j < i; j++) if (entries[i]->entity == entries[j]->entity) qa_save_reader_fail(&reader, "duplicate native projectile");
+  qa_cleanup_pop(&pending_node);
   for (size_t i = 0; i < r->count; i++) retire(r, r->projectiles[i]);
   r->count = 0; flush_retired(r);
   for (size_t i = 0; i < count; i++) set_projectile(r, entries[i]);

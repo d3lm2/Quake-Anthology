@@ -7,9 +7,9 @@ qa_q1_event qa_compat_qc_quake_temporary_event(qa_temporary_entity e, const qa_a
   qa_q1_event r; memset(&r, 0, sizeof r);
   if (e.kind == QA_TE_EXPLOSION_COLORS) { r.kind="colored-explosion"; r.has_origin=true; r.origin=e.origin; r.color_start=e.color_start; r.color_length=e.color_length; return r; }
   if (e.kind == QA_TE_BEAM) {
-    if (!actor) qa_range_error("QC beam entity %s had no owned actor when written", QA_JS_NUMBER(e.entity));
+    if (!actor) qa_raise("Error", 0, 0, "QC beam entity %s had no owned actor when written", QA_JS_NUMBER(e.entity));
     const char *style = e.type==5?"lightning1":e.type==6?"lightning2":e.type==9?"lightning3":(e.type==13&&!qw)?"grapple":NULL;
-    if (!style) qa_range_error("Unsupported QC beam %s", QA_JS_NUMBER(e.type));
+    if (!style) qa_raise("Error", 0, 0, "Unsupported QC beam %s", QA_JS_NUMBER(e.type));
     r.kind="beam"; r.beam_style=style; r.has_actor=true; r.actor=*actor; r.start=e.start; r.end=e.end; return r;
   }
   if (qw && (e.type==2||e.type==12||e.type==13)) {
@@ -20,6 +20,6 @@ qa_q1_event qa_compat_qc_quake_temporary_event(qa_temporary_entity e, const qa_a
   if(e.type==0)name="spike"; else if(e.type==1)name="superspike"; else if(e.type==2)name="gunshot";
   else if(e.type==3)name="explosion"; else if(e.type==4)name="tar-explosion"; else if(e.type==7)name="wizard-spike";
   else if(e.type==8)name="knight-spike"; else if(e.type==10)name="lava-splash"; else if(e.type==11)name="teleport";
-  else qa_range_error("Unsupported QC point effect %s", QA_JS_NUMBER(e.type));
+  else qa_raise("Error", 0, 0, "Unsupported QC point effect %s", QA_JS_NUMBER(e.type));
   r.kind="effect"; r.effect=name; r.has_origin=true; r.origin=e.origin; r.amount=e.count; return r;
 }

@@ -8,7 +8,7 @@
 static qa_bot_log_io_result ok(void) { return (qa_bot_log_io_result){QA_LOG_IO_OK}; }
 static void live(qa_bot_log *l) {
   if (!l->is_open)
-    qa_range_error("Bot log source FILE is closed but its pointer is retained");
+    qa_raise("Error", 0, 0, "Bot log source FILE is closed but its pointer is retained");
 }
 static int32_t src_int(double v) {
   double t = trunc(v);
@@ -161,13 +161,15 @@ qa_save_value *qa_bot_log_capture_save_state(qa_bot_log *l) {
     qa_save_value_set(state, "kind", qa_save_value_string("closed-retained"));
   else {
     if (!l->stream.has_checkpoint || l->stream.checkpoint_position == NULL) {
-      fprintf(stderr, "Active bot log stream does not support continuation checkpoints\n");
-      abort();
+      qa_save_value_free(state);
+      qa_save_value_free(out);
+      qa_raise("Error", 0, 0, "Active bot log stream does not support continuation checkpoints");
     }
     int64_t position = l->stream.checkpoint_position(l->stream.ctx);
     if (position < 0 || position > INT64_C(9007199254740991)) {
-      fprintf(stderr, "Bot log stream returned an invalid byte position\n");
-      abort();
+      qa_save_value_free(state);
+      qa_save_value_free(out);
+      qa_raise("Error", 0, 0, "Bot log stream returned an invalid byte position");
     }
     qa_save_value_set(state, "kind", qa_save_value_string("open"));
     qa_save_value_set(state, "position", qa_save_value_number((double)position));
@@ -184,10 +186,7 @@ static void log_field(const qa_save_reader *r, const char *name, qa_save_reader 
     qa_range_error("Out of memory reading the bot log");
 }
 void qa_bot_log_restore_save_state(qa_bot_log *l, const qa_save_value *value) {
-  if (l->is_open || l->retained_closed) {
-    fprintf(stderr, "Log restore requires an empty owner\n");
-    abort();
-  }
+  if (l->is_open || l->retained_closed) qa_raise("Error", 0, 0, "Log restore requires an empty owner");
   static const char *const KINDS[] = {"closed", "closed-retained", "open"};
   qa_save_reader reader, state, cell;
   if (!qa_save_reader_init(&reader, value, "bot.log"))
@@ -220,10 +219,8 @@ void qa_bot_log_restore_save_state(qa_bot_log *l, const qa_save_value *value) {
     double position = qa_save_reader_integer_min(&cell, 0);
     qa_save_reader_destroy(&cell);
     qa_bot_log_open_result result = l->resume_file(l->resume_ctx, opened, (int64_t)position);
-    if (!result.opened) {
-      fprintf(stderr, "Bot log resume failed for %s\n", opened);
-      abort();
-    }
+    if (!result.opened) /* TS rethrows the host's error; the C open result carries no text */
+      qa_raise("Error", 0, 0, "Bot log resume failed for %s", opened);
     stream = result.stream;
     active = true;
   }

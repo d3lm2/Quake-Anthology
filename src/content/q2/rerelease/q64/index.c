@@ -22,8 +22,7 @@ static double turn_q(double current, double ideal, double speed) {
   double move = ideal - current;
   if (ideal > current && move >= 180) move -= 360;
   else if (ideal <= current && move <= -180) move += 360;
-  double clamped = move < -speed ? -speed : move > speed ? speed : move;
-  return anglemod_q(current + clamped);
+  return anglemod_q(current + qa_js_max(-speed, qa_js_min(speed, move))); /* a negative speed makes the max win */
 }
 static qa_q2rr_eye_state *eye_get(qa_q2_rerelease_q64 *q, qa_actor_id a) {
   for (size_t i = 0; i < q->eye_count; i++) if (qa_same_actor(q->eyes[i].actor, a)) return &q->eyes[i].state;
@@ -119,8 +118,11 @@ static void eye_setup(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
 }
 static void eye_think(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_rerelease_q64 *q = c;
-  qa_q2rr_eye_state *st = eye_get(q, e->actor.id);
-  if (!st) qa_q2rr_error("func_eye source state missing");
+  qa_q2rr_eye_state *found = eye_get(q, e->actor.id);
+  if (!found) qa_q2rr_error("func_eye source state missing");
+  /* By value: TS holds the state object, and the targets fired below can release
+   * another eye, which moves the entries of the eyes array. Nothing is written back. */
+  qa_q2rr_eye_state state = *found, *st = &state;
   qa_body_state body = rr_body_of(g, e);
   bool has_closest = false; qa_actor_id closest = {0}; double closest_dist = INFINITY;
   size_t pn = 0; const qa_actor_id *pls = g->host->players(g->host->ctx, &pn);
@@ -156,7 +158,7 @@ static qa_vec3 look_at(qa_q2_entity *e, qa_q2_game_services *g, qa_vec3 origin, 
   size_t n = 0; qa_q2_entity *const *targets = g->targets(g->ctx, pt ? pt : "", &n);
   if (n == 0) return previous;
   qa_vec3 delta = qa_q2_subtract(rr_body_of(g, targets[0]).origin, origin);
-  double planar = hypot(delta.x, delta.y);
+  double planar = qa_js_hypot2(delta.x, delta.y);
   return rr_v3(planar == 0 ? (delta.z > 0 ? -90 : 90) : -atan2(delta.z, planar) * 180 / 3.141592653589793,
                planar == 0 ? 0 : atan2(delta.y, delta.x) * 180 / 3.141592653589793, 0);
 }
@@ -219,9 +221,18 @@ static void camera_think(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
       if (dummy) g->remove(g->ctx, dummy);
       qa_q2_players_set_intermission(q->players->base, (qa_q2_intermission){.kind = "playing"});
       q->players->intermission_camera_set = true;
-      size_t n = 0; qa_q2_entity *const *dests = g->targets(g->ctx, e->killtarget, &n);
+      /* TS iterates the array targets() returned; the host reuses one result buffer and
+       * a use callback can look up targets again, so the loop walks a copy. */
+      size_t n = 0; qa_q2_entity *const *found = g->targets(g->ctx, e->killtarget, &n);
+      qa_q2_entity **dests = n ? malloc(n * sizeof *dests) : NULL;
+      if (n && !dests) qa_range_error("Out of memory");
+      if (n) memcpy(dests, found, n * sizeof *dests);
+      qa_cleanup guard;
+      qa_cleanup_push(&guard, free, dests);
       for (size_t i = 0; i < n; i++) if (dests[i]->use.fn)
         dests[i]->use.fn(dests[i]->use.ctx, dests[i], g, &e->actor.id, e->has_activator ? &e->activator : NULL);
+      qa_cleanup_pop(&guard);
+      free(dests);
       qa_q2_rerelease_players_finish_camera(q->players, g);
     }
     g->cancel(g->ctx, e); return;
@@ -242,7 +253,7 @@ static void camera_think(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
     qa_q2_entity *next = (target->target && target->target[0]) ? g->pick_target(g->ctx, target->target) : NULL;
     e->has_goal = next != NULL; if (next) e->goal = next->actor.id;
     if (next) {
-      st->speed = next->speed != 0 ? next->speed : 55;
+      st->speed = rr_or(next->speed, 55);
       qa_vec3 a2 = rr_body_of(g, next).origin;
       qa_vec3 b2 = rr_body_of(g, e).origin;
       st->distance = st->remaining = qa_q2_length(qa_q2_subtract(a2, b2));
@@ -261,7 +272,7 @@ static void camera_think(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
     if (ds && ds->fading) {
       qa_q2_rerelease_event ev; memset(&ev, 0, sizeof ev);
       ev.kind = "alpha"; ev.has_actor = true; ev.actor = dummy->actor.id;
-      ev.alpha = fraction > 1.0 / 255 ? fraction : 1.0 / 255;
+      ev.alpha = qa_js_max(1.0 / 255, fraction);
       rr_emit_rr(&q->hooks, ev);
     }
   }
@@ -280,11 +291,11 @@ static void dummy_think(void *c, qa_q2_entity *e, qa_q2_game_services *g) {
   qa_q2_rerelease_client_animation(&ctx, qa_q2_rerelease_players_get_extra(q->players, source->actor.id));
   g->show(g->ctx, e);
   if (st->fading) {
-    st->fade_remaining = st->fade_remaining - 0.1 > 0 ? st->fade_remaining - 0.1 : 0;
+    st->fade_remaining = qa_js_max(0, st->fade_remaining - 0.1);
     double a = st->fade_duration == 0 ? 0 : st->fade_remaining / st->fade_duration;
     qa_q2_rerelease_event ev; memset(&ev, 0, sizeof ev);
     ev.kind = "alpha"; ev.has_actor = true; ev.actor = e->actor.id;
-    ev.alpha = a > 1.0 / 255 ? a : 1.0 / 255;
+    ev.alpha = qa_js_max(1.0 / 255, a);
     rr_emit_rr(&q->hooks, ev);
   }
   g->schedule(g->ctx, e, 0.1, q->dummy_think);
@@ -312,19 +323,19 @@ bool qa_q2_rerelease_q64_spawn(qa_q2_rerelease_q64 *q, qa_q2_entity *e, qa_q2_ga
   if (strcmp(cn, "func_eye") != 0 && strcmp(cn, "func_spinning") != 0) return false;
   g->solid(g->ctx, e, "brush"); g->motion(g->ctx, e, "push");
   if (strcmp(cn, "func_spinning") == 0) {
-    if (e->speed == 0) e->speed = 100;
-    if (e->damage == 0) e->damage = 2;
+    e->speed = rr_or(e->speed, 100);
+    e->damage = rr_or(e->damage, 2);
     e->timestamp = 0;
     g->schedule(g->ctx, e, rr_frame(g), q->spinning_think);
   } else {
     double rad = qa_q2_number_field(&e->spawn, "radius", 0);
-    e->damage_radius = rad != 0 ? rad : 512;
-    e->speed = (e->speed != 0 ? e->speed : 45) * rr_frame(g);
+    e->damage_radius = rr_or(rad, 512);
+    e->speed = rr_or(e->speed, 45) * rr_frame(g);
     e->wait = 1;
     double vc = qa_q2_number_field(&e->spawn, "vision_cone", 0);
     qa_vec3 neutral_angles2 = rr_body_of(g, e).angles;
     qa_vec3 eye_position2 = qa_q2_vector_field(&e->spawn, "eye_position");
-    qa_q2rr_eye_state st = {neutral_angles2, eye_position2, vc != 0 ? vc : 0.5};
+    qa_q2rr_eye_state st = {neutral_angles2, eye_position2, rr_or(vc, 0.5)};
     eye_set(q, e->actor.id, st);
     const char *pt = qa_q2_spawn_get(&e->spawn, "pathtarget");
     if (pt && pt[0]) g->schedule(g->ctx, e, 0.1, q->eye_setup);

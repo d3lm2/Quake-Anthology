@@ -97,6 +97,7 @@ struct qa_app_application_input {
   bool has_external_routing; qa_command_cvar_routing external_routing;
   qa_command_buffer *commands;
   bool archive_persistence;
+  bool bindings_local; /* TS bindingsLocal: the in-game binding menu keeps edits to this game */
 
   input_local **locals; size_t local_count, local_capacity;
   input_local **all_locals; size_t all_local_count, all_local_capacity; /* every record built */

@@ -71,7 +71,7 @@ static size_t campaign_entries(const qa_save_image *image, const qa_provider_che
     if (!match && entry->schema && qa_campaign_unit_checkpoint.schema && strcmp(entry->schema, qa_campaign_unit_checkpoint.schema) == 0) match = true;
     if (match) { if (!*out_first) *out_first = entry; count++; }
   }
-  if (count > 1) qa_range_error("Duplicate campaign unit checkpoint");
+  if (count > 1) qa_raise("Error", 0, 0, "Duplicate campaign unit checkpoint");
   if (*out_first) qa_validate_save_provider_owner(**out_first, image->recipe.map.entities.provider);
   return count;
 }
@@ -85,6 +85,12 @@ static void worlds_set(worlds_t *worlds, char *key, uint8_t *bytes, size_t lengt
     if (strcmp(worlds->rows[i].key, key) == 0) { free(worlds->rows[i].bytes); worlds->rows[i].bytes = bytes; worlds->rows[i].length = length; free(key); return; }
   if (worlds->count == worlds->cap) { worlds->cap = worlds->cap ? worlds->cap * 2 : 8; worlds->rows = realloc(worlds->rows, worlds->cap * sizeof *worlds->rows); }
   worlds->rows[worlds->count++] = (world_row){key, bytes, length};
+}
+static void worlds_free_node(void *arg) { worlds_free(arg); }
+static void free_row_node(void *arg) {
+  world_row *row = arg;
+  free(row->key);
+  free(row->bytes);
 }
 static world_row *worlds_take(worlds_t *worlds, const char *key, world_row *out) {
   for (size_t i = 0; i < worlds->count; i++)
@@ -160,12 +166,17 @@ qa_app_campaign_unit_visit *qa_app_campaign_unit_stage(qa_app_campaign_unit *uni
   }
   bool reset = new_unit || (unit->has_current && strcmp(unit->current_content, destination.content) != 0);
   worlds_t worlds = reset ? (worlds_t){0} : worlds_copy(&unit->worlds);
+  qa_cleanup worlds_cleanup;
+  qa_cleanup_push(&worlds_cleanup, worlds_free_node, &worlds);
   if (!reset && departure) {
     qa_provider_checkpoint *filtered = NULL;
     qa_save_image world = world_only_image(departure, &filtered);
     qa_app_resource_request from = location_of(departure);
     uint8_t *bytes = NULL; size_t length = 0;
+    qa_cleanup filtered_cleanup;
+    qa_cleanup_push(&filtered_cleanup, free, filtered);
     unit->codec.encode(unit->codec.ctx, &world, &bytes, &length);
+    qa_cleanup_pop(&filtered_cleanup);
     free(filtered);
     worlds_set(&worlds, map_key(from.content, from.path), bytes, length);
   }
@@ -173,11 +184,17 @@ qa_app_campaign_unit_visit *qa_app_campaign_unit_stage(qa_app_campaign_unit *uni
   world_row saved;
   const qa_save_image *restore = NULL;
   if (worlds_take(&worlds, dest_key, &saved)) {
+    free(dest_key);
+    dest_key = NULL;
+    qa_cleanup saved_cleanup;
+    qa_cleanup_push(&saved_cleanup, free_row_node, &saved);
     restore = unit->codec.decode(unit->codec.ctx, saved.bytes, saved.length);
+    qa_cleanup_pop(&saved_cleanup);
     free(saved.key);
     free(saved.bytes);
   }
   free(dest_key);
+  qa_cleanup_pop(&worlds_cleanup);
   qa_app_campaign_unit_visit *visit = calloc(1, sizeof *visit);
   visit->unit = unit;
   visit->revision = unit->revision;
@@ -197,7 +214,7 @@ void qa_app_campaign_unit_visit_destroy(qa_app_campaign_unit_visit *visit) {
 }
 void qa_app_campaign_unit_visit_commit(qa_app_campaign_unit_visit *visit) {
   qa_app_campaign_unit *unit = visit->unit;
-  if (visit->revision != unit->revision) qa_range_error("Campaign visit was superseded");
+  if (visit->revision != unit->revision) qa_raise("Error", 0, 0, "Campaign visit was superseded");
   free(unit->current_content);
   free(unit->current_path);
   unit->current_content = dup(visit->destination_content);
@@ -247,74 +264,130 @@ qa_provider_checkpoint qa_app_campaign_unit_attach(qa_app_campaign_unit *unit, c
     qa_raise("Error", 0, 0, "Campaign save does not match the active map");
   return qa_app_campaign_unit_checkpoint(unit, true, current, out_bytes, out_length);
 }
+/* Everything restore() owns while it can raise (a save file is untrusted input). */
+typedef struct restore_state {
+  qa_save_value *value;
+  char *current_content, *current_path;
+  char **maps;
+  uint8_t **bytes;
+  size_t *lengths;
+  size_t entry_count;
+  worlds_t worlds;
+} restore_state;
+static void restore_state_free(void *arg) {
+  restore_state *state = arg;
+  if (state->value != NULL) qa_save_value_free(state->value);
+  free(state->current_content);
+  free(state->current_path);
+  for (size_t i = 0; i < state->entry_count; i++) {
+    free(state->maps[i]);
+    free(state->bytes[i]);
+  }
+  free(state->maps);
+  free(state->bytes);
+  free(state->lengths);
+  worlds_free(&state->worlds);
+  *state = (restore_state){0};
+}
+static char *checked_dup(const char *text) {
+  char *copy = dup(text);
+  if (copy == NULL) qa_range_error("Out of memory");
+  return copy;
+}
 void qa_app_campaign_unit_restore(qa_app_campaign_unit *unit, const qa_save_image *image) {
   const qa_provider_checkpoint *checkpoint;
   campaign_entries(image, &checkpoint);
   qa_app_resource_request here = location_of(image);
-  char *current_content = dup(here.content), *current_path = dup(here.path);
-  worlds_t worlds = {0};
+  restore_state state = {0};
+  qa_cleanup cleanup;
+  qa_cleanup_push(&cleanup, restore_state_free, &state);
+  state.current_content = checked_dup(here.content);
+  state.current_path = checked_dup(here.path);
   if (checkpoint) {
-    qa_save_value *value = qa_decode_checkpoint_value(checkpoint->bytes.bytes, checkpoint->bytes.length);
+    state.value = qa_decode_checkpoint_value(checkpoint->bytes.bytes, checkpoint->bytes.length);
     qa_save_reader reader, current_reader;
-    qa_save_reader_init(&reader, value, "campaign-unit");
+    qa_save_reader_init(&reader, state.value, "campaign-unit");
     qa_save_reader_field(&reader, "current", &current_reader);
     bool is_null = qa_save_reader_is_null(&current_reader);
-    char *content = NULL, *path = NULL;
+    free(state.current_content);
+    free(state.current_path);
+    state.current_content = NULL;
+    state.current_path = NULL;
     if (!is_null) {
       qa_save_reader content_reader, path_reader;
       qa_save_reader_field(&current_reader, "content", &content_reader);
-      content = dup(qa_save_reader_string(&content_reader));
+      state.current_content = checked_dup(qa_save_reader_string(&content_reader));
       qa_save_reader_destroy(&content_reader);
-      if (!qa_is_content_id(content)) qa_range_error("Invalid campaign content identity");
+      if (!qa_is_content_id(state.current_content)) qa_raise("Error", 0, 0, "Invalid campaign content identity");
       qa_save_reader_field(&current_reader, "path", &path_reader);
-      path = dup(qa_save_reader_string(&path_reader));
+      state.current_path = checked_dup(qa_save_reader_string(&path_reader));
       qa_save_reader_destroy(&path_reader);
     }
     qa_save_reader_destroy(&current_reader);
-    if (!content || !keys_equal(content, path, here.content, here.path))
-      qa_range_error("Campaign checkpoint active map does not match its world");
-    free(current_content); free(current_path);
-    current_content = content; current_path = path;
+    if (state.current_content == NULL || !keys_equal(state.current_content, state.current_path, here.content, here.path))
+      qa_raise("Error", 0, 0, "Campaign checkpoint active map does not match its world");
+    /* reader.field("worlds").list(...) reads every entry before any world is decoded. */
     qa_save_reader list_reader;
     qa_save_reader_field(&reader, "worlds", &list_reader);
     size_t count = qa_save_reader_list_count(&list_reader);
+    state.maps = calloc(count ? count : 1, sizeof *state.maps);
+    state.bytes = calloc(count ? count : 1, sizeof *state.bytes);
+    state.lengths = calloc(count ? count : 1, sizeof *state.lengths);
+    if (!state.maps || !state.bytes || !state.lengths) qa_range_error("Out of memory");
     for (size_t i = 0; i < count; i++) {
       qa_save_reader item, map_reader, bytes_reader;
       qa_save_reader_item(&list_reader, i, &item);
       qa_save_reader_field(&item, "map", &map_reader);
-      char *map = dup(qa_save_reader_string(&map_reader));
+      state.maps[i] = checked_dup(qa_save_reader_string(&map_reader));
+      state.entry_count = i + 1;
       qa_save_reader_destroy(&map_reader);
       qa_save_reader_field(&item, "bytes", &bytes_reader);
       size_t length = 0;
       const uint8_t *data = qa_save_reader_bytes(&bytes_reader, &length);
-      uint8_t *bytes = malloc(length ? length : 1);
-      memcpy(bytes, data, length);
+      state.bytes[i] = malloc(length ? length : 1);
+      if (state.bytes[i] == NULL) qa_range_error("Out of memory");
+      memcpy(state.bytes[i], data, length);
+      state.lengths[i] = length;
       qa_save_reader_destroy(&bytes_reader);
       qa_save_reader_destroy(&item);
-      const qa_save_image *saved = unit->codec.decode(unit->codec.ctx, bytes, length);
-      qa_app_resource_request saved_location = location_of(saved);
-      char *saved_key = map_key(saved_location.content, saved_location.path);
-      char *current_key = map_key(current_content, current_path);
-      bool duplicate = false;
-      for (size_t j = 0; j < worlds.count; j++) if (strcmp(worlds.rows[j].key, map) == 0) duplicate = true;
-      const qa_provider_checkpoint *nested;
-      size_t nested_count = campaign_entries(saved, &nested);
-      bool invalid = strcmp(map, saved_key) != 0 || strcmp(saved_location.content, current_content) != 0 ||
-          strcmp(map, current_key) == 0 || duplicate || nested_count != 0;
-      free(saved_key); free(current_key);
-      if (invalid) qa_range_error("Invalid campaign unit world checkpoint");
-      worlds_set(&worlds, map, bytes, length);
     }
     qa_save_reader_destroy(&list_reader);
     qa_save_reader_destroy(&reader);
-    qa_save_value_free(value);
+    for (size_t i = 0; i < count; i++) {
+      const char *map = state.maps[i];
+      const qa_save_image *saved = unit->codec.decode(unit->codec.ctx, state.bytes[i], state.lengths[i]);
+      qa_app_resource_request saved_location = location_of(saved);
+      char *saved_key = map_key(saved_location.content, saved_location.path);
+      char *current_key = map_key(state.current_content, state.current_path);
+      bool duplicate = false;
+      for (size_t j = 0; j < state.worlds.count; j++) if (strcmp(state.worlds.rows[j].key, map) == 0) duplicate = true;
+      bool invalid = strcmp(map, saved_key) != 0 || strcmp(saved_location.content, state.current_content) != 0 ||
+          strcmp(map, current_key) == 0 || duplicate;
+      free(saved_key);
+      free(current_key);
+      /* `|| campaignEntries(saved).length !== 0`: evaluated (and able to throw) only when the rest held. */
+      if (!invalid) {
+        const qa_provider_checkpoint *nested;
+        invalid = campaign_entries(saved, &nested) != 0;
+      }
+      if (invalid) qa_raise("Error", 0, 0, "Invalid campaign unit world checkpoint");
+      /* worlds.set(entry.map, entry.bytes.slice()): the row takes this entry's copies. */
+      worlds_set(&state.worlds, state.maps[i], state.bytes[i], state.lengths[i]);
+      state.maps[i] = NULL;
+      state.bytes[i] = NULL;
+    }
   }
+  qa_cleanup_pop(&cleanup);
   free(unit->current_content);
   free(unit->current_path);
-  unit->current_content = current_content;
-  unit->current_path = current_path;
+  unit->current_content = state.current_content;
+  unit->current_path = state.current_path;
   unit->has_current = true;
   worlds_free(&unit->worlds);
-  unit->worlds = worlds;
+  unit->worlds = state.worlds;
   unit->revision++;
+  state.current_content = NULL;
+  state.current_path = NULL;
+  state.worlds = (worlds_t){0};
+  restore_state_free(&state);
 }

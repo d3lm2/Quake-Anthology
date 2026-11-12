@@ -34,7 +34,17 @@ typedef struct ctx {
   qa_common_parse_state *parser;
   qa_q3_animation_warning *warnings; size_t count, cap;
   const char *source;
+  /* Owned text and the cursor, released when a raise unwinds (TS: garbage collected). */
+  qa_common_parse_cursor *cursor; char *held[2];
 } ctx;
+static void hold(ctx *c,int slot,char *text){ c->held[slot]=text; }
+static void drop(ctx *c,int slot){ free(c->held[slot]); c->held[slot]=NULL; }
+static void unwind(void *arg){
+  ctx *c=arg; drop(c,0); drop(c,1);
+  for(size_t i=0;i<c->count;i++) free(c->warnings[i].message);
+  free(c->warnings); c->warnings=NULL; c->count=c->cap=0;
+  if(c->cursor){ qa_common_parse_cursor_destroy(c->cursor); c->cursor=NULL; }
+}
 /* TS print(): %s substitution, 1024-byte buffer check on message length. */
 static char *print_fmt(ctx *c, const char *format, const char *a, const char *b){
   char buf[4096]; const char *args[2]={a?a:"",b?b:""}; size_t ai=0,o=0;
@@ -49,7 +59,7 @@ static char *print_fmt(ctx *c, const char *format, const char *a, const char *b)
 }
 static void warn_fmt(ctx *c, const char *format, const char *a, const char *b){
   char *m=print_fmt(c,format,a,b);
-  if(c->count==c->cap){ c->cap=c->cap?c->cap*2:8; c->warnings=realloc(c->warnings,c->cap*sizeof *c->warnings); if(!c->warnings) qa_range_error("out of memory"); }
+  if(c->count==c->cap){ c->cap=c->cap?c->cap*2:8; c->warnings=realloc(c->warnings,c->cap*sizeof *c->warnings); if(!c->warnings){ free(m); qa_range_error("out of memory"); } }
   c->warnings[c->count++]=(qa_q3_animation_warning){(double)((c->parser->line+1)|0),1,m};
 }
 static qa_q3_animation *cell(qa_q3_player_animation_target *t, int index){
@@ -66,20 +76,22 @@ void qa_q3_parse_player_animation_config(const char *text, const char *source,
   qa_q3_player_animation_target *target=(context&&context->target)?context->target:&owned;
   qa_common_parse_state owned_parser; qa_common_parse_state_init(&owned_parser);
   qa_common_parse_state *parser=(context&&context->parser)?context->parser:&owned_parser;
-  ctx c={context,parser,NULL,0,0,source};
+  ctx c={context,parser,NULL,0,0,source,NULL,{NULL,NULL}};
   size_t length=strlen(text);
   if(length==0) qa_text_parse_error(source,1,1,"empty animation file");
-  if(length>19998){ char *m=print_fmt(&c,"File %s too long\n",source,NULL); const char *mm=m; qa_text_parse_error(source,1,1,"%s",mm); }
+  qa_cleanup owned_node; qa_cleanup_push(&owned_node,unwind,&c);
+  if(length>19998){ char *m=print_fmt(&c,"File %s too long\n",source,NULL); hold(&c,0,m); qa_text_parse_error(source,1,1,"%s",m); }
   qa_common_parse_cursor cursor;
   if(!qa_common_parse_cursor_init(&cursor,text,length,false)) qa_range_error("out of memory");
+  c.cursor=&cursor;
   target->footsteps=QA_Q3_FOOTSTEPS_NORMAL; target->head_offset=(qa_vec3){0,0,0};
   target->gender=QA_Q3_GENDER_MALE; target->fixed_legs=false; target->fixed_torso=false;
   for(;;){
     bool prev_has=cursor.has_offset; size_t previous=cursor.offset;
-    char *token=xstrdup(qa_common_parse_state_parse(parser,&cursor,true));
+    char *token=xstrdup(qa_common_parse_state_parse(parser,&cursor,true)); hold(&c,0,token);
     char directive[1100]; lower_into(directive,sizeof directive,token);
     if(strcmp(directive,"footsteps")==0){
-      char *value=xstrdup(qa_common_parse_state_parse(parser,&cursor,true));
+      char *value=xstrdup(qa_common_parse_state_parse(parser,&cursor,true)); hold(&c,1,value);
       char low[1100]; lower_into(low,sizeof low,value);
       if(!strcmp(low,"default")||!strcmp(low,"normal")) target->footsteps=QA_Q3_FOOTSTEPS_NORMAL;
       else if(!strcmp(low,"boot")) target->footsteps=QA_Q3_FOOTSTEPS_BOOT;
@@ -87,11 +99,13 @@ void qa_q3_parse_player_animation_config(const char *text, const char *source,
       else if(!strcmp(low,"mech")) target->footsteps=QA_Q3_FOOTSTEPS_MECH;
       else if(!strcmp(low,"energy")) target->footsteps=QA_Q3_FOOTSTEPS_ENERGY;
       else warn_fmt(&c,"Bad footsteps parm in %s: %s\n",source,value);
-      free(value);
+      drop(&c,1);
     } else if(strcmp(directive,"headoffset")==0){
-      double vals[3];
-      for(int k=0;k<3;k++){ char *v=xstrdup(qa_common_parse_state_parse(parser,&cursor,true)); vals[k]=qa_game_atof(v); free(v); }
-      target->head_offset=(qa_vec3){vals[0],vals[1],vals[2]};
+      /* TS stores each component as it is parsed. */
+      for(int k=0;k<3;k++){
+        double value=qa_game_atof(qa_common_parse_state_parse(parser,&cursor,true));
+        if(k==0) target->head_offset.x=value; else if(k==1) target->head_offset.y=value; else target->head_offset.z=value;
+      }
     } else if(strcmp(directive,"sex")==0){
       char *v=xstrdup(qa_common_parse_state_parse(parser,&cursor,true));
       char first=v[0]?(char)tolower((unsigned char)v[0]):'\0';
@@ -101,18 +115,18 @@ void qa_q3_parse_player_animation_config(const char *text, const char *source,
     else if(strcmp(directive,"fixedtorso")==0){ target->fixed_torso=true; }
     else {
       char first=token[0];
-      if(first>='0'&&first<='9'){ if(prev_has) qa_common_parse_cursor_set_offset(&cursor,previous); else qa_common_parse_cursor_set_null(&cursor); free(token); break; }
+      if(first>='0'&&first<='9'){ if(prev_has) qa_common_parse_cursor_set_offset(&cursor,previous); else qa_common_parse_cursor_set_null(&cursor); drop(&c,0); break; }
       warn_fmt(&c,"unknown token '%s' is %s\n",token,source);
-      if(prev_has==cursor.has_offset&&previous==cursor.offset){ free(token); qa_common_parse_cursor_destroy(&cursor); qa_text_parse_error(source,(parser->line+1)|0,1,"animation prelude reached the source nonprogress cycle"); }
+      if(prev_has==cursor.has_offset&&previous==cursor.offset) qa_text_parse_error(source,(parser->line+1)|0,1,"animation prelude reached the source nonprogress cycle");
     }
-    free(token);
+    drop(&c,0);
   }
   int32_t skip=0; int index=0;
   for(;index<QA_Q3_SOURCE_ANIMATION_COUNT;index++){
-    char *first_token=xstrdup(qa_common_parse_state_parse(parser,&cursor,true));
+    char *first_token=xstrdup(qa_common_parse_state_parse(parser,&cursor,true)); hold(&c,0,first_token);
     qa_q3_animation *animation=cell(target,index);
     if(first_token[0]=='\0'){
-      free(first_token);
+      drop(&c,0);
       if(index>=QA_Q3_ANIM_TORSO_GETFLAG&&index<=QA_Q3_ANIM_TORSO_NEGATIVE){
         qa_q3_animation *g=cell(target,QA_Q3_ANIM_TORSO_GESTURE);
         animation->first_frame=g->first_frame; animation->frame_lerp=g->frame_lerp;
@@ -122,14 +136,15 @@ void qa_q3_parse_player_animation_config(const char *text, const char *source,
       }
       break;
     }
-    animation->first_frame=qa_game_atoi(first_token); free(first_token);
-    if(index==QA_Q3_ANIM_LEGS_WALKCR) skip=(int32_t)(qa_js_to_int32(animation->first_frame)-qa_js_to_int32(cell(target,QA_Q3_ANIM_TORSO_GESTURE)->first_frame));
-    if(index>=QA_Q3_ANIM_LEGS_WALKCR&&index<QA_Q3_ANIM_TORSO_GETFLAG) animation->first_frame=(double)(int32_t)(qa_js_to_int32(animation->first_frame)-skip);
+    animation->first_frame=qa_game_atoi(first_token); drop(&c,0);
+    /* TS `(a - b) | 0`: subtract as numbers, then ToInt32 (an int32 subtraction can overflow). */
+    if(index==QA_Q3_ANIM_LEGS_WALKCR) skip=qa_js_to_int32(animation->first_frame-cell(target,QA_Q3_ANIM_TORSO_GESTURE)->first_frame);
+    if(index>=QA_Q3_ANIM_LEGS_WALKCR&&index<QA_Q3_ANIM_TORSO_GETFLAG) animation->first_frame=(double)qa_js_to_int32(animation->first_frame-(double)skip);
     char *count_token=xstrdup(qa_common_parse_state_parse(parser,&cursor,true));
     if(count_token[0]=='\0'){ free(count_token); break; }
     animation->num_frames=qa_game_atoi(count_token); free(count_token);
     animation->reversed=false; animation->flipflop=false;
-    if(animation->num_frames<0){ animation->num_frames=(double)(int32_t)(-qa_js_to_int32(animation->num_frames)); animation->reversed=true; }
+    if(animation->num_frames<0){ animation->num_frames=(double)qa_js_to_int32(-animation->num_frames); animation->reversed=true; }
     char *loop_token=xstrdup(qa_common_parse_state_parse(parser,&cursor,true));
     if(loop_token[0]=='\0'){ free(loop_token); break; }
     animation->loop_frames=qa_game_atoi(loop_token); free(loop_token);
@@ -140,11 +155,12 @@ void qa_q3_parse_player_animation_config(const char *text, const char *source,
     animation->frame_lerp=qa_qvm_float_to_int((float)(1000.0/fps));
     animation->initial_lerp=qa_qvm_float_to_int((float)(1000.0/fps));
   }
-  qa_common_parse_cursor_destroy(&cursor);
+  qa_common_parse_cursor_destroy(&cursor); c.cursor=NULL;
   if(index!=QA_Q3_SOURCE_ANIMATION_COUNT){
-    char *m=print_fmt(&c,"Error parsing animation file: %s",source,NULL);
+    char *m=print_fmt(&c,"Error parsing animation file: %s",source,NULL); hold(&c,0,m);
     qa_text_parse_error(source,(parser->line+1)|0,1,"%s",m);
   }
+  qa_cleanup_pop(&owned_node);
   /* Object.assign copies (flipflop retained from source cell for back*, as TS). */
   qa_q3_animation *backcr=cell(target,QA_Q3_ANIM_LEGS_BACKCR); *backcr=*cell(target,QA_Q3_ANIM_LEGS_WALKCR); backcr->reversed=true;
   qa_q3_animation *backwalk=cell(target,QA_Q3_ANIM_LEGS_BACKWALK); *backwalk=*cell(target,QA_Q3_ANIM_LEGS_WALK); backwalk->reversed=true;

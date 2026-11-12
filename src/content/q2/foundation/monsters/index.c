@@ -214,12 +214,38 @@ static const qa_monster_mission *lookup_mission(void *ctx, qa_actor_id actor) {
   qa_q2m_monsters *m = ctx;
   return m->hooks.mission ? m->hooks.mission(m->hooks.ctx, actor) : NULL;
 }
+static void free_entry(qa_q2m_actor_entry *entry) {
+  free(entry->state);
+  free(entry);
+}
+/* TS keeps a context object and its state alive for as long as running code
+ * holds them: die() reads state.gibbed after a death that removed the entity,
+ * moveFrame reads state.nextMove after a move-end callback did, endFrame walks
+ * a snapshot of contexts. The entry leaves the map now and is freed later. */
+static void retire_entry(qa_q2m_monsters *m, qa_q2m_actor_entry *entry) {
+  if (!grow((void **)&m->retired, &m->retired_cap, m->retired_count, sizeof *m->retired)) abort();
+  m->retired[m->retired_count++] = entry;
+}
+/* Frees the retired entries; one whose attack storage a live entity still
+ * shows as its lastAttack is kept (TS keeps that attack object). */
+static void flush_retired(qa_q2m_monsters *m, qa_q2_game_services *game) {
+  size_t kept = 0;
+  for (size_t i = 0; i < m->retired_count; i++) {
+    qa_q2m_actor_entry *entry = m->retired[i];
+    qa_q2_entity *entity = game != NULL && q2m_live(game, entry->actor) ? game->entity(game->ctx, &entry->actor) : NULL;
+    if (entity != NULL && entity->last_attack == &entry->last_attack) { m->retired[kept++] = entry; continue; }
+    free_entry(entry);
+  }
+  m->retired_count = kept;
+}
 static void remove_entry(qa_q2m_monsters *m, qa_actor_id actor) {
   for (size_t i = 0; i < m->entry_count; i++)
     if (qa_same_actor(m->entries[i]->actor, actor)) {
-      free(m->entries[i]->state);
-      free(m->entries[i]);
-      m->entries[i] = m->entries[--m->entry_count];
+      qa_q2m_actor_entry *entry = m->entries[i];
+      /* TS contexts.delete: the Map keeps the order of the rest (capture lists it). */
+      memmove(&m->entries[i], &m->entries[i + 1], (m->entry_count - i - 1) * sizeof *m->entries);
+      m->entry_count--;
+      retire_entry(m, entry);
       return;
     }
 }
@@ -232,7 +258,8 @@ static void pending_delete(qa_q2m_monsters *m, qa_actor_id actor) {
   for (size_t i = 0; i < m->pending_count; i++)
     if (qa_same_actor(m->pending[i]->actor, actor)) {
       free(m->pending[i]);
-      m->pending[i] = m->pending[--m->pending_count];
+      memmove(&m->pending[i], &m->pending[i + 1], (m->pending_count - i - 1) * sizeof *m->pending);
+      m->pending_count--;
       return;
     }
 }
@@ -253,8 +280,10 @@ bool qa_q2m_monsters_init(qa_q2m_monsters *m, qa_q2m_weapons weapons, qa_q2m_mon
 void qa_q2m_monsters_destroy(qa_q2m_monsters *m) {
   /* C ownership: stop the registry calling into freed monsters. */
   if (m->connected) qa_session_actor_registry_off_release(m->release_registry, m->release_subscription);
-  for (size_t i = 0; i < m->entry_count; i++) { free(m->entries[i]->state); free(m->entries[i]); }
+  for (size_t i = 0; i < m->entry_count; i++) free_entry(m->entries[i]);
   free(m->entries);
+  for (size_t i = 0; i < m->retired_count; i++) free_entry(m->retired[i]);
+  free(m->retired);
   for (size_t i = 0; i < m->pending_count; i++) free(m->pending[i]);
   free(m->pending);
   free(m->definitions);
@@ -320,6 +349,8 @@ void qa_q2m_monsters_hunt_target(qa_q2m_monsters *m, qa_q2m_context *context) {
   qa_q2m_perception_hunt_target(&m->perception, context);
 }
 void qa_q2m_monsters_begin_frame(qa_q2m_monsters *m, qa_q2_game_services *game) {
+  /* No monster code is running here, so nothing holds a retired context. */
+  flush_retired(m, game);
   qa_q2m_perception_begin_frame(&m->perception, game);
 }
 void qa_q2m_monsters_report_noise(qa_q2m_monsters *m, qa_actor_id actor, qa_vec3 origin, bool secondary) {
@@ -373,8 +404,9 @@ static void mth_set_move(void *impl, qa_q2m_context *c, const char *name, bool h
   if (!has_immediate) immediate = true;
   const qa_q2m_definition *d = entry_of_context(c)->definition;
   const qa_q2m_move *move = NULL;
+  /* TS looks the name up in new Map(moves.map(move => [move.name, move])): the last move of a name wins. */
   for (size_t i = 0; i < d->move_count; i++)
-    if (strcmp(d->moves[i].name, name) == 0) { move = &d->moves[i]; break; }
+    if (strcmp(d->moves[i].name, name) == 0) move = &d->moves[i];
   if (!move) qa_raise("Error", 0, 0, "%s: unknown source animation %s", c->entity->classname, name);
   if (q2m_rr(c->game) && !immediate) c->state->next_move = move;
   else { c->state->move = move; c->state->next_move = NULL; }
@@ -448,8 +480,7 @@ static bool mth_move_to_goal(void *impl, qa_q2m_context *c, double distance) {
 }
 static void mth_dodge(void *impl, qa_q2m_context *c, qa_actor_id attacker, double eta,
                       const qa_trace_result *trace, bool has_gravity, bool gravity) {
-  (void)has_gravity;
-  qa_q2m_monsters_dodge(impl, c->entity, c->game, attacker, eta, trace, gravity);
+  qa_q2m_monsters_dodge(impl, c->entity, c->game, attacker, eta, trace, has_gravity ? gravity : false); /* TS gravity = false */
 }
 static bool monsters_blocked(qa_q2m_monsters *m, qa_q2m_context *c, double distance);
 static bool mth_blocked(void *impl, qa_q2m_context *c, double distance) {
@@ -494,8 +525,21 @@ static qa_q2m_context *attach_context(qa_q2m_monsters *m, qa_q2_entity *entity, 
   c->blocked = mth_blocked;
   c->platform_state = mth_platform_state;
   c->idle = mth_idle; c->search = mth_search;
-  /* Replace any existing entry for this actor (respawn). */
-  remove_entry(m, entity->actor.id);
+  /* TS contexts.set: an actor that already has a context (respawn) keeps its place in the map. */
+  for (size_t i = 0; i < m->entry_count; i++) {
+    qa_q2m_actor_entry *old = m->entries[i];
+    if (!qa_same_actor(old->actor, entity->actor.id)) continue;
+    entry->has_last_attack = old->has_last_attack;
+    entry->last_attack = old->last_attack;
+    entry->last_attack_attacker = old->last_attack_attacker;
+    entry->last_attack_inflictor = old->last_attack_inflictor;
+    if (entry->last_attack.attacker == &old->last_attack_attacker) entry->last_attack.attacker = &entry->last_attack_attacker;
+    if (entry->last_attack.inflictor == &old->last_attack_inflictor) entry->last_attack.inflictor = &entry->last_attack_inflictor;
+    if (entity->last_attack == &old->last_attack) entity->last_attack = &entry->last_attack;
+    m->entries[i] = entry;
+    retire_entry(m, old);
+    return c;
+  }
   if (!grow((void **)&m->entries, &m->entry_cap, m->entry_count, sizeof *m->entries)) { free(entry); return NULL; }
   m->entries[m->entry_count++] = entry;
   return c;
@@ -572,11 +616,14 @@ static void src_use(void *ctx, qa_q2_entity *e, qa_q2_game_services *g, const qa
   const qa_monster_mission *mission = m->hooks.mission ? m->hooks.mission(m->hooks.ctx, e->actor.id) : NULL;
   if (mission && mission->use(mission->ctx, activator)) return;
   qa_q2m_context *c = require_context(m, e);
-  qa_q2_monster_target_result observed = activator ? g->monster_target(g->ctx, activator) : (qa_q2_monster_target_result){false, {0, false, false, false, 0, false, 0, false, 0}};
-  qa_q2m_context *activator_context = activator ? qa_q2m_monsters_context(m, *activator) : NULL;
-  if (e->has_enemy || c->state->dead || !activator || (observed.has_value && observed.value.notarget)
-      || (!g->host->is_player(g->host->ctx, *activator) && !(activator_context && activator_context->state->good_guy)))
-    return;
+  /* TS evaluates these left to right and stops at the first true one. */
+  if (e->has_enemy || c->state->dead || !activator) return;
+  qa_q2_monster_target_result observed = g->monster_target(g->ctx, activator);
+  if (observed.has_value && observed.value.notarget) return;
+  if (!g->host->is_player(g->host->ctx, *activator)) {
+    qa_q2m_context *activator_context = qa_q2m_monsters_context(m, *activator);
+    if (!(activator_context && activator_context->state->good_guy)) return;
+  }
   e->enemy = *activator; e->has_enemy = true;
   qa_q2m_perception_found_target(&m->perception, c);
 }
@@ -694,33 +741,29 @@ static void connect_monsters(qa_q2m_monsters *m, qa_q2_game_services *game) {
   qa_q2_source_callbacks_register(game->source_callbacks, qa_q2m_monsters_callbacks(m));
   qa_q2m_perception_bind(&m->perception, game);
 }
+/* TS `{ ...builtIn("monster_infantry", game), classname: "turret_driver", gibHealth: 0, viewHeight: 24 }`. */
+static const qa_q2m_definition *turret_driver_definition(qa_q2m_monsters *m, qa_q2_game_services *game) {
+  const qa_q2m_definition *infantry = built_in(m, "monster_infantry", game);
+  if (!infantry) return NULL;
+  for (size_t i = 0; i < m->builtin_count; i++) {
+    const qa_q2m_definition *d = &m->builtin_storage[i];
+    if (strcmp(d->classname, "turret_driver") == 0 && d->moves == infantry->moves) return d;
+  }
+  qa_q2m_definition *d = alloc_builtin(m);
+  if (!d) return NULL;
+  *d = *infantry; /* the builtin storage is preallocated and never moves */
+  d->classname = "turret_driver";
+  d->gib_health = 0;
+  d->has_view_height = true; d->view_height = 24;
+  return d;
+}
 const qa_q2m_definition *qa_q2m_monsters_definition(qa_q2m_monsters *m, const char *classname, qa_q2_game_services *game) {
   int edition = q2m_rr(game) ? 1 : 0;
   for (size_t i = 0; i < m->edition_counts[edition]; i++)
     if (strcmp(m->edition_definitions[edition][i]->classname, classname) == 0) return m->edition_definitions[edition][i];
   for (size_t i = 0; i < m->definition_count; i++)
     if (strcmp(m->definitions[i]->classname, classname) == 0) return m->definitions[i];
-  if (strcmp(classname, "turret_driver") == 0) {
-    const qa_q2m_definition *infantry = built_in(m, "monster_infantry", game);
-    if (!infantry) return NULL;
-    for (size_t i = 0; i < m->builtin_count; i++) {
-      const qa_q2m_definition *d = &m->builtin_storage[i];
-      if (strcmp(d->classname, "turret_driver") == 0 && d->moves == infantry->moves) return d;
-    }
-    qa_q2m_definition *d = alloc_builtin(m);
-    if (!d) return NULL;
-    /* Re-fetch infantry: alloc uses preallocated storage, stable. */
-    const qa_q2m_definition *inf = NULL;
-    for (size_t i = 0; i < m->builtin_count; i++)
-      if (strcmp(m->builtin_storage[i].classname, "monster_infantry") == 0 && m->builtin_storage[i].moves == infantry->moves)
-        inf = &m->builtin_storage[i];
-    if (!inf) return NULL;
-    *d = *inf;
-    d->classname = "turret_driver";
-    d->gib_health = 0;
-    d->has_view_height = true; d->view_height = 24;
-    return d;
-  }
+  if (strcmp(classname, "turret_driver") == 0) return turret_driver_definition(m, game);
   return built_in(m, classname, game);
 }
 void qa_q2m_monsters_register(qa_q2m_monsters *m, const qa_q2m_definition *definition, int edition) {
@@ -742,18 +785,27 @@ void qa_q2m_monsters_register(qa_q2m_monsters *m, const qa_q2m_definition *defin
     }
     if ((double)move->frame_count < move->last_frame - move->first_frame + 1)
       qa_raise("Error", 0, 0, "Q2 move %s has an incomplete frame table", move->name);
-    const char *names[64];
-    size_t name_count = 0;
-    if (move->end && name_count < 64) names[name_count++] = move->end;
-    for (size_t fi = 0; fi < move->frame_count; fi++)
-      for (size_t ai2 = 0; ai2 < move->frames[fi].action_count; ai2++)
-        if (!move->frames[fi].actions[ai2].is_nextframe && name_count < 64)
-          names[name_count++] = move->frames[fi].actions[ai2].name;
-    for (size_t ni = 0; ni < name_count; ni++) {
-      bool found = shared_callback(names[ni]) != NULL;
+    /* TS checks move.end and then every frame action, however many (no fixed list). */
+    size_t action_total = 0;
+    for (size_t fi = 0; fi < move->frame_count; fi++) action_total += move->frames[fi].action_count;
+    for (size_t ni = 0; ni < action_total + 1; ni++) {
+      const char *name = NULL;
+      if (ni == 0) name = move->end;
+      else {
+        size_t index = ni - 1;
+        for (size_t fi = 0; fi < move->frame_count; fi++) {
+          if (index < move->frames[fi].action_count) {
+            if (!move->frames[fi].actions[index].is_nextframe) name = move->frames[fi].actions[index].name;
+            break;
+          }
+          index -= move->frames[fi].action_count;
+        }
+      }
+      if (name == NULL) continue;
+      bool found = shared_callback(name) != NULL;
       for (size_t ci = 0; ci < definition->callback_count && !found; ci++)
-        if (strcmp(definition->callbacks[ci].name, names[ni]) == 0) found = true;
-      if (!found) qa_raise("Error", 0, 0, "Q2 move %s references missing callback %s", move->name, names[ni]);
+        if (strcmp(definition->callbacks[ci].name, name) == 0) found = true;
+      if (!found) qa_raise("Error", 0, 0, "Q2 move %s references missing callback %s", move->name, name);
     }
   }
   if (!grow((void **)list, cap, *count, sizeof **list)) return;
@@ -864,9 +916,29 @@ void qa_q2m_monsters_process_pain(qa_q2m_monsters *m, qa_q2_entity *entity, qa_q
   qa_q2m_pending_damage *pending = pending_of(m, entity->actor.id);
   qa_q2m_context *c = qa_q2m_monsters_context(m, entity->actor.id);
   if (!pending || !c || pending->reaction.pain.damage == 0) return;
-  const qa_q2m_definition *d = entry_of_context(c)->definition;
-  entity->last_attack = pending->has_attack ? &pending->attack : NULL;
+  qa_q2m_actor_entry *entry = entry_of_context(c);
+  const qa_q2m_definition *d = entry->definition;
+  /* TS `entity.lastAttack = pending.attack`: the attack object outlives the pending record deleted below, and the
+   * reaction handed to die/pain is the record read here even when a new hit is queued while they run. Both are
+   * copied out of the pending entry, which queuePain rewrites and pendingDamage.delete frees. */
+  entry->has_last_attack = pending->has_attack;
+  if (pending->has_attack) {
+    entry->last_attack = pending->attack;
+    if (pending->attack.attacker != NULL) {
+      entry->last_attack_attacker = *pending->attack.attacker;
+      entry->last_attack.attacker = &entry->last_attack_attacker;
+    }
+    if (pending->attack.inflictor != NULL) {
+      entry->last_attack_inflictor = *pending->attack.inflictor;
+      entry->last_attack.inflictor = &entry->last_attack_inflictor;
+    }
+  }
+  entity->last_attack = pending->has_attack ? &entry->last_attack : NULL;
   qa_death_reaction reaction = pending->reaction;
+  qa_actor_id reaction_attacker, reaction_inflictor;
+  reaction.pain.attack = entity->last_attack;
+  if (reaction.pain.attacker != NULL) { reaction_attacker = *reaction.pain.attacker; reaction.pain.attacker = &reaction_attacker; }
+  if (reaction.inflictor != NULL) { reaction_inflictor = *reaction.inflictor; reaction.inflictor = &reaction_inflictor; }
   if (qa_q2m_health(game, &entity->actor.id) <= 0) {
     monsters_die(m, c, d, reaction);
     if (q2m_live(game, entity->actor.id) && qa_q2m_health(game, &entity->actor.id) > c->state->gib_health
@@ -894,19 +966,21 @@ void qa_q2m_monsters_process_pain(qa_q2m_monsters *m, qa_q2_entity *entity, qa_q
 }
 void qa_q2m_monsters_end_frame(qa_q2m_monsters *m, qa_q2_game_services *game) {
   if (!q2m_rr(game) || m->pending_count == 0) return;
-  /* Sort a snapshot by source slot (actors.source_of), as TS. */
+  /* A snapshot of the contexts sorted by source slot (actors.sourceOf). Array.prototype.sort is stable, so
+   * contexts with equal slots keep their map order: an insertion sort over keys read once. */
   size_t count = m->entry_count;
   qa_q2m_context **ordered = malloc((count ? count : 1) * sizeof *ordered);
-  if (!ordered) return;
-  for (size_t i = 0; i < count; i++) ordered[i] = &m->entries[i]->context;
-  for (size_t i = 0; i < count; i++)
-    for (size_t j = i + 1; j < count; j++) {
-      qa_actor_source_result sa = qa_session_actor_registry_source_of(game->host->actors, ordered[i]->entity->actor.id);
-      qa_actor_source_result sb = qa_session_actor_registry_source_of(game->host->actors, ordered[j]->entity->actor.id);
-      double ka = sa.has_value ? sa.slot : (double)ordered[i]->entity->actor.id.slot;
-      double kb = sb.has_value ? sb.slot : (double)ordered[j]->entity->actor.id.slot;
-      if (kb < ka) { qa_q2m_context *t = ordered[i]; ordered[i] = ordered[j]; ordered[j] = t; }
-    }
+  double *keys = malloc((count ? count : 1) * sizeof *keys);
+  if (!ordered || !keys) { free(ordered); free(keys); return; }
+  for (size_t i = 0; i < count; i++) {
+    qa_q2m_context *context = &m->entries[i]->context;
+    qa_actor_source_result source = qa_session_actor_registry_source_of(game->host->actors, context->entity->actor.id);
+    double key = source.has_value ? source.slot : (double)context->entity->actor.id.slot;
+    size_t at = i;
+    while (at > 0 && key < keys[at - 1]) { keys[at] = keys[at - 1]; ordered[at] = ordered[at - 1]; at--; }
+    keys[at] = key; ordered[at] = context;
+  }
+  free(keys);
   for (size_t i = 0; i < count; i++)
     if (q2m_live(game, ordered[i]->entity->actor.id) && (qa_js_to_uint32(ordered[i]->entity->server_flags) & 4u) != 0)
       qa_q2m_monsters_process_pain(m, ordered[i]->entity, game);
@@ -1319,8 +1393,8 @@ static qa_q2m_context *admit(qa_q2m_monsters *m, qa_q2_entity *entity, qa_q2_gam
   connect_monsters(m, game);
   bool rr = q2m_rr(game);
   const qa_q2m_move *initial_move = NULL;
-  for (size_t i = 0; i < definition->move_count; i++)
-    if (strcmp(definition->moves[i].name, definition->initial_move) == 0) initial_move = &definition->moves[i];
+  for (size_t i = 0; i < definition->move_count; i++) /* TS moves.find: the first move of that name */
+    if (strcmp(definition->moves[i].name, definition->initial_move) == 0) { initial_move = &definition->moves[i]; break; }
   if (!initial_move) qa_raise("Error", 0, 0, "Missing Q2 monster initial move %s", definition->initial_move);
   qa_q2m_context *prev_ctx = reviving ? qa_q2m_monsters_context(m, entity->actor.id) : NULL;
   const qa_q2m_state *previous = prev_ctx ? prev_ctx->state : NULL;
@@ -1597,26 +1671,39 @@ bool qa_q2m_monsters_spawn(qa_q2m_monsters *m, qa_q2_entity *entity, qa_q2_game_
   (void)admit(m, entity, game, d, false, false);
   return true;
 }
+/* TS spawnSummoned: an unknown class or an admission that left no context (deathmatch, or an initialize that
+ * removed the entity) throws. */
 qa_q2m_context *qa_q2m_monsters_spawn_summoned(qa_q2m_monsters *m, qa_q2_entity *entity, qa_q2_game_services *game) {
   const qa_q2m_definition *d = qa_q2m_monsters_definition(m, entity->classname, game);
-  return d ? admit(m, entity, game, d, false, true) : NULL;
+  if (!d) qa_raise("Error", 0, 0, "Cannot summon unknown Q2 monster %s", entity->classname);
+  (void)admit(m, entity, game, d, false, true);
+  return require_context(m, entity);
 }
+/* TS respawn: cancels the pending think and admits again with the previous context's carried fields. The entity
+ * keeps its enemy, goal, owner and use callback until admission replaces them. */
 qa_q2m_context *qa_q2m_monsters_respawn(qa_q2m_monsters *m, qa_q2_entity *entity, qa_q2_game_services *game) {
   qa_q2m_actor_entry *entry = entry_of(m, entity->actor.id);
   const qa_q2m_definition *d = entry ? entry->definition : qa_q2m_monsters_definition(m, entity->classname, game);
-  entity->has_enemy = false; entity->has_goal = false; entity->has_owner = false;
-  entity->use = (qa_q2_use){NULL, NULL};
-  return d ? admit(m, entity, game, d, true, false) : NULL;
+  if (!d) qa_raise("Error", 0, 0, "Cannot revive unknown Q2 monster %s", entity->classname);
+  game->cancel(game->ctx, entity);
+  (void)admit(m, entity, game, d, true, false);
+  qa_q2m_context *c = qa_q2m_monsters_context(m, entity->actor.id);
+  if (!c) qa_raise("Error", 0, 0, "Q2 monster %s was inhibited during revival", entity->classname);
+  return c;
 }
 void qa_q2m_monsters_resume_monster(qa_q2m_monsters *m, qa_q2_entity *entity, qa_q2_game_services *game) {
   qa_q2m_context *c = qa_q2m_monsters_context(m, entity->actor.id);
-  if (!c) return;
-  if (!q2m_rr(game)) game->schedule(game->ctx, entity, 0.1, (qa_q2_think){m, src_think});
-  else monsters_start(m, c);
+  if (!c) qa_raise("Error", 0, 0, "No monster callbacks for %s", entity->classname);
+  game->schedule(game->ctx, entity, !q2m_rr(game) ? 0.1 : game->host->frame_seconds(game->host->ctx), (qa_q2_think){m, src_think});
 }
+/* TS spawnInfantryDriver: always the built-in infantry (a registered turret_driver definition is not consulted),
+ * counted like any other monster. */
 qa_q2m_context *qa_q2m_monsters_spawn_infantry_driver(qa_q2m_monsters *m, qa_q2_entity *entity, qa_q2_game_services *game) {
-  qa_q2m_context *c = qa_q2m_monsters_spawn_summoned(m, entity, game);
-  if (c) c->state->stand_ground = true;
+  const qa_q2m_definition *d = turret_driver_definition(m, game);
+  if (!d) qa_raise("Error", 0, 0, "Missing infantry definition");
+  (void)admit(m, entity, game, d, false, false);
+  qa_q2m_context *c = qa_q2m_monsters_context(m, entity->actor.id);
+  if (!c) qa_raise("Error", 0, 0, "Turret infantry driver was inhibited");
   return c;
 }
 
@@ -1842,7 +1929,7 @@ void qa_q2m_monsters_checkpoint_free(qa_q2m_monsters_checkpoint *cp) {
 static const qa_q2m_move *find_move(const qa_q2m_definition *d, const char *name) {
   for (size_t i = 0; i < d->move_count; i++)
     if (strcmp(d->moves[i].name, name) == 0) return &d->moves[i];
-  qa_raise("Error", 0, 0, "%s checkpoint has unknown source animation %s", d->classname, name);
+  qa_raise("Error", 0, 0, "Unknown saved Q2 monster move %s", name);
 }
 typedef struct restore_ref_env { qa_q2_game_services *game; } restore_ref_env;
 static qa_actor_id restore_ref(void *ctx, qa_saved_actor_id actor) {
@@ -1853,17 +1940,16 @@ void qa_q2m_monsters_restore(qa_q2m_monsters *m, qa_q2_game_services *game, cons
   connect_monsters(m, game);
   /* TS contexts.clear(): the entities these contexts pointed at may already
    * be gone (a foundation restore rebuilds them), so do not read them. */
-  for (size_t i = 0; i < m->entry_count; i++) { free(m->entries[i]->state); free(m->entries[i]); }
+  for (size_t i = 0; i < m->entry_count; i++) retire_entry(m, m->entries[i]);
   m->entry_count = 0;
+  flush_retired(m, game);
   while (m->pending_count) pending_delete(m, m->pending[0]->actor);
-  qa_q2m_perception_restore(&m->perception, game, &cp->perception);
   for (size_t i = 0; i < cp->actor_count; i++) {
     const qa_q2m_actor_checkpoint *saved = &cp->actors[i];
     qa_owned_actor owner = qa_q2_restore_actor(game, saved->actor);
     qa_q2_entity *entity = game->entity(game->ctx, &owner.id);
-    if (!entity) continue;
     const qa_q2m_definition *d = qa_q2m_monsters_definition(m, saved->definition, game);
-    if (!d) qa_raise("Error", 0, 0, "Q2 monster checkpoint has no registered definition %s", saved->definition);
+    if (!entity || !d) qa_raise("Error", 0, 0, "Missing restored Q2 monster %s", saved->definition);
     const qa_q2m_state_checkpoint *s = &saved->state;
     const qa_q2m_move *move = find_move(d, s->move);
     const qa_q2m_move *next_move = s->next_move ? find_move(d, s->next_move) : NULL;
@@ -1887,8 +1973,7 @@ void qa_q2m_monsters_restore(qa_q2m_monsters *m, qa_q2_game_services *game, cons
     if (s->has_move_target) state->move_target = qa_session_actor_registry_reference_saved(game->host->actors, s->move_target, NULL);
     state->has_commander = s->has_commander;
     if (s->has_commander) state->commander = qa_session_actor_registry_reference_saved(game->host->actors, s->commander, NULL);
-    qa_q2m_context *c = attach_context(m, entity, game, d, state);
-    if (d->restore.fn) d->restore.fn(d->restore.ctx, c);
+    if (!attach_context(m, entity, game, d, state)) { free(state); return; }
     if (saved->pending_damage.has_value) {
       const qa_q2m_damage_checkpoint *p = &saved->pending_damage.value;
       qa_q2m_pending_damage *entry = malloc(sizeof *entry);
@@ -1913,11 +1998,18 @@ void qa_q2m_monsters_restore(qa_q2m_monsters *m, qa_q2_game_services *game, cons
         reaction.pain.attack = &entry->attack;
       }
       entry->reaction = reaction;
+      /* TS pendingDamage.set: a second record for one actor replaces the first. */
+      pending_delete(m, owner.id);
       if (!grow((void **)&m->pending, &m->pending_cap, m->pending_count, sizeof *m->pending)) { free(entry); return; }
       m->pending[m->pending_count++] = entry;
     }
-    entity->pain = (qa_q2_pain){m, src_pain};
-    entity->die = (qa_q2_die){m, src_die};
+  }
+  /* TS restores perception after every context is attached, then runs each definition's restore hook in map
+   * order. The entities keep the pain and die callbacks the foundation restored by name. */
+  qa_q2m_perception_restore(&m->perception, game, &cp->perception);
+  for (size_t i = 0; i < m->entry_count; i++) {
+    qa_q2m_actor_entry *entry = m->entries[i];
+    if (entry->definition->restore.fn) entry->definition->restore.fn(entry->definition->restore.ctx, &entry->context);
   }
 }
 

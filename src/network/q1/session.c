@@ -5,6 +5,7 @@
 #include "qa/network/q1/codecs/codec.h"
 #include "qa/network/q1/handshake.h"
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,24 @@ void qa_write_client_string_command(qa_size_buf *s, const char *text) {
   qa_msg_write_byte(s, 4); qa_msg_write_string(s, text);
 }
 static void stuff(qa_size_buf *s, const char *text) { qa_msg_write_byte(s, 9); qa_msg_write_string(s, text); }
+static void destroy_buf_slot(void *arg);
+static void free_text(void *text) { free(text); }
+static void write_command(qa_size_buf *buf, const char *format, ...) {
+  va_list args, copy;
+  va_start(args, format);
+  va_copy(copy, args);
+  int n = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *text = n >= 0 ? malloc((size_t)n + 1) : NULL;
+  if (!text) { va_end(args); qa_range_error("Out of memory"); }
+  vsnprintf(text, (size_t)n + 1, format, args);
+  va_end(args);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_text, text);
+  qa_write_client_string_command(buf, text);
+  qa_cleanup_pop(&guard);
+  free(text);
+}
 void qa_netquake_signon_init(qa_netquake_signon *s, qa_netquake_seat_identity seat) {
   s->stage = 0; s->seat = seat;
 }
@@ -23,18 +42,16 @@ uint8_t *qa_netquake_signon_receive(qa_netquake_signon *s, double stage, size_t 
   qa_size_buf buf; qa_size_buf_init(&buf, 8000, false);
   if (stage == 1) qa_write_client_string_command(&buf, "prespawn");
   else if (stage == 2) {
-    char tmp[1024];
-    snprintf(tmp, sizeof tmp, "name \"%s\"\n", s->seat.name);
-    qa_write_client_string_command(&buf, tmp);
+    /* Template strings of any length: a long name or spawn string reaches the 8000-byte
+     * SizeBuf (and its overflow error) instead of being cut by a fixed buffer. */
+    qa_cleanup guard;
+    qa_cleanup_push(&guard, destroy_buf_slot, &buf);
+    write_command(&buf, "name \"%s\"\n", s->seat.name);
     int color = qa_js_to_int32(s->seat.color); /* color >> 4, color & 15 */
-    snprintf(tmp, sizeof tmp, "color %d %d\n", color >> 4, color & 15);
-    qa_write_client_string_command(&buf, tmp);
-    if (s->seat.has_extension_flags) {
-      snprintf(tmp, sizeof tmp, "ex_flags %s\n", QA_JS_NUMBER(s->seat.extension_flags));
-      qa_write_client_string_command(&buf, tmp);
-    }
-    snprintf(tmp, sizeof tmp, "spawn %s", s->seat.spawn_parameters);
-    qa_write_client_string_command(&buf, tmp);
+    write_command(&buf, "color %d %d\n", color >> 4, color & 15);
+    if (s->seat.has_extension_flags) write_command(&buf, "ex_flags %s\n", QA_JS_NUMBER(s->seat.extension_flags));
+    write_command(&buf, "spawn %s", s->seat.spawn_parameters);
+    qa_cleanup_pop(&guard);
   } else if (stage == 3) qa_write_client_string_command(&buf, "begin");
   uint8_t *out = qa_size_buf_bytes(&buf, out_len);
   qa_size_buf_destroy(&buf); return out;

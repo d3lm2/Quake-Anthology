@@ -9,6 +9,7 @@
 
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +46,106 @@ static bool same_saved_actor(qa_saved_actor_id left, qa_saved_actor_id right) {
 static bool same_owned(qa_owned_actor left, qa_owned_actor right) {
   return left.token == right.token && qa_same_actor(left.id, right.id) &&
          same_text(left.owner, right.owner);
+}
+
+/* --- TS Set<string> / Map<key(actor), index>: open-addressing tables so the
+ * duplicate checks and actor lookups stay linear as TS's are. A slot holds
+ * index + 1 (0 = empty); keys are read back through the table's key array.
+ * Capacity is a power of two at least twice the entry count. --- */
+typedef struct key_table {
+  size_t *slots;
+  size_t capacity, count;
+  const char **texts;           /* text keys, by index (text tables) */
+  qa_saved_actor_id *actors;    /* actor keys, by index (actor tables) */
+  size_t key_capacity;
+} key_table;
+static void key_table_free(key_table *table) {
+  free(table->slots);
+  free(table->texts);
+  free(table->actors);
+  memset(table, 0, sizeof *table);
+}
+static uint64_t text_hash(const char *text) {
+  uint64_t hash = 1469598103934665603ULL;
+  for (const unsigned char *at = (const unsigned char *)text; *at != 0; at++)
+    hash = (hash ^ *at) * 1099511628211ULL;
+  return hash;
+}
+static uint64_t actor_hash(qa_saved_actor_id actor) {
+  double slot = actor.slot + 0.0, generation = actor.generation + 0.0; /* -0 keys as 0 */
+  uint64_t a, b;
+  memcpy(&a, &slot, sizeof a);
+  memcpy(&b, &generation, sizeof b);
+  uint64_t hash = (a ^ (b * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL;
+  return hash ^ (hash >> 31);
+}
+static uint64_t key_hash(const key_table *table, size_t index) {
+  return table->texts != NULL ? text_hash(table->texts[index]) : actor_hash(table->actors[index]);
+}
+/* Rehashes into a table able to hold `entries` keys; false on OOM. */
+static bool key_table_reserve(key_table *table, size_t entries, bool text) {
+  if (entries <= table->key_capacity && table->slots != NULL) return true;
+  size_t key_capacity = table->key_capacity != 0 ? table->key_capacity : 8;
+  while (key_capacity < entries) key_capacity *= 2;
+  size_t capacity = 16;
+  while (capacity < key_capacity * 2) capacity *= 2;
+  size_t *slots = calloc(capacity, sizeof *slots);
+  if (slots == NULL) return false;
+  if (text) {
+    const char **texts = realloc(table->texts, key_capacity * sizeof *texts);
+    if (texts == NULL) { free(slots); return false; }
+    table->texts = texts;
+  } else {
+    qa_saved_actor_id *actors = realloc(table->actors, key_capacity * sizeof *actors);
+    if (actors == NULL) { free(slots); return false; }
+    table->actors = actors;
+  }
+  free(table->slots);
+  table->slots = slots;
+  table->capacity = capacity;
+  table->key_capacity = key_capacity;
+  for (size_t i = 0; i < table->count; i++) {
+    size_t at = (size_t)key_hash(table, i) & (capacity - 1);
+    while (slots[at] != 0) at = (at + 1) & (capacity - 1);
+    slots[at] = i + 1;
+  }
+  return true;
+}
+/* Index of the key or SIZE_MAX. */
+static size_t text_table_find(const key_table *table, const char *text) {
+  if (table->slots == NULL) return SIZE_MAX;
+  size_t mask = table->capacity - 1;
+  for (size_t at = (size_t)text_hash(text) & mask; table->slots[at] != 0; at = (at + 1) & mask)
+    if (strcmp(table->texts[table->slots[at] - 1], text) == 0) return table->slots[at] - 1;
+  return SIZE_MAX;
+}
+static size_t actor_table_find(const key_table *table, qa_saved_actor_id actor) {
+  if (table->slots == NULL) return SIZE_MAX;
+  size_t mask = table->capacity - 1;
+  for (size_t at = (size_t)actor_hash(actor) & mask; table->slots[at] != 0; at = (at + 1) & mask)
+    if (same_saved_actor(table->actors[table->slots[at] - 1], actor)) return table->slots[at] - 1;
+  return SIZE_MAX;
+}
+/* TS Set.add: false when the key was already present. `*oom` reports OOM. */
+static bool text_table_add(key_table *table, const char *text, bool *oom) {
+  if (text_table_find(table, text) != SIZE_MAX) return false;
+  if (!key_table_reserve(table, table->count + 1, true)) { *oom = true; return false; }
+  size_t mask = table->capacity - 1, at = (size_t)text_hash(text) & mask;
+  while (table->slots[at] != 0) at = (at + 1) & mask;
+  table->texts[table->count] = text;
+  table->slots[at] = ++table->count;
+  return true;
+}
+/* TS Map.set over an actor key: a repeated key keeps its first index here
+ * (the callers' keys are distinct). */
+static bool actor_table_add(key_table *table, qa_saved_actor_id actor, bool *oom) {
+  if (actor_table_find(table, actor) != SIZE_MAX) return false;
+  if (!key_table_reserve(table, table->count + 1, false)) { *oom = true; return false; }
+  size_t mask = table->capacity - 1, at = (size_t)actor_hash(actor) & mask;
+  while (table->slots[at] != 0) at = (at + 1) & mask;
+  table->actors[table->count] = actor;
+  table->slots[at] = ++table->count;
+  return true;
 }
 
 /* --- SaveReader helpers (q2_classic_guest.c precedent) --- */
@@ -118,8 +219,22 @@ static char *normalize_resource_path(const char *path) {
 }
 static const char *normalized_field(qa_source_items_result *result,
                                     const qa_save_reader *reader) {
-  return pool_string(result, normalize_resource_path(qa_save_reader_string(reader)),
-                     reader);
+  size_t length = 0;
+  const char *text = qa_save_reader_string_length(reader, &length);
+  /* TS refuses a path holding a NUL (normalized.includes("\0")); the C text would end there. */
+  if (length != strlen(text)) qa_range_error("Invalid relative resource path: %s", text);
+  return pool_string(result, normalize_resource_path(text), reader);
+}
+/* TS string length (UTF-16 units) of UTF-8 text. */
+static size_t utf16_units(const char *text) {
+  size_t units = 0;
+  for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++)
+    if ((*p & 0xc0) != 0x80) units += *p >= 0xf0 ? 2 : 1;
+  return units;
+}
+static int compare_doubles(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return (x > y) - (x < y);
 }
 static double dot3(qa_vec3 left, qa_vec3 right) {
   return left.x * right.x + left.y * right.y + left.z * right.z;
@@ -230,10 +345,11 @@ static void read_source_item_icon(qa_source_items_result *result,
   }
   out->kind = QA_WEAPON_HUD_ICON_WAD_PICTURE;
   qa_save_reader lump = field(reader, "lump");
-  out->lump = qa_save_reader_string(&lump);
+  size_t lump_bytes = 0;
+  out->lump = qa_save_reader_string_length(&lump, &lump_bytes);
   qa_save_reader_destroy(&lump);
-  size_t lump_length = strlen(out->lump);
-  if (lump_length == 0 || lump_length > 16)
+  size_t lump_length = utf16_units(out->lump);
+  if (lump_length == 0 || lump_length > 16 || lump_bytes != strlen(out->lump))
     qa_save_reader_fail(reader, "Item icon requires a valid WAD lump name");
 }
 static const char *read_digest(const qa_save_reader *reader) {
@@ -261,12 +377,14 @@ static void read_held_weapon_declaration(qa_source_items_result *result,
   if (!qa_save_reader_is_undefined(&part)) {
     subset = (qa_held_weapon_part *)calloc(1, sizeof *subset);
     if (subset == NULL) qa_save_reader_fail(&part, "out of memory");
+    out->model.part = subset; /* owned by the declaration from here, so a raise releases it */
     qa_save_reader digests = field(&part, "digests");
     size_t digest_count = qa_save_reader_list_count(&digests);
     const char **digest_values =
         (const char **)calloc(digest_count != 0 ? digest_count : 1,
                               sizeof *digest_values);
     if (digest_values == NULL) qa_save_reader_fail(&digests, "out of memory");
+    subset->digests.values = digest_values;
     for (size_t i = 0; i < digest_count; i++) {
       qa_save_reader entry = item(&digests, i);
       digest_values[i] = read_digest(&entry);
@@ -280,6 +398,7 @@ static void read_held_weapon_declaration(qa_source_items_result *result,
     double *vertex_values =
         (double *)calloc(vertex_count != 0 ? vertex_count : 1, sizeof *vertex_values);
     if (vertex_values == NULL) qa_save_reader_fail(&vertices, "out of memory");
+    subset->vertices.values = vertex_values;
     for (size_t i = 0; i < vertex_count; i++) {
       qa_save_reader entry = item(&vertices, i);
       vertex_values[i] = qa_save_reader_integer_min(&entry, 0);
@@ -288,10 +407,14 @@ static void read_held_weapon_declaration(qa_source_items_result *result,
     qa_save_reader_destroy(&vertices);
     subset->vertices.values = vertex_values;
     subset->vertices.count = vertex_count;
+    /* new Set(vertices).size, in O(n log n): a sorted copy has a repeat next to itself. */
     bool duplicate = false;
-    for (size_t i = 0; i < vertex_count && !duplicate; i++)
-      for (size_t j = i + 1; j < vertex_count; j++)
-        if (vertex_values[j] == vertex_values[i]) duplicate = true;
+    double *sorted = (double *)malloc((vertex_count != 0 ? vertex_count : 1) * sizeof *sorted);
+    if (sorted == NULL) qa_save_reader_fail(&part, "out of memory");
+    memcpy(sorted, vertex_values, vertex_count * sizeof *sorted);
+    qsort(sorted, vertex_count, sizeof *sorted, compare_doubles);
+    for (size_t i = 1; i < vertex_count && !duplicate; i++) duplicate = sorted[i] == sorted[i - 1];
+    free(sorted);
     if (digest_count == 0 || vertex_count == 0 || duplicate)
       qa_save_reader_fail(&part,
           "held model subset requires source digests and distinct vertices");
@@ -342,8 +465,8 @@ static void read_definition(qa_source_items_result *result,
       qa_weapon_hud_icon *decoded =
           (qa_weapon_hud_icon *)calloc(1, sizeof *decoded);
       if (decoded == NULL) qa_save_reader_fail(&icon, "out of memory");
-      read_source_item_icon(result, &icon, out->source.content, decoded);
       out->icon = decoded;
+      read_source_item_icon(result, &icon, out->source.content, decoded);
     }
   }
   qa_save_reader_destroy(&icon);
@@ -354,6 +477,7 @@ static void read_definition(qa_source_items_result *result,
     qa_source_item_action *decoded =
         (qa_source_item_action *)calloc(count != 0 ? count : 1, sizeof *decoded);
     if (decoded == NULL) qa_save_reader_fail(&actions, "out of memory");
+    out->actions = decoded;
     for (size_t i = 0; i < count; i++) {
       qa_save_reader entry = item(&actions, i);
       const char *action = qa_save_reader_choice_string(&entry, action_names, 2);
@@ -366,10 +490,13 @@ static void read_definition(qa_source_items_result *result,
   }
   qa_save_reader_destroy(&actions);
   if (has_actions) {
-    bool duplicate = false;
-    for (size_t i = 0; i < out->action_count && !duplicate; i++)
-      for (size_t j = i + 1; j < out->action_count; j++)
-        if (out->actions[j] == out->actions[i]) duplicate = true;
+    /* Two action names exist: a list longer than its distinct names repeats one. */
+    bool seen_use = false, seen_drop = false, duplicate = false;
+    for (size_t i = 0; i < out->action_count && !duplicate; i++) {
+      bool *seen = out->actions[i] == QA_SOURCE_ITEM_ACTION_USE ? &seen_use : &seen_drop;
+      duplicate = *seen;
+      *seen = true;
+    }
     if (out->action_count == 0 || duplicate)
       qa_save_reader_fail(reader, "Source item actions are empty or duplicated");
   }
@@ -385,8 +512,8 @@ static void read_definition(qa_source_items_result *result,
     qa_held_weapon_declaration *decoded =
         (qa_held_weapon_declaration *)calloc(1, sizeof *decoded);
     if (decoded == NULL) qa_save_reader_fail(&held, "out of memory");
-    read_held_weapon_declaration(result, &held, decoded);
     out->weapon.held = decoded;
+    read_held_weapon_declaration(result, &held, decoded);
   }
   qa_save_reader_destroy(&held);
   qa_save_reader ammo = field(reader, "ammo");
@@ -472,21 +599,29 @@ static bool same_definition(const qa_source_item_definition *left,
          (left->weapon.held == NULL ||
           same_held(left->weapon.held, right->weapon.held));
 }
-static bool item_in(const char *const *items, size_t count, const char *item) {
-  for (size_t i = 0; i < count; i++)
-    if (same_text(items[i], item)) return true;
-  return false;
+static void free_result(void *arg) { qa_source_items_result_free(arg); }
+/* The Sets of one readSourceItems call (actors across records; the others per record). */
+typedef struct read_scratch { key_table actors, primary_items, items, rows; } read_scratch;
+static void read_scratch_free(void *arg) {
+  read_scratch *scratch = arg;
+  key_table_free(&scratch->actors);
+  key_table_free(&scratch->primary_items);
+  key_table_free(&scratch->items);
+  key_table_free(&scratch->rows);
 }
-static bool inventory_has(const qa_inventory_entry *entries, size_t count,
-                          const char *item) {
-  for (size_t i = 0; i < count; i++)
-    if (same_text(entries[i].item, item)) return true;
-  return false;
-}
-
+static bool read_source_items_body(const qa_save_image *save, qa_source_items_result *out);
+/* A malformed record raises with everything read so far released (TS discards it). */
 bool qa_read_source_items(const qa_save_image *save, qa_source_items_result *out) {
-  static const char *const admissions[] = {"add", "replace-primary"};
   memset(out, 0, sizeof *out);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_result, out);
+  bool ok = read_source_items_body(save, out);
+  qa_cleanup_pop(&guard);
+  return ok;
+}
+static bool read_source_items_records(const qa_save_image *save, qa_source_items_result *out,
+                                      const qa_save_reader *reader, read_scratch *scratch);
+static bool read_source_items_body(const qa_save_image *save, qa_source_items_result *out) {
   const qa_provider_checkpoint *record = NULL;
   size_t matches = 0;
   for (size_t i = 0; i < save->provider_count; i++) {
@@ -505,14 +640,28 @@ bool qa_read_source_items(const qa_save_image *save, qa_source_items_result *out
   out->root = root;
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, root, k_schema)) return false;
-  size_t count = qa_save_reader_list_count(&reader);
+  read_scratch scratch;
+  memset(&scratch, 0, sizeof scratch);
+  qa_cleanup scratch_guard;
+  qa_cleanup_push(&scratch_guard, read_scratch_free, &scratch);
+  bool ok = read_source_items_records(save, out, &reader, &scratch);
+  qa_cleanup_pop(&scratch_guard);
+  read_scratch_free(&scratch);
+  qa_save_reader_destroy(&reader);
+  return ok;
+}
+static bool read_source_items_records(const qa_save_image *save, qa_source_items_result *out,
+                                      const qa_save_reader *reader, read_scratch *scratch) {
+  static const char *const admissions[] = {"add", "replace-primary"};
+  bool oom = false;
+  size_t count = qa_save_reader_list_count(reader);
   out->records = (qa_source_items_record *)calloc(count != 0 ? count : 1,
                                                   sizeof *out->records);
-  if (out->records == NULL) qa_save_reader_fail(&reader, "out of memory");
+  if (out->records == NULL) qa_save_reader_fail(reader, "out of memory");
   out->count = count;
   for (size_t index = 0; index < count; index++) {
     qa_source_items_record *decoded = &out->records[index];
-    qa_save_reader entry = item(&reader, index);
+    qa_save_reader entry = item(reader, index);
     qa_save_reader actor_field = field(&entry, "actor");
     decoded->actor = qa_read_saved_actor(&actor_field);
     qa_save_reader_destroy(&actor_field);
@@ -531,21 +680,20 @@ bool qa_read_source_items(const qa_save_image *save, qa_source_items_result *out
       qa_save_reader_destroy(&row);
     }
     qa_save_reader_destroy(&primary);
-    bool duplicate_actor = false;
-    for (size_t i = 0; i < index; i++)
-      if (same_saved_actor(out->records[i].actor, decoded->actor))
-        duplicate_actor = true;
+    /* TS primaryItems = new Set(primary items), items = new Set(). */
+    key_table_free(&scratch->primary_items);
+    key_table_free(&scratch->items);
+    key_table_free(&scratch->rows);
     bool duplicate_primary = false;
-    for (size_t i = 0; i < primary_count && !duplicate_primary; i++)
-      for (size_t j = i + 1; j < primary_count; j++)
-        if (same_text(decoded->primary[j].item, decoded->primary[i].item))
-          duplicate_primary = true;
-    if (duplicate_actor || duplicate_primary)
+    for (size_t i = 0; i < primary_count; i++)
+      if (!text_table_add(&scratch->primary_items, decoded->primary[i].item, &oom) && !oom)
+        duplicate_primary = true;
+    if (oom) qa_save_reader_fail(&entry, "out of memory");
+    if (actor_table_find(&scratch->actors, decoded->actor) != SIZE_MAX || duplicate_primary)
       qa_save_reader_fail(&entry, "duplicate primary inventory or actor");
-    /* Source-item ids admitted across every group of this record. */
-    const char **items = NULL;
-    size_t item_count = 0;
-    size_t item_capacity = 0;
+    actor_table_add(&scratch->actors, decoded->actor, &oom);
+    if (oom) qa_save_reader_fail(&entry, "out of memory");
+    key_table *items = &scratch->items; /* source-item ids admitted across every group */
     qa_save_reader groups = field(&entry, "groups");
     size_t group_count = qa_save_reader_list_count(&groups);
     decoded->groups = (qa_source_items_group *)calloc(
@@ -574,23 +722,15 @@ bool qa_read_source_items(const qa_save_image *save, qa_source_items_result *out
             qa_save_reader_choice_string(&admission, admissions, 2);
         qa_save_reader_destroy(&admission);
         const qa_source_item_definition *def = &group->items[r].definition;
-        bool in_primary =
-            inventory_has(decoded->primary, primary_count, def->item);
+        bool in_primary = text_table_find(&scratch->primary_items, def->item) != SIZE_MAX;
         bool admission_ok = strcmp(group->items[r].admission, "add") == 0
             ? !in_primary : in_primary;
         if (!same_text(def->source.provider, group->owner) ||
-            item_in(items, item_count, def->item) || !admission_ok)
+            text_table_find(items, def->item) != SIZE_MAX || !admission_ok)
           qa_save_reader_fail(&row,
               "source item admission differs from primary ownership");
-        if (item_count == item_capacity) {
-          size_t grown = item_capacity == 0 ? 8 : item_capacity * 2;
-          const char **grown_items =
-              (const char **)realloc(items, grown * sizeof *grown_items);
-          if (grown_items == NULL) qa_save_reader_fail(&row, "out of memory");
-          items = grown_items;
-          item_capacity = grown;
-        }
-        items[item_count++] = def->item;
+        text_table_add(items, def->item, &oom);
+        if (oom) qa_save_reader_fail(&row, "out of memory");
         qa_save_reader_destroy(&row);
       }
       qa_save_reader_destroy(&rows);
@@ -611,21 +751,23 @@ bool qa_read_source_items(const qa_save_image *save, qa_source_items_result *out
           "source items have no distinct effective inventory");
     const qa_inventory_entry *rows = effective->entries;
     size_t row_count = effective->entry_count;
+    /* new Set(rows items).size !== rows.length */
     bool coverage_bad = false;
     for (size_t i = 0; i < row_count && !coverage_bad; i++)
-      for (size_t j = i + 1; j < row_count; j++)
-        if (same_text(rows[j].item, rows[i].item)) coverage_bad = true;
-    for (size_t i = 0; i < item_count && !coverage_bad; i++)
-      if (!inventory_has(rows, row_count, items[i])) coverage_bad = true;
+      if (!text_table_add(&scratch->rows, rows[i].item, &oom)) coverage_bad = true;
+    if (oom) qa_save_reader_fail(&entry, "out of memory");
+    /* [...items].some(item => !rows.some(entry => entry.item === item)) */
+    for (size_t i = 0; i < items->count && !coverage_bad; i++)
+      if (text_table_find(&scratch->rows, items->texts[i]) == SIZE_MAX) coverage_bad = true;
     if (!coverage_bad) {
       /* isDeepStrictEqual(rows minus items, primary minus items). */
       size_t row_index = 0;
       size_t primary_index = 0;
       for (;;) {
         while (row_index < row_count &&
-               item_in(items, item_count, rows[row_index].item)) row_index++;
+               text_table_find(items, rows[row_index].item) != SIZE_MAX) row_index++;
         while (primary_index < primary_count &&
-               item_in(items, item_count, decoded->primary[primary_index].item))
+               text_table_find(items, decoded->primary[primary_index].item) != SIZE_MAX)
           primary_index++;
         if ((row_index < row_count) != (primary_index < primary_count)) {
           coverage_bad = true;
@@ -641,13 +783,11 @@ bool qa_read_source_items(const qa_save_image *save, qa_source_items_result *out
         primary_index++;
       }
     }
-    free(items);
     if (coverage_bad)
       qa_save_reader_fail(&entry,
           "source item coverage differs from effective inventory");
     qa_save_reader_destroy(&entry);
   }
-  qa_save_reader_destroy(&reader);
   return true;
 }
 
@@ -1018,15 +1158,23 @@ bool qa_prepare_source_item_restore(const qa_save_image *save,
       save->inventory_count != 0 ? save->inventory_count : 1,
       sizeof *out->primary_inventories);
   if (out->primary_inventories == NULL) return false;
+  /* TS byActor = new Map(records by key(actor)); readSourceItems refuses repeated actors. */
+  key_table by_actor;
+  memset(&by_actor, 0, sizeof by_actor);
+  bool oom = false;
+  for (size_t i = 0; i < out->records.count && !oom; i++)
+    actor_table_add(&by_actor, out->records.records[i].actor, &oom);
+  if (oom) { key_table_free(&by_actor); return false; }
   for (size_t i = 0; i < save->inventory_count; i++) {
     out->primary_inventories[i] = save->inventories[i];
-    const qa_source_items_record *record =
-        record_for(&out->records, save->inventories[i].actor);
-    if (record != NULL) {
+    size_t found = actor_table_find(&by_actor, save->inventories[i].actor);
+    if (found != SIZE_MAX) {
+      const qa_source_items_record *record = &out->records.records[found];
       out->primary_inventories[i].entries = record->primary;
       out->primary_inventories[i].entry_count = record->primary_count;
     }
   }
+  key_table_free(&by_actor);
   out->primary.inventories = out->primary_inventories;
   return true;
 }
@@ -1092,6 +1240,8 @@ void qa_source_item_restore_finish(const qa_source_item_restore *restore,
                                   sizeof *restored);
   if (restored == NULL)
     qa_save_format_error(k_schema, "out of memory");
+  qa_cleanup restored_guard; /* a raise drops the scratch with TS's frame */
+  qa_cleanup_push(&restored_guard, free, restored);
   size_t restored_count = 0;
   size_t observation_count = 0;
   const qa_actor_observation *observations =
@@ -1142,6 +1292,7 @@ void qa_source_item_restore_finish(const qa_source_item_restore *restore,
       }
     }
   }
+  qa_cleanup_pop(&restored_guard);
   free(restored);
   if (restored_count != record_count)
     qa_save_format_error(k_schema, "saved source item actor was not restored");

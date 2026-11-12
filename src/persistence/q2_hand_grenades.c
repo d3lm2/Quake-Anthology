@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
+
 static qa_save_reader field(const qa_save_reader *reader, const char *name) {
   qa_save_reader out;
   if (!qa_save_reader_field(reader, name, &out))
@@ -16,8 +18,8 @@ static qa_save_reader item(const qa_save_reader *reader, size_t index) {
     qa_save_reader_fail(reader, "out of memory");
   return out;
 }
-/* TS readSavedActor (save-image.ts, not yet ported as a module):
- * {slot: integer(0), generation: integer(0)}. Local copy only. */
+/* TS readSavedActor (save-image.ts): {slot: integer(0), generation: integer(0)},
+ * the same reads as qa_read_saved_actor (persistence/save_image.c). */
 static qa_saved_actor_id read_actor(const qa_save_reader *reader) {
   qa_saved_actor_id actor;
   qa_save_reader slot = field(reader, "slot");
@@ -166,21 +168,22 @@ static qa_save_value *build_hand_grenades_actor(const qa_hand_grenades_actor *in
 static void read_hand_grenades_checkpoint(const qa_save_reader *reader, qa_persist_hand_grenades_checkpoint *out);
 static qa_save_value *build_hand_grenades_checkpoint(const qa_persist_hand_grenades_checkpoint *in);
 
+/* TS loadout(): initialAmmo and capacity are read and compared before enabled and infiniteAmmo. */
 static void read_hand_grenade_loadout(const qa_save_reader *reader, qa_persist_hand_grenade_loadout *out) {
   memset(out, 0, sizeof *out);
-  { qa_save_reader f0 = field(reader, "enabled");
-    (*out).enabled = qa_save_reader_boolean(&f0);
-    qa_save_reader_destroy(&f0); }
   { qa_save_reader f1 = field(reader, "initialAmmo");
     (*out).initial_ammo = qa_save_reader_integer_min(&f1, 0);
     qa_save_reader_destroy(&f1); }
   { qa_save_reader f2 = field(reader, "capacity");
     (*out).capacity = qa_save_reader_integer_min(&f2, 0);
     qa_save_reader_destroy(&f2); }
+  if (out->initial_ammo > out->capacity) qa_save_reader_fail(reader, "initial hand grenade allowance exceeds capacity");
+  { qa_save_reader f0 = field(reader, "enabled");
+    (*out).enabled = qa_save_reader_boolean(&f0);
+    qa_save_reader_destroy(&f0); }
   { qa_save_reader f3 = field(reader, "infiniteAmmo");
     (*out).infinite_ammo = qa_save_reader_boolean(&f3);
     qa_save_reader_destroy(&f3); }
-  if (out->initial_ammo > out->capacity) qa_save_reader_fail(reader, "initial hand grenade allowance exceeds capacity");
 }
 static qa_save_value *build_hand_grenade_loadout(const qa_persist_hand_grenade_loadout *in) {
   qa_save_value *obj = qa_save_value_object();
@@ -275,9 +278,16 @@ fail:
 
 
 
+static void free_partial(void *arg) { qa_persist_hand_grenades_checkpoint_free(arg); }
+static void free_value(void *arg) { qa_save_value_free(arg); }
+/* A malformed actor raises with the actors array (and a decoder's tree) released. */
 qa_persist_hand_grenades_checkpoint qa_read_hand_grenades_checkpoint(const qa_save_reader *reader) {
   qa_persist_hand_grenades_checkpoint out;
+  memset(&out, 0, sizeof out);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_partial, &out);
   read_hand_grenades_checkpoint(reader, &out);
+  qa_cleanup_pop(&guard);
   return out;
 }
 uint8_t *qa_encode_hand_grenades_checkpoint(const qa_persist_hand_grenades_checkpoint *checkpoint, size_t *out_length) {
@@ -292,9 +302,13 @@ bool qa_decode_hand_grenades_checkpoint(const uint8_t *bytes, size_t length, qa_
   if (root == NULL) return false;
   qa_save_reader reader;
   if (!qa_save_reader_init(&reader, root, "q2-hand-grenades")) { qa_save_value_free(root); return false; }
-  read_hand_grenades_checkpoint(&reader, out);
+  qa_cleanup guard; /* the tree is released when the read raises */
+  qa_cleanup_push(&guard, free_value, root);
+  qa_persist_hand_grenades_checkpoint read = qa_read_hand_grenades_checkpoint(&reader);
+  qa_cleanup_pop(&guard);
   qa_save_reader_destroy(&reader);
-  out->root = root;
+  read.root = root;
+  *out = read;
   return true;
 }
 

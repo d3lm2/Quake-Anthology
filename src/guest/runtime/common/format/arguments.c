@@ -6,7 +6,7 @@
 #include "qa/foundation/support.h"
 #include "qa/guest/runtime/common/memory.h"
 
-static void type_error(const char *message) { qa_range_error("%s", message); }
+static void type_error(const char *message) { qa_raise("TypeError", 0, 0, "%s", message); }
 
 const char *qa_format_dialect_name(qa_format_dialect dialect) {
   return dialect == QA_FORMAT_WINDOWS ? "windows" : "system-v";

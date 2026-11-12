@@ -3,14 +3,34 @@
 #include "qa/network/common/js_number.h"
 
 #include <math.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 #include "qa/foundation/support.h"
 
+/* Zeroed, so a raise partway through a lump finds every unfilled slot empty. */
 static void *xmalloc(size_t size) {
-  void *p = malloc(size == 0 ? 1 : size);
+  void *p = calloc(size == 0 ? 1 : size, 1);
   if (p == NULL) qa_range_error("Out of memory");
   return p;
+}
+
+/* A malformed record (a non-finite float, an invalid face side) raises partway
+ * through a lump; the records read so far must not leak when the caller catches it. */
+static void free_slot(void *slot) { free(*(void **)slot); }
+typedef struct nested_records {
+  void **result;
+  size_t *filled;
+  size_t stride, member;
+} nested_records;
+static void nested_release(void *arg) {
+  nested_records *records = (nested_records *)arg;
+  uint8_t *base = (uint8_t *)*records->result;
+  if (base != NULL) {
+    for (size_t i = 0; i < *records->filled; i++) free(*(void **)(base + i * records->stride + records->member));
+  }
+  free(base);
 }
 
 qa_vec3 qa_q1_read_vec3(qa_binary_reader *reader) {
@@ -74,6 +94,8 @@ static size_t record_count(qa_binary_reader *reader, size_t stride) {
 qa_bsp_plane *qa_q1_read_planes(qa_binary_reader *reader, size_t *out_count) {
   size_t count = record_count(reader, 20);
   qa_bsp_plane *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) {
     qa_vec3 normal = qa_q1_read_vec3(reader);
     double distance = qa_binary_reader_finite_f32(reader);
@@ -83,6 +105,7 @@ qa_bsp_plane *qa_q1_read_planes(qa_binary_reader *reader, size_t *out_count) {
     result[i].type = type;
     result[i].signbits = (normal.x < 0 ? 1 : 0) | (normal.y < 0 ? 2 : 0) | (normal.z < 0 ? 4 : 0);
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -105,6 +128,8 @@ qa_bsp_node *qa_q1_read_nodes(qa_binary_reader *reader, qa_q1_bsp_format format,
   size_t stride = format == QA_Q1_FORMAT_BSP29 ? 24 : format == QA_Q1_FORMAT_2PSB ? 32 : 44;
   size_t count = record_count(reader, stride);
   qa_bsp_node *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) {
     result[i].plane = qa_binary_reader_i32(reader);
     result[i].children[0] = node_child(reader, format, (double)count);
@@ -118,6 +143,7 @@ qa_bsp_node *qa_q1_read_nodes(qa_binary_reader *reader, qa_q1_bsp_format format,
       result[i].faces.count = qa_binary_reader_u32(reader);
     }
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -135,11 +161,14 @@ qa_q1_clip_node *qa_q1_read_clipnodes(qa_binary_reader *reader, qa_q1_bsp_format
   size_t stride = format == QA_Q1_FORMAT_BSP29 ? 8 : 12;
   size_t count = record_count(reader, stride);
   qa_q1_clip_node *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) {
     result[i].plane = qa_binary_reader_i32(reader);
     result[i].children[0] = clip_child(reader, format, (double)count);
     result[i].children[1] = clip_child(reader, format, (double)count);
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -148,6 +177,8 @@ qa_q1_leaf *qa_q1_read_leaves(qa_binary_reader *reader, qa_q1_bsp_format format,
   size_t stride = format == QA_Q1_FORMAT_BSP29 ? 28 : format == QA_Q1_FORMAT_2PSB ? 32 : 44;
   size_t count = record_count(reader, stride);
   qa_q1_leaf *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) {
     result[i].contents = qa_binary_reader_i32(reader);
     result[i].has_visibility_offset = qa_q1_optional_offset(qa_binary_reader_i32(reader), &result[i].visibility_offset);
@@ -161,6 +192,7 @@ qa_q1_leaf *qa_q1_read_leaves(qa_binary_reader *reader, qa_q1_bsp_format format,
     }
     for (int j = 0; j < 4; j++) result[i].ambient_sound[j] = qa_binary_reader_u8(reader);
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -169,6 +201,8 @@ qa_bsp_edge *qa_q1_read_edges(qa_binary_reader *reader, qa_q1_bsp_format format,
   size_t stride = format == QA_Q1_FORMAT_BSP29 ? 4 : 8;
   size_t count = record_count(reader, stride);
   qa_bsp_edge *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) {
     if (format == QA_Q1_FORMAT_BSP29) {
       result[i].vertices[0] = qa_binary_reader_u16(reader);
@@ -178,6 +212,7 @@ qa_bsp_edge *qa_q1_read_edges(qa_binary_reader *reader, qa_q1_bsp_format format,
       result[i].vertices[1] = qa_binary_reader_u32(reader);
     }
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -186,6 +221,10 @@ qa_bsp_face *qa_q1_read_faces(qa_binary_reader *reader, qa_q1_bsp_format format,
   size_t stride = format == QA_Q1_FORMAT_BSP29 ? 20 : 28;
   size_t count = record_count(reader, stride);
   qa_bsp_face *result = xmalloc(count * sizeof *result);
+  size_t filled = count; /* calloc: an unfilled slot frees NULL */
+  nested_records nested = {(void **)&result, &filled, sizeof *result, offsetof(qa_bsp_face, styles.values)};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, nested_release, &nested);
   for (size_t i = 0; i < count; i++) {
     result[i].plane = format == QA_Q1_FORMAT_BSP29 ? qa_binary_reader_u16(reader) : qa_binary_reader_u32(reader);
     double side = format == QA_Q1_FORMAT_BSP29 ? qa_binary_reader_u16(reader) : qa_binary_reader_u32(reader);
@@ -200,6 +239,7 @@ qa_bsp_face *qa_q1_read_faces(qa_binary_reader *reader, qa_q1_bsp_format format,
     result[i].back = side == 1;
     result[i].has_lighting_offset = qa_q1_optional_offset(qa_binary_reader_i32(reader), &result[i].lighting_offset);
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -207,12 +247,15 @@ qa_bsp_face *qa_q1_read_faces(qa_binary_reader *reader, qa_q1_bsp_format format,
 qa_q1_texture_info *qa_q1_read_texture_info(qa_binary_reader *reader, size_t *out_count) {
   size_t count = record_count(reader, 40);
   qa_q1_texture_info *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) {
     result[i].projection.s = qa_q1_read_vec4(reader);
     result[i].projection.t = qa_q1_read_vec4(reader);
     result[i].texture = qa_binary_reader_i32(reader);
     result[i].flags = qa_binary_reader_i32(reader);
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -220,6 +263,10 @@ qa_q1_texture_info *qa_q1_read_texture_info(qa_binary_reader *reader, size_t *ou
 qa_q1_world_model *qa_q1_read_models(qa_binary_reader *reader, size_t *out_count) {
   size_t count = record_count(reader, 64);
   qa_q1_world_model *result = xmalloc(count * sizeof *result);
+  size_t filled = count; /* calloc: an unfilled slot frees NULL */
+  nested_records nested = {(void **)&result, &filled, sizeof *result, offsetof(qa_q1_world_model, headnodes.values)};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, nested_release, &nested);
   for (size_t i = 0; i < count; i++) {
     result[i].bounds = qa_q1_read_bounds(reader, true);
     result[i].origin = qa_q1_read_vec3(reader);
@@ -231,6 +278,7 @@ qa_q1_world_model *qa_q1_read_models(qa_binary_reader *reader, size_t *out_count
     result[i].faces.first = qa_binary_reader_i32(reader);
     result[i].faces.count = qa_binary_reader_i32(reader);
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -238,7 +286,10 @@ qa_q1_world_model *qa_q1_read_models(qa_binary_reader *reader, size_t *out_count
 qa_vec3 *qa_q1_read_vertices(qa_binary_reader *reader, size_t *out_count) {
   size_t count = record_count(reader, 12);
   qa_vec3 *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) result[i] = qa_q1_read_vec3(reader);
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -246,7 +297,10 @@ qa_vec3 *qa_q1_read_vertices(qa_binary_reader *reader, size_t *out_count) {
 double *qa_q1_read_surface_edges(qa_binary_reader *reader, size_t *out_count) {
   size_t count = record_count(reader, 4);
   double *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) result[i] = qa_binary_reader_i32(reader);
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }
@@ -255,9 +309,12 @@ double *qa_q1_read_leaf_faces(qa_binary_reader *reader, qa_q1_bsp_format format,
   size_t stride = format == QA_Q1_FORMAT_BSP29 ? 2 : 4;
   size_t count = record_count(reader, stride);
   double *result = xmalloc(count * sizeof *result);
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free_slot, &result);
   for (size_t i = 0; i < count; i++) {
     result[i] = format == QA_Q1_FORMAT_BSP29 ? qa_binary_reader_u16(reader) : qa_binary_reader_u32(reader);
   }
+  qa_cleanup_pop(&guard);
   *out_count = count;
   return result;
 }

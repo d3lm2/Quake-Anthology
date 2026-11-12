@@ -67,7 +67,7 @@ typedef qa_q3_pres_player_presenter presenter_t;
 static double presenter_time(presenter_t *presenter) { return presenter->host.state->time; }
 static qa_q3_base_source_player_state *snapshot_ps(presenter_t *presenter) {
   qa_q3_pres_retail_snapshot *snap = presenter->host.state->snap;
-  if (snap == NULL) qa_range_error("CG_Player requires an active snapshot");
+  if (snap == NULL) qa_raise("Error", 0, 0, "CG_Player requires an active snapshot");
   return &snap->player_state;
 }
 static void add_model(presenter_t *presenter, const qa_q3_pres_ref_model_entity *model) {
@@ -77,7 +77,7 @@ static void add_model(presenter_t *presenter, const qa_q3_pres_ref_model_entity 
 
 void qa_q3_pres_player_presenter_init(presenter_t *presenter, qa_q3_pres_player_presentation_host host) {
   if (host.product != host.state->product) {
-    qa_range_error("Player media product differs from cgame product");
+    qa_raise("Error", 0, 0, "Player media product differs from cgame product");
   }
   presenter->host = host;
 }
@@ -176,7 +176,7 @@ bool qa_q3_pres_player_presenter_light_verts(presenter_t *presenter, qa_vec3 nor
         components[axis] = (double)(qa_js_to_int32(trunc(ambient[axis])) & 255);
       } else {
         double value = trunc(f_(ambient[axis] + f_(incoming * directed[axis])));
-        components[axis] = (double)(qa_js_to_int32((value < 255 ? value : 255)) & 255);
+        components[axis] = (double)(qa_js_to_int32(qa_js_min(255, value)) & 255);
       }
     }
     vertices[index].color = qa_math_vec4(components[0], components[1], components[2], 255);
@@ -260,7 +260,7 @@ static shadow_result shadow(presenter_t *presenter, qa_q3_pres_client_entity *en
   if (trace.fraction == 1 || strcmp(trace.solidity, "clear") != 0) return hidden;
   shadow_result result = {true, f_(trace.end.z + 1)};
   if (options.shadows != 1) return result;
-  if (!trace.has_plane) qa_range_error("Player shadow hit has no contact plane");
+  if (!trace.has_plane) qa_raise("Error", 0, 0, "Player shadow hit has no contact plane");
   double alpha = f_(1 - trace.fraction);
   qa_q3_pres_impact_mark_request request;
   memset(&request, 0, sizeof request);
@@ -467,14 +467,14 @@ static qa_vec3 trail_position_at(qa_q3_pres_skull_trail *trail, int64_t index) {
 }
 static void tokens(presenter_t *presenter, qa_q3_pres_client_entity *entity, qa_q3_pres_client_info *ci,
     double render_flags, const qa_q3_pres_mission_player_media *media) {
-  double token_count_value = entity->current_state.generic1 < 10 ? entity->current_state.generic1 : 10;
+  double token_count_value = qa_js_min(entity->current_state.generic1, 10);
   int32_t number = qa_js_to_int32(entity->current_state.number);
   if (number < 0 || number >= QA_Q3_PRES_MAX_CLIENTS) {
     /* Corpses have non-client entity numbers, and source indexes cg.skullTrails out of bounds for them; there is nothing to trail. */
     return;
   }
   qa_q3_pres_skull_trail *trail = &presenter->host.state->skull_trails[number];
-  if (token_count_value == 0) {
+  if (token_count_value == 0 || token_count_value != token_count_value) { /* TS !tokens: 0 and NaN */
     trail->num_positions = 0;
     return;
   }
@@ -752,6 +752,7 @@ static void reset_entities(store_t *store, double index) {
       store->entity_reset(store->entity_reset_ctx, entity);
   }
 }
+qa_q3_pres_client_game_state *qa_q3_pres_client_info_store_state(const store_t *store) { return store->host.state; }
 qa_q3_pres_client_info *qa_q3_pres_client_info_store_client_info(store_t *store, double index) {
   if (index != trunc(index) || index < 0 || index >= 64) {
     char wanted[32];
@@ -951,8 +952,10 @@ static load_status load_skin(store_t *store, qa_q3_pres_client_info *ci,
   if (status != LOAD_OK) return status;
   CHECKED(check);
   if (file.found) {
-    if (!store->host.register_skin(store->host.resources_ctx, file.path, &ci->legs_skin)) return LOAD_OOM;
+    const qa_q3_pres_scene_skin *handle = NULL; /* TS assigns the handle only after check() */
+    if (!store->host.register_skin(store->host.resources_ctx, file.path, &handle)) return LOAD_OOM;
     CHECKED(check);
+    ci->legs_skin = handle;
   }
   if (ci->legs_skin == NULL) {
     char message[192];
@@ -963,8 +966,10 @@ static load_status load_skin(store_t *store, qa_q3_pres_client_info *ci,
   if (status != LOAD_OK) return status;
   CHECKED(check);
   if (file.found) {
-    if (!store->host.register_skin(store->host.resources_ctx, file.path, &ci->torso_skin)) return LOAD_OOM;
+    const qa_q3_pres_scene_skin *handle = NULL; /* TS assigns the handle only after check() */
+    if (!store->host.register_skin(store->host.resources_ctx, file.path, &handle)) return LOAD_OOM;
     CHECKED(check);
+    ci->torso_skin = handle;
   }
   if (ci->torso_skin == NULL) {
     char message[192];
@@ -975,8 +980,10 @@ static load_status load_skin(store_t *store, qa_q3_pres_client_info *ci,
   if (status != LOAD_OK) return status;
   CHECKED(check);
   if (file.found) {
-    if (!store->host.register_skin(store->host.resources_ctx, file.path, &ci->head_skin)) return LOAD_OOM;
+    const qa_q3_pres_scene_skin *handle = NULL; /* TS assigns the handle only after check() */
+    if (!store->host.register_skin(store->host.resources_ctx, file.path, &handle)) return LOAD_OOM;
     CHECKED(check);
+    ci->head_skin = handle;
   }
   if (ci->head_skin == NULL) {
     char message[192];
@@ -990,7 +997,20 @@ typedef struct anim_print_ctx { store_t *store; load_check *check; bool supersed
 static void anim_print(void *ctx, const char *message) {
   anim_print_ctx *print = ctx;
   print->store->host.print(print->store->host.ctx, message);
-  if (superseded(print->check)) print->superseded_seen = true;
+  /* TS check() throws SupersededClientLoad out of the parse. */
+  if (superseded(print->check)) {
+    print->superseded_seen = true;
+    qa_raise("SupersededClientLoad", 0, 0, "superseded client load");
+  }
+}
+typedef struct anim_parse_call {
+  const char *text, *path;
+  const qa_q3_player_animation_parse_context *context;
+  qa_q3_player_animation_config *config;
+} anim_parse_call;
+static void anim_parse_run(void *ctx) {
+  anim_parse_call *call = ctx;
+  qa_q3_parse_player_animation_config(call->text, call->path, call->context, call->config);
 }
 static load_status load_animation(store_t *store, qa_q3_pres_client_info *ci, const char *path,
     load_check *check, bool *out_loaded) {
@@ -1019,15 +1039,23 @@ static load_status load_animation(store_t *store, qa_q3_pres_client_info *ci, co
   anim_print_ctx print = {store, check, false};
   qa_q3_player_animation_parse_context context = {&target, &store->animation_parser, &print, anim_print};
   qa_q3_player_animation_config config;
-  /* Landed parse errors abort (qa_text_parse_error); TS would catch
-   * PlayerAnimationParseError and return false here. */
-  qa_q3_parse_player_animation_config(text, path, &context, &config);
+  memset(&config, 0, sizeof config);
+  anim_parse_call call = {text, path, &context, &config};
+  qa_caught_error caught;
+  bool parsed = qa_try(anim_parse_run, &call, &caught);
   free(text);
+  /* TS parses into ci itself, so what a failed parse had stored stays. */
   ci->footsteps = target.footsteps;
   ci->head_offset = target.head_offset;
   ci->gender = target.gender;
   ci->fixed_legs = target.fixed_legs;
   ci->fixed_torso = target.fixed_torso;
+  if (!parsed) {
+    if (strcmp(caught.name, "SupersededClientLoad") == 0) return LOAD_SUPERSEDED;
+    /* TS catches PlayerAnimationParseError (the parser's TextParseError) and reports the file as not loaded. */
+    if (strcmp(caught.name, "TextParseError") != 0) qa_rethrow(&caught);
+    return LOAD_OK;
+  }
   qa_q3_player_animation_config_destroy(&config);
   if (print.superseded_seen || superseded(check)) return LOAD_SUPERSEDED;
   *out_loaded = true;
@@ -1039,8 +1067,10 @@ static load_status register_model_path(store_t *store, const char *format, const
                                    arg2 != NULL ? qa_q3_game_format_string(arg2) : qa_q3_game_format_null()};
   load_status status = filename_of(store, 128, format, args, arg2 != NULL ? 2 : 1, check, path_out, 128);
   if (status != LOAD_OK) return status;
-  if (!store->host.register_model(store->host.resources_ctx, path_out, out)) return LOAD_OOM;
+  qa_q3_pres_scene_model handle = qa_q3_pres_default_model; /* TS assigns the handle only after check() */
+  if (!store->host.register_model(store->host.resources_ctx, path_out, &handle)) return LOAD_OOM;
   CHECKED(check);
+  *out = handle;
   return LOAD_OK;
 }
 static load_status load_model(store_t *store, qa_q3_pres_client_info *ci,
@@ -1082,7 +1112,9 @@ static load_status load_model(store_t *store, qa_q3_pres_client_info *ci,
     return LOAD_OK;
   }
   if (head[0] == '*') {
-    status = register_model_path(store, "models/players/heads/%s/%s.md3", head_model + 1, head_model + 1,
+    /* TS headModel.slice(1): "" when the star came from the body model and the head model name is empty. */
+    const char *starred = head_model[0] != '\0' ? head_model + 1 : "";
+    status = register_model_path(store, "models/players/heads/%s/%s.md3", starred, starred,
         check, path, &ci->head_model);
   } else {
     status = register_model_path(store, "models/players/%s/head.md3", head, NULL, check, path,
@@ -1168,8 +1200,10 @@ static load_status load_model(store_t *store, qa_q3_pres_client_info *ci,
     CHECKED(check);
   }
   if (icon.found) {
-    if (!store->host.register_shader_no_mip(store->host.ctx, icon.path, &ci->model_icon)) return LOAD_OOM;
+    const qa_q3_pres_scene_shader *shader = NULL;
+    if (!store->host.register_shader_no_mip(store->host.ctx, icon.path, &shader)) return LOAD_OOM;
     CHECKED(check);
+    ci->model_icon = shader;
   }
   *out_loaded = ci->model_icon != NULL;
   return LOAD_OK;
@@ -1240,8 +1274,8 @@ static load_status load_client(store_t *store, qa_q3_pres_client_info *ci,
     if (loaded) {
       snprintf(path, sizeof path, "sound/player/%.80s/%.60s", STR(ci->model_name), name);
       if (!store->host.register_sound(store->host.ctx, path, false, &sounds[index])) return LOAD_OOM;
-      CHECKED(check);
     }
+    CHECKED(check);
     if (sounds[index] == NULL) {
       snprintf(path, sizeof path, "sound/player/%.80s/%.60s", fallback, name);
       if (!store->host.register_sound(store->host.ctx, path, false, &sounds[index])) return LOAD_OOM;
@@ -1298,10 +1332,11 @@ static bool reuse(store_t *store, qa_q3_pres_client_info *ci, qa_q3_pres_client_
 }
 static load_status defer(store_t *store, qa_q3_pres_client_info *ci,
     qa_q3_pres_client_info_settings settings, load_check *check) {
+  /* TS slots.slice(0, maxClients): the end truncates, and a negative end counts back from 64. */
   size_t candidate_count = 0;
-  if (settings.max_clients > 0) {
-    candidate_count = settings.max_clients >= 64 ? 64 : (size_t)settings.max_clients;
-  }
+  double slice_end = settings.max_clients != settings.max_clients ? 0 : trunc(settings.max_clients);
+  if (slice_end < 0) slice_end = slice_end + 64 < 0 ? 0 : slice_end + 64;
+  candidate_count = slice_end >= 64 ? 64 : (size_t)slice_end;
   for (size_t i = 0; i < candidate_count; i++) {
     qa_q3_pres_client_info *match = store->slots[i];
     if (match->info_valid && !match->deferred && same_string(ci->skin_name, match->skin_name) &&
@@ -1361,6 +1396,7 @@ static char *info_value(const char *config, const char *key) {
   return qa_info_value_for_key(config, key);
 }
 
+static void destroy_client_info(void *arg) { qa_q3_pres_client_info_destroy(arg); }
 bool qa_q3_pres_client_info_store_new_client_info(store_t *store, double index, const char *configstring) {
   qa_q3_pres_client_info *slot = qa_q3_pres_client_info_store_client_info(store, index);
   double request = store->requests[(size_t)index] + 1;
@@ -1368,9 +1404,12 @@ bool qa_q3_pres_client_info_store_new_client_info(store_t *store, double index, 
   load_check check = {store, index, request, store->lifecycle, true};
   qa_q3_pres_client_info next;
   qa_q3_pres_client_info_init(&next);
+  qa_cleanup next_node; /* a raise out of the load (CommonError drop) releases next */
+  qa_cleanup_push(&next_node, destroy_client_info, &next);
   bool ok = true;
   if (configstring == NULL || configstring[0] == '\0') {
     ok = qa_q3_pres_client_info_copy_from(slot, &next);
+    qa_cleanup_pop(&next_node);
     qa_q3_pres_client_info_destroy(&next);
     return ok;
   }
@@ -1414,6 +1453,7 @@ bool qa_q3_pres_client_info_store_new_client_info(store_t *store, double index, 
   ok = ok && value != NULL && set_sliced_field(&next.blue_team, value, 31);
   free(value);
   if (!ok) {
+    qa_cleanup_pop(&next_node);
     qa_q3_pres_client_info_destroy(&next);
     return false;
   }
@@ -1442,6 +1482,7 @@ bool qa_q3_pres_client_info_store_new_client_info(store_t *store, double index, 
   free(model_value);
   free(head_value);
   if (!ok) {
+    qa_cleanup_pop(&next_node);
     qa_q3_pres_client_info_destroy(&next);
     return false;
   }
@@ -1462,10 +1503,12 @@ bool qa_q3_pres_client_info_store_new_client_info(store_t *store, double index, 
     }
   }
   if (status == LOAD_SUPERSEDED) {
+    qa_cleanup_pop(&next_node);
     qa_q3_pres_client_info_destroy(&next);
     return true;
   }
   if (status == LOAD_OOM) {
+    qa_cleanup_pop(&next_node);
     qa_q3_pres_client_info_destroy(&next);
     return false;
   }
@@ -1474,6 +1517,7 @@ bool qa_q3_pres_client_info_store_new_client_info(store_t *store, double index, 
     ok = qa_q3_pres_client_info_copy_from(slot, &next);
     if (ok && loaded) reset_entities(store, index);
   }
+  qa_cleanup_pop(&next_node);
   qa_q3_pres_client_info_destroy(&next);
   return ok;
 }

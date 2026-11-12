@@ -173,20 +173,30 @@ static char *format(const char *pattern, const qa_q3_game_format_arg *args, size
   return check(qa_q3_game_format(pattern, args, count, 32000));
 }
 static double clock_time(qa_game_bot_catalog_bots_a *c) { return c->game->clock_time(c->game->ctx); }
+/* A TS template literal has no length limit: print through a sized heap buffer. */
+static void print_two(qa_game_bot_catalog_bots_a *c, const char *head, const char *middle,
+                      const char *tail) {
+  size_t a = strlen(head), b = strlen(middle), d = strlen(tail);
+  char *text = check(malloc(a + b + d + 1));
+  memcpy(text, head, a);
+  memcpy(text + a, middle, b);
+  memcpy(text + a + b, tail, d + 1);
+  print(c, text);
+  free(text);
+}
 
 static void load_file(qa_game_bot_catalog_bots_a *c, const char *filename,
                       qa_game_info_catalog_bots_a *destination) {
   size_t length = 0;
   const uint8_t *bytes = c->files.read(c->files.ctx, filename, &length);
-  char text[256];
   if (bytes == NULL) {
-    snprintf(text, sizeof text, "^1file not found: %s\n", filename);
-    print(c, text);
+    print_two(c, "^1file not found: ", filename, "\n");
     return;
   }
   if (length >= MAX_TEXT) {
-    snprintf(text, sizeof text, "^1file too large: %s is %zu, max allowed is %d", filename, length, MAX_TEXT);
-    print(c, text);
+    char tail[64];
+    snprintf(tail, sizeof tail, " is %zu, max allowed is %d", length, MAX_TEXT);
+    print_two(c, "^1file too large: ", filename, tail);
     return;
   }
   qa_common_parse_cursor cursor;
@@ -379,10 +389,8 @@ static void add_bot(qa_game_bot_catalog_bots_a *c, const char *name, double skil
                     int64_t delay, const char *alternate_name) {
   skill = (float)skill;
   char *info = qa_game_bot_catalog_bot_info_by_name(c, name);
-  char text[256];
   if (info == NULL) {
-    snprintf(text, sizeof text, "^1Error: Bot '%s' not defined\n", name);
-    print(c, text);
+    print_two(c, "^1Error: Bot '", name, "' not defined\n");
     return;
   }
   char *userinfo = check(calloc(1, 1));
@@ -669,8 +677,7 @@ void qa_game_bot_catalog_check_minimum_players(qa_game_bot_catalog_bots_a *c) {
     return;
   c->check_minimum_time = time;
   if (!c->has_minimum_players) {
-    fprintf(stderr, "G_CheckMinimumPlayers requires G_InitBots\n");
-    abort();
+    qa_raise("Error", 0, 0, "G_CheckMinimumPlayers requires G_InitBots");
   }
   qa_bot_cvar_update_bots_a(&c->minimum_players);
   int64_t minimum = c->minimum_players.integer_value;
@@ -739,22 +746,27 @@ static void field(const qa_save_reader *r, const char *name, qa_save_reader *out
 }
 static void restore_catalog(qa_game_bot_catalog_bots_a *c, qa_game_info_catalog_bots_a *target,
                             const qa_save_reader *cell) {
+  /* TS order: every info allocation restores (and validates) first, then count, then the extent. */
   qa_save_reader infos, count_reader, entry;
   field(cell, "infos", &infos);
   size_t length = qa_save_reader_list_count(&infos);
-  field(cell, "count", &count_reader);
-  double count = qa_save_reader_integer_min(&count_reader, 0);
-  qa_save_reader_destroy(&count_reader);
-  qa_q3_game_memory_allocation next[QA_GAME_MAX_INFOS];
-  for (size_t i = 0; i < length && i < QA_GAME_MAX_INFOS; i++) {
+  qa_q3_game_memory_allocation *next = check(calloc(length == 0 ? 1 : length, sizeof *next));
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, next);
+  for (size_t i = 0; i < length; i++) {
     if (!qa_save_reader_item(&infos, i, &entry))
       qa_range_error("Out of memory in the bot catalog");
     next[i] = qa_q3_game_memory_restore_allocation(c->game->memory, entry.value);
     qa_save_reader_destroy(&entry);
   }
+  field(cell, "count", &count_reader);
+  double count = qa_save_reader_integer_min(&count_reader, 0);
+  qa_save_reader_destroy(&count_reader);
   if (count > (double)length || length > QA_GAME_MAX_INFOS)
     qa_save_reader_fail(cell, "invalid catalog extent");
+  qa_cleanup_pop(&guard);
   memcpy(target->infos, next, length * sizeof *next);
+  free(next);
   target->infos_length = length;
   target->count = (int64_t)count;
   qa_save_reader_destroy(&infos);
@@ -769,20 +781,29 @@ void qa_game_bot_catalog_restore_save_state(qa_game_bot_catalog_bots_a *c, const
   field(&reader, "arenas", &cell);
   restore_catalog(c, &c->arenas, &cell);
   qa_save_reader_destroy(&cell);
+  /* TS maps every queue cell before it checks the extent. */
   field(&reader, "queue", &list);
-  if (qa_save_reader_list_count(&list) != 16)
-    qa_save_reader_fail(&reader, "incorrect spawn queue extent");
-  for (size_t i = 0; i < 16; i++) {
+  size_t queue_length = qa_save_reader_list_count(&list);
+  qa_bot_spawn_slot_bots_a *queue = check(calloc(queue_length == 0 ? 1 : queue_length, sizeof *queue));
+  qa_cleanup queue_guard;
+  qa_cleanup_push(&queue_guard, free, queue);
+  for (size_t i = 0; i < queue_length; i++) {
     if (!qa_save_reader_item(&list, i, &cell))
       qa_range_error("Out of memory in the bot catalog");
     field(&cell, "clientNum", &leaf);
-    c->queue[i].client_num = (int64_t)qa_save_reader_integer(&leaf);
+    queue[i].client_num = (int64_t)qa_save_reader_integer(&leaf);
     qa_save_reader_destroy(&leaf);
     field(&cell, "spawnTime", &leaf);
-    c->queue[i].spawn_time = qa_save_reader_number(&leaf);
+    queue[i].spawn_time = qa_save_reader_number(&leaf);
     qa_save_reader_destroy(&leaf);
     qa_save_reader_destroy(&cell);
   }
+  if (queue_length != 16)
+    qa_save_reader_fail(&reader, "incorrect spawn queue extent");
+  qa_cleanup_pop(&queue_guard);
+  for (size_t i = 0; i < 16; i++)
+    c->queue[i] = queue[i];
+  free(queue);
   qa_save_reader_destroy(&list);
   field(&reader, "minimumPlayers", &cell);
   c->has_minimum_players = !qa_save_reader_is_null(&cell);

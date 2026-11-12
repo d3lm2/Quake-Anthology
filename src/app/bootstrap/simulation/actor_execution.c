@@ -146,7 +146,7 @@ qa_app_sim_shared_physics_flags qa_app_sim_actor_flags(const qa_app_sim_actor_ex
     return flags;
   }
   const qa_q2_entity *entity = entry->q2_entity;
-  const qa_q2m_state *monster = entry->read_monster(entry->ctx);
+  const qa_q2m_state *monster = entry->read_monster(entry->ctx, entry->actor.id);
   int32_t bits = qa_js_to_int32(entity->flags);
   flags.has_team_slave = true; flags.team_slave = (bits & 1024) != 0;
   flags.has_always_touch = true; flags.always_touch = (bits & 0x10000000) != 0;
@@ -175,7 +175,7 @@ void qa_app_sim_write_actor_flags(const qa_app_sim_actor_execution *entry, qa_ap
     }
     return;
   }
-  qa_q2m_state *monster = entry->read_monster(entry->ctx);
+  qa_q2m_state *monster = entry->read_monster(entry->ctx, entry->actor.id);
   if (monster == NULL) return;
   if (changes.has_water_level) {
     double level = changes.water_level;
@@ -282,6 +282,7 @@ static void q2_push_turn(q2_turn *turn, qa_owned_actor actor) {
   if (count != 0 && team == NULL) qa_range_error("Out of memory");
   if (count != 0) memcpy(team, shared, count * sizeof *team);
   if (count != 0 && !qa_same_actor(team[0].id, actor.id)) { free(team); return; }
+  qa_cleanup team_node; qa_cleanup_push(&team_node, free, team); /* a raising push, think or postPhysics frees the copy */
   for (size_t i = 0; i < count; i++) qa_app_sim_actor_visited_add(context->visited, team[i]);
   qa_actor_id obstacle;
   bool blocked = qa_app_sim_shared_physics_push_team(context->physics, team, count, context->elapsed, &obstacle);
@@ -305,6 +306,7 @@ static void q2_push_turn(q2_turn *turn, qa_owned_actor actor) {
   for (size_t i = 0; i < count; i++)
     if (qa_session_actor_registry_is_live(context->actors, team[i].id))
       qa_q2_entity_services_post_physics(services, team[i].id);
+  qa_cleanup_pop(&team_node);
   free(team);
 }
 

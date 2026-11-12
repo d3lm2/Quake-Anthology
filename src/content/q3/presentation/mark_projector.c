@@ -8,10 +8,13 @@
 #include "qa/core/renderer_math.h"
 #include "qa/foundation/support.h"
 #include "qa/foundation/js.h"
-enum { MAX_CLIP = 64, MAX_SURF = 64 };
+/* CLIP_OUT: one chop pushes at most two points per input vertex and accepts at most
+ * MAX_CLIP - 3 of them; TS arrays have no limit, so the scratch holds the worst case. */
+enum { MAX_CLIP = 64, MAX_SURF = 64, CLIP_OUT = 2 * MAX_CLIP };
 static float f32(double v) { return (float)v; }
 static const void *at_idx(const void *base, size_t stride, size_t count, double index) {
-  if (index < 0 || index != (double)(size_t)index || (size_t)index >= count)
+  /* NaN and non-integers are TS undefined; no integer cast before the range is known. */
+  if (!(index >= 0) || !(index < (double)count) || index != floor(index))
     qa_range_error("mark geometry index %s outside %zu", QA_JS_NUMBER(index), count);
   return (const char *)base + stride * (size_t)index;
 }
@@ -19,7 +22,8 @@ static const void *at_idx(const void *base, size_t stride, size_t count, double 
 static qa_vec3 finite_vec(qa_vec3 v) {
   if (!isfinite(f32(v.x)) || !isfinite(f32(v.y)) || !isfinite(f32(v.z)))
     qa_range_error("mark coordinates must be finite float32 values");
-  return v;
+  /* TS returns vec3(value.x, value.y, value.z): rounded to binary32. */
+  return (qa_vec3){f32(v.x), f32(v.y), f32(v.z)};
 }
 static void capacity(double v) {
   if (v != trunc(v) || v < 0 || v > 1000000) qa_range_error("mark buffer capacity must be an integer in [0, 1000000]");
@@ -30,7 +34,7 @@ static int box_side(qa_bounds b, qa_plane p) {
   if (p.normal.z == 1) { if (p.distance <= b.min.z) return 1; if (p.distance >= b.max.z) return 2; return 3; }
   return qa_box_on_plane_side(b, p);
 }
-/* R_ChopPolyBehindPlane. out capacity MAX_CLIP. Returns count. */
+/* R_ChopPolyBehindPlane. out capacity CLIP_OUT. Returns count. */
 static size_t chop(const qa_vec3 *pts, size_t n, qa_plane plane, qa_vec3 *out) {
   if (n >= MAX_CLIP - 2) return 0;
   double dist[MAX_CLIP]; int side[MAX_CLIP]; bool has0 = false, has1 = false;
@@ -80,32 +84,51 @@ static void coll_points(void *ctx, double first, const qa_vec3 *pts, size_t n) {
   if (!grow((void **)&c->out.points, &c->pcap, c->out.point_count + n, sizeof *c->out.points)) { c->oom = true; return; }
   memcpy(c->out.points + c->out.point_count, pts, n * sizeof *pts); c->out.point_count += n;
 }
+static void collect_free(void *arg) { qa_q3_pres_mark_fragments_destroy(&((collect_t *)arg)->out); }
 bool qa_q3_pres_bsp_mark_projector_mark_fragments(qa_q3_pres_bsp_mark_projector *p,
     qa_q3_pres_mark_projection q, qa_q3_pres_mark_fragments *out) {
   memset(out, 0, sizeof *out);
   collect_t c; memset(&c, 0, sizeof c); c.q = &q;
   qa_q3_pres_source_mark_projection rec = {(double)q.point_count, q.max_points, q.max_fragments, &c,
       coll_point, coll_proj, coll_frag, coll_points};
+  /* A RangeError from the record (bad geometry index, non-finite point) must not leave the
+   * collected arrays behind for a caller that catches it. */
+  qa_cleanup collected;
+  qa_cleanup_push(&collected, collect_free, &c);
   qa_q3_pres_bsp_mark_projector_mark_fragments_record(p, rec);
+  qa_cleanup_pop(&collected);
   if (c.oom) { qa_q3_pres_mark_fragments_destroy(&c.out); return false; }
   *out = c.out; return true;
 }
+typedef struct { bool *visited; double *stack; } box_scratch;
+static void box_scratch_free(void *arg) { box_scratch *s = arg; free(s->visited); free(s->stack); }
 static size_t box_surfaces(qa_q3_pres_bsp_mark_projector *p, qa_bounds b, qa_vec3 dir,
     const qa_q3_pres_mark_surface **out) {
   const qa_q3_pres_mark_geometry *g = &p->geometry;
   /* visited flags over surface indices via small local set (indices < surfaces_count). */
   size_t sc = g->surfaces_count;
-  bool *visited = sc ? calloc(sc, 1) : NULL;
-  if (sc && !visited) return 0;
-  double stack[4096]; size_t sp = 0, n = 0;
+  /* The TS stack is an unbounded array; a walk never holds more than one entry per node
+   * plus one, so that is the capacity (no fixed cap that a deep tree could exceed). */
+  box_scratch scratch = {sc ? calloc(sc, 1) : NULL, malloc((g->node_count + 2) * sizeof(double))};
+  bool *visited = scratch.visited;
+  double *stack = scratch.stack;
+  if ((sc && !visited) || !stack) { box_scratch_free(&scratch); return 0; }
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, box_scratch_free, &scratch);
+  size_t sp = 0, n = 0, stack_cap = g->node_count + 2;
   if (g->node_count == 0) { if (g->leaf_count) stack[sp++] = -1; } else stack[sp++] = 0;
   while (sp > 0) {
     double index = stack[--sp];
     if (index >= 0) {
       qa_q3_pres_mark_node node = AT(g->nodes, g->node_count, index);
       int side = box_side(b, AT(g->planes, g->plane_count, node.plane));
-      if ((side & 2) && sp < 4096) stack[sp++] = node.child_is_node[1] ? node.child_index[1] : -1 - node.child_index[1];
-      if ((side & 1) && sp < 4096) stack[sp++] = node.child_is_node[0] ? node.child_index[0] : -1 - node.child_index[0];
+      if (sp + 2 > stack_cap) { /* only a cyclic (corrupt) tree gets here */
+        double *grown = realloc(stack, stack_cap * 2 * sizeof *stack);
+        if (!grown) break;
+        scratch.stack = stack = grown; stack_cap *= 2;
+      }
+      if (side & 2) stack[sp++] = node.child_is_node[1] ? node.child_index[1] : -1 - node.child_index[1];
+      if (side & 1) stack[sp++] = node.child_is_node[0] ? node.child_index[0] : -1 - node.child_index[0];
       continue;
     }
     qa_q3_pres_mark_leaf leaf = AT(g->leaves, g->leaf_count, -index - 1);
@@ -121,12 +144,13 @@ static size_t box_surfaces(qa_q3_pres_bsp_mark_projector *p, qa_bounds b, qa_vec
       out[n++] = s;
     }
   }
-  free(visited); return n;
+  qa_cleanup_pop(&scratch_cleanup);
+  box_scratch_free(&scratch); return n;
 }
 double qa_q3_pres_bsp_mark_projector_mark_fragments_record(qa_q3_pres_bsp_mark_projector *p,
     qa_q3_pres_source_mark_projection q) {
   capacity(q.max_points); capacity(q.max_fragments);
-  if (q.point_count != trunc(q.point_count) || q.point_count < 1)
+  if (!isfinite(q.point_count) || q.point_count != trunc(q.point_count) || q.point_count < 1)
     qa_range_error("mark projection requires at least one input point");
   qa_vec3 projection = finite_vec(q.read_projection(q.ctx));
   qa_vec3 direction = qa_normalize3_or_zero(projection);
@@ -160,7 +184,7 @@ double qa_q3_pres_bsp_mark_projector_mark_fragments_record(qa_q3_pres_bsp_mark_p
     if (s->kind == QA_Q3_PRES_MARK_FACE) {
       if (qa_dot3(s->plane.normal, direction) > -0.5) continue;
       for (size_t i = 0; i < s->index_count; i += 3) {
-        qa_vec3 tri[3], cur[MAX_CLIP], nxt[MAX_CLIP];
+        qa_vec3 tri[3], cur[CLIP_OUT], nxt[CLIP_OUT];
         for (int o = 0; o < 3; o++)
           tri[o] = qa_add3(AT(s->vertices, s->vertex_count, AT(s->indices, s->index_count, (double)(i + (size_t)o))),
                            qa_scale3(s->plane.normal, 0));
@@ -187,7 +211,7 @@ double qa_q3_pres_bsp_mark_projector_mark_fragments_record(qa_q3_pres_bsp_mark_p
           }
           qa_vec3 normal = qa_normalize_fast3(qa_cross3(qa_sub3(tri[0], tri[1]), qa_sub3(tri[2], tri[1])));
           if (qa_dot3(normal, direction) >= thr[t]) continue;
-          qa_vec3 cur[MAX_CLIP], nxt[MAX_CLIP]; memcpy(cur, tri, sizeof tri); size_t cn = 3;
+          qa_vec3 cur[CLIP_OUT], nxt[CLIP_OUT]; memcpy(cur, tri, sizeof tri); size_t cn = 3;
           for (size_t pi = 0; pi < npl && cn; pi++) { cn = chop(cur, cn, planes[pi], nxt); memcpy(cur, nxt, cn * sizeof *cur); }
           if (cn && (double)cn + returned_points <= q.max_points) {
             q.write_fragment(q.ctx, returned_fragments, (qa_q3_pres_mark_fragment){returned_points, (double)cn});

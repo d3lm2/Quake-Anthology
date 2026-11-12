@@ -376,7 +376,7 @@ qa_app_q3_source_subsystems_owner *qa_app_q3_source_subsystems_owner_create(
     qa_app_q3_source_subsystems_parts parts);
 void qa_app_q3_source_subsystems_owner_destroy(qa_app_q3_source_subsystems_owner *owner);
 /* The qa_app_q3_source_subsystems table bound to the owned subsystems.
- * Entries with no landed owner API stay NULL (see runtime.c note). */
+ * settings_capture stays NULL: the checkpoint reads the settings rows itself (q3/runtime.c). */
 qa_app_q3_source_subsystems qa_app_q3_source_subsystems_owner_table(
     qa_app_q3_source_subsystems_owner *owner);
 /* Refresh the flattened snapshot fields from level + settings (the TS

@@ -37,8 +37,9 @@ static double field_integer_min(const qa_save_reader *reader, const char *name, 
   qa_save_reader_destroy(&f);
   return value;
 }
+/* Zeroed, so a partly read declaration can be destroyed when a reader raises. */
 static void *xmalloc_at(const qa_save_reader *reader, size_t size) {
-  void *value = malloc(size != 0 ? size : 1);
+  void *value = calloc(1, size != 0 ? size : 1);
   if (value == NULL) qa_save_reader_fail(reader, "out of memory");
   return value;
 }
@@ -57,14 +58,16 @@ static qa_qc_pickup_scalar read_scalar(const qa_save_reader *reader) {
   else { scalar.is_global = true; scalar.word = field_integer_min(reader, "word", 0); }
   return scalar;
 }
-static qa_qc_pickup_item read_item(const qa_save_reader *reader) {
-  qa_qc_pickup_item result;
+/* Fills *out in place: what is already read stays owned by the declaration
+ * being built, which releases it if a later field is malformed. */
+static void read_item(const qa_save_reader *reader, qa_qc_pickup_item *out) {
+#define result (*out)
   memset(&result, 0, sizeof result);
   /* TS item() reads "resource" before "item", so a malformed resource reports first. */
   qa_save_reader resource_reader = field(reader, "resource");
   if (!qa_save_reader_is_null(&resource_reader)) {
     qa_pickup_resource *resource = xmalloc_at(reader, sizeof *resource);
-    memset(resource, 0, sizeof *resource);
+    result.resource = resource;
     static const char *const KINDS[2] = {"protection", "inventory"};
     const char *kind = field_choice(&resource_reader, "kind", KINDS, 2);
     if (strcmp(kind, "protection") == 0) {
@@ -78,7 +81,6 @@ static qa_qc_pickup_item read_item(const qa_save_reader *reader) {
       resource->item = qa_namespaced(&nested);
       qa_save_reader_destroy(&nested);
     }
-    result.resource = resource;
   }
   qa_save_reader_destroy(&resource_reader);
   qa_save_reader item_reader = field(reader, "item");
@@ -87,48 +89,53 @@ static qa_qc_pickup_item read_item(const qa_save_reader *reader) {
   qa_save_reader count_reader = field(reader, "count");
   if (!qa_save_reader_is_undefined(&count_reader)) {
     qa_qc_pickup_scalar *count = xmalloc_at(reader, sizeof *count);
-    *count = read_scalar(&count_reader);
     result.count = count;
+    *count = read_scalar(&count_reader);
   }
   qa_save_reader_destroy(&count_reader);
-  return result;
+#undef result
 }
+static void destroy_partial_declaration(void *arg) { qa_q1qc_pickup_caller_declaration_destroy(arg); }
 qa_qc_pickup_caller_declaration qa_q1qc_read_pickup_caller(const qa_save_reader *reader) {
   qa_qc_pickup_caller_declaration declaration;
   memset(&declaration, 0, sizeof declaration);
-  declaration.function = field_string(reader, "function");
+  /* A malformed declaration raises from the readers below (TS GC frees the parts). */
+  qa_cleanup node;
+  qa_cleanup_push(&node, destroy_partial_declaration, &declaration);
+  /* TS reads the descriptor kind before the function name. */
   qa_save_reader descriptor = field(reader, "descriptor");
   static const char *const KINDS[3] = {"constant", "string", "float"};
   const char *kind = field_choice(&descriptor, "kind", KINDS, 3);
+  declaration.function = field_string(reader, "function");
   declaration.descriptor.kind = kind;
   if (strcmp(kind, "constant") == 0) {
-    declaration.descriptor.constant_item = read_item(&descriptor);
+    read_item(&descriptor, &declaration.descriptor.constant_item);
   } else {
     declaration.descriptor.field = field_string(&descriptor, "field");
     qa_save_reader values = field(&descriptor, "values");
     size_t count = qa_save_reader_list_count(&values);
     if (strcmp(kind, "string") == 0) {
       qa_qc_pickup_item_string_value *entries = xmalloc_at(&values, count * sizeof *entries);
+      declaration.descriptor.string_values = entries;
+      declaration.descriptor.string_value_count = count;
       for (size_t i = 0; i < count; i++) {
         qa_save_reader entry = item(&values, i);
-        entries[i].item = read_item(&entry);
+        read_item(&entry, &entries[i].item);
         entries[i].value = field_string(&entry, "value");
         qa_save_reader_destroy(&entry);
       }
-      declaration.descriptor.string_values = entries;
-      declaration.descriptor.string_value_count = count;
     } else {
       qa_qc_pickup_item_float_value *entries = xmalloc_at(&values, count * sizeof *entries);
+      declaration.descriptor.float_values = entries;
+      declaration.descriptor.float_value_count = count;
       for (size_t i = 0; i < count; i++) {
         qa_save_reader entry = item(&values, i);
-        entries[i].item = read_item(&entry);
+        read_item(&entry, &entries[i].item);
         qa_save_reader value = field(&entry, "value");
         entries[i].value = qa_save_reader_finite(&value);
         qa_save_reader_destroy(&value);
         qa_save_reader_destroy(&entry);
       }
-      declaration.descriptor.float_values = entries;
-      declaration.descriptor.float_value_count = count;
     }
     qa_save_reader_destroy(&values);
   }
@@ -136,21 +143,27 @@ qa_qc_pickup_caller_declaration qa_q1qc_read_pickup_caller(const qa_save_reader 
   qa_save_reader dropped = field(reader, "dropped");
   if (!qa_save_reader_is_undefined(&dropped)) {
     qa_qc_pickup_scalar *scalar = xmalloc_at(reader, sizeof *scalar);
-    *scalar = read_scalar(&dropped);
     declaration.dropped = scalar;
+    *scalar = read_scalar(&dropped);
   }
   qa_save_reader_destroy(&dropped);
   qa_save_reader regions = field(reader, "regions");
   size_t region_count = qa_save_reader_list_count(&regions);
   qa_qc_pickup_region *entries = xmalloc_at(&regions, region_count * sizeof *entries);
+  declaration.regions = entries;
+  declaration.region_count = region_count;
   for (size_t i = 0; i < region_count; i++) {
     qa_save_reader region = item(&regions, i);
-    memset(&entries[i], 0, sizeof entries[i]);
+    /* TS reads the operation kind before the region bounds and statements. */
+    qa_save_reader operation = field(&region, "operation");
+    static const char *const OPS[4] = {"decision", "admission", "grant", "consume"};
+    entries[i].operation_kind = field_choice(&operation, "kind", OPS, 4);
     entries[i].entry = field_integer_min(&region, "entry", 0);
     entries[i].exit = field_integer_min(&region, "exit", 0);
     qa_save_reader statements = field(&region, "statements");
     size_t statement_count = qa_save_reader_list_count(&statements);
     qa_qc_statement *words = xmalloc_at(&statements, statement_count * sizeof *words);
+    entries[i].statements = words;
     for (size_t s = 0; s < statement_count; s++) {
       qa_save_reader statement = item(&statements, s);
       words[s].opcode = field_integer_min(&statement, "opcode", 0);
@@ -160,11 +173,7 @@ qa_qc_pickup_caller_declaration qa_q1qc_read_pickup_caller(const qa_save_reader 
       qa_save_reader_destroy(&statement);
     }
     qa_save_reader_destroy(&statements);
-    entries[i].statements = words;
     entries[i].statement_count = statement_count;
-    qa_save_reader operation = field(&region, "operation");
-    static const char *const OPS[4] = {"decision", "admission", "grant", "consume"};
-    entries[i].operation_kind = field_choice(&operation, "kind", OPS, 4);
     if (strcmp(entries[i].operation_kind, "decision") == 0) {
       entries[i].operation_word = field_integer_min(&operation, "word", 0);
       qa_save_reader accepted = field(&operation, "accepted");
@@ -175,8 +184,7 @@ qa_qc_pickup_caller_declaration qa_q1qc_read_pickup_caller(const qa_save_reader 
     qa_save_reader_destroy(&region);
   }
   qa_save_reader_destroy(&regions);
-  declaration.regions = entries;
-  declaration.region_count = region_count;
+  qa_cleanup_pop(&node);
   return declaration;
 }
 static void destroy_item(const qa_qc_pickup_item *item) {
@@ -221,6 +229,18 @@ static qa_q1qc_pickup_descriptor describe_item(const qa_q1qc_program *program,
   }
   return descriptor;
 }
+/* Owned memory released when a declaration is rejected (the TS garbage). */
+typedef struct declared_build {
+  qa_q1qc_pickup_stage *stages; size_t count;
+  int64_t *callers;
+  size_t *order;
+} declared_build;
+static void declared_build_release(void *arg) {
+  declared_build *build = arg;
+  qa_q1qc_pickup_stages_destroy(build->stages, build->count);
+  free(build->callers);
+  free(build->order);
+}
 qa_q1qc_pickup_stage *qa_q1qc_declared_pickup_stages(
     const qa_q1qc_program *program,
     const qa_qc_pickup_caller_declaration *declarations, size_t declaration_count,
@@ -230,6 +250,9 @@ qa_q1qc_pickup_stage *qa_q1qc_declared_pickup_stages(
   memset(stages, 0, declaration_count * sizeof *stages);
   int64_t *callers = xmalloc(declaration_count * sizeof *callers);
   size_t caller_count = 0;
+  declared_build build = {stages, declaration_count, callers, NULL};
+  qa_cleanup node;
+  qa_cleanup_push(&node, declared_build_release, &build);
   for (size_t d = 0; d < declaration_count; d++) {
     const qa_qc_pickup_caller_declaration *declaration = &declarations[d];
     const qa_q1qc_function *fn = qa_q1qc_function_named(program, declaration->function);
@@ -261,6 +284,7 @@ qa_q1qc_pickup_stage *qa_q1qc_declared_pickup_stages(
     }
     /* Stable sort of region indices by entry (TS [...regions].sort). */
     size_t *order = xmalloc(declaration->region_count * sizeof *order);
+    build.order = order;
     for (size_t i = 0; i < declaration->region_count; i++) order[i] = i;
     for (size_t i = 1; i < declaration->region_count; i++) {
       size_t key = order[i];
@@ -362,8 +386,10 @@ qa_q1qc_pickup_stage *qa_q1qc_declared_pickup_stages(
       stage->regions[r] = built;
     }
     stage->region_count = declaration->region_count;
+    build.order = NULL;
     free(order);
   }
+  qa_cleanup_pop(&node);
   free(callers);
   *out_count = declaration_count;
   return stages;

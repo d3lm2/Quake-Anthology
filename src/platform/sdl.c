@@ -4,6 +4,8 @@
 
 #include <ctype.h>
 #include <math.h>
+#include <stdarg.h>
+#include <stdnoreturn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,12 +24,23 @@ static void ensure_main_ready(void) {
   }
 }
 
+/* TS `throw new Error(...)`; the RangeError and AggregateError sites name
+ * their class where they raise. */
+static noreturn void sdl_error(const char *format, ...) {
+  char text[2048];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(text, sizeof text, format, args);
+  va_end(args);
+  qa_raise("Error", 0, 0, "%s", text);
+}
+
 static void checked(int result, const char *operation) {
-  if (result < 0) qa_range_error("%s: %s", operation, SDL_GetError());
+  if (result < 0) sdl_error("%s: %s", operation, SDL_GetError());
 }
 
 static void *handle(void *result, const char *operation) {
-  if (result == NULL) qa_range_error("%s: %s", operation, SDL_GetError());
+  if (result == NULL) sdl_error("%s: %s", operation, SDL_GetError());
   return result;
 }
 
@@ -60,7 +73,7 @@ static void initialize_subsystem(uint32_t subsystem, const char *operation) {
 void qa_open_sdl_url(const char *url) {
   ensure_main_ready();
   if (SDL_OpenURL(url == NULL ? "" : url) != 0) {
-    qa_range_error("Could not open the sign-in browser.");
+    sdl_error("Could not open the sign-in browser.");
   }
 }
 
@@ -126,7 +139,7 @@ static int32_t source_visual_precision(double value, const char *name) {
 int32_t qa_sdl_display_index(double requested, double count) {
   native_integer(requested, "SDL display index");
   if (!isfinite(count) || trunc(count) != count || count <= 0) {
-    qa_range_error("SDL has no video displays");
+    sdl_error("SDL has no video displays");
   }
   return requested < 0 || requested >= count ? 0 : (int32_t)requested;
 }
@@ -135,7 +148,7 @@ static void validate_refresh_limits(double min, double max) {
   native_integer(min, "Minimum display refresh");
   native_integer(max, "Maximum display refresh");
   if (min != 0 && max != 0 && min > max) {
-    qa_range_error("r_minDisplayRefresh must be less than or equal to r_maxDisplayRefresh");
+    sdl_error("r_minDisplayRefresh must be less than or equal to r_maxDisplayRefresh");
   }
 }
 
@@ -226,24 +239,24 @@ static void validate_utf8(const uint8_t *bytes, size_t length) {
                    : lead >= 0xf0 && lead < 0xf5                ? 3
                                                                 : SIZE_MAX;
     if (extra == SIZE_MAX || i + 1 + extra > length) {
-      qa_range_error("SDL text event is not valid UTF-8");
+      qa_raise("TypeError", 0, 0, "Invalid byte sequence");
     }
     for (size_t k = 1; k <= extra; k++) {
       if ((bytes[i + k] & 0xc0) != 0x80) {
-        qa_range_error("SDL text event is not valid UTF-8");
+        qa_raise("TypeError", 0, 0, "Invalid byte sequence");
       }
     }
     if (extra == 2 && lead == 0xe0 && bytes[i + 1] < 0xa0) {
-      qa_range_error("SDL text event is not valid UTF-8");
+      qa_raise("TypeError", 0, 0, "Invalid byte sequence");
     }
     if (extra == 2 && lead == 0xed && bytes[i + 1] > 0x9f) {
-      qa_range_error("SDL text event is not valid UTF-8");
+      qa_raise("TypeError", 0, 0, "Invalid byte sequence");
     }
     if (extra == 3 && lead == 0xf0 && bytes[i + 1] < 0x90) {
-      qa_range_error("SDL text event is not valid UTF-8");
+      qa_raise("TypeError", 0, 0, "Invalid byte sequence");
     }
     if (extra == 3 && lead == 0xf4 && bytes[i + 1] > 0x8f) {
-      qa_range_error("SDL text event is not valid UTF-8");
+      qa_raise("TypeError", 0, 0, "Invalid byte sequence");
     }
     i += 1 + extra;
   }
@@ -278,8 +291,10 @@ qa_sdl_event qa_decode_sdl_event(const uint8_t *bytes, size_t length) {
       size_t end = 0;
       while (end < available && bytes[12 + end] != 0) end++;
       validate_utf8(bytes + 12, end);
-      memcpy(event.as.text.text, bytes + 12, end);
-      event.as.text.text[end] = '\0';
+      /* TextDecoder (ignoreBOM false) drops a leading byte order mark. */
+      size_t skip = end >= 3 && bytes[12] == 0xef && bytes[13] == 0xbb && bytes[14] == 0xbf ? 3 : 0;
+      memcpy(event.as.text.text, bytes + 12 + skip, end - skip);
+      event.as.text.text[end - skip] = '\0';
       break;
     }
     case 0x400:
@@ -392,7 +407,7 @@ static bool pending_push(qa_sdl_event **pending, size_t *count, size_t *capacity
 }
 
 static SDL_Window *opened(const qa_sdl_window *window) {
-  if (window->sdl_window == NULL) qa_range_error("SDL window is closed");
+  if (window->sdl_window == NULL) sdl_error("SDL window is closed");
   return window->sdl_window;
 }
 
@@ -401,7 +416,7 @@ static void require_window_list_ownership(void) {
     qa_sdl_window *window = g_windows[i];
     if (window->has_render_lease &&
         !qa_sdl_render_context_lease_parked(&window->render_lease)) {
-      qa_range_error("SDL window list is reserved for the render worker");
+      sdl_error("SDL window list is reserved for the render worker");
     }
   }
 }
@@ -433,7 +448,7 @@ static char *apply_fullscreen(SDL_Window *window, const qa_sdl_window_options *o
     if (native_modes == NULL || modes == NULL) {
       free(native_modes);
       free(modes);
-      qa_range_error("Selected SDL display mode disappeared");
+      sdl_error("Selected SDL display mode disappeared");
     }
     for (int i = 0; i < count; i++) {
       checked(SDL_GetDisplayMode(index, i, &native_modes[i]), "SDL_GetDisplayMode");
@@ -463,7 +478,7 @@ static char *apply_fullscreen(SDL_Window *window, const qa_sdl_window_options *o
       snprintf(failure, sizeof failure, "SDL_GetClosestDisplayMode: %s", SDL_GetError());
     }
     if ((SDL_GetWindowFlags(window) & 1u) != 0) {
-      qa_range_error("%s; SDL's newly created window is unexpectedly fullscreen", failure);
+      sdl_error("%s; SDL's newly created window is unexpectedly fullscreen", failure);
     }
     return xstrdup(failure);
   }
@@ -482,7 +497,7 @@ static char *apply_fullscreen(SDL_Window *window, const qa_sdl_window_options *o
            "SDL_SetWindowFullscreen windowed fallback after %s", failure);
   checked(SDL_SetWindowFullscreen(window, 0), operation);
   if ((SDL_GetWindowFlags(window) & 1u) != 0) {
-    qa_range_error("%s; SDL did not restore windowed mode", failure);
+    sdl_error("%s; SDL did not restore windowed mode", failure);
   }
   return xstrdup(failure);
 }
@@ -527,13 +542,37 @@ static bool visual_attempt(const char *title, int x, int y, int width, int heigh
   return true;
 }
 
+typedef struct open_scope {
+  SDL_Window **window;
+  SDL_Renderer **renderer;
+  SDL_Texture **texture;
+  SDL_GLContext *context;
+  bool *driver_loaded;
+  char **driver_copy;
+  char **fullscreen_failure;
+  qa_sdl_window *out;
+} open_scope;
+
+static void open_unwind(void *raw) {
+  open_scope *scope = (open_scope *)raw;
+  if (*scope->texture != NULL) SDL_DestroyTexture(*scope->texture);
+  if (*scope->renderer != NULL) SDL_DestroyRenderer(*scope->renderer);
+  if (*scope->context != NULL) SDL_GL_DeleteContext(*scope->context);
+  if (*scope->window != NULL) SDL_DestroyWindow(*scope->window);
+  if (*scope->driver_loaded) SDL_GL_UnloadLibrary();
+  SDL_QuitSubSystem(video_subsystem);
+  free(*scope->driver_copy);
+  free(*scope->fullscreen_failure);
+  memset(scope->out, 0, sizeof *scope->out);
+}
+
 bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out) {
   require_window_list_ownership();
   const double dimensions[2] = {options->width, options->height};
   for (int i = 0; i < 2; i++) {
     if (!isfinite(dimensions[i]) || trunc(dimensions[i]) != dimensions[i] ||
         dimensions[i] <= 0 || dimensions[i] > 16384) {
-      qa_range_error("SDL window dimensions must be integers in 1..16384");
+      sdl_error("SDL window dimensions must be integers in 1..16384");
     }
   }
   native_integer(options->display_refresh, "SDL display refresh");
@@ -560,7 +599,7 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
   const char *driver = gl ? options->driver : NULL;
   bool sharing_driver = false;
   if (driver != NULL && driver[0] == '\0') {
-    qa_range_error("SDL GL driver name is empty");
+    sdl_error("SDL GL driver name is empty");
   }
   if (gl) {
     for (size_t i = 0; i < g_window_count; i++) {
@@ -569,7 +608,7 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
         continue;
       }
       if (!streq_nullable(existing->driver, driver)) {
-        qa_range_error("SDL cannot select different GL libraries for concurrent windows");
+        sdl_error("SDL cannot select different GL libraries for concurrent windows");
       }
       sharing_driver = true;
     }
@@ -577,7 +616,7 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
   /* SDL's loader can accept a path without loading it; only the system
    * GL library is supported, not legacy vendor drivers. */
   if (driver != NULL && !ascii_iequals(driver, qa_default_open_gl_driver(NULL))) {
-    qa_range_error("Unsupported SDL system OpenGL driver: %s", driver);
+    sdl_error("Unsupported SDL system OpenGL driver: %s", driver);
   }
   initialize_subsystem(video_subsystem, "SDL_InitSubSystem");
   SDL_Window *window = NULL;
@@ -587,8 +626,12 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
   bool driver_loaded = false;
   char *driver_copy = NULL;
   char *fullscreen_failure = NULL;
-  /* Fatal failures below abort (the TS throw reaches the crash handler);
-   * only the recoverable GL visual attempts and OOM clean up here. */
+  /* TS catch: every failure below releases the native resources made so far
+   * and the subsystem reference, then rethrows (renderer restart recovers). */
+  open_scope scope = {&window, &renderer, &texture, &context, &driver_loaded,
+                      &driver_copy, &fullscreen_failure, out};
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, open_unwind, &scope);
   int32_t display_index = qa_sdl_display_index(options->display_index,
                                                SDL_GetNumVideoDisplays());
   SDL_Rect bounds;
@@ -644,9 +687,7 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
                      attempt_depth, attempt_stencil, &window, &context);
     }
     if (window == NULL || context == NULL) {
-      if (driver_loaded) SDL_GL_UnloadLibrary();
-      SDL_QuitSubSystem(video_subsystem);
-      qa_range_error("SDL could not create any source GL visual candidate");
+      qa_raise("AggregateError", 0, 0, "SDL could not create any source GL visual candidate");
     }
     if (options->has_allow_software_gl && !options->allow_software_gl) {
       typedef const unsigned char *(*gl_get_string_fn)(uint32_t);
@@ -658,7 +699,7 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
       const char *name = renderer_name == NULL ? "" : (const char *)renderer_name;
       /* GLW_SetMode rejects only these two source tokens. */
       if (ascii_iequals(name, "mesa x11") || ascii_iequals(name, "mesa glx indirect")) {
-        qa_range_error("You are using software Mesa; add +set r_allowSoftwareGL 1 "
+        sdl_error("You are using software Mesa; add +set r_allowSoftwareGL 1 "
                        "to allow this driver");
       }
     }
@@ -683,7 +724,7 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
     checked(SDL_GetRendererOutputSize(renderer, &drawable_width, &drawable_height),
             "SDL_GetRendererOutputSize");
     if (drawable_width <= 0 || drawable_height <= 0) {
-      qa_range_error("SDL returned invalid drawable dimensions");
+      sdl_error("SDL returned invalid drawable dimensions");
     }
     texture = (SDL_Texture *)handle(
         SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, 1, drawable_width,
@@ -695,20 +736,21 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
     out->texture_width = drawable_width;
     out->texture_height = drawable_height;
   } else {
-    if (context == NULL) qa_range_error("SDL GL visual has no context");
+    if (context == NULL) sdl_error("SDL GL visual has no context");
     SDL_GL_GetDrawableSize(window, &drawable_width, &drawable_height);
     out->gl_context = context;
     out->driver = driver_copy;
   }
   uint32_t id = SDL_GetWindowID(window);
-  if (id == 0) qa_range_error("SDL_GetWindowID: %s", SDL_GetError());
+  if (id == 0) sdl_error("SDL_GetWindowID: %s", SDL_GetError());
   if (drawable_width <= 0 || drawable_height <= 0) {
-    qa_range_error("SDL returned invalid drawable dimensions");
+    sdl_error("SDL returned invalid drawable dimensions");
   }
   out->id = id;
   out->fullscreen_failure = fullscreen_failure;
   out->position_origin_x = origin_x;
   out->position_origin_y = origin_y;
+  qa_cleanup_pop(&guard);
   if (!registry_add_window(out)) {
     registry_remove_window(out);
     if (texture != NULL) SDL_DestroyTexture(texture);
@@ -724,6 +766,7 @@ bool qa_sdl_window_open(const qa_sdl_window_options *options, qa_sdl_window *out
   }
   return true;
 oom:
+  qa_cleanup_pop(&guard);
   if (context != NULL) SDL_GL_DeleteContext(context);
   if (window != NULL) SDL_DestroyWindow(window);
   if (driver_loaded) SDL_GL_UnloadLibrary();
@@ -777,7 +820,7 @@ qa_sdl_size qa_sdl_window_logical_size(qa_sdl_window *window) {
   int width = 0, height = 0;
   SDL_GetWindowSize(opened(window), &width, &height);
   if (width <= 0 || height <= 0) {
-    qa_range_error("SDL returned invalid window dimensions");
+    sdl_error("SDL returned invalid window dimensions");
   }
   qa_sdl_size size = {width, height};
   return size;
@@ -793,7 +836,7 @@ qa_sdl_size qa_sdl_window_drawable_size(qa_sdl_window *window) {
     SDL_GL_GetDrawableSize(native, &width, &height);
   }
   if (width <= 0 || height <= 0) {
-    qa_range_error("SDL returned invalid drawable dimensions");
+    sdl_error("SDL returned invalid drawable dimensions");
   }
   qa_sdl_size size = {width, height};
   return size;
@@ -817,7 +860,7 @@ void qa_sdl_window_set_size(qa_sdl_window *window, double width, double height) 
   }
   if (window->has_render_lease &&
       !qa_sdl_render_context_lease_parked(&window->render_lease)) {
-    qa_range_error("SDL render context is reserved for the worker");
+    sdl_error("SDL render context is reserved for the worker");
   }
   SDL_SetWindowSize(opened(window), (int)width, (int)height);
 }
@@ -829,7 +872,7 @@ bool qa_sdl_window_fullscreen(qa_sdl_window *window) {
 void qa_sdl_window_set_fullscreen(qa_sdl_window *window, bool enabled) {
   if (window->has_render_lease &&
       !qa_sdl_render_context_lease_parked(&window->render_lease)) {
-    qa_range_error("SDL render context is reserved for the worker");
+    sdl_error("SDL render context is reserved for the worker");
   }
   checked(SDL_SetWindowFullscreen(opened(window), enabled ? 0x1001u : 0u),
           "SDL_SetWindowFullscreen");
@@ -846,7 +889,7 @@ bool qa_sdl_window_display(qa_sdl_window *window, qa_sdl_display *out) {
   SDL_Rect bounds;
   checked(SDL_GetDisplayBounds(index, &bounds), "SDL_GetDisplayBounds");
   if (bounds.w <= 0 || bounds.h <= 0) {
-    qa_range_error("SDL returned invalid display bounds");
+    sdl_error("SDL returned invalid display bounds");
   }
   out->name = sdl_string(SDL_GetDisplayName(index));
   if (out->name == NULL) return false;
@@ -865,7 +908,7 @@ qa_sdl_window_presentation qa_sdl_window_capture_presentation(qa_sdl_window *win
   uint32_t flags = qa_sdl_window_flags(window);
   qa_sdl_display display;
   if (!qa_sdl_window_display(window, &display)) {
-    qa_range_error("SDL returned invalid window position");
+    sdl_error("SDL returned invalid window position");
   }
   int left = 0, top = 0;
   SDL_GetWindowPosition(native, &left, &top);
@@ -951,10 +994,10 @@ qa_sdl_display_mode *qa_sdl_window_display_modes(qa_sdl_window *window,
 void qa_sdl_window_make_current(qa_sdl_window *window) {
   SDL_Window *native = opened(window);
   if (window->backend != QA_SDL_BACKEND_GL) {
-    qa_range_error("makeCurrent requires a GL window");
+    sdl_error("makeCurrent requires a GL window");
   }
   if (window->has_render_lease) {
-    qa_range_error("SDL render context is reserved for the worker");
+    sdl_error("SDL render context is reserved for the worker");
   }
   checked(SDL_GL_MakeCurrent(native, window->render_enabled ? window->gl_context : NULL),
           "SDL_GL_MakeCurrent");
@@ -980,10 +1023,10 @@ bool qa_sdl_window_rendering_enabled(const qa_sdl_window *window) {
 void qa_sdl_window_set_rendering_enabled(qa_sdl_window *window, bool enabled) {
   SDL_Window *native = opened(window);
   if (window->backend != QA_SDL_BACKEND_GL) {
-    qa_range_error("setRenderingEnabled requires a GL window");
+    sdl_error("setRenderingEnabled requires a GL window");
   }
   if (window->has_render_lease) {
-    qa_range_error("SDL render context is reserved for the worker");
+    sdl_error("SDL render context is reserved for the worker");
   }
   checked(SDL_GL_MakeCurrent(native, enabled ? window->gl_context : NULL),
           "SDL_GL_MakeCurrent diagnostic");
@@ -994,19 +1037,19 @@ qa_sdl_render_context_transfer qa_sdl_window_detach_render_context(
     qa_sdl_window *window) {
   SDL_Window *native = opened(window);
   if (window->backend != QA_SDL_BACKEND_GL) {
-    qa_range_error("detachRenderContext requires a GL window");
+    sdl_error("detachRenderContext requires a GL window");
   }
   if (window->has_render_lease) {
-    qa_range_error("SDL render context is reserved for the worker");
+    sdl_error("SDL render context is reserved for the worker");
   }
   if (window->procedure_leases != 0) {
-    qa_range_error("Close GL procedure tables before transferring the context");
+    sdl_error("Close GL procedure tables before transferring the context");
   }
   checked(SDL_GL_MakeCurrent(native, window->gl_context),
           "SDL_GL_MakeCurrent transfer");
   if (!qa_sdl_render_context_lease_detach(native, window->gl_context, window->id,
                                           &window->render_lease)) {
-    qa_range_error("SDL context transfer registration failed");
+    sdl_error("SDL context transfer registration failed");
   }
   window->has_render_lease = true;
   return window->render_lease.transfer;
@@ -1024,7 +1067,7 @@ void qa_sdl_window_restore_render_context(qa_sdl_window *window) {
 
 void *qa_sdl_window_get_gl_proc_address(qa_sdl_window *window, const char *name) {
   if (name == NULL || name[0] == '\0') {
-    qa_range_error("GL procedure name is empty");
+    sdl_error("GL procedure name is empty");
   }
   qa_sdl_window_make_current(window);
   char operation[256];
@@ -1036,7 +1079,7 @@ void qa_sdl_window_swap(qa_sdl_window *window) {
   SDL_Window *native = opened(window);
   qa_sdl_window_make_current(window);
   if (window->backend != QA_SDL_BACKEND_GL) {
-    qa_range_error("swap requires a GL window");
+    sdl_error("swap requires a GL window");
   }
   /* SDL requires a current window to swap; Mac flushBuffer did not. */
   if (!window->render_enabled) {
@@ -1121,13 +1164,13 @@ bool qa_sdl_gamma_lease_closed(const qa_sdl_gamma_lease *lease) {
 }
 
 void qa_sdl_gamma_lease_apply(qa_sdl_gamma_lease *lease, double gamma) {
-  if (g_gamma_lease != lease) qa_range_error("SDL gamma lease is closed");
+  if (g_gamma_lease != lease) sdl_error("SDL gamma lease is closed");
   if (!isfinite(gamma) || gamma < 0.5 || gamma > 3) {
     qa_range_error("Gamma requires a finite value in 0.5..3");
   }
   qa_sdl_gamma_lease_synchronize(lease);
   if (lease->capability_kind != QA_SDL_GAMMA_API_ACCEPTED) {
-    qa_range_error("SDL gamma is %s: %s", gamma_kind_name(lease->capability_kind),
+    sdl_error("SDL gamma is %s: %s", gamma_kind_name(lease->capability_kind),
                    lease->capability_reason == NULL ? "" : lease->capability_reason);
   }
   uint16_t ramp[256];
@@ -1137,9 +1180,18 @@ void qa_sdl_gamma_lease_apply(qa_sdl_gamma_lease *lease, double gamma) {
           "SDL_SetWindowGammaRamp");
 }
 
+static void gamma_owner_clear(void *raw) {
+  (void)raw;
+  g_gamma_lease = NULL;
+}
+
 void qa_sdl_gamma_lease_close(qa_sdl_gamma_lease *lease) {
   if (g_gamma_lease != lease) return;
+  /* TS try { restore() } finally { gammaLease = null } */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, gamma_owner_clear, NULL);
   gamma_restore(lease);
+  qa_cleanup_pop(&guard);
   g_gamma_lease = NULL;
 }
 
@@ -1154,7 +1206,7 @@ void qa_sdl_gamma_lease_destroy(qa_sdl_gamma_lease *lease) {
 qa_sdl_gamma_lease *qa_sdl_window_begin_gamma(qa_sdl_window *window) {
   SDL_Window *native = opened(window);
   if (g_gamma_lease != NULL) {
-    qa_range_error("SDL display gamma already has an owner");
+    sdl_error("SDL display gamma already has an owner");
   }
   qa_sdl_gamma_lease *lease = (qa_sdl_gamma_lease *)calloc(1, sizeof *lease);
   if (lease == NULL) return NULL;
@@ -1211,7 +1263,7 @@ bool qa_sdl_input_lease_closed(const qa_sdl_input_lease *lease) {
 
 void qa_sdl_input_lease_set_relative_mouse(qa_sdl_input_lease *lease, bool enabled) {
   opened(lease->window);
-  if (g_input_lease != lease) qa_range_error("SDL input lease is closed");
+  if (g_input_lease != lease) sdl_error("SDL input lease is closed");
   if (lease->relative == enabled &&
       qa_sdl_window_relative_mouse(lease->window) == enabled) {
     return;
@@ -1226,7 +1278,8 @@ void qa_sdl_input_lease_close(qa_sdl_input_lease *lease) {
   if (lease->relative && SDL_SetRelativeMouseMode(0) < 0) failed = true;
   SDL_StopTextInput();
   g_input_lease = NULL;
-  if (failed) qa_range_error("SDL input release failed");
+  /* TS AggregateError([Error("SDL_SetRelativeMouseMode release: ...")]). */
+  if (failed) qa_raise("AggregateError", 0, 0, "SDL input release failed");
 }
 
 void qa_sdl_input_lease_destroy(qa_sdl_input_lease *lease) {
@@ -1238,7 +1291,7 @@ void qa_sdl_input_lease_destroy(qa_sdl_input_lease *lease) {
 qa_sdl_input_lease *qa_sdl_window_begin_input(qa_sdl_window *window) {
   opened(window);
   if (g_input_lease != NULL) {
-    qa_range_error("SDL gameplay input already has an owner");
+    sdl_error("SDL gameplay input already has an owner");
   }
   qa_sdl_input_lease *lease = (qa_sdl_input_lease *)calloc(1, sizeof *lease);
   if (lease == NULL) return NULL;
@@ -1298,11 +1351,11 @@ qa_sdl_event *qa_sdl_window_poll_events(qa_sdl_window *window, size_t *out_count
 void qa_sdl_window_present(qa_sdl_window *window, const uint8_t *rgba, size_t length) {
   opened(window);
   if (window->backend != QA_SDL_BACKEND_CPU) {
-    qa_range_error("present requires a CPU window");
+    sdl_error("present requires a CPU window");
   }
   qa_sdl_size size = qa_sdl_window_drawable_size(window);
   if (length != (size_t)size.width * (size_t)size.height * 4u) {
-    qa_range_error("RGBA framebuffer size does not match the window");
+    sdl_error("RGBA framebuffer size does not match the window");
   }
   if (window->texture_width != size.width || window->texture_height != size.height) {
     SDL_Texture *texture = (SDL_Texture *)handle(
@@ -1312,7 +1365,7 @@ void qa_sdl_window_present(qa_sdl_window *window, const uint8_t *rgba, size_t le
     if (SDL_SetTextureBlendMode(texture, 0) < 0) {
       const char *message = SDL_GetError();
       SDL_DestroyTexture(texture);
-      qa_range_error("SDL_SetTextureBlendMode resize: %s", message);
+      sdl_error("SDL_SetTextureBlendMode resize: %s", message);
     }
     SDL_DestroyTexture(window->texture);
     window->texture = texture;
@@ -1331,9 +1384,9 @@ void qa_sdl_window_present(qa_sdl_window *window, const uint8_t *rgba, size_t le
 uint8_t *qa_sdl_window_read_pixels(qa_sdl_window *window, size_t *out_length) {
   opened(window);
   if (window->backend != QA_SDL_BACKEND_CPU) {
-    qa_range_error("readPixels requires a CPU window");
+    sdl_error("readPixels requires a CPU window");
   }
-  if (!window->has_frame) qa_range_error("No framebuffer has been presented");
+  if (!window->has_frame) sdl_error("No framebuffer has been presented");
   qa_sdl_size size = qa_sdl_window_drawable_size(window);
   size_t length = (size_t)size.width * (size_t)size.height * 4u;
   uint8_t *rgba = (uint8_t *)malloc(length);
@@ -1398,20 +1451,23 @@ void qa_sdl_window_push_event(qa_sdl_window *window, const qa_sdl_event *event) 
       write_i32(bytes, 20, event->as.window.data2);
       break;
     default:
-      qa_range_error("Unsupported SDL event: [object Object]");
+      sdl_error("Unsupported SDL event: [object Object]");
   }
   SDL_Event native;
   memset(&native, 0, sizeof native);
   memcpy(&native, bytes, sizeof bytes < sizeof native ? sizeof bytes : sizeof native);
   int result = SDL_PushEvent(&native);
   checked(result, "SDL_PushEvent");
-  if (result == 0) qa_range_error("SDL event was filtered");
+  if (result == 0) sdl_error("SDL event was filtered");
 }
+
+static void gamma_close_run(void *ctx) { qa_sdl_gamma_lease_close((qa_sdl_gamma_lease *)ctx); }
+static void input_close_run(void *ctx) { qa_sdl_input_lease_close((qa_sdl_input_lease *)ctx); }
 
 void qa_sdl_window_close(qa_sdl_window *window) {
   if (window->sdl_window == NULL) return;
   if (window->procedure_leases != 0) {
-    qa_range_error("Close GL procedure tables before closing the window");
+    sdl_error("Close GL procedure tables before closing the window");
   }
   qa_sdl_window_restore_render_context(window);
   require_window_list_ownership();
@@ -1421,8 +1477,12 @@ void qa_sdl_window_close(qa_sdl_window *window) {
   SDL_GLContext context = window->gl_context;
   qa_sdl_backend backend = window->backend;
   bool has_driver = window->driver != NULL;
-  if (window->gamma != NULL) qa_sdl_gamma_lease_close(window->gamma);
-  if (window->input != NULL) qa_sdl_input_lease_close(window->input);
+  /* TS collects the gamma and input release errors, finishes the close, then
+   * throws AggregateError("SDL window cleanup failed"). */
+  qa_caught_error caught;
+  bool failed = false;
+  if (window->gamma != NULL && !qa_try(gamma_close_run, window->gamma, &caught)) failed = true;
+  if (window->input != NULL && !qa_try(input_close_run, window->input, &caught)) failed = true;
   window->sdl_window = NULL;
   window->renderer = NULL;
   window->texture = NULL;
@@ -1445,6 +1505,7 @@ void qa_sdl_window_close(qa_sdl_window *window) {
   SDL_DestroyWindow(native);
   if (backend == QA_SDL_BACKEND_GL && has_driver) SDL_GL_UnloadLibrary();
   SDL_QuitSubSystem(video_subsystem);
+  if (failed) qa_raise("AggregateError", 0, 0, "SDL window cleanup failed");
 }
 
 static bool is_joystick_kind(qa_sdl_event_kind kind) {
@@ -1514,7 +1575,7 @@ bool qa_sdl_joystick_open_first(qa_sdl_joystick_print_fn print, void *print_ctx,
     pointer = SDL_JoystickOpen(index);
     if (pointer != NULL) break;
     if (print != NULL) {
-      char message[512];
+      char message[1100];
       snprintf(message, sizeof message, "SDL_JoystickOpen %d: %s\n", index,
                SDL_GetError());
       print(message, print_ctx);
@@ -1578,7 +1639,7 @@ bool qa_sdl_joystick_open_first(qa_sdl_joystick_print_fn print, void *print_ctx,
 qa_sdl_event *qa_sdl_joystick_poll_events(qa_sdl_joystick *joystick,
                                           qa_sdl_joystick_profile profile,
                                           size_t *out_count) {
-  if (joystick->pointer == NULL) qa_range_error("SDL joystick is closed");
+  if (joystick->pointer == NULL) sdl_error("SDL joystick is closed");
   SDL_JoystickUpdate();
   for (;;) {
     SDL_Event native;

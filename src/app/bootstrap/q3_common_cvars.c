@@ -30,17 +30,18 @@ void qa_app_q3_server_cvar_definitions_make(qa_app_q3_server_cvar_definitions *o
     {"sv_maxPing", "0", QA_CVAR_FLAG_ARCHIVE | QA_CVAR_FLAG_SERVER_INFO},
     {"sv_floodProtect", "1", QA_CVAR_FLAG_ARCHIVE | QA_CVAR_FLAG_SERVER_INFO},
     {"sv_strictAuth", "1", QA_CVAR_FLAG_ARCHIVE}, {"bot_enable", "1", QA_CVAR_FLAG_NONE},
+    {"logfile", "0", QA_CVAR_FLAG_TEMPORARY}, /* TS 9542c329 */
   };
   size_t count = sizeof common / sizeof common[0];
   memcpy(out->items, common, sizeof common);
   for (size_t i = 0; i < 3; i++) out->items[count++] = qa_collision_map_cvar_definitions[i];
   out->count = count;
 }
-const char *const qa_app_q3_server_cvar_names[24] = {
+const char *const qa_app_q3_server_cvar_names[25] = {
   "protocol", "sv_pure", "sv_allowDownload", "sv_maxRate", "sv_fps", "sv_serverid", "sv_paks",
   "sv_pakNames", "sv_referencedPaks", "sv_referencedPakNames", "sv_maxclients", "mapname",
   "sv_mapname", "sv_privateClients", "sv_privatePassword", "sv_reconnectlimit", "sv_minPing",
-  "sv_maxPing", "sv_floodProtect", "sv_strictAuth", "bot_enable",
+  "sv_maxPing", "sv_floodProtect", "sv_strictAuth", "bot_enable", "logfile",
   /* collisionMapCvarDefinitions names, in landed order (filled by init check in tests) */
   "cm_noAreas", "cm_noCurves", "cm_playerCurveClip",
 };

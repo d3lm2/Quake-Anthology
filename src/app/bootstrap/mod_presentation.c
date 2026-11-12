@@ -363,9 +363,10 @@ static char *guest_string(const qa_qvm_host_call *call, int32_t pointer) {
   if (text == NULL) qa_range_error("Out of memory");
   return text;
 }
-static void write_game_state(qa_qvm_memory *memory, int64_t address, const qa_q3_source_game_state_record *state) {
-  qa_qvm_writable_view view;
-  qa_qvm_memory_data_view(memory, address, QA_QVM_GAME_STATE_BYTES, &view);
+/* TS writeSourceQvmGameState(guest, guest.view(address, bytes), context().gameState): the view is taken before the
+ * context is read. */
+static void write_game_state(qa_qvm_memory *memory, int64_t address, qa_qvm_writable_view view,
+                             const qa_q3_source_game_state_record *state) {
   for (int i = 0; i < 1024; i++) qa_qvm_writable_view_set_int32(&view, i * 4, state->string_offsets[i], true);
   qa_qvm_memory_write_bytes(memory, address + 4096, state->string_data, 16000);
   qa_qvm_writable_view_set_int32(&view, 20096, (int32_t)state->data_count, true);
@@ -382,14 +383,16 @@ static qa_qvm_host_result host(void *ctx, const qa_qvm_host_call *call) {
     qa_component_presentation_media_request request;
     memset(&request, 0, sizeof request);
     char *intro = NULL, *loop = NULL;
+    qa_cleanup intro_node, loop_node;
+    qa_cleanup_push(&intro_node, free, NULL); qa_cleanup_push(&loop_node, free, NULL);
     if (call->code == QA_QVM_CGAME_IMPORT_CG_S_STOPBACKGROUNDTRACK) request.kind = QA_MEDIA_REQUEST_MUSIC_STOP;
     else {
       intro = guest_string(call, qa_qvm_host_call_word(call, 1));
+      intro_node.arg = intro;
       loop = guest_string(call, qa_qvm_host_call_word(call, 2));
+      loop_node.arg = loop;
       request.kind = QA_MEDIA_REQUEST_MUSIC; request.intro = intro; request.loop = loop;
     }
-    qa_cleanup intro_node, loop_node;
-    qa_cleanup_push(&intro_node, free, intro); qa_cleanup_push(&loop_node, free, loop);
     p->options.presentation_media.deliver(p->options.presentation_media.ctx, &request, p->initializing, owns_current, p);
     qa_cleanup_pop(&loop_node); qa_cleanup_pop(&intro_node);
     free(intro); free(loop);
@@ -398,18 +401,22 @@ static qa_qvm_host_result host(void *ctx, const qa_qvm_host_call *call) {
   }
   if (engine && call->code == QA_QVM_CGAME_IMPORT_CG_R_REMAP_SHADER) {
     if (p->options.presentation_media.deliver == NULL) qa_qvm_reject_syscall(call);
-    char *original = qa_qvm_memory_read_string(call->guest, qa_qvm_host_call_word(call, 1));
-    char *replacement = qa_qvm_memory_read_string(call->guest, qa_qvm_host_call_word(call, 2));
+    /* TS reads the offset text (word 3) before original and replacement. */
     char *offset_text = qa_qvm_memory_read_string(call->guest, qa_qvm_host_call_word(call, 3));
-    if (original == NULL || replacement == NULL || offset_text == NULL) qa_range_error("Out of memory");
+    if (offset_text == NULL) qa_range_error("Out of memory");
     double offset = qa_js_parse_float(offset_text);
     free(offset_text);
+    qa_cleanup original_node, replacement_node;
+    char *original = qa_qvm_memory_read_string(call->guest, qa_qvm_host_call_word(call, 1));
+    if (original == NULL) qa_range_error("Out of memory");
+    qa_cleanup_push(&original_node, free, original);
+    char *replacement = qa_qvm_memory_read_string(call->guest, qa_qvm_host_call_word(call, 2));
+    if (replacement == NULL) qa_range_error("Out of memory");
+    qa_cleanup_push(&replacement_node, free, replacement);
     qa_component_presentation_media_request request;
     memset(&request, 0, sizeof request);
     request.kind = QA_MEDIA_REQUEST_SHADER_REMAP; request.original = original; request.replacement = replacement;
     request.time_offset = isnan(offset) ? 0 : offset;
-    qa_cleanup original_node, replacement_node;
-    qa_cleanup_push(&original_node, free, original); qa_cleanup_push(&replacement_node, free, replacement);
     p->options.presentation_media.deliver(p->options.presentation_media.ctx, &request, p->initializing, owns_current, p);
     qa_cleanup_pop(&replacement_node); qa_cleanup_pop(&original_node);
     free(original); free(replacement);
@@ -425,8 +432,10 @@ static qa_qvm_host_result host(void *ctx, const qa_qvm_host_call *call) {
   if (engine && call->code == QA_QVM_CGAME_IMPORT_CG_GETGAMESTATE) {
     qa_qvm_presentation_context current;
     int32_t address = qa_qvm_host_call_word(call, 1);
+    qa_qvm_writable_view view;
+    qa_qvm_memory_data_view(call->guest, address, QA_QVM_GAME_STATE_BYTES, &view);
     context(p, &current);
-    write_game_state(call->guest, address, &current.game_state);
+    write_game_state(call->guest, address, view, &current.game_state);
     return 0;
   }
   host_frame frame = {p, call};
@@ -700,8 +709,7 @@ static owner_t *create_owner(const qa_app_mod_presentation_options *options, dou
   bool closed = qa_try(close_run, p, &cleanup);
   qa_app_application_mod_presentation_destroy(p);
   if (!closed)
-    qa_raise("AggregateError", 0, 2, "Component presentation initialization and cleanup failed (first %s: %s; cleanup %s: %s)",
-             error.name, error.message, cleanup.name, cleanup.message);
+    qa_raise("AggregateError", 0, 2, "Component presentation initialization and cleanup failed");
   qa_rethrow(&error);
 }
 qa_app_application_mod_presentation *qa_app_application_mod_presentation_create(const qa_app_mod_presentation_options *options,
@@ -924,10 +932,15 @@ static void restore_owned(owner_t *p, const restore_input *checkpoint) {
   reader_field(&r, "version", &field); qa_save_reader_literal_number(&field, 1);
   const qa_qvm_mod_presentation_declaration *declaration = &p->options.source->prepared.declaration;
   reader_field(&r, "declaration", &field);
+  /* TS encodeCheckpointValue(undefined) refuses before the comparison. */
+  if (field.value == NULL) qa_save_format_error("checkpoint", "%s", "checkpoint contains a non-data value");
   qa_save_value *expected = qa_app_qvm_presentation_declaration_value(declaration);
-  bool same = field.value != NULL && encoded_equal(field.value, expected);
+  qa_cleanup expected_node;
+  qa_cleanup_push(&expected_node, (void (*)(void *))qa_save_value_free, expected);
+  bool same = encoded_equal(field.value, expected);
+  qa_cleanup_pop(&expected_node);
   qa_save_value_free(expected);
-  if (!same) qa_save_reader_fail(&field, "component declaration changed");
+  if (!same) qa_save_reader_fail(&r, "component declaration changed"); /* TS r.fail: the record's path */
   qa_qvm_abi_profile profile = declaration_base(declaration)->cgame.abi_profile;
   reader_field(&r, "frameSequence", &field); p->frame_sequence = qa_save_reader_integer_min(&field, -1);
   reader_field(&r, "frameOrdinal", &field);
@@ -942,10 +955,10 @@ static void restore_owned(owner_t *p, const restore_input *checkpoint) {
   if (p->has_scene_time_offset) p->scene_time_offset = qa_save_reader_finite(&field) - p->options.clock.now(p->options.clock.ctx);
   qa_save_reader color, part;
   reader_field(&r, "hudColor", &color);
-  reader_field(&color, "x", &part); p->hud_color.x = (float)qa_save_reader_number(&part);
-  reader_field(&color, "y", &part); p->hud_color.y = (float)qa_save_reader_number(&part);
-  reader_field(&color, "z", &part); p->hud_color.z = (float)qa_save_reader_number(&part);
-  reader_field(&color, "w", &part); p->hud_color.w = (float)qa_save_reader_number(&part);
+  reader_field(&color, "x", &part); p->hud_color.x = qa_save_reader_number(&part);
+  reader_field(&color, "y", &part); p->hud_color.y = qa_save_reader_number(&part);
+  reader_field(&color, "z", &part); p->hud_color.z = qa_save_reader_number(&part);
+  reader_field(&color, "w", &part); p->hud_color.w = qa_save_reader_number(&part);
   reader_field(&r, "sceneContext", &field);
   if (!qa_save_reader_is_null(&field)) {
     qa_qvm_scene_context read;
@@ -988,6 +1001,12 @@ static void restore_owned(owner_t *p, const restore_input *checkpoint) {
   qa_qvm_mod_presentation_restore_checkpoint(&p->core, field.value, checkpoint->resolve, checkpoint->resolve_ctx);
   reader_field(&r, "commands", &field);
   size_t count = qa_save_reader_list_count(&field);
+  /* TS list(v => v.string()) reads every name before the duplicate check. */
+  for (size_t i = 0; i < count; i++) {
+    qa_save_reader item;
+    if (!qa_save_reader_item(&field, i, &item)) qa_range_error("Out of memory");
+    (void)qa_save_reader_string(&item);
+  }
   for (size_t i = 0; i < count; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(&field, i, &item)) qa_range_error("Out of memory");
@@ -1021,8 +1040,7 @@ void qa_app_application_mod_presentation_publish_commands(owner_t *p) {
 static void fail_closed(owner_t *p, const qa_caught_error *error, const char *message) {
   qa_caught_error cleanup;
   if (!qa_try(close_run, p, &cleanup))
-    qa_raise("AggregateError", 0, 2, "%s (first %s: %s; cleanup %s: %s)", message, error->name, error->message,
-             cleanup.name, cleanup.message);
+    qa_raise("AggregateError", 0, 2, "%s", message);
   qa_rethrow(error);
 }
 typedef struct command_job { owner_t *p; const char *const *arguments; size_t count; bool result; } command_job;
@@ -1120,6 +1138,12 @@ static body_storage capture_bodies(owner_t *p, double time) {
   return storage;
 }
 typedef struct frame_job { owner_t *p; double sequence; const qa_q3_pres_scene_content *result; } frame_job;
+typedef struct taken_hud { qa_app_q3_overlay_submission *items; size_t count; } taken_hud;
+static void release_taken_hud(void *value) {
+  taken_hud *taken = value;
+  for (size_t i = 0; i < taken->count; i++) free_hud_submission(&taken->items[i]);
+  free(taken->items);
+}
 static void frame_run(void *ctx) {
   frame_job *job = ctx;
   owner_t *p = job->p;
@@ -1143,15 +1167,22 @@ static void frame_run(void *ctx) {
   size_t hud_count = 0;
   qa_app_q3_overlay_submission *hud = qa_event_ring_take(&p->pending_hud, &p->hud_cursor, &hud_count);
   qa_event_ring_retire(&p->pending_hud);
+  taken_hud taken = {hud, hud_count};
+  qa_cleanup hud_node; /* a raising preload drops the taken submissions */
+  qa_cleanup_push(&hud_node, release_taken_hud, &taken);
   qa_q3_pres_scene_recorder_clear_scene(recorder);
   const qa_q3_pres_scene_content **contents = xcalloc(hud_count + 1, sizeof *contents);
   size_t content_count = 0;
   contents[content_count++] = &scene;
   for (size_t i = 0; i < hud_count; i++) if (hud[i].scene != NULL) contents[content_count++] = &hud[i].scene->content;
+  qa_cleanup contents_node;
+  qa_cleanup_push(&contents_node, free, (void *)contents);
   qa_app_application_q3_scene_renderer_preload(qa_app_application_mod_presentation_renderer(p), contents, content_count);
+  qa_cleanup_pop(&contents_node);
   free(contents);
   assert_current(p);
   flush_audio(p);
+  qa_cleanup_pop(&hud_node);
   qa_cleanup_pop(&scene_node);
   qa_cleanup_pop(&bodies_node);
   p->has_previous_frame_time = true; p->previous_frame_time = time; p->frame_sequence = job->sequence;
@@ -1230,8 +1261,7 @@ void qa_app_application_mod_presentation_close(owner_t *p) {
   if (p->renderer != NULL) { qa_app_application_q3_scene_renderer_destroy(p->renderer); p->renderer = NULL; }
   if (p->has_captured) { qa_q3_pres_scene_content_destroy(&p->captured); p->has_captured = false; }
   if (failures.count != 0)
-    qa_raise("AggregateError", 0, (long long)failures.count, "Component presentation cleanup failed (%zu errors; first %s: %s)",
-             failures.count, failures.first.name, failures.first.message);
+    qa_raise("AggregateError", 0, (long long)failures.count, "Component presentation cleanup failed");
 }
 void qa_app_application_mod_presentation_destroy(owner_t *p) {
   if (p == NULL) return;

@@ -1,18 +1,30 @@
 /* Port of src/platform/sdl-render-context.ts. GPL-2.0-or-later. */
 #include "qa/platform/sdl_render_context.h"
 
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdnoreturn.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "qa/foundation/support.h"
 
+/* Every refusal here is a plain TS `throw new Error(...)`. */
+static noreturn void sdl_error(const char *format, ...) {
+  char text[1536];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(text, sizeof text, format, args);
+  va_end(args);
+  qa_raise("Error", 0, 0, "%s", text);
+}
+
 static void checked(int result, const char *operation) {
-  if (result < 0) qa_range_error("%s: %s", operation, SDL_GetError());
+  if (result < 0) sdl_error("%s: %s", operation, SDL_GetError());
 }
 
 static void *pointer(void *value, const char *operation) {
-  if (value == NULL) qa_range_error("%s: %s", operation, SDL_GetError());
+  if (value == NULL) sdl_error("%s: %s", operation, SDL_GetError());
   return value;
 }
 
@@ -55,11 +67,11 @@ bool qa_sdl_render_context_lease_detach(SDL_Window *window, SDL_GLContext contex
   (void)out;
   /* Cocoa may dispatch drawable updates onto the main queue, which the
    * frontend's synchronous worker waits cannot service. */
-  qa_range_error("SDL OpenGL render workers require main-queue dispatch support "
+  sdl_error("SDL OpenGL render workers require main-queue dispatch support "
                  "on macOS; use the serial renderer");
 #else
   if (SDL_GL_GetCurrentContext() != context) {
-    qa_range_error("SDL context must be current before detach");
+    sdl_error("SDL context must be current before detach");
   }
   memset(out, 0, sizeof *out);
   _Atomic int32_t *ownership = (_Atomic int32_t *)malloc(sizeof *ownership);
@@ -79,14 +91,14 @@ bool qa_sdl_render_context_lease_detach(SDL_Window *window, SDL_GLContext contex
     SDL_SetWindowData(window, out->transfer.key, NULL);
     SDL_SetWindowData(window, owner_key, NULL);
     free(ownership);
-    qa_range_error("SDL context transfer registration failed");
+    sdl_error("SDL context transfer registration failed");
   }
   if (SDL_GL_MakeCurrent(window, NULL) < 0) {
     const char *message = SDL_GetError();
     SDL_SetWindowData(window, out->transfer.key, NULL);
     SDL_SetWindowData(window, owner_key, NULL);
     free(ownership);
-    qa_range_error("SDL_GL_MakeCurrent detach: %s", message);
+    sdl_error("SDL_GL_MakeCurrent detach: %s", message);
   }
   atomic_store(ownership, QA_SDL_CONTEXT_OFFERED);
   return true;
@@ -103,12 +115,12 @@ void qa_sdl_render_context_lease_restore(qa_sdl_render_context_lease *lease) {
   if (current == QA_SDL_CONTEXT_RESTORED) return;
   if ((current != QA_SDL_CONTEXT_OFFERED && current != QA_SDL_CONTEXT_RELEASED) ||
       !atomic_compare_exchange_strong(state, &current, QA_SDL_CONTEXT_RESTORING)) {
-    qa_range_error("SDL render context is still owned by the worker");
+    sdl_error("SDL render context is still owned by the worker");
   }
   if (SDL_GL_MakeCurrent(lease->window, lease->context) < 0) {
     const char *message = SDL_GetError();
     atomic_store(state, QA_SDL_CONTEXT_RELEASED);
-    qa_range_error("SDL_GL_MakeCurrent restore: %s", message);
+    sdl_error("SDL_GL_MakeCurrent restore: %s", message);
   }
   char owner_key[96];
   snprintf(owner_key, sizeof owner_key, "%s-owner", lease->transfer.key);
@@ -139,7 +151,7 @@ static qa_sdl_render_context_transfer parse_transfer(
     const qa_sdl_render_context_transfer *value) {
   if (value == NULL || value->window_id == 0 || !valid_key(value->key) ||
       value->ownership == NULL) {
-    qa_range_error("Invalid SDL render context transfer");
+    sdl_error("Invalid SDL render context transfer");
   }
   return *value;
 }
@@ -150,36 +162,36 @@ bool qa_sdl_worker_render_context_adopt(const qa_sdl_render_context_transfer *va
   _Atomic int32_t *state = transfer.ownership;
   int32_t expected = QA_SDL_CONTEXT_OFFERED;
   if (!atomic_compare_exchange_strong(state, &expected, QA_SDL_CONTEXT_ADOPTED)) {
-    qa_range_error("SDL render context transfer was already consumed");
+    sdl_error("SDL render context transfer was already consumed");
   }
   /* On failure the TS stores released before rethrowing; checked() and
    * pointer() abort instead, so validate before each checked call. */
   if (SDL_GL_GetCurrentContext() != NULL) {
     atomic_store(state, QA_SDL_CONTEXT_RELEASED);
-    qa_range_error("Worker already has a current SDL context");
+    sdl_error("Worker already has a current SDL context");
   }
   SDL_Window *window = SDL_GetWindowFromID(transfer.window_id);
   if (window == NULL) {
     const char *message = SDL_GetError();
     atomic_store(state, QA_SDL_CONTEXT_RELEASED);
-    qa_range_error("SDL_GetWindowFromID: %s", message);
+    sdl_error("SDL_GetWindowFromID: %s", message);
   }
   char owner_key[96];
   snprintf(owner_key, sizeof owner_key, "%s-owner", transfer.key);
   if (SDL_GetWindowData(window, owner_key) != (void *)transfer.ownership) {
     atomic_store(state, QA_SDL_CONTEXT_RELEASED);
-    qa_range_error("SDL render context ownership does not match the registered transfer");
+    sdl_error("SDL render context ownership does not match the registered transfer");
   }
   void *context = SDL_GetWindowData(window, transfer.key);
   if (context == NULL) {
     const char *message = SDL_GetError();
     atomic_store(state, QA_SDL_CONTEXT_RELEASED);
-    qa_range_error("SDL_GetWindowData context: %s", message);
+    sdl_error("SDL_GetWindowData context: %s", message);
   }
   if (SDL_GL_MakeCurrent(window, context) < 0) {
     const char *message = SDL_GetError();
     atomic_store(state, QA_SDL_CONTEXT_RELEASED);
-    qa_range_error("SDL_GL_MakeCurrent adopt: %s", message);
+    sdl_error("SDL_GL_MakeCurrent adopt: %s", message);
   }
   memset(out, 0, sizeof *out);
   out->window = window;
@@ -191,7 +203,7 @@ bool qa_sdl_worker_render_context_adopt(const qa_sdl_render_context_transfer *va
 
 void qa_sdl_worker_render_context_make_current(qa_sdl_worker_render_context *context) {
   if (context->closed || atomic_load(context->state) != QA_SDL_CONTEXT_ADOPTED) {
-    qa_range_error("SDL worker render context is released");
+    sdl_error("SDL worker render context is released");
   }
   checked(SDL_GL_MakeCurrent(context->window,
                              context->render_enabled ? context->context : NULL),
@@ -199,27 +211,27 @@ void qa_sdl_worker_render_context_make_current(qa_sdl_worker_render_context *con
 }
 
 void qa_sdl_worker_render_context_park(qa_sdl_worker_render_context *context) {
-  if (context->closed) qa_range_error("SDL worker render context is released");
+  if (context->closed) sdl_error("SDL worker render context is released");
   if (atomic_load(context->state) == QA_SDL_CONTEXT_PARKED) return;
   if (atomic_load(context->state) != QA_SDL_CONTEXT_ADOPTED) {
-    qa_range_error("SDL worker render context is not adopted");
+    sdl_error("SDL worker render context is not adopted");
   }
   checked(SDL_GL_MakeCurrent(context->window, NULL), "SDL_GL_MakeCurrent worker park");
   atomic_store(context->state, QA_SDL_CONTEXT_PARKED);
 }
 
 void qa_sdl_worker_render_context_resume(qa_sdl_worker_render_context *context) {
-  if (context->closed) qa_range_error("SDL worker render context is released");
+  if (context->closed) sdl_error("SDL worker render context is released");
   if (atomic_load(context->state) == QA_SDL_CONTEXT_ADOPTED) return;
   int32_t expected = QA_SDL_CONTEXT_PARKED;
   if (!atomic_compare_exchange_strong(context->state, &expected, QA_SDL_CONTEXT_ADOPTED)) {
-    qa_range_error("SDL worker render context is not parked");
+    sdl_error("SDL worker render context is not parked");
   }
   if (SDL_GL_MakeCurrent(context->window,
                          context->render_enabled ? context->context : NULL) < 0) {
     const char *message = SDL_GetError();
     atomic_store(context->state, QA_SDL_CONTEXT_PARKED);
-    qa_range_error("SDL_GL_MakeCurrent worker resume: %s", message);
+    sdl_error("SDL_GL_MakeCurrent worker resume: %s", message);
   }
 }
 
@@ -231,7 +243,7 @@ bool qa_sdl_worker_render_context_rendering_enabled(
 void qa_sdl_worker_render_context_set_rendering_enabled(
     qa_sdl_worker_render_context *context, bool enabled) {
   if (context->closed || atomic_load(context->state) != QA_SDL_CONTEXT_ADOPTED) {
-    qa_range_error("SDL worker render context is released");
+    sdl_error("SDL worker render context is released");
   }
   checked(SDL_GL_MakeCurrent(context->window, enabled ? context->context : NULL),
           "SDL_GL_MakeCurrent worker diagnostic");
@@ -244,7 +256,7 @@ void qa_sdl_worker_render_context_drawable_size(qa_sdl_worker_render_context *co
   int width = 0, height = 0;
   SDL_GL_GetDrawableSize(context->window, &width, &height);
   if (width <= 0 || height <= 0) {
-    qa_range_error("SDL returned invalid drawable dimensions");
+    sdl_error("SDL returned invalid drawable dimensions");
   }
   *out_width = width;
   *out_height = height;
@@ -252,7 +264,7 @@ void qa_sdl_worker_render_context_drawable_size(qa_sdl_worker_render_context *co
 
 void *qa_sdl_worker_render_context_get_gl_proc_address(
     qa_sdl_worker_render_context *context, const char *name) {
-  if (name == NULL || name[0] == '\0') qa_range_error("Invalid GL procedure name");
+  if (name == NULL || name[0] == '\0') sdl_error("Invalid GL procedure name");
   qa_sdl_worker_render_context_make_current(context);
   char operation[256];
   snprintf(operation, sizeof operation, "SDL_GL_GetProcAddress %s", name);
@@ -298,7 +310,7 @@ int32_t qa_sdl_worker_render_context_swap_interval(
   qa_sdl_worker_render_context_make_current(context);
   int32_t value = SDL_GL_GetSwapInterval();
   if (value != -1 && value != 0 && value != 1) {
-    qa_range_error("Unsupported SDL swap interval: %d", (int)value);
+    sdl_error("Unsupported SDL swap interval: %d", (int)value);
   }
   return value;
 }
@@ -306,7 +318,7 @@ int32_t qa_sdl_worker_render_context_swap_interval(
 void qa_sdl_worker_render_context_release(qa_sdl_worker_render_context *context) {
   if (context->closed) return;
   if (context->procedure_leases != 0) {
-    qa_range_error("Close GL procedure tables before releasing the worker context");
+    sdl_error("Close GL procedure tables before releasing the worker context");
   }
   checked(SDL_GL_MakeCurrent(context->window, NULL),
           "SDL_GL_MakeCurrent worker release");

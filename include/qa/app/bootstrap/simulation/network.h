@@ -1,9 +1,9 @@
 /* Port of src/app/bootstrap/simulation/network.ts (createQ2ApplicationServerHost).
  *
  * The TS adapters take `simulation: SharedSimulation` and `content:
- * LoadedApplicationContent` as concrete classes. runtime.ts is not yet ported as a
- * class with the members these adapters call, so the members they read are gathered
- * in qa_app_sim_network_simulation and qa_app_sim_network_content: real C objects
+ * LoadedApplicationContent` as classes. Here the members they read are gathered
+ * in qa_app_sim_network_simulation and qa_app_sim_network_content (the SharedSimulation
+ * fills them in shared_simulation_access.c): real C objects
  * (actor registry, body table, scene queries, recipe, options, source games) are
  * pointers, and each SharedSimulation / LoadedApplicationContent method the TS calls
  * is one fn+ctx entry with the TS name. Every entry receives `ctx`.
@@ -149,7 +149,9 @@ typedef struct qa_app_sim_q2_server_binding_options {
   const qa_app_sim_network_content *content;
   qa_q2_protocol_identity protocol;
   const void *administration;
-  const void *const *masters; size_t master_count;
+  /* TS `masters?: () => readonly NetworkAddress[]`, called on each heartbeat (NULL is absent). The rows are
+   * qa_net_address pointers, borrowed until the next call. */
+  void *masters_ctx; const void *const *(*masters)(void *ctx, size_t *out_count);
   /* playerIdentity(client, identity): has_identity false is TS null. */
   void *player_identity_ctx;
   void (*player_identity)(void *ctx, qa_client_id client, bool has_identity, double seat, const char *social_id);

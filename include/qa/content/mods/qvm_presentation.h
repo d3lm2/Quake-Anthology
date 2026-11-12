@@ -2,8 +2,8 @@
  * Port of src/content/mods/qvm-presentation.ts. Returned
  * declarations borrow strings from the save/JSON tree; sub-objects
  * and lists are malloc'd (top-level NULL only on OOM).
- * normalizeResourcePath (TS owner content/mounts/paths.ts) is
- * mirrored as a static until that module lands.
+ * normalizeResourcePath (TS owner content/mounts/paths.ts) has a
+ * private static copy.
  * GPL-2.0-or-later.
  */
 #ifndef QA_CONTENT_MODS_QVM_PRESENTATION_H

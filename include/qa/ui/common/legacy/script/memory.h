@@ -78,6 +78,10 @@ qa_save_value *qa_ui_source_script_capture_save_state(
     const qa_ui_script_memory_capture *capture);
 void qa_ui_source_script_dispose(qa_ui_source_script_storage *script);
 void qa_ui_source_script_destroy(qa_ui_source_script_storage *script);
+/* Frees the C handle of a storage TS would drop without disposing (a failed
+   restore or include): a memory owner keeps its allocations; without an
+   owner the bytes are freed (the collector's part). */
+void qa_ui_source_script_discard(qa_ui_source_script_storage *script);
 
 const qa_ui_script_memory *qa_ui_source_script_memory(
     const qa_ui_source_script_storage *script);

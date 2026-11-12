@@ -59,6 +59,13 @@ qa_ui_setting_bindings qa_ui_bind_native_video_settings(
     void (*report)(void *ctx, const char *message), void *report_ctx,
     void (*mutate)(void *ctx, const qa_ui_window_mutation *mutation),
     void *mutate_ctx);
+/** The same over a SettingCvars view (read at each call). */
+qa_ui_setting_bindings qa_ui_bind_native_video_settings_view(
+    qa_sdl_window *(*current_window)(void *ctx), void *window_ctx,
+    qa_ui_setting_cvars cvars,
+    void (*report)(void *ctx, const char *message), void *report_ctx,
+    void (*mutate)(void *ctx, const qa_ui_window_mutation *mutation),
+    void *mutate_ctx);
 
 /** TS LanguageChoice. */
 typedef struct qa_ui_language_choice {

@@ -16,7 +16,7 @@ enum { CONTENTS_LAVA = 8, CONTENTS_SLIME = 16, EF_TICKING = 2, EF_CONNECTION = 0
   EF_PLAYER_EVENT = 0x10, CHAN_VOICE = 3 };
 
 static qa_q3_game_client *client_of(qa_q3_game_entity *entity) {
-  if (entity->client == NULL) qa_range_error("Client effects require a client entity");
+  if (entity->client == NULL) qa_raise("Error", 0, 0, "Client effects require a client entity");
   return entity->client;
 }
 static double s32(double v) { return qa_js_to_int32(v); }
@@ -129,7 +129,7 @@ double qa_q3_ta_client_speed_multiplier(const qa_q3_base_player_state *ps) {
 const qa_q3_ta_ammo_regeneration_rule *qa_q3_ta_ammo_regeneration_rule_for(double weapon) {
   for (int i = 0; i < AMMO_RULE_COUNT; i++)
     if (ammo_regeneration[i].weapon == weapon) return &ammo_regeneration[i];
-  qa_range_error("Weapon has no original Ammo Regen rule");
+  qa_raise("Error", 0, 0, "Weapon has no original Ammo Regen rule");
 }
 
 qa_q3_ta_ammo_regeneration_step qa_q3_ta_step_ammo_regeneration(

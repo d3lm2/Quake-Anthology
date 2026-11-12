@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "qa/content/mounts/paths.h"
+#include "qa/foundation/support.h"
 #include "qa/persistence/value.h"
 void qa_q3_pres_body_profile_free(qa_qvm_body_submission *submissions, size_t count) {
   if (submissions == NULL) return;
@@ -70,6 +71,18 @@ static const char *part_literal(const char *part) {
   if (strcmp(part, "upper") == 0) return "upper";
   return "head";
 }
+/* A SaveFormatError raised by a reader unwinds through read_declaration; a caller that
+ * catches it (TS: the rejected promise) must not be left with the tree, rows or file bytes. */
+typedef struct declaration_scratch {
+  qa_save_value *value;
+  qa_qvm_body_submission *rows;
+  size_t count;
+} declaration_scratch;
+static void declaration_scratch_free(void *arg) {
+  declaration_scratch *scratch = (declaration_scratch *)arg;
+  if (scratch->rows != NULL) qa_q3_pres_body_profile_free(scratch->rows, scratch->count);
+  qa_save_value_free(scratch->value);
+}
 static qa_q3_pres_body_profile_result read_declaration(const qa_resolved_qvm_artifact *artifact, const uint8_t *bytes,
                                                        size_t length, qa_qvm_body_submission **out, size_t *out_count) {
   qa_save_value *value = qa_parse_json_value(bytes, length, false);
@@ -82,6 +95,9 @@ static qa_q3_pres_body_profile_result read_declaration(const qa_resolved_qvm_art
     qa_save_value_free(value);
     return QA_Q3_PRES_BODY_PROFILE_OOM;
   }
+  declaration_scratch scratch = {value, NULL, 0};
+  qa_cleanup scratch_cleanup;
+  qa_cleanup_push(&scratch_cleanup, declaration_scratch_free, &scratch);
   bool oom = false;
   qa_save_reader version;
   if (!qa_save_reader_field(&reader, "version", &version)) goto done;
@@ -113,6 +129,8 @@ static qa_q3_pres_body_profile_result read_declaration(const qa_resolved_qvm_art
     qa_save_reader_destroy(&list);
     goto done;
   }
+  scratch.rows = rows;
+  scratch.count = count;
   for (size_t i = 0; i < count && !oom; i++) {
     qa_save_reader item;
     if (!qa_save_reader_item(&list, i, &item)) {
@@ -213,6 +231,7 @@ static qa_q3_pres_body_profile_result read_declaration(const qa_resolved_qvm_art
     result = QA_Q3_PRES_BODY_PROFILE_OK;
   }
 done:
+  qa_cleanup_pop(&scratch_cleanup);
   if (rows != NULL) qa_q3_pres_body_profile_free(rows, count);
   qa_save_reader_destroy(&reader);
   qa_save_value_free(value);
@@ -226,7 +245,10 @@ qa_q3_pres_body_profile_result qa_q3_pres_read_cgame_body_profile(const qa_resol
   if (artifact->role == NULL || strcmp(artifact->role, "cgame") != 0) return QA_Q3_PRES_BODY_PROFILE_NONE;
   qa_content_opened_resource opened;
   if (qa_content_mounted_open(mounts, "cgame-presentation.json", NULL, NULL, &opened)) {
+    qa_cleanup bytes_cleanup;
+    qa_cleanup_push(&bytes_cleanup, free, opened.bytes);
     qa_q3_pres_body_profile_result result = read_declaration(artifact, opened.bytes, opened.byte_length, out, out_count);
+    qa_cleanup_pop(&bytes_cleanup);
     free(opened.bytes); /* opened bytes are caller-freed */
     return result;
   }

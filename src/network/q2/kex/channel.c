@@ -150,7 +150,14 @@ bool qa_kex_channel_send(qa_kex_channel *channel, double kind, const uint8_t *pa
       }
       if (bytes_len > 0) memcpy(kept, bytes, bytes_len);
       qa_kex_pending_packet entry = {(double)channel->reliable, kept, bytes_len};
-      (void)qa_event_ring_admit(&channel->pending, &entry);
+      if (qa_event_ring_append(&channel->pending, &entry) == 0) {
+        /* TS pending.admit() throws when the ring is full; nothing allocated here survives. */
+        free(kept);
+        free(bytes);
+        free(data);
+        qa_range_error("Event ring capacity exhausted (%d undrained records); drain before admitting more",
+                       8192);
+      }
       channel->pending_bytes += (double)bytes_len;
     }
     bool this_accepted = channel->emit(channel->emit_ctx, bytes, bytes_len);

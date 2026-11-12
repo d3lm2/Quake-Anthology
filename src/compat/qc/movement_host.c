@@ -48,9 +48,9 @@ static bool m_read(void *ctx, qa_actor_id actor, qa_q1_monster_move_state *out) 
   else if (ground_ref == 0) { out->ground.kind = QA_TRACE_HIT_WORLD; out->ground.model = 0; }
   else if (!has_ground_actor) out->ground.kind = QA_TRACE_HIT_NONE;
   else { out->ground.kind = QA_TRACE_HIT_ACTOR; out->ground.actor = ground_actor; }
+  int32_t enemy_ref = qa_compat_qc_words_int(w, foff(s, "enemy")); /* TS reads the enemy word before the yaw fields */
   out->ideal_yaw = qa_compat_qc_words_float(w, foff(s, "ideal_yaw"));
   out->yaw_speed = qa_compat_qc_words_float(w, foff(s, "yaw_speed"));
-  int32_t enemy_ref = qa_compat_qc_words_int(w, foff(s, "enemy"));
   qa_actor_id enemy;
   if (enemy_ref != 0 && referenced(s, enemy_ref, &enemy)) { out->has_enemy = true; out->enemy = enemy; }
   return true;

@@ -34,7 +34,7 @@ qa_save_value *qa_qvm_weapon_profile_declaration(const qa_qvm_weapon_profile *pr
   if (definition->fire.kind != QA_WEAPON_CALLBACK_QVM ||
       (definition->has_activate && definition->activate.kind != QA_WEAPON_CALLBACK_QVM) ||
       strncmp(definition->id, "qvm:", 4) != 0)
-    qa_range_error("Invalid QVM weapon callback identity");
+    qa_raise("Error", 0, 0, "Invalid QVM weapon callback identity");
   qa_save_value *result = qa_save_value_object();
   if (result == NULL) qa_range_error("QVM memory allocation failed");
   set_number(result, "version", 1);
@@ -196,14 +196,26 @@ void qa_qvm_read_weapon_profile(const qa_save_value *value, const qa_resolved_qv
   qa_save_reader_destroy(&reader);
 }
 
+static void free_declaration(void *arg) { qa_save_value_free(arg); }
+static void free_profile(void *arg) { qa_qvm_weapon_profile_free(arg); }
+
 void qa_qvm_validate_weapon_profile(const qa_qvm_weapon_profile *profile,
                                     const qa_resolved_qvm_artifact *artifact, qa_qvm_weapon_profile *out) {
   const char *abi_profile = artifact->has_abi_profile ? artifact->abi_profile : "q3-modern";
   qa_save_value *declaration = qa_qvm_weapon_profile_declaration(profile, abi_profile);
+  /* A refused declaration leaves neither the tree nor the half-read profile behind. */
+  memset(out, 0, sizeof *out);
+  qa_cleanup declaration_cleanup, out_cleanup;
+  qa_cleanup_push(&declaration_cleanup, free_declaration, declaration);
+  qa_cleanup_push(&out_cleanup, free_profile, out);
   qa_qvm_read_weapon_profile(declaration, artifact, out);
+  qa_cleanup_pop(&out_cleanup);
+  qa_cleanup_pop(&declaration_cleanup);
   qa_save_value_free(declaration);
-  if (!qa_same_weapon_behavior(profile->definition, out->definition))
-    qa_range_error("QVM weapon callback identity differs from the loaded artifact");
+  if (!qa_same_weapon_behavior(profile->definition, out->definition)) {
+    qa_qvm_weapon_profile_free(out);
+    qa_raise("Error", 0, 0, "QVM weapon callback identity differs from the loaded artifact");
+  }
 }
 
 void qa_qvm_weapon_profile_free(qa_qvm_weapon_profile *profile) {

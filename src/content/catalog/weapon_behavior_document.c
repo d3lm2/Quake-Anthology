@@ -1,6 +1,7 @@
 /* Port of src/content/catalog/weapon-behavior-document.ts.
  * GPL-2.0-or-later. */
 #include "qa/content/catalog/weapon_behavior_document.h"
+#include "qa/content/json_text.h"
 
 #include "catalog_internal.h"
 
@@ -11,7 +12,7 @@ static bool is_record(const qa_save_value *value) {
 bool qa_read_weapon_behavior_document(const uint8_t *bytes, size_t length,
                                       qa_weapon_behavior_document *out) {
   memset(out, 0, sizeof *out);
-  qa_save_value *value = qa_parse_json_value(bytes, length, false);
+  qa_save_value *value = qa_content_parse_json_fatal(bytes, length);
   if (value == NULL) return false;
   const qa_save_value *behaviors =
       is_record(value) ? qa_save_value_get(value, "behaviors") : NULL;

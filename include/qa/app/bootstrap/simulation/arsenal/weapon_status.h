@@ -12,9 +12,8 @@
 /* TS re-export of q1WeaponDisplayName (caller buffer). */
 void qa_app_q1_weapon_display_name(qa_q1_weapon weapon, char *out, size_t out_size);
 typedef double (*qa_app_item_count_fn)(void *ctx, qa_item_id item);
-/* Mirror of Q1EntityServices surface read here (foundation runtime
- * slice not landed; declared getters in entity_services.h have no
- * definitions yet). */
+/* The part of Q1EntityServices read here, passed as callbacks: arsenal/q1.c
+ * and shared_simulation_arsenal.c bind them to the game's services. */
 typedef struct qa_app_q1_status_host {
   void *ctx;
   qa_item_id (*weapon_item)(void *ctx, qa_q1_weapon weapon);
@@ -30,5 +29,10 @@ bool qa_app_q2_weapon_status(const qa_q2w_definition *definition, qa_app_item_co
 /* product "baseq3"|"missionpack". */
 bool qa_app_q3_weapon_status(qa_item_id item, const char *product, qa_app_item_count_fn count, void *count_ctx,
     qa_provider_reference source, char *label, size_t label_size, qa_weapon_hud_status *out);
+/* The whole size (with the terminator) of the label each status function writes for the same arguments: a caller
+ * passes a label buffer of this size (TS labels have no length bound). */
+size_t qa_app_q1_weapon_label_size(qa_q1_weapon weapon);
+size_t qa_app_q2_weapon_label_size(const qa_q2w_definition *definition);
+size_t qa_app_q3_weapon_label_size(qa_item_id item, const char *product);
 qa_arsenal_ammo_warning qa_app_q3_arsenal_warning(const char *product, qa_app_item_count_fn count, void *count_ctx);
 #endif

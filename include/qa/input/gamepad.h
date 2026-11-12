@@ -21,6 +21,10 @@ typedef struct qa_stick_curve {
   double deadzone;
   double outer_threshold; /* radial only */
   double exponent;
+  /* The TS object's key order, which JSON.stringify keeps: false is defaultGamepadTuning's literal (kind, deadzone,
+   * outerThreshold, exponent), true the settings parser's and the settings menu's kind change (kind, deadzone,
+   * exponent, outerThreshold). */
+  bool parsed_order;
 } qa_stick_curve;
 
 /** TS GamepadTuning["gyro"]. */
@@ -29,6 +33,9 @@ typedef struct qa_gyro_tuning {
   double yaw_sensitivity;
   double pitch_sensitivity;
   bool yaw_axis_z; /* TS yawAxis "z"; false is "y" */
+  /* The TS key order: false is defaultGamepadTuning's literal (enabled, yawSensitivity, pitchSensitivity, yawAxis), true
+   * the settings parser's (enabled, yawAxis, yawSensitivity, pitchSensitivity). */
+  bool parsed_order;
 } qa_gyro_tuning;
 
 /** TS GamepadTuning. */

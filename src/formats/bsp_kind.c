@@ -2,6 +2,9 @@
 #include "qa/formats/bsp_kind.h"
 
 #include "qa/core/binary/index.h"
+#include "qa/foundation/support.h"
+
+static void reader_release(void *reader) { qa_binary_reader_destroy((qa_binary_reader *)reader); }
 
 const char *qa_classify_bsp(const uint8_t *data, size_t length,
                             const char *source) {
@@ -10,6 +13,9 @@ const char *qa_classify_bsp(const uint8_t *data, size_t length,
   if (!qa_binary_reader_init(&reader, (uint8_t *)data, length, name)) {
     return NULL;
   }
+  /* A truncated header raises from the reader; a caught raise must not leak its name. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, reader_release, &reader);
   uint32_t magic = qa_binary_reader_u32(&reader);
   const char *result = NULL;
   if (magic == 29 || magic == 0x32505342u || magic == 0x42535032u ||
@@ -22,15 +28,14 @@ const char *qa_classify_bsp(const uint8_t *data, size_t length,
     } else if (magic == 0x50534249u && (version == 44 || version == 46)) {
       result = "q3";
     } else {
-      qa_binary_reader_destroy(&reader);
       qa_binary_error(name, 4, "unsupported BSP version %llu",
                       (unsigned long long)version);
     }
   } else {
-    qa_binary_reader_destroy(&reader);
     qa_binary_error(name, 0, "unsupported BSP identifier %llu",
                     (unsigned long long)magic);
   }
+  qa_cleanup_pop(&guard);
   qa_binary_reader_destroy(&reader);
   return result;
 }

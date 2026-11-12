@@ -44,9 +44,9 @@ qa_app_selected_movement_prediction *qa_app_selected_movement_prediction_create(
   if (!qa_same_actor((qa_actor_id){options.probe.actor.id.session, 0, 0, options.probe.actor.id.token},
                      (qa_actor_id){options.seat.session, 0, 0, options.probe.actor.id.token})
       && options.probe.actor.id.session.token != options.seat.session.token)
-    qa_range_error("Prediction actor and seat belong to different sessions");
+    qa_raise("Error", 0, 0, "Prediction actor and seat belong to different sessions");
   if (!options.probe.profile.kind || strcmp(state_kind_name(initial.state.kind), options.probe.profile.kind) != 0)
-    qa_range_error("Prediction snapshot does not match selected movement");
+    qa_raise("Error", 0, 0, "Prediction snapshot does not match selected movement");
   qa_app_selected_movement_prediction *prediction = calloc(1, sizeof *prediction);
   if (!prediction) return NULL;
   prediction->options = options;
@@ -59,13 +59,16 @@ void qa_app_selected_movement_prediction_destroy(qa_app_selected_movement_predic
   qa_app_movement_prediction_snapshot_destroy(&prediction->snapshot);
   free(prediction);
 }
+void qa_app_selected_movement_prediction_set_profile(qa_app_selected_movement_prediction *prediction, qa_movement_profile profile) {
+  prediction->options.probe.profile = profile;
+}
 const qa_app_movement_prediction_options *qa_app_selected_movement_prediction_options(
     const qa_app_selected_movement_prediction *prediction) { return &prediction->options; }
 
 void qa_app_selected_movement_prediction_receive(qa_app_selected_movement_prediction *prediction,
     qa_app_movement_prediction_snapshot snapshot) {
   if (strcmp(state_kind_name(snapshot.state.kind), prediction->options.probe.profile.kind) != 0)
-    qa_range_error("Prediction snapshot changed movement family");
+    qa_raise("Error", 0, 0, "Prediction snapshot changed movement family");
   qa_app_movement_prediction_snapshot_destroy(&prediction->snapshot);
   prediction->snapshot = qa_app_copy_prediction_snapshot(snapshot);
   while (prediction->command_count && prediction->commands[0].sequence <= snapshot.sequence) {
@@ -76,10 +79,12 @@ void qa_app_selected_movement_prediction_receive(qa_app_selected_movement_predic
 
 void qa_app_selected_movement_prediction_submit(qa_app_selected_movement_prediction *prediction,
     qa_app_prediction_command entry) {
-  if (!(isfinite(entry.sequence) && entry.sequence == trunc(entry.sequence)) || !isfinite(entry.time_milliseconds))
+  /* Number.isSafeInteger(sequence) */
+  if (!(isfinite(entry.sequence) && entry.sequence == trunc(entry.sequence) && fabs(entry.sequence) <= 9007199254740991.0)
+      || !isfinite(entry.time_milliseconds))
     qa_range_error("Prediction command needs a finite clock and integer sequence");
   if (strcmp(command_kind_name(entry.command.kind), prediction->options.probe.profile.kind) != 0)
-    qa_range_error("Prediction command does not match selected movement");
+    qa_raise("Error", 0, 0, "Prediction command does not match selected movement");
   if (entry.sequence <= prediction->snapshot.sequence) return;
   if (prediction->command_count && entry.sequence <= prediction->commands[prediction->command_count - 1].sequence) return;
   if (prediction->command_count >= 64) {
@@ -94,11 +99,22 @@ void qa_app_selected_movement_prediction_submit(qa_app_selected_movement_predict
 /* word << 16 >> 16 runs in int32: it sign-extends the low 16 bits (an int64 shift does not). */
 double qa_app_prediction_short_angle(double word) { return qa_js_shr(qa_js_shl(word, 16), 16) * 360.0 / 65536.0; }
 
+typedef struct replay_parts { qa_app_movement_prediction_snapshot *player; qa_app_movement_prediction_result *out; } replay_parts;
+static void replay_parts_free(void *arg) {
+  replay_parts *parts = arg;
+  qa_app_movement_prediction_snapshot_destroy(parts->player);
+  free(parts->out->effects);
+  parts->out->effects = NULL; parts->out->effect_count = 0;
+}
 qa_app_movement_prediction_result qa_app_selected_movement_prediction_replay(
     qa_app_selected_movement_prediction *prediction,
     void (*observe)(void *ctx, qa_app_movement_prediction_snapshot snapshot), void *observe_ctx) {
   qa_app_movement_prediction_result out; memset(&out, 0, sizeof out);
   qa_app_movement_prediction_snapshot player = qa_app_copy_prediction_snapshot(prediction->snapshot);
+  /* A raising step (a removed actor, a refused command) releases the replay copy and its effects. */
+  replay_parts parts = {&player, &out};
+  qa_cleanup parts_cleanup;
+  qa_cleanup_push(&parts_cleanup, replay_parts_free, &parts);
   bool q2 = player.state.kind == QA_MOVEMENT_STATE_Q2 || player.state.kind == QA_MOVEMENT_STATE_Q2_RERELEASE;
   double flags = player.state.kind == QA_MOVEMENT_STATE_Q2 ? player.state.as.q2.flags
       : player.state.kind == QA_MOVEMENT_STATE_Q2_RERELEASE ? player.state.as.q2_rerelease.flags : 0;
@@ -118,10 +134,12 @@ qa_app_movement_prediction_result qa_app_selected_movement_prediction_replay(
         player.view_angles.z = command.as.q2_rerelease.angles.z + player.state.as.q2_rerelease.delta_angles.z;
       }
     }
+    qa_cleanup_pop(&parts_cleanup);
     out.status = "disabled"; out.player = player; return out;
   }
   double newest = prediction->command_count ? prediction->commands[prediction->command_count - 1].sequence : player.sequence;
   if (prediction->discarded_sequence > player.sequence || newest - player.sequence >= 63) {
+    qa_cleanup_pop(&parts_cleanup);
     out.status = "history-exhausted"; out.player = player; return out;
   }
   bool first = true;
@@ -142,6 +160,7 @@ qa_app_movement_prediction_result qa_app_selected_movement_prediction_replay(
         prediction->commands[i], options, NULL);
     qa_app_movement_prediction_snapshot_destroy(&player);
     player = stepped.player;
+    /* The step's own effects and contacts are released at the end of this pass; a raise below is out of memory. */
     if (stepped.result.effect_count) {
       qa_ordered_movement_effect *effects = realloc(out.effects, (out.effect_count + stepped.result.effect_count) * sizeof *effects);
       if (!effects) qa_range_error("Out of memory");
@@ -154,6 +173,7 @@ qa_app_movement_prediction_result qa_app_selected_movement_prediction_replay(
     first = false;
     if (observe) observe(observe_ctx, qa_app_copy_prediction_snapshot(player));
   }
+  qa_cleanup_pop(&parts_cleanup);
   out.status = first ? "unchanged" : "predicted";
   out.player = player;
   return out;

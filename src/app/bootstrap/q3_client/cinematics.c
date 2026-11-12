@@ -146,28 +146,38 @@ static void decode_source(void *ctx) {
   int64_t width = 0, height = 0;
   scope->ok = qa_cinematic_dimensions(&entry->source, &width, &height);
 }
+static void pending_load_done(void *arg) { ((qa_app_application_q3_cinematics *)arg)->pending_loads--; }
+/* The MissingCinematicError message of the last prepare that returned false (TS throws it). */
+static _Thread_local char missing_message[QA_CAUGHT_MESSAGE_CAPACITY];
 static bool prepare_mode(qa_app_application_q3_cinematics *c, const char *path, bool restoring,
                          qa_app_ui_cinematic_asset *out) {
   if (c->restoring && !restoring) js_error("Cinematic restore has not completed");
   if (c->closed) js_error("UI cinematics are closed");
   if (find_source(c, path) == NULL) {
-    char selected[1024];
-    if (strchr(path, '/') != NULL) snprintf(selected, sizeof selected, "%s", path);
-    else snprintf(selected, sizeof selected, "video/%s", path);
-    /* /\.[^/]+$/ */
-    const char *base = strrchr(selected, '/');
-    const char *dot = strrchr(base != NULL ? base : selected, '.');
+    /* selected = path.includes("/") ? path : `video/${path}`; name = /\.[^/]+$/.test(selected) ? selected : `${selected}.roq` */
+    const char *prefix = strchr(path, '/') != NULL ? "" : "video/";
+    const char *slash = strrchr(path, '/');
+    const char *segment = slash != NULL ? slash + 1 : path;
+    const char *dot = strchr(segment, '.'); /* a dot followed by at least one character of the last segment */
     bool has_ext = dot != NULL && dot[1] != '\0';
-    char name[1080];
-    if (has_ext) snprintf(name, sizeof name, "%s", selected);
-    else snprintf(name, sizeof name, "%s.roq", selected);
+    size_t name_length = strlen(prefix) + strlen(path) + 5;
+    char *name = malloc(name_length);
+    if (name == NULL) qa_range_error("Out of memory");
+    snprintf(name, name_length, "%s%s%s", prefix, path, has_ext ? "" : ".roq");
+    qa_cleanup name_guard;
+    qa_cleanup_push(&name_guard, free, name);
     c->pending_loads++;
     qa_content_opened_resource opened;
+    qa_cleanup pending_guard; /* try { open } finally { pendingLoads-- }: a closed mount plan raises */
+    qa_cleanup_push(&pending_guard, pending_load_done, c);
     bool found = qa_content_mounted_open(qa_app_application_q3_assets_provider(c->media)->mounts, name, NULL, NULL, &opened);
+    qa_cleanup_pop(&pending_guard);
     c->pending_loads--;
     if (c->closed) { if (found) free(opened.bytes); js_error("UI cinematic loaded after close"); }
     if (!found || opened.byte_length == 0) {
       if (found) free(opened.bytes);
+      snprintf(missing_message, sizeof missing_message, "Missing cinematic %s", name);
+      qa_cleanup_pop(&name_guard); free(name);
       return false; /* MissingCinematicError: Missing cinematic <name> */
     }
     /* name.slice(name.lastIndexOf(".") + 1).toLowerCase() */
@@ -177,7 +187,11 @@ static bool prepare_mode(qa_app_application_q3_cinematics *c, const char *path, 
     if (extension == NULL) qa_range_error("Out of memory");
     bool supported = strcmp(extension, "roq") == 0 || strcmp(extension, "cin") == 0
       || strcmp(extension, "ogv") == 0 || strcmp(extension, "pcx") == 0;
-    if (!supported) { free(extension); free(opened.bytes); return false; }
+    if (!supported) {
+      snprintf(missing_message, sizeof missing_message, "Unsupported cinematic format: %s", extension);
+      free(extension); free(opened.bytes); qa_cleanup_pop(&name_guard); free(name);
+      return false; /* MissingCinematicError */
+    }
     if (c->source_count == c->source_capacity) {
       size_t cap = c->source_capacity == 0 ? 8 : c->source_capacity * 2;
       source_entry *next = realloc(c->sources, cap * sizeof *next);
@@ -196,11 +210,15 @@ static bool prepare_mode(qa_app_application_q3_cinematics *c, const char *path, 
       qa_cinematic_source_dispose(&entry->source);
       free(entry->name); free(entry->bytes);
       if (c->closed) js_error("UI cinematic loaded after close");
+      snprintf(missing_message, sizeof missing_message, "Undecodable cinematic %s", name);
+      qa_cleanup_pop(&name_guard); free(name);
       return false; /* MissingCinematicError: Undecodable cinematic <name> */
     }
     if (!qa_resolved_resource_copy(opened.reference, &entry->resource)) qa_range_error("Out of memory");
     entry->path = xstrdup(path);
     c->source_count++;
+    qa_cleanup_pop(&name_guard);
+    free(name);
   }
   out->path = find_source(c, path)->path;
   return true;
@@ -279,6 +297,7 @@ static void movie_release(movie_entry *movie) {
   free(movie->asset_path);
   memset(movie, 0, sizeof *movie);
 }
+static void release_movie(void *arg) { movie_release(arg); }
 typedef struct movie_scope { qa_app_application_q3_cinematics *c; int index; const source_entry *prepared; cinematic_mode mode; } movie_scope;
 /* The TS try block after the playback exists: image, video source, picture, publication. */
 static void movie_body(void *ctx) {
@@ -341,7 +360,14 @@ static void create_movie(qa_app_application_q3_cinematics *c, int index, qa_app_
   options.on_complete = movie_on_complete;
   options.developer_print_ctx = c;
   options.developer_print = dev_print;
-  if (!qa_cinematic_playback_init(&movie->playback, &prepared->source, &options, checkpoint)) {
+  /* A malformed movie raises out of the constructor (which releases the playback): the id goes too. */
+  qa_cleanup release_guard;
+  qa_cleanup_push(&release_guard, release_movie, movie);
+  bool initialized = qa_cinematic_playback_init(&movie->playback, &prepared->source, &options, checkpoint);
+  qa_cleanup_pop(&release_guard);
+  if (!initialized) {
+    /* False (OOM) leaves the copied source name and any partial decoder to release. */
+    qa_cinematic_playback_destroy(&movie->playback);
     movie_release(movie);
     qa_range_error("Out of memory");
   }
@@ -448,6 +474,7 @@ static qa_save_value *resource_value(const qa_resolved_resource_reference *resou
   qa_save_value_set(o, "id", qa_save_value_string(resource->id));
   return o;
 }
+static void free_value(void *value) { qa_save_value_free(value); }
 qa_save_value *qa_app_application_q3_cinematics_capture_checkpoint(qa_app_application_q3_cinematics *c) {
   bool any_pending = false;
   for (int i = 0; i < 16; i++) if (c->pending_systems[i]) any_pending = true;
@@ -461,19 +488,22 @@ qa_save_value *qa_app_application_q3_cinematics_capture_checkpoint(qa_app_applic
     if (c->systems_used[i] && c->systems[i].capture_checkpoint == NULL)
       js_error("System cinematic checkpoint requires its attached client transition checkpoint");
   qa_save_value *root = qa_save_value_object();
+  qa_cleanup root_guard; /* a system, playback or mixer capture that raises */
+  qa_cleanup_push(&root_guard, free_value, root);
   qa_save_value_set(root, "version", qa_save_value_number(1));
   int order[16];
   size_t count = systems_in_order(c, order);
+  /* Every container joins root before its parts are captured, so a raise frees all of it (key order unchanged). */
   qa_save_value *systems = qa_save_value_array();
+  qa_save_value_set(root, "systems", systems);
   for (size_t n = 0; n < count; n++) {
     int i = order[n];
     qa_app_system_cinematic_handle *system = &c->systems[i];
     qa_save_value *entry = qa_save_value_object();
+    qa_save_value_push(systems, entry);
     qa_save_value_set(entry, "index", qa_save_value_number(i));
     qa_save_value_set(entry, "checkpoint", system->capture_checkpoint(system->ctx));
-    qa_save_value_push(systems, entry);
   }
-  qa_save_value_set(root, "systems", systems);
   qa_save_value *sources = qa_save_value_array();
   for (size_t i = 0; i < c->source_count; i++) {
     qa_save_value *entry = qa_save_value_object();
@@ -484,10 +514,12 @@ qa_save_value *qa_app_application_q3_cinematics_capture_checkpoint(qa_app_applic
   qa_save_value_set(root, "sources", sources);
   count = movies_in_order(c, order);
   qa_save_value *movies = qa_save_value_array();
+  qa_save_value_set(root, "movies", movies);
   for (size_t n = 0; n < count; n++) {
     int i = order[n];
     movie_entry *movie = &c->movies[i];
     qa_save_value *entry = qa_save_value_object();
+    qa_save_value_push(movies, entry);
     qa_save_value_set(entry, "index", qa_save_value_number(i));
     qa_save_value_set(entry, "asset", qa_save_value_string(movie->asset_path));
     qa_save_value *mode = qa_save_value_object();
@@ -501,9 +533,8 @@ qa_save_value *qa_app_application_q3_cinematics_capture_checkpoint(qa_app_applic
     char id[96];
     snprintf(id, sizeof id, "%s:%d", c->namespace_, i);
     qa_save_value_set(entry, "pcm", c->mixer.capture_stream_checkpoint(c->mixer.ctx, id));
-    qa_save_value_push(movies, entry);
   }
-  qa_save_value_set(root, "movies", movies);
+  qa_cleanup_pop(&root_guard);
   return root;
 }
 /* Map<number, ...> keys: a handle names a slot only when it is an integer 0..15. */
@@ -737,7 +768,7 @@ static void restore_body(void *ctx) {
   bool has_restore = c->has_system && c->system.restore != NULL;
   for (size_t i = 0; i < s->source_rows; i++) {
     qa_app_ui_cinematic_asset asset;
-    if (!prepare_mode(c, s->sources[i].path, true, &asset)) js_error("Missing cinematic %s", s->sources[i].path);
+    if (!prepare_mode(c, s->sources[i].path, true, &asset)) js_error("%s", missing_message); /* the MissingCinematicError */
     source_entry *prepared = find_source(c, s->sources[i].path);
     if (prepared == NULL || strcmp(prepared->resource.id, s->sources[i].resource.id) != 0)
       qa_save_reader_fail(&s->r, "cinematic resource changed: %s", s->sources[i].path);

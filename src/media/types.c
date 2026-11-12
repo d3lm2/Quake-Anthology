@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "qa/foundation/support.h"
+
 const char *qa_cinematic_status_name(qa_cinematic_status status) {
   switch (status) {
     case QA_CINEMATIC_PLAYING: return "playing";
@@ -100,8 +102,10 @@ bool qa_read_cinematic_frame(const qa_save_reader *reader,
     memcpy(copy, rgba, rgba_length);
   }
   qa_save_reader_destroy(&rgba_r);
+  /* The later field refusals raise; the copied pixels go with them. */
+  qa_cleanup guard;
+  qa_cleanup_push(&guard, free, copy);
   if ((double)width * (double)height * 4.0 != (double)rgba_length) {
-    free(copy);
     qa_save_reader_fail(reader, "frame dimensions differ from pixels");
   }
   qa_cinematic_frame frame;
@@ -122,9 +126,11 @@ bool qa_read_cinematic_frame(const qa_save_reader *reader,
   if (!qa_save_reader_field(reader, "time", &time_r)) goto oom;
   frame.time = qa_save_reader_finite(&time_r);
   qa_save_reader_destroy(&time_r);
+  qa_cleanup_pop(&guard);
   *out = frame;
   return true;
 oom:
+  qa_cleanup_pop(&guard);
   qa_cinematic_frame_dispose(&frame);
   return false;
 }

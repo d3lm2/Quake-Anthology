@@ -82,6 +82,10 @@ static int cmp_i64(const void *a, const void *b) {
   return (x > y) - (x < y);
 }
 bool qa_q3_select_snapshot_entities(const qa_q3_player_state_record *player, const qa_q3_visibility_bindings *host, qa_q3_visible_entities *out) {
+  return qa_q3_select_snapshot_entities_from(player, (double)player->viewheight, host, out);
+}
+bool qa_q3_select_snapshot_entities_from(const qa_q3_player_state_record *player, double viewheight,
+                                         const qa_q3_visibility_bindings *host, qa_q3_visible_entities *out) {
   memset(out, 0, sizeof *out);
   if (player->client_num < 0 || player->client_num >= 1024)
     qa_common_error(QA_COMMON_ERROR_DROP, "SV_SvEntityForGentity: bad gEnt");
@@ -96,7 +100,8 @@ bool qa_q3_select_snapshot_entities(const qa_q3_player_state_record *player, con
   /* Host collision/entity callbacks and the drops above raise; release the set. */
   qa_cleanup guard;
   qa_cleanup_push(&guard, free, s.visited);
-  qa_vec3 eye = { player->origin.x, player->origin.y, (float)(player->origin.z + (float)player->viewheight) };
+  /* Math.fround(origin.z + Math.fround(viewheight)): a fractional view height is kept. */
+  qa_vec3 eye = { player->origin.x, player->origin.y, (float)(player->origin.z + (float)viewheight) };
   visible_from(&s, eye);
   qa_cleanup_pop(&guard);
   free(s.visited); s.visited = NULL;

@@ -39,6 +39,7 @@ static void pending_free(pending_state *pending) {
   for (size_t i = 0; i < pending->configs.count; i++) free(pending->configs.entries[i].value);
   free(pending->configs.entries);
   qa_q2_baseline_list_free(&pending->baselines);
+  qa_q2_server_data_result_clear(&pending->data);
   free(pending);
 }
 static void cancel_loading(qa_app_q2_client_receiver *r) {
@@ -72,6 +73,7 @@ qa_app_q2_client_receiver *qa_app_q2_client_receiver_create(
 void qa_app_q2_client_receiver_destroy(qa_app_q2_client_receiver *receiver) {
   if (!receiver) return;
   pending_free(receiver->pending);
+  qa_q2_server_data_result_clear(&receiver->server_data);
   qa_q2_server_message_reader_destroy(&receiver->reader);
   for (size_t i = 0; i < receiver->assertion_count; i++) free(receiver->assertions[i]);
   free(receiver->assertions);
@@ -115,7 +117,7 @@ static void seed_add(seed_builder *b, uint8_t *message, size_t length) {
 }
 void qa_app_q2_client_receiver_seed(qa_app_q2_client_receiver *receiver, qa_app_q2_recording_seed *out) {
   if (!receiver->has_server_data || strcmp(receiver->state, "active") != 0)
-    qa_range_error("Recording requires an active Q2 server");
+    qa_raise("Error", 0, 0, "Recording requires an active Q2 server");
   qa_q2_wire_codec *wire = &receiver->reader.wire;
   /* TS wire.protocol: the codec's selected protocol. */
   qa_q2_protocol_identity protocol = wire->selected_protocol;
@@ -294,13 +296,19 @@ static void server_commands(qa_app_q2_client_receiver *r, const char *text) {
           || (checked && signon_integer(word_count > 1 ? words[1] : NULL) != r->server_data.servercount))
         qa_raise("Error", 0, 0, "Q2 precache refers to another server generation");
       cancel_loading(r);
+      qa_q2_server_data_result data; /* the pending state owns its copy */
+      qa_q2_server_data_result_copy(&data, &r->server_data);
       pending_state *pending = calloc(1, sizeof *pending);
-      if (!pending) qa_range_error("out of memory");
-      pending->data = r->server_data;
+      if (!pending) { qa_q2_server_data_result_clear(&data); qa_range_error("out of memory"); }
+      pending->data = data;
       pending->configs.count = r->reader.config_count;
       pending->configs.entries = malloc(
           (pending->configs.count ? pending->configs.count : 1) * sizeof *pending->configs.entries);
-      if (!pending->configs.entries) { free(pending); qa_range_error("out of memory"); }
+      if (!pending->configs.entries) {
+        qa_q2_server_data_result_clear(&pending->data);
+        free(pending);
+        qa_range_error("out of memory");
+      }
       for (size_t i = 0; i < pending->configs.count; i++) {
         pending->configs.entries[i].index = r->reader.config_strings[i].index;
         pending->configs.entries[i].value = copy_text(r->reader.config_strings[i].value);
@@ -354,7 +362,10 @@ static void server_records(qa_app_q2_client_receiver *r, qa_q2_server_record *re
         if (r->host.server_data)
           r->host.server_data(r->host.ctx, &record->event.data, assert_thunk, assertion);
         assert_current(r, assertion->generation);
-        r->server_data = record->event.data; r->has_server_data = true;
+        qa_q2_server_data_result data; /* the record's strings go with the record */
+        qa_q2_server_data_result_copy(&data, &record->event.data);
+        qa_q2_server_data_result_clear(&r->server_data);
+        r->server_data = data; r->has_server_data = true;
         r->last_frame = -1; r->has_recorded_time = false;
         if (!r->source.is_demo) r->source.reset_commands(r->source.ctx);
         r->state = "loading";

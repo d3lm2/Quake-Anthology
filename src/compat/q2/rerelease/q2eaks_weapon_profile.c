@@ -7,14 +7,17 @@
 #include "qa/compat/q2/rerelease/native_weapon_declaration.h"
 
 const qa_content_digest qa_compat_q2_q2eaks_weapon_digest = "sha256:b60b79f7fb6f115218681a9cbab8765267e34f72466975526df05ad288925dde";
-static const qa_guest_value_layout float_layout = {false, "float32", {NULL, 0, 0, 0, NULL, 0}};
+/* The signature keeps a pointer to its parameter list, so the lists have static storage (they were locals of
+ * these functions: the returned signatures pointed at dead stack). */
+#define P_LAYOUT {false, "pointer", {NULL, 0, 0, 0, NULL, 0}}
+#define I_LAYOUT {false, "int32", {NULL, 0, 0, 0, NULL, 0}}
+#define F_LAYOUT {false, "float32", {NULL, 0, 0, 0, NULL, 0}}
 qa_compat_q2_guest_call_signature qa_compat_q2_q2eaks_weapon_think_signature(void) {
-  const qa_guest_value_layout params[] = {qa_compat_q2_rr_pointer_layout};
+  static const qa_guest_value_layout params[] = {P_LAYOUT};
   return qa_compat_q2_rerelease_signature(params, 1, true, qa_compat_q2_rr_pointer_layout);
 }
 qa_compat_q2_guest_call_signature qa_compat_q2_q2eaks_fire_rocket_signature(void) {
-  const qa_guest_value_layout params[] = {qa_compat_q2_rr_pointer_layout, qa_compat_q2_rr_pointer_layout, qa_compat_q2_rr_pointer_layout,
-                                          qa_compat_q2_rr_int_layout, qa_compat_q2_rr_int_layout, float_layout, qa_compat_q2_rr_int_layout};
+  static const qa_guest_value_layout params[] = {P_LAYOUT, P_LAYOUT, P_LAYOUT, I_LAYOUT, I_LAYOUT, F_LAYOUT, I_LAYOUT};
   return qa_compat_q2_rerelease_signature(params, 7, false, qa_compat_q2_rr_pointer_layout);
 }
 static const qa_guest_field_layout projectile_fields[] = {
@@ -45,13 +48,13 @@ static qa_guest_address registered_at(const qa_compat_q2_memory *memory, qa_gues
   }
   if (!differs) differs = qa_compat_q2_mem_read_u32(memory, qa_compat_q2_mem_offset(memory, record, 8)) != tag;
   if (!differs) differs = callback.byte_offset != entry_at(memory, base, expected_rva).byte_offset;
-  if (differs) qa_range_error("Q2Eaks typed source callback registration differs: %s", name);
+  if (differs) qa_raise("Error", 0, 0, "Q2Eaks typed source callback registration differs: %s", name);
   memory->check(memory->ctx, callback, 1, "execute");
   return callback;
 }
 qa_compat_q2_q2eaks_weapon_entries qa_compat_q2_q2eaks_get_weapon_entries(const qa_compat_q2_memory *memory, qa_guest_address image_base) {
   if (strcmp(memory->module.digest, qa_compat_q2_q2eaks_weapon_digest) != 0 || memory->pointer_bytes != 8)
-    qa_range_error("Q2Eaks weapon profile requires the exact v0.21 Windows x64 artifact");
+    qa_raise("Error", 0, 0, "Q2Eaks weapon profile requires the exact v0.21 Windows x64 artifact");
   qa_guest_address level_time = qa_compat_q2_mem_offset(memory, image_base, 0x2999c8);
   memory->check(memory->ctx, level_time, 8, "read");
   qa_compat_q2_q2eaks_weapon_entries out;
